@@ -49,6 +49,7 @@ from reuleauxcoder.interfaces.entrypoint.remote_relay import (
 )
 from reuleauxcoder.interfaces.entrypoint.session_lifecycle import restore_session
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
+from reuleauxcoder.services.config.loader import ConfigValidationError
 from reuleauxcoder.services.llm.client import LLM
 
 
@@ -70,6 +71,9 @@ class AppRunner:
         """Initialize all application components and return context."""
         config = self.dependencies.load_config(self.options.config_path)
         setattr(config, "_source_path", self.options.config_path)
+        validation_errors = config.validate()
+        if validation_errors:
+            raise ConfigValidationError(validation_errors)
         if self.options.server_mode:
             config.remote_exec.enabled = True
             config.remote_exec.host_mode = True

@@ -44,6 +44,17 @@ class ConfigEnvironmentError(Exception):
     """Raised when config references a missing environment variable."""
 
 
+class ConfigValidationError(Exception):
+    """Raised when loaded config is structurally complete but invalid."""
+
+    def __init__(self, errors: list[str]):
+        self.errors = list(errors)
+        message = "Invalid configuration:\n" + "\n".join(
+            f"  - {error}" for error in self.errors
+        )
+        super().__init__(message)
+
+
 class ConfigLoader:
     """Loads configuration from config.yaml.
 
