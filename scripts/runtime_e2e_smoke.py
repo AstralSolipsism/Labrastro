@@ -67,26 +67,26 @@ SOURCE_EXCLUDES = [
 ]
 
 REQUIRED_TABLES = [
-    "ez_runtime_tasks",
-    "ez_runtime_events",
-    "ez_runtime_claims",
-    "ez_runtime_sessions",
-    "ez_runtime_artifacts",
-    "ez_sessions",
-    "ez_session_snapshots",
-    "ez_taskflow_goals",
-    "ez_taskflow_briefs",
-    "ez_taskflow_issue_drafts",
-    "ez_taskflow_task_drafts",
-    "ez_taskflow_dispatch_decisions",
-    "ez_taskflow_events",
-    "ez_issues",
-    "ez_assignments",
-    "ez_mentions",
-    "ez_assignment_events",
-    "ez_github_pull_requests",
-    "ez_github_review_comments",
-    "ez_github_webhook_deliveries",
+    "labrastro_runtime_tasks",
+    "labrastro_runtime_events",
+    "labrastro_runtime_claims",
+    "labrastro_runtime_sessions",
+    "labrastro_runtime_artifacts",
+    "labrastro_sessions",
+    "labrastro_session_snapshots",
+    "labrastro_taskflow_goals",
+    "labrastro_taskflow_briefs",
+    "labrastro_taskflow_issue_drafts",
+    "labrastro_taskflow_task_drafts",
+    "labrastro_taskflow_dispatch_decisions",
+    "labrastro_taskflow_events",
+    "labrastro_issues",
+    "labrastro_assignments",
+    "labrastro_mentions",
+    "labrastro_assignment_events",
+    "labrastro_github_pull_requests",
+    "labrastro_github_review_comments",
+    "labrastro_github_webhook_deliveries",
 ]
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled", "blocked", "timeout"}
@@ -720,19 +720,28 @@ class ServerRunner:
         self.bash(f"mv {q(stage)} {q(src)}", timeout=120)
         base_dockerfile = src / "docker" / "Dockerfile"
         if base_dockerfile.exists():
+            base_image = "labrastro-host:test"
+            runtime_dockerfile = self.root / "Dockerfile.runtime"
+            if runtime_dockerfile.exists():
+                match = re.search(
+                    r"(?im)^\s*FROM\s+([^\s]+)",
+                    runtime_dockerfile.read_text(encoding="utf-8", errors="replace"),
+                )
+                if match:
+                    base_image = match.group(1)
             self.run_cmd(
                 [
                     "docker",
                     "build",
                     "-t",
-                    "labrastro-host:test",
+                    base_image,
                     "-f",
                     str(base_dockerfile),
                     str(src),
                 ],
                 timeout=1800,
             )
-            self.record_step("build_base_image", image="labrastro-host:test")
+            self.record_step("build_base_image", image=base_image)
         self.run_cmd(
             [
                 "docker",
@@ -803,7 +812,7 @@ class ServerRunner:
             timeout=60,
         ).stdout.strip()
         existing_tables = self.psql(
-            "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'ez_%' ORDER BY tablename",
+            "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'labrastro_%' ORDER BY tablename",
             database=self.db_name,
         ).stdout.splitlines()
         existing = {item.strip() for item in existing_tables if item.strip()}
@@ -1805,8 +1814,8 @@ class ServerRunner:
             import json, os
             from pathlib import Path
             from reuleauxcoder.services.config.loader import ConfigLoader
-            from reuleauxcoder.infrastructure.persistence.db import create_postgres_engine
-            from reuleauxcoder.infrastructure.persistence.postgres_session_store import PostgresSessionStore
+            from labrastro_server.infrastructure.persistence.db import create_postgres_engine
+            from labrastro_server.infrastructure.persistence.postgres_session_store import PostgresSessionStore
             config_path = Path({self.container_config_path()!r})
             cfg = ConfigLoader.from_path(config_path)
             store = PostgresSessionStore(create_postgres_engine(cfg.persistence.database_url))
@@ -1837,11 +1846,11 @@ class ServerRunner:
             raise RuntimeError(f"session persistence smoke failed: {data}")
         self.restart_host()
         session_count = self.psql(
-            "SELECT count(*) FROM ez_sessions WHERE fingerprint='runtime-smoke:" + self.timestamp + "'",
+            "SELECT count(*) FROM labrastro_sessions WHERE fingerprint='runtime-smoke:" + self.timestamp + "'",
             database=self.db_name,
         ).stdout.strip()
         snapshot_count = self.psql(
-            "SELECT count(*) FROM ez_session_snapshots WHERE session_id='" + data["session_id"] + "'",
+            "SELECT count(*) FROM labrastro_session_snapshots WHERE session_id='" + data["session_id"] + "'",
             database=self.db_name,
         ).stdout.strip()
         if session_count == "0" or snapshot_count == "0":
