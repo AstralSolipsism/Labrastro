@@ -119,7 +119,7 @@ class PostgresSessionStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_sessions (
+                    INSERT INTO labrastro_sessions (
                         id, fingerprint, model, saved_at, preview, messages,
                         runtime_state, active_mode, total_prompt_tokens,
                         total_completion_tokens, has_history_content, deleted_at
@@ -194,7 +194,7 @@ class PostgresSessionStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_sessions (
+                    INSERT INTO labrastro_sessions (
                         id, fingerprint, model, saved_at, preview, messages,
                         runtime_state, active_mode, total_prompt_tokens,
                         total_completion_tokens, has_history_content, deleted_at
@@ -274,7 +274,7 @@ class PostgresSessionStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_sessions
+                    SELECT * FROM labrastro_sessions
                     WHERE id=:id AND deleted_at IS NULL
                     """
                 ),
@@ -293,7 +293,7 @@ class PostgresSessionStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_sessions
+                    UPDATE labrastro_sessions
                     SET deleted_at=now(), updated_at=now()
                     WHERE id=:id AND deleted_at IS NULL
                     """
@@ -319,7 +319,7 @@ class PostgresSessionStore:
                 text(
                     f"""
                     SELECT id, model, saved_at, preview, fingerprint
-                    FROM ez_sessions
+                    FROM labrastro_sessions
                     WHERE {' AND '.join(clauses)}
                     ORDER BY saved_at DESC, updated_at DESC
                     LIMIT :limit
@@ -365,7 +365,7 @@ class PostgresSessionStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT snapshot FROM ez_session_snapshots
+                    SELECT snapshot FROM labrastro_session_snapshots
                     WHERE session_id=:session_id
                     ORDER BY version DESC
                     LIMIT 1
@@ -392,7 +392,7 @@ class PostgresSessionStore:
                 text(
                     """
                     SELECT COALESCE(max(version), 0) + 1
-                    FROM ez_session_snapshots
+                    FROM labrastro_session_snapshots
                     WHERE session_id=:session_id
                     """
                 ),
@@ -401,7 +401,7 @@ class PostgresSessionStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_session_snapshots (
+                    INSERT INTO labrastro_session_snapshots (
                         session_id, version, snapshot, stats, turn_count,
                         trace_node_count, trace_edge_count
                     ) VALUES (
@@ -429,7 +429,7 @@ class PostgresSessionStore:
     def delete_snapshot(self, session_id: str) -> bool:
         with self.engine.begin() as conn:
             result = conn.execute(
-                text("DELETE FROM ez_session_snapshots WHERE session_id=:session_id"),
+                text("DELETE FROM labrastro_session_snapshots WHERE session_id=:session_id"),
                 {"session_id": session_id},
             )
             return int(result.rowcount or 0) > 0
@@ -474,7 +474,7 @@ class PostgresSessionStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_sessions
+                    UPDATE labrastro_sessions
                     SET legacy_file_path=:legacy_file_path
                     WHERE id=:id
                     """

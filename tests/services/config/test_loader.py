@@ -207,8 +207,8 @@ def test_parse_config_keeps_existing_agent_default_model() -> None:
 def test_expand_env_refs_expands_provider_and_profile_runtime_fields(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("EZ_PROVIDER_KEY", "sk-env")
-    monkeypatch.setenv("EZ_BASE_URL", "https://env.example/v1")
+    monkeypatch.setenv("LABRASTRO_PROVIDER_KEY", "sk-env")
+    monkeypatch.setenv("LABRASTRO_BASE_URL", "https://env.example/v1")
 
     expanded = ConfigLoader()._expand_env_refs(
         {
@@ -216,7 +216,7 @@ def test_expand_env_refs_expands_provider_and_profile_runtime_fields(
                 "items": {
                     "openai": {
                         "type": "openai_chat",
-                        "api_key": "${EZ_PROVIDER_KEY}",
+                        "api_key": "${LABRASTRO_PROVIDER_KEY}",
                     }
                 }
             },
@@ -224,8 +224,8 @@ def test_expand_env_refs_expands_provider_and_profile_runtime_fields(
                 "profiles": {
                     "main": {
                         "model": "gpt",
-                        "api_key": "${EZ_PROVIDER_KEY}",
-                        "base_url": "${EZ_BASE_URL}",
+                        "api_key": "${LABRASTRO_PROVIDER_KEY}",
+                        "base_url": "${LABRASTRO_BASE_URL}",
                     }
                 }
             },
@@ -247,14 +247,14 @@ def test_expand_env_refs_reports_missing_env_var() -> None:
                     "items": {
                         "openai": {
                             "type": "openai_chat",
-                            "api_key": "${EZ_MISSING_KEY}",
+                            "api_key": "${LABRASTRO_MISSING_KEY}",
                         }
                     }
                 }
             }
         )
 
-    assert "EZ_MISSING_KEY" in str(exc.value)
+    assert "LABRASTRO_MISSING_KEY" in str(exc.value)
 
 
 def test_parse_config_reads_remote_exec_settings() -> None:

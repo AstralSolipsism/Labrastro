@@ -178,7 +178,7 @@ class PostgresRuntimeStore:
         with self.engine.begin() as conn:
             conn.execute(
                 text(
-                    "INSERT INTO ez_runtime_locks(name) VALUES ('global_claim') "
+                    "INSERT INTO labrastro_runtime_locks(name) VALUES ('global_claim') "
                     "ON CONFLICT (name) DO NOTHING"
                 )
             )
@@ -221,7 +221,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_runtime_tasks (
+                    INSERT INTO labrastro_runtime_tasks (
                         id, issue_id, agent_id, trigger_mode, status, prompt,
                         runtime_profile_id, executor, execution_location,
                         parent_task_id, trigger_comment_id, branch_name, pr_url,
@@ -270,13 +270,13 @@ class PostgresRuntimeStore:
         )
         with self.engine.begin() as conn:
             conn.execute(
-                text("SELECT name FROM ez_runtime_locks WHERE name='global_claim' FOR UPDATE")
+                text("SELECT name FROM labrastro_runtime_locks WHERE name='global_claim' FOR UPDATE")
             ).first()
             self._recover_stale_with_conn(conn)
             running = conn.execute(
                 text(
                     """
-                    SELECT count(*) FROM ez_runtime_tasks
+                    SELECT count(*) FROM labrastro_runtime_tasks
                     WHERE status IN ('dispatched', 'running', 'waiting_approval')
                     """
                 )
@@ -286,7 +286,7 @@ class PostgresRuntimeStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_runtime_tasks
+                    SELECT * FROM labrastro_runtime_tasks
                     WHERE status = 'queued'
                     ORDER BY created_at ASC
                     LIMIT 100
@@ -311,7 +311,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE ez_runtime_tasks
+                        UPDATE labrastro_runtime_tasks
                         SET status='dispatched', worker_id=:worker_id,
                             dispatched_at=COALESCE(dispatched_at, now()),
                             updated_at=now()
@@ -325,7 +325,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO ez_runtime_claims (
+                        INSERT INTO labrastro_runtime_claims (
                             request_id, task_id, worker_id, peer_id, status,
                             lease_sec, lease_deadline, last_heartbeat_at,
                             runtime_snapshot, metadata
@@ -418,7 +418,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_claims
+                    UPDATE labrastro_runtime_claims
                     SET last_heartbeat_at=now(),
                         lease_deadline=now() + (:lease_sec * interval '1 second'),
                         lease_sec=:lease_sec
@@ -432,7 +432,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE ez_runtime_tasks
+                        UPDATE labrastro_runtime_tasks
                         SET status='running',
                             started_at=COALESCE(started_at, now()),
                             updated_at=now()
@@ -474,7 +474,7 @@ class PostgresRuntimeStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT id FROM ez_runtime_tasks
+                    SELECT id FROM labrastro_runtime_tasks
                     WHERE status IN ('dispatched', 'running', 'waiting_approval')
                     FOR UPDATE
                     """
@@ -486,7 +486,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE ez_runtime_tasks
+                        UPDATE labrastro_runtime_tasks
                         SET status='failed', failure_reason='host_restarted',
                             output=COALESCE(output, 'host restarted while task was in flight'),
                             completed_at=now(), updated_at=now()
@@ -498,7 +498,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE ez_runtime_claims
+                        UPDATE labrastro_runtime_claims
                         SET status='released', released_at=now()
                         WHERE task_id=:task_id AND status='active'
                         """
@@ -590,7 +590,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE ez_runtime_tasks
+                        UPDATE labrastro_runtime_tasks
                         SET status='blocked', metadata=CAST(:metadata AS JSONB), updated_at=now()
                         WHERE id=:task_id
                         """
@@ -617,7 +617,7 @@ class PostgresRuntimeStore:
                     conn.execute(
                         text(
                             """
-                            UPDATE ez_runtime_tasks
+                            UPDATE labrastro_runtime_tasks
                             SET status=:status, updated_at=now()
                             WHERE id=:task_id
                             """
@@ -695,7 +695,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_tasks
+                    UPDATE labrastro_runtime_tasks
                     SET status=:status, output=:output,
                         executor_session_id=:executor_session_id,
                         issue_status=:issue_status,
@@ -785,7 +785,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_tasks
+                    UPDATE labrastro_runtime_tasks
                     SET status='failed', output=:error, failure_reason='manual',
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
@@ -811,7 +811,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO ez_runtime_cancel_requests(task_id, reason)
+                        INSERT INTO labrastro_runtime_cancel_requests(task_id, reason)
                         VALUES (:task_id, :reason)
                         ON CONFLICT (task_id) DO UPDATE
                         SET reason=EXCLUDED.reason, requested_at=now(), resolved_at=NULL
@@ -829,7 +829,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_tasks
+                    UPDATE labrastro_runtime_tasks
                     SET status='cancelled', cancel_reason=:reason,
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
@@ -852,7 +852,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_tasks
+                    UPDATE labrastro_runtime_tasks
                     SET branch_name=:branch_name, pr_url=:pr_url, updated_at=now()
                     WHERE id=:task_id
                     """
@@ -878,7 +878,7 @@ class PostgresRuntimeStore:
                 text(
                     """
                     SELECT task_id, seq, type, payload
-                    FROM ez_runtime_events
+                    FROM labrastro_runtime_events
                     WHERE task_id=:task_id AND seq > :after_seq
                     ORDER BY seq ASC
                     """
@@ -898,7 +898,7 @@ class PostgresRuntimeStore:
     def list_artifacts(self, task_id: str) -> list[TaskArtifact]:
         with self.engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT * FROM ez_runtime_artifacts WHERE task_id=:task_id"),
+                text("SELECT * FROM labrastro_runtime_artifacts WHERE task_id=:task_id"),
                 {"task_id": task_id},
             ).mappings()
             return [self._artifact_from_row(row) for row in rows]
@@ -927,7 +927,7 @@ class PostgresRuntimeStore:
             rows = conn.execute(
                 text(
                     f"""
-                    SELECT * FROM ez_runtime_tasks
+                    SELECT * FROM labrastro_runtime_tasks
                     WHERE {' AND '.join(clauses)}
                     ORDER BY created_at DESC
                     LIMIT :limit
@@ -941,7 +941,7 @@ class PostgresRuntimeStore:
         with self.engine.begin() as conn:
             task = self._task_from_row(self._task_row(conn, task_id))
             session = conn.execute(
-                text("SELECT * FROM ez_runtime_sessions WHERE task_id=:task_id"),
+                text("SELECT * FROM labrastro_runtime_sessions WHERE task_id=:task_id"),
                 {"task_id": task_id},
             ).mappings().first()
             claim = conn.execute(
@@ -950,7 +950,7 @@ class PostgresRuntimeStore:
                     SELECT request_id, task_id, worker_id, peer_id, status,
                            lease_sec, lease_deadline, last_heartbeat_at, claimed_at,
                            released_at, metadata
-                    FROM ez_runtime_claims
+                    FROM labrastro_runtime_claims
                     WHERE task_id=:task_id
                     ORDER BY claimed_at DESC
                     LIMIT 1
@@ -997,7 +997,7 @@ class PostgresRuntimeStore:
         seq = conn.execute(
             text(
                 """
-                UPDATE ez_runtime_tasks
+                UPDATE labrastro_runtime_tasks
                 SET next_event_seq=next_event_seq + 1, updated_at=now()
                 WHERE id=:task_id
                 RETURNING next_event_seq - 1 AS seq
@@ -1008,7 +1008,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                INSERT INTO ez_runtime_events(task_id, seq, type, payload)
+                INSERT INTO labrastro_runtime_events(task_id, seq, type, payload)
                 VALUES (:task_id, :seq, :type, CAST(:payload AS JSONB))
                 """
             ),
@@ -1022,7 +1022,7 @@ class PostgresRuntimeStore:
 
     def _task_row(self, conn: Any, task_id: str) -> Any:
         row = conn.execute(
-            text("SELECT * FROM ez_runtime_tasks WHERE id=:task_id"),
+            text("SELECT * FROM labrastro_runtime_tasks WHERE id=:task_id"),
             {"task_id": task_id},
         ).mappings().first()
         if row is None:
@@ -1109,7 +1109,7 @@ class PostgresRuntimeStore:
         count = conn.execute(
             text(
                 """
-                SELECT count(*) FROM ez_runtime_tasks
+                SELECT count(*) FROM labrastro_runtime_tasks
                 WHERE agent_id=:agent_id
                   AND status IN ('dispatched', 'running', 'waiting_approval')
                 """
@@ -1169,7 +1169,7 @@ class PostgresRuntimeStore:
         return conn.execute(
             text(
                 """
-                SELECT * FROM ez_runtime_claims
+                SELECT * FROM labrastro_runtime_claims
                 WHERE request_id=:request_id AND status='active'
                 """
             ),
@@ -1192,7 +1192,7 @@ class PostgresRuntimeStore:
         reason = conn.execute(
             text(
                 """
-                SELECT reason FROM ez_runtime_cancel_requests
+                SELECT reason FROM labrastro_runtime_cancel_requests
                 WHERE task_id=:task_id AND resolved_at IS NULL
                 """
             ),
@@ -1209,7 +1209,7 @@ class PostgresRuntimeStore:
         rows = conn.execute(
             text(
                 f"""
-                SELECT * FROM ez_runtime_claims
+                SELECT * FROM labrastro_runtime_claims
                 WHERE status='active' AND lease_deadline <= {deadline_expr}
                 FOR UPDATE
                 """
@@ -1228,7 +1228,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE ez_runtime_tasks
+                        UPDATE labrastro_runtime_tasks
                         SET status='queued', worker_id=NULL, updated_at=now()
                         WHERE id=:task_id
                         """
@@ -1249,7 +1249,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_claims
+                    UPDATE labrastro_runtime_claims
                     SET status='expired', released_at=now()
                     WHERE request_id=:request_id
                     """
@@ -1269,7 +1269,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                UPDATE ez_runtime_tasks
+                UPDATE labrastro_runtime_tasks
                 SET status=CASE WHEN status='dispatched' THEN 'running' ELSE status END,
                     executor_session_id=COALESCE(:executor_session_id, executor_session_id),
                     workdir=COALESCE(:workdir, workdir),
@@ -1289,7 +1289,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                INSERT INTO ez_runtime_sessions (
+                INSERT INTO labrastro_runtime_sessions (
                     task_id, agent_id, executor, execution_location, issue_id,
                     workdir, branch, executor_session_id, metadata
                 ) VALUES (
@@ -1297,13 +1297,13 @@ class PostgresRuntimeStore:
                     :workdir, :branch, :executor_session_id, CAST(:metadata AS JSONB)
                 )
                 ON CONFLICT (task_id) DO UPDATE SET
-                    workdir=COALESCE(EXCLUDED.workdir, ez_runtime_sessions.workdir),
-                    branch=COALESCE(EXCLUDED.branch, ez_runtime_sessions.branch),
+                    workdir=COALESCE(EXCLUDED.workdir, labrastro_runtime_sessions.workdir),
+                    branch=COALESCE(EXCLUDED.branch, labrastro_runtime_sessions.branch),
                     executor_session_id=COALESCE(
                         EXCLUDED.executor_session_id,
-                        ez_runtime_sessions.executor_session_id
+                        labrastro_runtime_sessions.executor_session_id
                     ),
-                    metadata=ez_runtime_sessions.metadata || EXCLUDED.metadata,
+                    metadata=labrastro_runtime_sessions.metadata || EXCLUDED.metadata,
                     updated_at=now()
                 """
             ),
@@ -1347,7 +1347,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                INSERT INTO ez_runtime_artifacts (
+                INSERT INTO labrastro_runtime_artifacts (
                     id, task_id, type, status, branch_name, pr_url, content,
                     path, metadata, merge_status, merged_by
                 ) VALUES (
@@ -1377,7 +1377,7 @@ class PostgresRuntimeStore:
         if artifact.type == ArtifactType.PULL_REQUEST:
             set_parts.append("issue_status='in_review'")
         conn.execute(
-            text(f"UPDATE ez_runtime_tasks SET {', '.join(set_parts)} WHERE id=:task_id"),
+            text(f"UPDATE labrastro_runtime_tasks SET {', '.join(set_parts)} WHERE id=:task_id"),
             updates,
         )
         self._append_event(conn, task_id, "artifact_attached", {"artifact": _artifact_to_dict(artifact)})
@@ -1387,7 +1387,7 @@ class PostgresRuntimeStore:
         count = conn.execute(
             text(
                 """
-                SELECT count(*) FROM ez_runtime_artifacts
+                SELECT count(*) FROM labrastro_runtime_artifacts
                 WHERE task_id=:task_id AND type='pull_request'
                   AND status NOT IN ('merged', 'closed')
                 """
@@ -1400,7 +1400,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                UPDATE ez_runtime_claims
+                UPDATE labrastro_runtime_claims
                 SET status=:status, released_at=now()
                 WHERE task_id=:task_id AND status='active'
                 """
@@ -1412,7 +1412,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                UPDATE ez_runtime_cancel_requests
+                UPDATE labrastro_runtime_cancel_requests
                 SET resolved_at=now()
                 WHERE task_id=:task_id AND resolved_at IS NULL
                 """

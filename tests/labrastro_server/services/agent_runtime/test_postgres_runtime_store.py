@@ -5,8 +5,8 @@ import os
 
 import pytest
 
-from reuleauxcoder.infrastructure.persistence.db import create_postgres_engine
-from reuleauxcoder.infrastructure.persistence.migration import run_migrations
+from labrastro_server.infrastructure.persistence.db import create_postgres_engine
+from labrastro_server.infrastructure.persistence.migration import run_migrations
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRuntimeControlPlane,
     RuntimeTaskRequest,

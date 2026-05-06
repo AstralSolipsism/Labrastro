@@ -1,11 +1,6 @@
-"""Persistence infrastructure adapters."""
+"""Local persistence helpers for ReuleauxCoder executor state."""
 
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
-from reuleauxcoder.infrastructure.persistence.postgres_session_store import (
-    PostgresSessionStore,
-)
-from reuleauxcoder.infrastructure.persistence.workspace_config_store import (
-    WorkspaceConfigStore,
-)
+from reuleauxcoder.infrastructure.persistence.workspace_config_store import WorkspaceConfigStore
 
-__all__ = ["PostgresSessionStore", "SessionStore", "WorkspaceConfigStore"]
+__all__ = ["SessionStore", "WorkspaceConfigStore"]
