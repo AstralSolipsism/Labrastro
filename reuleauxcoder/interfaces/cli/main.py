@@ -32,7 +32,11 @@ from reuleauxcoder.extensions.provider.manifest import (
     run_provider_record_cli,
     run_provider_test_cli,
 )
-from reuleauxcoder.services.config.loader import ConfigEnvironmentError, ExampleConfigError
+from reuleauxcoder.services.config.loader import (
+    ConfigEnvironmentError,
+    ConfigValidationError,
+    ExampleConfigError,
+)
 
 
 def _run_once(agent, prompt: str):
@@ -89,7 +93,7 @@ def main():
     try:
         runner = AppRunner(options)
         ctx = runner.initialize()
-    except (ConfigEnvironmentError, ExampleConfigError) as e:
+    except (ConfigEnvironmentError, ConfigValidationError, ExampleConfigError) as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 

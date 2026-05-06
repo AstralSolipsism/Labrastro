@@ -474,11 +474,12 @@ def test_switch_session_model_rejects_unknown_or_disabled_provider() -> None:
 class TestRunnerRemoteExec:
     def test_local_mode_no_relay(self, tmp_path: Path) -> None:
         """When remote_exec is disabled, runner starts normally with local backend."""
-        config = Config(remote_exec=RemoteExecConfig(enabled=False))
+        config = Config(api_key="key", remote_exec=RemoteExecConfig(enabled=False))
         runner = AppRunner(
             options=AppOptions(),
             dependencies=AppDependencies(
                 load_config=lambda _: config,
+                create_llm=lambda _: FakeLLM(),
             ),
         )
         ctx = runner.initialize()
@@ -513,6 +514,7 @@ class TestRunnerRemoteExec:
 
     def test_remote_enabled_host_mode_starts_relay(self, tmp_path: Path) -> None:
         config = Config(
+            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -524,6 +526,7 @@ class TestRunnerRemoteExec:
             options=AppOptions(),
             dependencies=AppDependencies(
                 load_config=lambda _: config,
+                create_llm=lambda _: FakeLLM(),
             ),
         )
         ctx = runner.initialize()
@@ -539,6 +542,7 @@ class TestRunnerRemoteExec:
         self, tmp_path: Path
     ) -> None:
         config = Config(
+            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -551,6 +555,7 @@ class TestRunnerRemoteExec:
             options=AppOptions(),
             dependencies=AppDependencies(
                 load_config=lambda _: config,
+                create_llm=lambda _: FakeLLM(),
             ),
         )
         ctx = runner.initialize()
@@ -565,6 +570,7 @@ class TestRunnerRemoteExec:
             raise RuntimeError("boom")
 
         config = Config(
+            api_key="key",
             remote_exec=RemoteExecConfig(enabled=True, host_mode=True),
             auth=_test_auth_config(tmp_path),
         )
@@ -572,6 +578,7 @@ class TestRunnerRemoteExec:
             options=AppOptions(),
             dependencies=AppDependencies(
                 load_config=lambda _: config,
+                create_llm=lambda _: FakeLLM(),
                 create_remote_relay_server=bad_relay_factory,
             ),
         )
@@ -582,6 +589,7 @@ class TestRunnerRemoteExec:
 
     def test_cleanup_runs_relay_cleanup(self, tmp_path: Path) -> None:
         config = Config(
+            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -593,6 +601,7 @@ class TestRunnerRemoteExec:
             options=AppOptions(),
             dependencies=AppDependencies(
                 load_config=lambda _: config,
+                create_llm=lambda _: FakeLLM(),
             ),
         )
         ctx = runner.initialize()
