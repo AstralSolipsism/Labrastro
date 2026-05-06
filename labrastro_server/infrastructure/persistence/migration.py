@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from reuleauxcoder.infrastructure.persistence.db import normalize_database_url
+from labrastro_server.infrastructure.persistence.db import normalize_database_url
 
 
 def migrations_dir() -> Path:

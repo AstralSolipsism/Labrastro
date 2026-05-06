@@ -5,12 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from reuleauxcoder.infrastructure.persistence.db import create_postgres_engine
-from reuleauxcoder.infrastructure.persistence.migration import (
+from labrastro_server.infrastructure.persistence.db import create_postgres_engine
+from labrastro_server.infrastructure.persistence.migration import (
     current_revision,
     run_migrations,
 )
-from reuleauxcoder.infrastructure.persistence.postgres_session_store import (
+from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
@@ -60,7 +60,7 @@ def run_db_cli(args) -> int:
             conn.execute(
                 text(
                     """
-                    DELETE FROM ez_session_snapshots
+                    DELETE FROM labrastro_session_snapshots
                     WHERE created_at < now() - (:days * interval '1 day')
                     """
                 ),
@@ -69,10 +69,10 @@ def run_db_cli(args) -> int:
             conn.execute(
                 text(
                     """
-                    DELETE FROM ez_runtime_events
+                    DELETE FROM labrastro_runtime_events
                     WHERE created_at < now() - (:days * interval '1 day')
                     AND task_id IN (
-                        SELECT id FROM ez_runtime_tasks
+                        SELECT id FROM labrastro_runtime_tasks
                         WHERE status IN ('completed', 'failed', 'cancelled', 'blocked')
                     )
                     """

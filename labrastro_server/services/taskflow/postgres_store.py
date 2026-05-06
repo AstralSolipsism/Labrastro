@@ -65,7 +65,7 @@ class PostgresTaskflowStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_taskflow_goals (
+                    INSERT INTO labrastro_taskflow_goals (
                         id, title, prompt, status, session_id, peer_id, metadata
                     ) VALUES (
                         :id, :title, :prompt, :status, :session_id, :peer_id,
@@ -88,7 +88,7 @@ class PostgresTaskflowStore:
     def get_goal(self, goal_id: str) -> GoalRecord:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_taskflow_goals WHERE id=:goal_id"),
+                text("SELECT * FROM labrastro_taskflow_goals WHERE id=:goal_id"),
                 {"goal_id": goal_id},
             ).mappings().first()
         if row is None:
@@ -100,7 +100,7 @@ class PostgresTaskflowStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_taskflow_goals
+                    UPDATE labrastro_taskflow_goals
                     SET title=:title, prompt=:prompt, status=:status,
                         session_id=:session_id, peer_id=:peer_id,
                         metadata=CAST(:metadata AS JSONB), updated_at=now()
@@ -126,7 +126,7 @@ class PostgresTaskflowStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_taskflow_briefs (
+                    INSERT INTO labrastro_taskflow_briefs (
                         id, goal_id, summary, decision_points, status, version,
                         metadata
                     ) VALUES (
@@ -138,7 +138,7 @@ class PostgresTaskflowStore:
                         summary=EXCLUDED.summary,
                         decision_points=EXCLUDED.decision_points,
                         status=EXCLUDED.status,
-                        version=ez_taskflow_briefs.version + 1,
+                        version=labrastro_taskflow_briefs.version + 1,
                         metadata=EXCLUDED.metadata,
                         updated_at=now()
                     """
@@ -163,7 +163,7 @@ class PostgresTaskflowStore:
     def get_brief(self, goal_id: str) -> PlanBriefRecord | None:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_taskflow_briefs WHERE goal_id=:goal_id"),
+                text("SELECT * FROM labrastro_taskflow_briefs WHERE goal_id=:goal_id"),
                 {"goal_id": goal_id},
             ).mappings().first()
         return PlanBriefRecord.from_dict(_row_dict(row)) if row is not None else None
@@ -173,7 +173,7 @@ class PostgresTaskflowStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_taskflow_issue_drafts (
+                    INSERT INTO labrastro_taskflow_issue_drafts (
                         id, goal_id, title, description, status, metadata
                     ) VALUES (
                         :id, :goal_id, :title, :description, :status,
@@ -195,7 +195,7 @@ class PostgresTaskflowStore:
     def get_issue_draft(self, issue_draft_id: str) -> IssueDraftRecord:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_taskflow_issue_drafts WHERE id=:issue_id"),
+                text("SELECT * FROM labrastro_taskflow_issue_drafts WHERE id=:issue_id"),
                 {"issue_id": issue_draft_id},
             ).mappings().first()
         if row is None:
@@ -207,7 +207,7 @@ class PostgresTaskflowStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_taskflow_issue_drafts
+                    SELECT * FROM labrastro_taskflow_issue_drafts
                     WHERE goal_id=:goal_id
                     ORDER BY created_at ASC
                     """
@@ -221,7 +221,7 @@ class PostgresTaskflowStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_taskflow_task_drafts (
+                    INSERT INTO labrastro_taskflow_task_drafts (
                         id, goal_id, issue_draft_id, title, prompt, status,
                         required_capabilities, preferred_capabilities, task_type,
                         workspace_root, repo_url, execution_location,
@@ -243,7 +243,7 @@ class PostgresTaskflowStore:
     def get_task_draft(self, draft_id: str) -> TaskDraftRecord:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_taskflow_task_drafts WHERE id=:draft_id"),
+                text("SELECT * FROM labrastro_taskflow_task_drafts WHERE id=:draft_id"),
                 {"draft_id": draft_id},
             ).mappings().first()
         if row is None:
@@ -255,7 +255,7 @@ class PostgresTaskflowStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_taskflow_task_drafts
+                    UPDATE labrastro_taskflow_task_drafts
                     SET issue_draft_id=:issue_draft_id, title=:title,
                         prompt=:prompt, status=:status,
                         required_capabilities=CAST(:required_capabilities AS JSONB),
@@ -286,7 +286,7 @@ class PostgresTaskflowStore:
             rows = conn.execute(
                 text(
                     f"""
-                    SELECT * FROM ez_taskflow_task_drafts
+                    SELECT * FROM labrastro_taskflow_task_drafts
                     WHERE {' AND '.join(clauses)}
                     ORDER BY created_at ASC
                     """
@@ -302,7 +302,7 @@ class PostgresTaskflowStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_taskflow_dispatch_decisions (
+                    INSERT INTO labrastro_taskflow_dispatch_decisions (
                         id, task_draft_id, status, selected_agent_id, candidates,
                         filtered, score_summary, manual_override, reason,
                         runtime_task_id, metadata
@@ -337,7 +337,7 @@ class PostgresTaskflowStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_taskflow_dispatch_decisions
+                    SELECT * FROM labrastro_taskflow_dispatch_decisions
                     WHERE task_draft_id=:task_draft_id
                     ORDER BY created_at ASC
                     """
@@ -355,7 +355,7 @@ class PostgresTaskflowStore:
             row = conn.execute(
                 text(
                     """
-                    UPDATE ez_taskflow_goals
+                    UPDATE labrastro_taskflow_goals
                     SET next_event_seq = next_event_seq + 1
                     WHERE id=:goal_id
                     RETURNING next_event_seq - 1 AS seq
@@ -369,7 +369,7 @@ class PostgresTaskflowStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_taskflow_events(goal_id, seq, type, payload)
+                    INSERT INTO labrastro_taskflow_events(goal_id, seq, type, payload)
                     VALUES (:goal_id, :seq, :type, CAST(:payload AS JSONB))
                     """
                 ),
@@ -388,7 +388,7 @@ class PostgresTaskflowStore:
                 text(
                     """
                     SELECT goal_id, seq, type, payload, created_at
-                    FROM ez_taskflow_events
+                    FROM labrastro_taskflow_events
                     WHERE goal_id=:goal_id AND seq > :after_seq
                     ORDER BY seq ASC
                     """

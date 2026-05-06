@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from reuleauxcoder.domain.config.models import Config, PersistenceConfig
-from reuleauxcoder.infrastructure.persistence.db import create_postgres_engine
-from reuleauxcoder.infrastructure.persistence.migration import run_migrations
-from reuleauxcoder.infrastructure.persistence.postgres_session_store import (
+from labrastro_server.infrastructure.persistence.db import create_postgres_engine
+from labrastro_server.infrastructure.persistence.migration import run_migrations
+from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore

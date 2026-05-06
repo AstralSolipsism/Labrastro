@@ -57,7 +57,7 @@ class PostgresIssueAssignmentStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_issues (
+                    INSERT INTO labrastro_issues (
                         id, title, description, status, peer_id, source,
                         taskflow_goal_id, taskflow_issue_draft_id, metadata
                     ) VALUES (
@@ -84,7 +84,7 @@ class PostgresIssueAssignmentStore:
     def get_issue(self, issue_id: str) -> IssueRecord:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_issues WHERE id=:issue_id"),
+                text("SELECT * FROM labrastro_issues WHERE id=:issue_id"),
                 {"issue_id": issue_id},
             ).mappings().first()
         if row is None:
@@ -96,7 +96,7 @@ class PostgresIssueAssignmentStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_issues
+                    UPDATE labrastro_issues
                     SET title=:title, description=:description, status=:status,
                         peer_id=:peer_id, source=:source,
                         taskflow_goal_id=:taskflow_goal_id,
@@ -123,7 +123,7 @@ class PostgresIssueAssignmentStore:
         return self.get_issue(issue.id)
 
     def list_issues(self, peer_id: str | None = None) -> list[IssueRecord]:
-        sql = "SELECT * FROM ez_issues"
+        sql = "SELECT * FROM labrastro_issues"
         params: dict[str, Any] = {}
         if peer_id is not None:
             sql += " WHERE peer_id=:peer_id"
@@ -138,7 +138,7 @@ class PostgresIssueAssignmentStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_assignments (
+                    INSERT INTO labrastro_assignments (
                         id, issue_id, status, target_agent_id, source, reason,
                         task_draft_id, dispatch_decision_id, runtime_task_id,
                         metadata
@@ -156,7 +156,7 @@ class PostgresIssueAssignmentStore:
     def get_assignment(self, assignment_id: str) -> AssignmentRecord:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_assignments WHERE id=:assignment_id"),
+                text("SELECT * FROM labrastro_assignments WHERE id=:assignment_id"),
                 {"assignment_id": assignment_id},
             ).mappings().first()
         if row is None:
@@ -168,7 +168,7 @@ class PostgresIssueAssignmentStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_assignments
+                    UPDATE labrastro_assignments
                     SET status=:status, target_agent_id=:target_agent_id,
                         source=:source, reason=:reason,
                         task_draft_id=:task_draft_id,
@@ -190,7 +190,7 @@ class PostgresIssueAssignmentStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_assignments
+                    SELECT * FROM labrastro_assignments
                     WHERE issue_id=:issue_id
                     ORDER BY created_at ASC
                     """
@@ -204,7 +204,7 @@ class PostgresIssueAssignmentStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_mentions (
+                    INSERT INTO labrastro_mentions (
                         id, raw_text, status, peer_id, issue_id, assignment_id,
                         context_type, context_id, agent_ref, resolved_agent_id,
                         candidates, reason, source, metadata
@@ -223,7 +223,7 @@ class PostgresIssueAssignmentStore:
     def get_mention(self, mention_id: str) -> MentionRecord:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_mentions WHERE id=:mention_id"),
+                text("SELECT * FROM labrastro_mentions WHERE id=:mention_id"),
                 {"mention_id": mention_id},
             ).mappings().first()
         if row is None:
@@ -235,7 +235,7 @@ class PostgresIssueAssignmentStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_mentions
+                    UPDATE labrastro_mentions
                     SET raw_text=:raw_text, status=:status, peer_id=:peer_id,
                         issue_id=:issue_id, assignment_id=:assignment_id,
                         context_type=:context_type, context_id=:context_id,
@@ -265,7 +265,7 @@ class PostgresIssueAssignmentStore:
         if issue_id is not None:
             filters.append("issue_id=:issue_id")
             params["issue_id"] = issue_id
-        sql = "SELECT * FROM ez_mentions"
+        sql = "SELECT * FROM labrastro_mentions"
         if filters:
             sql += " WHERE " + " AND ".join(filters)
         sql += " ORDER BY created_at ASC"
@@ -285,7 +285,7 @@ class PostgresIssueAssignmentStore:
                 text(
                     """
                     SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-                    FROM ez_assignment_events
+                    FROM labrastro_assignment_events
                     WHERE scope=:scope AND scope_id=:scope_id
                     """
                 ),
@@ -294,7 +294,7 @@ class PostgresIssueAssignmentStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_assignment_events (
+                    INSERT INTO labrastro_assignment_events (
                         scope, scope_id, seq, type, payload
                     ) VALUES (
                         :scope, :scope_id, :seq, :type,
@@ -319,7 +319,7 @@ class PostgresIssueAssignmentStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_assignment_events
+                    SELECT * FROM labrastro_assignment_events
                     WHERE scope=:scope AND scope_id=:scope_id AND seq>:after_seq
                     ORDER BY seq ASC
                     """

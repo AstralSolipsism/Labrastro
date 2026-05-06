@@ -1,4 +1,4 @@
-"""Create GitHub pull request lifecycle tables."""
+﻿"""Create GitHub pull request lifecycle tables."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_github_pull_requests (
+        CREATE TABLE IF NOT EXISTS labrastro_github_pull_requests (
             id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL REFERENCES ez_runtime_tasks(id) ON DELETE CASCADE,
-            artifact_id TEXT REFERENCES ez_runtime_artifacts(id) ON DELETE SET NULL,
+            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+            artifact_id TEXT REFERENCES labrastro_runtime_artifacts(id) ON DELETE SET NULL,
             repository TEXT NOT NULL,
             owner TEXT NOT NULL,
             repo TEXT NOT NULL,
@@ -41,12 +41,12 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_github_review_comments (
+        CREATE TABLE IF NOT EXISTS labrastro_github_review_comments (
             id TEXT PRIMARY KEY,
             github_id TEXT NOT NULL UNIQUE,
             pr_record_id TEXT NOT NULL
-                REFERENCES ez_github_pull_requests(id) ON DELETE CASCADE,
-            task_id TEXT NOT NULL REFERENCES ez_runtime_tasks(id) ON DELETE CASCADE,
+                REFERENCES labrastro_github_pull_requests(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
             repository TEXT NOT NULL,
             pr_number INTEGER NOT NULL,
             author TEXT NOT NULL DEFAULT '',
@@ -56,8 +56,8 @@ def upgrade() -> None:
             side TEXT,
             url TEXT NOT NULL DEFAULT '',
             state TEXT NOT NULL DEFAULT 'open',
-            task_draft_id TEXT REFERENCES ez_taskflow_task_drafts(id) ON DELETE SET NULL,
-            assignment_id TEXT REFERENCES ez_assignments(id) ON DELETE SET NULL,
+            task_draft_id TEXT REFERENCES labrastro_taskflow_task_drafts(id) ON DELETE SET NULL,
+            assignment_id TEXT REFERENCES labrastro_assignments(id) ON DELETE SET NULL,
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -66,7 +66,7 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_github_webhook_deliveries (
+        CREATE TABLE IF NOT EXISTS labrastro_github_webhook_deliveries (
             delivery_id TEXT PRIMARY KEY,
             event TEXT NOT NULL DEFAULT '',
             action TEXT NOT NULL DEFAULT '',
@@ -80,31 +80,31 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_github_pull_requests_task
-            ON ez_github_pull_requests(task_id, updated_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_github_pull_requests_task
+            ON labrastro_github_pull_requests(task_id, updated_at DESC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_github_pull_requests_status
-            ON ez_github_pull_requests(status, updated_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_github_pull_requests_status
+            ON labrastro_github_pull_requests(status, updated_at DESC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_github_review_comments_task
-            ON ez_github_review_comments(task_id, created_at ASC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_github_review_comments_task
+            ON labrastro_github_review_comments(task_id, created_at ASC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_github_review_comments_pr
-            ON ez_github_review_comments(pr_record_id, created_at ASC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_github_review_comments_pr
+            ON labrastro_github_review_comments(pr_record_id, created_at ASC)
         """
     )
 
 
 def downgrade() -> None:
-    op.execute("DROP TABLE IF EXISTS ez_github_webhook_deliveries")
-    op.execute("DROP TABLE IF EXISTS ez_github_review_comments")
-    op.execute("DROP TABLE IF EXISTS ez_github_pull_requests")
+    op.execute("DROP TABLE IF EXISTS labrastro_github_webhook_deliveries")
+    op.execute("DROP TABLE IF EXISTS labrastro_github_review_comments")
+    op.execute("DROP TABLE IF EXISTS labrastro_github_pull_requests")

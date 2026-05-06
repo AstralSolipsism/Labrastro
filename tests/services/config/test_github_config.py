@@ -22,18 +22,18 @@ def test_github_config_masks_webhook_secret() -> None:
 
 
 def test_github_env_refs_are_expanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EZ_GITHUB_APP_ID", "123")
-    monkeypatch.setenv("EZ_GITHUB_INSTALLATION_ID", "456")
-    monkeypatch.setenv("EZ_GITHUB_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("LABRASTRO_GITHUB_APP_ID", "123")
+    monkeypatch.setenv("LABRASTRO_GITHUB_INSTALLATION_ID", "456")
+    monkeypatch.setenv("LABRASTRO_GITHUB_WEBHOOK_SECRET", "secret")
 
     expanded = ConfigLoader()._expand_env_refs(
         {
             "github": {
                 "enabled": True,
-                "app_id": "${EZ_GITHUB_APP_ID}",
-                "installation_id": "${EZ_GITHUB_INSTALLATION_ID}",
+                "app_id": "${LABRASTRO_GITHUB_APP_ID}",
+                "installation_id": "${LABRASTRO_GITHUB_INSTALLATION_ID}",
                 "private_key_path": "/run/secrets/github.pem",
-                "webhook_secret": "${EZ_GITHUB_WEBHOOK_SECRET}",
+                "webhook_secret": "${LABRASTRO_GITHUB_WEBHOOK_SECRET}",
             }
         }
     )

@@ -13,7 +13,7 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_auth_users (
+        CREATE TABLE IF NOT EXISTS labrastro_auth_users (
             id TEXT PRIMARY KEY,
             username TEXT NOT NULL,
             password_hash TEXT NOT NULL,
@@ -29,15 +29,15 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_ez_auth_users_username_lower
-            ON ez_auth_users (lower(username))
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_labrastro_auth_users_username_lower
+            ON labrastro_auth_users (lower(username))
         """
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_auth_devices (
+        CREATE TABLE IF NOT EXISTS labrastro_auth_devices (
             id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES ez_auth_users(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES labrastro_auth_users(id) ON DELETE CASCADE,
             label TEXT NOT NULL DEFAULT '',
             created_at DOUBLE PRECISION NOT NULL,
             last_seen_at DOUBLE PRECISION,
@@ -47,16 +47,16 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_auth_devices_user
-            ON ez_auth_devices(user_id, created_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_auth_devices_user
+            ON labrastro_auth_devices(user_id, created_at DESC)
         """
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_auth_refresh_tokens (
+        CREATE TABLE IF NOT EXISTS labrastro_auth_refresh_tokens (
             id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES ez_auth_users(id) ON DELETE CASCADE,
-            device_id TEXT NOT NULL REFERENCES ez_auth_devices(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES labrastro_auth_users(id) ON DELETE CASCADE,
+            device_id TEXT NOT NULL REFERENCES labrastro_auth_devices(id) ON DELETE CASCADE,
             token_hash TEXT NOT NULL UNIQUE,
             expires_at DOUBLE PRECISION NOT NULL,
             created_at DOUBLE PRECISION NOT NULL,
@@ -66,19 +66,19 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_auth_refresh_tokens_user_device
-            ON ez_auth_refresh_tokens(user_id, device_id, created_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_auth_refresh_tokens_user_device
+            ON labrastro_auth_refresh_tokens(user_id, device_id, created_at DESC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_auth_refresh_tokens_revoked
-            ON ez_auth_refresh_tokens(revoked_at)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_auth_refresh_tokens_revoked
+            ON labrastro_auth_refresh_tokens(revoked_at)
         """
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS ez_auth_audit_events (
+        CREATE TABLE IF NOT EXISTS labrastro_auth_audit_events (
             id TEXT PRIMARY KEY,
             type TEXT NOT NULL,
             created_at DOUBLE PRECISION NOT NULL,
@@ -92,26 +92,26 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_auth_audit_events_created
-            ON ez_auth_audit_events(created_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_auth_audit_events_created
+            ON labrastro_auth_audit_events(created_at DESC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_auth_audit_events_user
-            ON ez_auth_audit_events(user_id, created_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_auth_audit_events_user
+            ON labrastro_auth_audit_events(user_id, created_at DESC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_ez_auth_audit_events_type
-            ON ez_auth_audit_events(type, created_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_auth_audit_events_type
+            ON labrastro_auth_audit_events(type, created_at DESC)
         """
     )
 
 
 def downgrade() -> None:
-    op.execute("DROP TABLE IF EXISTS ez_auth_audit_events")
-    op.execute("DROP TABLE IF EXISTS ez_auth_refresh_tokens")
-    op.execute("DROP TABLE IF EXISTS ez_auth_devices")
-    op.execute("DROP TABLE IF EXISTS ez_auth_users")
+    op.execute("DROP TABLE IF EXISTS labrastro_auth_audit_events")
+    op.execute("DROP TABLE IF EXISTS labrastro_auth_refresh_tokens")
+    op.execute("DROP TABLE IF EXISTS labrastro_auth_devices")
+    op.execute("DROP TABLE IF EXISTS labrastro_auth_users")

@@ -52,7 +52,7 @@ class PostgresAuthStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_auth_users
+                    SELECT * FROM labrastro_auth_users
                     WHERE lower(username)=lower(:username)
                     """
                 ),
@@ -63,7 +63,7 @@ class PostgresAuthStore:
     def get_user_by_id(self, user_id: str) -> AuthUser | None:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_auth_users WHERE id=:user_id"),
+                text("SELECT * FROM labrastro_auth_users WHERE id=:user_id"),
                 {"user_id": user_id},
             ).mappings().first()
         return AuthUser.from_dict(_row_dict(row)) if row else None
@@ -71,7 +71,7 @@ class PostgresAuthStore:
     def list_users(self) -> list[AuthUser]:
         with self.engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT * FROM ez_auth_users ORDER BY lower(username) ASC")
+                text("SELECT * FROM labrastro_auth_users ORDER BY lower(username) ASC")
             ).mappings()
             return [AuthUser.from_dict(_row_dict(row)) for row in rows]
 
@@ -83,7 +83,7 @@ class PostgresAuthStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_auth_users (
+                    INSERT INTO labrastro_auth_users (
                         id, username, password_hash, role, scopes, enabled,
                         configured, created_at, updated_at, last_login_at
                     ) VALUES (
@@ -114,7 +114,7 @@ class PostgresAuthStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_auth_devices (
+                    INSERT INTO labrastro_auth_devices (
                         id, user_id, label, created_at, last_seen_at, revoked_at
                     ) VALUES (
                         :id, :user_id, :label, :created_at, :last_seen_at, :revoked_at
@@ -133,14 +133,14 @@ class PostgresAuthStore:
     def get_device(self, device_id: str) -> AuthDevice | None:
         with self.engine.begin() as conn:
             row = conn.execute(
-                text("SELECT * FROM ez_auth_devices WHERE id=:device_id"),
+                text("SELECT * FROM labrastro_auth_devices WHERE id=:device_id"),
                 {"device_id": device_id},
             ).mappings().first()
         return AuthDevice.from_dict(_row_dict(row)) if row else None
 
     def list_devices(self, *, user_id: str | None = None) -> list[AuthDevice]:
         params: dict[str, Any] = {}
-        sql = "SELECT * FROM ez_auth_devices"
+        sql = "SELECT * FROM labrastro_auth_devices"
         if user_id is not None:
             sql += " WHERE user_id=:user_id"
             params["user_id"] = user_id
@@ -157,7 +157,7 @@ class PostgresAuthStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_auth_refresh_tokens (
+                    INSERT INTO labrastro_auth_refresh_tokens (
                         id, user_id, device_id, token_hash, expires_at,
                         created_at, revoked_at
                     ) VALUES (
@@ -180,7 +180,7 @@ class PostgresAuthStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_auth_refresh_tokens
+                    SELECT * FROM labrastro_auth_refresh_tokens
                     WHERE token_hash=:token_hash
                     """
                 ),
@@ -202,7 +202,7 @@ class PostgresAuthStore:
         if device_id is not None:
             filters.append("device_id=:device_id")
             params["device_id"] = device_id
-        sql = "SELECT * FROM ez_auth_refresh_tokens"
+        sql = "SELECT * FROM labrastro_auth_refresh_tokens"
         if filters:
             sql += " WHERE " + " AND ".join(filters)
         sql += " ORDER BY created_at DESC"
@@ -229,7 +229,7 @@ class PostgresAuthStore:
             result = conn.execute(
                 text(
                     """
-                    UPDATE ez_auth_refresh_tokens
+                    UPDATE labrastro_auth_refresh_tokens
                     SET revoked_at=:revoked_at
                     WHERE """ + " AND ".join(filters)
                 ),
@@ -242,7 +242,7 @@ class PostgresAuthStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_auth_audit_events (
+                    INSERT INTO labrastro_auth_audit_events (
                         id, type, created_at, user_id, username, device_id,
                         source_ip, payload
                     ) VALUES (
@@ -282,7 +282,7 @@ class PostgresAuthStore:
         if user_id:
             filters.append("user_id=:user_id")
             params["user_id"] = user_id
-        sql = "SELECT * FROM ez_auth_audit_events"
+        sql = "SELECT * FROM labrastro_auth_audit_events"
         if filters:
             sql += " WHERE " + " AND ".join(filters)
         sql += " ORDER BY created_at DESC LIMIT :limit"

@@ -47,7 +47,7 @@ class PostgresGitHubStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_github_pull_requests (
+                    INSERT INTO labrastro_github_pull_requests (
                         id, task_id, artifact_id, repository, owner, repo, number,
                         node_id, url, api_url, base_ref, head_ref, head_sha,
                         status, review_state, merge_status, draft, metadata,
@@ -60,7 +60,7 @@ class PostgresGitHubStore:
                     )
                     ON CONFLICT (repository, number) DO UPDATE SET
                         task_id=EXCLUDED.task_id,
-                        artifact_id=COALESCE(EXCLUDED.artifact_id, ez_github_pull_requests.artifact_id),
+                        artifact_id=COALESCE(EXCLUDED.artifact_id, labrastro_github_pull_requests.artifact_id),
                         node_id=EXCLUDED.node_id,
                         url=EXCLUDED.url,
                         api_url=EXCLUDED.api_url,
@@ -88,7 +88,7 @@ class PostgresGitHubStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_github_pull_requests
+                    SELECT * FROM labrastro_github_pull_requests
                     WHERE repository=:repository AND number=:number
                     """
                 ),
@@ -103,7 +103,7 @@ class PostgresGitHubStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_github_pull_requests
+                    SELECT * FROM labrastro_github_pull_requests
                     WHERE task_id=:task_id
                     ORDER BY updated_at DESC
                     LIMIT 1
@@ -118,7 +118,7 @@ class PostgresGitHubStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_github_pull_requests
+                    SELECT * FROM labrastro_github_pull_requests
                     WHERE status='open'
                     ORDER BY updated_at DESC
                     """
@@ -169,7 +169,7 @@ class PostgresGitHubStore:
             result = conn.execute(
                 text(
                     """
-                    INSERT INTO ez_github_webhook_deliveries (
+                    INSERT INTO labrastro_github_webhook_deliveries (
                         delivery_id, event, action, payload, status
                     ) VALUES (
                         :delivery_id, :event, :action, CAST(:payload AS JSONB), 'processing'
@@ -193,7 +193,7 @@ class PostgresGitHubStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_github_webhook_deliveries
+                    UPDATE labrastro_github_webhook_deliveries
                     SET status=:status, error=:error, processed_at=now()
                     WHERE delivery_id=:delivery_id
                     """
@@ -208,7 +208,7 @@ class PostgresGitHubStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO ez_github_review_comments (
+                    INSERT INTO labrastro_github_review_comments (
                         id, github_id, pr_record_id, task_id, repository, pr_number,
                         author, body, path, line, side, url, state,
                         task_draft_id, assignment_id, metadata
@@ -225,8 +225,8 @@ class PostgresGitHubStore:
                         side=EXCLUDED.side,
                         url=EXCLUDED.url,
                         state=EXCLUDED.state,
-                        task_draft_id=COALESCE(EXCLUDED.task_draft_id, ez_github_review_comments.task_draft_id),
-                        assignment_id=COALESCE(EXCLUDED.assignment_id, ez_github_review_comments.assignment_id),
+                        task_draft_id=COALESCE(EXCLUDED.task_draft_id, labrastro_github_review_comments.task_draft_id),
+                        assignment_id=COALESCE(EXCLUDED.assignment_id, labrastro_github_review_comments.assignment_id),
                         metadata=EXCLUDED.metadata,
                         updated_at=now()
                     """
@@ -236,7 +236,7 @@ class PostgresGitHubStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_github_review_comments
+                    SELECT * FROM labrastro_github_review_comments
                     WHERE github_id=:github_id
                     """
                 ),
@@ -249,7 +249,7 @@ class PostgresGitHubStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM ez_github_review_comments
+                    SELECT * FROM labrastro_github_review_comments
                     WHERE task_id=:task_id
                     ORDER BY created_at ASC
                     """
@@ -269,7 +269,7 @@ class PostgresGitHubStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_github_review_comments
+                    UPDATE labrastro_github_review_comments
                     SET task_draft_id=:task_draft_id,
                         assignment_id=:assignment_id,
                         updated_at=now()
@@ -299,7 +299,7 @@ class PostgresGitHubStore:
         conn.execute(
             text(
                 """
-                UPDATE ez_runtime_artifacts
+                UPDATE labrastro_runtime_artifacts
                 SET status=:status,
                     merge_status=:merge_status,
                     pr_url=:pr_url,
@@ -319,7 +319,7 @@ class PostgresGitHubStore:
             conn.execute(
                 text(
                     """
-                    UPDATE ez_runtime_tasks
+                    UPDATE labrastro_runtime_tasks
                     SET issue_status='done', updated_at=now()
                     WHERE id=:task_id
                     """

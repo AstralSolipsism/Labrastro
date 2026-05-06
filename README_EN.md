@@ -122,7 +122,7 @@ auth:
 ```
 
 `store_backend: auto` uses Postgres tables
-`ez_auth_users`, `ez_auth_devices`, `ez_auth_refresh_tokens`, and `ez_auth_audit_events`
+`labrastro_auth_users`, `labrastro_auth_devices`, `labrastro_auth_refresh_tokens`, and `labrastro_auth_audit_events`
 when `persistence.database_url` is configured; otherwise it falls back to `.rcoder/auth.json`.
 The first administrator must come from backend config. The frontend does not initialize the system.
 
