@@ -65,9 +65,12 @@ Edit `.env` and set at least:
 RCODER_MODEL=
 RCODER_BASE_URL=
 RCODER_API_KEY=
-RCODER_BOOTSTRAP_ACCESS_SECRET=
-RCODER_ADMIN_ACCESS_SECRET=
+LABRASTRO_AUTH_TOKEN_SECRET=
+LABRASTRO_SUPERADMIN_USERNAME=admin
+LABRASTRO_SUPERADMIN_PASSWORD_HASH=
 ```
+
+Generate the password hash with `rcoder auth hash-password`, then place it in `LABRASTRO_SUPERADMIN_PASSWORD_HASH`.
 
 Start the host:
 
@@ -75,6 +78,16 @@ Start the host:
 docker compose up -d --build
 docker compose logs -f labrastro-host
 ```
+
+### Production Exposure
+
+The expected production shape is to run Labrastro as an HTTP service inside the container and terminate HTTPS at the deployment layer, for example with Nginx, Caddy, Traefik, or Cloudflare:
+
+```text
+https://labrastro.example.com -> Nginx/Caddy -> labrastro-host:8765
+```
+
+This is the intended deployment model. Labrastro owns account authentication, authorization, token lifecycle, and audit behavior. TLS certificates, HSTS, DNS, public ports, firewall rules, IP allowlists, and reverse-proxy logs are deployment-layer responsibilities. Not listening for HTTPS directly inside the application does not make Remote Auth, Remote Relay / Peer, or the Admin control plane incomplete.
 
 For Postgres-backed control-plane state:
 
@@ -85,19 +98,39 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --buil
 
 The config template reads `LABRASTRO_DATABASE_URL` for database connectivity.
 
-## Remote Bootstrap
+## Remote Login
 
-Configure remote relay in `.rcoder/config.yaml` on the host:
+Configure remote relay and account authentication in `.rcoder/config.yaml` on the host:
 
 ```yaml
 remote_exec:
   enabled: true
   host_mode: true
   relay_bind: 127.0.0.1:8765
-  bootstrap_access_secret: <long-random-secret>
-  admin_access_secret: <long-random-secret>
   bootstrap_token_ttl_sec: 120
   peer_token_ttl_sec: 3600
+
+auth:
+  enabled: true
+  token_secret: <long-random-secret>
+  store_backend: auto
+  password_min_length: 10
+  login_rate_limit_count: 5
+  superadmins:
+    - username: admin
+      password_hash: <pbkdf2-password-hash>
+```
+
+`store_backend: auto` uses Postgres tables
+`ez_auth_users`, `ez_auth_devices`, `ez_auth_refresh_tokens`, and `ez_auth_audit_events`
+when `persistence.database_url` is configured; otherwise it falls back to `.rcoder/auth.json`.
+The first administrator must come from backend config. The frontend does not initialize the system.
+
+Generate and verify auth config:
+
+```bash
+uv run rcoder auth hash-password
+uv run rcoder auth verify-config --config .rcoder/config.yaml
 ```
 
 Start host mode:
@@ -106,20 +139,24 @@ Start host mode:
 rcoder --server
 ```
 
-Bootstrap a Linux/macOS peer:
+The VS Code extension connects with Host URL, username, and password. After login, it automatically requests one-time peer bootstrap tokens.
+
+## Agent Runtime / Multi CLI Backend
+
+The multi CLI execution backend runs on the server side or inside managed peer containers. The VS Code extension does not require local Codex, Claude, Gemini, or backend console access. CLI installation, provider login state, MCP credentials, and runtime HOME/config isolation are maintained by the deployment.
+
+When a Go worker registers, it reports executor capability to the Host, including `installed`, `stream_json`, `session_discovery`, `resume_by_id`, `mcp_config`, `runtime_home_isolation`, and `limitations`. `/remote/capabilities` aggregates online peer capabilities for the extension UI. Registration only performs fast installed detection and does not synchronously run external CLI `--version`; actual CLI versions should be recorded during deployment smoke tests and fixture upgrades.
+
+Resume semantics are fixed: follow-up tasks continue the same CLI session only when executor, agent, runtime profile, workdir/branch, and `executor_session_id` all match. Retry defaults to a fresh run, and only explicit `resume_session=true` reuses the original session. Gemini keeps `resume_by_id=false` until a real resume fixture proves stable session extraction, so the UI shows fresh-run behavior.
+
+Deployment smoke:
 
 ```bash
-RC_HOST="https://<HOST>" \
-RC_BOOTSTRAP_SECRET='<your-bootstrap-secret>' \
-sh -c 'curl -fsSL -H "X-RC-Bootstrap-Secret: ${RC_BOOTSTRAP_SECRET}" "${RC_HOST}/remote/bootstrap.sh" | sh'
-```
-
-Bootstrap a Windows PowerShell peer:
-
-```powershell
-$env:RC_HOST = "https://<HOST>"
-$env:RC_BOOTSTRAP_SECRET = "<your-bootstrap-secret>"
-iex (Invoke-WebRequest -UseBasicParsing -Headers @{ "X-RC-Bootstrap-Secret" = $env:RC_BOOTSTRAP_SECRET } "${env:RC_HOST}/remote/bootstrap.ps1").Content
+claude --version
+gemini --version
+codex --version
+uv run pytest tests/labrastro_server/services/agent_runtime tests/labrastro_server/http
+cd reuleauxcoder-agent && go test ./...
 ```
 
 ## Development

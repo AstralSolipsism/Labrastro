@@ -398,7 +398,8 @@ Key sections:
 - **`context`**: optional compression tuning — `snip_keep_recent_tools` (default 5), `snip_threshold_chars` (1500), `snip_min_lines` (6), `summarize_keep_recent_turns` (5).
 - **`session`**: `auto_save` (default true), `dir` (default `.rcoder/sessions`).
 - **`tool_output`**: `max_chars` (default 12000), `max_lines` (120), `store_full_output` (true), `store_dir` (`.rcoder/tool-outputs`).
-- **`remote_exec`**: `enabled`, `host_mode`, `relay_bind`, `bootstrap_access_secret`, `bootstrap_token_ttl_sec`, `peer_token_ttl_sec`, `heartbeat_interval_sec`, `heartbeat_timeout_sec`, `default_tool_timeout_sec`, `shell_timeout_sec`.
+- **`remote_exec`**: `enabled`, `host_mode`, `relay_bind`, `bootstrap_token_ttl_sec`, `peer_token_ttl_sec`, `heartbeat_interval_sec`, `heartbeat_timeout_sec`, `default_tool_timeout_sec`, `shell_timeout_sec`.
+- **`auth`**: `enabled`, `token_secret`, `access_token_ttl_sec`, `refresh_token_ttl_sec`, `password_hash_iterations`, `store_path`, `superadmins`.
 - **`cli`**: `history_file` (default `~/.rcoder/history`).
 
 ## Coding Conventions

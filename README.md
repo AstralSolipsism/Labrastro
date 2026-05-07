@@ -65,9 +65,12 @@ cp .env.example .env
 RCODER_MODEL=
 RCODER_BASE_URL=
 RCODER_API_KEY=
-RCODER_BOOTSTRAP_ACCESS_SECRET=
-RCODER_ADMIN_ACCESS_SECRET=
+LABRASTRO_AUTH_TOKEN_SECRET=
+LABRASTRO_SUPERADMIN_USERNAME=admin
+LABRASTRO_SUPERADMIN_PASSWORD_HASH=
 ```
+
+密码哈希可用 `rcoder auth hash-password` 生成，并写入 `LABRASTRO_SUPERADMIN_PASSWORD_HASH`。
 
 启动 host：
 
@@ -77,6 +80,16 @@ docker compose logs -f labrastro-host
 ```
 
 默认 compose 会把宿主机 `../.rcoder` 挂载到容器 `/app/.rcoder`。生产环境必须确保这个宿主机目录位于持久化磁盘上；也可以在首次启动前把 volume 改成自己的 `/data/labrastro/config` 持久化路径。
+
+### 生产暴露方式
+
+生产环境推荐把 Labrastro 后端作为容器内 HTTP 服务运行，再由 Nginx、Caddy、Traefik 或 Cloudflare 等部署层组件终止 HTTPS 并反向代理到容器端口：
+
+```text
+https://labrastro.example.com -> Nginx/Caddy -> labrastro-host:8765
+```
+
+这是预期部署模型。Labrastro 应用内负责账号认证、权限、token 生命周期和审计；TLS 证书、HSTS、域名、公网端口、防火墙、IP allowlist 和反向代理日志属于部署层治理。未在应用内直接监听 HTTPS 不代表 Remote Auth、Remote Relay / Peer 或 Admin 控制面不完整。
 
 ### Postgres 控制面
 
@@ -89,19 +102,38 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --buil
 
 数据库迁移代码位于 `reuleauxcoder/infrastructure/persistence/migrations`。配置模板中的数据库连接读取 `LABRASTRO_DATABASE_URL`。
 
-## 远端 Bootstrap
+## 远端登录
 
-先在 host 的 `.rcoder/config.yaml` 中配置 remote relay：
+先在 host 的 `.rcoder/config.yaml` 中配置 remote relay 和账号认证：
 
 ```yaml
 remote_exec:
   enabled: true
   host_mode: true
   relay_bind: 127.0.0.1:8765
-  bootstrap_access_secret: <long-random-secret>
-  admin_access_secret: <long-random-secret>
   bootstrap_token_ttl_sec: 120
   peer_token_ttl_sec: 3600
+
+auth:
+  enabled: true
+  token_secret: <long-random-secret>
+  store_backend: auto
+  password_min_length: 10
+  login_rate_limit_count: 5
+  superadmins:
+    - username: admin
+      password_hash: <pbkdf2-password-hash>
+```
+
+`store_backend: auto` 会在 `persistence.database_url` 存在时使用 Postgres 表
+`ez_auth_users`、`ez_auth_devices`、`ez_auth_refresh_tokens`、`ez_auth_audit_events`，
+否则回退到文件存储 `.rcoder/auth.json`。首次管理员只能由后端配置提供；前端不做系统初始化。
+
+生成和校验认证配置：
+
+```bash
+uv run rcoder auth hash-password
+uv run rcoder auth verify-config --config .rcoder/config.yaml
 ```
 
 启动 host：
@@ -110,20 +142,24 @@ remote_exec:
 rcoder --server
 ```
 
-Linux/macOS peer bootstrap：
+VS Code 插件连接时填写 Host URL、用户名和密码。插件登录后会自动申请一次性 peer bootstrap token，不需要用户手动执行 bootstrap 命令。
+
+## Agent Runtime / Multi CLI backend
+
+Agent Runtime 的多 CLI 执行底座运行在后端或受控 peer 容器中。用户插件不需要安装或登录 Codex、Claude、Gemini 等 CLI，也不需要后端控制台权限；CLI 安装、provider 登录态、MCP 凭据和 runtime HOME/config 隔离都由服务端部署维护。
+
+Go worker 注册时会向 Host 上报 executor capability，包括 `installed`、`stream_json`、`session_discovery`、`resume_by_id`、`mcp_config`、`runtime_home_isolation` 和 `limitations`。`/remote/capabilities` 会汇总在线 peer 能力供插件展示。注册热路径只做快速 installed 探测，不同步运行外部 CLI `--version`；CLI 实际版本应在部署 smoke 和 fixture 升级记录中确认。
+
+Resume 语义固定为：follow-up 在同 executor、同 agent、同 runtime profile、同 workdir/branch 且存在 `executor_session_id` 时继续同一 CLI 会话；retry 默认 fresh run，只有显式 `resume_session=true` 才复用原 session。Gemini 在真实 resume fixture 证明前保持 `resume_by_id=false`，前端会明确显示 fresh run 状态。
+
+常用部署 smoke：
 
 ```bash
-RC_HOST="https://<HOST>" \
-RC_BOOTSTRAP_SECRET='<your-bootstrap-secret>' \
-sh -c 'curl -fsSL -H "X-RC-Bootstrap-Secret: ${RC_BOOTSTRAP_SECRET}" "${RC_HOST}/remote/bootstrap.sh" | sh'
-```
-
-Windows PowerShell peer bootstrap：
-
-```powershell
-$env:RC_HOST = "https://<HOST>"
-$env:RC_BOOTSTRAP_SECRET = "<your-bootstrap-secret>"
-iex (Invoke-WebRequest -UseBasicParsing -Headers @{ "X-RC-Bootstrap-Secret" = $env:RC_BOOTSTRAP_SECRET } "${env:RC_HOST}/remote/bootstrap.ps1").Content
+claude --version
+gemini --version
+codex --version
+uv run pytest tests/labrastro_server/services/agent_runtime tests/labrastro_server/http
+cd reuleauxcoder-agent && go test ./...
 ```
 
 ## 本地开发
