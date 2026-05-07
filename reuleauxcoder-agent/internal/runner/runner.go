@@ -93,10 +93,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			"agent_runtime.remote_server",
 		)
 		hostInfo["agent_runtime"] = map[string]any{
-			"executors":           runtimeExecutors(),
-			"execution_locations": runtimeExecutionLocations(),
-			"workspace_root":      workspaceRoot,
-			"runtime_root":        filepath.Join(workspaceRoot, ".rcoder", "agent-runtime"),
+			"executors":             runtimeExecutors(),
+			"execution_locations":   runtimeExecutionLocations(),
+			"workspace_root":        workspaceRoot,
+			"runtime_root":          filepath.Join(workspaceRoot, ".rcoder", "agent-runtime"),
+			"executor_capabilities": runtimeExecutorCapabilities(),
 		}
 	}
 	registerResp, err := r.client.Register(ctx, protocol.RegisterRequest{
@@ -1013,6 +1014,88 @@ func runtimeExecutors() []string {
 
 func runtimeExecutionLocations() []string {
 	return []string{"local_workspace", "daemon_worktree", "remote_server"}
+}
+
+func runtimeExecutorCapabilities() map[string]any {
+	return map[string]any{
+		"fake": map[string]any{
+			"installed":              true,
+			"version":                "builtin",
+			"stream_json":            true,
+			"session_discovery":      false,
+			"resume_by_id":           false,
+			"usage":                  false,
+			"mcp_config":             false,
+			"runtime_home_isolation": "none",
+			"model_arg":              false,
+			"limitations":            []string{"development executor only"},
+		},
+		"reuleauxcoder": commandExecutorCapability("rcoder", map[string]any{
+			"stream_json":            false,
+			"session_discovery":      true,
+			"resume_by_id":           true,
+			"usage":                  false,
+			"mcp_config":             true,
+			"runtime_home_isolation": "shared_or_entrypoint",
+			"model_arg":              true,
+			"limitations":            []string{"plain stdout compatibility backend"},
+		}),
+		"codex": commandExecutorCapability("codex", map[string]any{
+			"stream_json":            true,
+			"session_discovery":      true,
+			"resume_by_id":           true,
+			"usage":                  true,
+			"mcp_config":             false,
+			"runtime_home_isolation": "per_task",
+			"model_arg":              true,
+			"tested_version":         "0.100.0+",
+			"limitations":            []string{"uses app-server jsonrpc_stdio transport"},
+		}),
+		"claude": commandExecutorCapability("claude", map[string]any{
+			"stream_json":            true,
+			"session_discovery":      true,
+			"resume_by_id":           true,
+			"usage":                  true,
+			"mcp_config":             true,
+			"runtime_home_isolation": "per_agent",
+			"model_arg":              true,
+			"tested_version":         "2.0.0+",
+			"limitations":            []string{},
+		}),
+		"gemini": commandExecutorCapability("gemini", map[string]any{
+			"stream_json":            true,
+			"session_discovery":      true,
+			"resume_by_id":           false,
+			"usage":                  true,
+			"mcp_config":             false,
+			"runtime_home_isolation": "per_agent",
+			"model_arg":              true,
+			"limitations":            []string{"resume_by_id disabled until fixture verifies stable session id"},
+		}),
+	}
+}
+
+func commandExecutorCapability(command string, values map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		out[key] = value
+	}
+	_, err := exec.LookPath(command)
+	out["installed"] = err == nil
+	if err != nil {
+		out["version"] = ""
+		out["limitations"] = appendStringList(out["limitations"], "executable not found on PATH")
+		return out
+	}
+	return out
+}
+
+func appendStringList(value any, item string) []string {
+	out := []string{}
+	if values, ok := value.([]string); ok {
+		out = append(out, values...)
+	}
+	return append(out, item)
 }
 
 func runtimeWorkspaceID(workspaceRoot string) string {
