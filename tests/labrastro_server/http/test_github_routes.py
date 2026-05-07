@@ -9,8 +9,11 @@ from urllib import request
 from urllib.error import HTTPError
 
 from reuleauxcoder.domain.config.models import GitHubConfig
-from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
+from labrastro_server.interfaces.http.remote.service import (
+    RemoteRelayHTTPService as _RemoteRelayHTTPService,
+)
 from labrastro_server.relay.server import RelayServer
+from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRuntimeControlPlane,
     RuntimeTaskRequest,
@@ -20,6 +23,33 @@ from labrastro_server.services.github.service import PullRequestService
 
 
 _URLOPEN = request.build_opener(request.ProxyHandler({})).open
+
+TEST_ADMIN_TOKEN = "test-admin-token"
+TEST_ADMIN_HEADERS = {"Authorization": f"Bearer {TEST_ADMIN_TOKEN}"}
+
+
+class _TestAuthService:
+    def state(self) -> dict:
+        return {"ok": True, "auth_enabled": True, "login_required": True}
+
+    def authenticate_access_token(self, token: str):
+        if token == TEST_ADMIN_TOKEN:
+            return AuthPrincipal("usr_test", "admin", "superadmin", "dev_test")
+        return None
+
+    def me(self, principal):
+        return {"ok": True, "user": principal.public_user(), "device": None}
+
+    def bootstrap_token(self, principal, ttl_sec: int):
+        return {"ok": True, "bootstrap_token": self._issue_bootstrap_token(ttl_sec)}
+
+
+def RemoteRelayHTTPService(*args, **kwargs):  # noqa: N802
+    service = _TestAuthService()
+    auth_service = kwargs.pop("auth_service", service)
+    instance = _RemoteRelayHTTPService(*args, auth_service=auth_service, **kwargs)
+    service._issue_bootstrap_token = instance.issue_bootstrap_token
+    return instance
 
 
 class FakeGitHubClient:
@@ -73,7 +103,6 @@ def test_github_webhook_rejects_bad_signature() -> None:
     service = RemoteRelayHTTPService(
         relay_server=relay,
         bind=f"127.0.0.1:{port}",
-        admin_access_secret="admin-secret",
         runtime_control_plane=runtime,
         github_pr_service=pr_service,
     )
@@ -101,7 +130,7 @@ def test_github_webhook_rejects_bad_signature() -> None:
         status, payload = _json_request(
             "GET",
             f"{service.base_url}/remote/admin/github/status",
-            headers={"X-RC-Admin-Secret": "admin-secret"},
+            headers=TEST_ADMIN_HEADERS,
         )
         assert status == 200
         assert payload["ok"] is True

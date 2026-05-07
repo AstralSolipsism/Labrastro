@@ -25,6 +25,7 @@ from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from reuleauxcoder.interfaces.interactions import UIInteractor
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 from labrastro_server.infrastructure.persistence.factory import (
+    create_auth_store,
     create_github_pull_request_service,
     create_issue_assignment_service,
     create_runtime_control_plane,
@@ -33,6 +34,7 @@ from labrastro_server.infrastructure.persistence.factory import (
 )
 from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
+from labrastro_server.services.auth.service import AuthService, validate_auth_config
 from reuleauxcoder.services.llm.client import LLM
 from reuleauxcoder.services.llm.factory import build_llm_from_settings
 
@@ -206,13 +208,23 @@ def _default_create_remote_http_service(
         runtime_control_plane=runtime_control_plane,
         issue_assignment_service=issue_assignment_service,
     )
+    auth_errors = []
+    if not config.auth.enabled:
+        auth_errors.append("auth.enabled is required for remote host mode")
+    auth_errors.extend(validate_auth_config(config.auth))
+    if auth_errors:
+        raise ValueError("; ".join(auth_errors))
+    auth_service = AuthService(
+        config.auth,
+        create_auth_store(config),
+        issue_bootstrap_token=lambda ttl: relay_server.issue_bootstrap_token(ttl_sec=ttl),
+    )
     return RemoteRelayHTTPService(
         relay_server=relay_server,
         bind=config.remote_exec.relay_bind,
         ui_bus=ui_bus,
         artifact_provider=_default_create_remote_artifact_provider(ui_bus),
-        bootstrap_access_secret=config.remote_exec.bootstrap_access_secret,
-        admin_access_secret=config.remote_exec.admin_access_secret,
+        auth_service=auth_service,
         bootstrap_token_ttl_sec=config.remote_exec.bootstrap_token_ttl_sec,
         mcp_servers=config.mcp_servers,
         mcp_artifact_root=config.mcp_artifact_root,

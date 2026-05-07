@@ -36,6 +36,17 @@ def parse_args():
     )
     cleanup.add_argument("--retention-days", type=int, required=True)
 
+    auth_parser = subparsers.add_parser("auth", help="Authentication helpers")
+    auth_subparsers = auth_parser.add_subparsers(dest="auth_command")
+    hash_password = auth_subparsers.add_parser(
+        "hash-password", help="Generate a password hash for a configured superadmin"
+    )
+    hash_password.add_argument("--password")
+    hash_password.add_argument("--iterations", type=int, default=260_000)
+    auth_subparsers.add_parser(
+        "verify-config", help="Validate remote auth configuration readiness"
+    )
+
     env_parser = subparsers.add_parser(
         "env", help="Record lightweight CLI environment manifest entries"
     )

@@ -545,14 +545,107 @@ class RemoteExecConfig:
     enabled: bool = False
     host_mode: bool = False
     relay_bind: str = "127.0.0.1:8765"
-    bootstrap_access_secret: str = ""
-    admin_access_secret: str = ""
     bootstrap_token_ttl_sec: int = 300
     peer_token_ttl_sec: int = 3600
     heartbeat_interval_sec: int = 10
     heartbeat_timeout_sec: int = 30
     default_tool_timeout_sec: int = 30
     shell_timeout_sec: int = 120
+
+
+@dataclass
+class AuthSuperadminConfig:
+    """Configured superadmin account."""
+
+    username: str = ""
+    password_hash: str = ""
+    role: str = "superadmin"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AuthSuperadminConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            username=str(data.get("username", "") or ""),
+            password_hash=str(data.get("password_hash", "") or ""),
+            role=str(data.get("role", "superadmin") or "superadmin"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "username": self.username,
+            "password_hash": self.password_hash,
+            "role": self.role,
+        }
+
+
+@dataclass
+class AuthConfig:
+    """Remote host user authentication settings."""
+
+    enabled: bool = False
+    token_secret: str = ""
+    access_token_ttl_sec: int = 900
+    refresh_token_ttl_sec: int = 2_592_000
+    password_hash_iterations: int = 260_000
+    password_min_length: int = 10
+    password_max_length: int = 256
+    login_rate_limit_count: int = 5
+    login_rate_limit_window_sec: int = 900
+    store_backend: str = "auto"
+    store_path: str = ".rcoder/auth.json"
+    superadmins: list[AuthSuperadminConfig] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AuthConfig":
+        if not isinstance(data, dict):
+            return cls()
+        raw_superadmins = data.get("superadmins", [])
+        superadmins = (
+            [
+                AuthSuperadminConfig.from_dict(item)
+                for item in raw_superadmins
+                if isinstance(item, dict)
+            ]
+            if isinstance(raw_superadmins, list)
+            else []
+        )
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            token_secret=str(data.get("token_secret", "") or ""),
+            access_token_ttl_sec=int(data.get("access_token_ttl_sec", 900) or 900),
+            refresh_token_ttl_sec=int(
+                data.get("refresh_token_ttl_sec", 2_592_000) or 2_592_000
+            ),
+            password_hash_iterations=int(
+                data.get("password_hash_iterations", 260_000) or 260_000
+            ),
+            password_min_length=int(data.get("password_min_length", 10) or 10),
+            password_max_length=int(data.get("password_max_length", 256) or 256),
+            login_rate_limit_count=int(data.get("login_rate_limit_count", 5) or 5),
+            login_rate_limit_window_sec=int(
+                data.get("login_rate_limit_window_sec", 900) or 900
+            ),
+            store_backend=str(data.get("store_backend", "auto") or "auto"),
+            store_path=str(data.get("store_path", ".rcoder/auth.json") or ".rcoder/auth.json"),
+            superadmins=superadmins,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "token_secret": self.token_secret,
+            "access_token_ttl_sec": self.access_token_ttl_sec,
+            "refresh_token_ttl_sec": self.refresh_token_ttl_sec,
+            "password_hash_iterations": self.password_hash_iterations,
+            "password_min_length": self.password_min_length,
+            "password_max_length": self.password_max_length,
+            "login_rate_limit_count": self.login_rate_limit_count,
+            "login_rate_limit_window_sec": self.login_rate_limit_window_sec,
+            "store_backend": self.store_backend,
+            "store_path": self.store_path,
+            "superadmins": [item.to_dict() for item in self.superadmins],
+        }
 
 
 @dataclass
@@ -1012,6 +1105,9 @@ class Config:
     # Remote execution settings
     remote_exec: RemoteExecConfig = field(default_factory=RemoteExecConfig)
 
+    # Remote host authentication settings
+    auth: AuthConfig = field(default_factory=AuthConfig)
+
     # Server Agent runtime settings
     agent_runtime: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
 
@@ -1044,6 +1140,37 @@ class Config:
             errors.append("agent_runtime.max_running_agents must be positive")
         if self.agent_runtime.max_shells_per_agent < 1:
             errors.append("agent_runtime.max_shells_per_agent must be positive")
+        if self.remote_exec.enabled and self.remote_exec.host_mode:
+            if not self.auth.enabled:
+                errors.append("auth.enabled is required for remote host mode")
+            if not self.auth.superadmins:
+                errors.append("auth.superadmins is required for remote host mode")
+        if self.auth.enabled:
+            if not self.auth.token_secret:
+                errors.append("auth.token_secret is required when auth.enabled is true")
+            if self.auth.access_token_ttl_sec < 1:
+                errors.append("auth.access_token_ttl_sec must be positive")
+            if self.auth.refresh_token_ttl_sec < 1:
+                errors.append("auth.refresh_token_ttl_sec must be positive")
+            if self.auth.password_hash_iterations < 1:
+                errors.append("auth.password_hash_iterations must be positive")
+            if self.auth.password_min_length < 1:
+                errors.append("auth.password_min_length must be positive")
+            if self.auth.password_max_length < self.auth.password_min_length:
+                errors.append("auth.password_max_length must be >= auth.password_min_length")
+            if self.auth.login_rate_limit_count < 1:
+                errors.append("auth.login_rate_limit_count must be positive")
+            if self.auth.login_rate_limit_window_sec < 1:
+                errors.append("auth.login_rate_limit_window_sec must be positive")
+            if self.auth.store_backend not in {"auto", "file", "postgres"}:
+                errors.append("auth.store_backend must be one of auto, file, postgres")
+            for superadmin in self.auth.superadmins:
+                if not superadmin.username.strip():
+                    errors.append("auth.superadmins.username is required")
+                if not superadmin.password_hash.strip():
+                    errors.append("auth.superadmins.password_hash is required")
+                if superadmin.role != "superadmin":
+                    errors.append("auth.superadmins entries must use role superadmin")
         valid_persistence_backends = {"auto", "memory", "postgres"}
         if self.persistence.backend not in valid_persistence_backends:
             errors.append("persistence.backend must be one of auto, memory, postgres")

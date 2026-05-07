@@ -366,4 +366,4 @@ def test_remote_exec_config_defaults() -> None:
     assert config.remote_exec.enabled is False
     assert config.remote_exec.host_mode is False
     assert config.remote_exec.relay_bind == "127.0.0.1:8765"
-    assert config.remote_exec.admin_access_secret == ""
+    assert config.auth.enabled is False

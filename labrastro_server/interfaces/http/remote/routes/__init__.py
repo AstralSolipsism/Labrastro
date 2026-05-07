@@ -2,6 +2,7 @@
 
 from labrastro_server.interfaces.http.remote.routes.admin import RemoteAdminRoutes
 from labrastro_server.interfaces.http.remote.routes.artifacts import RemoteArtifactRoutes
+from labrastro_server.interfaces.http.remote.routes.auth import RemoteAuthRoutes
 from labrastro_server.interfaces.http.remote.routes.base import RemoteRelayBaseHandler
 from labrastro_server.interfaces.http.remote.routes.chat import RemoteChatRoutes
 from labrastro_server.interfaces.http.remote.routes.collaboration import RemoteCollaborationRoutes
@@ -14,6 +15,7 @@ from labrastro_server.interfaces.http.remote.routes.taskflow import RemoteTaskfl
 __all__ = [
     "RemoteAdminRoutes",
     "RemoteArtifactRoutes",
+    "RemoteAuthRoutes",
     "RemoteChatRoutes",
     "RemoteCollaborationRoutes",
     "RemoteManifestRoutes",

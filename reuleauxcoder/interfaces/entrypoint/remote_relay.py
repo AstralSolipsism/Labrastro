@@ -93,6 +93,8 @@ def init_remote_relay(runner, config: Config, ui_bus: UIEventBus) -> None:
     except Exception as exc:
         relay.stop()
         runner._relay_server = None
+        if config.remote_exec.enabled and config.remote_exec.host_mode:
+            raise
         ui_bus.warning(
             f"Remote relay HTTP service initialization failed: {exc}",
             kind=UIEventKind.REMOTE,
@@ -400,12 +402,6 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         )
         runner._relay_http_service.environment_skills = dict(
             next_config.environment.skills
-        )
-        runner._relay_http_service.bootstrap_access_secret = (
-            next_config.remote_exec.bootstrap_access_secret
-        )
-        runner._relay_http_service.admin_access_secret = (
-            next_config.remote_exec.admin_access_secret
         )
         if ui_bus is not None:
             ui_bus.info("Remote admin config reloaded.", kind=UIEventKind.REMOTE)

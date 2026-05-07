@@ -105,13 +105,25 @@ approval:
 #   enabled: true
 #   host_mode: true
 #   relay_bind: "127.0.0.1:8765"
-#   bootstrap_access_secret: "replace-with-a-long-random-secret"
 #   bootstrap_token_ttl_sec: 120
 #   peer_token_ttl_sec: 3600
 #   heartbeat_interval_sec: 10
 #   heartbeat_timeout_sec: 30
 #   default_tool_timeout_sec: 30
 #   shell_timeout_sec: 120
+#
+# auth:
+#   enabled: true
+#   token_secret: "replace-with-a-long-random-secret"
+#   store_backend: auto  # auto uses Postgres when persistence.database_url exists, otherwise file
+#   store_path: ".rcoder/auth.json"
+#   password_min_length: 10
+#   password_max_length: 256
+#   login_rate_limit_count: 5
+#   login_rate_limit_window_sec: 900
+#   superadmins:
+#     - username: "admin"
+#       password_hash: "pbkdf2_sha256$260000$generated-salt$generated-hash"
 #
 # cli:
 #   # history_file: "~/.rcoder/history"

@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import gzip
 import json
-import secrets
 import time
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
-from labrastro_server.interfaces.http.remote.bootstrap import (
-    generate_bootstrap_script,
-    generate_powershell_bootstrap_script,
-)
 from labrastro_server.interfaces.http.remote.helpers import (
     GZIP_MIN_BYTES,
     optional_payload_str,
@@ -63,23 +58,11 @@ from labrastro_server.services.environment_run import (
 from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemoteAdminRoutes:
-    def _verify_admin_secret(self) -> bool:
-        configured_secret = self.service.admin_access_secret
-        presented_secret = self.headers.get("X-RC-Admin-Secret", "")
-        return bool(configured_secret) and secrets.compare_digest(
-            presented_secret, configured_secret
-        )
-
     def _handle_admin(self, path: str) -> None:
-        if not self.service.admin_access_secret:
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": "admin_disabled"})
-            return
-        if not self._verify_admin_secret():
-            self._send_json(
-                HTTPStatus.FORBIDDEN, {"error": "invalid_admin_secret"}
-            )
-            return
         payload = self._read_json()
+        principal = self._require_auth_scopes({self._admin_scope_for_path(path)})
+        if principal is None:
+            return
         try:
             if path.startswith("/remote/admin/github/"):
                 if self._handle_admin_github(path, payload):
@@ -419,4 +402,20 @@ class RemoteAdminRoutes:
             return
         self._send_json(result.status, result.payload)
 
-
+    def _admin_scope_for_path(self, path: str) -> str:
+        read_paths = {
+            "/remote/admin/status",
+            "/remote/admin/github/status",
+            "/remote/admin/runtime/events",
+            "/remote/admin/runtime/tasks/list",
+            "/remote/admin/runtime/tasks/load",
+            "/remote/admin/server-settings/read",
+            "/remote/admin/providers/list",
+            "/remote/admin/providers/models",
+            "/remote/admin/models/list",
+            "/remote/admin/toolchains/list",
+            "/remote/admin/toolchains/dashboard",
+        }
+        if path in read_paths:
+            return "admin:read"
+        return "admin:write"

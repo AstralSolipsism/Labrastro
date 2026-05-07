@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -17,6 +18,8 @@ _URLOPEN = request.build_opener(request.ProxyHandler({})).open
 from reuleauxcoder.domain.agent.events import AgentEvent
 from reuleauxcoder.domain.config.models import (
     AgentRuntimeConfig,
+    AuthConfig,
+    AuthSuperadminConfig,
     Config,
     ContextConfig,
     MCPServerConfig,
@@ -26,7 +29,11 @@ from reuleauxcoder.domain.config.models import (
     ProvidersConfig,
     RemoteExecConfig,
 )
+from labrastro_server.services.auth.crypto import hash_password
 from reuleauxcoder.domain.session.models import Session, SessionRuntimeState
+
+TEST_AUTH_PASSWORD = "admin-password"
+TEST_AUTH_PASSWORD_HASH = hash_password(TEST_AUTH_PASSWORD, iterations=1000)
 from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
@@ -70,6 +77,36 @@ def _json_request(
     with _URLOPEN(req, timeout=5) as resp:
         body = resp.read().decode("utf-8")
         return resp.status, json.loads(body) if body else {}
+
+
+def _test_auth_config(store_dir: Path | None = None) -> AuthConfig:
+    if store_dir is None:
+        store_dir = Path(tempfile.mkdtemp(prefix="labrastro-auth-"))
+    return AuthConfig(
+        enabled=True,
+        token_secret="test-token-secret",
+        password_hash_iterations=1000,
+        store_path=str(store_dir / "auth.json"),
+        superadmins=[
+            AuthSuperadminConfig(
+                username="admin",
+                password_hash=TEST_AUTH_PASSWORD_HASH,
+            )
+        ],
+    )
+
+
+def _login_admin(base_url: str) -> str:
+    _, body = _json_request(
+        "POST",
+        f"{base_url}/remote/auth/login",
+        {
+            "username": "admin",
+            "password": TEST_AUTH_PASSWORD,
+            "device_label": "pytest",
+        },
+    )
+    return str(body["access_token"])
 
 
 class FakeLLM:
@@ -254,6 +291,7 @@ def _build_runner_with_fake_agent(
         remote_exec=RemoteExecConfig(
             enabled=True, host_mode=True, relay_bind=relay_bind
         ),
+        auth=_test_auth_config(),
         modes={
             "coder": ModeConfig(name="coder", description="Default coding mode"),
             "debugger": ModeConfig(name="debugger", description="Debug mode"),
@@ -479,7 +517,8 @@ class TestRunnerRemoteExec:
                 enabled=True,
                 host_mode=True,
                 relay_bind=f"127.0.0.1:{_free_port()}",
-            )
+            ),
+            auth=_test_auth_config(tmp_path),
         )
         runner = AppRunner(
             options=AppOptions(),
@@ -505,7 +544,8 @@ class TestRunnerRemoteExec:
                 host_mode=True,
                 relay_bind=f"127.0.0.1:{_free_port()}",
                 peer_token_ttl_sec=123,
-            )
+            ),
+            auth=_test_auth_config(tmp_path),
         )
         runner = AppRunner(
             options=AppOptions(),
@@ -524,7 +564,10 @@ class TestRunnerRemoteExec:
         def bad_relay_factory(_config: Config) -> RelayServer:
             raise RuntimeError("boom")
 
-        config = Config(remote_exec=RemoteExecConfig(enabled=True, host_mode=True))
+        config = Config(
+            remote_exec=RemoteExecConfig(enabled=True, host_mode=True),
+            auth=_test_auth_config(tmp_path),
+        )
         runner = AppRunner(
             options=AppOptions(),
             dependencies=AppDependencies(
@@ -543,7 +586,8 @@ class TestRunnerRemoteExec:
                 enabled=True,
                 host_mode=True,
                 relay_bind=f"127.0.0.1:{_free_port()}",
-            )
+            ),
+            auth=_test_auth_config(tmp_path),
         )
         runner = AppRunner(
             options=AppOptions(),
@@ -606,17 +650,16 @@ class TestRunnerRemoteExec:
         assert agent.mcp_manager == "manager"
         assert started == ["server-only", "shared"]
 
-    def test_server_mode_smoke_bootstrap_endpoint(self, tmp_path: Path) -> None:
+    def test_server_mode_smoke_auth_bootstrap_token(self, tmp_path: Path) -> None:
         relay_bind = "127.0.0.1:18765"
-        bootstrap_secret = "runner-secret"
         config = Config(
             api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
                 relay_bind=relay_bind,
-                bootstrap_access_secret=bootstrap_secret,
             ),
+            auth=_test_auth_config(tmp_path),
         )
         runner = AppRunner(
             options=AppOptions(server_mode=True),
@@ -630,21 +673,16 @@ class TestRunnerRemoteExec:
             assert runner._relay_http_service is not None
             assert isinstance(runner._relay_http_service, RemoteRelayHTTPService)
 
-            req = request.Request(
-                f"http://{relay_bind}/remote/bootstrap.sh",
-                headers={"X-RC-Bootstrap-Secret": bootstrap_secret},
-                method="GET",
+            access_token = _login_admin(f"http://{relay_bind}")
+            status, body = _json_request(
+                "POST",
+                f"http://{relay_bind}/remote/auth/bootstrap-token",
+                {},
+                headers={"Authorization": f"Bearer {access_token}"},
             )
-            with _URLOPEN(req, timeout=5) as resp:
-                body = resp.read().decode("utf-8")
-                content_type = resp.headers.get_content_type()
 
-            assert resp.status == 200
-            assert content_type in {"text/x-shellscript", "text/plain"}
-            assert "#!/bin/sh" in body
-            assert "RC_HOST" in body
-            assert "rcoder-peer" in body
-            assert "/remote/artifacts/{os}/{arch}/rcoder-peer" in body
+            assert status == 200
+            assert body["bootstrap_token"].startswith("bt_")
         finally:
             runner.cleanup(ctx.agent)
 
@@ -662,8 +700,8 @@ class TestRunnerRemoteExec:
                     "enabled": True,
                     "host_mode": True,
                     "relay_bind": relay_bind,
-                    "admin_access_secret": "admin-secret",
                 },
+                "auth": _test_auth_config(tmp_path).to_dict(),
                 "agent_runtime": {
                     "max_running_agents": 1,
                     "max_shells_per_agent": 1,
@@ -681,10 +719,8 @@ class TestRunnerRemoteExec:
                     enabled=bool(remote_exec.get("enabled", True)),
                     host_mode=bool(remote_exec.get("host_mode", True)),
                     relay_bind=str(remote_exec.get("relay_bind", relay_bind)),
-                    admin_access_secret=str(
-                        remote_exec.get("admin_access_secret", "admin-secret")
-                    ),
                 ),
+                auth=AuthConfig.from_dict(data.get("auth", {})),
                 agent_runtime=AgentRuntimeConfig.from_dict(
                     data.get("agent_runtime", {})
                 ),
@@ -713,6 +749,7 @@ class TestRunnerRemoteExec:
             control = runner._relay_http_service.runtime_control_plane
             assert control is not None
 
+            access_token = _login_admin(runner._relay_http_service.base_url)
             _, body = _json_request(
                 "POST",
                 f"{runner._relay_http_service.base_url}/remote/admin/server-settings/update",
@@ -733,7 +770,7 @@ class TestRunnerRemoteExec:
                         },
                     }
                 },
-                headers={"X-RC-Admin-Secret": "admin-secret"},
+                headers={"Authorization": f"Bearer {access_token}"},
             )
 
             assert body["ok"] is True

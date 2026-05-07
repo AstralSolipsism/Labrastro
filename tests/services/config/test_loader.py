@@ -270,8 +270,6 @@ def test_parse_config_reads_remote_exec_settings() -> None:
                 "enabled": True,
                 "host_mode": True,
                 "relay_bind": "0.0.0.0:9999",
-                "bootstrap_access_secret": "top-secret",
-                "admin_access_secret": "admin-secret",
                 "bootstrap_token_ttl_sec": 111,
                 "peer_token_ttl_sec": 222,
                 "heartbeat_interval_sec": 7,
@@ -279,20 +277,41 @@ def test_parse_config_reads_remote_exec_settings() -> None:
                 "default_tool_timeout_sec": 44,
                 "shell_timeout_sec": 155,
             },
+            "auth": {
+                "enabled": True,
+                "token_secret": "token-secret",
+                "store_backend": "postgres",
+                "password_min_length": 12,
+                "password_max_length": 128,
+                "login_rate_limit_count": 3,
+                "login_rate_limit_window_sec": 600,
+                "superadmins": [
+                    {
+                        "username": "admin",
+                        "password_hash": "pbkdf2_sha256$260000$salt$hash",
+                    }
+                ],
+            },
         }
     )
 
     assert config.remote_exec.enabled is True
     assert config.remote_exec.host_mode is True
     assert config.remote_exec.relay_bind == "0.0.0.0:9999"
-    assert config.remote_exec.bootstrap_access_secret == "top-secret"
-    assert config.remote_exec.admin_access_secret == "admin-secret"
     assert config.remote_exec.bootstrap_token_ttl_sec == 111
     assert config.remote_exec.peer_token_ttl_sec == 222
     assert config.remote_exec.heartbeat_interval_sec == 7
     assert config.remote_exec.heartbeat_timeout_sec == 21
     assert config.remote_exec.default_tool_timeout_sec == 44
     assert config.remote_exec.shell_timeout_sec == 155
+    assert config.auth.enabled is True
+    assert config.auth.token_secret == "token-secret"
+    assert config.auth.store_backend == "postgres"
+    assert config.auth.password_min_length == 12
+    assert config.auth.password_max_length == 128
+    assert config.auth.login_rate_limit_count == 3
+    assert config.auth.login_rate_limit_window_sec == 600
+    assert config.auth.superadmins[0].username == "admin"
 
 
 def test_parse_config_reads_peer_mcp_artifacts() -> None:

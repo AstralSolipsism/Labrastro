@@ -14,6 +14,8 @@ from reuleauxcoder.infrastructure.persistence.postgres_session_store import (
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
 from labrastro_server.services.agent_runtime.postgres_store import PostgresRuntimeStore
+from labrastro_server.services.auth.file_store import FileAuthStore
+from labrastro_server.services.auth.postgres_store import PostgresAuthStore
 from labrastro_server.services.collaboration.in_memory_store import (
     InMemoryIssueAssignmentStore,
 )
@@ -108,6 +110,22 @@ def create_github_pull_request_service(
         runtime_control_plane=runtime_control_plane,
         issue_assignment_service=issue_assignment_service,
     )
+
+
+def create_auth_store(config: Config) -> Any:
+    backend = str(config.auth.store_backend or "auto")
+    use_postgres = backend == "postgres" or (
+        backend == "auto" and should_use_postgres(config.persistence)
+    )
+    if use_postgres:
+        engine = _engine_for(config)
+        if engine is None:
+            raise RuntimeError("auth.store_backend=postgres requires Postgres persistence")
+        return PostgresAuthStore(engine)
+    store_path = Path(config.auth.store_path).expanduser()
+    if not store_path.is_absolute():
+        store_path = Path.cwd() / store_path
+    return FileAuthStore(store_path)
 
 
 def create_session_store(config: Config, sessions_dir: Path | None) -> Any:

@@ -24,7 +24,10 @@ _URLOPEN = request.build_opener(request.ProxyHandler({})).open
 
 _GO_AVAILABLE = shutil.which("go") is not None
 
-from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
+from labrastro_server.interfaces.http.remote.service import (
+    RemoteRelayHTTPService as _RemoteRelayHTTPService,
+)
+from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
 from reuleauxcoder.domain.config.models import (
     EnvironmentCLIToolConfig,
@@ -61,6 +64,47 @@ from reuleauxcoder.interfaces.entrypoint.runner import (
     _default_create_remote_artifact_provider,
 )
 from reuleauxcoder.interfaces.events import UIEventBus
+
+
+TEST_ADMIN_TOKEN = "test-admin-token"
+TEST_ADMIN_HEADERS = {"Authorization": f"Bearer {TEST_ADMIN_TOKEN}"}
+
+
+class _TestAuthService:
+    def state(self) -> dict:
+        return {"ok": True, "auth_enabled": True, "login_required": True}
+
+    def authenticate_access_token(self, token: str):
+        if token == TEST_ADMIN_TOKEN:
+            return AuthPrincipal("usr_test", "admin", "superadmin", "dev_test")
+        return None
+
+    def me(self, principal):
+        return {"ok": True, "user": principal.public_user(), "device": None}
+
+    def bootstrap_token(self, principal, ttl_sec: int):
+        return {
+            "ok": True,
+            "bootstrap_token": self._issue_bootstrap_token(ttl_sec),
+            "expires_in": ttl_sec,
+        }
+
+    def login(self, username: str, password: str, device_label: str):
+        raise NotImplementedError
+
+    def refresh(self, refresh_token: str):
+        raise NotImplementedError
+
+    def logout(self, refresh_token: str) -> None:
+        return None
+
+
+def RemoteRelayHTTPService(*args, **kwargs):  # noqa: N802
+    service = _TestAuthService()
+    auth_service = kwargs.pop("auth_service", service)
+    instance = _RemoteRelayHTTPService(*args, auth_service=auth_service, **kwargs)
+    service._issue_bootstrap_token = instance.issue_bootstrap_token
+    return instance
 
 
 def _free_port() -> int:
@@ -224,7 +268,7 @@ class TestRemoteRelayHTTPService:
         finally:
             relay.stop()
 
-    def test_admin_provider_and_model_endpoints_require_secret_and_mask_keys(
+    def test_admin_provider_and_model_endpoints_require_login_and_mask_keys(
         self, tmp_path: Path
     ) -> None:
         relay = RelayServer()
@@ -235,7 +279,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             admin_config_path=config_path,
             admin_config_reload_handler=lambda: reloads.append("reload"),
             admin_provider_test_handler=lambda provider, model, prompt: {
@@ -260,11 +303,11 @@ class TestRemoteRelayHTTPService:
                 _json_request(
                     "POST", f"{service.base_url}/remote/admin/providers/list", {}
                 )
-                raise AssertionError("admin endpoint should require a secret")
+                raise AssertionError("admin endpoint should require login")
             except HTTPError as exc:
-                assert exc.code == 403
+                assert exc.code == 401
 
-            admin_headers = {"X-RC-Admin-Secret": "admin-secret"}
+            admin_headers = TEST_ADMIN_HEADERS
             status, record = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/providers/record",
@@ -439,7 +482,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             admin_config_path=Path("unused-config.yaml"),
         )
         service.start()
@@ -449,7 +491,7 @@ class TestRemoteRelayHTTPService:
                     "POST",
                     f"{service.base_url}/remote/admin/status",
                     {},
-                    headers={"X-RC-Admin-Secret": "admin-secret"},
+                    headers=TEST_ADMIN_HEADERS,
                 )
 
             assert status == 200
@@ -486,13 +528,12 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             admin_config_path=config_path,
             admin_config_reload_handler=lambda: reloads.append("reload"),
         )
         service.start()
         try:
-            admin_headers = {"X-RC-Admin-Secret": "admin-secret"}
+            admin_headers = TEST_ADMIN_HEADERS
 
             _, cli = _json_request(
                 "POST",
@@ -640,7 +681,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             admin_config_path=config_path,
             admin_config_reload_handler=lambda: (_ for _ in ()).throw(
                 RuntimeError("reload failed")
@@ -658,7 +698,7 @@ class TestRemoteRelayHTTPService:
                         "api_key": "sk-broken",
                         "base_url": "https://broken.invalid/v1",
                     },
-                    headers={"X-RC-Admin-Secret": "admin-secret"},
+                    headers=TEST_ADMIN_HEADERS,
                 )
                 raise AssertionError("reload failure should surface as HTTP 500")
             except HTTPError as exc:
@@ -674,7 +714,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_bootstrap_and_artifact_endpoints(self) -> None:
+    def test_auth_bootstrap_token_and_artifact_endpoint(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
@@ -689,33 +729,30 @@ class TestRemoteRelayHTTPService:
                 if (os_name, arch, name) == ("linux", "amd64", "rcoder-peer")
                 else None
             ),
-            bootstrap_access_secret="top-secret",
             bootstrap_token_ttl_sec=60,
         )
         service.start()
         try:
             try:
-                _text_request(f"{service.base_url}/remote/bootstrap.sh")
-                raise AssertionError("bootstrap should require secret")
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/auth/bootstrap-token",
+                    {},
+                )
+                raise AssertionError("bootstrap token should require auth")
             except HTTPError as exc:
-                assert exc.code == 403
+                assert exc.code == 401
                 body = json.loads(exc.read().decode("utf-8"))
-                assert body["error"] == "invalid_bootstrap_secret"
+                assert body["error"] == "unauthorized"
 
-            status, headers, raw_script = _raw_request(
-                "GET",
-                f"{service.base_url}/remote/bootstrap.sh",
-                headers={"X-RC-Bootstrap-Secret": "top-secret"},
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/auth/bootstrap-token",
+                {},
+                headers=TEST_ADMIN_HEADERS,
             )
-            script = raw_script.decode("utf-8")
             assert status == 200
-            assert headers["Cache-Control"] == "no-store"
-            assert "rcoder-peer" in script
-            assert service.base_url in script
-            assert "/remote/artifacts/{os}/{arch}/rcoder-peer" in script
-            assert "( : </dev/tty ) 2>/dev/null" in script
-            assert "[ -r /dev/tty ]" not in script
-            assert 'exec "$BIN" --host "$HOST" --bootstrap-token "$TOKEN"\n' in script
+            assert body["bootstrap_token"].startswith("bt_")
 
             with _URLOPEN(
                 f"{service.base_url}/remote/artifacts/linux/amd64/rcoder-peer",
@@ -1139,7 +1176,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             runtime_control_plane=control,
             environment_cli_tools={
                 "gitnexus": EnvironmentCLIToolConfig(
@@ -1160,7 +1196,7 @@ class TestRemoteRelayHTTPService:
                     "workspace_root": "/tmp/peer",
                     "entry_ids": ["cli:gitnexus"],
                 },
-                headers={"X-RC-Admin-Secret": "admin-secret"},
+                headers=TEST_ADMIN_HEADERS,
             )
 
             assert status == 200
@@ -1177,56 +1213,6 @@ class TestRemoteRelayHTTPService:
                 "phase": "install",
                 "command": "npm install -g gitnexus",
             } in task["metadata"]["allowed_commands"]
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_powershell_bootstrap_endpoint(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            artifact_provider=lambda _os_name, _arch, _name: (
-                b"peer-binary",
-                "application/octet-stream",
-            ),
-            bootstrap_access_secret="top-secret",
-            bootstrap_token_ttl_sec=60,
-        )
-        service.start()
-        try:
-            try:
-                _text_request(f"{service.base_url}/remote/bootstrap.ps1")
-                raise AssertionError("bootstrap should require secret")
-            except HTTPError as exc:
-                assert exc.code == 403
-                body = json.loads(exc.read().decode("utf-8"))
-                assert body["error"] == "invalid_bootstrap_secret"
-
-            try:
-                _text_request(
-                    f"{service.base_url}/remote/bootstrap.ps1",
-                    headers={"X-RC-Bootstrap-Secret": "wrong"},
-                )
-                raise AssertionError("bootstrap should reject wrong secret")
-            except HTTPError as exc:
-                assert exc.code == 403
-                body = json.loads(exc.read().decode("utf-8"))
-                assert body["error"] == "invalid_bootstrap_secret"
-
-            status, script = _text_request(
-                f"{service.base_url}/remote/bootstrap.ps1",
-                headers={"X-RC-Bootstrap-Secret": "top-secret"},
-            )
-            assert status == 200
-            assert "$ErrorActionPreference" in script
-            assert "bt_" in script
-            assert "rcoder-peer.exe" in script
-            assert "/remote/artifacts/{os}/{arch}/rcoder-peer" in script
-            assert '.Replace("{os}", "windows")' in script
-            assert "--interactive" in script
         finally:
             service.stop()
             relay.stop()
@@ -2124,13 +2110,14 @@ class TestRemoteRelayHTTPService:
             assert body["ok"] is True
             assert body["api_version"] == 1
             assert isinstance(body["server_version"], str)
-            assert body["capabilities"] == {
-                "sessions": True,
-                "chat_stream": True,
-                "taskflow": True,
-                "issue_assignment": True,
-                "fresh_session_without_session_hint": True,
-                "peer_token_heartbeat_refresh": True,
+            assert body["capabilities"]["sessions"] is True
+            assert body["capabilities"]["chat_stream"] is True
+            assert body["capabilities"]["taskflow"] is True
+            assert body["capabilities"]["issue_assignment"] is True
+            assert body["capabilities"]["fresh_session_without_session_hint"] is True
+            assert body["capabilities"]["peer_token_heartbeat_refresh"] is True
+            assert body["capabilities"]["agent_runtime"] == {
+                "executor_capabilities": {}
             }
         finally:
             service.stop()
@@ -2151,6 +2138,45 @@ class TestRemoteRelayHTTPService:
             assert body["capabilities"]["chat_stream"] is False
             assert body["capabilities"]["fresh_session_without_session_hint"] is False
             assert body["capabilities"]["peer_token_heartbeat_refresh"] is True
+            assert body["capabilities"]["agent_runtime"]["executor_capabilities"] == {}
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capabilities_include_peer_executor_capabilities(self) -> None:
+        relay = RelayServer()
+        relay.registry.register(
+            meta={
+                "host_info_min": {
+                    "agent_runtime": {
+                        "executor_capabilities": {
+                            "claude": {
+                                "installed": True,
+                                "version": "2.0.0",
+                                "stream_json": True,
+                                "resume_by_id": True,
+                                "limitations": [],
+                            },
+                            "gemini": {
+                                "installed": False,
+                                "limitations": ["executable not found on PATH"],
+                            },
+                        }
+                    }
+                }
+            }
+        )
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(relay_server=relay, bind=f"127.0.0.1:{port}")
+        service.start()
+        try:
+            _, body = _json_request("GET", f"{service.base_url}/remote/capabilities")
+            executor_capabilities = body["capabilities"]["agent_runtime"][
+                "executor_capabilities"
+            ]
+            assert executor_capabilities["claude"]["resume_by_id"] is True
+            assert executor_capabilities["gemini"]["installed"] is False
         finally:
             service.stop()
             relay.stop()
@@ -2198,7 +2224,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             runtime_control_plane=control,
         )
         service.start()
@@ -2217,7 +2242,7 @@ class TestRemoteRelayHTTPService:
                 },
             )
             peer_token = register_body["payload"]["peer_token"]
-            admin_headers = {"X-RC-Admin-Secret": "admin-secret"}
+            admin_headers = TEST_ADMIN_HEADERS
 
             _, submit_body = _json_request(
                 "POST",
@@ -2735,7 +2760,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             admin_config_path=config_path,
             runtime_control_plane=control,
         )
@@ -2765,7 +2789,7 @@ class TestRemoteRelayHTTPService:
                 },
             )
             peer_token = register_body["payload"]["peer_token"]
-            admin_headers = {"X-RC-Admin-Secret": "admin-secret"}
+            admin_headers = TEST_ADMIN_HEADERS
 
             _, update_body = _json_request(
                 "POST",
@@ -2882,7 +2906,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             admin_config_path=config_path,
             runtime_control_plane=control,
         )
@@ -2909,7 +2932,7 @@ class TestRemoteRelayHTTPService:
                         "agents": {},
                     },
                 },
-                headers={"X-RC-Admin-Secret": "admin-secret"},
+                headers=TEST_ADMIN_HEADERS,
             )
 
             assert update_body["ok"] is True
@@ -2937,7 +2960,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             runtime_control_plane=control,
         )
         service.start()
@@ -2952,7 +2974,7 @@ class TestRemoteRelayHTTPService:
                         "agent_id": "smoke_reviewer",
                         "prompt": "run smoke",
                     },
-                    headers={"X-RC-Admin-Secret": "admin-secret"},
+                    headers=TEST_ADMIN_HEADERS,
                 )
             except HTTPError as exc:
                 body = json.loads(exc.read().decode("utf-8"))
@@ -3064,7 +3086,6 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            admin_access_secret="admin-secret",
             runtime_control_plane=control,
         )
         service.start()
@@ -3117,7 +3138,7 @@ class TestRemoteRelayHTTPService:
                 time.sleep(0.1)
             assert relay.registry.list_online()
 
-            admin_headers = {"X-RC-Admin-Secret": "admin-secret"}
+            admin_headers = TEST_ADMIN_HEADERS
             _, submit = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/runtime/submit",

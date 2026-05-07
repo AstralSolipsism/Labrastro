@@ -10,6 +10,7 @@ from reuleauxcoder.domain.agent_runtime.models import AgentConfig, AgentModelCon
 from reuleauxcoder.compat import migrate_bash_to_shell, migrate_legacy_config
 from reuleauxcoder.domain.config.models import (
     AgentRuntimeConfig,
+    AuthConfig,
     ApprovalConfig,
     ApprovalRuleConfig,
     Config,
@@ -131,6 +132,28 @@ class ConfigLoader:
                     persistence["database_url"] = self._expand_env_value(
                         persistence["database_url"], "persistence.database_url"
                     )
+        auth = expanded.get("auth", {})
+        if isinstance(auth, dict):
+            for field in ("token_secret", "store_path"):
+                if field in auth:
+                    value = str(auth.get(field) or "").strip()
+                    if value:
+                        auth[field] = self._expand_env_value(
+                            auth[field], f"auth.{field}"
+                        )
+            raw_superadmins = auth.get("superadmins", [])
+            if isinstance(raw_superadmins, list):
+                for index, item in enumerate(raw_superadmins):
+                    if not isinstance(item, dict):
+                        continue
+                    for field in ("username", "password_hash"):
+                        if field in item:
+                            value = str(item.get(field) or "").strip()
+                            if value:
+                                item[field] = self._expand_env_value(
+                                    item[field],
+                                    f"auth.superadmins.{index}.{field}",
+                                )
         github = expanded.get("github", {})
         if isinstance(github, dict):
             for field in (
@@ -327,6 +350,7 @@ class ConfigLoader:
         prompt_config = data.get("prompt", {})
         context_config = data.get("context", {})
         remote_exec_config = data.get("remote_exec", {})
+        auth_config = data.get("auth", {})
         agent_runtime_config = data.get("agent_runtime", {})
         persistence_config = data.get("persistence", {})
         github_config = data.get("github", {})
@@ -515,12 +539,6 @@ class ConfigLoader:
                 enabled=bool(remote_exec_config.get("enabled", False)),
                 host_mode=bool(remote_exec_config.get("host_mode", False)),
                 relay_bind=str(remote_exec_config.get("relay_bind", "127.0.0.1:8765")),
-                bootstrap_access_secret=str(
-                    remote_exec_config.get("bootstrap_access_secret", "")
-                ),
-                admin_access_secret=str(
-                    remote_exec_config.get("admin_access_secret", "")
-                ),
                 bootstrap_token_ttl_sec=int(
                     remote_exec_config.get("bootstrap_token_ttl_sec", 300)
                 ),
@@ -537,6 +555,9 @@ class ConfigLoader:
                     remote_exec_config.get("default_tool_timeout_sec", 30)
                 ),
                 shell_timeout_sec=int(remote_exec_config.get("shell_timeout_sec", 120)),
+            ),
+            auth=AuthConfig.from_dict(
+                auth_config if isinstance(auth_config, dict) else {}
             ),
             agent_runtime=agent_runtime,
             persistence=PersistenceConfig.from_dict(

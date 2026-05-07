@@ -288,8 +288,10 @@ class ServerRunner:
                 "smoke": str(self.smoke_dir),
             },
         }
-        self.admin_secret = ""
-        self.bootstrap_secret = ""
+        self.access_token = ""
+        self.refresh_token = ""
+        self.auth_username = os.environ.get("LABRASTRO_SUPERADMIN_USERNAME", "admin")
+        self.auth_password = os.environ.get("LABRASTRO_SUPERADMIN_PASSWORD", "")
         self.config_path: Path | None = None
         self.compose_path: Path | None = None
         self.compose_service = ""
@@ -387,9 +389,29 @@ class ServerRunner:
             "POST",
             path,
             payload or {},
-            headers={"X-RC-Admin-Secret": self.admin_secret},
+            headers={"Authorization": f"Bearer {self.access_token}"},
             timeout=60,
         )
+
+    def login(self) -> None:
+        if not self.auth_password:
+            raise RuntimeError("LABRASTRO_SUPERADMIN_PASSWORD is required for auth smoke login")
+        body = self.http_json(
+            "POST",
+            "/remote/auth/login",
+            {
+                "username": self.auth_username,
+                "password": self.auth_password,
+                "device_label": "runtime_e2e_smoke",
+            },
+            timeout=60,
+        )
+        self.access_token = str(body.get("access_token") or "")
+        self.refresh_token = str(body.get("refresh_token") or "")
+        self.masker.add(self.access_token)
+        self.masker.add(self.refresh_token)
+        if not self.access_token:
+            raise RuntimeError("auth login did not return access token")
 
     def peer_post(
         self, path: str, peer_token: str, payload: dict[str, Any] | None = None
@@ -655,12 +677,6 @@ class ServerRunner:
             """
         )
         self.config_path.write_text(cleaned + block + "\n", encoding="utf-8")
-        self.admin_secret = self.resolve_config_secret("admin_access_secret")
-        self.bootstrap_secret = self.resolve_config_secret("bootstrap_access_secret")
-        self.masker.add(self.admin_secret)
-        self.masker.add(self.bootstrap_secret)
-        if not self.admin_secret or not self.bootstrap_secret:
-            raise RuntimeError("admin/bootstrap secret could not be resolved")
         self.record_step("patch_config", config=str(self.config_path), database_url="***")
 
     def cleanup_generated_global_example_config(self) -> None:
@@ -968,19 +984,16 @@ class ServerRunner:
         return {"bin": str(bin_dir), "log": str(log_path)}
 
     def bootstrap_token(self) -> str:
-        req = urlrequest.Request(
-            self.host_url + "/remote/bootstrap.sh",
-            headers={"X-RC-Bootstrap-Secret": self.bootstrap_secret},
-            method="GET",
+        body = self.http_json(
+            "POST",
+            "/remote/auth/bootstrap-token",
+            {},
+            headers={"Authorization": f"Bearer {self.access_token}"},
+            timeout=20,
         )
-        with urlrequest.urlopen(req, timeout=20) as resp:
-            script = resp.read().decode("utf-8", errors="replace")
-        match = re.search(r'TOKEN="\$\{RC_TOKEN:-([^}]+)\}"', script)
-        if not match:
-            match = re.search(r'TOKEN="([^"]+)"', script)
-        if not match:
-            raise RuntimeError("bootstrap token not found in bootstrap.sh")
-        token = match.group(1)
+        token = str(body.get("bootstrap_token") or "")
+        if not token:
+            raise RuntimeError("bootstrap token not returned by auth API")
         self.masker.add(token)
         return token
 
@@ -1931,6 +1944,7 @@ class ServerRunner:
             self.cleanup_generated_global_example_config()
             self.start_host()
             self.verify_service()
+            self.login()
             _, agent_id = self.setup_smoke_agent()
             fixture = self.create_git_fixture()
             fake_gh = self.install_fake_gh()

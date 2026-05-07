@@ -20,6 +20,7 @@ from reuleauxcoder.interfaces.entrypoint import AppRunner, AppOptions
 from reuleauxcoder.interfaces.events import AgentEventBridge
 from reuleauxcoder.interfaces.ui_registry import UIRegistry
 from reuleauxcoder.extensions.environment.manifest import run_env_record_cli
+from reuleauxcoder.extensions.auth.cli import run_auth_cli
 from reuleauxcoder.extensions.db.cli import run_db_cli
 from reuleauxcoder.extensions.mcp.artifacts import (
     run_mcp_artifact_cli,
@@ -44,6 +45,8 @@ def main():
     args = parse_args()
     if getattr(args, "command", None) == "db":
         sys.exit(run_db_cli(args))
+    if getattr(args, "command", None) == "auth":
+        sys.exit(run_auth_cli(args))
     if getattr(args, "command", None) == "env" and getattr(
         args, "env_command", None
     ) == "record":

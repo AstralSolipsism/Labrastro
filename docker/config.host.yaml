@@ -29,14 +29,25 @@ remote_exec:
   enabled: true
   host_mode: true
   relay_bind: 0.0.0.0:8765
-  bootstrap_access_secret: ${RCODER_BOOTSTRAP_ACCESS_SECRET}
-  admin_access_secret: ${RCODER_ADMIN_ACCESS_SECRET}
   bootstrap_token_ttl_sec: 120
   peer_token_ttl_sec: 3600
   heartbeat_interval_sec: 10
   heartbeat_timeout_sec: 30
   default_tool_timeout_sec: 30
   shell_timeout_sec: 120
+
+auth:
+  enabled: true
+  token_secret: ${LABRASTRO_AUTH_TOKEN_SECRET}
+  store_backend: auto
+  store_path: .rcoder/auth.json
+  password_min_length: 10
+  password_max_length: 256
+  login_rate_limit_count: 5
+  login_rate_limit_window_sec: 900
+  superadmins:
+    - username: ${LABRASTRO_SUPERADMIN_USERNAME}
+      password_hash: ${LABRASTRO_SUPERADMIN_PASSWORD_HASH}
 
 agent_runtime:
   max_running_agents: 4

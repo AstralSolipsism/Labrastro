@@ -20,6 +20,7 @@ from labrastro_server.services.admin.service import (
     ProviderTestHandler,
     RemoteAdminConfigManager,
 )
+from labrastro_server.services.auth.service import AuthService
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
@@ -61,6 +62,7 @@ from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from labrastro_server.interfaces.http.remote.routes.admin import RemoteAdminRoutes
 from labrastro_server.interfaces.http.remote.routes.artifacts import RemoteArtifactRoutes
+from labrastro_server.interfaces.http.remote.routes.auth import RemoteAuthRoutes
 from labrastro_server.interfaces.http.remote.routes.base import RemoteRelayBaseHandler
 from labrastro_server.interfaces.http.remote.routes.chat import RemoteChatRoutes
 from labrastro_server.interfaces.http.remote.routes.collaboration import RemoteCollaborationRoutes
@@ -239,8 +241,7 @@ class RemoteRelayHTTPService:
         | None = None,
         session_handler: Callable[[str, str, dict[str, Any]], dict[str, Any]]
         | None = None,
-        bootstrap_access_secret: str = "",
-        admin_access_secret: str = "",
+        auth_service: AuthService | None = None,
         bootstrap_token_ttl_sec: int = 300,
         mcp_servers: list[Any] | None = None,
         mcp_artifact_root: str | Path = ".rcoder/mcp-artifacts",
@@ -262,8 +263,9 @@ class RemoteRelayHTTPService:
         self.chat_handler = chat_handler
         self.stream_chat_handler = stream_chat_handler
         self.session_handler = session_handler
-        self.bootstrap_access_secret = bootstrap_access_secret
-        self.admin_access_secret = admin_access_secret
+        if auth_service is None:
+            raise ValueError("auth_service is required")
+        self.auth_service = auth_service
         self.bootstrap_token_ttl_sec = bootstrap_token_ttl_sec
         self.mcp_servers = list(mcp_servers or [])
         self.mcp_artifact_root = Path(mcp_artifact_root)
@@ -490,6 +492,7 @@ class RemoteRelayHTTPService:
         service = self
 
         class Handler(
+            RemoteAuthRoutes,
             RemoteAdminRoutes,
             RemoteSessionRoutes,
             RemoteChatRoutes,
@@ -505,6 +508,9 @@ class RemoteRelayHTTPService:
         ):
             def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
+                if parsed.path.startswith("/remote/auth/"):
+                    if self._handle_auth_get(parsed.path):
+                        return
                 if parsed.path == "/remote/capabilities":
                     self._handle_capabilities()
                     return
@@ -523,12 +529,6 @@ class RemoteRelayHTTPService:
                 if parsed.path.startswith("/remote/agent-runtime/tasks/"):
                     self._handle_runtime_events_get(parsed)
                     return
-                if parsed.path == "/remote/bootstrap.sh":
-                    self._handle_bootstrap(parsed, "sh")
-                    return
-                if parsed.path == "/remote/bootstrap.ps1":
-                    self._handle_bootstrap(parsed, "ps1")
-                    return
                 if parsed.path.startswith("/remote/artifacts/"):
                     self._handle_artifact(parsed.path)
                     return
@@ -542,6 +542,9 @@ class RemoteRelayHTTPService:
 
             def do_POST(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
+                if parsed.path.startswith("/remote/auth/"):
+                    if self._handle_auth_post(parsed.path):
+                        return
                 if parsed.path == "/remote/register":
                     self._handle_register()
                     return

@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import gzip
 import json
-import secrets
 import time
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
-from labrastro_server.interfaces.http.remote.bootstrap import (
-    generate_bootstrap_script,
-    generate_powershell_bootstrap_script,
-)
 from labrastro_server.interfaces.http.remote.helpers import (
     GZIP_MIN_BYTES,
     optional_payload_str,
@@ -60,6 +55,7 @@ from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemotePeerRoutes:
     def _handle_capabilities(self) -> None:
+        runtime_capabilities = self._agent_runtime_capabilities()
         self._send_json(
             HTTPStatus.OK,
             {
@@ -75,48 +71,47 @@ class RemotePeerRoutes:
                     "fresh_session_without_session_hint": self.service.stream_chat_handler
                     is not None,
                     "peer_token_heartbeat_refresh": True,
+                    "agent_runtime": runtime_capabilities,
                 },
             },
         )
 
-    def _handle_bootstrap(self, parsed, script_kind: str) -> None:
-        del parsed
-        configured_secret = self.service.bootstrap_access_secret
-        presented_secret = self.headers.get("X-RC-Bootstrap-Secret", "")
-        if not configured_secret:
-            self._send_json(
-                HTTPStatus.FORBIDDEN, {"error": "bootstrap_disabled"}
-            )
-            return
-        if not secrets.compare_digest(presented_secret, configured_secret):
-            self._send_json(
-                HTTPStatus.FORBIDDEN, {"error": "invalid_bootstrap_secret"}
-            )
-            return
-        token = self.service.issue_bootstrap_token(
-            ttl_sec=self.service.bootstrap_token_ttl_sec
-        )
-        host_header = self.headers.get("Host")
-        forwarded_proto = self.headers.get("X-Forwarded-Proto", "http")
-        request_base_url = (
-            f"{forwarded_proto}://{host_header}"
-            if host_header
-            else self.service.base_url
-        )
-        if script_kind == "ps1":
-            script = generate_powershell_bootstrap_script(
-                request_base_url, token
-            )
-            content_type = "text/x-powershell; charset=utf-8"
-        else:
-            script = generate_bootstrap_script(request_base_url, token)
-            content_type = "text/x-shellscript; charset=utf-8"
-        self._send_text(
-            HTTPStatus.OK,
-            script,
-            content_type,
-            {"Cache-Control": "no-store"},
-        )
+    def _agent_runtime_capabilities(self) -> dict[str, Any]:
+        executor_capabilities: dict[str, dict[str, Any]] = {}
+        for peer in self.service.relay_server.registry.list_online():
+            host_info = peer.meta.get("host_info_min")
+            if not isinstance(host_info, dict):
+                continue
+            agent_runtime = host_info.get("agent_runtime")
+            if not isinstance(agent_runtime, dict):
+                continue
+            raw = agent_runtime.get("executor_capabilities")
+            if not isinstance(raw, dict):
+                continue
+            for name, value in raw.items():
+                if not isinstance(value, dict):
+                    continue
+                key = str(name)
+                next_value = dict(value)
+                current = executor_capabilities.get(key)
+                if current is None or (
+                    current.get("installed") is not True
+                    and next_value.get("installed") is True
+                ):
+                    executor_capabilities[key] = next_value
+                    continue
+                current_limits = {
+                    str(item)
+                    for item in current.get("limitations", [])
+                    if str(item).strip()
+                }
+                next_limits = {
+                    str(item)
+                    for item in next_value.get("limitations", [])
+                    if str(item).strip()
+                }
+                current["limitations"] = sorted(current_limits | next_limits)
+        return {"executor_capabilities": executor_capabilities}
 
     def _handle_register(self) -> None:
         payload = self._read_json()

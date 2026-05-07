@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import gzip
 import json
-import secrets
 import time
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
-from labrastro_server.interfaces.http.remote.bootstrap import (
-    generate_bootstrap_script,
-    generate_powershell_bootstrap_script,
-)
 from labrastro_server.interfaces.http.remote.helpers import (
     GZIP_MIN_BYTES,
     optional_payload_str,
@@ -174,5 +169,35 @@ class RemoteRelayBaseHandler:
 
     def _verify_query_peer(self, parsed: Any) -> str | None:
         return self._verify_peer_token(self._query_value(parsed, "peer_token"))
+
+    def _bearer_token(self) -> str:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return ""
+        return header[len("Bearer ") :].strip()
+
+    def _require_auth(self, roles: set[str] | None = None):
+        principal = self.service.auth_service.authenticate_access_token(
+            self._bearer_token()
+        )
+        if principal is None:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return None
+        if roles and principal.role not in roles:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return None
+        return principal
+
+    def _require_auth_scopes(self, scopes: set[str]):
+        principal = self.service.auth_service.authenticate_access_token(
+            self._bearer_token()
+        )
+        if principal is None:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return None
+        if any(not principal.has_scope(scope) for scope in scopes):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return None
+        return principal
 
 
