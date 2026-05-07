@@ -96,6 +96,106 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     assert control.list_events(task.id, after_seq=0)[0].type == "queued"
 
 
+def test_complete_without_session_id_preserves_stream_pinned_session() -> None:
+    control = AgentRuntimeControlPlane()
+    task = control.submit_task(
+        RuntimeTaskRequest(
+            issue_id="issue-session",
+            agent_id="coder",
+            prompt="run",
+            executor="codex",
+            execution_location="daemon_worktree",
+        ),
+        task_id="task-session",
+    )
+    control.pin_session(
+        task.id,
+        TaskSessionRef(
+            agent_id="coder",
+            executor=ExecutorType.CODEX,
+            execution_location=ExecutionLocation.DAEMON_WORKTREE,
+            issue_id="issue-session",
+            task_id=task.id,
+            workdir="/tmp/work",
+            branch="agent/coder/task-session",
+            executor_session_id="codex-thread-1",
+        ),
+    )
+
+    completed = control.complete_task(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+    )
+
+    assert completed.executor_session_id == "codex-thread-1"
+    assert control.load_task_detail(task.id)["session"]["executor_session_id"] == "codex-thread-1"
+
+
+def test_followup_task_inherits_parent_session_when_scope_matches() -> None:
+    control = AgentRuntimeControlPlane()
+    parent = control.submit_task(
+        RuntimeTaskRequest(
+            issue_id="issue-followup",
+            agent_id="coder",
+            prompt="parent",
+            executor="claude",
+            execution_location="daemon_worktree",
+            workdir="/tmp/work",
+            branch_name="agent/coder/task-parent",
+            pr_url="https://example.test/pr/1",
+            executor_session_id="claude-session-1",
+        ),
+        task_id="task-parent",
+    )
+
+    followup = control.submit_task(
+        RuntimeTaskRequest(
+            issue_id="issue-followup",
+            agent_id="coder",
+            prompt="follow up",
+            parent_task_id=parent.id,
+            trigger_comment_id="comment-1",
+        ),
+        task_id="task-followup",
+    )
+
+    assert followup.executor == parent.executor
+    assert followup.runtime_profile_id == parent.runtime_profile_id
+    assert followup.workdir == parent.workdir
+    assert followup.branch_name == parent.branch_name
+    assert followup.pr_url == parent.pr_url
+    assert followup.executor_session_id == "claude-session-1"
+
+
+def test_followup_task_does_not_inherit_session_for_different_agent() -> None:
+    control = AgentRuntimeControlPlane()
+    parent = control.submit_task(
+        RuntimeTaskRequest(
+            issue_id="issue-followup",
+            agent_id="coder",
+            prompt="parent",
+            executor="claude",
+            execution_location="daemon_worktree",
+            workdir="/tmp/work",
+            branch_name="agent/coder/task-parent",
+            executor_session_id="claude-session-1",
+        ),
+        task_id="task-parent-agent",
+    )
+
+    followup = control.submit_task(
+        RuntimeTaskRequest(
+            issue_id="issue-followup",
+            agent_id="reviewer",
+            prompt="follow up",
+            parent_task_id=parent.id,
+        ),
+        task_id="task-followup-agent",
+    )
+
+    assert followup.executor_session_id is None
+
+
 def test_claim_task_waits_for_wakeup_when_task_is_submitted() -> None:
     control = AgentRuntimeControlPlane()
     claims = []
@@ -748,11 +848,21 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
     assert blocked is not None
     assert blocked.status.value == "blocked"
 
+    blocked.executor_session_id = "fake-session-1"
+
     retry = control.retry_task(task.id, new_task_id="task-retry")
 
     assert retry.status.value == "queued"
     assert retry.metadata["retry_of"] == task.id
     assert retry.metadata["repo_url"] == "file:///repo"
+    assert retry.executor_session_id is None
+
+    resumed = control.retry_task(
+        task.id,
+        new_task_id="task-retry-resume",
+        resume_session=True,
+    )
+    assert resumed.executor_session_id == "fake-session-1"
 
 
 def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:

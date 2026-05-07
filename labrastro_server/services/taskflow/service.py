@@ -465,6 +465,16 @@ class TaskflowService:
             issue_id=draft.issue_draft_id or draft.goal_id,
             agent_id=selected_agent_id,
             prompt=draft.prompt,
+            parent_task_id=(
+                str(metadata["parent_task_id"])
+                if metadata.get("parent_task_id") is not None
+                else None
+            ),
+            trigger_comment_id=(
+                str(metadata["trigger_comment_id"])
+                if metadata.get("trigger_comment_id") is not None
+                else None
+            ),
             runtime_profile_id=(
                 str(selected_candidate.get("runtime_profile") or "") or None
             ),

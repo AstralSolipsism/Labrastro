@@ -478,6 +478,8 @@ class PullRequestService:
             "github_review_comment_id": comment.github_id,
             "github_pr_record_id": record.id,
             "github_pr_url": record.url,
+            "parent_task_id": record.task_id,
+            "trigger_comment_id": comment.github_id,
             "repository": record.repository,
             "path": comment.path,
             "line": comment.line,

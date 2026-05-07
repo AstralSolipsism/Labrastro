@@ -251,6 +251,7 @@ class RemoteAdminRoutes:
                             if payload.get("new_task_id") is not None
                             else None
                         ),
+                        resume_session=payload.get("resume_session") is True,
                     )
                 except KeyError:
                     self._send_json(

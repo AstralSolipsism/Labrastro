@@ -70,6 +70,19 @@ def _workspace_key(value: str | None) -> str:
     return str(value or "").strip().replace("\\", "/").rstrip("/").lower()
 
 
+def _can_resume_from_parent(request: Any, parent: TaskRecord) -> bool:
+    if not parent.executor_session_id:
+        return False
+    return (
+        request.agent_id == parent.agent_id
+        and request.runtime_profile_id == parent.runtime_profile_id
+        and request.executor == parent.executor
+        and request.execution_location == parent.execution_location
+        and _workspace_key(request.workdir) == _workspace_key(parent.workdir)
+        and str(request.branch_name or "") == str(parent.branch_name or "")
+    )
+
+
 def _optional_executor(value: ExecutorType | str | None) -> ExecutorType | None:
     if isinstance(value, ExecutorType):
         return value
@@ -214,6 +227,7 @@ class PostgresRuntimeStore:
             trigger_comment_id=request.trigger_comment_id,
             branch_name=request.branch_name,
             pr_url=request.pr_url,
+            executor_session_id=request.executor_session_id,
             workdir=request.workdir,
             metadata=metadata,
         )
@@ -225,12 +239,12 @@ class PostgresRuntimeStore:
                         id, issue_id, agent_id, trigger_mode, status, prompt,
                         runtime_profile_id, executor, execution_location,
                         parent_task_id, trigger_comment_id, branch_name, pr_url,
-                        workdir, metadata, runtime_snapshot
+                        executor_session_id, workdir, metadata, runtime_snapshot
                     ) VALUES (
                         :id, :issue_id, :agent_id, :trigger_mode, :status, :prompt,
                         :runtime_profile_id, :executor, :execution_location,
                         :parent_task_id, :trigger_comment_id, :branch_name, :pr_url,
-                        :workdir, CAST(:metadata AS JSONB),
+                        :executor_session_id, :workdir, CAST(:metadata AS JSONB),
                         CAST(:runtime_snapshot AS JSONB)
                     )
                     """
@@ -697,7 +711,7 @@ class PostgresRuntimeStore:
                     """
                     UPDATE ez_runtime_tasks
                     SET status=:status, output=:output,
-                        executor_session_id=:executor_session_id,
+                        executor_session_id=COALESCE(:executor_session_id, executor_session_id),
                         issue_status=:issue_status,
                         failure_reason=COALESCE(:failure_reason, failure_reason),
                         metadata=CAST(:metadata AS JSONB),
@@ -715,6 +729,12 @@ class PostgresRuntimeStore:
                     "metadata": _json(metadata),
                 },
             )
+            if result.executor_session_id:
+                self._upsert_session_with_conn(
+                    conn,
+                    task,
+                    executor_session_id=result.executor_session_id,
+                )
             for event, expansion in expanded_events:
                 self._append_event(conn, task_id, event.type.value, event.to_dict())
                 for event_type, payload in expansion.events:
@@ -747,7 +767,13 @@ class PostgresRuntimeStore:
             self._resolve_cancel(conn, task_id)
             return task
 
-    def retry_task(self, task_id: str, *, new_task_id: str | None = None) -> TaskRecord:
+    def retry_task(
+        self,
+        task_id: str,
+        *,
+        new_task_id: str | None = None,
+        resume_session: bool = False,
+    ) -> TaskRecord:
         task = self.get_task(task_id)
         if not task.is_terminal:
             raise ValueError("only terminal runtime tasks can be retried")
@@ -772,6 +798,9 @@ class PostgresRuntimeStore:
                 branch_name=task.branch_name,
                 pr_url=task.pr_url,
                 workdir=task.workdir,
+                executor_session_id=task.executor_session_id
+                if resume_session
+                else None,
                 model=str(task.metadata.get("model"))
                 if task.metadata.get("model") is not None
                 else None,
@@ -968,6 +997,20 @@ class PostgresRuntimeStore:
         }
 
     def _resolve_request(self, request: Any) -> Any:
+        parent = self.get_task(request.parent_task_id) if request.parent_task_id else None
+        if parent is not None:
+            if request.runtime_profile_id is None:
+                request.runtime_profile_id = parent.runtime_profile_id
+            if request.executor is None:
+                request.executor = parent.executor
+            if request.execution_location is None:
+                request.execution_location = parent.execution_location
+            if request.workdir is None:
+                request.workdir = parent.workdir
+            if request.branch_name is None:
+                request.branch_name = parent.branch_name
+            if request.pr_url is None:
+                request.pr_url = parent.pr_url
         agents = _dict_from(self.runtime_snapshot.get("agents"))
         profiles = _dict_from(self.runtime_snapshot.get("runtime_profiles"))
         raw_agent = _dict_from(agents.get(request.agent_id))
@@ -989,6 +1032,12 @@ class PostgresRuntimeStore:
         )
         if request.model is None and raw_profile.get("model") is not None:
             request.model = str(raw_profile["model"])
+        if (
+            parent is not None
+            and request.executor_session_id is None
+            and _can_resume_from_parent(request, parent)
+        ):
+            request.executor_session_id = parent.executor_session_id
         return request
 
     def _append_event(
@@ -1329,6 +1378,44 @@ class PostgresRuntimeStore:
                 "executor_session_id": session.executor_session_id,
                 "workdir": session.workdir,
                 "branch": session.branch,
+            },
+        )
+
+    def _upsert_session_with_conn(
+        self,
+        conn: Any,
+        task: TaskRecord,
+        *,
+        executor_session_id: str,
+    ) -> None:
+        conn.execute(
+            text(
+                """
+                INSERT INTO ez_runtime_sessions (
+                    task_id, agent_id, executor, execution_location, issue_id,
+                    workdir, branch, executor_session_id, metadata
+                ) VALUES (
+                    :task_id, :agent_id, :executor, :execution_location, :issue_id,
+                    :workdir, :branch, :executor_session_id, CAST('{}' AS JSONB)
+                )
+                ON CONFLICT (task_id) DO UPDATE SET
+                    workdir=COALESCE(EXCLUDED.workdir, ez_runtime_sessions.workdir),
+                    branch=COALESCE(EXCLUDED.branch, ez_runtime_sessions.branch),
+                    executor_session_id=EXCLUDED.executor_session_id,
+                    updated_at=now()
+                """
+            ),
+            {
+                "task_id": task.id,
+                "agent_id": task.agent_id,
+                "executor": (task.executor or ExecutorType.REULEAUXCODER).value,
+                "execution_location": (
+                    task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+                ).value,
+                "issue_id": task.issue_id,
+                "workdir": task.workdir,
+                "branch": task.branch_name,
+                "executor_session_id": executor_session_id,
             },
         )
 

@@ -131,6 +131,19 @@ def _workspace_key(value: str | None) -> str:
     return str(value or "").strip().replace("\\", "/").rstrip("/").lower()
 
 
+def _can_resume_from_parent(request: "RuntimeTaskRequest", parent: TaskRecord) -> bool:
+    if not parent.executor_session_id:
+        return False
+    return (
+        request.agent_id == parent.agent_id
+        and request.runtime_profile_id == parent.runtime_profile_id
+        and request.executor == parent.executor
+        and request.execution_location == parent.execution_location
+        and _workspace_key(request.workdir) == _workspace_key(parent.workdir)
+        and str(request.branch_name or "") == str(parent.branch_name or "")
+    )
+
+
 @dataclass
 class RuntimeTaskRequest:
     """Request accepted by the Labrastro runtime control plane."""
@@ -147,6 +160,7 @@ class RuntimeTaskRequest:
     branch_name: str | None = None
     pr_url: str | None = None
     workdir: str | None = None
+    executor_session_id: str | None = None
     model: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -302,6 +316,7 @@ class AgentRuntimeControlPlane:
                 trigger_comment_id=request.trigger_comment_id,
                 branch_name=request.branch_name,
                 pr_url=request.pr_url,
+                executor_session_id=request.executor_session_id,
                 workdir=request.workdir,
                 metadata=metadata,
             )
@@ -318,6 +333,20 @@ class AgentRuntimeControlPlane:
             self._wakeup.notify_all()
 
     def _resolve_request_locked(self, request: RuntimeTaskRequest) -> RuntimeTaskRequest:
+        parent = self._states.get(request.parent_task_id).task if request.parent_task_id in self._states else None
+        if parent is not None:
+            if request.runtime_profile_id is None:
+                request.runtime_profile_id = parent.runtime_profile_id
+            if request.executor is None:
+                request.executor = parent.executor
+            if request.execution_location is None:
+                request.execution_location = parent.execution_location
+            if request.workdir is None:
+                request.workdir = parent.workdir
+            if request.branch_name is None:
+                request.branch_name = parent.branch_name
+            if request.pr_url is None:
+                request.pr_url = parent.pr_url
         snapshot = self.runtime_snapshot
         agents = _dict_from(snapshot.get("agents"))
         profiles = _dict_from(snapshot.get("runtime_profiles"))
@@ -342,6 +371,12 @@ class AgentRuntimeControlPlane:
         )
         if request.model is None and raw_profile.get("model") is not None:
             request.model = str(raw_profile["model"])
+        if (
+            parent is not None
+            and request.executor_session_id is None
+            and _can_resume_from_parent(request, parent)
+        ):
+            request.executor_session_id = parent.executor_session_id
         return request
 
     def claim_task(
@@ -876,7 +911,20 @@ class AgentRuntimeControlPlane:
             else:
                 task.status = TaskStatus.FAILED
                 task.output = result.output
-            task.executor_session_id = result.executor_session_id
+            if result.executor_session_id:
+                task.executor_session_id = result.executor_session_id
+                self._sessions[task_id] = TaskSessionRef(
+                    agent_id=task.agent_id,
+                    executor=task.executor or ExecutorType.REULEAUXCODER,
+                    execution_location=(
+                        task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+                    ),
+                    issue_id=task.issue_id,
+                    task_id=task_id,
+                    workdir=task.workdir,
+                    branch=task.branch_name,
+                    executor_session_id=task.executor_session_id,
+                )
             for event in result.events:
                 self._append_event_locked(task_id, event.type.value, event.to_dict())
                 expansion = expand_environment_executor_event(task.metadata, event)
@@ -916,9 +964,14 @@ class AgentRuntimeControlPlane:
         task_id: str,
         *,
         new_task_id: str | None = None,
+        resume_session: bool = False,
     ) -> TaskRecord:
         if self._store is not None:
-            task = self._store.retry_task(task_id, new_task_id=new_task_id)
+            task = self._store.retry_task(
+                task_id,
+                new_task_id=new_task_id,
+                resume_session=resume_session,
+            )
             self.notify_task_available()
             return task
         with self._lock:
@@ -942,6 +995,9 @@ class AgentRuntimeControlPlane:
                 branch_name=task.branch_name,
                 pr_url=task.pr_url,
                 workdir=task.workdir,
+                executor_session_id=task.executor_session_id
+                if resume_session
+                else None,
                 model=str(task.metadata.get("model"))
                 if task.metadata.get("model") is not None
                 else None,

@@ -97,7 +97,13 @@ class RuntimeStore(Protocol):
         artifacts: list[dict[str, Any]] | None = None,
     ) -> TaskRecord: ...
 
-    def retry_task(self, task_id: str, *, new_task_id: str | None = None) -> TaskRecord: ...
+    def retry_task(
+        self,
+        task_id: str,
+        *,
+        new_task_id: str | None = None,
+        resume_session: bool = False,
+    ) -> TaskRecord: ...
 
     def fail_task(self, task_id: str, *, error: str) -> TaskRecord: ...
 
