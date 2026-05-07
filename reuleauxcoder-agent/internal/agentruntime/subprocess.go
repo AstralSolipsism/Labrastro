@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -59,16 +58,14 @@ func (b SubprocessBackend) Execute(ctx context.Context, req RunRequest, opts Run
 	}
 
 	var events []Event
-	var output strings.Builder
+	parser := newStreamParser(req.Executor)
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	for scanner.Scan() {
-		event := normalizeStreamLine(req.Executor, scanner.Text())
-		if event.Type == EventText {
-			output.WriteString(event.Text)
+		for _, event := range parser.ParseLine(scanner.Text()) {
+			events = append(events, event)
+			emitEvent(opts, event)
 		}
-		events = append(events, event)
-		emitEvent(opts, event)
 	}
 	if err := scanner.Err(); err != nil {
 		event := Event{Type: EventError, Text: err.Error()}
@@ -87,11 +84,13 @@ func (b SubprocessBackend) Execute(ctx context.Context, req RunRequest, opts Run
 			events = append(events, event)
 			emitEvent(opts, event)
 			return RunResult{
-				TaskID: req.TaskID,
-				Status: status,
-				Output: output.String(),
-				Error:  errText,
-				Events: events,
+				TaskID:            req.TaskID,
+				Status:            status,
+				Output:            parser.Output(),
+				Error:             errText,
+				ExecutorSessionID: parser.SessionID(),
+				Usage:             parser.Usage(),
+				Events:            events,
 			}, waitErr
 		}
 		errText := strings.TrimSpace(stderr.Tail())
@@ -101,66 +100,39 @@ func (b SubprocessBackend) Execute(ctx context.Context, req RunRequest, opts Run
 			errText = withAgentStderr(waitErr.Error(), req.Executor, errText)
 		}
 		return RunResult{
-			TaskID: req.TaskID,
-			Status: "failed",
-			Output: output.String(),
-			Error:  errText,
-			Events: events,
+			TaskID:            req.TaskID,
+			Status:            "failed",
+			Output:            parser.Output(),
+			Error:             errText,
+			ExecutorSessionID: parser.SessionID(),
+			Usage:             parser.Usage(),
+			Events:            events,
 		}, waitErr
+	}
+	finalStatus := "completed"
+	finalError := ""
+	if parser.StatusOverride() != "" {
+		finalStatus = parser.StatusOverride()
+		finalError = parser.ErrorText()
 	}
 	events = append(events, Event{
 		Type: EventStatus,
 		Data: map[string]any{
-			"status":      "completed",
-			"duration_ms": time.Since(start).Milliseconds(),
+			"status":              finalStatus,
+			"duration_ms":         time.Since(start).Milliseconds(),
+			"executor_session_id": parser.SessionID(),
 		},
 	})
 	emitEvent(opts, events[len(events)-1])
 	return RunResult{
-		TaskID: req.TaskID,
-		Status: "completed",
-		Output: output.String(),
-		Events: events,
+		TaskID:            req.TaskID,
+		Status:            finalStatus,
+		Output:            parser.Output(),
+		Error:             finalError,
+		ExecutorSessionID: parser.SessionID(),
+		Usage:             parser.Usage(),
+		Events:            events,
 	}, nil
-}
-
-func normalizeStreamLine(provider, line string) Event {
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		if strings.EqualFold(provider, "reuleauxcoder") {
-			return Event{Type: EventText, Text: line, Data: map[string]any{"provider": provider}}
-		}
-		return Event{Type: EventLog, Text: line, Data: map[string]any{"provider": provider}}
-	}
-	if typ, ok := raw["type"].(string); ok {
-		switch strings.ReplaceAll(typ, "-", "_") {
-		case "text":
-			if text, ok := raw["text"].(string); ok && text != "" {
-				return Event{Type: EventText, Text: text, Data: raw}
-			}
-			if text, ok := raw["content"].(string); ok && text != "" {
-				return Event{Type: EventText, Text: text, Data: raw}
-			}
-			return Event{Type: EventText, Data: raw}
-		case "thinking":
-			return Event{Type: EventThinking, Data: raw}
-		case "tool_use":
-			return Event{Type: EventToolUse, Data: raw}
-		case "tool_result":
-			return Event{Type: EventToolResult, Data: raw}
-		case "error":
-			return Event{Type: EventError, Data: raw}
-		case "result":
-			return Event{Type: EventResult, Data: raw}
-		}
-	}
-	if text, ok := raw["content"].(string); ok && text != "" {
-		return Event{Type: EventText, Text: text, Data: raw}
-	}
-	if text, ok := raw["text"].(string); ok && text != "" {
-		return Event{Type: EventText, Text: text, Data: raw}
-	}
-	return Event{Type: EventStatus, Data: raw}
 }
 
 func mergeEnv(base []string, extra map[string]string) []string {

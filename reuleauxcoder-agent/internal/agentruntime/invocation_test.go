@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,16 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if fixture := os.Getenv("AGENTRUNTIME_HELPER_FIXTURE"); fixture != "" {
+		f, err := os.Open(fixture)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		_, _ = io.Copy(os.Stdout, f)
+		_ = f.Close()
+		os.Exit(0)
+	}
 	if os.Getenv("AGENTRUNTIME_HELPER_STREAM") == "1" {
 		fmt.Println(`{"type":"thinking","message":"plan"}`)
 		fmt.Println(`{"type":"text","text":"hello"}`)
@@ -22,29 +33,68 @@ func TestMain(m *testing.M) {
 
 func TestBuildInvocationFiltersProtocolCriticalArgs(t *testing.T) {
 	req := RunRequest{
-		TaskID:   "task-1",
-		AgentID:  "coder",
-		Executor: "claude",
-		Prompt:   "hello",
-		Model:    "claude-sonnet",
-		Workdir:  "/tmp/work",
+		TaskID:            "task-1",
+		AgentID:           "coder",
+		Executor:          "claude",
+		Prompt:            "hello",
+		Model:             "claude-sonnet",
+		Workdir:           "/tmp/work",
+		ExecutorSessionID: "claude-session-1",
 	}
 	inv, err := BuildInvocation(req, RunOptions{
 		SystemPrompt: "system",
-		CustomArgs:   []string{"--output-format", "text", "--dangerously-skip-permissions"},
+		CustomArgs: []string{
+			"--output-format", "text",
+			"--model", "hijacked-model",
+			"--resume", "hijacked-session",
+			"--dangerously-skip-permissions",
+		},
 	})
 	if err != nil {
 		t.Fatalf("BuildInvocation error: %v", err)
 	}
 	joined := strings.Join(inv.Args, " ")
-	if strings.Contains(joined, "text") {
+	if strings.Contains(joined, "text") || strings.Contains(joined, "hijacked") {
 		t.Fatalf("filtered value leaked into args: %v", inv.Args)
+	}
+	if countArg(inv.Args, "--resume") != 1 {
+		t.Fatalf("daemon-managed resume should appear exactly once: %v", inv.Args)
 	}
 	if !strings.Contains(joined, "--dangerously-skip-permissions") {
 		t.Fatalf("safe custom arg missing: %v", inv.Args)
 	}
 	if inv.Transport != "stream_json" {
 		t.Fatalf("transport = %q", inv.Transport)
+	}
+}
+
+func TestBuildGeminiInvocationFiltersProtocolCriticalArgs(t *testing.T) {
+	inv, err := BuildInvocation(RunRequest{
+		Executor:          "gemini",
+		Prompt:            "hello",
+		Model:             "gemini-pro",
+		ExecutorSessionID: "gemini-session-1",
+	}, RunOptions{
+		CustomArgs: []string{
+			"--prompt", "hijacked prompt",
+			"--output-format", "text",
+			"--resume", "hijacked-session",
+			"--model", "hijacked-model",
+			"--debug",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildInvocation error: %v", err)
+	}
+	joined := strings.Join(inv.Args, " ")
+	if strings.Contains(joined, "hijacked") || strings.Contains(joined, "text") {
+		t.Fatalf("filtered gemini value leaked: %v", inv.Args)
+	}
+	if countArg(inv.Args, "-r") != 1 {
+		t.Fatalf("daemon-managed -r should appear exactly once: %v", inv.Args)
+	}
+	if !strings.Contains(joined, "--debug") {
+		t.Fatalf("safe custom arg missing: %v", inv.Args)
 	}
 }
 
@@ -119,6 +169,54 @@ func TestNormalizeStreamLineMapsCommonCLIEvents(t *testing.T) {
 		if got := normalizeStreamLine("claude", tc.line); got.Type != tc.want {
 			t.Fatalf("line %s event type = %s want %s", tc.line, got.Type, tc.want)
 		}
+	}
+}
+
+func TestClaudeStreamParserExtractsSessionOutputToolsAndUsage(t *testing.T) {
+	parser := parseFixture(t, "claude", "testdata/claude_fresh.jsonl")
+	if parser.SessionID() != "claude-session-1" {
+		t.Fatalf("session id = %q", parser.SessionID())
+	}
+	if parser.Output() != "hello done" {
+		t.Fatalf("output = %q", parser.Output())
+	}
+	usage := parser.Usage()["claude-sonnet"]
+	if usage.InputTokens != 10 || usage.OutputTokens != 5 || usage.CacheReadTokens != 2 || usage.CacheWriteTokens != 3 {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestClaudeStreamParserMarksResultError(t *testing.T) {
+	parser := parseFixture(t, "claude", "testdata/claude_error.jsonl")
+	if parser.SessionID() != "claude-session-error" {
+		t.Fatalf("session id = %q", parser.SessionID())
+	}
+	if parser.StatusOverride() != "failed" || parser.ErrorText() != "model not found" {
+		t.Fatalf("status/error = %q %q", parser.StatusOverride(), parser.ErrorText())
+	}
+}
+
+func TestGeminiStreamParserExtractsSessionOutputToolsAndUsage(t *testing.T) {
+	parser := parseFixture(t, "gemini", "testdata/gemini_fresh.jsonl")
+	if parser.SessionID() != "gemini-session-1" {
+		t.Fatalf("session id = %q", parser.SessionID())
+	}
+	if parser.Output() != "hello " {
+		t.Fatalf("output = %q", parser.Output())
+	}
+	usage := parser.Usage()["gemini-pro"]
+	if usage.InputTokens != 13 || usage.OutputTokens != 8 || usage.CacheReadTokens != 4 {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestGeminiStreamParserMarksResultError(t *testing.T) {
+	parser := parseFixture(t, "gemini", "testdata/gemini_error.jsonl")
+	if parser.SessionID() != "gemini-session-error" {
+		t.Fatalf("session id = %q", parser.SessionID())
+	}
+	if parser.StatusOverride() != "failed" || parser.ErrorText() != "quota exceeded" {
+		t.Fatalf("status/error = %q %q", parser.StatusOverride(), parser.ErrorText())
 	}
 }
 
@@ -217,7 +315,7 @@ func TestSubprocessBackendStreamsEventsToSink(t *testing.T) {
 	sinkEvents := []Event{}
 	result, err := SubprocessBackend{}.Execute(
 		context.Background(),
-		RunRequest{TaskID: "task-stream", Executor: "gemini", Prompt: "ignored"},
+		RunRequest{TaskID: "task-stream", Executor: "reuleauxcoder", Prompt: "ignored"},
 		RunOptions{
 			Command: executable,
 			Env:     map[string]string{"AGENTRUNTIME_HELPER_STREAM": "1"},
@@ -238,6 +336,73 @@ func TestSubprocessBackendStreamsEventsToSink(t *testing.T) {
 	if sinkEvents[0].Type != EventThinking || sinkEvents[1].Type != EventText || sinkEvents[2].Type != EventStatus {
 		t.Fatalf("unexpected sink event order: %#v", sinkEvents)
 	}
+}
+
+func TestSubprocessBackendReturnsExecutorSessionIDFromClaudeStream(t *testing.T) {
+	fixture, err := filepath.Abs("testdata/claude_fresh.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sink []Event
+	result, err := SubprocessBackend{}.Execute(
+		context.Background(),
+		RunRequest{TaskID: "task-claude", Executor: "claude", Prompt: "ignored"},
+		RunOptions{
+			Command: os.Args[0],
+			Env: map[string]string{
+				"AGENTRUNTIME_HELPER_FIXTURE": fixture,
+			},
+			EventSink: func(event Event) {
+				sink = append(sink, event)
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result.ExecutorSessionID != "claude-session-1" {
+		t.Fatalf("executor session id = %q", result.ExecutorSessionID)
+	}
+	if result.Output != "hello done" {
+		t.Fatalf("output = %q", result.Output)
+	}
+	if !hasSessionPinnedEvent(sink, "claude-session-1") {
+		t.Fatalf("missing session pin event: %#v", sink)
+	}
+}
+
+func parseFixture(t *testing.T, provider, path string) *streamParser {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parser := newStreamParser(provider)
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		parser.ParseLine(line)
+	}
+	return parser
+}
+
+func hasSessionPinnedEvent(events []Event, sessionID string) bool {
+	for _, event := range events {
+		if event.Type == EventStatus &&
+			event.Data["status"] == "session_pinned" &&
+			event.Data["executor_session_id"] == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func countArg(args []string, target string) int {
+	count := 0
+	for _, arg := range args {
+		if arg == target {
+			count++
+		}
+	}
+	return count
 }
 
 func TestCodexAppServerNotificationsNormalizeEvents(t *testing.T) {

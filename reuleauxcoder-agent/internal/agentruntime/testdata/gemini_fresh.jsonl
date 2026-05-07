@@ -1,0 +1,5 @@
+{"type":"init","session_id":"gemini-session-1","model":"gemini-pro"}
+{"type":"message","role":"assistant","content":"hello "}
+{"type":"tool_use","tool_name":"read_file","tool_id":"call_1","parameters":{"path":"README.md"}}
+{"type":"tool_result","tool_id":"call_1","status":"success","output":"ok"}
+{"type":"result","status":"success","stats":{"total_tokens":21,"input_tokens":13,"output_tokens":8,"models":{"gemini-pro":{"total_tokens":21,"input_tokens":13,"output_tokens":8,"cached":4}}}}

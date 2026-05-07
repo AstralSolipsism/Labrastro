@@ -26,6 +26,9 @@ const (
 
 var claudeBlockedArgs = map[string]blockedArgMode{
 	"-p":                  blockedStandalone,
+	"-r":                  blockedWithValue,
+	"--resume":            blockedWithValue,
+	"--model":             blockedWithValue,
 	"--print":             blockedStandalone,
 	"--output-format":     blockedWithValue,
 	"--input-format":      blockedWithValue,
@@ -40,11 +43,15 @@ var codexBlockedArgs = map[string]blockedArgMode{
 }
 
 var geminiBlockedArgs = map[string]blockedArgMode{
-	"-p":     blockedWithValue,
-	"--yolo": blockedStandalone,
-	"-o":     blockedWithValue,
-	"-r":     blockedStandalone,
-	"-m":     blockedWithValue,
+	"-p":              blockedWithValue,
+	"--prompt":        blockedWithValue,
+	"--yolo":          blockedStandalone,
+	"-o":              blockedWithValue,
+	"--output-format": blockedWithValue,
+	"-r":              blockedWithValue,
+	"--resume":        blockedWithValue,
+	"-m":              blockedWithValue,
+	"--model":         blockedWithValue,
 }
 
 var reuleauxcoderBlockedArgs = map[string]blockedArgMode{
