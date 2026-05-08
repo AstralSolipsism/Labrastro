@@ -93,6 +93,7 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled", "blocked", 
 SMOKE_PERSISTENCE_RE = re.compile(
     r"\n# runtime_e2e_smoke [^\n]+\npersistence:\n(?:  .*(?:\n|$))*"
 )
+DEFAULT_SMOKE_DATABASE = "ezcode_smoke"
 
 
 def utc_timestamp() -> str:
@@ -265,7 +266,7 @@ class ServerRunner:
         if not self.pg_password:
             raise SystemExit("Postgres password is required")
         self.masker = Masker([self.pg_password])
-        self.db_name = args.database_name or f"ezcode_smoke_{self.timestamp.lower()}"
+        self.db_name = args.database_name or DEFAULT_SMOKE_DATABASE
         if not is_safe_identifier(self.db_name):
             raise SystemExit(f"Unsafe database name: {self.db_name}")
         if not is_safe_identifier(self.pg_user):
@@ -645,12 +646,11 @@ class ServerRunner:
 
     def create_database(self) -> str:
         self.log("create postgres smoke database")
-        exists = self.psql(
-            f"SELECT 1 FROM pg_database WHERE datname = '{self.db_name}'",
+        self.psql(
+            f"DROP DATABASE IF EXISTS {self.db_name} WITH (FORCE)",
             database="postgres",
-        ).stdout.strip()
-        if exists != "1":
-            self.psql(f"CREATE DATABASE {self.db_name}", database="postgres")
+        )
+        self.psql(f"CREATE DATABASE {self.db_name}", database="postgres")
         dsn = f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_container}:5432/{self.db_name}"
         self.masker.add(dsn)
         self.record_step("create_database", database=self.db_name)
