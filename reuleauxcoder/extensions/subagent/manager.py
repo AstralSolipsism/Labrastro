@@ -382,14 +382,12 @@ def _create_subagent_llm(parent_agent, model_profile_name: str | None):
         if normalized == "main":
             return (
                 getattr(config, "active_main_model_profile", None)
-                or getattr(config, "active_model_profile", None)
                 or getattr(config, "active_sub_model_profile", None)
             )
 
         return (
             getattr(config, "active_sub_model_profile", None)
             or getattr(config, "active_main_model_profile", None)
-            or getattr(config, "active_model_profile", None)
         )
 
     profile_name = _resolve_profile_name(model_profile_name)

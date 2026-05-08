@@ -161,7 +161,6 @@ def upgrade() -> None:
             total_prompt_tokens INT NOT NULL DEFAULT 0,
             total_completion_tokens INT NOT NULL DEFAULT 0,
             has_history_content BOOLEAN NOT NULL DEFAULT TRUE,
-            legacy_file_path TEXT,
             deleted_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

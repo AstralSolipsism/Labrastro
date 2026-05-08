@@ -251,7 +251,6 @@ def _handle_set_main_model(command, ctx) -> CommandResult:
     if profile is None:
         return CommandResult(action="continue")
 
-    ctx.config.active_model_profile = profile_name
     ctx.config.active_main_model_profile = profile_name
     ctx.config.model = profile.model
     provider = _profile_provider(ctx.config, profile)
@@ -260,7 +259,7 @@ def _handle_set_main_model(command, ctx) -> CommandResult:
     ctx.config.temperature = profile.temperature
     ctx.config.max_tokens = profile.max_tokens
     ctx.config.max_context_tokens = profile.max_context_tokens
-    path = WorkspaceConfigStore().save_active_model_profile(profile_name)
+    path = WorkspaceConfigStore().save_active_main_model_profile(profile_name)
 
     _apply_main_profile_to_runtime(ctx, profile_name, profile)
     payload = _refresh_model_view(ctx)
@@ -320,7 +319,6 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
     active_main = (
         runtime_main
         or getattr(config, "active_main_model_profile", None)
-        or getattr(config, "active_model_profile", None)
     )
     active_sub = (
         runtime_sub or getattr(config, "active_sub_model_profile", None) or active_main

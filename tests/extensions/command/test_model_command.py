@@ -59,7 +59,6 @@ def _build_ctx() -> SimpleNamespace:
         approval=ApprovalConfig(),
         model_profiles={"alpha": profile_a, "beta": profile_b},
         active_main_model_profile="alpha",
-        active_model_profile="alpha",
         active_sub_model_profile="alpha",
         max_context_tokens=64000,
     )
@@ -87,7 +86,6 @@ def test_switch_model_is_session_scoped() -> None:
     assert ctx.agent.llm.model == "model-beta"
     assert ctx.agent.active_main_model_profile == "beta"
     assert ctx.config.active_main_model_profile == "alpha"
-    assert ctx.config.active_model_profile == "alpha"
     assert result.payload["active_main_profile"] == "beta"
     assert result.payload["active_sub_profile"] == "alpha"
 
@@ -111,7 +109,7 @@ def test_set_main_model_updates_global_and_runtime(monkeypatch) -> None:
         return "/tmp/config.yaml"
 
     monkeypatch.setattr(
-        "reuleauxcoder.extensions.command.builtin.model.WorkspaceConfigStore.save_active_model_profile",
+        "reuleauxcoder.extensions.command.builtin.model.WorkspaceConfigStore.save_active_main_model_profile",
         fake_save,
     )
 
@@ -119,7 +117,6 @@ def test_set_main_model_updates_global_and_runtime(monkeypatch) -> None:
 
     assert saved["profile_name"] == "beta"
     assert ctx.config.active_main_model_profile == "beta"
-    assert ctx.config.active_model_profile == "beta"
     assert ctx.config.model == "model-beta"
     assert ctx.agent.active_main_model_profile == "beta"
     assert result.payload["active_main_profile"] == "beta"

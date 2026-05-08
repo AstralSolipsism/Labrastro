@@ -1,5 +1,4 @@
 models:
-  active: host-main
   active_main: host-main
   profiles:
     host-main:
@@ -39,7 +38,7 @@ remote_exec:
 auth:
   enabled: true
   token_secret: ${LABRASTRO_AUTH_TOKEN_SECRET}
-  store_backend: auto
+  store_backend: postgres
   store_path: .rcoder/auth.json
   password_min_length: 10
   password_max_length: 256
@@ -69,16 +68,15 @@ agent_runtime:
         - environment.manifest.read
 
 persistence:
-  backend: auto
+  backend: postgres
   database_url: ${LABRASTRO_DATABASE_URL}
   auto_migrate: true
   runtime_enabled: true
   sessions_enabled: true
-  legacy_session_import: lazy
   retention_days: 0
 
 session:
-  auto_save: false
+  auto_save: true
 
 skills:
   enabled: true

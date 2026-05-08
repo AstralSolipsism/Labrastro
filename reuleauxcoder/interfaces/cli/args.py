@@ -27,10 +27,6 @@ def parse_args():
     db_subparsers = db_parser.add_subparsers(dest="db_command")
     db_subparsers.add_parser("migrate", help="Run database migrations")
     db_subparsers.add_parser("status", help="Print current database migration revision")
-    import_sessions = db_subparsers.add_parser(
-        "import-sessions", help="Import legacy JSON sessions into Postgres"
-    )
-    import_sessions.add_argument("--session-dir")
     cleanup = db_subparsers.add_parser(
         "cleanup", help="Delete old persisted snapshots and terminal task events"
     )

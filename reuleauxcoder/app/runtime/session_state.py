@@ -175,9 +175,7 @@ def restore_config_runtime_defaults(config: Config, agent: Agent) -> None:
         pass
     else:
         profiles = getattr(config, "model_profiles", {}) or {}
-        main_profile_name = getattr(config, "active_main_model_profile", None) or getattr(
-            config, "active_model_profile", None
-        )
+        main_profile_name = getattr(config, "active_main_model_profile", None)
         if main_profile_name and main_profile_name in profiles:
             profile = profiles[main_profile_name]
             reconfigure_llm_from_settings(
@@ -190,9 +188,7 @@ def restore_config_runtime_defaults(config: Config, agent: Agent) -> None:
         else:
             agent.llm.debug_trace = getattr(config, "llm_debug_trace", False)
         setattr(agent, "active_main_model_profile", main_profile_name)
-    main_profile_name = getattr(config, "active_main_model_profile", None) or getattr(
-        config, "active_model_profile", None
-    )
+    main_profile_name = getattr(config, "active_main_model_profile", None)
     setattr(
         agent,
         "active_sub_model_profile",

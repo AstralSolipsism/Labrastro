@@ -3,8 +3,7 @@
 # Expected YAML structure for config.yaml
 CONFIG_SCHEMA = {
     "models": {
-        "active": "string (optional, legacy alias of active_main, defaults to first profile key)",
-        "active_main": "string (optional, defaults to active or first profile key)",
+        "active_main": "string (optional, defaults to first profile key)",
         "active_sub": "string (optional, defaults to active_main)",
         "profiles": {
             "profile_name": {
@@ -49,14 +48,6 @@ CONFIG_SCHEMA = {
                 "allowed_subagent_modes": "list of strings (optional)",
             }
         },
-    },
-    "app": {
-        "model": "string (legacy, auto-migrated)",
-        "api_key": "string (legacy, auto-migrated)",
-        "base_url": "string (legacy, auto-migrated)",
-        "max_tokens": "int (legacy, auto-migrated)",
-        "temperature": "float (legacy, auto-migrated)",
-        "max_context_tokens": "int (legacy, auto-migrated)",
     },
     "approval": {
         "default_mode": "string (default: require_approval, one of allow/warn/require_approval/deny)",
@@ -202,7 +193,6 @@ CONFIG_SCHEMA = {
         "auto_migrate": "bool (default: true)",
         "runtime_enabled": "bool (default: true)",
         "sessions_enabled": "bool (default: true)",
-        "legacy_session_import": "string (one of lazy, disabled; default lazy)",
         "retention_days": "int (default: 0, zero keeps runtime events and snapshots forever)",
     },
     "environment": {

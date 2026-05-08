@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -15,6 +16,58 @@ ProviderType = Literal["openai_chat", "anthropic_messages", "openai_responses"]
 ProviderCompat = Literal["generic", "deepseek", "kimi", "glm", "qwen", "zenmux"]
 
 SUPPORTED_PROVIDER_COMPATS = {"generic", "deepseek", "kimi", "glm", "qwen", "zenmux"}
+
+DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID = "environment_local"
+DEFAULT_ENVIRONMENT_AGENT_ID = "environment_configurator"
+DEFAULT_ENVIRONMENT_RUNTIME_PROFILE: dict[str, Any] = {
+    "executor": "reuleauxcoder",
+    "execution_location": "local_workspace",
+    "runtime_home_policy": "per_task",
+    "approval_mode": "full",
+}
+DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
+    "name": "Environment Configurator",
+    "description": "Checks and configures the local workspace environment from the server manifest.",
+    "runtime_profile": DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
+    "capabilities": [
+        "environment.check",
+        "environment.configure",
+        "environment.manifest.read",
+    ],
+}
+
+
+def ensure_default_environment_agent_runtime(
+    data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return agent_runtime data with the current system environment Agent present."""
+
+    runtime = deepcopy(data) if isinstance(data, dict) else {}
+    raw_profiles = runtime.get("runtime_profiles")
+    profiles = raw_profiles if isinstance(raw_profiles, dict) else {}
+    runtime["runtime_profiles"] = profiles
+    profile = profiles.get(DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID)
+    if not isinstance(profile, dict):
+        profiles[DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID] = deepcopy(
+            DEFAULT_ENVIRONMENT_RUNTIME_PROFILE
+        )
+    else:
+        for key, value in DEFAULT_ENVIRONMENT_RUNTIME_PROFILE.items():
+            profile.setdefault(key, deepcopy(value))
+
+    raw_agents = runtime.get("agents")
+    agents = raw_agents if isinstance(raw_agents, dict) else {}
+    runtime["agents"] = agents
+    agent = agents.get(DEFAULT_ENVIRONMENT_AGENT_ID)
+    if not isinstance(agent, dict):
+        agents[DEFAULT_ENVIRONMENT_AGENT_ID] = deepcopy(DEFAULT_ENVIRONMENT_AGENT)
+    else:
+        for key, value in DEFAULT_ENVIRONMENT_AGENT.items():
+            if key not in agent:
+                agent[key] = deepcopy(value)
+        if not isinstance(agent.get("capabilities"), list):
+            agent["capabilities"] = list(DEFAULT_ENVIRONMENT_AGENT["capabilities"])
+    return runtime
 
 
 def normalize_provider_compat(value: Any) -> ProviderCompat:
@@ -731,7 +784,6 @@ class PersistenceConfig:
     auto_migrate: bool = True
     runtime_enabled: bool = True
     sessions_enabled: bool = True
-    legacy_session_import: str = "lazy"
     retention_days: int = 0
 
     @classmethod
@@ -744,7 +796,6 @@ class PersistenceConfig:
             auto_migrate=bool(data.get("auto_migrate", True)),
             runtime_enabled=bool(data.get("runtime_enabled", True)),
             sessions_enabled=bool(data.get("sessions_enabled", True)),
-            legacy_session_import=str(data.get("legacy_session_import", "lazy") or "lazy"),
             retention_days=int(data.get("retention_days", 0) or 0),
         )
 
@@ -755,7 +806,6 @@ class PersistenceConfig:
             "auto_migrate": self.auto_migrate,
             "runtime_enabled": self.runtime_enabled,
             "sessions_enabled": self.sessions_enabled,
-            "legacy_session_import": self.legacy_session_import,
             "retention_days": self.retention_days,
         }
 
@@ -1068,7 +1118,6 @@ class Config:
     mcp_artifact_root: str = ".rcoder/mcp-artifacts"
     model_profiles: dict[str, ModelProfileConfig] = field(default_factory=dict)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
-    active_model_profile: Optional[str] = None
     active_main_model_profile: Optional[str] = None
     active_sub_model_profile: Optional[str] = None
 
@@ -1176,8 +1225,6 @@ class Config:
             errors.append("persistence.backend must be one of auto, memory, postgres")
         if self.persistence.backend == "postgres" and not self.persistence.database_url:
             errors.append("persistence.database_url is required when backend is postgres")
-        if self.persistence.legacy_session_import not in {"lazy", "disabled"}:
-            errors.append("persistence.legacy_session_import must be lazy or disabled")
         if self.persistence.retention_days < 0:
             errors.append("persistence.retention_days must be zero or positive")
         if self.github.enabled:
@@ -1218,11 +1265,6 @@ class Config:
                     f"agent_runtime.agents[{agent_id}].model.model is required when provider is set"
                 )
         valid_actions = {"allow", "warn", "require_approval", "deny"}
-        if (
-            self.active_model_profile
-            and self.active_model_profile not in self.model_profiles
-        ):
-            errors.append("active_model_profile must exist in model_profiles")
         if (
             self.active_main_model_profile
             and self.active_main_model_profile not in self.model_profiles

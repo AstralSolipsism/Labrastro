@@ -34,7 +34,7 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
     merged = loader._merge_dicts(
         {
             "models": {
-                "active": "main",
+                "active_main": "main",
                 "profiles": {
                     "main": {"model": "gpt-4o", "api_key": "k1"},
                     "sub": {"model": "gpt-4o-mini", "api_key": "k2"},
@@ -43,7 +43,7 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
         },
         {
             "models": {
-                "active": "sub",
+                "active_main": "sub",
                 "profiles": {
                     "main": {"temperature": 0.2},
                     "extra": {"model": "x", "api_key": "k3"},
@@ -52,7 +52,7 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
         },
     )
 
-    assert merged["models"]["active"] == "sub"
+    assert merged["models"]["active_main"] == "sub"
     assert merged["models"]["profiles"]["main"] == {
         "model": "gpt-4o",
         "api_key": "k1",
@@ -60,6 +60,19 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
     }
     assert "sub" in merged["models"]["profiles"]
     assert "extra" in merged["models"]["profiles"]
+
+
+def test_parse_config_defaults_session_auto_save_enabled() -> None:
+    config = ConfigLoader()._parse_config({})
+
+    assert config.session_auto_save is True
+
+
+def test_host_config_keeps_session_auto_save_enabled() -> None:
+    config_path = Path(__file__).resolve().parents[3] / "docker" / "config.host.yaml"
+    data = ConfigLoader()._load_yaml(config_path)
+
+    assert data["session"]["auto_save"] is True
 
 
 def test_parse_config_selects_active_profiles_and_modes() -> None:
@@ -104,7 +117,6 @@ def test_parse_config_selects_active_profiles_and_modes() -> None:
 
     assert config.model == "gpt-main"
     assert config.api_key == "main-key"
-    assert config.active_model_profile == "main"
     assert config.active_main_model_profile == "main"
     assert config.active_sub_model_profile == "sub"
     assert config.active_mode == "coder"
@@ -146,13 +158,10 @@ def test_parse_config_reads_provider_backed_profiles() -> None:
         }
     )
 
-    coder_model = config.agent_runtime.agents["coder"].model
     assert config.providers.items["anthropic-main"].type == "anthropic_messages"
     assert config.providers.items["anthropic-main"].compat == "deepseek"
     assert config.model_profiles["main"].provider == "anthropic-main"
-    assert coder_model.provider == "anthropic-main"
-    assert coder_model.model == "claude-sonnet"
-    assert coder_model.display_name == "main"
+    assert "coder" not in config.agent_runtime.agents
     assert config.api_key == "sk-ant"
     assert config.base_url == "https://api.anthropic.com"
 
@@ -512,7 +521,6 @@ def test_parse_config_falls_back_when_active_profile_missing() -> None:
 
     assert config.active_main_model_profile == "first"
     assert config.active_sub_model_profile == "first"
-    assert config.active_model_profile == "first"
     assert config.model == "gpt-first"
 
 
@@ -523,7 +531,6 @@ def test_merge_dicts_preserves_active_main_and_active_sub_across_layers() -> Non
     # Simulate global config
     global_data = {
         "models": {
-            "active": "glm-5",
             "active_main": "glm-5",
             "profiles": {
                 "glm-5": {"model": "glm-5", "api_key": "k"},
@@ -536,7 +543,6 @@ def test_merge_dicts_preserves_active_main_and_active_sub_across_layers() -> Non
     # Simulate workspace override
     workspace_data = {
         "models": {
-            "active": "ds-v4-pro",
             "active_main": "ds-v4-pro",
             "active_sub": "ds-v4-flash",
         }
@@ -544,7 +550,6 @@ def test_merge_dicts_preserves_active_main_and_active_sub_across_layers() -> Non
 
     merged = loader._merge_dicts(global_data, workspace_data)
 
-    assert merged["models"]["active"] == "ds-v4-pro"
     assert merged["models"]["active_main"] == "ds-v4-pro"
     assert merged["models"]["active_sub"] == "ds-v4-flash"
     # Profiles from global should survive

@@ -35,7 +35,6 @@ def test_create_subagent_llm_uses_full_profile_runtime_settings() -> None:
     config = Config(
         model_profiles={"sub-profile": sub_profile},
         active_main_model_profile="sub-profile",
-        active_model_profile="sub-profile",
         active_sub_model_profile="sub-profile",
     )
     parent_agent = SimpleNamespace(

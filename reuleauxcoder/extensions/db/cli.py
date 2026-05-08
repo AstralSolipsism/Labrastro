@@ -13,7 +13,6 @@ from labrastro_server.infrastructure.persistence.migration import (
 from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
-from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 from reuleauxcoder.services.config.loader import ConfigLoader
 
 
@@ -34,16 +33,6 @@ def run_db_cli(args) -> int:
         return 0
     if args.db_command == "status":
         print(current_revision(database_url) or "unversioned")
-        return 0
-    if args.db_command == "import-sessions":
-        engine = create_postgres_engine(database_url)
-        session_dir = Path(args.session_dir) if args.session_dir else None
-        store = PostgresSessionStore(
-            engine,
-            legacy_store=SessionStore(session_dir),
-            legacy_session_import="lazy",
-        )
-        print(f"imported_sessions={store.import_legacy_sessions(session_dir)}")
         return 0
     if args.db_command == "cleanup":
         engine = create_postgres_engine(database_url)

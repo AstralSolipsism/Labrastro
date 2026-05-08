@@ -130,12 +130,7 @@ def create_auth_store(config: Config) -> Any:
 
 def create_session_store(config: Config, sessions_dir: Path | None) -> Any:
     engine = _engine_for(config)
-    legacy_store = SessionStore(sessions_dir)
     if engine is None or not config.persistence.sessions_enabled:
-        return legacy_store
-    return PostgresSessionStore(
-        engine,
-        legacy_store=legacy_store,
-        legacy_session_import=config.persistence.legacy_session_import,
-    )
+        return SessionStore(sessions_dir)
+    return PostgresSessionStore(engine)
 

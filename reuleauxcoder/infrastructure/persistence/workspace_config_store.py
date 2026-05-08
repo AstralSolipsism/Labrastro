@@ -38,7 +38,7 @@ class WorkspaceConfigStore:
         save_yaml_config(self._path, data)
         return self._path
 
-    def save_active_model_profile(self, profile_name: str) -> Path:
+    def save_active_main_model_profile(self, profile_name: str) -> Path:
         """Persist active main model profile into workspace ``config.yaml``."""
         try:
             data = load_yaml_config(self._path)
@@ -46,7 +46,6 @@ class WorkspaceConfigStore:
             data = {}
 
         models_data = data.setdefault("models", {})
-        models_data["active"] = profile_name
         models_data["active_main"] = profile_name
         save_yaml_config(self._path, data)
         return self._path

@@ -62,6 +62,41 @@ def test_parse_config_reads_agent_runtime_profiles_and_agents() -> None:
         "code_review",
         "read_repo",
     ]
+    assert "environment_local" in config.agent_runtime.runtime_profiles
+    assert "environment_configurator" in config.agent_runtime.agents
+
+
+def test_parse_config_injects_environment_configurator_by_default() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "models": {
+                "active_main": "main",
+                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
+            },
+            "agent_runtime": {
+                "runtime_profiles": {
+                    "codex_remote": {
+                        "executor": "codex",
+                        "execution_location": "remote_server",
+                    }
+                },
+                "agents": {},
+            },
+        }
+    )
+
+    profile = config.agent_runtime.runtime_profiles["environment_local"]
+    assert profile.executor.value == "reuleauxcoder"
+    assert profile.execution_location.value == "local_workspace"
+    assert profile.runtime_home_policy == "per_task"
+    assert profile.approval_mode == "full"
+    agent = config.agent_runtime.agents["environment_configurator"]
+    assert agent.runtime_profile == "environment_local"
+    assert agent.capabilities == [
+        "environment.check",
+        "environment.configure",
+        "environment.manifest.read",
+    ]
 
 
 def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
@@ -185,7 +220,6 @@ def test_parse_config_reads_persistence_settings() -> None:
                 "auto_migrate": False,
                 "runtime_enabled": True,
                 "sessions_enabled": True,
-                "legacy_session_import": "disabled",
                 "retention_days": 30,
             },
         }
@@ -194,7 +228,6 @@ def test_parse_config_reads_persistence_settings() -> None:
     assert config.persistence.backend == "postgres"
     assert config.persistence.database_url == "postgresql://user:pass@localhost/labrastro"
     assert config.persistence.auto_migrate is False
-    assert config.persistence.legacy_session_import == "disabled"
     assert config.persistence.retention_days == 30
 
 
@@ -319,6 +352,11 @@ def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None
         "display_name": "V4 Pro",
         "parameters": {},
     }
+    assert "environment_configurator" in status["agent_profiles"]
+    environment_agent = status["server_settings"]["agent_runtime"]["agents"][
+        "environment_configurator"
+    ]
+    assert environment_agent["runtime_profile"] == "environment_local"
 
 
 def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agents() -> None:
@@ -379,8 +417,8 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
     runtime = manager.data["agent_runtime"]
     assert runtime["max_running_agents"] == 3
     assert runtime["max_shells_per_agent"] == 2
-    assert set(runtime["runtime_profiles"]) == {"fake_daemon"}
-    assert set(runtime["agents"]) == {"smoke"}
+    assert set(runtime["runtime_profiles"]) == {"fake_daemon", "environment_local"}
+    assert set(runtime["agents"]) == {"smoke", "environment_configurator"}
 
 
 def test_admin_server_settings_update_rejects_missing_agent_profile() -> None:

@@ -18,6 +18,7 @@ from reuleauxcoder.domain.config.models import (
     ModelProfileConfig,
     ProviderCapabilities,
     ProviderConfig,
+    ensure_default_environment_agent_runtime,
     infer_provider_compat,
 )
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULT_ACTIVE_MODE
@@ -118,7 +119,9 @@ class RemoteAdminConfigManager:
         data = self._load_data()
         raw_runtime = data.get("agent_runtime", {})
         runtime = AgentRuntimeConfig.from_dict(
-            raw_runtime if isinstance(raw_runtime, dict) else {}
+            ensure_default_environment_agent_runtime(
+                raw_runtime if isinstance(raw_runtime, dict) else {}
+            )
         )
         raw_github = data.get("github", {})
         github = GitHubConfig.from_dict(raw_github if isinstance(raw_github, dict) else {})
@@ -178,7 +181,11 @@ class RemoteAdminConfigManager:
                         merged_runtime[key] = deepcopy(raw_runtime[key])
                 merged = {"agent_runtime": merged_runtime}
                 try:
-                    runtime = AgentRuntimeConfig.from_dict(merged["agent_runtime"])
+                    runtime = AgentRuntimeConfig.from_dict(
+                        ensure_default_environment_agent_runtime(
+                            merged["agent_runtime"]
+                        )
+                    )
                 except Exception as exc:
                     return AdminConfigResult(
                         False,
@@ -195,7 +202,11 @@ class RemoteAdminConfigManager:
                     {"agent_runtime": raw_runtime},
                 )
                 try:
-                    runtime = AgentRuntimeConfig.from_dict(merged["agent_runtime"])
+                    runtime = AgentRuntimeConfig.from_dict(
+                        ensure_default_environment_agent_runtime(
+                            merged["agent_runtime"]
+                        )
+                    )
                 except Exception as exc:
                     return AdminConfigResult(
                         False,
@@ -684,7 +695,6 @@ class RemoteAdminConfigManager:
                 return AdminConfigResult(False, {"error": "profile_not_found"}, 404)
             if target in {"main", "both"}:
                 models["active_main"] = profile_id
-                models["active"] = profile_id
             if target in {"sub", "both"}:
                 models["active_sub"] = profile_id
             profile_data = profiles.get(profile_id)
@@ -782,20 +792,18 @@ class RemoteAdminConfigManager:
         self, data: dict[str, Any], active_mode: str | None
     ) -> dict[str, Any]:
         raw_runtime = data.get("agent_runtime", {})
-        runtime = raw_runtime if isinstance(raw_runtime, dict) else {}
+        runtime = ensure_default_environment_agent_runtime(
+            raw_runtime if isinstance(raw_runtime, dict) else {}
+        )
         raw_agents = runtime.get("agents", {})
         agents = deepcopy(raw_agents) if isinstance(raw_agents, dict) else {}
-        legacy_model = self._legacy_agent_model(data)
         mode_names = self._mode_names(data)
         for agent_id in mode_names:
             item = agents.get(agent_id)
             if not isinstance(item, dict):
-                item = {"name": agent_id}
-                agents[agent_id] = item
-            if legacy_model and not isinstance(item.get("model"), dict):
-                item["model"] = deepcopy(legacy_model)
-        if active_mode and active_mode not in agents and legacy_model:
-            agents[active_mode] = {"name": active_mode, "model": deepcopy(legacy_model)}
+                agents[agent_id] = {"name": agent_id}
+        if active_mode and active_mode not in agents:
+            agents[active_mode] = {"name": active_mode}
         return agents
 
     def _active_agent_model(
@@ -821,42 +829,6 @@ class RemoteAdminConfigManager:
         if isinstance(profiles, dict):
             names.update(str(name) for name in profiles.keys())
         return sorted(names)
-
-    def _legacy_agent_model(self, data: dict[str, Any]) -> dict[str, Any]:
-        models = data.get("models", {})
-        if not isinstance(models, dict):
-            return {}
-        profiles = models.get("profiles", {})
-        if not isinstance(profiles, dict) or not profiles:
-            return {}
-        profile_id = models.get("active_main") or models.get("active") or next(iter(profiles.keys()), "")
-        profile = profiles.get(profile_id)
-        if not isinstance(profile, dict):
-            return {}
-        provider = str(profile.get("provider") or "").strip()
-        model = str(profile.get("model") or "").strip()
-        if not provider or not model:
-            return {}
-        return {
-            "provider": provider,
-            "model": model,
-            "display_name": str(profile_id),
-            "parameters": {
-                key: profile[key]
-                for key in (
-                    "max_tokens",
-                    "temperature",
-                    "max_context_tokens",
-                    "preserve_reasoning_content",
-                    "backfill_reasoning_content_for_tool_calls",
-                    "reasoning_effort",
-                    "thinking_enabled",
-                    "reasoning_replay_mode",
-                    "reasoning_replay_placeholder",
-                )
-                if key in profile
-            },
-        }
 
     def _provider_profile_blockers(
         self, data: dict[str, Any], provider_id: str

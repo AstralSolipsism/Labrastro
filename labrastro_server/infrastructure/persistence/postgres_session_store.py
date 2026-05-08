@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 import json
 import time
@@ -57,14 +56,9 @@ class PostgresSessionStore:
     def __init__(
         self,
         engine: Any,
-        *,
-        legacy_store: SessionStore | None = None,
-        legacy_session_import: str = "lazy",
     ) -> None:
         _require_sqlalchemy()
         self.engine = engine
-        self.legacy_store = legacy_store
-        self.legacy_session_import = legacy_session_import
 
     @staticmethod
     def generate_session_id() -> str:
@@ -281,10 +275,6 @@ class PostgresSessionStore:
                 {"id": session_id},
             ).mappings().first()
         if row is None:
-            if self.legacy_session_import == "lazy":
-                imported = self._import_legacy_session(session_id)
-                if imported is not None:
-                    return imported
             return None
         return self._session_from_row(row)
 
@@ -327,7 +317,7 @@ class PostgresSessionStore:
                 ),
                 params,
             ).mappings().all()
-        listed = [
+        return [
             SessionMetadata(
                 id=str(row["id"]),
                 model=str(row["model"]),
@@ -339,20 +329,6 @@ class PostgresSessionStore:
             )
             for row in rows
         ]
-        if (
-            len(listed) < params["limit"]
-            and self.legacy_session_import == "lazy"
-            and self.legacy_store is not None
-        ):
-            seen = {item.id for item in listed}
-            for item in self.legacy_store.list(
-                limit=params["limit"], fingerprint=fingerprint
-            ):
-                if item.id not in seen:
-                    listed.append(item)
-                if len(listed) >= params["limit"]:
-                    break
-        return listed
 
     def get_latest(
         self, *, fingerprint: str | None = DEFAULT_SESSION_FINGERPRINT
@@ -378,8 +354,6 @@ class PostgresSessionStore:
             if isinstance(snapshot, dict):
                 return dict(snapshot), None
             return None, "snapshot_not_object"
-        if self.legacy_session_import == "lazy" and self.legacy_store is not None:
-            return self.legacy_store.load_snapshot(session_id)
         return None, None
 
     def save_snapshot(self, session_id: str, snapshot: dict) -> None:
@@ -437,54 +411,6 @@ class PostgresSessionStore:
     @staticmethod
     def get_exit_time(messages: list[dict]) -> str | None:
         return SessionStore.get_exit_time(messages)
-
-    def import_legacy_sessions(self, session_dir: Path | None = None) -> int:
-        legacy = SessionStore(session_dir) if session_dir is not None else self.legacy_store
-        if legacy is None:
-            return 0
-        count = 0
-        for item in legacy.list(limit=10_000, fingerprint=None):
-            if self._import_legacy_session(item.id, legacy_store=legacy) is not None:
-                count += 1
-        return count
-
-    def _import_legacy_session(
-        self, session_id: str, *, legacy_store: SessionStore | None = None
-    ) -> Session | None:
-        legacy = legacy_store or self.legacy_store
-        if legacy is None:
-            return None
-        loaded = legacy.load(session_id)
-        if loaded is None:
-            return None
-        self.save(
-            loaded.messages,
-            loaded.model,
-            session_id=loaded.id,
-            total_prompt_tokens=loaded.total_prompt_tokens,
-            total_completion_tokens=loaded.total_completion_tokens,
-            active_mode=loaded.active_mode,
-            runtime_state=loaded.runtime_state,
-            fingerprint=loaded.fingerprint,
-        )
-        snapshot, _ = legacy.load_snapshot(session_id)
-        if snapshot is not None:
-            self.save_snapshot(session_id, snapshot)
-        with self.engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    UPDATE labrastro_sessions
-                    SET legacy_file_path=:legacy_file_path
-                    WHERE id=:id
-                    """
-                ),
-                {
-                    "id": loaded.id,
-                    "legacy_file_path": str(legacy._get_session_path(loaded.id)),
-                },
-            )
-        return loaded
 
     def _session_from_row(self, row: Any) -> Session:
         messages = list(row["messages"] or [])
