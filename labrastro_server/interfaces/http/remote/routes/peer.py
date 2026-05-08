@@ -56,6 +56,7 @@ from reuleauxcoder.interfaces.events import UIEventKind
 class RemotePeerRoutes:
     def _handle_capabilities(self) -> None:
         runtime_capabilities = self._agent_runtime_capabilities()
+        session_history_status = self._session_history_status()
         self._send_json(
             HTTPStatus.OK,
             {
@@ -64,6 +65,10 @@ class RemotePeerRoutes:
                 "server_version": package_version(),
                 "capabilities": {
                     "sessions": self.service.session_handler is not None,
+                    "session_auto_save": session_history_status["session_auto_save"],
+                    "session_history_writable": session_history_status[
+                        "session_history_writable"
+                    ],
                     "chat_stream": self.service.stream_chat_handler is not None,
                     "taskflow": self.service.taskflow_service is not None,
                     "issue_assignment": self.service.issue_assignment_service
@@ -75,6 +80,25 @@ class RemotePeerRoutes:
                 },
             },
         )
+
+    def _session_history_status(self) -> dict[str, bool]:
+        provider = getattr(self.service, "session_history_status_provider", None)
+        if callable(provider):
+            try:
+                status = provider()
+                return {
+                    "session_auto_save": bool(status.get("session_auto_save", True)),
+                    "session_history_writable": bool(
+                        status.get("session_history_writable", False)
+                    ),
+                }
+            except Exception:
+                pass
+        sessions_available = self.service.session_handler is not None
+        return {
+            "session_auto_save": True,
+            "session_history_writable": sessions_available,
+        }
 
     def _agent_runtime_capabilities(self) -> dict[str, Any]:
         executor_capabilities: dict[str, dict[str, Any]] = {}

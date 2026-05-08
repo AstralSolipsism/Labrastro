@@ -838,6 +838,98 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
+    def test_runner_stream_chat_accepts_snapshot_after_ready_before_end(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        port = _free_port()
+        release = threading.Event()
+
+        def chat_behavior(agent: FakeAgent, prompt: str) -> str:
+            assert getattr(agent, "current_session_id", "")
+            release.wait(timeout=3)
+            return f"done:{prompt}"
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            session_dir=str(tmp_path / "sessions"),
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hello"},
+            )
+            cursor = 0
+            ready = None
+            deadline = time.time() + 3
+            while time.time() < deadline and ready is None:
+                _, stream_body = _json_request(
+                    "POST",
+                    f"{runner._relay_http_service.base_url}/remote/chat/stream",
+                    {
+                        "peer_token": peer_token,
+                        "chat_id": start_body["chat_id"],
+                        "cursor": cursor,
+                        "timeout_sec": 0.5,
+                    },
+                )
+                cursor = stream_body["next_cursor"]
+                ready = next(
+                    (
+                        event
+                        for event in stream_body["events"]
+                        if event["type"] == "remote_peer_ready"
+                    ),
+                    None,
+                )
+            assert ready is not None
+            session_id = ready["payload"]["session_id"]
+
+            _, snapshot_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/snapshot",
+                {
+                    "peer_token": peer_token,
+                    "session_id": session_id,
+                    "snapshot": {"version": 1, "sessionId": session_id},
+                },
+            )
+            assert snapshot_body["ok"] is True
+
+            _, listed = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/list",
+                {"peer_token": peer_token},
+            )
+            assert not any(item["id"] == session_id for item in listed["sessions"])
+
+            release.set()
+            _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+            _, listed_after = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/list",
+                {"peer_token": peer_token},
+            )
+            assert any(item["id"] == session_id for item in listed_after["sessions"])
+        finally:
+            release.set()
+            runner.cleanup(ctx.agent)
+
     def test_runner_stream_chat_uses_explicit_session_hint(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
@@ -980,6 +1072,11 @@ class TestRunnerRemoteExec:
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(workspace),
             )
+            _, capabilities = _json_request(
+                "GET", f"{runner._relay_http_service.base_url}/remote/capabilities"
+            )
+            assert capabilities["capabilities"]["session_auto_save"] is False
+            assert capabilities["capabilities"]["session_history_writable"] is False
 
             _, start_body = _json_request(
                 "POST",

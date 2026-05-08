@@ -175,42 +175,6 @@ def switch_session_model(
     if not isinstance(parameters, dict):
         parameters = {}
     display_name = str(payload.get("display_name") or "").strip()
-    legacy_profile_id = str(payload.get("profile_id") or payload.get("id") or "").strip()
-    if legacy_profile_id and (not provider_id or not model_id):
-        legacy_profile = (getattr(config, "model_profiles", {}) or {}).get(
-            legacy_profile_id
-        )
-        if legacy_profile is None:
-            return {
-                "ok": False,
-                "error": "model_profile_not_found",
-                "profile_id": legacy_profile_id,
-                "_status": 404,
-            }
-        provider_id = getattr(legacy_profile, "provider", None) or ""
-        model_id = getattr(legacy_profile, "model", None) or ""
-        display_name = legacy_profile_id
-        parameters = {
-            "max_tokens": getattr(legacy_profile, "max_tokens", None),
-            "temperature": getattr(legacy_profile, "temperature", None),
-            "max_context_tokens": getattr(legacy_profile, "max_context_tokens", None),
-            "preserve_reasoning_content": getattr(
-                legacy_profile, "preserve_reasoning_content", None
-            ),
-            "backfill_reasoning_content_for_tool_calls": getattr(
-                legacy_profile,
-                "backfill_reasoning_content_for_tool_calls",
-                None,
-            ),
-            "reasoning_effort": getattr(legacy_profile, "reasoning_effort", None),
-            "thinking_enabled": getattr(legacy_profile, "thinking_enabled", None),
-            "reasoning_replay_mode": getattr(
-                legacy_profile, "reasoning_replay_mode", None
-            ),
-            "reasoning_replay_placeholder": getattr(
-                legacy_profile, "reasoning_replay_placeholder", None
-            ),
-        }
     if not provider_id or not model_id:
         return {"ok": False, "error": "provider_model_required", "_status": 400}
     provider = getattr(config, "providers", None)
@@ -263,8 +227,7 @@ def switch_session_model(
             llm_debug_trace=getattr(config, "llm_debug_trace", None),
             active_main_model_profile=getattr(
                 config, "active_main_model_profile", None
-            )
-            or getattr(config, "active_model_profile", None),
+            ),
             active_sub_model_profile=getattr(config, "active_sub_model_profile", None),
         )
     )
@@ -422,6 +385,25 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 )
         return f"remote:{machine_key}:{workspace_root or '.'}"
 
+    def _session_history_status() -> dict[str, bool]:
+        current_config = _current_config()
+        session_auto_save = bool(
+            getattr(current_config, "session_auto_save", True)
+            if current_config is not None
+            else False
+        )
+        persistence = getattr(current_config, "persistence", None)
+        sessions_enabled = bool(getattr(persistence, "sessions_enabled", True))
+        return {
+            "session_auto_save": session_auto_save,
+            "session_history_writable": bool(
+                runner._relay_http_service
+                and runner._relay_http_service.session_handler is not None
+                and session_auto_save
+                and sessions_enabled
+            ),
+        }
+
     def _session_metadata_payload(
         session: Session | SessionMetadata,
     ) -> dict[str, Any]:
@@ -440,6 +422,27 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
     def _load_session_snapshot(session_id: str) -> tuple[dict[str, Any] | None, str | None]:
         return session_store.load_snapshot(session_id)
+
+    def _persist_session_placeholder(peer_agent: Agent, peer_id: str) -> None:
+        current_config = _current_config()
+        session_id = str(getattr(peer_agent, "current_session_id", "") or "")
+        if not session_id or current_config is None:
+            return
+        if not getattr(current_config, "session_auto_save", True):
+            return
+        if session_store.load(session_id) is not None:
+            return
+        save_runtime_state = getattr(session_store, "save_runtime_state", None)
+        if not callable(save_runtime_state):
+            return
+        save_runtime_state(
+            session_id,
+            getattr(getattr(peer_agent, "llm", None), "model", current_config.model),
+            build_session_runtime_state(current_config, peer_agent),
+            messages=[],
+            active_mode=getattr(peer_agent, "active_mode", None),
+            fingerprint=_peer_fingerprint(peer_id),
+        )
 
     def _handle_session_request(
         action: str, peer_id: str, payload: dict[str, Any]
@@ -503,8 +506,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 active_mode=getattr(current_config, "active_mode", None),
                 active_main_model_profile=getattr(
                     current_config, "active_main_model_profile", None
-                )
-                or getattr(current_config, "active_model_profile", None),
+                ),
                 active_sub_model_profile=getattr(
                     current_config, "active_sub_model_profile", None
                 ),
@@ -605,6 +607,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
         return {"ok": False, "error": "unknown_session_action", "_status": 404}
 
+    runner._relay_http_service.session_history_status_provider = _session_history_status
     runner._relay_http_service.set_session_handler(_handle_session_request)
 
     def _create_peer_agent(
@@ -810,6 +813,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return
 
         session_id = getattr(peer_agent, "current_session_id", "-") or "-"
+        _persist_session_placeholder(peer_agent, peer_id)
         peer_info = relay_server.registry.get(peer_id)
         connection_marker = (
             f"{getattr(peer_info, 'connected_at', 0):.6f}"

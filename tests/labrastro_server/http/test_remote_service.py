@@ -2111,6 +2111,8 @@ class TestRemoteRelayHTTPService:
             assert body["api_version"] == 1
             assert isinstance(body["server_version"], str)
             assert body["capabilities"]["sessions"] is True
+            assert body["capabilities"]["session_auto_save"] is True
+            assert body["capabilities"]["session_history_writable"] is True
             assert body["capabilities"]["chat_stream"] is True
             assert body["capabilities"]["taskflow"] is True
             assert body["capabilities"]["issue_assignment"] is True
@@ -2135,6 +2137,8 @@ class TestRemoteRelayHTTPService:
         try:
             _, body = _json_request("GET", f"{service.base_url}/remote/capabilities")
             assert body["capabilities"]["sessions"] is False
+            assert body["capabilities"]["session_auto_save"] is True
+            assert body["capabilities"]["session_history_writable"] is False
             assert body["capabilities"]["chat_stream"] is False
             assert body["capabilities"]["fresh_session_without_session_hint"] is False
             assert body["capabilities"]["peer_token_heartbeat_refresh"] is True
@@ -2939,11 +2943,13 @@ class TestRemoteRelayHTTPService:
             runtime_settings = update_body["settings"]["agent_runtime"]
             assert runtime_settings["max_running_agents"] == 3
             assert runtime_settings["max_shells_per_agent"] == 1
-            assert "runtime_profiles" not in runtime_settings
-            assert "agents" not in runtime_settings
+            assert set(runtime_settings["runtime_profiles"]) == {"environment_local"}
+            assert set(runtime_settings["agents"]) == {"environment_configurator"}
             assert control.max_running_tasks == 3
-            assert control.runtime_snapshot["runtime_profiles"] == {}
-            assert control.runtime_snapshot["agents"] == {}
+            assert set(control.runtime_snapshot["runtime_profiles"]) == {
+                "environment_local"
+            }
+            assert set(control.runtime_snapshot["agents"]) == {"environment_configurator"}
         finally:
             service.stop()
             relay.stop()

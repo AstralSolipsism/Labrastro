@@ -241,6 +241,7 @@ class RemoteRelayHTTPService:
         | None = None,
         session_handler: Callable[[str, str, dict[str, Any]], dict[str, Any]]
         | None = None,
+        session_history_status_provider: Callable[[], dict[str, Any]] | None = None,
         auth_service: AuthService | None = None,
         bootstrap_token_ttl_sec: int = 300,
         mcp_servers: list[Any] | None = None,
@@ -263,6 +264,7 @@ class RemoteRelayHTTPService:
         self.chat_handler = chat_handler
         self.stream_chat_handler = stream_chat_handler
         self.session_handler = session_handler
+        self.session_history_status_provider = session_history_status_provider
         if auth_service is None:
             raise ValueError("auth_service is required")
         self.auth_service = auth_service
