@@ -25,6 +25,8 @@ Labrastro 自有控制面使用新命名：
 - 数据库默认名、用户、volume：`labrastro`
 - 数据库环境变量：`LABRASTRO_DATABASE_URL`、`LABRASTRO_AUTO_MIGRATE`、`LABRASTRO_TEST_DATABASE_URL`
 
+完整命名兼容边界见 `docs/adr/0002-naming-boundary.md`。
+
 ## 能力概览
 
 - **Labrastro 后端基座**：为 VS Code/Webview 入口提供远端会话、模型调用、任务状态、环境清单和工具执行入口。
@@ -100,7 +102,7 @@ cd /data/labrastro/src/docker
 docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
 ```
 
-数据库迁移代码位于 `reuleauxcoder/infrastructure/persistence/migrations`。配置模板中的数据库连接读取 `LABRASTRO_DATABASE_URL`。
+数据库迁移代码位于 `labrastro_server/infrastructure/persistence/migrations`。配置模板中的数据库连接读取 `LABRASTRO_DATABASE_URL`。迁移策略见 `docs/adr/0001-database-migration-policy.md`；当前开发测试阶段可重建数据库，生产数据保留策略需另行发布。
 
 ## 远端登录
 
