@@ -14,8 +14,8 @@ from labrastro_server.services.auth.models import AuthDevice, AuthUser, RefreshT
 from labrastro_server.services.auth.postgres_store import PostgresAuthStore
 from labrastro_server.services.auth.service import AuthError, AuthService
 from reuleauxcoder.domain.config.models import AuthConfig, AuthSuperadminConfig
-from reuleauxcoder.infrastructure.persistence.db import create_postgres_engine
-from reuleauxcoder.infrastructure.persistence.migration import run_migrations
+from labrastro_server.infrastructure.persistence.db import create_postgres_engine
+from labrastro_server.infrastructure.persistence.migration import run_migrations
 
 
 TEST_PASSWORD = "admin-password"
