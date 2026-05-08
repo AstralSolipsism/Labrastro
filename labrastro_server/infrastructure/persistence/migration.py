@@ -33,7 +33,37 @@ def run_migrations(database_url: str) -> None:
     except ImportError as exc:  # pragma: no cover - exercised without extras.
         raise RuntimeError("Database migrations require alembic.") from exc
 
+    _ensure_alembic_version_capacity(database_url)
     command.upgrade(_alembic_config(database_url), "head")
+
+
+def _ensure_alembic_version_capacity(database_url: str) -> None:
+    try:
+        from sqlalchemy import create_engine, text
+    except ImportError as exc:  # pragma: no cover - exercised without extras.
+        raise RuntimeError("Database migrations require sqlalchemy.") from exc
+
+    engine = create_engine(normalize_database_url(database_url), pool_pre_ping=True)
+    with engine.begin() as conn:
+        if getattr(conn.dialect, "name", "") != "postgresql":
+            return
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS alembic_version (
+                    version_num VARCHAR(255) NOT NULL PRIMARY KEY
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE alembic_version
+                ALTER COLUMN version_num TYPE VARCHAR(255)
+                """
+            )
+        )
 
 
 def current_revision(database_url: str) -> str | None:
