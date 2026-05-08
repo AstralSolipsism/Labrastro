@@ -221,6 +221,9 @@ def test_parse_config_reads_persistence_settings() -> None:
                 "runtime_enabled": True,
                 "sessions_enabled": True,
                 "retention_days": 30,
+                "snapshot_max_versions_per_session": 12,
+                "snapshot_compress_threshold_bytes": 4096,
+                "maintenance_interval_sec": 120,
             },
         }
     )
@@ -229,6 +232,9 @@ def test_parse_config_reads_persistence_settings() -> None:
     assert config.persistence.database_url == "postgresql://user:pass@localhost/labrastro"
     assert config.persistence.auto_migrate is False
     assert config.persistence.retention_days == 30
+    assert config.persistence.snapshot_max_versions_per_session == 12
+    assert config.persistence.snapshot_compress_threshold_bytes == 4096
+    assert config.persistence.maintenance_interval_sec == 120
 
 
 def test_missing_persistence_database_url_env_is_optional() -> None:

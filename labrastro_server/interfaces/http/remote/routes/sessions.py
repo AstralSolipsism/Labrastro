@@ -84,36 +84,29 @@ class RemoteSessionRoutes:
                 peer_token = req.peer_token
                 session_payload = req.to_dict()
             else:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                self._send_error(HTTPStatus.NOT_FOUND, "not_found")
                 return
         except Exception:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "invalid_session_request"}
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.session_handler is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"ok": False, "error": "sessions_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "sessions_unavailable")
             return
 
         try:
             result = dict(self.service.session_handler(action, peer_id, session_payload))
             status = int(result.pop("_status", HTTPStatus.OK))
-        except Exception as exc:
-            self._send_json(
+        except Exception:
+            self._send_error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"ok": False, "error": str(exc)},
+                "session_request_failed",
             )
             return
         self._send_json(status, result)

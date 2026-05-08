@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from labrastro_server.interfaces.http.remote.protocol import (
@@ -9,6 +12,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     CleanupResult,
     ChatRequest,
     ChatStartRequest,
+    ChatStartResponse,
+    ChatStreamRequest,
+    ChatStreamResponse,
     DisconnectNotice,
     EnvironmentCLIToolManifest,
     EnvironmentMCPServerManifest,
@@ -30,11 +36,29 @@ from labrastro_server.interfaces.http.remote.protocol import (
     RegisterRequest,
     RegisterResponse,
     RelayEnvelope,
+    REMOTE_ENDPOINTS,
     SessionModelSwitchRequest,
+    SessionListRequest,
     ToolPreviewRequest,
     ToolPreviewResult,
     ToolStreamChunk,
+    endpoint_registry,
 )
+
+
+CONTRACT_FIXTURES_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "labrastro_server"
+    / "interfaces"
+    / "http"
+    / "remote"
+    / "protocol"
+    / "contracts.json"
+)
+
+
+def _contract_fixtures() -> dict:
+    return json.loads(CONTRACT_FIXTURES_PATH.read_text(encoding="utf-8"))
 
 
 class TestRelayEnvelope:
@@ -51,6 +75,66 @@ class TestRelayEnvelope:
         assert restored.request_id == "req-123"
         assert restored.peer_id == "peer-456"
         assert restored.payload["tool_name"] == "shell"
+
+
+class TestRemoteHTTPContract:
+    def test_endpoint_registry_is_serializable_and_unique(self) -> None:
+        registry = endpoint_registry()
+
+        assert registry
+        assert len(registry) == len({(item["method"], item["path"]) for item in registry})
+        assert registry == [endpoint.to_dict() for endpoint in REMOTE_ENDPOINTS]
+        assert {
+            "name",
+            "method",
+            "path",
+            "request_model",
+            "response_shape",
+            "auth",
+        } <= set(registry[0])
+
+    def test_contract_fixtures_have_registered_endpoints_and_error_shape(self) -> None:
+        contracts = _contract_fixtures()
+        endpoints = {
+            (endpoint.method, endpoint.path)
+            for endpoint in REMOTE_ENDPOINTS
+        }
+
+        assert contracts["version"] == 1
+        for fixture in contracts["fixtures"]:
+            assert (fixture["method"], fixture["path"]) in endpoints
+            response = fixture["response"]
+            if isinstance(response, dict) and response.get("ok") is False:
+                assert set(response) == {
+                    "ok",
+                    "error",
+                    "message",
+                    "details",
+                    "request_id",
+                }
+                assert isinstance(response["error"], str)
+                assert isinstance(response["message"], str)
+                assert isinstance(response["details"], dict)
+                assert isinstance(response["request_id"], str)
+
+    def test_contract_fixtures_roundtrip_protocol_models(self) -> None:
+        fixtures = {
+            fixture["name"]: fixture
+            for fixture in _contract_fixtures()["fixtures"]
+        }
+
+        register = fixtures["peer.register"]
+        RegisterRequest.from_dict(register["request"])
+        RegisterResponse.from_dict(register["response"]["payload"])
+        Heartbeat.from_dict(fixtures["peer.heartbeat"]["request"])
+        SessionListRequest.from_dict(fixtures["sessions.list"]["request"])
+        SessionModelSwitchRequest.from_dict(fixtures["sessions.model"]["request"])
+        ChatStartRequest.from_dict(fixtures["chat.start"]["request"])
+        ChatStartResponse.from_dict(fixtures["chat.start"]["response"])
+        ChatStreamRequest.from_dict(fixtures["chat.stream"]["request"])
+        ChatStreamResponse.from_dict(fixtures["chat.stream"]["response"])
+        EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
+        EnvironmentManifestResponse.from_dict(fixtures["environment.manifest"]["response"])
 
 
 class TestRegisterRequest:

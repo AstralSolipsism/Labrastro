@@ -51,21 +51,17 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
 )
+from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
 from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemoteRuntimeRoutes:
     def _handle_runtime_events_get(self, parsed: Any) -> None:
         peer_id = self._verify_query_peer(parsed)
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.runtime_control_plane is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "agent_runtime_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runtime_unavailable")
             return
         parts = [
             unquote(part)
@@ -77,7 +73,7 @@ class RemoteRuntimeRoutes:
             or parts[:3] != ["remote", "agent-runtime", "tasks"]
             or parts[4] != "events"
         ):
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            self._send_error(HTTPStatus.NOT_FOUND, "not_found")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         task_id = parts[3]
@@ -85,17 +81,36 @@ class RemoteRuntimeRoutes:
         timeout_sec = float(
             self._query_value(parsed, "timeout_sec", "0") or 0
         )
+        limit = clamp_event_limit(
+            int(self._query_value(parsed, "limit", "200") or 200)
+        )
         try:
             events = self.service.runtime_control_plane.wait_events(
-                task_id, after_seq=after_seq, timeout_sec=timeout_sec
+                task_id,
+                after_seq=after_seq,
+                timeout_sec=timeout_sec,
+                limit=limit,
             )
         except AttributeError:
             events = self.service.runtime_control_plane.list_events(
-                task_id, after_seq=after_seq
+                task_id, after_seq=after_seq, limit=limit
             )
+        next_seq = max([after_seq, *[int(event.seq) for event in events]])
+        has_more = bool(
+            self.service.runtime_control_plane.list_events(
+                task_id,
+                after_seq=next_seq,
+                limit=1,
+            )
+        )
         self._send_json(
             HTTPStatus.OK,
-            {"ok": True, "events": [event.to_dict() for event in events]},
+            {
+                "ok": True,
+                "events": [event.to_dict() for event in events],
+                "next_seq": next_seq,
+                "has_more": has_more,
+            },
         )
 
     def _handle_runtime_claim(self) -> None:
@@ -103,15 +118,10 @@ class RemoteRuntimeRoutes:
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.runtime_control_plane is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "agent_runtime_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runtime_unavailable")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         raw_executors = payload.get("executors", [])
@@ -138,23 +148,18 @@ class RemoteRuntimeRoutes:
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.runtime_control_plane is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "agent_runtime_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runtime_unavailable")
             return
         request_id = str(payload.get("request_id") or "")
         task_id = str(payload.get("task_id") or "")
         worker_id = str(payload.get("worker_id") or "")
         if not request_id or not task_id or not worker_id:
-            self._send_json(
+            self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                {"error": "request_id_task_id_and_worker_id_required"},
+                "request_id_task_id_and_worker_id_required",
             )
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
@@ -176,23 +181,18 @@ class RemoteRuntimeRoutes:
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.runtime_control_plane is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "agent_runtime_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runtime_unavailable")
             return
         request_id = str(payload.get("request_id") or "")
         task_id = str(payload.get("task_id") or "")
         worker_id = str(payload.get("worker_id") or "")
         if not request_id or not task_id or not worker_id:
-            self._send_json(
+            self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                {"error": "request_id_task_id_and_worker_id_required"},
+                "request_id_task_id_and_worker_id_required",
             )
             return
         metadata: dict[str, Any] = {}
@@ -223,7 +223,7 @@ class RemoteRuntimeRoutes:
                 metadata=metadata,
             )
         except KeyError:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "task_not_found"})
+            self._send_error(HTTPStatus.NOT_FOUND, "task_not_found")
             return
         if not ok:
             status = (
@@ -231,10 +231,7 @@ class RemoteRuntimeRoutes:
                 if reason == "task_not_found"
                 else HTTPStatus.FORBIDDEN
             )
-            self._send_json(
-                status,
-                {"ok": False, "error": reason or "claim_owner_mismatch"},
-            )
+            self._send_error(status, reason or "claim_owner_mismatch")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True})
@@ -244,26 +241,19 @@ class RemoteRuntimeRoutes:
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.runtime_control_plane is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "agent_runtime_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runtime_unavailable")
             return
         task_id = str(payload.get("task_id") or "")
         request_id = str(payload.get("request_id") or "")
         worker_id = str(payload.get("worker_id") or "")
         event_type = str(payload.get("type") or "")
         if not task_id or not event_type or not request_id or not worker_id:
-            self._send_json(
+            self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                {
-                    "error": "request_id_task_id_worker_id_and_type_required"
-                },
+                "request_id_task_id_worker_id_and_type_required",
             )
             return
         data = payload.get("data", {})
@@ -288,10 +278,7 @@ class RemoteRuntimeRoutes:
                 if reason == "task_not_found"
                 else HTTPStatus.FORBIDDEN
             )
-            self._send_json(
-                status,
-                {"ok": False, "error": reason or "claim_owner_mismatch"},
-            )
+            self._send_error(status, reason or "claim_owner_mismatch")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True})
@@ -301,23 +288,18 @@ class RemoteRuntimeRoutes:
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.runtime_control_plane is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "agent_runtime_unavailable"},
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runtime_unavailable")
             return
         task_id = str(payload.get("task_id") or "")
         request_id = str(payload.get("request_id") or "")
         worker_id = str(payload.get("worker_id") or "")
         if not task_id or not request_id or not worker_id:
-            self._send_json(
+            self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                {"error": "request_id_task_id_and_worker_id_required"},
+                "request_id_task_id_and_worker_id_required",
             )
             return
         raw_events = payload.get("events", [])
@@ -371,7 +353,7 @@ class RemoteRuntimeRoutes:
                 ],
             )
         except KeyError:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "task_not_found"})
+            self._send_error(HTTPStatus.NOT_FOUND, "task_not_found")
             return
         if not ok:
             status = (
@@ -379,10 +361,7 @@ class RemoteRuntimeRoutes:
                 if reason == "task_not_found"
                 else HTTPStatus.FORBIDDEN
             )
-            self._send_json(
-                status,
-                {"ok": False, "error": reason or "claim_owner_mismatch"},
-            )
+            self._send_error(status, reason or "claim_owner_mismatch")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         github: dict[str, Any] | None = None

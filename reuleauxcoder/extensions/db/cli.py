@@ -10,8 +10,8 @@ from labrastro_server.infrastructure.persistence.migration import (
     current_revision,
     run_migrations,
 )
-from labrastro_server.infrastructure.persistence.postgres_session_store import (
-    PostgresSessionStore,
+from labrastro_server.infrastructure.persistence.maintenance import (
+    PersistenceMaintenanceService,
 )
 from reuleauxcoder.services.config.loader import ConfigLoader
 
@@ -40,35 +40,23 @@ def run_db_cli(args) -> int:
         if days <= 0:
             print("retention_days must be positive for cleanup", file=sys.stderr)
             return 1
-        try:
-            from sqlalchemy import text
-        except ImportError as exc:
-            print(f"sqlalchemy required: {exc}", file=sys.stderr)
-            return 1
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM labrastro_session_snapshots
-                    WHERE created_at < now() - (:days * interval '1 day')
-                    """
-                ),
-                {"days": days},
-            )
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM labrastro_runtime_events
-                    WHERE created_at < now() - (:days * interval '1 day')
-                    AND task_id IN (
-                        SELECT id FROM labrastro_runtime_tasks
-                        WHERE status IN ('completed', 'failed', 'cancelled', 'blocked')
-                    )
-                    """
-                ),
-                {"days": days},
-            )
+        config = ConfigLoader.from_path(Path(args.config) if args.config else None)
+        maintenance = PersistenceMaintenanceService(
+            engine,
+            retention_days=days,
+            snapshot_max_versions_per_session=(
+                config.persistence.snapshot_max_versions_per_session
+            ),
+            interval_sec=config.persistence.maintenance_interval_sec,
+        )
+        result = maintenance.run_once()
         print(f"cleanup_complete retention_days={days}")
+        print(
+            "deleted "
+            f"snapshot_versions={result.snapshot_versions_deleted} "
+            f"snapshots={result.snapshot_retention_deleted} "
+            f"runtime_events={result.runtime_events_deleted}"
+        )
         return 0
     print("unknown db command", file=sys.stderr)
     return 1

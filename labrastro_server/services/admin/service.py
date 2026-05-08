@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -74,6 +75,17 @@ class RemoteAdminConfigManager:
             "agent_runtime": get_agent_runtime_limiter().snapshot(),
         }
 
+    def config_etag(self, data: dict[str, Any] | None = None) -> str:
+        payload = json.dumps(
+            data if data is not None else self._load_data(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        import hashlib
+
+        return f'"sha256-{hashlib.sha256(payload).hexdigest()}"'
+
     def list_modes(self) -> dict[str, Any]:
         data = self._load_data()
         raw_modes = data.get("modes", {})
@@ -131,6 +143,7 @@ class RemoteAdminConfigManager:
                 "github": github.to_dict(mask_secret=True),
             },
             "runtime": get_agent_runtime_limiter().snapshot(),
+            "config_etag": self.config_etag(data),
         }
 
     def update_server_settings(self, payload: dict[str, Any]) -> AdminConfigResult:

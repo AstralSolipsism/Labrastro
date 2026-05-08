@@ -14,12 +14,14 @@ from labrastro_server.services.auth.crypto import (
     verify_password,
 )
 from labrastro_server.services.auth.models import (
+    AccessTokenRecord,
     AUTH_ROLES,
     AUTH_SCOPES,
     AuthDevice,
     AuthPrincipal,
     AuthSession,
     AuthUser,
+    LoginFailureRecord,
     RefreshTokenRecord,
     effective_scopes,
     normalize_scopes,
@@ -58,8 +60,6 @@ class AuthService:
         self.config = config
         self.store = store
         self.issue_bootstrap_token = issue_bootstrap_token
-        self._access_tokens: dict[str, tuple[AuthPrincipal, float]] = {}
-        self._failed_logins: dict[tuple[str, str], list[float]] = {}
         self._sync_configured_superadmins()
 
     def state(self) -> dict[str, Any]:
@@ -151,23 +151,25 @@ class AuthService:
     def authenticate_access_token(self, token: str) -> AuthPrincipal | None:
         if not token:
             return None
-        item = self._access_tokens.get(token)
-        if item is None:
+        token_hash = hash_token(token, self.config.token_secret)
+        record = self.store.get_access_token_by_hash(token_hash)
+        if record is None:
             return None
-        principal, expires_at = item
-        if expires_at <= time.time():
-            self._access_tokens.pop(token, None)
+        now = time.time()
+        if record.revoked_at is not None:
             return None
-        user = self.store.get_user_by_id(principal.user_id)
+        if record.expires_at <= now:
+            self.store.update_access_token(replace(record, revoked_at=now))
+            return None
+        user = self.store.get_user_by_id(record.user_id)
         if user is None or not user.enabled:
-            self._access_tokens.pop(token, None)
+            self.store.update_access_token(replace(record, revoked_at=now))
             return None
-        if principal.device_id:
-            device = self.store.get_device(principal.device_id)
-            if device is None or device.revoked_at is not None:
-                self._access_tokens.pop(token, None)
-                return None
-        return self._principal_for(user, principal.device_id)
+        device = self.store.get_device(record.device_id)
+        if device is None or device.revoked_at is not None:
+            self.store.update_access_token(replace(record, revoked_at=now))
+            return None
+        return self._principal_for(user, record.device_id)
 
     def require_roles(
         self, principal: AuthPrincipal | None, roles: set[str]
@@ -467,7 +469,16 @@ class AuthService:
         refresh_token = "rt_" + secrets.token_urlsafe(32)
         refresh_expires_at = now + self.config.refresh_token_ttl_sec
         principal = self._principal_for(user, device.id)
-        self._access_tokens[access_token] = (principal, access_expires_at)
+        self.store.record_access_token(
+            AccessTokenRecord(
+                id="at_" + uuid.uuid4().hex,
+                user_id=user.id,
+                device_id=device.id,
+                token_hash=hash_token(access_token, self.config.token_secret),
+                expires_at=access_expires_at,
+                created_at=now,
+            )
+        )
         self.store.record_refresh_token(
             RefreshTokenRecord(
                 id="rt_" + uuid.uuid4().hex,
@@ -579,34 +590,39 @@ class AuthService:
     def _check_login_rate_limit(self, username: str, source: str) -> None:
         limit = int(getattr(self.config, "login_rate_limit_count", 5) or 5)
         window = int(getattr(self.config, "login_rate_limit_window_sec", 900) or 900)
-        key = (username.strip().lower(), source)
         now = time.time()
-        recent = [
-            timestamp
-            for timestamp in self._failed_logins.get(key, [])
-            if timestamp >= now - window
-        ]
-        self._failed_logins[key] = recent
-        if len(recent) >= limit:
+        self.store.delete_old_login_failures(before=now - window)
+        recent = self.store.count_login_failures(
+            username=username.strip().lower(),
+            source=source,
+            since=now - window,
+        )
+        if recent >= limit:
             self._audit("login_rate_limited", username=username, source_ip=source)
             raise AuthError("rate_limited")
 
     def _record_failed_login(self, username: str, source: str) -> None:
-        key = (username.strip().lower(), source)
-        self._failed_logins.setdefault(key, []).append(time.time())
+        self.store.record_login_failure(
+            LoginFailureRecord(
+                id="lf_" + uuid.uuid4().hex,
+                username=username.strip().lower(),
+                source=source,
+                failed_at=time.time(),
+            )
+        )
 
     def _clear_failed_login(self, username: str, source: str) -> None:
-        self._failed_logins.pop((username.strip().lower(), source), None)
+        self.store.clear_login_failures(
+            username=username.strip().lower(),
+            source=source,
+        )
 
     def _revoke_access_tokens(self, user_id: str, device_id: str | None) -> None:
-        revoked = [
-            token
-            for token, (principal, _expires_at) in self._access_tokens.items()
-            if principal.user_id == user_id
-            and (device_id is None or principal.device_id == device_id)
-        ]
-        for token in revoked:
-            self._access_tokens.pop(token, None)
+        self.store.revoke_access_tokens(
+            user_id=user_id,
+            device_id=device_id,
+            revoked_at=time.time(),
+        )
 
     def _revoke_other_device_sessions(
         self, user_id: str, current_device_id: str | None, revoked_at: float
@@ -617,15 +633,17 @@ class AuthService:
                 continue
             self.store.update_refresh_token(replace(token, revoked_at=revoked_at))
             revoked += 1
-        for token, (principal, _expires_at) in list(self._access_tokens.items()):
-            if principal.user_id == user_id and principal.device_id != current_device_id:
-                self._access_tokens.pop(token, None)
+        self.store.revoke_access_tokens(
+            user_id=user_id,
+            exclude_device_id=current_device_id,
+            revoked_at=revoked_at,
+        )
         return revoked
 
     def _revoke_user_sessions(self, user_id: str) -> int:
         now = time.time()
         revoked = self.store.revoke_refresh_tokens(user_id=user_id, revoked_at=now)
-        self._revoke_access_tokens(user_id, None)
+        self.store.revoke_access_tokens(user_id=user_id, revoked_at=now)
         return revoked
 
     def _audit(self, event_type: str, **payload: Any) -> None:

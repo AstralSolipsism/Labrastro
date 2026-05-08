@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import time
+import uuid
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -53,18 +54,123 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 )
 from reuleauxcoder.interfaces.events import UIEventKind
 
+
+class RemoteRouteError(Exception):
+    def __init__(
+        self,
+        status: int | HTTPStatus,
+        code: str,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message or code)
+        self.status = int(status)
+        self.code = code
+        self.message = message or _default_error_message(code)
+        self.details = details or {}
+
+
+def _default_error_message(code: str) -> str:
+    return {
+        "invalid_json": "request body must be valid JSON",
+        "invalid_content_length": "request content length is invalid",
+        "request_body_too_large": "request body is too large",
+        "unauthorized": "authentication required",
+        "forbidden": "permission denied",
+        "not_found": "route not found",
+        "internal_server_error": "internal server error",
+    }.get(code, code.replace("_", " "))
+
+
 class RemoteRelayBaseHandler:
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         return
 
     def _read_json(self) -> dict[str, Any]:
-        content_length = int(self.headers.get("Content-Length", "0"))
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError as exc:
+            raise RemoteRouteError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_content_length",
+            ) from exc
         if content_length <= 0:
             return {}
+        max_body = int(
+            getattr(self.service, "max_request_body_bytes", 16 * 1024 * 1024)
+            or 16 * 1024 * 1024
+        )
+        if content_length > max_body:
+            raise RemoteRouteError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "request_body_too_large",
+                details={"limit": max_body},
+            )
         raw = self.rfile.read(content_length)
         if not raw:
             return {}
-        return json.loads(raw.decode("utf-8"))
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RemoteRouteError(HTTPStatus.BAD_REQUEST, "invalid_json") from exc
+        if not isinstance(decoded, dict):
+            raise RemoteRouteError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_json",
+                "request body must be a JSON object",
+            )
+        return decoded
+
+    def _request_id(self) -> str:
+        request_id = getattr(self, "_remote_request_id", None)
+        if isinstance(request_id, str) and request_id:
+            return request_id
+        header = self.headers.get("X-Request-ID", "")
+        if isinstance(header, str) and header.strip():
+            request_id = header.strip()[:128]
+        else:
+            request_id = uuid.uuid4().hex
+        self._remote_request_id = request_id
+        return request_id
+
+    def _error_payload(
+        self,
+        code: str,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": code,
+            "message": message or _default_error_message(code),
+            "details": details or {},
+            "request_id": self._request_id(),
+        }
+
+    def _send_error(
+        self,
+        status: int | HTTPStatus,
+        code: str,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._send_json(status, self._error_payload(code, message, details))
+
+    def _coerce_error_payload(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if payload.get("ok") is False and "request_id" in payload:
+            return payload
+        raw_code = payload.get("error")
+        code = raw_code if isinstance(raw_code, str) and raw_code else "request_failed"
+        raw_message = payload.get("message")
+        message = raw_message if isinstance(raw_message, str) and raw_message else ""
+        details = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"ok", "error", "message", "request_id"}
+        }
+        return self._error_payload(code, message, details)
 
     def _accepts_gzip(self) -> bool:
         accepted = self.headers.get("Accept-Encoding", "")
@@ -83,6 +189,7 @@ class RemoteRelayBaseHandler:
         compressible: bool = False,
     ) -> None:
         response_headers = dict(headers or {})
+        response_headers.setdefault("X-Request-ID", self._request_id())
         data = body
         if (
             compressible
@@ -122,6 +229,8 @@ class RemoteRelayBaseHandler:
         payload: dict[str, Any],
         headers: dict[str, str] | None = None,
     ) -> None:
+        if int(status) >= 400:
+            payload = self._coerce_error_payload(payload)
         body = json.dumps(payload).encode("utf-8")
         self._send_response_body(
             status,
@@ -181,10 +290,10 @@ class RemoteRelayBaseHandler:
             self._bearer_token()
         )
         if principal is None:
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            self._send_error(HTTPStatus.UNAUTHORIZED, "unauthorized")
             return None
         if roles and principal.role not in roles:
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
             return None
         return principal
 
@@ -193,10 +302,10 @@ class RemoteRelayBaseHandler:
             self._bearer_token()
         )
         if principal is None:
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            self._send_error(HTTPStatus.UNAUTHORIZED, "unauthorized")
             return None
         if any(not principal.has_scope(scope) for scope in scopes):
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
             return None
         return principal
 

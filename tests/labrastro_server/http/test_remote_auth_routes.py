@@ -48,6 +48,14 @@ def _auth_headers(access_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
 
 
+def _assert_error_shape(body: dict, code: str) -> None:
+    assert body["ok"] is False
+    assert body["error"] == code
+    assert isinstance(body["message"], str)
+    assert isinstance(body["details"], dict)
+    assert isinstance(body["request_id"], str)
+
+
 def _auth_service(tmp_path: Path, relay: RelayServer) -> AuthService:
     store_path = tmp_path / "auth.json"
     store = FileAuthStore(store_path)
@@ -84,7 +92,9 @@ def _auth_service(tmp_path: Path, relay: RelayServer) -> AuthService:
     return service
 
 
-def _service(tmp_path: Path) -> tuple[RemoteRelayHTTPService, RelayServer]:
+def _service(
+    tmp_path: Path, **service_kwargs: object
+) -> tuple[RemoteRelayHTTPService, RelayServer]:
     relay = RelayServer()
     relay.start()
     service = RemoteRelayHTTPService(
@@ -92,6 +102,7 @@ def _service(tmp_path: Path) -> tuple[RemoteRelayHTTPService, RelayServer]:
         bind=f"127.0.0.1:{_free_port()}",
         auth_service=_auth_service(tmp_path, relay),
         bootstrap_token_ttl_sec=60,
+        **service_kwargs,
     )
     service.start()
     return service, relay
@@ -247,7 +258,9 @@ def test_bootstrap_token_is_bearer_protected_and_one_time(tmp_path: Path) -> Non
         except HTTPError as exc:
             assert exc.code == 403
             body = json.loads(exc.read().decode("utf-8"))
-            assert body["type"] == "register_rejected"
+            assert body["ok"] is False
+            assert body["error"] == "register_rejected"
+            assert body["details"]["reason"]
     finally:
         service.stop()
         relay.stop()
@@ -361,6 +374,57 @@ def test_auth_login_rate_limit_returns_429(tmp_path: Path) -> None:
             raise AssertionError("rate-limited login should fail")
         except HTTPError as exc:
             assert exc.code == 429
+    finally:
+        service.stop()
+        relay.stop()
+
+
+def test_invalid_json_unknown_route_and_body_limit_return_error_shape(
+    tmp_path: Path,
+) -> None:
+    service, relay = _service(tmp_path, max_request_body_bytes=32)
+    try:
+        invalid_req = request.Request(
+            f"{service.base_url}/remote/auth/login",
+            data=b"{invalid-json",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            _URLOPEN(invalid_req, timeout=5)
+            raise AssertionError("invalid JSON should fail")
+        except HTTPError as exc:
+            assert exc.code == 400
+            _assert_error_shape(
+                json.loads(exc.read().decode("utf-8")),
+                "invalid_json",
+            )
+
+        oversized_req = request.Request(
+            f"{service.base_url}/remote/auth/login",
+            data=json.dumps({"username": "x" * 64}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            _URLOPEN(oversized_req, timeout=5)
+            raise AssertionError("oversized JSON should fail")
+        except HTTPError as exc:
+            assert exc.code == 413
+            _assert_error_shape(
+                json.loads(exc.read().decode("utf-8")),
+                "request_body_too_large",
+            )
+
+        try:
+            _json_request("GET", f"{service.base_url}/remote/missing")
+            raise AssertionError("unknown route should fail")
+        except HTTPError as exc:
+            assert exc.code == 404
+            _assert_error_shape(
+                json.loads(exc.read().decode("utf-8")),
+                "not_found",
+            )
     finally:
         service.stop()
         relay.stop()

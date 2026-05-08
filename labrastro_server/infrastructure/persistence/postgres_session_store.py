@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Optional
+import gzip
 import json
 import time
 import uuid
@@ -35,6 +36,14 @@ def _json(value: Any) -> str:
     return json.dumps(value if value is not None else {}, ensure_ascii=False)
 
 
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value if value is not None else {},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _saved_at_to_dt(value: str | None) -> datetime:
     if not value or value == "?":
         return datetime.now(timezone.utc)
@@ -56,9 +65,14 @@ class PostgresSessionStore:
     def __init__(
         self,
         engine: Any,
+        *,
+        snapshot_compress_threshold_bytes: int = 262144,
     ) -> None:
         _require_sqlalchemy()
         self.engine = engine
+        self.snapshot_compress_threshold_bytes = max(
+            1, int(snapshot_compress_threshold_bytes or 1)
+        )
 
     @staticmethod
     def generate_session_id() -> str:
@@ -341,7 +355,8 @@ class PostgresSessionStore:
             row = conn.execute(
                 text(
                     """
-                    SELECT snapshot FROM labrastro_session_snapshots
+                    SELECT snapshot, snapshot_blob, snapshot_encoding
+                    FROM labrastro_session_snapshots
                     WHERE session_id=:session_id
                     ORDER BY version DESC
                     LIMIT 1
@@ -350,10 +365,10 @@ class PostgresSessionStore:
                 {"session_id": session_id},
             ).mappings().first()
         if row is not None:
-            snapshot = row["snapshot"]
-            if isinstance(snapshot, dict):
-                return dict(snapshot), None
-            return None, "snapshot_not_object"
+            snapshot, error = self._decode_snapshot_row(row)
+            if error is not None:
+                return None, error
+            return snapshot, None
         return None, None
 
     def save_snapshot(self, session_id: str, snapshot: dict) -> None:
@@ -361,6 +376,9 @@ class PostgresSessionStore:
         trace_nodes = snapshot.get("traceNodes", [])
         trace_edges = snapshot.get("traceEdges", [])
         turns = snapshot.get("turns", [])
+        snapshot_json, snapshot_blob, snapshot_encoding, snapshot_bytes = (
+            self._encode_snapshot(snapshot)
+        )
         with self.engine.begin() as conn:
             version = conn.execute(
                 text(
@@ -377,18 +395,20 @@ class PostgresSessionStore:
                     """
                     INSERT INTO labrastro_session_snapshots (
                         session_id, version, snapshot, stats, turn_count,
-                        trace_node_count, trace_edge_count
+                        trace_node_count, trace_edge_count, snapshot_blob,
+                        snapshot_encoding, snapshot_bytes
                     ) VALUES (
                         :session_id, :version, CAST(:snapshot AS JSONB),
                         CAST(:stats AS JSONB), :turn_count,
-                        :trace_node_count, :trace_edge_count
+                        :trace_node_count, :trace_edge_count, :snapshot_blob,
+                        :snapshot_encoding, :snapshot_bytes
                     )
                     """
                 ),
                 {
                     "session_id": session_id,
                     "version": int(version),
-                    "snapshot": _json(snapshot),
+                    "snapshot": snapshot_json,
                     "stats": _json(stats),
                     "turn_count": len(turns) if isinstance(turns, list) else 0,
                     "trace_node_count": len(trace_nodes)
@@ -397,6 +417,9 @@ class PostgresSessionStore:
                     "trace_edge_count": len(trace_edges)
                     if isinstance(trace_edges, list)
                     else 0,
+                    "snapshot_blob": snapshot_blob,
+                    "snapshot_encoding": snapshot_encoding,
+                    "snapshot_bytes": snapshot_bytes,
                 },
             )
 
@@ -407,6 +430,32 @@ class PostgresSessionStore:
                 {"session_id": session_id},
             )
             return int(result.rowcount or 0) > 0
+
+    def _encode_snapshot(
+        self, snapshot: dict
+    ) -> tuple[str | None, bytes | None, str, int]:
+        payload = _json_bytes(snapshot)
+        if len(payload) >= self.snapshot_compress_threshold_bytes:
+            return None, gzip.compress(payload), "json+gzip", len(payload)
+        return payload.decode("utf-8"), None, "jsonb", len(payload)
+
+    @staticmethod
+    def _decode_snapshot_row(row: Any) -> tuple[dict | None, str | None]:
+        encoding = str(row.get("snapshot_encoding") or "jsonb")
+        if encoding == "json+gzip":
+            blob = row.get("snapshot_blob")
+            if blob is None:
+                return None, "snapshot_blob_missing"
+            try:
+                raw = gzip.decompress(bytes(blob))
+                snapshot = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return None, "snapshot_blob_invalid"
+        else:
+            snapshot = row.get("snapshot")
+        if isinstance(snapshot, dict):
+            return dict(snapshot), None
+        return None, "snapshot_not_object"
 
     @staticmethod
     def get_exit_time(messages: list[dict]) -> str | None:

@@ -144,13 +144,15 @@ class RemotePeerRoutes:
                 RegisterRequest.from_dict(payload)
             )
         except RegisterRejectedError as exc:
-            self._send_json(
+            self._send_error(
                 HTTPStatus.FORBIDDEN,
-                {
-                    "type": "register_rejected",
-                    "payload": RegisterRejected(reason=exc.message).to_dict(),
-                },
+                "register_rejected",
+                "remote peer registration rejected",
+                {"reason": RegisterRejected(reason=exc.message).reason},
             )
+            return
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_register_request")
             return
         self.service.ui_bus and self.service.ui_bus.success(
             f"Remote peer registered: {resp.peer_id}",
@@ -163,14 +165,16 @@ class RemotePeerRoutes:
 
     def _handle_heartbeat(self) -> None:
         payload = self._read_json()
-        hb = Heartbeat.from_dict(payload)
+        try:
+            hb = Heartbeat.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_heartbeat_request")
+            return
         peer_id = self.service.relay_server.token_manager.refresh_peer_token(
             hb.peer_token, ttl_sec=self.service.relay_server.peer_token_ttl_sec
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True, "peer_id": peer_id})
@@ -179,17 +183,13 @@ class RemotePeerRoutes:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         if not isinstance(peer_token, str) or not peer_token:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "peer_token_required"}
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "peer_token_required")
             return
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         env = self.service._next_envelope(peer_id)
@@ -208,46 +208,46 @@ class RemotePeerRoutes:
             peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if not isinstance(request_id, str) or not request_id:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "request_id_required"}
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "request_id_required")
             return
-        if result_type == "cleanup_result":
-            result = CleanupResult.from_dict(result_payload)
-            env = RelayEnvelope(
-                type="cleanup_result",
-                request_id=request_id,
-                peer_id=peer_id,
-                payload=result.to_dict(),
-            )
-        elif result_type == "tool_stream":
-            env = RelayEnvelope(
-                type="tool_stream",
-                request_id=request_id,
-                peer_id=peer_id,
-                payload=result_payload,
-            )
-        elif result_type == "tool_preview_result":
-            result = ToolPreviewResult.from_dict(result_payload)
-            env = RelayEnvelope(
-                type="tool_preview_result",
-                request_id=request_id,
-                peer_id=peer_id,
-                payload=result.to_dict(),
-            )
-        else:
-            result = ExecToolResult.from_dict(result_payload)
-            env = RelayEnvelope(
-                type="tool_result",
-                request_id=request_id,
-                peer_id=peer_id,
-                payload=result.to_dict(),
-            )
+        try:
+            if result_type == "cleanup_result":
+                result = CleanupResult.from_dict(result_payload)
+                env = RelayEnvelope(
+                    type="cleanup_result",
+                    request_id=request_id,
+                    peer_id=peer_id,
+                    payload=result.to_dict(),
+                )
+            elif result_type == "tool_stream":
+                env = RelayEnvelope(
+                    type="tool_stream",
+                    request_id=request_id,
+                    peer_id=peer_id,
+                    payload=result_payload,
+                )
+            elif result_type == "tool_preview_result":
+                result = ToolPreviewResult.from_dict(result_payload)
+                env = RelayEnvelope(
+                    type="tool_preview_result",
+                    request_id=request_id,
+                    peer_id=peer_id,
+                    payload=result.to_dict(),
+                )
+            else:
+                result = ExecToolResult.from_dict(result_payload)
+                env = RelayEnvelope(
+                    type="tool_result",
+                    request_id=request_id,
+                    peer_id=peer_id,
+                    payload=result.to_dict(),
+                )
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_result_request")
+            return
         self.service.relay_server.handle_inbound(peer_id, env)
         self._send_json(HTTPStatus.OK, {"ok": True})
 
@@ -258,9 +258,7 @@ class RemotePeerRoutes:
             peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         notice = DisconnectNotice(
             reason=payload.get("reason", "peer_initiated")

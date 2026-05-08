@@ -785,6 +785,9 @@ class PersistenceConfig:
     runtime_enabled: bool = True
     sessions_enabled: bool = True
     retention_days: int = 0
+    snapshot_max_versions_per_session: int = 20
+    snapshot_compress_threshold_bytes: int = 262144
+    maintenance_interval_sec: int = 3600
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PersistenceConfig":
@@ -797,6 +800,15 @@ class PersistenceConfig:
             runtime_enabled=bool(data.get("runtime_enabled", True)),
             sessions_enabled=bool(data.get("sessions_enabled", True)),
             retention_days=int(data.get("retention_days", 0) or 0),
+            snapshot_max_versions_per_session=int(
+                data.get("snapshot_max_versions_per_session", 20) or 20
+            ),
+            snapshot_compress_threshold_bytes=int(
+                data.get("snapshot_compress_threshold_bytes", 262144) or 262144
+            ),
+            maintenance_interval_sec=int(
+                data.get("maintenance_interval_sec", 3600) or 3600
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -807,6 +819,9 @@ class PersistenceConfig:
             "runtime_enabled": self.runtime_enabled,
             "sessions_enabled": self.sessions_enabled,
             "retention_days": self.retention_days,
+            "snapshot_max_versions_per_session": self.snapshot_max_versions_per_session,
+            "snapshot_compress_threshold_bytes": self.snapshot_compress_threshold_bytes,
+            "maintenance_interval_sec": self.maintenance_interval_sec,
         }
 
 
@@ -1227,6 +1242,16 @@ class Config:
             errors.append("persistence.database_url is required when backend is postgres")
         if self.persistence.retention_days < 0:
             errors.append("persistence.retention_days must be zero or positive")
+        if self.persistence.snapshot_max_versions_per_session < 1:
+            errors.append(
+                "persistence.snapshot_max_versions_per_session must be positive"
+            )
+        if self.persistence.snapshot_compress_threshold_bytes < 1:
+            errors.append(
+                "persistence.snapshot_compress_threshold_bytes must be positive"
+            )
+        if self.persistence.maintenance_interval_sec < 1:
+            errors.append("persistence.maintenance_interval_sec must be positive")
         if self.github.enabled:
             if self.persistence.backend == "memory" or not self.persistence.database_url:
                 errors.append(

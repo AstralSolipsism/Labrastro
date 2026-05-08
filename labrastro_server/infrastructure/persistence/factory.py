@@ -8,6 +8,9 @@ from typing import Any
 from reuleauxcoder.domain.config.models import Config, PersistenceConfig
 from labrastro_server.infrastructure.persistence.db import create_postgres_engine
 from labrastro_server.infrastructure.persistence.migration import run_migrations
+from labrastro_server.infrastructure.persistence.maintenance import (
+    PersistenceMaintenanceService,
+)
 from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
@@ -132,5 +135,26 @@ def create_session_store(config: Config, sessions_dir: Path | None) -> Any:
     engine = _engine_for(config)
     if engine is None or not config.persistence.sessions_enabled:
         return SessionStore(sessions_dir)
-    return PostgresSessionStore(engine)
+    return PostgresSessionStore(
+        engine,
+        snapshot_compress_threshold_bytes=(
+            config.persistence.snapshot_compress_threshold_bytes
+        ),
+    )
+
+
+def create_persistence_maintenance_service(
+    config: Config,
+) -> PersistenceMaintenanceService | None:
+    engine = _engine_for(config)
+    if engine is None:
+        return None
+    return PersistenceMaintenanceService(
+        engine,
+        retention_days=config.persistence.retention_days,
+        snapshot_max_versions_per_session=(
+            config.persistence.snapshot_max_versions_per_session
+        ),
+        interval_sec=config.persistence.maintenance_interval_sec,
+    )
 

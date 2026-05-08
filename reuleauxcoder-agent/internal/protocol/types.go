@@ -2,6 +2,14 @@ package protocol
 
 import "encoding/json"
 
+type ErrorResponse struct {
+	OK        bool           `json:"ok"`
+	Error     string         `json:"error"`
+	Message   string         `json:"message"`
+	Details   map[string]any `json:"details,omitempty"`
+	RequestID string         `json:"request_id"`
+}
+
 type RegisterRequest struct {
 	BootstrapToken string         `json:"bootstrap_token"`
 	HostInfoMin    map[string]any `json:"host_info_min,omitempty"`
@@ -317,6 +325,20 @@ type AgentRuntimeEventReport struct {
 	Type      string         `json:"type"`
 	Text      string         `json:"text,omitempty"`
 	Data      map[string]any `json:"data,omitempty"`
+}
+
+type AgentRuntimeTaskEvent struct {
+	TaskID  string         `json:"task_id"`
+	Seq     int            `json:"seq"`
+	Type    string         `json:"type"`
+	Payload map[string]any `json:"payload,omitempty"`
+}
+
+type AgentRuntimeEventsResponse struct {
+	OK      bool                    `json:"ok"`
+	Events  []AgentRuntimeTaskEvent `json:"events,omitempty"`
+	NextSeq int                     `json:"next_seq"`
+	HasMore bool                    `json:"has_more"`
 }
 
 type AgentRuntimeHeartbeatRequest struct {

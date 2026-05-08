@@ -33,7 +33,11 @@ from labrastro_server.services.agent_runtime.prompt_renderer import (
     CanonicalAgentContext,
     ExecutorPromptRenderer,
 )
-from labrastro_server.services.agent_runtime.runtime_store import RuntimeStore
+from labrastro_server.services.agent_runtime.runtime_store import (
+    DEFAULT_RUNTIME_EVENT_LIMIT,
+    RuntimeStore,
+    clamp_event_limit,
+)
 
 
 def _new_id(prefix: str) -> str:
@@ -1117,22 +1121,35 @@ class AgentRuntimeControlPlane:
                 metadata=pr.metadata,
             )
 
-    def list_events(self, task_id: str, *, after_seq: int = 0) -> list[RuntimeTaskEvent]:
+    def list_events(
+        self,
+        task_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
+    ) -> list[RuntimeTaskEvent]:
+        limit = clamp_event_limit(limit)
         if self._store is not None:
-            return self._store.list_events(task_id, after_seq=after_seq)
+            return self._store.list_events(task_id, after_seq=after_seq, limit=limit)
         with self._lock:
             return [
                 event
                 for event in list(self._events.get(task_id, []))
                 if event.seq > after_seq
-            ]
+            ][:limit]
 
     def wait_events(
-        self, task_id: str, *, after_seq: int = 0, timeout_sec: float = 0.0
+        self,
+        task_id: str,
+        *,
+        after_seq: int = 0,
+        timeout_sec: float = 0.0,
+        limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
     ) -> list[RuntimeTaskEvent]:
+        limit = clamp_event_limit(limit)
         deadline = time.time() + max(0.0, float(timeout_sec or 0.0))
         while True:
-            events = self.list_events(task_id, after_seq=after_seq)
+            events = self.list_events(task_id, after_seq=after_seq, limit=limit)
             if events or timeout_sec <= 0:
                 return events
             remaining = deadline - time.time()
@@ -1190,11 +1207,19 @@ class AgentRuntimeControlPlane:
                 tasks = [task for task in tasks if task.get("issue_id") == issue_id]
             return tasks[-max(1, int(limit or 50)) :]
 
-    def load_task_detail(self, task_id: str, *, event_limit: int = 100) -> dict[str, Any]:
+    def load_task_detail(
+        self,
+        task_id: str,
+        *,
+        event_limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
+    ) -> dict[str, Any]:
+        event_limit = clamp_event_limit(event_limit)
         if self._store is not None:
             return self._store.load_task_detail(task_id, event_limit=event_limit)
         task = self.task_to_dict(task_id)
-        events = [event.to_dict() for event in self.list_events(task_id, after_seq=0)]
+        with self._lock:
+            raw_events = list(self._events.get(task_id, []))[-event_limit:]
+        events = [event.to_dict() for event in raw_events]
         session = self._sessions.get(task_id)
         return {
             "task": task,
@@ -1212,7 +1237,7 @@ class AgentRuntimeControlPlane:
             if session is not None
             else None,
             "claim": None,
-            "events": events[-max(1, int(event_limit or 100)) :],
+            "events": events,
         }
 
     def _running_count_locked(self) -> int:

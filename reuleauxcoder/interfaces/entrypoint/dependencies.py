@@ -28,6 +28,7 @@ from labrastro_server.infrastructure.persistence.factory import (
     create_auth_store,
     create_github_pull_request_service,
     create_issue_assignment_service,
+    create_persistence_maintenance_service,
     create_runtime_control_plane,
     create_session_store as create_configured_session_store,
     create_taskflow_service,
@@ -208,6 +209,7 @@ def _default_create_remote_http_service(
         runtime_control_plane=runtime_control_plane,
         issue_assignment_service=issue_assignment_service,
     )
+    persistence_maintenance_service = create_persistence_maintenance_service(config)
     auth_errors = []
     if not config.auth.enabled:
         auth_errors.append("auth.enabled is required for remote host mode")
@@ -235,6 +237,7 @@ def _default_create_remote_http_service(
         taskflow_service=taskflow_service,
         issue_assignment_service=issue_assignment_service,
         github_pr_service=github_pr_service,
+        persistence_maintenance_service=persistence_maintenance_service,
     )
 
 

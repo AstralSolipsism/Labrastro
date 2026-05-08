@@ -10,7 +10,13 @@ import pytest
 
 from labrastro_server.services.auth.crypto import hash_password, hash_token, verify_password
 from labrastro_server.services.auth.file_store import FileAuthStore
-from labrastro_server.services.auth.models import AuthDevice, AuthUser, RefreshTokenRecord
+from labrastro_server.services.auth.models import (
+    AccessTokenRecord,
+    AuthDevice,
+    AuthUser,
+    LoginFailureRecord,
+    RefreshTokenRecord,
+)
 from labrastro_server.services.auth.postgres_store import PostgresAuthStore
 from labrastro_server.services.auth.service import AuthError, AuthService
 from reuleauxcoder.domain.config.models import AuthConfig, AuthSuperadminConfig
@@ -90,6 +96,24 @@ def test_file_auth_store_contract_lists_revokes_and_filters_audit(tmp_path: Path
             created_at=now,
         )
     )
+    store.record_access_token(
+        AccessTokenRecord(
+            id="at_contract",
+            user_id=user.id,
+            device_id=device.id,
+            token_hash="access_hashed",
+            expires_at=now + 900,
+            created_at=now,
+        )
+    )
+    store.record_login_failure(
+        LoginFailureRecord(
+            id="lf_contract",
+            username="contract",
+            source="127.0.0.1",
+            failed_at=now,
+        )
+    )
     store.append_audit_event(
         {
             "id": "evt_contract",
@@ -104,6 +128,18 @@ def test_file_auth_store_contract_lists_revokes_and_filters_audit(tmp_path: Path
     assert store.list_devices(user_id=user.id)[0].id == device.id
     assert store.revoke_refresh_tokens(user_id=user.id, revoked_at=now + 1) == 1
     assert store.list_refresh_tokens(user_id=user.id)[0].revoked_at == now + 1
+    assert store.get_access_token_by_hash("access_hashed") is not None
+    assert store.revoke_access_tokens(device_id=device.id, revoked_at=now + 2) == 1
+    assert store.get_access_token_by_hash("access_hashed").revoked_at == now + 2
+    assert store.count_login_failures(
+        username="contract",
+        source="127.0.0.1",
+        since=now - 60,
+    ) == 1
+    assert store.clear_login_failures(
+        username="contract",
+        source="127.0.0.1",
+    ) == 1
     assert store.list_audit_events(event_type="contract", user_id=user.id)[0]["id"] == "evt_contract"
 
 
@@ -146,6 +182,24 @@ def test_postgres_auth_store_contract() -> None:
             created_at=now,
         )
     )
+    store.record_access_token(
+        AccessTokenRecord(
+            id=f"at_{suffix}",
+            user_id=user.id,
+            device_id=device.id,
+            token_hash=f"access_hash_{suffix}",
+            expires_at=now + 900,
+            created_at=now,
+        )
+    )
+    store.record_login_failure(
+        LoginFailureRecord(
+            id=f"lf_{suffix}",
+            username=user.username,
+            source="127.0.0.1",
+            failed_at=now,
+        )
+    )
     store.append_audit_event(
         {
             "id": f"evt_{suffix}",
@@ -159,6 +213,13 @@ def test_postgres_auth_store_contract() -> None:
     assert store.get_user_by_username(user.username).id == user.id
     assert store.list_devices(user_id=user.id)[0].id == device.id
     assert store.revoke_refresh_tokens(device_id=device.id, revoked_at=now + 2) == 1
+    assert store.get_access_token_by_hash(f"access_hash_{suffix}") is not None
+    assert store.revoke_access_tokens(user_id=user.id, revoked_at=now + 3) == 1
+    assert store.count_login_failures(
+        username=user.username,
+        source="127.0.0.1",
+        since=now - 60,
+    ) == 1
     assert store.list_audit_events(event_type="contract", user_id=user.id)[0]["id"] == f"evt_{suffix}"
 
 
@@ -205,6 +266,41 @@ def test_access_token_expires(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     )
 
     assert service.authenticate_access_token(session.access_token) is None
+
+
+def test_access_token_survives_auth_service_restart(tmp_path: Path) -> None:
+    service, store = _service(tmp_path)
+
+    session = service.login("admin", TEST_PASSWORD, "pytest")
+    restarted = AuthService(
+        service.config,
+        store,
+        issue_bootstrap_token=lambda ttl: f"bt_restarted_{ttl}",
+    )
+
+    principal = restarted.authenticate_access_token(session.access_token)
+    assert principal is not None
+    assert principal.username == "admin"
+
+
+def test_login_rate_limit_survives_auth_service_restart(tmp_path: Path) -> None:
+    service, store = _service(tmp_path)
+    source_ip = "127.0.0.1"
+
+    for _index in range(5):
+        with pytest.raises(AuthError) as bad_login:
+            service.login("missing", "bad-password", "pytest", source_ip=source_ip)
+        assert bad_login.value.code == "invalid_credentials"
+
+    restarted = AuthService(
+        service.config,
+        store,
+        issue_bootstrap_token=lambda ttl: f"bt_restarted_{ttl}",
+    )
+    with pytest.raises(AuthError) as rate_limited:
+        restarted.login("missing", "bad-password", "pytest", source_ip=source_ip)
+
+    assert rate_limited.value.code == "rate_limited"
 
 
 def test_disabled_configured_user_cannot_login(tmp_path: Path) -> None:

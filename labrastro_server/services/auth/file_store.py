@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from labrastro_server.services.auth.models import (
+    AccessTokenRecord,
     AuthDevice,
     AuthUser,
+    LoginFailureRecord,
     RefreshTokenRecord,
 )
 
@@ -168,6 +170,144 @@ class FileAuthStore:
             self._write_unlocked(data)
         return revoked
 
+    def record_access_token(self, token: AccessTokenRecord) -> None:
+        with self._lock:
+            data = self._read_unlocked()
+            data["access_tokens"] = [
+                item
+                for item in data["access_tokens"]
+                if str(item.get("id")) != token.id
+                and str(item.get("token_hash")) != token.token_hash
+            ]
+            data["access_tokens"].append(token.to_dict())
+            self._write_unlocked(data)
+
+    def get_access_token_by_hash(self, token_hash: str) -> AccessTokenRecord | None:
+        data = self._read()
+        for item in data["access_tokens"]:
+            token = AccessTokenRecord.from_dict(item)
+            if token.token_hash == token_hash:
+                return token
+        return None
+
+    def update_access_token(self, token: AccessTokenRecord) -> None:
+        self.record_access_token(token)
+
+    def revoke_access_tokens(
+        self,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        exclude_device_id: str | None = None,
+        revoked_at: float,
+    ) -> int:
+        revoked = 0
+        with self._lock:
+            data = self._read_unlocked()
+            tokens = [
+                AccessTokenRecord.from_dict(item)
+                for item in data["access_tokens"]
+            ]
+            next_tokens: list[dict[str, Any]] = []
+            for token in tokens:
+                matches_user = user_id is None or token.user_id == user_id
+                matches_device = device_id is None or token.device_id == device_id
+                excluded = (
+                    exclude_device_id is not None
+                    and token.device_id == exclude_device_id
+                )
+                if (
+                    matches_user
+                    and matches_device
+                    and not excluded
+                    and token.revoked_at is None
+                ):
+                    token = AccessTokenRecord(
+                        id=token.id,
+                        user_id=token.user_id,
+                        device_id=token.device_id,
+                        token_hash=token.token_hash,
+                        expires_at=token.expires_at,
+                        created_at=token.created_at,
+                        revoked_at=revoked_at,
+                    )
+                    revoked += 1
+                next_tokens.append(token.to_dict())
+            data["access_tokens"] = next_tokens
+            self._write_unlocked(data)
+        return revoked
+
+    def delete_expired_access_tokens(self, *, now: float) -> int:
+        deleted = 0
+        with self._lock:
+            data = self._read_unlocked()
+            next_tokens: list[dict[str, Any]] = []
+            for item in data["access_tokens"]:
+                token = AccessTokenRecord.from_dict(item)
+                if token.expires_at <= now:
+                    deleted += 1
+                    continue
+                next_tokens.append(token.to_dict())
+            data["access_tokens"] = next_tokens
+            self._write_unlocked(data)
+        return deleted
+
+    def record_login_failure(self, failure: LoginFailureRecord) -> None:
+        with self._lock:
+            data = self._read_unlocked()
+            data["login_failures"] = [
+                item
+                for item in data["login_failures"]
+                if str(item.get("id")) != failure.id
+            ]
+            data["login_failures"].append(failure.to_dict())
+            self._write_unlocked(data)
+
+    def count_login_failures(
+        self, *, username: str, source: str, since: float
+    ) -> int:
+        normalized = username.strip().lower()
+        data = self._read()
+        return sum(
+            1
+            for item in data["login_failures"]
+            if str(item.get("username") or "").strip().lower() == normalized
+            and str(item.get("source") or "") == source
+            and float(item.get("failed_at", 0) or 0) >= since
+        )
+
+    def clear_login_failures(self, *, username: str, source: str) -> int:
+        normalized = username.strip().lower()
+        cleared = 0
+        with self._lock:
+            data = self._read_unlocked()
+            next_failures: list[dict[str, Any]] = []
+            for item in data["login_failures"]:
+                if (
+                    str(item.get("username") or "").strip().lower() == normalized
+                    and str(item.get("source") or "") == source
+                ):
+                    cleared += 1
+                    continue
+                next_failures.append(dict(item))
+            data["login_failures"] = next_failures
+            self._write_unlocked(data)
+        return cleared
+
+    def delete_old_login_failures(self, *, before: float) -> int:
+        deleted = 0
+        with self._lock:
+            data = self._read_unlocked()
+            next_failures: list[dict[str, Any]] = []
+            for item in data["login_failures"]:
+                if float(item.get("failed_at", 0) or 0) < before:
+                    deleted += 1
+                    continue
+                next_failures.append(dict(item))
+            data["login_failures"] = next_failures
+            self._write_unlocked(data)
+        return deleted
+
     def append_audit_event(self, event: dict[str, Any]) -> None:
         with self._lock:
             data = self._read_unlocked()
@@ -253,5 +393,7 @@ class FileAuthStore:
             "users": [],
             "devices": [],
             "refresh_tokens": [],
+            "access_tokens": [],
+            "login_failures": [],
             "audit_events": [],
         }

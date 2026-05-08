@@ -1,0 +1,393 @@
+{
+  "version": 1,
+  "error_shape": {
+    "ok": false,
+    "error": "stable_code",
+    "message": "safe public message",
+    "details": {},
+    "request_id": "req_contract"
+  },
+  "fixtures": [
+    {
+      "name": "auth.login",
+      "method": "POST",
+      "path": "/remote/auth/login",
+      "auth": "none",
+      "request": {
+        "username": "admin",
+        "password": "admin-password",
+        "device_label": "VS Code"
+      },
+      "response": {
+        "ok": true,
+        "access_token": "at_contract",
+        "access_expires_at": 1893456000.0,
+        "refresh_token": "rt_contract",
+        "refresh_expires_at": 1893459600.0,
+        "user": {
+          "id": "usr_contract",
+          "username": "admin",
+          "role": "superadmin",
+          "scopes": ["admin:read", "admin:write", "peer:bootstrap"]
+        },
+        "device": {
+          "id": "dev_contract",
+          "label": "VS Code"
+        }
+      }
+    },
+    {
+      "name": "auth.refresh",
+      "method": "POST",
+      "path": "/remote/auth/refresh",
+      "auth": "none",
+      "request": {
+        "refresh_token": "rt_contract"
+      },
+      "response": {
+        "ok": true,
+        "access_token": "at_rotated",
+        "access_expires_at": 1893456000.0,
+        "refresh_token": "rt_rotated",
+        "refresh_expires_at": 1893459600.0,
+        "user": {
+          "id": "usr_contract",
+          "username": "admin",
+          "role": "superadmin",
+          "scopes": ["admin:read", "admin:write", "peer:bootstrap"]
+        },
+        "device": {
+          "id": "dev_contract",
+          "label": "VS Code"
+        }
+      }
+    },
+    {
+      "name": "auth.bootstrap_token",
+      "method": "POST",
+      "path": "/remote/auth/bootstrap-token",
+      "auth": "bearer",
+      "request": {},
+      "response": {
+        "ok": true,
+        "bootstrap_token": "bt_contract",
+        "expires_in": 300
+      }
+    },
+    {
+      "name": "peer.register",
+      "method": "POST",
+      "path": "/remote/register",
+      "auth": "bootstrap_token",
+      "request": {
+        "bootstrap_token": "bt_contract",
+        "cwd": "/workspace",
+        "workspace_root": "/workspace",
+        "capabilities": ["shell", "read_file"],
+        "host_info_min": {
+          "os": "linux",
+          "arch": "amd64"
+        }
+      },
+      "response": {
+        "type": "register_ok",
+        "payload": {
+          "peer_id": "peer_contract",
+          "peer_token": "pt_contract",
+          "heartbeat_interval_sec": 10
+        }
+      }
+    },
+    {
+      "name": "peer.heartbeat",
+      "method": "POST",
+      "path": "/remote/heartbeat",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "ts": 1893456000.0
+      },
+      "response": {
+        "ok": true,
+        "peer_id": "peer_contract"
+      }
+    },
+    {
+      "name": "sessions.list",
+      "method": "POST",
+      "path": "/remote/sessions/list",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "limit": 20,
+        "if_list_etag": "etag_contract"
+      },
+      "response": {
+        "ok": true,
+        "sessions": [],
+        "list_etag": "etag_next"
+      }
+    },
+    {
+      "name": "sessions.model",
+      "method": "POST",
+      "path": "/remote/sessions/model",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_id": "session_contract",
+        "provider_id": "provider_contract",
+        "model_id": "model_contract",
+        "parameters": {
+          "temperature": 0.2
+        }
+      },
+      "response": {
+        "ok": true,
+        "session_id": "session_contract"
+      }
+    },
+    {
+      "name": "chat.start",
+      "method": "POST",
+      "path": "/remote/chat/start",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "prompt": "hello",
+        "session_hint": "session_contract",
+        "mode": "chat"
+      },
+      "response": {
+        "chat_id": "chat_contract",
+        "error": null
+      }
+    },
+    {
+      "name": "chat.stream",
+      "method": "POST",
+      "path": "/remote/chat/stream",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "chat_id": "chat_contract",
+        "cursor": 0,
+        "timeout_sec": 30.0
+      },
+      "response": {
+        "events": [
+          {
+            "chat_id": "chat_contract",
+            "seq": 1,
+            "type": "chat_start",
+            "payload": {
+              "prompt": "hello"
+            }
+          }
+        ],
+        "done": false,
+        "next_cursor": 1,
+        "error": null
+      }
+    },
+    {
+      "name": "chat.stream_lost_events",
+      "method": "POST",
+      "path": "/remote/chat/stream",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "chat_id": "chat_contract",
+        "cursor": 1,
+        "timeout_sec": 0.0
+      },
+      "response": {
+        "events": [
+          {
+            "chat_id": "chat_contract",
+            "seq": 41,
+            "type": "events_lost",
+            "payload": {
+              "first_available_seq": 42,
+              "dropped_count": 40
+            }
+          },
+          {
+            "chat_id": "chat_contract",
+            "seq": 42,
+            "type": "delta",
+            "payload": {
+              "artifact_ref": {
+                "type": "chat_event_payload",
+                "path": "/tmp/labrastro-chat-events/chat_contract/42.json.gz",
+                "encoding": "json+gzip",
+                "bytes": 1048576,
+                "preview": "{\"text\":\"large\"}"
+              }
+            }
+          }
+        ],
+        "done": false,
+        "next_cursor": 42,
+        "error": null
+      }
+    },
+    {
+      "name": "runtime.claim",
+      "method": "POST",
+      "path": "/remote/runtime/claim",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "worker_id": "worker_contract",
+        "executors": ["codex"],
+        "wait_sec": 0
+      },
+      "response": {
+        "claim": null
+      }
+    },
+    {
+      "name": "runtime.events",
+      "method": "GET",
+      "path": "/remote/agent-runtime/tasks/{task_id}/events",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "after_seq": 0,
+        "limit": 200
+      },
+      "response": {
+        "ok": true,
+        "events": [
+          {
+            "task_id": "task_contract",
+            "seq": 1,
+            "type": "queued",
+            "payload": {}
+          }
+        ],
+        "next_seq": 1,
+        "has_more": false
+      }
+    },
+    {
+      "name": "runtime.complete",
+      "method": "POST",
+      "path": "/remote/runtime/complete",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "request_id": "run_contract",
+        "task_id": "task_contract",
+        "worker_id": "worker_contract",
+        "status": "completed",
+        "output": "done",
+        "events": [],
+        "usage": {},
+        "artifacts": []
+      },
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "name": "admin.runtime.submit",
+      "method": "POST",
+      "path": "/remote/admin/runtime/submit",
+      "auth": "bearer",
+      "request": {
+        "issue_id": "manual",
+        "agent_id": "default",
+        "prompt": "run diagnostics",
+        "executor": "codex",
+        "runtime_profile_id": "default",
+        "metadata": {
+          "workspace_root": "/workspace"
+        }
+      },
+      "response": {
+        "ok": true,
+        "task": {
+          "id": "task_contract",
+          "status": "queued"
+        }
+      }
+    },
+    {
+      "name": "admin.server_settings.read",
+      "method": "POST",
+      "path": "/remote/admin/server-settings/read",
+      "auth": "bearer",
+      "request": {},
+      "response": {
+        "ok": true,
+        "settings": {
+          "agent_runtime": {},
+          "github": {}
+        },
+        "runtime": {},
+        "config_etag": "\"sha256-contract\""
+      }
+    },
+    {
+      "name": "admin.providers.list",
+      "method": "POST",
+      "path": "/remote/admin/providers/list",
+      "auth": "bearer",
+      "request": {},
+      "response": {
+        "ok": true,
+        "providers": []
+      }
+    },
+    {
+      "name": "environment.manifest",
+      "method": "POST",
+      "path": "/remote/environment/manifest",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "os": "linux",
+        "arch": "amd64",
+        "workspace": "/workspace"
+      },
+      "response": {
+        "cli_tools": [],
+        "mcp_servers": [],
+        "skills": []
+      }
+    },
+    {
+      "name": "error.invalid_json",
+      "method": "POST",
+      "path": "/remote/auth/login",
+      "auth": "none",
+      "request": "not-json",
+      "response": {
+        "ok": false,
+        "error": "invalid_json",
+        "message": "request body must be valid JSON",
+        "details": {},
+        "request_id": "req_contract"
+      }
+    },
+    {
+      "name": "error.invalid_peer_token",
+      "method": "POST",
+      "path": "/remote/heartbeat",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_invalid",
+        "ts": 1893456000.0
+      },
+      "response": {
+        "ok": false,
+        "error": "invalid_peer_token",
+        "message": "invalid peer token",
+        "details": {},
+        "request_id": "req_contract"
+      }
+    }
+  ]
+}

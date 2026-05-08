@@ -85,11 +85,13 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     reloaded = _control()
     events = reloaded.list_events(task.id, after_seq=0)
     assert [event.type for event in events][0] == "queued"
+    assert len(reloaded.list_events(task.id, after_seq=0, limit=1)) == 1
     assert reloaded.task_to_dict(task.id)["status"] == "completed"
-    detail = reloaded.load_task_detail(task.id)
+    detail = reloaded.load_task_detail(task.id, event_limit=1)
     json.dumps(detail)
     assert detail["session"]["workdir"] == "/tmp/pg-worktree"
     assert detail["claim"]["status"] == "completed"
+    assert len(detail["events"]) == 1
 
 
 def test_postgres_runtime_store_host_restart_fails_running_task() -> None:

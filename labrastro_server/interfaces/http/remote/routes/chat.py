@@ -60,18 +60,14 @@ class RemoteChatRoutes:
         try:
             req = ChatRequest.from_dict(payload)
         except Exception:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "invalid_chat_request"}
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             req.peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
 
         workflow_mode = (
@@ -81,11 +77,9 @@ class RemoteChatRoutes:
         )
         if workflow_mode == "taskflow":
             if self.service.stream_chat_handler is None:
-                self._send_json(
+                self._send_error(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    ChatResponse(
-                        response="", error="chat_stream_unavailable"
-                    ).to_dict(),
+                    "chat_stream_unavailable",
                 )
                 return
             session = self.service._create_chat_session(
@@ -107,8 +101,8 @@ class RemoteChatRoutes:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
                     self.service.stream_chat_handler(peer_id, req.prompt, session)
-                except Exception as exc:
-                    session.append_event("error", {"message": str(exc)})
+                except Exception:
+                    session.append_event("error", {"message": "chat_handler_failed"})
                 finally:
                     session.mark_done()
             response_text = ""
@@ -131,17 +125,14 @@ class RemoteChatRoutes:
             return
 
         if self.service.chat_handler is None:
-            self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                ChatResponse(response="", error="chat_unavailable").to_dict(),
-            )
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "chat_unavailable")
             return
 
         with self.service._get_peer_chat_lock(peer_id):
             try:
                 response = self.service.chat_handler(peer_id, req.prompt)
-            except Exception as exc:
-                response = ChatResponse(response="", error=str(exc))
+            except Exception:
+                response = ChatResponse(response="", error="chat_handler_failed")
 
         self._send_json(HTTPStatus.OK, response.to_dict())
 
@@ -150,25 +141,19 @@ class RemoteChatRoutes:
         try:
             req = ChatStartRequest.from_dict(payload)
         except Exception:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "invalid_chat_start_request"}
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_start_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             req.peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         if self.service.stream_chat_handler is None:
-            self._send_json(
+            self._send_error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                ChatStartResponse(
-                    chat_id="", error="chat_stream_unavailable"
-                ).to_dict(),
+                "chat_stream_unavailable",
             )
             return
 
@@ -199,8 +184,8 @@ class RemoteChatRoutes:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
                     self.service.stream_chat_handler(peer_id, req.prompt, session)
-                except Exception as exc:
-                    session.append_event("error", {"message": str(exc)})
+                except Exception:
+                    session.append_event("error", {"message": "chat_handler_failed"})
                 finally:
                     session.mark_done()
 
@@ -214,22 +199,18 @@ class RemoteChatRoutes:
         try:
             req = ChatStreamRequest.from_dict(payload)
         except Exception:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST, {"error": "invalid_chat_stream_request"}
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_stream_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             req.peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         session = self.service._get_chat_session(req.chat_id)
         if session is None or session.peer_id != peer_id:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "chat_not_found"})
+            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
             return
 
         events, done, next_cursor = session.wait_events(
@@ -247,28 +228,18 @@ class RemoteChatRoutes:
         try:
             req = ChatCancelRequest.from_dict(payload)
         except Exception:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "invalid_chat_cancel_request"},
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_cancel_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             req.peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         session = self.service._get_chat_session(req.chat_id)
         if session is None or session.peer_id != peer_id:
-            self._send_json(
-                HTTPStatus.NOT_FOUND,
-                ChatCancelResponse(
-                    ok=False, error="chat_not_found"
-                ).to_dict(),
-            )
+            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
             return
 
         reason = req.reason or "chat_cancelled"
@@ -277,6 +248,8 @@ class RemoteChatRoutes:
             session.append_event(
                 "chat_cancel_requested", {"reason": reason}
             )
+            session.append_event("chat_cancelled", {"reason": reason})
+            session.mark_done()
         self._send_json(
             HTTPStatus.OK, ChatCancelResponse(ok=True).to_dict()
         )
@@ -286,37 +259,22 @@ class RemoteChatRoutes:
         try:
             req = ApprovalReplyRequest.from_dict(payload)
         except Exception:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "invalid_approval_reply_request"},
-            )
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_approval_reply_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
             req.peer_token
         )
         if peer_id is None:
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED, {"error": "invalid_peer_token"}
-            )
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
         session = self.service._get_chat_session(req.chat_id)
         if session is None or session.peer_id != peer_id:
-            self._send_json(
-                HTTPStatus.NOT_FOUND,
-                ApprovalReplyResponse(
-                    ok=False, error="chat_not_found"
-                ).to_dict(),
-            )
+            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
             return
         ok = session.resolve_approval(req.approval_id, req.decision, req.reason)
         if not ok:
-            self._send_json(
-                HTTPStatus.NOT_FOUND,
-                ApprovalReplyResponse(
-                    ok=False, error="approval_not_found"
-                ).to_dict(),
-            )
+            self._send_error(HTTPStatus.NOT_FOUND, "approval_not_found")
             return
         self._send_json(HTTPStatus.OK, ApprovalReplyResponse(ok=True).to_dict())
 

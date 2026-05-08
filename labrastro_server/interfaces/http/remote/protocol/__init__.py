@@ -37,6 +37,11 @@ from labrastro_server.interfaces.http.remote.protocol.mcp import (
     PeerMCPToolsReport,
     RemoteMCPToolInfo,
 )
+from labrastro_server.interfaces.http.remote.protocol.registry import (
+    REMOTE_ENDPOINTS,
+    RemoteEndpoint,
+    endpoint_registry,
+)
 from labrastro_server.interfaces.http.remote.protocol.sessions import (
     SessionDeleteRequest,
     SessionListRequest,
@@ -88,7 +93,9 @@ __all__ = [
     "RegisterRequest",
     "RegisterResponse",
     "RelayEnvelope",
+    "REMOTE_ENDPOINTS",
     "RemoteMCPToolInfo",
+    "RemoteEndpoint",
     "SessionDeleteRequest",
     "SessionListRequest",
     "SessionLoadRequest",
@@ -98,4 +105,5 @@ __all__ = [
     "ToolPreviewRequest",
     "ToolPreviewResult",
     "ToolStreamChunk",
+    "endpoint_registry",
 ]

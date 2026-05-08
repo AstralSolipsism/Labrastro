@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import queue
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -63,7 +66,10 @@ from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from labrastro_server.interfaces.http.remote.routes.admin import RemoteAdminRoutes
 from labrastro_server.interfaces.http.remote.routes.artifacts import RemoteArtifactRoutes
 from labrastro_server.interfaces.http.remote.routes.auth import RemoteAuthRoutes
-from labrastro_server.interfaces.http.remote.routes.base import RemoteRelayBaseHandler
+from labrastro_server.interfaces.http.remote.routes.base import (
+    RemoteRelayBaseHandler,
+    RemoteRouteError,
+)
 from labrastro_server.interfaces.http.remote.routes.chat import RemoteChatRoutes
 from labrastro_server.interfaces.http.remote.routes.collaboration import RemoteCollaborationRoutes
 from labrastro_server.interfaces.http.remote.routes.github import RemoteGitHubRoutes
@@ -82,6 +88,159 @@ from labrastro_server.services.taskflow.service import TaskflowService
 
 
 @dataclass
+class _BufferedChatEvent:
+    event: dict[str, Any]
+    size_bytes: int
+
+
+class _ChatEventBuffer:
+    def __init__(
+        self,
+        *,
+        chat_id: str,
+        artifact_root: Path,
+        max_events: int,
+        max_payload_bytes: int,
+        max_total_bytes: int,
+    ) -> None:
+        self.chat_id = chat_id
+        self.artifact_dir = artifact_root / chat_id
+        self.max_events = max(1, int(max_events or 1))
+        self.max_payload_bytes = max(1, int(max_payload_bytes or 1))
+        self.max_total_bytes = max(self.max_payload_bytes, int(max_total_bytes or self.max_payload_bytes))
+        self._items: list[_BufferedChatEvent] = []
+        self._total_bytes = 0
+        self._dropped_count = 0
+
+    @property
+    def first_available_seq(self) -> int:
+        if self._items:
+            return int(self._items[0].event.get("seq", 0) or 0)
+        return 0
+
+    @property
+    def latest_seq(self) -> int:
+        if self._items:
+            return int(self._items[-1].event.get("seq", 0) or 0)
+        return 0
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped_count
+
+    def append(self, event: dict[str, Any]) -> None:
+        normalized = self._normalize_event(event)
+        size_bytes = self._event_size(normalized)
+        self._items.append(_BufferedChatEvent(normalized, size_bytes))
+        self._total_bytes += size_bytes
+        self._prune()
+
+    def events_after(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        cursor = max(0, int(cursor or 0))
+        events = [
+            dict(item.event)
+            for item in self._items
+            if int(item.event.get("seq", 0) or 0) > cursor
+        ]
+        if self._items and cursor < self.first_available_seq - 1:
+            lost_seq = self.first_available_seq - 1
+            events.insert(
+                0,
+                {
+                    "chat_id": self.chat_id,
+                    "seq": lost_seq,
+                    "type": "events_lost",
+                    "payload": {
+                        "first_available_seq": self.first_available_seq,
+                        "dropped_count": self._dropped_count,
+                    },
+                },
+            )
+        next_cursor = cursor
+        if events:
+            next_cursor = max(
+                int(event.get("seq", 0) or 0)
+                for event in events
+            )
+        else:
+            next_cursor = max(cursor, self.latest_seq)
+        return events, next_cursor
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        return [dict(item.event) for item in self._items]
+
+    def cleanup_artifacts(self) -> None:
+        shutil.rmtree(self.artifact_dir, ignore_errors=True)
+
+    def _normalize_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        payload_bytes = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload_bytes) <= self.max_payload_bytes:
+            return {**event, "payload": payload}
+
+        seq = int(event.get("seq", 0) or 0)
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = self.artifact_dir / f"{seq}.json.gz"
+        artifact_path.write_bytes(gzip.compress(payload_bytes))
+        preview = payload_bytes[:4096].decode("utf-8", errors="replace")
+        return {
+            **event,
+            "payload": {
+                "artifact_ref": {
+                    "type": "chat_event_payload",
+                    "path": str(artifact_path),
+                    "encoding": "json+gzip",
+                    "bytes": len(payload_bytes),
+                    "preview": preview,
+                }
+            },
+        }
+
+    def _prune(self) -> None:
+        while (
+            len(self._items) > self.max_events
+            or self._total_bytes > self.max_total_bytes
+        ):
+            if not self._items:
+                break
+            dropped = self._items.pop(0)
+            self._total_bytes -= dropped.size_bytes
+            self._dropped_count += 1
+            self._delete_event_artifact(dropped.event)
+
+    def _delete_event_artifact(self, event: dict[str, Any]) -> None:
+        payload = event.get("payload")
+        artifact = payload.get("artifact_ref") if isinstance(payload, dict) else None
+        if not isinstance(artifact, dict):
+            return
+        path = artifact.get("path")
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            return
+
+    @staticmethod
+    def _event_size(event: dict[str, Any]) -> int:
+        return len(
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+
+@dataclass
 class _RemoteChatSession:
     chat_id: str
     peer_id: str
@@ -89,7 +248,6 @@ class _RemoteChatSession:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_goal_id: str | None = None
-    events: list[dict[str, Any]] = field(default_factory=list)
     done: bool = False
     running: bool = False
     seq_next: int = 1
@@ -100,6 +258,27 @@ class _RemoteChatSession:
     cancel_requested: bool = False
     cancel_reason: str | None = None
     cancel_callback: Callable[[str], None] | None = None
+    artifact_root: Path = field(
+        default_factory=lambda: Path(tempfile.gettempdir()) / "labrastro-chat-events"
+    )
+    max_events: int = 1000
+    max_payload_bytes: int = 256 * 1024
+    max_total_bytes: int = 4 * 1024 * 1024
+    last_activity_at: float = field(default_factory=time.time)
+    _event_buffer: _ChatEventBuffer = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_buffer = _ChatEventBuffer(
+            chat_id=self.chat_id,
+            artifact_root=self.artifact_root,
+            max_events=self.max_events,
+            max_payload_bytes=self.max_payload_bytes,
+            max_total_bytes=self.max_total_bytes,
+        )
+
+    @property
+    def events(self) -> list[dict[str, Any]]:
+        return self._event_buffer.snapshot()
 
     def append_event(
         self, event_type: str, payload: dict[str, Any] | None = None
@@ -107,7 +286,7 @@ class _RemoteChatSession:
         with self.cond:
             seq = self.seq_next
             self.seq_next += 1
-            self.events.append(
+            self._event_buffer.append(
                 {
                     "chat_id": self.chat_id,
                     "seq": seq,
@@ -115,6 +294,7 @@ class _RemoteChatSession:
                     "payload": payload or {},
                 }
             )
+            self.last_activity_at = time.time()
             self.cond.notify_all()
             return seq
 
@@ -123,23 +303,26 @@ class _RemoteChatSession:
     ) -> tuple[list[dict[str, Any]], bool, int]:
         deadline = time.time() + max(timeout_sec, 0.0)
         with self.cond:
-            while cursor >= len(self.events) and not self.done:
+            while cursor >= self._event_buffer.latest_seq and not self.done:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
                 self.cond.wait(timeout=remaining)
-            out = self.events[cursor:]
-            return out, self.done, len(self.events)
+            out, next_cursor = self._event_buffer.events_after(cursor)
+            self.last_activity_at = time.time()
+            return out, self.done, next_cursor
 
     def mark_running(self) -> None:
         with self.cond:
             self.running = True
+            self.last_activity_at = time.time()
 
     def mark_done(self) -> None:
         with self.cond:
             self.running = False
             self.done = True
             self.finished_at = time.time()
+            self.last_activity_at = self.finished_at
             for waiter in self.approval_waiters.values():
                 if waiter.get("done"):
                     continue
@@ -147,6 +330,14 @@ class _RemoteChatSession:
                 waiter["decision"] = "deny_once"
                 waiter["reason"] = "chat_closed"
             self.cond.notify_all()
+
+    def is_stale(self, now: float, *, closed_ttl_sec: float, idle_ttl_sec: float) -> bool:
+        if self.done and self.finished_at is not None:
+            return now - self.finished_at > closed_ttl_sec
+        return now - self.last_activity_at > idle_ttl_sec
+
+    def cleanup_artifacts(self) -> None:
+        self._event_buffer.cleanup_artifacts()
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
         call_immediately = False
@@ -256,6 +447,15 @@ class RemoteRelayHTTPService:
         taskflow_service: TaskflowService | None = None,
         issue_assignment_service: IssueAssignmentService | None = None,
         github_pr_service: PullRequestService | None = None,
+        persistence_maintenance_service: Any | None = None,
+        max_request_body_bytes: int = 16 * 1024 * 1024,
+        chat_max_events: int = 1000,
+        chat_max_payload_bytes: int = 256 * 1024,
+        chat_max_total_bytes: int = 4 * 1024 * 1024,
+        chat_closed_ttl_sec: float = 300.0,
+        chat_idle_ttl_sec: float = 30 * 60.0,
+        chat_gc_interval_sec: float = 30.0,
+        chat_artifact_root: str | Path | None = None,
     ) -> None:
         self.relay_server = relay_server
         self.bind = bind
@@ -298,6 +498,8 @@ class RemoteRelayHTTPService:
             if github_pr_service is not None
             else None
         )
+        self.persistence_maintenance_service = persistence_maintenance_service
+        self.max_request_body_bytes = max(1, int(max_request_body_bytes or 1))
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._queues: dict[str, queue.Queue[RelayEnvelope]] = {}
@@ -306,7 +508,22 @@ class RemoteRelayHTTPService:
         self._peer_chat_locks_lock = threading.Lock()
         self._chat_sessions: dict[str, _RemoteChatSession] = {}
         self._chat_sessions_lock = threading.Lock()
-        self._chat_session_ttl_sec = 300.0
+        self._chat_max_events = max(1, int(chat_max_events or 1))
+        self._chat_max_payload_bytes = max(1, int(chat_max_payload_bytes or 1))
+        self._chat_max_total_bytes = max(
+            self._chat_max_payload_bytes,
+            int(chat_max_total_bytes or self._chat_max_payload_bytes),
+        )
+        self._chat_session_ttl_sec = max(0.0, float(chat_closed_ttl_sec))
+        self._chat_idle_ttl_sec = max(0.0, float(chat_idle_ttl_sec))
+        self._chat_gc_interval_sec = max(1.0, float(chat_gc_interval_sec))
+        self._chat_artifact_root = (
+            Path(chat_artifact_root)
+            if chat_artifact_root is not None
+            else Path(tempfile.gettempdir()) / "labrastro-chat-events"
+        )
+        self._chat_gc_stop = threading.Event()
+        self._chat_gc_thread: threading.Thread | None = None
         self._runtime_recovery_stop = threading.Event()
         self._runtime_recovery_thread: threading.Thread | None = None
         self._runtime_recovery_interval_sec = 2.0
@@ -329,6 +546,8 @@ class RemoteRelayHTTPService:
         self._server = ThreadingHTTPServer((host, port), handler_cls)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        self._start_chat_gc()
+        self._start_persistence_maintenance()
         self._start_runtime_recovery()
         self._start_github_reconcile()
         if self.ui_bus is not None:
@@ -340,6 +559,8 @@ class RemoteRelayHTTPService:
     def stop(self) -> None:
         self._stop_github_reconcile()
         self._stop_runtime_recovery()
+        self._stop_persistence_maintenance()
+        self._stop_chat_gc()
         if self._server is None:
             return
         self._server.shutdown()
@@ -373,6 +594,40 @@ class RemoteRelayHTTPService:
         if self._runtime_recovery_thread is not None:
             self._runtime_recovery_thread.join(timeout=3)
             self._runtime_recovery_thread = None
+
+    def _start_persistence_maintenance(self) -> None:
+        service = self.persistence_maintenance_service
+        if service is None:
+            return
+        start = getattr(service, "start", None)
+        if callable(start):
+            start()
+
+    def _stop_persistence_maintenance(self) -> None:
+        service = self.persistence_maintenance_service
+        if service is None:
+            return
+        stop = getattr(service, "stop", None)
+        if callable(stop):
+            stop()
+
+    def _start_chat_gc(self) -> None:
+        if self._chat_gc_thread is not None:
+            return
+        self._chat_gc_stop.clear()
+
+        def loop() -> None:
+            while not self._chat_gc_stop.wait(self._chat_gc_interval_sec):
+                self._gc_chat_sessions()
+
+        self._chat_gc_thread = threading.Thread(target=loop, daemon=True)
+        self._chat_gc_thread.start()
+
+    def _stop_chat_gc(self) -> None:
+        self._chat_gc_stop.set()
+        if self._chat_gc_thread is not None:
+            self._chat_gc_thread.join(timeout=3)
+            self._chat_gc_thread = None
 
     def _start_github_reconcile(self) -> None:
         if self.github_pr_service is None or self.github_reconcile_service is None:
@@ -438,6 +693,10 @@ class RemoteRelayHTTPService:
             mode=mode,
             workflow_mode=workflow_mode,
             taskflow_goal_id=taskflow_goal_id,
+            artifact_root=self._chat_artifact_root,
+            max_events=self._chat_max_events,
+            max_payload_bytes=self._chat_max_payload_bytes,
+            max_total_bytes=self._chat_max_total_bytes,
         )
         with self._chat_sessions_lock:
             self._chat_sessions[session.chat_id] = session
@@ -449,12 +708,16 @@ class RemoteRelayHTTPService:
             stale_ids = [
                 chat_id
                 for chat_id, session in self._chat_sessions.items()
-                if session.done
-                and session.finished_at is not None
-                and now - session.finished_at > self._chat_session_ttl_sec
+                if session.is_stale(
+                    now,
+                    closed_ttl_sec=self._chat_session_ttl_sec,
+                    idle_ttl_sec=self._chat_idle_ttl_sec,
+                )
             ]
             for chat_id in stale_ids:
-                self._chat_sessions.pop(chat_id, None)
+                session = self._chat_sessions.pop(chat_id, None)
+                if session is not None:
+                    session.cleanup_artifacts()
 
     def _get_chat_session(self, chat_id: str) -> _RemoteChatSession | None:
         self._gc_chat_sessions()
@@ -509,6 +772,9 @@ class RemoteRelayHTTPService:
             BaseHTTPRequestHandler,
         ):
             def do_GET(self) -> None:  # noqa: N802
+                self._dispatch_remote(self._do_GET)
+
+            def _do_GET(self) -> None:
                 parsed = urlparse(self.path)
                 if parsed.path.startswith("/remote/auth/"):
                     if self._handle_auth_get(parsed.path):
@@ -540,9 +806,12 @@ class RemoteRelayHTTPService:
                 if parsed.path.startswith("/remote/mcp/artifacts/"):
                     self._handle_mcp_artifact(parsed.path)
                     return
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                self._send_error(HTTPStatus.NOT_FOUND, "not_found")
 
             def do_POST(self) -> None:  # noqa: N802
+                self._dispatch_remote(self._do_POST)
+
+            def _do_POST(self) -> None:
                 parsed = urlparse(self.path)
                 if parsed.path.startswith("/remote/auth/"):
                     if self._handle_auth_post(parsed.path):
@@ -622,7 +891,23 @@ class RemoteRelayHTTPService:
                 if parsed.path.startswith("/remote/admin/"):
                     self._handle_admin(parsed.path)
                     return
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                self._send_error(HTTPStatus.NOT_FOUND, "not_found")
+
+            def _dispatch_remote(self, handler: Callable[[], None]) -> None:
+                try:
+                    handler()
+                except RemoteRouteError as exc:
+                    self._send_error(
+                        exc.status,
+                        exc.code,
+                        exc.message,
+                        exc.details,
+                    )
+                except Exception:
+                    self._send_error(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "internal_server_error",
+                    )
 
         Handler.service = service
         return Handler

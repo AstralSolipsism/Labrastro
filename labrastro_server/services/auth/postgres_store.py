@@ -7,8 +7,10 @@ import json
 from typing import Any
 
 from labrastro_server.services.auth.models import (
+    AccessTokenRecord,
     AuthDevice,
     AuthUser,
+    LoginFailureRecord,
     RefreshTokenRecord,
 )
 
@@ -234,6 +236,156 @@ class PostgresAuthStore:
                     WHERE """ + " AND ".join(filters)
                 ),
                 params,
+            )
+        return int(result.rowcount or 0)
+
+    def record_access_token(self, token_record: AccessTokenRecord) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO labrastro_auth_access_tokens (
+                        id, user_id, device_id, token_hash, expires_at,
+                        created_at, revoked_at
+                    ) VALUES (
+                        :id, :user_id, :device_id, :token_hash, :expires_at,
+                        :created_at, :revoked_at
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        user_id=EXCLUDED.user_id,
+                        device_id=EXCLUDED.device_id,
+                        token_hash=EXCLUDED.token_hash,
+                        expires_at=EXCLUDED.expires_at,
+                        revoked_at=EXCLUDED.revoked_at
+                    """
+                ),
+                token_record.to_dict(),
+            )
+
+    def get_access_token_by_hash(self, token_hash: str) -> AccessTokenRecord | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT * FROM labrastro_auth_access_tokens
+                    WHERE token_hash=:token_hash
+                    """
+                ),
+                {"token_hash": token_hash},
+            ).mappings().first()
+        return AccessTokenRecord.from_dict(_row_dict(row)) if row else None
+
+    def update_access_token(self, token_record: AccessTokenRecord) -> None:
+        self.record_access_token(token_record)
+
+    def revoke_access_tokens(
+        self,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        exclude_device_id: str | None = None,
+        revoked_at: float,
+    ) -> int:
+        filters = ["revoked_at IS NULL"]
+        params: dict[str, Any] = {"revoked_at": revoked_at}
+        if user_id is not None:
+            filters.append("user_id=:user_id")
+            params["user_id"] = user_id
+        if device_id is not None:
+            filters.append("device_id=:device_id")
+            params["device_id"] = device_id
+        if exclude_device_id is not None:
+            filters.append("device_id<>:exclude_device_id")
+            params["exclude_device_id"] = exclude_device_id
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    UPDATE labrastro_auth_access_tokens
+                    SET revoked_at=:revoked_at
+                    WHERE """ + " AND ".join(filters)
+                ),
+                params,
+            )
+        return int(result.rowcount or 0)
+
+    def delete_expired_access_tokens(self, *, now: float) -> int:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    DELETE FROM labrastro_auth_access_tokens
+                    WHERE expires_at<=:now
+                    """
+                ),
+                {"now": now},
+            )
+        return int(result.rowcount or 0)
+
+    def record_login_failure(self, failure: LoginFailureRecord) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO labrastro_auth_login_failures (
+                        id, username, source, failed_at
+                    ) VALUES (
+                        :id, :username, :source, :failed_at
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        username=EXCLUDED.username,
+                        source=EXCLUDED.source,
+                        failed_at=EXCLUDED.failed_at
+                    """
+                ),
+                failure.to_dict(),
+            )
+
+    def count_login_failures(
+        self, *, username: str, source: str, since: float
+    ) -> int:
+        with self.engine.begin() as conn:
+            count = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM labrastro_auth_login_failures
+                    WHERE lower(username)=lower(:username)
+                      AND source=:source
+                      AND failed_at>=:since
+                    """
+                ),
+                {
+                    "username": username.strip(),
+                    "source": source,
+                    "since": since,
+                },
+            ).scalar_one()
+        return int(count or 0)
+
+    def clear_login_failures(self, *, username: str, source: str) -> int:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    DELETE FROM labrastro_auth_login_failures
+                    WHERE lower(username)=lower(:username)
+                      AND source=:source
+                    """
+                ),
+                {"username": username.strip(), "source": source},
+            )
+        return int(result.rowcount or 0)
+
+    def delete_old_login_failures(self, *, before: float) -> int:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    DELETE FROM labrastro_auth_login_failures
+                    WHERE failed_at<:before
+                    """
+                ),
+                {"before": before},
             )
         return int(result.rowcount or 0)
 

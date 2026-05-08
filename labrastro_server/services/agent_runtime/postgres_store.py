@@ -32,6 +32,10 @@ from labrastro_server.services.agent_runtime.prompt_renderer import (
     CanonicalAgentContext,
     ExecutorPromptRenderer,
 )
+from labrastro_server.services.agent_runtime.runtime_store import (
+    DEFAULT_RUNTIME_EVENT_LIMIT,
+    clamp_event_limit,
+)
 
 
 try:  # pragma: no cover - import availability is environment dependent.
@@ -899,9 +903,16 @@ class PostgresRuntimeStore:
                 metadata=pr.metadata,
             )
 
-    def list_events(self, task_id: str, *, after_seq: int = 0) -> list[Any]:
+    def list_events(
+        self,
+        task_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
+    ) -> list[Any]:
         from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskEvent
 
+        limit = clamp_event_limit(limit)
         with self.engine.begin() as conn:
             rows = conn.execute(
                 text(
@@ -910,9 +921,10 @@ class PostgresRuntimeStore:
                     FROM labrastro_runtime_events
                     WHERE task_id=:task_id AND seq > :after_seq
                     ORDER BY seq ASC
+                    LIMIT :limit
                     """
                 ),
-                {"task_id": task_id, "after_seq": after_seq},
+                {"task_id": task_id, "after_seq": after_seq, "limit": limit},
             ).mappings()
             return [
                 RuntimeTaskEvent(
@@ -966,7 +978,15 @@ class PostgresRuntimeStore:
             ).mappings()
             return [_task_to_dict(self._task_from_row(row)) for row in rows]
 
-    def load_task_detail(self, task_id: str, *, event_limit: int = 100) -> dict[str, Any]:
+    def load_task_detail(
+        self,
+        task_id: str,
+        *,
+        event_limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
+    ) -> dict[str, Any]:
+        from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskEvent
+
+        event_limit = clamp_event_limit(event_limit)
         with self.engine.begin() as conn:
             task = self._task_from_row(self._task_row(conn, task_id))
             session = conn.execute(
@@ -987,13 +1007,37 @@ class PostgresRuntimeStore:
                 ),
                 {"task_id": task_id},
             ).mappings().first()
-        events = [event.to_dict() for event in self.list_events(task_id, after_seq=0)]
+            event_rows = conn.execute(
+                text(
+                    """
+                    SELECT task_id, seq, type, payload
+                    FROM (
+                        SELECT task_id, seq, type, payload
+                        FROM labrastro_runtime_events
+                        WHERE task_id=:task_id
+                        ORDER BY seq DESC
+                        LIMIT :limit
+                    ) limited_events
+                    ORDER BY seq ASC
+                    """
+                ),
+                {"task_id": task_id, "limit": event_limit},
+            ).mappings().all()
+        events = [
+            RuntimeTaskEvent(
+                task_id=str(row["task_id"]),
+                seq=int(row["seq"]),
+                type=str(row["type"]),
+                payload=_dict_from(row["payload"]),
+            ).to_dict()
+            for row in event_rows
+        ]
         return {
             "task": _task_to_dict(task),
             "artifacts": self.artifacts_to_dict(task_id),
             "session": _jsonable_row(session) if session is not None else None,
             "claim": _jsonable_row(claim) if claim is not None else None,
-            "events": events[-max(1, int(event_limit or 100)) :],
+            "events": events,
         }
 
     def _resolve_request(self, request: Any) -> Any:

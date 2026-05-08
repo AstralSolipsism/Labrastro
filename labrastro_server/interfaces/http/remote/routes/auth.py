@@ -210,4 +210,4 @@ class RemoteAuthRoutes:
             status = HTTPStatus.TOO_MANY_REQUESTS
         elif error.code in {"configured_user_immutable"}:
             status = HTTPStatus.FORBIDDEN
-        self._send_json(status, {"error": error.code, "message": str(error)})
+        self._send_error(status, error.code, str(error))

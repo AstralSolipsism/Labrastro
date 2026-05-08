@@ -182,6 +182,67 @@ class RefreshTokenRecord:
 
 
 @dataclass(frozen=True)
+class AccessTokenRecord:
+    id: str
+    user_id: str
+    device_id: str
+    token_hash: str
+    expires_at: float
+    created_at: float
+    revoked_at: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "device_id": self.device_id,
+            "token_hash": self.token_hash,
+            "expires_at": self.expires_at,
+            "created_at": self.created_at,
+            "revoked_at": self.revoked_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AccessTokenRecord":
+        return cls(
+            id=str(data["id"]),
+            user_id=str(data["user_id"]),
+            device_id=str(data["device_id"]),
+            token_hash=str(data["token_hash"]),
+            expires_at=float(data.get("expires_at", 0) or 0),
+            created_at=float(data.get("created_at", 0) or 0),
+            revoked_at=(
+                float(data["revoked_at"]) if data.get("revoked_at") is not None else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LoginFailureRecord:
+    id: str
+    username: str
+    source: str
+    failed_at: float
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "username": self.username,
+            "source": self.source,
+            "failed_at": self.failed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LoginFailureRecord":
+        return cls(
+            id=str(data["id"]),
+            username=str(data["username"]),
+            source=str(data["source"]),
+            failed_at=float(data.get("failed_at", 0) or 0),
+        )
+
+
+@dataclass(frozen=True)
 class AuthPrincipal:
     user_id: str
     username: str

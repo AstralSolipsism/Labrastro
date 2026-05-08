@@ -96,6 +96,29 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     assert control.list_events(task.id, after_seq=0)[0].type == "queued"
 
 
+def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
+    control = AgentRuntimeControlPlane()
+    task = control.submit_task(
+        RuntimeTaskRequest(
+            issue_id="issue-events",
+            agent_id="coder",
+            prompt="events",
+        ),
+        task_id="task-events",
+    )
+    for idx in range(5):
+        control.append_executor_event(task.id, ExecutorEvent.text_event(f"event-{idx}"))
+
+    first_page = control.list_events(task.id, after_seq=0, limit=3)
+    assert [event.seq for event in first_page] == [1, 2, 3]
+
+    waited = control.wait_events(task.id, after_seq=1, timeout_sec=0, limit=2)
+    assert [event.seq for event in waited] == [2, 3]
+
+    detail = control.load_task_detail(task.id, event_limit=2)
+    assert [event["seq"] for event in detail["events"]] == [5, 6]
+
+
 def test_complete_without_session_id_preserves_stream_pinned_session() -> None:
     control = AgentRuntimeControlPlane()
     task = control.submit_task(

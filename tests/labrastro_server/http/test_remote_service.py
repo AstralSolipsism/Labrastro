@@ -70,7 +70,18 @@ TEST_ADMIN_TOKEN = "test-admin-token"
 TEST_ADMIN_HEADERS = {"Authorization": f"Bearer {TEST_ADMIN_TOKEN}"}
 
 
+class _TestAuditStore:
+    def __init__(self) -> None:
+        self.audit_events: list[dict] = []
+
+    def append_audit_event(self, event: dict) -> None:
+        self.audit_events.append(dict(event))
+
+
 class _TestAuthService:
+    def __init__(self) -> None:
+        self.store = _TestAuditStore()
+
     def state(self) -> dict:
         return {"ok": True, "auth_enabled": True, "login_required": True}
 
@@ -398,7 +409,7 @@ class TestRemoteRelayHTTPService:
                 assert exc.code == 409
                 body = json.loads(exc.read().decode("utf-8"))
                 assert body["error"] == "provider_in_use"
-                assert body["blockers"][0]["profile_id"] == "deepseek-main"
+                assert body["details"]["blockers"][0]["profile_id"] == "deepseek-main"
 
             _, active = _json_request(
                 "POST",
@@ -453,7 +464,9 @@ class TestRemoteRelayHTTPService:
                 {"provider_id": "deepseek-copy"},
                 headers=admin_headers,
             )
-            assert deleted == {"ok": True, "provider_id": "deepseek-copy"}
+            assert deleted["ok"] is True
+            assert deleted["provider_id"] == "deepseek-copy"
+            assert "config_etag" in deleted
             assert len(reloads) == 8
             raw = config_path.read_text(encoding="utf-8")
             assert "sk-secret-value" in raw
@@ -650,7 +663,10 @@ class TestRemoteRelayHTTPService:
                 {"kind": "mcp", "name": "gitnexus-mcp"},
                 headers=admin_headers,
             )
-            assert deleted == {"ok": True, "kind": "mcp", "name": "gitnexus-mcp"}
+            assert deleted["ok"] is True
+            assert deleted["kind"] == "mcp"
+            assert deleted["name"] == "gitnexus-mcp"
+            assert "config_etag" in deleted
 
             raw = config_path.read_text(encoding="utf-8")
             assert "gitnexus:" in raw
@@ -710,6 +726,87 @@ class TestRemoteRelayHTTPService:
             assert "sk-existing" in raw
             assert "broken" not in raw
             assert "sk-broken" not in raw
+            audit_text = json.dumps(service.auth_service.store.audit_events)
+            assert "admin_config_failed" in audit_text
+            assert "sk-broken" not in audit_text
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_config_etag_conflict_and_audit_redacts_secrets(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("models:\n  profiles: {}\n", encoding="utf-8")
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, read_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/server-settings/read",
+                {},
+                headers=TEST_ADMIN_HEADERS,
+            )
+            initial_etag = read_body["config_etag"]
+
+            _, created = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/providers/record",
+                {
+                    "if_match": initial_etag,
+                    "provider_id": "deepseek",
+                    "type": "openai_chat",
+                    "api_key": "sk-secret-value",
+                    "base_url": "https://api.deepseek.com/v1",
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert created["ok"] is True
+            assert created["config_etag"] != initial_etag
+
+            _, enabled = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/providers/enable",
+                {"provider_id": "deepseek", "enabled": False},
+                headers={**TEST_ADMIN_HEADERS, "If-Match": created["config_etag"]},
+            )
+            assert enabled["ok"] is True
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/providers/record",
+                    {
+                        "if_match": initial_etag,
+                        "provider_id": "blocked",
+                        "type": "openai_chat",
+                        "base_url": "https://blocked.invalid/v1",
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+                raise AssertionError("stale if_match should be rejected")
+            except HTTPError as exc:
+                assert exc.code == 409
+                body = json.loads(exc.read().decode("utf-8"))
+                assert body["error"] == "config_version_conflict"
+                assert body["details"]["config_etag"] == enabled["config_etag"]
+
+            raw = config_path.read_text(encoding="utf-8")
+            assert "blocked" not in raw
+            events = service.auth_service.store.audit_events
+            event_types = [event["type"] for event in events]
+            assert "admin_config_updated" in event_types
+            assert "admin_config_conflict" in event_types
+            audit_text = json.dumps(events)
+            assert "sk-secret-value" not in audit_text
+            assert "***" in audit_text
         finally:
             service.stop()
             relay.stop()
@@ -1474,7 +1571,9 @@ class TestRemoteRelayHTTPService:
             except HTTPError as exc:
                 assert exc.code == 403
                 body = json.loads(exc.read().decode("utf-8"))
-                assert body["type"] == "register_rejected"
+                assert body["ok"] is False
+                assert body["error"] == "register_rejected"
+                assert body["details"]["reason"]
         finally:
             service.stop()
             relay.stop()
@@ -1514,6 +1613,45 @@ class TestRemoteRelayHTTPService:
             assert status == 200
             assert chat_body["response"] == f"{peer_id}:hello"
             assert chat_body.get("error") in (None, "")
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_endpoint_sanitizes_host_handler_exceptions(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+
+        def chat_handler(_peer_id: str, _prompt: str) -> ChatResponse:
+            raise RuntimeError("secret chat failure")
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            chat_handler=chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            status, chat_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat",
+                {
+                    "peer_token": register_body["payload"]["peer_token"],
+                    "prompt": "hello",
+                },
+            )
+
+            assert status == 200
+            assert chat_body["error"] == "chat_handler_failed"
+            assert "secret chat failure" not in json.dumps(chat_body)
         finally:
             service.stop()
             relay.stop()
@@ -1750,6 +1888,272 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_chat_cancel_adds_terminal_event_and_marks_done(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            session.wait_approval("hold", timeout_sec=2)
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "cancel me"},
+            )
+            chat_id = start_body["chat_id"]
+
+            _, cancel_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/cancel",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "reason": "user_cancelled",
+                },
+            )
+            assert cancel_body["ok"] is True
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+            assert stream_body["done"] is True
+            event_types = [event["type"] for event in stream_body["events"]]
+            assert "chat_cancel_requested" in event_types
+            assert "chat_cancelled" in event_types
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_stream_reports_lost_events_when_buffer_pruned(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        finished = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                for idx in range(6):
+                    session.append_event("delta", {"idx": idx})
+                session.append_event("chat_end", {"response": "done"})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+            chat_max_events=3,
+            chat_artifact_root=tmp_path / "chat-events",
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "overflow"},
+            )
+            assert finished.wait(2)
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": start_body["chat_id"],
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+
+            events = stream_body["events"]
+            assert events[0]["type"] == "events_lost"
+            assert events[0]["payload"]["first_available_seq"] > 1
+            assert events[0]["payload"]["dropped_count"] >= 1
+            assert [event["type"] for event in events[1:]] == [
+                "delta",
+                "delta",
+                "chat_end",
+            ]
+            assert [event["payload"].get("idx") for event in events if event["type"] == "delta"] == [4, 5]
+            assert stream_body["next_cursor"] == events[-1]["seq"]
+            assert stream_body["done"] is True
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_stream_spills_oversized_payload_to_gzip_artifact(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        finished = threading.Event()
+        large_text = "x" * 512
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                session.append_event("delta", {"text": large_text})
+                session.append_event("chat_end", {"response": "done"})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+            chat_max_payload_bytes=128,
+            chat_artifact_root=tmp_path / "chat-events",
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "large"},
+            )
+            assert finished.wait(2)
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": start_body["chat_id"],
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+
+            delta_event = next(
+                event for event in stream_body["events"] if event["type"] == "delta"
+            )
+            artifact = delta_event["payload"]["artifact_ref"]
+            artifact_path = Path(artifact["path"])
+            assert artifact["encoding"] == "json+gzip"
+            assert artifact["bytes"] > 128
+            assert artifact_path.exists()
+            with gzip.open(artifact_path, "rt", encoding="utf-8") as fh:
+                assert json.load(fh) == {"text": large_text}
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_gc_removes_closed_idle_sessions_and_artifacts(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        finished = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                session.append_event("delta", {"text": "x" * 512})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+            chat_max_payload_bytes=128,
+            chat_artifact_root=tmp_path / "chat-events",
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "gc"},
+            )
+            chat_id = start_body["chat_id"]
+            assert finished.wait(2)
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+            delta_event = next(
+                event for event in stream_body["events"] if event["type"] == "delta"
+            )
+            artifact_path = Path(delta_event["payload"]["artifact_ref"]["path"])
+            assert artifact_path.exists()
+
+            session = service._get_chat_session(chat_id)
+            assert session is not None
+            service._chat_session_ttl_sec = 0
+            session.finished_at = time.time() - 1
+            service._gc_chat_sessions()
+
+            assert service._get_chat_session(chat_id) is None
+            assert not artifact_path.exists()
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_approval_reply_routes_to_matching_chat_session_only(self) -> None:
         relay = RelayServer()
         relay.start()
@@ -1963,6 +2367,8 @@ class TestRemoteRelayHTTPService:
             calls.append((action, peer_id, payload))
             if action == "load" and payload.get("session_id") == "missing":
                 return {"ok": False, "error": "session_not_found", "_status": 404}
+            if action == "new":
+                raise RuntimeError("secret session failure")
             return {"ok": True, "action": action}
 
         service = RemoteRelayHTTPService(
@@ -2021,6 +2427,19 @@ class TestRemoteRelayHTTPService:
                 raise AssertionError("expected missing session to fail")
             except HTTPError as exc:
                 assert exc.code == 404
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/sessions/new",
+                    {"peer_token": peer_token},
+                )
+                raise AssertionError("expected session handler error to fail")
+            except HTTPError as exc:
+                body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 500
+                assert body["error"] == "session_request_failed"
+                assert "secret session failure" not in body["message"]
 
             status, delete_body = _json_request(
                 "POST",
@@ -2319,6 +2738,24 @@ class TestRemoteRelayHTTPService:
                 },
             )
             assert event_body["ok"] is True
+
+            _, admin_events = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/runtime/events",
+                {"task_id": "task-http-runtime", "after_seq": 0, "limit": 2},
+                headers=admin_headers,
+            )
+            assert len(admin_events["events"]) == 2
+            assert admin_events["next_seq"] == admin_events["events"][-1]["seq"]
+            assert admin_events["has_more"] is True
+
+            _, peer_events = _json_request(
+                "GET",
+                f"{service.base_url}/remote/agent-runtime/tasks/task-http-runtime/events?peer_token={peer_token}&after_seq=0&limit=2",
+            )
+            assert len(peer_events["events"]) == 2
+            assert peer_events["next_seq"] == peer_events["events"][-1]["seq"]
+            assert peer_events["has_more"] is True
 
             try:
                 _json_request(
@@ -2986,7 +3423,7 @@ class TestRemoteRelayHTTPService:
                 body = json.loads(exc.read().decode("utf-8"))
                 assert exc.code == 400
                 assert body["error"] == "invalid_runtime_task"
-                assert "runtime profile not found: missing_profile" in body["message"]
+                assert "missing_profile" not in body["message"]
             else:
                 raise AssertionError("submit should reject missing runtime profile")
         finally:
