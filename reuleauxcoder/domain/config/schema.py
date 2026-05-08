@@ -134,7 +134,7 @@ CONFIG_SCHEMA = {
         "access_token_ttl_sec": "int (default: 900)",
         "refresh_token_ttl_sec": "int (default: 2592000)",
         "password_hash_iterations": "int (default: 260000)",
-        "password_min_length": "int (default: 10)",
+        "password_min_length": "int (default: 6)",
         "password_max_length": "int (default: 256)",
         "login_rate_limit_count": "int (default: 5)",
         "login_rate_limit_window_sec": "int (default: 900)",

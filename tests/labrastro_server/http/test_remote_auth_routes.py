@@ -339,6 +339,13 @@ def test_auth_management_devices_audit_and_scope_boundaries(tmp_path: Path) -> N
             headers=viewer_headers,
         )
         assert revoked["device"]["revoked_at"] is not None
+        _, after_revoke_devices = _json_request(
+            "POST",
+            f"{service.base_url}/remote/auth/devices/list",
+            {"user_id": viewer_login["user"]["id"]},
+            headers=admin_headers,
+        )
+        assert after_revoke_devices["devices"] == []
 
         _, audit = _json_request(
             "POST",

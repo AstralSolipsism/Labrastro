@@ -641,7 +641,7 @@ class AuthConfig:
     access_token_ttl_sec: int = 900
     refresh_token_ttl_sec: int = 2_592_000
     password_hash_iterations: int = 260_000
-    password_min_length: int = 10
+    password_min_length: int = 6
     password_max_length: int = 256
     login_rate_limit_count: int = 5
     login_rate_limit_window_sec: int = 900
@@ -673,7 +673,7 @@ class AuthConfig:
             password_hash_iterations=int(
                 data.get("password_hash_iterations", 260_000) or 260_000
             ),
-            password_min_length=int(data.get("password_min_length", 10) or 10),
+            password_min_length=int(data.get("password_min_length", 6) or 6),
             password_max_length=int(data.get("password_max_length", 256) or 256),
             login_rate_limit_count=int(data.get("login_rate_limit_count", 5) or 5),
             login_rate_limit_window_sec=int(

@@ -120,7 +120,7 @@ auth:
   enabled: true
   token_secret: <long-random-secret>
   store_backend: postgres
-  password_min_length: 10
+  password_min_length: 6
   login_rate_limit_count: 5
   superadmins:
     - username: admin

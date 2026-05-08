@@ -355,6 +355,14 @@ def test_password_policy_rate_limit_and_session_revocation(tmp_path: Path) -> No
         service.create_user(admin, username="shorty", password="short", role="user")
     assert policy_error.value.code == "password_policy_failed"
 
+    six_char = service.create_user(
+        admin,
+        username="sixchr",
+        password="abc123",
+        role="user",
+    )
+    assert six_char["user"]["username"] == "sixchr"
+
     for _index in range(5):
         with pytest.raises(AuthError) as bad_login:
             service.login("missing", "bad-password", "pytest", source_ip="127.0.0.1")
@@ -375,6 +383,7 @@ def test_password_policy_rate_limit_and_session_revocation(tmp_path: Path) -> No
     devices = service.list_devices(viewer)["devices"]
     assert devices
     service.revoke_device(viewer, device_id=devices[0]["id"])
+    assert service.list_devices(viewer)["devices"] == []
     assert service.authenticate_access_token(viewer_session.access_token) is None
     with pytest.raises(AuthError) as revoked_refresh:
         service.refresh(viewer_session.refresh_token)

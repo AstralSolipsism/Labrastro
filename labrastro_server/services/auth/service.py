@@ -410,6 +410,7 @@ class AuthService:
         devices = [
             self._public_device(device)
             for device in self.store.list_devices(user_id=target_user_id)
+            if device.revoked_at is None
         ]
         return {"ok": True, "devices": devices}
 
@@ -580,12 +581,13 @@ class AuthService:
         return normalize_scopes(list(requested))
 
     def _validate_password(self, password: str) -> None:
-        min_length = int(getattr(self.config, "password_min_length", 10) or 10)
+        min_length = int(getattr(self.config, "password_min_length", 6) or 6)
         max_length = int(getattr(self.config, "password_max_length", 256) or 256)
+        message = f"password must be {min_length}-{max_length} characters"
         if not isinstance(password, str) or len(password) < min_length:
-            raise AuthError("password_policy_failed")
+            raise AuthError("password_policy_failed", message)
         if len(password) > max_length:
-            raise AuthError("password_policy_failed")
+            raise AuthError("password_policy_failed", message)
 
     def _check_login_rate_limit(self, username: str, source: str) -> None:
         limit = int(getattr(self.config, "login_rate_limit_count", 5) or 5)
@@ -693,7 +695,7 @@ def validate_auth_config(config: AuthConfig) -> list[str]:
     store_backend = str(getattr(config, "store_backend", "auto") or "auto")
     if store_backend not in {"auto", "file", "postgres"}:
         errors.append("auth.store_backend must be one of auto, file, postgres")
-    password_min = int(getattr(config, "password_min_length", 10) or 10)
+    password_min = int(getattr(config, "password_min_length", 6) or 6)
     password_max = int(getattr(config, "password_max_length", 256) or 256)
     if password_min < 1:
         errors.append("auth.password_min_length must be positive")
