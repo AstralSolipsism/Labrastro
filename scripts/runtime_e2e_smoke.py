@@ -265,7 +265,7 @@ class ServerRunner:
         if not self.pg_password:
             raise SystemExit("Postgres password is required")
         self.masker = Masker([self.pg_password])
-        self.db_name = args.database_name or f"labrastro_runtime_smoke_{self.timestamp.lower()}"
+        self.db_name = args.database_name or f"ezcode_smoke_{self.timestamp.lower()}"
         if not is_safe_identifier(self.db_name):
             raise SystemExit(f"Unsafe database name: {self.db_name}")
         if not is_safe_identifier(self.pg_user):
@@ -290,8 +290,13 @@ class ServerRunner:
         }
         self.access_token = ""
         self.refresh_token = ""
-        self.auth_username = os.environ.get("LABRASTRO_SUPERADMIN_USERNAME", "admin")
-        self.auth_password = os.environ.get("LABRASTRO_SUPERADMIN_PASSWORD", "")
+        self.auth_username = secrets_payload.get("auth_username") or os.environ.get(
+            "LABRASTRO_SUPERADMIN_USERNAME", "admin"
+        )
+        self.auth_password = secrets_payload.get("auth_password") or os.environ.get(
+            "LABRASTRO_SUPERADMIN_PASSWORD", ""
+        )
+        self.masker.add(self.auth_password)
         self.config_path: Path | None = None
         self.compose_path: Path | None = None
         self.compose_service = ""
@@ -384,14 +389,31 @@ class ServerRunner:
         except URLError as exc:
             raise RuntimeError(f"HTTP {method} {path} failed: {exc}") from exc
 
-    def admin_json(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.http_json(
-            "POST",
-            path,
-            payload or {},
-            headers={"Authorization": f"Bearer {self.access_token}"},
-            timeout=60,
-        )
+    def admin_json(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        retry_on_unauthorized: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            return self.http_json(
+                "POST",
+                path,
+                payload or {},
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                timeout=60,
+            )
+        except RuntimeError as exc:
+            if retry_on_unauthorized and "status=401" in str(exc):
+                self.record_step("admin_relogin", path=path)
+                self.login()
+                return self.admin_json(
+                    path,
+                    payload,
+                    retry_on_unauthorized=False,
+                )
+            raise
 
     def login(self) -> None:
         if not self.auth_password:
@@ -672,7 +694,6 @@ class ServerRunner:
               auto_migrate: true
               runtime_enabled: true
               sessions_enabled: true
-              legacy_session_import: lazy
               retention_days: 0
             """
         )
@@ -928,10 +949,12 @@ class ServerRunner:
             )
             if result.get("ok") is not True:
                 self.record_step("restore_agent_runtime", "failed", response=result)
+                raise RuntimeError(f"restore_agent_runtime failed: {result}")
             else:
                 self.record_step("restore_agent_runtime")
         except Exception as exc:  # noqa: BLE001
             self.record_step("restore_agent_runtime", "failed", error=str(exc))
+            raise
 
     def create_git_fixture(self) -> dict[str, str]:
         self.log("create git fixture")
@@ -1796,6 +1819,7 @@ class ServerRunner:
         if hb.get("ok") is not True:
             raise RuntimeError(f"heartbeat failed before recovery restart: {hb}")
         self.restart_host()
+        self.login()
         detail = self.load_task(task_id)
         if detail["task"]["status"] != "failed":
             raise RuntimeError(f"recovery task was not marked failed: {detail['task']}")
@@ -1942,6 +1966,7 @@ class ServerRunner:
 
     def run(self) -> int:
         success = False
+        exit_code = 1
         try:
             self.preflight()
             self.backup()
@@ -1964,7 +1989,7 @@ class ServerRunner:
             self.verify_db_counts()
             success = True
             self.record_step("success")
-            return 0
+            exit_code = 0
         except Exception as exc:  # noqa: BLE001
             self.report["error"] = self.masker.mask(str(exc))
             self.record_step("failed", "failed", error=str(exc))
@@ -1977,12 +2002,21 @@ class ServerRunner:
             if not self.args.retain_success:
                 self.rollback()
             self.log(f"FAILED: {exc}")
-            return 1
+            exit_code = 1
         finally:
             self.stop_worker()
             if success:
-                self.restore_agent_runtime()
+                try:
+                    self.restore_agent_runtime()
+                except Exception as exc:  # noqa: BLE001
+                    self.report["error"] = self.masker.mask(str(exc))
+                    self.record_step("failed", "failed", error=str(exc))
+                    if not self.args.retain_success:
+                        self.rollback()
+                    self.log(f"FAILED: {exc}")
+                    exit_code = 1
             self.write_report()
+        return exit_code
 
 
 def dry_run(args: argparse.Namespace) -> int:
@@ -2022,8 +2056,10 @@ def dry_run(args: argparse.Namespace) -> int:
 def remote(args: argparse.Namespace) -> int:
     ssh_password = load_secret_from_env(args.ssh_password_env, "SSH password")
     pg_password = load_secret_from_env(args.pg_password_env, "Postgres password")
+    auth_username = os.environ.get("LABRASTRO_SUPERADMIN_USERNAME", "admin")
+    auth_password = os.environ.get("LABRASTRO_SUPERADMIN_PASSWORD", "")
     timestamp = args.timestamp or utc_timestamp()
-    masker = Masker([ssh_password, pg_password])
+    masker = Masker([ssh_password, pg_password, auth_password])
     repo_root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="labrastro-runtime-smoke-") as tmp:
         tmp_path = Path(tmp)
@@ -2059,8 +2095,16 @@ def remote(args: argparse.Namespace) -> int:
             ]
             if args.retain_success:
                 server_args.append("--retain-success")
+            if args.database_name:
+                server_args.extend(["--database-name", args.database_name])
             command = " ".join(q(item) for item in server_args) + " --secrets-stdin"
-            secrets_payload = json.dumps({"pg_password": pg_password})
+            secrets_payload = json.dumps(
+                {
+                    "pg_password": pg_password,
+                    "auth_username": auth_username,
+                    "auth_password": auth_password,
+                }
+            )
             code, out, err = ssh.run(command, input_text=secrets_payload, timeout=None)
             if out:
                 print_masked(masker, out.rstrip())
@@ -2105,6 +2149,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     remote_parser = sub.add_parser("remote", help="Upload and execute server smoke")
     add_common(remote_parser)
+    remote_parser.add_argument("--database-name")
     remote_parser.set_defaults(func=remote)
 
     server = sub.add_parser("server-steps", help="Run the smoke on the server")
