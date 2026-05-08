@@ -117,7 +117,7 @@ remote_exec:
 auth:
   enabled: true
   token_secret: <long-random-secret>
-  store_backend: auto
+  store_backend: postgres
   password_min_length: 10
   login_rate_limit_count: 5
   superadmins:
@@ -125,9 +125,9 @@ auth:
       password_hash: <pbkdf2-password-hash>
 ```
 
-`store_backend: auto` 会在 `persistence.database_url` 存在时使用 Postgres 表
+`store_backend: postgres` 使用 Postgres 表
 `labrastro_auth_users`、`labrastro_auth_devices`、`labrastro_auth_refresh_tokens`、`labrastro_auth_audit_events`，
-否则回退到文件存储 `.rcoder/auth.json`。首次管理员只能由后端配置提供；前端不做系统初始化。
+首次管理员只能由后端配置提供；前端不做系统初始化。
 
 生成和校验认证配置：
 

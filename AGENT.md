@@ -83,7 +83,7 @@ External resource access and low-level utilities.
 - **fs/paths.py**: Path utility functions — `get_sessions_dir()`, `get_history_file()`, `get_user_config_dir()` → `~/.rcoder`, `get_tool_outputs_dir(configured_dir=None)` → `.rcoder/tool-outputs`, `get_diagnostics_dir()` → `.rcoder/diagnostics`, `ensure_user_dirs()` creates all directories.
 - **persistence/**: Storage layer
   - `session_store.py` — `SessionStore`: JSON persistence for sessions. `save()` writes messages + runtime overlay + fingerprint, refreshes `saved_at`. `list()` and `get_latest()` are fingerprint-aware. `load()` backfills missing token metadata for older sessions. `append_system_message()` attaches diagnostics. `generate_session_id()` creates `session_<timestamp>_<hex>` IDs. Thread-safe via `threading.RLock()`. `DEFAULT_SESSION_FINGERPRINT = "local"`.
-  - `workspace_config_store.py` — `WorkspaceConfigStore`: persists runtime config changes to workspace `config.yaml`. Methods: `save_approval_config()`, `save_active_model_profile()`, `save_active_sub_model_profile()`, `save_active_mode()`, `save_mcp_server_config()`. Used by `[global]` slash commands.
+  - `workspace_config_store.py` — `WorkspaceConfigStore`: persists runtime config changes to workspace `config.yaml`. Methods: `save_approval_config()`, `save_active_main_model_profile()`, `save_active_sub_model_profile()`, `save_active_mode()`, `save_mcp_server_config()`. Used by `[global]` slash commands.
   - `skills_config_store.py` — `SkillsConfigStore`: persists disabled skills list to workspace config.
 - **yaml/**: YAML loading with error context (file path, line numbers).
 - **openai/**: OpenAI SDK wrapper for typed client instantiation.

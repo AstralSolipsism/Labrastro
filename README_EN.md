@@ -113,7 +113,7 @@ remote_exec:
 auth:
   enabled: true
   token_secret: <long-random-secret>
-  store_backend: auto
+  store_backend: postgres
   password_min_length: 10
   login_rate_limit_count: 5
   superadmins:
@@ -121,9 +121,8 @@ auth:
       password_hash: <pbkdf2-password-hash>
 ```
 
-`store_backend: auto` uses Postgres tables
+`store_backend: postgres` uses Postgres tables
 `labrastro_auth_users`, `labrastro_auth_devices`, `labrastro_auth_refresh_tokens`, and `labrastro_auth_audit_events`
-when `persistence.database_url` is configured; otherwise it falls back to `.rcoder/auth.json`.
 The first administrator must come from backend config. The frontend does not initialize the system.
 
 Generate and verify auth config:

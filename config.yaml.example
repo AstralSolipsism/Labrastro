@@ -115,7 +115,7 @@ approval:
 # auth:
 #   enabled: true
 #   token_secret: "replace-with-a-long-random-secret"
-#   store_backend: auto  # auto uses Postgres when persistence.database_url exists, otherwise file
+#   store_backend: postgres
 #   store_path: ".rcoder/auth.json"
 #   password_min_length: 10
 #   password_max_length: 256

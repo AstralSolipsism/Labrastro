@@ -40,7 +40,7 @@ RUN set -eux; \
         make \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md README_CN.md /app/
+COPY pyproject.toml README.md README_EN.md /app/
 COPY reuleauxcoder /app/reuleauxcoder
 COPY labrastro_server /app/labrastro_server
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
