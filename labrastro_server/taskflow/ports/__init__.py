@@ -1,7 +1,5 @@
-"""Compatibility import path for the single Taskflow application service."""
+"""Taskflow boundary ports."""
 
-from labrastro_server.taskflow.application.project_service import ProjectService
-from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 from labrastro_server.taskflow.ports.dispatch import (
     ExecutorCandidate,
     TaskflowDispatcher,
@@ -15,9 +13,7 @@ from labrastro_server.taskflow.ports.state_store import (
 __all__ = [
     "ExecutorCandidate",
     "InMemoryTaskflowStateStore",
-    "ProjectService",
     "TaskflowDispatcher",
     "TaskflowDispatchResult",
-    "TaskflowService",
     "TaskflowStateStore",
 ]
