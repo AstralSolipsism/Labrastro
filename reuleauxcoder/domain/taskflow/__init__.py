@@ -1,29 +1,8 @@
-"""Taskflow domain models."""
+"""Deprecated Taskflow package path.
 
-from reuleauxcoder.domain.taskflow.models import (
-    DecisionPoint,
-    DispatchDecisionRecord,
-    DispatchDecisionStatus,
-    GoalRecord,
-    GoalStatus,
-    IssueDraftRecord,
-    PlanBriefRecord,
-    PlanStatus,
-    TaskDraftRecord,
-    TaskDraftStatus,
-    TaskflowEvent,
-)
+The active Taskflow architecture lives under ``labrastro_server.taskflow``.
+This package is intentionally left without public re-exports so it does not
+mix the removed Goal/TaskDraft chain with the ProjectState/TaskflowState model.
+"""
 
-__all__ = [
-    "DecisionPoint",
-    "DispatchDecisionRecord",
-    "DispatchDecisionStatus",
-    "GoalRecord",
-    "GoalStatus",
-    "IssueDraftRecord",
-    "PlanBriefRecord",
-    "PlanStatus",
-    "TaskDraftRecord",
-    "TaskDraftStatus",
-    "TaskflowEvent",
-]
+__all__: list[str] = []

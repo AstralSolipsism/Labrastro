@@ -189,8 +189,6 @@ class Agent:
             return self.tools
 
         allowed = set(mode.tools)
-        if getattr(self, "workflow_mode", None) == "taskflow":
-            allowed.add("taskflow_update")
         return [tool for tool in self.tools if tool.name in allowed]
 
     def get_blocked_tools(self) -> list["Tool"]:
@@ -199,8 +197,6 @@ class Agent:
         if mode is None or not mode.tools or "*" in mode.tools:
             return []
         allowed = set(mode.tools)
-        if getattr(self, "workflow_mode", None) == "taskflow":
-            allowed.add("taskflow_update")
         return [tool for tool in self.tools if tool.name not in allowed]
 
     def suggest_modes_for_tool(self, tool_name: str) -> list[str]:
