@@ -78,6 +78,9 @@ from labrastro_server.interfaces.http.remote.routes.peer import RemotePeerRoutes
 from labrastro_server.interfaces.http.remote.routes.runtime import RemoteRuntimeRoutes
 from labrastro_server.interfaces.http.remote.routes.sessions import RemoteSessionRoutes
 from labrastro_server.interfaces.http.remote.routes.taskflow import RemoteTaskflowRoutes
+from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
+    ReuleauxCoderTaskflowDispatcher,
+)
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 from labrastro_server.services.github.service import (
     PullRequestService,
@@ -247,7 +250,7 @@ class _RemoteChatSession:
     session_hint: str | None = None
     mode: str | None = None
     workflow_mode: str | None = None
-    taskflow_goal_id: str | None = None
+    taskflow_id: str | None = None
     done: bool = False
     running: bool = False
     seq_next: int = 1
@@ -481,7 +484,11 @@ class RemoteRelayHTTPService:
         )
         self.runtime_control_plane = runtime_control_plane
         self.taskflow_service = taskflow_service or TaskflowService(
-            runtime_control_plane=runtime_control_plane
+            dispatcher=(
+                ReuleauxCoderTaskflowDispatcher(runtime_control_plane)
+                if runtime_control_plane is not None
+                else None
+            )
         )
         self.issue_assignment_service = (
             issue_assignment_service
@@ -683,7 +690,7 @@ class RemoteRelayHTTPService:
         *,
         mode: str | None = None,
         workflow_mode: str | None = None,
-        taskflow_goal_id: str | None = None,
+        taskflow_id: str | None = None,
     ) -> _RemoteChatSession:
         self._gc_chat_sessions()
         session = _RemoteChatSession(
@@ -692,7 +699,7 @@ class RemoteRelayHTTPService:
             session_hint=session_hint,
             mode=mode,
             workflow_mode=workflow_mode,
-            taskflow_goal_id=taskflow_goal_id,
+            taskflow_id=taskflow_id,
             artifact_root=self._chat_artifact_root,
             max_events=self._chat_max_events,
             max_payload_bytes=self._chat_max_payload_bytes,

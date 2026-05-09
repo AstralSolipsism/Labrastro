@@ -1667,7 +1667,7 @@ class TestRemoteRelayHTTPService:
             seen["prompt"] = prompt
             seen["mode"] = session.mode
             seen["workflow_mode"] = session.workflow_mode
-            seen["taskflow_goal_id"] = session.taskflow_goal_id
+            seen["taskflow_id"] = session.taskflow_id
             session.append_event("chat_end", {"response": "taskflow ok"})
 
         service = RemoteRelayHTTPService(
@@ -1695,7 +1695,7 @@ class TestRemoteRelayHTTPService:
                     "prompt": "turn this into a taskflow",
                     "mode": "taskflow",
                     "workflow_mode": "taskflow",
-                    "taskflow_goal_id": "goal-1",
+                    "taskflow_id": "taskflow-1",
                 },
             )
             assert status == 200
@@ -1706,7 +1706,7 @@ class TestRemoteRelayHTTPService:
                 "prompt": "turn this into a taskflow",
                 "mode": "taskflow",
                 "workflow_mode": "taskflow",
-                "taskflow_goal_id": "goal-1",
+                "taskflow_id": "taskflow-1",
             }
         finally:
             service.stop()
@@ -2317,7 +2317,7 @@ class TestRemoteRelayHTTPService:
                 "prompt": "hello",
                 "mode": "taskflow",
                 "workflow_mode": "taskflow",
-                "taskflow_goal_id": "goal-1",
+                "taskflow_id": "taskflow-1",
             }
         ).to_dict() == {
             "peer_token": "peer-token",
@@ -2325,7 +2325,7 @@ class TestRemoteRelayHTTPService:
             "session_hint": None,
             "mode": "taskflow",
             "workflow_mode": "taskflow",
-            "taskflow_goal_id": "goal-1",
+            "taskflow_id": "taskflow-1",
         }
         assert SessionListRequest.from_dict(
             {"peer_token": "peer-token", "limit": 5, "if_list_etag": "etag-1"}
@@ -2837,224 +2837,12 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_taskflow_http_api_plans_confirms_dispatches_and_reads_events(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        control = AgentRuntimeControlPlane(
-            runtime_snapshot={
-                "runtime_profiles": {
-                    "docs_profile": {
-                        "executor": "fake",
-                        "execution_location": "remote_server",
-                    }
-                },
-                "agents": {
-                    "docs": {
-                        "runtime_profile": "docs_profile",
-                        "capabilities": ["research", "docs"],
-                    }
-                },
-            }
-        )
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            runtime_control_plane=control,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "G:/repo/main",
-                    "workspace_root": "G:/repo/main",
-                    "capabilities": ["agent_runtime"],
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-            _, goal_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/goals",
-                {
-                    "peer_token": peer_token,
-                    "title": "Docs goal",
-                    "prompt": "Write docs",
-                },
-            )
-            goal_id = goal_body["goal"]["id"]
-
-            _, brief_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/goals/{goal_id}/brief",
-                {
-                    "peer_token": peer_token,
-                    "summary": "Write a docs brief.",
-                    "issue_drafts": [
-                        {
-                            "title": "Docs issue",
-                            "task_drafts": [
-                                {
-                                    "id": "draft-http",
-                                    "title": "Docs task",
-                                    "prompt": "Write docs",
-                                    "required_capabilities": ["research"],
-                                    "preferred_capabilities": ["docs"],
-                                    "task_type": "docs",
-                                }
-                            ],
-                        }
-                    ],
-                    "ready": True,
-                },
-            )
-            assert brief_body["goal"]["status"] == "ready"
-
-            _, confirm_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/goals/{goal_id}/confirm",
-                {"peer_token": peer_token},
-            )
-            assert confirm_body["goal"]["status"] == "confirmed"
-
-            _, dispatch_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/task-drafts/draft-http/dispatch",
-                {"peer_token": peer_token},
-            )
-            decision = dispatch_body["decision"]
-            assert decision["selected_agent_id"] == "docs"
-            runtime_task_id = decision["runtime_task_id"]
-
-            _, goal_detail = _json_request(
-                "GET",
-                f"{service.base_url}/remote/taskflow/goals/{goal_id}?peer_token={peer_token}",
-            )
-            assert goal_detail["task_drafts"][0]["runtime_task"]["id"] == runtime_task_id
-
-            _, runtime_events = _json_request(
-                "GET",
-                f"{service.base_url}/remote/agent-runtime/tasks/{runtime_task_id}/events?peer_token={peer_token}&after_seq=0",
-            )
-            assert runtime_events["events"][0]["type"] == "queued"
-
-            _, taskflow_events = _json_request(
-                "GET",
-                f"{service.base_url}/remote/taskflow/goals/{goal_id}/events?peer_token={peer_token}&after_seq=0",
-            )
-            assert {event["type"] for event in taskflow_events["events"]} >= {
-                "goal_created",
-                "task_draft_dispatched",
-            }
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_taskflow_http_api_enforces_peer_ownership(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        control = AgentRuntimeControlPlane(
-            runtime_snapshot={
-                "runtime_profiles": {
-                    "docs_profile": {"executor": "fake"},
-                },
-                "agents": {
-                    "docs": {
-                        "runtime_profile": "docs_profile",
-                        "capabilities": ["docs"],
-                    }
-                },
-            }
-        )
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            runtime_control_plane=control,
-        )
-        service.start()
-        try:
-            _, peer_a_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "G:/repo/a",
-                    "workspace_root": "G:/repo/a",
-                    "capabilities": ["agent_runtime"],
-                },
-            )
-            _, peer_b_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "G:/repo/b",
-                    "workspace_root": "G:/repo/b",
-                    "capabilities": ["agent_runtime"],
-                },
-            )
-            peer_a = peer_a_body["payload"]["peer_token"]
-            peer_b = peer_b_body["payload"]["peer_token"]
-
-            _, goal_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/goals",
-                {
-                    "peer_token": peer_a,
-                    "title": "Owned",
-                    "prompt": "owned",
-                },
-            )
-            goal_id = goal_body["goal"]["id"]
-            _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/goals/{goal_id}/brief",
-                {
-                    "peer_token": peer_a,
-                    "summary": "owned",
-                    "task_drafts": [
-                        {
-                            "id": "draft-owned",
-                            "title": "Owned task",
-                            "prompt": "owned task",
-                            "required_capabilities": ["docs"],
-                        }
-                    ],
-                },
-            )
-            _json_request(
-                "POST",
-                f"{service.base_url}/remote/taskflow/goals/{goal_id}/confirm",
-                {"peer_token": peer_a},
-            )
-
-            with pytest.raises(HTTPError) as get_exc:
-                _json_request(
-                    "GET",
-                    f"{service.base_url}/remote/taskflow/goals/{goal_id}?peer_token={peer_b}",
-                )
-            assert get_exc.value.code == 403
-            with pytest.raises(HTTPError) as confirm_exc:
-                _json_request(
-                    "POST",
-                    f"{service.base_url}/remote/taskflow/goals/{goal_id}/confirm",
-                    {"peer_token": peer_b},
-                )
-            assert confirm_exc.value.code == 403
-            with pytest.raises(HTTPError) as dispatch_exc:
-                _json_request(
-                    "POST",
-                    f"{service.base_url}/remote/taskflow/task-drafts/draft-owned/dispatch",
-                    {"peer_token": peer_b},
-                )
-            assert dispatch_exc.value.code == 403
-        finally:
-            service.stop()
-            relay.stop()
-
+    def test_taskflow_http_api_uses_taskflow_and_work_item_resources(self) -> None:
+        route_source = Path("labrastro_server/interfaces/http/remote/routes/taskflow.py").read_text(encoding="utf-8")
+        assert "/remote/taskflow/goals" not in route_source
+        assert "task-drafts" not in route_source
+        assert "taskflows" in route_source
+        assert "work-items" in route_source
     def test_issue_assignment_and_mention_http_api_reuses_taskflow_dispatch(
         self,
     ) -> None:
@@ -3171,7 +2959,7 @@ class TestRemoteRelayHTTPService:
                 f"{service.base_url}/remote/issues/{issue_id}?peer_token={peer_token}",
             )
             assert issue_detail["assignments"][0]["id"] == assignment["id"]
-            assert issue_detail["taskflow"]["task_drafts"][0]["runtime_task_id"]
+            assert issue_detail["taskflow"]["outputs"]["task_run_refs"]
 
             _, events_body = _json_request(
                 "GET",

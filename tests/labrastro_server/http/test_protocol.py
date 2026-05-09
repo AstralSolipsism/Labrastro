@@ -1,4 +1,4 @@
-"""Tests for remote execution protocol message models."""
+﻿"""Tests for remote execution protocol message models."""
 
 from __future__ import annotations
 
@@ -189,7 +189,7 @@ class TestChatRequest:
             prompt="plan this",
             mode="taskflow",
             workflow_mode="taskflow",
-            taskflow_goal_id="goal-1",
+            taskflow_id="taskflow-1",
         )
 
         restored = ChatRequest.from_dict(req.to_dict())
@@ -198,7 +198,7 @@ class TestChatRequest:
         assert restored.prompt == "plan this"
         assert restored.mode == "taskflow"
         assert restored.workflow_mode == "taskflow"
-        assert restored.taskflow_goal_id == "goal-1"
+        assert restored.taskflow_id == "taskflow-1"
 
 
 class TestChatStartRequest:
@@ -209,7 +209,7 @@ class TestChatStartRequest:
             session_hint="session-1",
             mode="taskflow",
             workflow_mode="taskflow",
-            taskflow_goal_id="goal-1",
+            taskflow_id="taskflow-1",
         )
 
         restored = ChatStartRequest.from_dict(req.to_dict())
@@ -219,7 +219,7 @@ class TestChatStartRequest:
         assert restored.session_hint == "session-1"
         assert restored.mode == "taskflow"
         assert restored.workflow_mode == "taskflow"
-        assert restored.taskflow_goal_id == "goal-1"
+        assert restored.taskflow_id == "taskflow-1"
 
 
 class TestSessionModelSwitchRequest:

@@ -86,7 +86,7 @@ class RemoteChatRoutes:
                 peer_id,
                 mode=req.mode,
                 workflow_mode=workflow_mode,
-                taskflow_goal_id=req.taskflow_goal_id,
+                taskflow_id=req.taskflow_id,
             )
             session.append_event(
                 "chat_start",
@@ -94,7 +94,7 @@ class RemoteChatRoutes:
                     "prompt": req.prompt,
                     "mode": req.mode,
                     "workflow_mode": workflow_mode,
-                    "taskflow_goal_id": req.taskflow_goal_id,
+                    "taskflow_id": req.taskflow_id,
                 },
             )
             session.mark_running()
@@ -167,7 +167,7 @@ class RemoteChatRoutes:
             req.session_hint,
             mode=req.mode,
             workflow_mode=workflow_mode,
-            taskflow_goal_id=req.taskflow_goal_id,
+            taskflow_id=req.taskflow_id,
         )
         session.append_event(
             "chat_start",
@@ -175,7 +175,7 @@ class RemoteChatRoutes:
                 "prompt": req.prompt,
                 "mode": req.mode,
                 "workflow_mode": workflow_mode,
-                "taskflow_goal_id": req.taskflow_goal_id,
+                "taskflow_id": req.taskflow_id,
             },
         )
         session.mark_running()

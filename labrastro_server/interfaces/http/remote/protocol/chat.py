@@ -11,7 +11,7 @@ class ChatRequest:
     prompt: str
     mode: str | None = None
     workflow_mode: str | None = None
-    taskflow_goal_id: str | None = None
+    taskflow_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {"peer_token": self.peer_token, "prompt": self.prompt}
@@ -19,8 +19,8 @@ class ChatRequest:
             payload["mode"] = self.mode
         if self.workflow_mode is not None:
             payload["workflow_mode"] = self.workflow_mode
-        if self.taskflow_goal_id is not None:
-            payload["taskflow_goal_id"] = self.taskflow_goal_id
+        if self.taskflow_id is not None:
+            payload["taskflow_id"] = self.taskflow_id
         return payload
 
     @classmethod
@@ -30,7 +30,7 @@ class ChatRequest:
             prompt=d["prompt"],
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
-            taskflow_goal_id=d.get("taskflow_goal_id") or d.get("goal_id"),
+            taskflow_id=d.get("taskflow_id"),
         )
 
 @dataclass
@@ -52,7 +52,7 @@ class ChatStartRequest:
     session_hint: str | None = None
     mode: str | None = None
     workflow_mode: str | None = None
-    taskflow_goal_id: str | None = None
+    taskflow_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -64,8 +64,8 @@ class ChatStartRequest:
             payload["mode"] = self.mode
         if self.workflow_mode is not None:
             payload["workflow_mode"] = self.workflow_mode
-        if self.taskflow_goal_id is not None:
-            payload["taskflow_goal_id"] = self.taskflow_goal_id
+        if self.taskflow_id is not None:
+            payload["taskflow_id"] = self.taskflow_id
         return payload
 
     @classmethod
@@ -76,7 +76,7 @@ class ChatStartRequest:
             session_hint=d.get("session_hint"),
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
-            taskflow_goal_id=d.get("taskflow_goal_id") or d.get("goal_id"),
+            taskflow_id=d.get("taskflow_id"),
         )
 
 @dataclass

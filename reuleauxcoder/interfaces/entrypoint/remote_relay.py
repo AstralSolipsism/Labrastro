@@ -37,7 +37,6 @@ from labrastro_server.interfaces.http.remote.protocol import ChatResponse, ToolP
 from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.extensions.skills.service import SkillsService
 from reuleauxcoder.extensions.tools.backend import ExecutionContext
-from reuleauxcoder.extensions.tools.taskflow import TaskflowPlanningTool
 from reuleauxcoder.interfaces.cli.commands import handle_command
 from reuleauxcoder.interfaces.cli.registration import CLI_PROFILE
 from reuleauxcoder.interfaces.cli.render import CLIRenderer
@@ -756,30 +755,25 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 return
         if getattr(remote_session, "workflow_mode", None) == TASKFLOW_WORKFLOW_MODE:
             taskflow_service = runner._relay_http_service.taskflow_service
-            goal_id = getattr(remote_session, "taskflow_goal_id", None)
-            if not goal_id:
-                goal = taskflow_service.create_goal(
-                    title=prompt.strip().splitlines()[0][:80]
-                    if prompt.strip()
-                    else "Taskflow goal",
-                    prompt=prompt,
+            taskflow_id = getattr(remote_session, "taskflow_id", None)
+            if not taskflow_id:
+                state = taskflow_service.start_taskflow(
+                    project_id=f"peer-{peer_id}",
+                    raw_goal=prompt,
                     session_id=getattr(peer_agent, "current_session_id", None),
                     peer_id=peer_id,
                     metadata={"source": "chat_start"},
                 )
-                goal_id = goal.id
-                remote_session.taskflow_goal_id = goal_id
+                taskflow_id = state.meta.taskflow_id
+                remote_session.taskflow_id = taskflow_id
                 remote_session.append_event(
-                    "taskflow_goal_created", {"goal": goal.to_dict()}
+                    "taskflow_started", {"taskflow": state.to_dict()}
                 )
             setattr(peer_agent, "workflow_mode", TASKFLOW_WORKFLOW_MODE)
             setattr(
                 peer_agent,
                 "workflow_prompt_append",
-                f"{TASKFLOW_SYSTEM_PROMPT}\nCurrent Taskflow goal_id: `{goal_id}`.",
-            )
-            peer_agent.add_tools(
-                [TaskflowPlanningTool(taskflow_service, goal_id=goal_id)]
+                f"{TASKFLOW_SYSTEM_PROMPT}\nCurrent Taskflow taskflow_id: `{taskflow_id}`.",
             )
         remote_session.set_cancel_callback(
             lambda reason: (
