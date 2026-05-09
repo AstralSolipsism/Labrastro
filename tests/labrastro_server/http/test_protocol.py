@@ -13,6 +13,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatRequest,
     ChatStartRequest,
     ChatStartResponse,
+    ChatStatusRequest,
+    ChatStatusResponse,
     ChatStreamRequest,
     ChatStreamResponse,
     DisconnectNotice,
@@ -133,6 +135,8 @@ class TestRemoteHTTPContract:
         ChatStartResponse.from_dict(fixtures["chat.start"]["response"])
         ChatStreamRequest.from_dict(fixtures["chat.stream"]["request"])
         ChatStreamResponse.from_dict(fixtures["chat.stream"]["response"])
+        ChatStatusRequest.from_dict(fixtures["chat.status"]["request"])
+        ChatStatusResponse.from_dict(fixtures["chat.status"]["response"])
         EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
         EnvironmentManifestResponse.from_dict(fixtures["environment.manifest"]["response"])
 
@@ -220,6 +224,47 @@ class TestChatStartRequest:
         assert restored.mode == "taskflow"
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
+
+
+class TestChatStatusProtocol:
+    def test_roundtrip_preserves_recovery_diagnostics(self) -> None:
+        req = ChatStatusRequest(peer_token="pt_1", chat_id="chat-1", cursor=7)
+        restored_req = ChatStatusRequest.from_dict(req.to_dict())
+
+        assert restored_req.peer_token == "pt_1"
+        assert restored_req.chat_id == "chat-1"
+        assert restored_req.cursor == 7
+
+        resp = ChatStatusResponse(
+            ok=True,
+            chat_id="chat-1",
+            peer_id="peer-1",
+            status="running",
+            running=True,
+            done=False,
+            reconnectable=True,
+            cursor=7,
+            next_cursor=9,
+            first_available_seq=1,
+            latest_seq=9,
+            dropped_count=0,
+            session_id="session-1",
+            mode="planner",
+            workflow_mode="taskflow",
+            taskflow_id="taskflow-1",
+            created_at=1.0,
+            last_activity_at=2.0,
+            finished_at=None,
+            error=None,
+        )
+        restored_resp = ChatStatusResponse.from_dict(resp.to_dict())
+
+        assert restored_resp.chat_id == "chat-1"
+        assert restored_resp.status == "running"
+        assert restored_resp.reconnectable is True
+        assert restored_resp.next_cursor == 9
+        assert restored_resp.session_id == "session-1"
+        assert restored_resp.workflow_mode == "taskflow"
 
 
 class TestSessionModelSwitchRequest:

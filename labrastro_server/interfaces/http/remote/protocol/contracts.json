@@ -191,6 +191,39 @@
       }
     },
     {
+      "name": "chat.status",
+      "method": "POST",
+      "path": "/remote/chat/status",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "chat_id": "chat_contract",
+        "cursor": 1
+      },
+      "response": {
+        "ok": true,
+        "chat_id": "chat_contract",
+        "peer_id": "peer_contract",
+        "status": "running",
+        "running": true,
+        "done": false,
+        "reconnectable": true,
+        "cursor": 1,
+        "next_cursor": 3,
+        "first_available_seq": 1,
+        "latest_seq": 3,
+        "dropped_count": 0,
+        "session_id": "session_contract",
+        "mode": "chat",
+        "workflow_mode": null,
+        "taskflow_id": null,
+        "created_at": 1760000000.0,
+        "last_activity_at": 1760000001.0,
+        "finished_at": null,
+        "error": null
+      }
+    },
+    {
       "name": "chat.stream_lost_events",
       "method": "POST",
       "path": "/remote/chat/stream",

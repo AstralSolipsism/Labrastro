@@ -17,6 +17,8 @@ from labrastro_server.interfaces.http.remote.protocol.chat import (
     ChatResponse,
     ChatStartRequest,
     ChatStartResponse,
+    ChatStatusRequest,
+    ChatStatusResponse,
     ChatStreamRequest,
     ChatStreamResponse,
 )
@@ -69,6 +71,8 @@ __all__ = [
     "ChatResponse",
     "ChatStartRequest",
     "ChatStartResponse",
+    "ChatStatusRequest",
+    "ChatStatusResponse",
     "ChatStreamRequest",
     "ChatStreamResponse",
     "CleanupRequest",
