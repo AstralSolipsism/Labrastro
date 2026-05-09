@@ -1888,6 +1888,265 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_chat_status_reports_running_done_and_error(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        running_started = threading.Event()
+        release_running = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, prompt: str, session) -> None:
+            if prompt == "boom":
+                session.append_event("error", {"message": "intentional_failure"})
+                return
+            running_started.set()
+            release_running.wait(timeout=2)
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hold"},
+            )
+            chat_id = start_body["chat_id"]
+            assert running_started.wait(2)
+
+            _, running_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/status",
+                {"peer_token": peer_token, "chat_id": chat_id, "cursor": 0},
+            )
+            assert running_status["ok"] is True
+            assert running_status["status"] == "running"
+            assert running_status["running"] is True
+            assert running_status["done"] is False
+            assert running_status["reconnectable"] is True
+            assert running_status["latest_seq"] >= 1
+
+            release_running.set()
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 2,
+                },
+            )
+            assert stream_body["done"] is True
+
+            _, done_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/status",
+                {"peer_token": peer_token, "chat_id": chat_id, "cursor": 0},
+            )
+            assert done_status["status"] == "done"
+            assert done_status["running"] is False
+            assert done_status["done"] is True
+            assert done_status["reconnectable"] is False
+
+            _, error_start = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "boom"},
+            )
+            _, error_stream = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": error_start["chat_id"],
+                    "cursor": 0,
+                    "timeout_sec": 2,
+                },
+            )
+            assert error_stream["done"] is True
+
+            _, error_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/status",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": error_start["chat_id"],
+                    "cursor": 0,
+                },
+            )
+            assert error_status["status"] == "error"
+            assert error_status["done"] is True
+            assert error_status["error"] == "intentional_failure"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_stream_cursor_resume_reads_events_created_between_polls(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        first_delta_sent = threading.Event()
+        release_second_delta = threading.Event()
+        finished = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                session.append_event("delta", {"text": "first"})
+                first_delta_sent.set()
+                release_second_delta.wait(timeout=2)
+                session.append_event("delta", {"text": "second"})
+                session.append_event("chat_end", {"response": "done"})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "resume"},
+            )
+            chat_id = start_body["chat_id"]
+            assert first_delta_sent.wait(2)
+
+            _, first_poll = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 0,
+                },
+            )
+            assert first_poll["done"] is False
+            assert [event["type"] for event in first_poll["events"]] == [
+                "chat_start",
+                "delta",
+            ]
+            first_cursor = first_poll["next_cursor"]
+
+            release_second_delta.set()
+            assert finished.wait(2)
+            _, resumed_poll = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": first_cursor,
+                    "timeout_sec": 1,
+                },
+            )
+
+            assert resumed_poll["done"] is True
+            assert [event["type"] for event in resumed_poll["events"]] == [
+                "delta",
+                "chat_end",
+            ]
+            assert resumed_poll["events"][0]["payload"]["text"] == "second"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_stream_accepts_replacement_peer_token_for_existing_chat(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        finished = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                session.append_event("delta", {"text": "after-reconnect"})
+                session.append_event("chat_end", {"response": "done"})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, first_register = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer-a",
+                },
+            )
+            _, replacement_register = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer-b",
+                },
+            )
+            first_token = first_register["payload"]["peer_token"]
+            replacement_token = replacement_register["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": first_token, "prompt": "resume from replacement"},
+            )
+            assert finished.wait(2)
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": replacement_token,
+                    "chat_id": start_body["chat_id"],
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+
+            assert stream_body["done"] is True
+            assert [event["type"] for event in stream_body["events"]] == [
+                "chat_start",
+                "delta",
+                "chat_end",
+            ]
+            assert stream_body["events"][1]["payload"]["text"] == "after-reconnect"
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_chat_cancel_adds_terminal_event_and_marks_done(self) -> None:
         relay = RelayServer()
         relay.start()

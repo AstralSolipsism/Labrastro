@@ -251,6 +251,9 @@ class _RemoteChatSession:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
+    session_id: str | None = None
+    status: str = "created"
+    last_error: str | None = None
     done: bool = False
     running: bool = False
     seq_next: int = 1
@@ -271,6 +274,8 @@ class _RemoteChatSession:
     _event_buffer: _ChatEventBuffer = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.session_id is None:
+            self.session_id = self.session_hint
         self._event_buffer = _ChatEventBuffer(
             chat_id=self.chat_id,
             artifact_root=self.artifact_root,
@@ -297,6 +302,18 @@ class _RemoteChatSession:
                     "payload": payload or {},
                 }
             )
+            if isinstance(payload, dict):
+                session_id = payload.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    self.session_id = session_id
+            if event_type == "error":
+                self.status = "error"
+                message = (payload or {}).get("message") if isinstance(payload, dict) else None
+                self.last_error = str(message) if message is not None else "error"
+            elif event_type == "chat_cancelled":
+                self.status = "cancelled"
+                reason = (payload or {}).get("reason") if isinstance(payload, dict) else None
+                self.last_error = str(reason) if reason is not None else "chat_cancelled"
             self.last_activity_at = time.time()
             self.cond.notify_all()
             return seq
@@ -318,12 +335,15 @@ class _RemoteChatSession:
     def mark_running(self) -> None:
         with self.cond:
             self.running = True
+            self.status = "running"
             self.last_activity_at = time.time()
 
     def mark_done(self) -> None:
         with self.cond:
             self.running = False
             self.done = True
+            if self.status not in {"error", "cancelled"}:
+                self.status = "done"
             self.finished_at = time.time()
             self.last_activity_at = self.finished_at
             for waiter in self.approval_waiters.values():
@@ -341,6 +361,33 @@ class _RemoteChatSession:
 
     def cleanup_artifacts(self) -> None:
         self._event_buffer.cleanup_artifacts()
+
+    def status_payload(self, cursor: int = 0) -> dict[str, Any]:
+        cursor = max(0, int(cursor or 0))
+        with self.cond:
+            _events, next_cursor = self._event_buffer.events_after(cursor)
+            return {
+                "ok": True,
+                "chat_id": self.chat_id,
+                "peer_id": self.peer_id,
+                "status": self.status,
+                "running": self.running,
+                "done": self.done,
+                "reconnectable": not self.done,
+                "cursor": cursor,
+                "next_cursor": next_cursor,
+                "first_available_seq": self._event_buffer.first_available_seq,
+                "latest_seq": self._event_buffer.latest_seq,
+                "dropped_count": self._event_buffer.dropped_count,
+                "session_id": self.session_id,
+                "mode": self.mode,
+                "workflow_mode": self.workflow_mode,
+                "taskflow_id": self.taskflow_id,
+                "created_at": self.created_at,
+                "last_activity_at": self.last_activity_at,
+                "finished_at": self.finished_at,
+                "error": self.last_error,
+            }
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
         call_immediately = False
@@ -873,6 +920,9 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/chat/stream":
                     self._handle_chat_stream()
+                    return
+                if parsed.path == "/remote/chat/status":
+                    self._handle_chat_status()
                     return
                 if parsed.path == "/remote/chat/cancel":
                     self._handle_chat_cancel()

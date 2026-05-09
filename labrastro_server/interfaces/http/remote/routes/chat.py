@@ -24,6 +24,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatResponse,
     ChatStartRequest,
     ChatStartResponse,
+    ChatStatusRequest,
+    ChatStatusResponse,
     ChatStreamRequest,
     ChatStreamResponse,
     CleanupResult,
@@ -55,6 +57,19 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemoteChatRoutes:
+    def _get_chat_control_session(self, peer_token: str, chat_id: str):
+        control_peer_id = self.service.relay_server.token_manager.verify_peer_token(
+            peer_token
+        )
+        if control_peer_id is None:
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+            return None
+        session = self.service._get_chat_session(chat_id)
+        if session is None:
+            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
+            return None
+        return control_peer_id, session
+
     def _handle_chat(self) -> None:
         payload = self._read_json()
         try:
@@ -202,16 +217,10 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_stream_request")
             return
 
-        peer_id = self.service.relay_server.token_manager.verify_peer_token(
-            req.peer_token
-        )
-        if peer_id is None:
-            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
             return
-        session = self.service._get_chat_session(req.chat_id)
-        if session is None or session.peer_id != peer_id:
-            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
-            return
+        _control_peer_id, session = control
 
         events, done, next_cursor = session.wait_events(
             req.cursor, req.timeout_sec
@@ -223,6 +232,26 @@ class RemoteChatRoutes:
             ).to_dict(),
         )
 
+    def _handle_chat_status(self) -> None:
+        payload = self._read_json()
+        try:
+            req = ChatStatusRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_status_request")
+            return
+
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
+            return
+        _control_peer_id, session = control
+
+        self._send_json(
+            HTTPStatus.OK,
+            ChatStatusResponse.from_dict(
+                session.status_payload(req.cursor)
+            ).to_dict(),
+        )
+
     def _handle_chat_cancel(self) -> None:
         payload = self._read_json()
         try:
@@ -231,16 +260,10 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_cancel_request")
             return
 
-        peer_id = self.service.relay_server.token_manager.verify_peer_token(
-            req.peer_token
-        )
-        if peer_id is None:
-            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
             return
-        session = self.service._get_chat_session(req.chat_id)
-        if session is None or session.peer_id != peer_id:
-            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
-            return
+        _control_peer_id, session = control
 
         reason = req.reason or "chat_cancelled"
         first_request = session.request_cancel(reason)
@@ -262,16 +285,10 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_approval_reply_request")
             return
 
-        peer_id = self.service.relay_server.token_manager.verify_peer_token(
-            req.peer_token
-        )
-        if peer_id is None:
-            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
             return
-        session = self.service._get_chat_session(req.chat_id)
-        if session is None or session.peer_id != peer_id:
-            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
-            return
+        _control_peer_id, session = control
         ok = session.resolve_approval(req.approval_id, req.decision, req.reason)
         if not ok:
             self._send_error(HTTPStatus.NOT_FOUND, "approval_not_found")
