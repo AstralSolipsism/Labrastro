@@ -59,10 +59,10 @@ class PostgresIssueAssignmentStore:
                     """
                     INSERT INTO labrastro_issues (
                         id, title, description, status, peer_id, source,
-                        taskflow_goal_id, taskflow_issue_draft_id, metadata
+                        taskflow_id, work_item_id, metadata
                     ) VALUES (
                         :id, :title, :description, :status, :peer_id, :source,
-                        :taskflow_goal_id, :taskflow_issue_draft_id,
+                        :taskflow_id, :work_item_id,
                         CAST(:metadata AS JSONB)
                     )
                     """
@@ -74,8 +74,8 @@ class PostgresIssueAssignmentStore:
                     "status": issue.status.value,
                     "peer_id": issue.peer_id,
                     "source": issue.source,
-                    "taskflow_goal_id": issue.taskflow_goal_id,
-                    "taskflow_issue_draft_id": issue.taskflow_issue_draft_id,
+                    "taskflow_id": issue.taskflow_id,
+                    "work_item_id": issue.work_item_id,
                     "metadata": _json(issue.metadata),
                 },
             )
@@ -99,8 +99,8 @@ class PostgresIssueAssignmentStore:
                     UPDATE labrastro_issues
                     SET title=:title, description=:description, status=:status,
                         peer_id=:peer_id, source=:source,
-                        taskflow_goal_id=:taskflow_goal_id,
-                        taskflow_issue_draft_id=:taskflow_issue_draft_id,
+                        taskflow_id=:taskflow_id,
+                        work_item_id=:work_item_id,
                         metadata=CAST(:metadata AS JSONB),
                         updated_at=now()
                     WHERE id=:id
@@ -113,8 +113,8 @@ class PostgresIssueAssignmentStore:
                     "status": issue.status.value,
                     "peer_id": issue.peer_id,
                     "source": issue.source,
-                    "taskflow_goal_id": issue.taskflow_goal_id,
-                    "taskflow_issue_draft_id": issue.taskflow_issue_draft_id,
+                    "taskflow_id": issue.taskflow_id,
+                    "work_item_id": issue.work_item_id,
                     "metadata": _json(issue.metadata),
                 },
             )
@@ -140,11 +140,11 @@ class PostgresIssueAssignmentStore:
                     """
                     INSERT INTO labrastro_assignments (
                         id, issue_id, status, target_agent_id, source, reason,
-                        task_draft_id, dispatch_decision_id, runtime_task_id,
+                        work_item_id, task_run_id, runtime_task_id,
                         metadata
                     ) VALUES (
                         :id, :issue_id, :status, :target_agent_id, :source,
-                        :reason, :task_draft_id, :dispatch_decision_id,
+                        :reason, :work_item_id, :task_run_id,
                         :runtime_task_id, CAST(:metadata AS JSONB)
                     )
                     """
@@ -171,8 +171,8 @@ class PostgresIssueAssignmentStore:
                     UPDATE labrastro_assignments
                     SET status=:status, target_agent_id=:target_agent_id,
                         source=:source, reason=:reason,
-                        task_draft_id=:task_draft_id,
-                        dispatch_decision_id=:dispatch_decision_id,
+                        work_item_id=:work_item_id,
+                        task_run_id=:task_run_id,
                         runtime_task_id=:runtime_task_id,
                         metadata=CAST(:metadata AS JSONB),
                         updated_at=now()
@@ -354,8 +354,8 @@ class PostgresIssueAssignmentStore:
             "target_agent_id": assignment.target_agent_id,
             "source": assignment.source,
             "reason": assignment.reason,
-            "task_draft_id": assignment.task_draft_id,
-            "dispatch_decision_id": assignment.dispatch_decision_id,
+            "work_item_id": assignment.work_item_id,
+            "task_run_id": assignment.task_run_id,
             "runtime_task_id": assignment.runtime_task_id,
             "metadata": _json(assignment.metadata),
         }

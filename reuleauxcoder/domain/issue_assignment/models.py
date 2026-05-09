@@ -89,8 +89,8 @@ class IssueRecord:
     status: IssueStatus | str = IssueStatus.OPEN
     peer_id: str | None = None
     source: str = "manual"
-    taskflow_goal_id: str | None = None
-    taskflow_issue_draft_id: str | None = None
+    taskflow_id: str | None = None
+    work_item_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -107,14 +107,14 @@ class IssueRecord:
             status=str(data.get("status") or IssueStatus.OPEN.value),
             peer_id=str(data["peer_id"]) if data.get("peer_id") is not None else None,
             source=str(data.get("source") or "manual"),
-            taskflow_goal_id=(
-                str(data["taskflow_goal_id"])
-                if data.get("taskflow_goal_id") is not None
+            taskflow_id=(
+                str(data["taskflow_id"])
+                if data.get("taskflow_id") is not None
                 else None
             ),
-            taskflow_issue_draft_id=(
-                str(data["taskflow_issue_draft_id"])
-                if data.get("taskflow_issue_draft_id") is not None
+            work_item_id=(
+                str(data["work_item_id"])
+                if data.get("work_item_id") is not None
                 else None
             ),
             metadata=_dict(data.get("metadata")),
@@ -130,8 +130,8 @@ class IssueRecord:
             "status": self.status.value,
             "peer_id": self.peer_id,
             "source": self.source,
-            "taskflow_goal_id": self.taskflow_goal_id,
-            "taskflow_issue_draft_id": self.taskflow_issue_draft_id,
+            "taskflow_id": self.taskflow_id,
+            "work_item_id": self.work_item_id,
             "metadata": dict(self.metadata),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -146,8 +146,8 @@ class AssignmentRecord:
     target_agent_id: str | None = None
     source: str = "manual"
     reason: str = ""
-    task_draft_id: str | None = None
-    dispatch_decision_id: str | None = None
+    work_item_id: str | None = None
+    task_run_id: str | None = None
     runtime_task_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
@@ -169,14 +169,14 @@ class AssignmentRecord:
             ),
             source=str(data.get("source") or "manual"),
             reason=str(data.get("reason") or ""),
-            task_draft_id=(
-                str(data["task_draft_id"])
-                if data.get("task_draft_id") is not None
+            work_item_id=(
+                str(data["work_item_id"])
+                if data.get("work_item_id") is not None
                 else None
             ),
-            dispatch_decision_id=(
-                str(data["dispatch_decision_id"])
-                if data.get("dispatch_decision_id") is not None
+            task_run_id=(
+                str(data["task_run_id"])
+                if data.get("task_run_id") is not None
                 else None
             ),
             runtime_task_id=(
@@ -197,8 +197,8 @@ class AssignmentRecord:
             "target_agent_id": self.target_agent_id,
             "source": self.source,
             "reason": self.reason,
-            "task_draft_id": self.task_draft_id,
-            "dispatch_decision_id": self.dispatch_decision_id,
+            "work_item_id": self.work_item_id,
+            "task_run_id": self.task_run_id,
             "runtime_task_id": self.runtime_task_id,
             "metadata": dict(self.metadata),
             "created_at": self.created_at,

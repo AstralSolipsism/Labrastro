@@ -201,11 +201,11 @@ class RemoteCollaborationRoutes:
                     description=str(payload.get("description") or ""),
                     peer_id=peer_id,
                     source=str(payload.get("source") or "manual"),
-                    taskflow_goal_id=optional_payload_str(
-                        payload, "taskflow_goal_id"
+                    taskflow_id=optional_payload_str(
+                        payload, "taskflow_id"
                     ),
-                    taskflow_issue_draft_id=optional_payload_str(
-                        payload, "taskflow_issue_draft_id"
+                    work_item_id=optional_payload_str(
+                        payload, "work_item_id"
                     ),
                     metadata=(
                         dict(payload.get("metadata"))

@@ -20,10 +20,9 @@ def upgrade() -> None:
             status TEXT NOT NULL DEFAULT 'open',
             peer_id TEXT,
             source TEXT NOT NULL DEFAULT 'manual',
-            taskflow_goal_id TEXT
-                REFERENCES labrastro_taskflow_goals(id) ON DELETE SET NULL,
-            taskflow_issue_draft_id TEXT
-                REFERENCES labrastro_taskflow_issue_drafts(id) ON DELETE SET NULL,
+            taskflow_id TEXT
+                REFERENCES labrastro_taskflow_states(taskflow_id) ON DELETE SET NULL,
+            work_item_id TEXT,
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -39,10 +38,8 @@ def upgrade() -> None:
             target_agent_id TEXT,
             source TEXT NOT NULL DEFAULT 'manual',
             reason TEXT NOT NULL DEFAULT '',
-            task_draft_id TEXT
-                REFERENCES labrastro_taskflow_task_drafts(id) ON DELETE SET NULL,
-            dispatch_decision_id TEXT
-                REFERENCES labrastro_taskflow_dispatch_decisions(id) ON DELETE SET NULL,
+            work_item_id TEXT,
+            task_run_id TEXT,
             runtime_task_id TEXT REFERENCES labrastro_runtime_tasks(id) ON DELETE SET NULL,
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

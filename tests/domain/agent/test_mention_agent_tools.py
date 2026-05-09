@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 
 from reuleauxcoder.extensions.tools.mention import MentionAgentTool
+from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
+    ReuleauxCoderTaskflowDispatcher,
+)
 from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 from labrastro_server.services.taskflow.service import TaskflowService
@@ -21,7 +24,7 @@ def test_mention_agent_tool_creates_record_without_dispatching_runtime_task() ->
             },
         }
     )
-    taskflow = TaskflowService(runtime_control_plane=runtime)
+    taskflow = TaskflowService(dispatcher=ReuleauxCoderTaskflowDispatcher(runtime))
     service = IssueAssignmentService(taskflow_service=taskflow)
     issue = service.create_issue(title="Docs", description="Write docs", peer_id="p1")
     tool = MentionAgentTool(service, peer_id="p1")

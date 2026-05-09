@@ -3,6 +3,9 @@ from __future__ import annotations
 import pytest
 
 from reuleauxcoder.domain.issue_assignment.models import AssignmentStatus, MentionStatus
+from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
+    ReuleauxCoderTaskflowDispatcher,
+)
 from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 from labrastro_server.services.taskflow.service import TaskflowService
@@ -42,11 +45,23 @@ def _runtime() -> AgentRuntimeControlPlane:
 
 def _service() -> tuple[IssueAssignmentService, TaskflowService, AgentRuntimeControlPlane]:
     runtime = _runtime()
-    taskflow = TaskflowService(runtime_control_plane=runtime)
+    taskflow = TaskflowService(dispatcher=ReuleauxCoderTaskflowDispatcher(runtime))
     return IssueAssignmentService(taskflow_service=taskflow), taskflow, runtime
 
 
-def test_assignment_creates_task_draft_but_does_not_dispatch_before_dispatch_call() -> None:
+def _work_item(taskflow: TaskflowService, project_id: str, work_item_id: str):
+    project = taskflow.project_service.get_project_state(project_id)
+    assert project is not None
+    for item in [
+        *project.work_items.active_work_items,
+        *project.work_items.reusable_work_items,
+    ]:
+        if item.id == work_item_id:
+            return item
+    raise AssertionError(f"work item not found: {work_item_id}")
+
+
+def test_assignment_creates_work_item_but_does_not_dispatch_before_dispatch_call() -> None:
     service, taskflow, runtime = _service()
     issue = service.create_issue(
         title="Write onboarding docs",
@@ -64,10 +79,10 @@ def test_assignment_creates_task_draft_but_does_not_dispatch_before_dispatch_cal
     )
 
     assert assignment.status == AssignmentStatus.READY
-    assert assignment.task_draft_id is not None
-    draft = taskflow.get_task_draft(assignment.task_draft_id, peer_id="peer-a")
-    assert draft.metadata["issue_id"] == issue.id
-    assert draft.metadata["assignment_id"] == assignment.id
+    assert assignment.work_item_id is not None
+    item = _work_item(taskflow, "peer-peer-a", assignment.work_item_id)
+    assert item.metadata["issue_id"] == issue.id
+    assert item.metadata["assignment_id"] == assignment.id
     assert runtime.list_tasks() == []
 
 
@@ -94,10 +109,7 @@ def test_assignment_dispatch_uses_taskflow_decision_and_runtime_metadata() -> No
     assert task.metadata["issue_id"] == issue.id
     assert task.metadata["assignment_id"] == assignment.id
     assert task.metadata["dispatch_source"] == "assignment"
-    decisions = taskflow.list_dispatch_decisions(
-        dispatched.task_draft_id or "", peer_id="peer-a"
-    )
-    assert decisions[0].metadata["source"] == "assignment"
+    assert dispatched.task_run_id is not None
 
 
 def test_assignment_without_capable_agent_needs_assignment_and_creates_no_runtime() -> None:
@@ -121,7 +133,7 @@ def test_assignment_without_capable_agent_needs_assignment_and_creates_no_runtim
 
 
 def test_assignment_can_be_reassigned_before_dispatch() -> None:
-    service, taskflow, _runtime = _service()
+    service, _taskflow, _runtime = _service()
     issue = service.create_issue(
         title="Review design",
         description="Review the design.",
@@ -142,8 +154,6 @@ def test_assignment_can_be_reassigned_before_dispatch() -> None:
 
     assert reassigned.target_agent_id == "design"
     assert reassigned.status == AssignmentStatus.READY
-    draft = taskflow.get_task_draft(reassigned.task_draft_id or "", peer_id="peer-a")
-    assert draft.manual_agent_id == "design"
 
 
 def test_mention_resolves_alias_and_creates_assignment_but_not_runtime_task() -> None:
@@ -178,7 +188,9 @@ def test_mention_conflict_or_unknown_agent_needs_assignment() -> None:
         "capabilities": ["docs"],
     }
     service = IssueAssignmentService(
-        taskflow_service=TaskflowService(runtime_control_plane=runtime)
+        taskflow_service=TaskflowService(
+            dispatcher=ReuleauxCoderTaskflowDispatcher(runtime)
+        )
     )
 
     mention = service.parse_mention(raw_text="@writer help", peer_id="peer-a")

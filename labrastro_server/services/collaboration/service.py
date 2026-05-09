@@ -14,12 +14,17 @@ from reuleauxcoder.domain.issue_assignment.models import (
     MentionRecord,
     MentionStatus,
 )
-from reuleauxcoder.domain.taskflow.models import GoalStatus, TaskDraftStatus
 from labrastro_server.services.collaboration.in_memory_store import (
     InMemoryIssueAssignmentStore,
 )
 from labrastro_server.services.collaboration.store import IssueAssignmentStore
 from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.taskflow.domain.project_state import TaskRunStatus
+from labrastro_server.taskflow.domain.taskflow_state import (
+    ReadinessGate,
+    TaskflowStatus,
+    WorkItemCandidate,
+)
 
 
 _MENTION_RE = re.compile(r"@([A-Za-z0-9_.-]+)")
@@ -98,42 +103,33 @@ class IssueAssignmentService:
         description: str = "",
         peer_id: str | None = None,
         source: str = "manual",
-        taskflow_goal_id: str | None = None,
-        taskflow_issue_draft_id: str | None = None,
+        taskflow_id: str | None = None,
+        work_item_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         issue_id: str | None = None,
     ) -> IssueRecord:
         title = title.strip() or "Untitled issue"
         description = description or ""
-        if taskflow_issue_draft_id:
-            issue_draft = self.taskflow_service.get_issue_draft(
-                taskflow_issue_draft_id, peer_id=peer_id
-            )
-            taskflow_goal_id = issue_draft.goal_id
-            if not description:
-                description = issue_draft.description
-            if title == "Untitled issue":
-                title = issue_draft.title
-        if taskflow_goal_id:
-            goal = self.taskflow_service.get_goal(taskflow_goal_id, peer_id=peer_id)
-            if goal.status == GoalStatus.CANCELLED:
-                raise ValueError("cannot create issue from cancelled Taskflow goal")
+        if taskflow_id:
+            state = self.taskflow_service.get_taskflow_state(taskflow_id)
+            if state.meta.status == TaskflowStatus.CANCELLED:
+                raise ValueError("cannot create issue from cancelled Taskflow")
         else:
-            goal = self.taskflow_service.create_goal(
-                title=title,
-                prompt=description,
+            state = self.taskflow_service.start_taskflow(
+                project_id=f"peer-{peer_id or 'default'}",
+                raw_goal=description or title,
                 peer_id=peer_id,
                 metadata={"source": "issue_assignment", **dict(metadata or {})},
             )
-            taskflow_goal_id = goal.id
+            taskflow_id = state.meta.taskflow_id
         issue = IssueRecord(
             id=issue_id or _new_id("issue"),
             title=title,
             description=description,
             peer_id=peer_id,
             source=source,
-            taskflow_goal_id=taskflow_goal_id,
-            taskflow_issue_draft_id=taskflow_issue_draft_id,
+            taskflow_id=taskflow_id,
+            work_item_id=work_item_id,
             metadata=dict(metadata or {}),
         )
         created = self.store.create_issue(issue)
@@ -158,11 +154,11 @@ class IssueAssignmentService:
             for mention in self.store.list_mentions(issue_id=issue.id)
         ]
         taskflow_detail = None
-        if issue.taskflow_goal_id:
+        if issue.taskflow_id:
             try:
-                taskflow_detail = self.taskflow_service.load_goal_detail(
-                    issue.taskflow_goal_id, peer_id=peer_id
-                )
+                taskflow_detail = self.taskflow_service.get_taskflow_state(
+                    issue.taskflow_id
+                ).to_dict()
             except Exception:
                 taskflow_detail = None
         return {
@@ -185,20 +181,9 @@ class IssueAssignmentService:
         payload: dict[str, Any] = {
             "assignment": assignment.to_dict(),
             "issue": issue.to_dict(),
-            "task_draft": None,
-            "dispatch_decisions": [],
+            "work_item_id": assignment.work_item_id,
+            "task_run_id": assignment.task_run_id,
         }
-        if assignment.task_draft_id:
-            draft = self.taskflow_service.get_task_draft(
-                assignment.task_draft_id, peer_id=peer_id
-            )
-            payload["task_draft"] = draft.to_dict()
-            payload["dispatch_decisions"] = [
-                decision.to_dict()
-                for decision in self.taskflow_service.list_dispatch_decisions(
-                    draft.id, peer_id=peer_id
-                )
-            ]
         return payload
 
     def create_assignment(
@@ -223,7 +208,7 @@ class IssueAssignmentService:
         issue = self._get_issue_for_peer(issue_id, peer_id)
         if issue.status == IssueStatus.CANCELLED:
             raise ValueError("cancelled issues cannot be assigned")
-        goal_id = self._ensure_backing_goal(issue, peer_id=peer_id)
+        taskflow_id = self._ensure_backing_goal(issue, peer_id=peer_id)
         assignment = AssignmentRecord(
             id=assignment_id or _new_id("assignment"),
             issue_id=issue.id,
@@ -232,28 +217,44 @@ class IssueAssignmentService:
             reason=reason,
             metadata=dict(metadata or {}),
         )
-        draft_metadata = {
+        candidate_metadata = {
             "issue_id": issue.id,
             "assignment_id": assignment.id,
             "assignment_source": source,
+            "required_capabilities": _string_list(required_capabilities),
+            "preferred_capabilities": _string_list(preferred_capabilities),
+            "task_type": _optional(task_type),
+            "workspace_root": _optional(workspace_root),
+            "repo_url": _optional(repo_url),
+            "execution_location": _optional(execution_location),
             **dict(metadata or {}),
         }
-        draft = self.taskflow_service.create_task_draft(
-            goal_id,
-            title=(title or issue.title),
-            prompt=(prompt or issue.description or issue.title),
-            required_capabilities=_string_list(required_capabilities),
-            preferred_capabilities=_string_list(preferred_capabilities),
-            task_type=_optional(task_type),
-            workspace_root=_optional(workspace_root),
-            repo_url=_optional(repo_url),
-            execution_location=_optional(execution_location),
-            manual_agent_id=assignment.target_agent_id,
-            status=TaskDraftStatus.CONFIRMED.value,
-            peer_id=peer_id,
-            metadata=draft_metadata,
+        self.taskflow_service.clarify_goal(
+            taskflow_id,
+            work_item_candidates=[
+                WorkItemCandidate(
+                    id=assignment.id,
+                    title=(title or issue.title),
+                    description=(prompt or issue.description or issue.title),
+                    type="implementation",
+                    dedupe_key=f"{issue.id}:{assignment.id}",
+                    metadata=candidate_metadata,
+                )
+            ],
+            readiness_gates=[
+                ReadinessGate(
+                    id=f"gate-{assignment.id}",
+                    name="assignment-ready",
+                    passed=True,
+                    rationale="Issue assignment created an explicit WorkItem candidate.",
+                )
+            ],
+            readiness_score=90,
         )
-        assignment.task_draft_id = draft.id
+        self.taskflow_service.confirm_goal(taskflow_id, confirmed_by="issue_assignment")
+        plan = self.taskflow_service.compile_goal(taskflow_id)
+        work_item_id = plan.work_item_candidates[0].work_item_id
+        assignment.work_item_id = work_item_id
         created = self.store.create_assignment(assignment)
         self.store.append_event(
             "issue",
@@ -265,7 +266,7 @@ class IssueAssignmentService:
             "assignment",
             created.id,
             "assignment_created",
-            {"assignment": created.to_dict(), "task_draft": draft.to_dict()},
+            {"assignment": created.to_dict(), "work_item_id": work_item_id},
         )
         return created
 
@@ -275,21 +276,24 @@ class IssueAssignmentService:
         assignment, issue = self._get_assignment_for_peer(assignment_id, peer_id)
         if assignment.status == AssignmentStatus.CANCELLED:
             raise ValueError("cancelled assignments cannot be dispatched")
-        if not assignment.task_draft_id:
-            raise ValueError("assignment has no task draft")
+        if not assignment.work_item_id:
+            raise ValueError("assignment has no work item")
         dispatch_source = "mention" if assignment.source == "mention" else "assignment"
-        decision = self.taskflow_service.dispatch_task_draft(
-            assignment.task_draft_id,
-            manual_agent_id=assignment.target_agent_id,
-            peer_id=peer_id,
-            source=dispatch_source,
-            metadata={"issue_id": issue.id, "assignment_id": assignment.id},
+        run = self.taskflow_service.dispatch_task_run(
+            issue.taskflow_id or self._ensure_backing_goal(issue, peer_id=peer_id),
+            work_item_id=assignment.work_item_id,
+            executor_hint=assignment.target_agent_id,
+            metadata={
+                "issue_id": issue.id,
+                "assignment_id": assignment.id,
+                "dispatch_source": dispatch_source,
+            },
         )
-        assignment.dispatch_decision_id = decision.id
-        assignment.runtime_task_id = decision.runtime_task_id
+        assignment.task_run_id = run.id
+        assignment.runtime_task_id = run.runtime_task_id
         assignment.status = (
             AssignmentStatus.DISPATCHED
-            if decision.runtime_task_id
+            if run.status == TaskRunStatus.DISPATCHED
             else AssignmentStatus.NEEDS_ASSIGNMENT
         )
         saved = self.store.update_assignment(assignment)
@@ -301,7 +305,7 @@ class IssueAssignmentService:
         payload = {
             "issue": issue.to_dict(),
             "assignment": saved.to_dict(),
-            "decision": decision.to_dict(),
+            "task_run": run.to_dict(),
         }
         self.store.append_event("issue", issue.id, event_type, payload)
         self.store.append_event("assignment", saved.id, event_type, payload)
@@ -342,14 +346,6 @@ class IssueAssignmentService:
         assignment.reason = reason or assignment.reason
         assignment.metadata.setdefault("reassigned_from_agent_id", previous_agent_id)
         saved = self.store.update_assignment(assignment)
-        if saved.task_draft_id:
-            draft = self.taskflow_service.get_task_draft(
-                saved.task_draft_id, peer_id=peer_id
-            )
-            draft.manual_agent_id = agent_id
-            if draft.status == TaskDraftStatus.NEEDS_ASSIGNMENT:
-                draft.status = TaskDraftStatus.CONFIRMED
-            self.taskflow_service.store.update_task_draft(draft)
         payload = {
             "issue": issue.to_dict(),
             "assignment": saved.to_dict(),
@@ -449,28 +445,21 @@ class IssueAssignmentService:
     def _ensure_backing_goal(
         self, issue: IssueRecord, *, peer_id: str | None = None
     ) -> str:
-        goal_id = issue.taskflow_goal_id
-        if goal_id:
-            goal = self.taskflow_service.get_goal(goal_id, peer_id=peer_id)
-            if goal.status == GoalStatus.CANCELLED:
-                raise ValueError("cancelled Taskflow goal cannot accept assignments")
-            if goal.status != GoalStatus.CONFIRMED:
-                self.taskflow_service.confirm_goal(
-                    goal_id, peer_id=peer_id, confirmed_by="issue_assignment"
-                )
-            return goal_id
-        goal = self.taskflow_service.create_goal(
-            title=issue.title,
-            prompt=issue.description,
+        taskflow_id = issue.taskflow_id
+        if taskflow_id:
+            state = self.taskflow_service.get_taskflow_state(taskflow_id)
+            if state.meta.status == TaskflowStatus.CANCELLED:
+                raise ValueError("cancelled Taskflow cannot accept assignments")
+            return taskflow_id
+        state = self.taskflow_service.start_taskflow(
+            project_id=f"peer-{peer_id or 'default'}",
+            raw_goal=issue.description or issue.title,
             peer_id=peer_id,
             metadata={"source": "issue_assignment", "issue_id": issue.id},
         )
-        self.taskflow_service.confirm_goal(
-            goal.id, peer_id=peer_id, confirmed_by="issue_assignment"
-        )
-        issue.taskflow_goal_id = goal.id
+        issue.taskflow_id = state.meta.taskflow_id
         self.store.update_issue(issue)
-        return goal.id
+        return state.meta.taskflow_id
 
     def _mention_from_resolution(
         self,
@@ -517,7 +506,8 @@ class IssueAssignmentService:
 
     def _resolve_agent_ref(self, ref: str) -> list[dict[str, Any]]:
         normalized = ref.strip().lstrip("@").lower()
-        runtime = getattr(self.taskflow_service, "runtime_control_plane", None)
+        dispatcher = getattr(self.taskflow_service, "dispatcher", None)
+        runtime = getattr(dispatcher, "runtime_control_plane", None)
         snapshot = _dict(runtime.runtime_snapshot) if runtime is not None else {}
         agents = _dict(snapshot.get("agents"))
         candidates: list[dict[str, Any]] = []
