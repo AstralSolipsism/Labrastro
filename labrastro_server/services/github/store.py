@@ -61,6 +61,6 @@ class GitHubStore(Protocol):
         self,
         comment_id: str,
         *,
-        task_draft_id: str | None,
+        work_item_id: str | None,
         assignment_id: str | None,
     ) -> None: ...

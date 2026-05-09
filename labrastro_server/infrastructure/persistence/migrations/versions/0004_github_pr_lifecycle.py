@@ -56,7 +56,7 @@ def upgrade() -> None:
             side TEXT,
             url TEXT NOT NULL DEFAULT '',
             state TEXT NOT NULL DEFAULT 'open',
-            task_draft_id TEXT REFERENCES labrastro_taskflow_task_drafts(id) ON DELETE SET NULL,
+            work_item_id TEXT,
             assignment_id TEXT REFERENCES labrastro_assignments(id) ON DELETE SET NULL,
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

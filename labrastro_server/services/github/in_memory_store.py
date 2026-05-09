@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from reuleauxcoder.domain.taskflow.models import utc_now
+from labrastro_server.taskflow.domain.time import utc_now
 from labrastro_server.services.github.models import (
     GitHubPullRequestRecord,
     GitHubReviewCommentRecord,
@@ -108,7 +108,7 @@ class InMemoryGitHubStore:
     ) -> GitHubReviewCommentRecord:
         existing = self._comments.get(record.github_id)
         if existing is not None:
-            record.task_draft_id = record.task_draft_id or existing.task_draft_id
+            record.work_item_id = record.work_item_id or existing.work_item_id
             record.assignment_id = record.assignment_id or existing.assignment_id
         record.updated_at = utc_now()
         self._comments[record.github_id] = deepcopy(record)
@@ -125,12 +125,12 @@ class InMemoryGitHubStore:
         self,
         comment_id: str,
         *,
-        task_draft_id: str | None,
+        work_item_id: str | None,
         assignment_id: str | None,
     ) -> None:
         comment = self._comments.get(comment_id)
         if comment is None:
             return
-        comment.task_draft_id = task_draft_id
+        comment.work_item_id = work_item_id
         comment.assignment_id = assignment_id
         comment.updated_at = utc_now()

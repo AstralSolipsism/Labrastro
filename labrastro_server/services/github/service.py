@@ -11,7 +11,7 @@ from typing import Any
 
 from reuleauxcoder.domain.agent_runtime.models import ArtifactStatus, ArtifactType
 from reuleauxcoder.domain.config.models import GitHubConfig
-from reuleauxcoder.domain.taskflow.models import utc_now
+from labrastro_server.taskflow.domain.time import utc_now
 from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
 from labrastro_server.services.agent_runtime.executor_backend import ExecutorEvent
 from labrastro_server.services.collaboration.service import IssueAssignmentService
@@ -318,15 +318,15 @@ class PullRequestService:
             assignment = self._create_followup_assignment(record, saved)
             self.store.set_review_comment_followup(
                 saved.github_id,
-                task_draft_id=assignment.task_draft_id,
+                work_item_id=assignment.work_item_id,
                 assignment_id=assignment.id,
             )
-            saved.task_draft_id = assignment.task_draft_id
+            saved.work_item_id = assignment.work_item_id
             saved.assignment_id = assignment.id
         except Exception as exc:
             self.store.set_review_comment_followup(
                 saved.github_id,
-                task_draft_id=None,
+                work_item_id=None,
                 assignment_id=None,
             )
             saved.metadata["followup_error"] = str(exc)

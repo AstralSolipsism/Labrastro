@@ -7,6 +7,9 @@ from typing import Any
 
 from reuleauxcoder.domain.agent_runtime.models import ArtifactStatus, ArtifactType
 from reuleauxcoder.domain.config.models import GitHubConfig
+from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
+    ReuleauxCoderTaskflowDispatcher,
+)
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRuntimeControlPlane,
     RuntimeTaskRequest,
@@ -166,7 +169,7 @@ def test_ensure_pr_for_task_records_failure_without_failing_task() -> None:
 def test_webhook_review_comment_is_idempotent_and_creates_followup_assignment() -> None:
     control = AgentRuntimeControlPlane()
     control.submit_task(RuntimeTaskRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
-    taskflow = TaskflowService(runtime_control_plane=control)
+    taskflow = TaskflowService(dispatcher=ReuleauxCoderTaskflowDispatcher(control))
     collaboration = IssueAssignmentService(taskflow_service=taskflow)
     store = InMemoryGitHubStore()
     record = store.upsert_pull_request(
@@ -213,9 +216,9 @@ def test_webhook_review_comment_is_idempotent_and_creates_followup_assignment() 
     comments = store.list_review_comments("task-1")
     assert len(comments) == 1
     assert comments[0].assignment_id
-    assert comments[0].task_draft_id
+    assert comments[0].work_item_id
     assignment = collaboration.load_assignment_detail(comments[0].assignment_id)
-    assert assignment["task_draft"]["prompt"].startswith("Address the GitHub review")
+    assert assignment["work_item_id"] == comments[0].work_item_id
     assert control.list_tasks(limit=20) == [control.task_to_dict("task-1")]
     assert store.get_pull_request(record.repository, record.number) is not None
 

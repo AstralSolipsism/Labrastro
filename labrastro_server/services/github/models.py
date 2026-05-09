@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from reuleauxcoder.domain.taskflow.models import utc_now
+from labrastro_server.taskflow.domain.time import utc_now
 
 
 @dataclass
@@ -105,7 +105,7 @@ class GitHubReviewCommentRecord:
     side: str | None = None
     url: str = ""
     state: str = "open"
-    task_draft_id: str | None = None
+    work_item_id: str | None = None
     assignment_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
@@ -128,9 +128,9 @@ class GitHubReviewCommentRecord:
             side=str(data["side"]) if data.get("side") is not None else None,
             url=str(data.get("url") or ""),
             state=str(data.get("state") or "open"),
-            task_draft_id=(
-                str(data["task_draft_id"])
-                if data.get("task_draft_id") is not None
+            work_item_id=(
+                str(data["work_item_id"])
+                if data.get("work_item_id") is not None
                 else None
             ),
             assignment_id=(
@@ -158,7 +158,7 @@ class GitHubReviewCommentRecord:
             "side": self.side,
             "url": self.url,
             "state": self.state,
-            "task_draft_id": self.task_draft_id,
+            "work_item_id": self.work_item_id,
             "assignment_id": self.assignment_id,
             "metadata": dict(self.metadata),
             "created_at": self.created_at,

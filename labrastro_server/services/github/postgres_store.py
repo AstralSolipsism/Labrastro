@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 import json
 
-from reuleauxcoder.domain.taskflow.models import utc_now
+from labrastro_server.taskflow.domain.time import utc_now
 from labrastro_server.services.github.models import (
     GitHubPullRequestRecord,
     GitHubReviewCommentRecord,
@@ -211,11 +211,11 @@ class PostgresGitHubStore:
                     INSERT INTO labrastro_github_review_comments (
                         id, github_id, pr_record_id, task_id, repository, pr_number,
                         author, body, path, line, side, url, state,
-                        task_draft_id, assignment_id, metadata
+                        work_item_id, assignment_id, metadata
                     ) VALUES (
                         :id, :github_id, :pr_record_id, :task_id, :repository, :pr_number,
                         :author, :body, :path, :line, :side, :url, :state,
-                        :task_draft_id, :assignment_id, CAST(:metadata AS JSONB)
+                        :work_item_id, :assignment_id, CAST(:metadata AS JSONB)
                     )
                     ON CONFLICT (github_id) DO UPDATE SET
                         author=EXCLUDED.author,
@@ -225,7 +225,7 @@ class PostgresGitHubStore:
                         side=EXCLUDED.side,
                         url=EXCLUDED.url,
                         state=EXCLUDED.state,
-                        task_draft_id=COALESCE(EXCLUDED.task_draft_id, labrastro_github_review_comments.task_draft_id),
+                        work_item_id=COALESCE(EXCLUDED.work_item_id, labrastro_github_review_comments.work_item_id),
                         assignment_id=COALESCE(EXCLUDED.assignment_id, labrastro_github_review_comments.assignment_id),
                         metadata=EXCLUDED.metadata,
                         updated_at=now()
@@ -262,7 +262,7 @@ class PostgresGitHubStore:
         self,
         comment_id: str,
         *,
-        task_draft_id: str | None,
+        work_item_id: str | None,
         assignment_id: str | None,
     ) -> None:
         with self.engine.begin() as conn:
@@ -270,7 +270,7 @@ class PostgresGitHubStore:
                 text(
                     """
                     UPDATE labrastro_github_review_comments
-                    SET task_draft_id=:task_draft_id,
+                    SET work_item_id=:work_item_id,
                         assignment_id=:assignment_id,
                         updated_at=now()
                     WHERE github_id=:comment_id
@@ -278,7 +278,7 @@ class PostgresGitHubStore:
                 ),
                 {
                     "comment_id": comment_id,
-                    "task_draft_id": task_draft_id,
+                    "work_item_id": work_item_id,
                     "assignment_id": assignment_id,
                 },
             )
