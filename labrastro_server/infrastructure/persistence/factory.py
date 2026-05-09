@@ -30,9 +30,10 @@ from labrastro_server.services.github.auth import GitHubInstallationTokenProvide
 from labrastro_server.services.github.client import GitHubClient
 from labrastro_server.services.github.postgres_store import PostgresGitHubStore
 from labrastro_server.services.github.service import PullRequestService
-from labrastro_server.services.taskflow.in_memory_store import InMemoryTaskflowStore
-from labrastro_server.services.taskflow.postgres_store import PostgresTaskflowStore
-from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
+    ReuleauxCoderTaskflowDispatcher,
+)
+from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 
 def should_use_postgres(persistence: PersistenceConfig) -> bool:
@@ -76,9 +77,12 @@ def create_runtime_control_plane(config: Config) -> AgentRuntimeControlPlane:
 def create_taskflow_service(
     config: Config, *, runtime_control_plane: AgentRuntimeControlPlane | None = None
 ) -> TaskflowService:
-    engine = _engine_for(config)
-    store = PostgresTaskflowStore(engine) if engine is not None else InMemoryTaskflowStore()
-    return TaskflowService(store, runtime_control_plane=runtime_control_plane)
+    dispatcher = (
+        ReuleauxCoderTaskflowDispatcher(runtime_control_plane)
+        if runtime_control_plane is not None
+        else None
+    )
+    return TaskflowService(dispatcher=dispatcher)
 
 
 def create_issue_assignment_service(
