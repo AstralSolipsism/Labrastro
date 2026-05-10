@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pytest
 
@@ -28,10 +28,14 @@ def _control(*, agents: dict | None = None) -> AgentRuntimeControlPlane:
             or {
                 "environment_configurator": {
                     "runtime_profile": "environment_local",
-                    "capabilities": [
-                        "environment.check",
-                        "environment.configure",
-                    ],
+                    "capability_refs": ["environment"],
+                    "resolved_capabilities": {
+                        "permissions": [
+                            "environment.check",
+                            "environment.configure",
+                            "environment.manifest.read",
+                        ]
+                    },
                 }
             },
         }
@@ -51,7 +55,7 @@ def _manifest() -> EnvironmentManifestResponse:
     )
 
 
-def test_environment_run_auto_selects_capable_agent_and_sets_check_metadata() -> None:
+def test_environment_run_uses_default_agent_and_sets_check_metadata() -> None:
     control = _control()
 
     result = EnvironmentRunService(control).submit(
@@ -100,7 +104,7 @@ def test_environment_run_configure_includes_install_command() -> None:
 
 
 def test_environment_run_rejects_missing_agent_candidate() -> None:
-    control = _control(agents={"coder": {"capabilities": ["edit_code"]}})
+    control = _control(agents={"coder": {"capability_refs": ["repo-dev"]}})
 
     with pytest.raises(EnvironmentRunError) as raised:
         EnvironmentRunService(control).submit(
@@ -109,11 +113,19 @@ def test_environment_run_rejects_missing_agent_candidate() -> None:
             workspace_root="/repo",
         )
 
-    assert raised.value.error == "environment_agent_required"
+    assert raised.value.error == "environment_agent_not_found"
 
 
-def test_environment_run_rejects_capability_mismatch_for_selected_agent() -> None:
-    control = _control(agents={"coder": {"capabilities": ["environment.check"]}})
+def test_environment_run_rejects_missing_permission_for_selected_agent() -> None:
+    control = _control(
+        agents={
+            "coder": {
+                "resolved_capabilities": {
+                    "permissions": ["environment.check", "environment.manifest.read"]
+                }
+            }
+        }
+    )
 
     with pytest.raises(EnvironmentRunError) as raised:
         EnvironmentRunService(control).submit(
@@ -123,4 +135,4 @@ def test_environment_run_rejects_capability_mismatch_for_selected_agent() -> Non
             agent_id="coder",
         )
 
-    assert raised.value.error == "environment_agent_capability_mismatch"
+    assert raised.value.error == "environment_agent_permission_mismatch"

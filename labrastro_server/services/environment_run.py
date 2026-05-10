@@ -16,12 +16,13 @@ from labrastro_server.services.agent_runtime.control_plane import (
     RuntimeTaskRequest,
 )
 from reuleauxcoder.domain.agent_runtime.models import TaskRecord, TriggerMode
+from reuleauxcoder.domain.config.models import DEFAULT_ENVIRONMENT_AGENT_ID
 
 
 ENVIRONMENT_WORKFLOW = "environment_config"
-ENVIRONMENT_AGENT_CAPABILITIES = {
-    "check": "environment.check",
-    "configure": "environment.configure",
+ENVIRONMENT_MODE_PERMISSIONS = {
+    "check": {"environment.check", "environment.manifest.read"},
+    "configure": {"environment.configure", "environment.manifest.read"},
 }
 
 
@@ -65,7 +66,7 @@ class EnvironmentRunService:
         agent_id: str | None = None,
     ) -> EnvironmentRunResult:
         normalized_mode = str(mode or "").strip().lower()
-        if normalized_mode not in ENVIRONMENT_AGENT_CAPABILITIES:
+        if normalized_mode not in ENVIRONMENT_MODE_PERMISSIONS:
             raise EnvironmentRunError(
                 "invalid_environment_mode",
                 "mode must be check or configure",
@@ -128,43 +129,37 @@ class EnvironmentRunService:
         )
 
     def _select_agent(self, *, mode: str, preferred_agent_id: str | None) -> str:
-        required_capability = ENVIRONMENT_AGENT_CAPABILITIES[mode]
+        required_permissions = ENVIRONMENT_MODE_PERMISSIONS[mode]
         snapshot = self.runtime_control_plane.runtime_snapshot
         agents = snapshot.get("agents", {})
         if not isinstance(agents, dict):
             agents = {}
-        normalized_preferred = str(preferred_agent_id or "").strip()
-        if normalized_preferred:
-            agent = agents.get(normalized_preferred)
-            if not isinstance(agent, dict):
-                raise EnvironmentRunError(
-                    "environment_agent_not_found",
-                    f"environment agent not found: {normalized_preferred}",
-                    status=HTTPStatus.NOT_FOUND,
-                )
-            capabilities = _capabilities(agent)
-            if required_capability not in capabilities:
-                raise EnvironmentRunError(
-                    "environment_agent_capability_mismatch",
-                    f"agent {normalized_preferred} does not declare {required_capability}",
-                )
-            return normalized_preferred
-        for candidate_id in sorted(str(agent_id) for agent_id in agents):
-            agent = agents.get(candidate_id)
-            if isinstance(agent, dict) and required_capability in _capabilities(agent):
-                return candidate_id
-        raise EnvironmentRunError(
-            "environment_agent_required",
-            "no Agent declares the required environment capability",
-            status=HTTPStatus.CONFLICT,
-        )
+        selected_id = str(preferred_agent_id or DEFAULT_ENVIRONMENT_AGENT_ID).strip()
+        agent = agents.get(selected_id)
+        if not isinstance(agent, dict):
+            raise EnvironmentRunError(
+                "environment_agent_not_found",
+                f"environment agent not found: {selected_id}",
+                status=HTTPStatus.NOT_FOUND,
+            )
+        permissions = _resolved_permissions(agent)
+        if not required_permissions <= permissions:
+            missing = sorted(required_permissions - permissions)
+            raise EnvironmentRunError(
+                "environment_agent_permission_mismatch",
+                f"agent {selected_id} lacks environment permissions: {', '.join(missing)}",
+            )
+        return selected_id
 
 
-def _capabilities(agent: dict[str, Any]) -> set[str]:
-    raw = agent.get("capabilities", [])
-    if not isinstance(raw, list):
+def _resolved_permissions(agent: dict[str, Any]) -> set[str]:
+    resolved = agent.get("resolved_capabilities", {})
+    if not isinstance(resolved, dict):
         return set()
-    return {str(item) for item in raw if str(item).strip()}
+    permissions = resolved.get("permissions", [])
+    if not isinstance(permissions, list):
+        return set()
+    return {str(item) for item in permissions if str(item).strip()}
 
 
 def _manifest_entries(manifest: EnvironmentManifestResponse) -> list[dict[str, Any]]:
