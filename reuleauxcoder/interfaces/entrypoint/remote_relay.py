@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import inspect
@@ -63,6 +64,127 @@ def _snapshot_digest(snapshot: dict[str, Any]) -> str:
     normalized.pop("updatedAt", None)
     normalized.pop("updated_at", None)
     return _stable_digest(normalized)
+
+
+def _message_field(message: Any, field: str) -> Any:
+    if isinstance(message, dict):
+        return message.get(field)
+    return getattr(message, field, None)
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def _assistant_contents_by_turn(messages: list[Any]) -> list[list[str]]:
+    groups: list[list[str]] = []
+    current_turn_index = -1
+    for message in messages:
+        role = _message_field(message, "role")
+        if role == "user":
+            groups.append([])
+            current_turn_index = len(groups) - 1
+            continue
+        if role != "assistant":
+            continue
+        content = _message_content_text(_message_field(message, "content"))
+        if not content:
+            continue
+        if current_turn_index < 0:
+            groups.append([])
+            current_turn_index = 0
+        groups[current_turn_index].append(content)
+    return groups
+
+
+def _patch_snapshot_turn_final_text(
+    turn: dict[str, Any], authoritative_final: str, turn_index: int
+) -> None:
+    assistant_messages = turn.get("assistantMessages")
+    if not isinstance(assistant_messages, list):
+        assistant_messages = []
+        turn["assistantMessages"] = assistant_messages
+    if not assistant_messages:
+        assistant_messages.append(
+            {
+                "id": f"assistant-final-{turn_index}",
+                "role": "assistant",
+                "parts": [],
+            }
+        )
+    message = assistant_messages[-1]
+    if not isinstance(message, dict):
+        message = {"role": "assistant", "parts": []}
+        assistant_messages[-1] = message
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        parts = []
+        message["parts"] = parts
+    text_part_index = -1
+    for index in range(len(parts) - 1, -1, -1):
+        part = parts[index]
+        if isinstance(part, dict) and part.get("type") == "text":
+            text_part_index = index
+            break
+    current_final = ""
+    if text_part_index >= 0 and isinstance(parts[text_part_index], dict):
+        text = parts[text_part_index].get("text")
+        current_final = text if isinstance(text, str) else ""
+    elif isinstance(message.get("text"), str):
+        current_final = str(message.get("text"))
+    if len(authoritative_final) <= len(current_final):
+        return
+    if text_part_index >= 0 and isinstance(parts[text_part_index], dict):
+        parts[text_part_index] = {
+            **parts[text_part_index],
+            "type": "text",
+            "text": authoritative_final,
+            "textFormat": parts[text_part_index].get("textFormat") or "markdown",
+        }
+    else:
+        parts.append(
+            {
+                "id": f"assistant-final-part-{turn_index}",
+                "type": "text",
+                "text": authoritative_final,
+                "textFormat": "markdown",
+            }
+        )
+    message["text"] = authoritative_final
+
+
+def _merge_snapshot_with_session_messages(
+    snapshot: dict[str, Any], messages: list[Any]
+) -> dict[str, Any]:
+    turns = snapshot.get("turns")
+    if not isinstance(turns, list):
+        return snapshot
+    assistant_groups = _assistant_contents_by_turn(messages)
+    if not assistant_groups:
+        return snapshot
+    next_snapshot = copy.deepcopy(snapshot)
+    next_turns = next_snapshot.get("turns")
+    if not isinstance(next_turns, list):
+        return snapshot
+    for turn_index, turn in enumerate(next_turns):
+        if turn_index >= len(assistant_groups) or not isinstance(turn, dict):
+            continue
+        final_content = assistant_groups[turn_index][-1] if assistant_groups[turn_index] else ""
+        if final_content:
+            _patch_snapshot_turn_final_text(turn, final_content, turn_index)
+    return next_snapshot
 
 
 def init_remote_relay(runner, config: Config, ui_bus: UIEventBus) -> None:
@@ -353,7 +475,9 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if runner._relay_http_service.runtime_control_plane is not None:
             runner._relay_http_service.runtime_control_plane.configure(
                 max_running_tasks=next_config.agent_runtime.max_running_agents,
-                runtime_snapshot=next_config.agent_runtime.to_runtime_snapshot(),
+                runtime_snapshot=next_config.agent_runtime.to_runtime_snapshot(
+                    next_config.capability_packages
+                ),
             )
         runner._relay_http_service.mcp_servers = list(next_config.mcp_servers)
         runner._relay_http_service.mcp_artifact_root = Path(
@@ -674,6 +798,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "error": "session_fingerprint_mismatch",
                     "_status": 403,
                 }
+            snapshot = _merge_snapshot_with_session_messages(snapshot, loaded.messages)
             digest = _snapshot_digest(snapshot)
             latest_snapshot, _snapshot_error = _load_session_snapshot(session_id)
             if (
@@ -981,7 +1106,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
         def _peer_supports_tool_preview() -> bool:
             peer = relay_server.registry.get(peer_id)
-            return bool(peer and "tool_preview" in peer.capabilities)
+            return bool(peer and "tool_preview" in peer.features)
 
         def _args_section(request: ApprovalRequest) -> dict[str, Any] | None:
             if not request.tool_args:
