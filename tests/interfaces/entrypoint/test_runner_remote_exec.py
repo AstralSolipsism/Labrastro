@@ -127,6 +127,7 @@ class FakeLLM:
 class MemorySessionStore:
     def __init__(self) -> None:
         self.sessions: dict[str, Session] = {}
+        self.snapshots: dict[str, dict] = {}
         self._next_id = 0
 
     def generate_session_id(self) -> str:
@@ -206,9 +207,14 @@ class MemorySessionStore:
         return items[0] if items else None
 
     def load_snapshot(self, _session_id: str) -> tuple[dict | None, str | None]:
-        return None, None
+        snapshot = self.snapshots.get(_session_id)
+        return (dict(snapshot), None) if snapshot is not None else (None, None)
+
+    def save_snapshot(self, session_id: str, snapshot: dict) -> None:
+        self.snapshots[session_id] = dict(snapshot)
 
     def delete_snapshot(self, _session_id: str) -> None:
+        self.snapshots.pop(_session_id, None)
         return None
 
     def delete(self, session_id: str) -> bool:
@@ -1340,6 +1346,112 @@ class TestRunnerRemoteExec:
             end = [event for event in events if event["type"] == "chat_end"][-1]
             assert ready["model"] == "deep-model"
             assert "hello|model=deep-model|sid=session-model" in end["payload"]["response"]
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_session_fork_clones_history_and_reuses_it_for_chat(self) -> None:
+        workspace = Path(__file__).resolve().parent
+        port = _free_port()
+        session_store = MemorySessionStore()
+
+        def chat_behavior(agent: FakeAgent, prompt: str) -> str:
+            existing = [
+                message.get("content")
+                for message in agent.state.messages
+                if message.get("role") == "user"
+            ]
+            return f"{prompt}|history={','.join(existing)}|sid={getattr(agent, 'current_session_id', '-')}"
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            session_store=session_store,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hello"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+            )
+            ready = [
+                event["payload"]
+                for event in events
+                if event["type"] == "remote_peer_ready"
+            ][0]
+            source_session_id = ready["session_id"]
+
+            _, loaded = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/load",
+                {"peer_token": peer_token, "session_id": source_session_id},
+            )
+            assert len(loaded["messages"]) >= 2
+
+            snapshot = {
+                "version": 1,
+                "sessionId": "placeholder",
+                "session": {
+                    "id": "placeholder",
+                    "kind": "fork",
+                    "parentSessionId": source_session_id,
+                    "sourceSessionId": source_session_id,
+                    "summary": "Fork summary",
+                },
+                "turns": [],
+            }
+            _, forked = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/fork",
+                {
+                    "peer_token": peer_token,
+                    "source_session_id": source_session_id,
+                    "keep_through_message_index": 0,
+                    "snapshot": snapshot,
+                },
+            )
+            forked_session_id = forked["metadata"]["id"]
+            assert forked["messages"] == loaded["messages"][:1]
+            assert forked["snapshot"]["session"]["parentSessionId"] == source_session_id
+
+            _, fork_start = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {
+                    "peer_token": peer_token,
+                    "prompt": "follow up",
+                    "session_hint": forked_session_id,
+                },
+            )
+            fork_events = _collect_stream_events(
+                runner._relay_http_service.base_url, peer_token, fork_start["chat_id"]
+            )
+            fork_ready = [
+                event["payload"]
+                for event in fork_events
+                if event["type"] == "remote_peer_ready"
+            ][0]
+            fork_end = [event for event in fork_events if event["type"] == "chat_end"][-1]
+            assert fork_ready["session_id"] == forked_session_id
+            assert "follow up|history=hello|sid=" in fork_end["payload"]["response"]
+
+            forked_session = session_store.load(forked_session_id)
+            assert forked_session is not None
+            assert any(
+                message.get("role") == "user" and message.get("content") == "follow up"
+                for message in forked_session.messages
+            )
         finally:
             runner.cleanup(ctx.agent)
 

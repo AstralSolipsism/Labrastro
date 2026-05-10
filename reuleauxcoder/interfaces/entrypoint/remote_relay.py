@@ -568,6 +568,96 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 "fingerprint": fingerprint,
             }
 
+        if action == "fork":
+            source_session_id = str(payload.get("source_session_id") or "").strip()
+            if not source_session_id:
+                return {
+                    "ok": False,
+                    "error": "missing_source_session_id",
+                    "_status": 400,
+                }
+            keep_raw = payload.get("keep_through_message_index", -1)
+            try:
+                keep_through_message_index = int(keep_raw)
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": "invalid_keep_through_message_index",
+                    "_status": 400,
+                }
+            if keep_through_message_index < -1:
+                return {
+                    "ok": False,
+                    "error": "invalid_keep_through_message_index",
+                    "_status": 400,
+                }
+            source = session_store.load(source_session_id)
+            if source is None:
+                return {"ok": False, "error": "session_not_found", "_status": 404}
+            if source.fingerprint != fingerprint:
+                return {
+                    "ok": False,
+                    "error": "session_fingerprint_mismatch",
+                    "fingerprint": source.fingerprint,
+                    "current_fingerprint": fingerprint,
+                    "_status": 403,
+                }
+            if keep_through_message_index >= len(source.messages):
+                return {
+                    "ok": False,
+                    "error": "keep_through_message_index_out_of_range",
+                    "message_count": len(source.messages),
+                    "_status": 400,
+                }
+
+            session_id = session_store.generate_session_id()
+            cloned_messages = (
+                []
+                if keep_through_message_index < 0
+                else [
+                    json.loads(json.dumps(message))
+                    for message in source.messages[: keep_through_message_index + 1]
+                ]
+            )
+            runtime_state = SessionRuntimeState.from_dict(source.runtime_state.to_dict())
+            session_store.save_runtime_state(
+                session_id,
+                runtime_state.model or source.model,
+                runtime_state,
+                messages=cloned_messages,
+                total_prompt_tokens=0,
+                total_completion_tokens=0,
+                active_mode=source.active_mode or runtime_state.active_mode,
+                fingerprint=fingerprint,
+            )
+
+            snapshot_payload = payload.get("snapshot")
+            if isinstance(snapshot_payload, dict) and snapshot_payload:
+                session_store.save_snapshot(session_id, snapshot_payload)
+
+            saved = session_store.load(session_id)
+            snapshot, snapshot_error = _load_session_snapshot(session_id)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "source_session_id": source_session_id,
+                "keep_through_message_index": keep_through_message_index,
+                "fingerprint": fingerprint,
+                "metadata": _session_metadata_payload(saved)
+                if saved is not None
+                else {
+                    "id": session_id,
+                    "model": runtime_state.model or source.model,
+                    "saved_at": "",
+                    "preview": "",
+                    "fingerprint": fingerprint,
+                },
+                "messages": list(saved.messages) if saved is not None else cloned_messages,
+                "runtime_state": runtime_state.to_dict(),
+                "snapshot": snapshot,
+                "snapshot_error": snapshot_error,
+            }
+
         if action == "snapshot":
             session_id = str(payload.get("session_id") or "")
             snapshot = payload.get("snapshot")
