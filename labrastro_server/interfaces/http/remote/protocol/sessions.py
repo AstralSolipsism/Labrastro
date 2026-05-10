@@ -64,6 +64,41 @@ class SessionDeleteRequest:
         return cls(peer_token=d["peer_token"], session_id=d["session_id"])
 
 @dataclass
+class SessionForkRequest:
+    peer_token: str
+    source_session_id: str
+    keep_through_message_index: int = -1
+    snapshot: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "peer_token": self.peer_token,
+            "source_session_id": self.source_session_id,
+            "keep_through_message_index": self.keep_through_message_index,
+        }
+        if self.snapshot:
+            payload["snapshot"] = self.snapshot
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionForkRequest":
+        snapshot = d.get("snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        return cls(
+            peer_token=d["peer_token"],
+            source_session_id=str(
+                d.get("source_session_id") or d.get("sourceSessionId") or ""
+            ),
+            keep_through_message_index=int(
+                d.get("keep_through_message_index")
+                if d.get("keep_through_message_index") is not None
+                else d.get("keepThroughMessageIndex", -1)
+            ),
+            snapshot=snapshot,
+        )
+
+@dataclass
 class SessionSnapshotRequest:
     peer_token: str
     session_id: str
@@ -135,6 +170,7 @@ __all__ = [
     "SessionLoadRequest",
     "SessionNewRequest",
     "SessionDeleteRequest",
+    "SessionForkRequest",
     "SessionSnapshotRequest",
     "SessionModelSwitchRequest",
 ]

@@ -47,6 +47,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("sessions.load", "POST", "/remote/sessions/load", "SessionLoadRequest", "SessionLoadResponse", "peer_token"),
     RemoteEndpoint("sessions.new", "POST", "/remote/sessions/new", "SessionNewRequest", "SessionNewResponse", "peer_token"),
     RemoteEndpoint("sessions.delete", "POST", "/remote/sessions/delete", "SessionDeleteRequest", "Ok", "peer_token"),
+    RemoteEndpoint("sessions.fork", "POST", "/remote/sessions/fork", "SessionForkRequest", "SessionLoadResponse", "peer_token"),
     RemoteEndpoint("sessions.snapshot", "POST", "/remote/sessions/snapshot", "SessionSnapshotRequest", "Ok", "peer_token"),
     RemoteEndpoint("sessions.model", "POST", "/remote/sessions/model", "SessionModelSwitchRequest", "Ok", "peer_token"),
     RemoteEndpoint("chat.once", "POST", "/remote/chat", "ChatRequest", "ChatResponse", "peer_token"),

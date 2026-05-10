@@ -38,6 +38,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     RegisterRequest,
     RelayEnvelope,
     SessionDeleteRequest,
+    SessionForkRequest,
     SessionListRequest,
     SessionLoadRequest,
     SessionModelSwitchRequest,
@@ -73,6 +74,10 @@ class RemoteSessionRoutes:
                 session_payload = req.to_dict()
             elif action == "delete":
                 req = SessionDeleteRequest.from_dict(payload)
+                peer_token = req.peer_token
+                session_payload = req.to_dict()
+            elif action == "fork":
+                req = SessionForkRequest.from_dict(payload)
                 peer_token = req.peer_token
                 session_payload = req.to_dict()
             elif action == "snapshot":

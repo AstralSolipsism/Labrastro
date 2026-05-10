@@ -46,6 +46,7 @@ from labrastro_server.interfaces.http.remote.protocol.registry import (
 )
 from labrastro_server.interfaces.http.remote.protocol.sessions import (
     SessionDeleteRequest,
+    SessionForkRequest,
     SessionListRequest,
     SessionLoadRequest,
     SessionModelSwitchRequest,
@@ -101,6 +102,7 @@ __all__ = [
     "RemoteMCPToolInfo",
     "RemoteEndpoint",
     "SessionDeleteRequest",
+    "SessionForkRequest",
     "SessionListRequest",
     "SessionLoadRequest",
     "SessionModelSwitchRequest",

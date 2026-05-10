@@ -44,6 +44,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     CleanupResult,
     ExecToolResult,
     SessionDeleteRequest,
+    SessionForkRequest,
     SessionListRequest,
     SessionLoadRequest,
     SessionNewRequest,
@@ -2602,6 +2603,19 @@ class TestRemoteRelayHTTPService:
         assert SessionDeleteRequest.from_dict(
             {"peer_token": "peer-token", "session_id": "session-1"}
         ).to_dict() == {"peer_token": "peer-token", "session_id": "session-1"}
+        assert SessionForkRequest.from_dict(
+            {
+                "peer_token": "peer-token",
+                "source_session_id": "session-1",
+                "keep_through_message_index": 3,
+                "snapshot": {"version": 1},
+            }
+        ).to_dict() == {
+            "peer_token": "peer-token",
+            "source_session_id": "session-1",
+            "keep_through_message_index": 3,
+            "snapshot": {"version": 1},
+        }
         assert SessionSnapshotRequest.from_dict(
             {
                 "peer_token": "peer-token",
@@ -2709,6 +2723,20 @@ class TestRemoteRelayHTTPService:
             assert delete_body["ok"] is True
             assert delete_body["action"] == "delete"
             assert calls[-1][0] == "delete"
+
+            status, fork_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/sessions/fork",
+                {
+                    "peer_token": peer_token,
+                    "source_session_id": "session-ok",
+                    "keep_through_message_index": 1,
+                },
+            )
+            assert status == 200
+            assert fork_body["ok"] is True
+            assert fork_body["action"] == "fork"
+            assert calls[-1][0] == "fork"
         finally:
             service.stop()
             relay.stop()
