@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """End-to-end smoke orchestration for Labrastro Agent Runtime persistence.
 
 The script has two halves:
@@ -815,7 +815,7 @@ class ServerRunner:
         last_error = ""
         while time.time() < deadline:
             try:
-                body = self.http_json("GET", "/remote/capabilities", timeout=5)
+                body = self.http_json("GET", "/remote/features", timeout=5)
                 if body.get("ok"):
                     return
             except Exception as exc:  # noqa: BLE001 - logged after timeout
@@ -834,7 +834,7 @@ class ServerRunner:
 
     def verify_service(self) -> None:
         self.log("verify service and database")
-        capabilities = self.http_json("GET", "/remote/capabilities")
+        features = self.http_json("GET", "/remote/features")
         db_status = self.run_cmd(
             [
                 "docker",
@@ -856,7 +856,7 @@ class ServerRunner:
         missing = [table for table in REQUIRED_TABLES if table not in existing]
         if missing:
             raise RuntimeError(f"missing Postgres tables: {missing}")
-        self.report["checks"]["capabilities"] = capabilities
+        self.report["checks"]["features"] = features
         self.report["checks"]["db_status"] = db_status
         self.report["checks"]["tables"] = sorted(existing)
         self.record_step("verify_service", db_status=db_status)
@@ -884,14 +884,21 @@ class ServerRunner:
         runtime["agents"][agent_id] = {
             "name": "Runtime Smoke Agent",
             "runtime_profile": profile_id,
-            "capabilities": ["read_repo", "code_review"],
+            "dispatch": {
+                "profile": "Best for runtime smoke review tasks.",
+                "examples": ["Run the fake executor smoke review flow."],
+                "avoid": ["Production deployment tasks."],
+            },
             "prompt": {"system_append": "Runtime smoke test agent."},
             "max_concurrent_tasks": 1,
         }
         runtime["agents"][shadow_agent_id] = {
             "name": "Runtime Smoke Agent",
             "runtime_profile": profile_id,
-            "capabilities": ["shadow_only"],
+            "dispatch": {
+                "profile": "Shadow Agent used only for ambiguous mention smoke tests.",
+                "avoid": ["Normal task dispatch."],
+            },
             "prompt": {"system_append": "Runtime smoke ambiguous mention shadow."},
             "max_concurrent_tasks": 1,
         }
@@ -1112,7 +1119,7 @@ class ServerRunner:
         fixture: dict[str, str],
         *,
         suffix: str,
-        capabilities: list[str] | None = None,
+        features: list[str] | None = None,
     ) -> str:
         token = self.bootstrap_token()
         body = self.http_json(
@@ -1122,7 +1129,7 @@ class ServerRunner:
                 "bootstrap_token": token,
                 "cwd": fixture["repo"],
                 "workspace_root": fixture["repo"],
-                "capabilities": capabilities or ["agent_runtime"],
+                "features": features or ["agent_runtime"],
                 "metadata": {"runtime_smoke_peer": suffix},
             },
         )
@@ -1400,8 +1407,6 @@ class ServerRunner:
                                 "id": draft_id,
                                 "title": "Runtime smoke Taskflow task",
                                 "prompt": "runtime smoke taskflow",
-                                "required_capabilities": ["code_review"],
-                                "preferred_capabilities": ["read_repo"],
                                 "task_type": "code_review",
                                 "execution_location": "daemon_worktree",
                                 "repo_url": fixture["repo_url"],
@@ -1429,7 +1434,9 @@ class ServerRunner:
             raise RuntimeError(f"taskflow goal was not confirmed: {confirmed}")
 
         dispatch = self.peer_post(
-            f"/remote/taskflow/task-drafts/{draft_id}/dispatch", peer_token
+            f"/remote/taskflow/task-drafts/{draft_id}/dispatch",
+            peer_token,
+            {"executor_hint": agent_id},
         )
         decision = dispatch["decision"]
         runtime_task_id = decision.get("runtime_task_id")
@@ -1499,7 +1506,6 @@ class ServerRunner:
                         "id": blocked_draft_id,
                         "title": "Impossible task",
                         "prompt": "cannot dispatch",
-                        "required_capabilities": ["capability_that_does_not_exist"],
                         "repo_url": fixture["repo_url"],
                     }
                 ],
@@ -1576,8 +1582,6 @@ class ServerRunner:
                 "target_agent_id": agent_id,
                 "title": "Runtime smoke assignment",
                 "prompt": "runtime smoke assignment",
-                "required_capabilities": ["code_review"],
-                "preferred_capabilities": ["read_repo"],
                 "task_type": "code_review",
                 "execution_location": "daemon_worktree",
                 "repo_url": fixture["repo_url"],
@@ -1701,7 +1705,6 @@ class ServerRunner:
             peer_token,
             {
                 "assignment_id": blocked_assignment_id,
-                "required_capabilities": ["capability_that_does_not_exist"],
             },
         )
         blocked_dispatch = self.peer_post(
@@ -1784,7 +1787,7 @@ class ServerRunner:
                 "bootstrap_token": token,
                 "cwd": fixture["repo"],
                 "workspace_root": fixture["repo"],
-                "capabilities": [
+                "features": [
                     "agent_runtime",
                     "agent_runtime.daemon_worktree",
                 ],

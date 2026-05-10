@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pytest
 
@@ -29,14 +29,17 @@ def _runtime() -> AgentRuntimeControlPlane:
                     "name": "Docs Agent",
                     "aliases": ["writer", "docsbot"],
                     "runtime_profile": "docs_profile",
-                    "capabilities": ["docs", "research", "write_docs"],
+                    "dispatch": {
+                        "profile": "Best for documentation and research writing.",
+                        "examples": ["Write onboarding docs"],
+                    },
                     "max_concurrent_tasks": 2,
                 },
                 "design": {
                     "name": "Designer",
                     "aliases": ["designer"],
                     "runtime_profile": "design_profile",
-                    "capabilities": ["design"],
+                    "dispatch": {"profile": "Best for design review."},
                 },
             },
         }
@@ -73,8 +76,6 @@ def test_assignment_creates_work_item_but_does_not_dispatch_before_dispatch_call
         issue.id,
         peer_id="peer-a",
         target_agent_id="docs",
-        required_capabilities=["docs"],
-        preferred_capabilities=["write_docs"],
         task_type="docs",
     )
 
@@ -97,7 +98,6 @@ def test_assignment_dispatch_uses_taskflow_decision_and_runtime_metadata() -> No
         issue.id,
         peer_id="peer-a",
         target_agent_id="docs",
-        required_capabilities=["docs"],
     )
 
     dispatched = service.dispatch_assignment(assignment.id, peer_id="peer-a")
@@ -112,7 +112,7 @@ def test_assignment_dispatch_uses_taskflow_decision_and_runtime_metadata() -> No
     assert dispatched.task_run_id is not None
 
 
-def test_assignment_without_capable_agent_needs_assignment_and_creates_no_runtime() -> None:
+def test_assignment_without_explicit_agent_needs_assignment_and_creates_no_runtime() -> None:
     service, _taskflow, runtime = _service()
     issue = service.create_issue(
         title="Secret ops",
@@ -122,7 +122,6 @@ def test_assignment_without_capable_agent_needs_assignment_and_creates_no_runtim
     assignment = service.create_assignment(
         issue.id,
         peer_id="peer-a",
-        required_capabilities=["secret_vault"],
     )
 
     updated = service.dispatch_assignment(assignment.id, peer_id="peer-a")
@@ -185,7 +184,7 @@ def test_mention_conflict_or_unknown_agent_needs_assignment() -> None:
     runtime.runtime_snapshot["agents"]["other_docs"] = {
         "aliases": ["writer"],
         "runtime_profile": "docs_profile",
-        "capabilities": ["docs"],
+        "dispatch": {"profile": "Also writes docs."},
     }
     service = IssueAssignmentService(
         taskflow_service=TaskflowService(

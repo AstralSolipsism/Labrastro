@@ -19,7 +19,7 @@ def test_mention_agent_tool_creates_record_without_dispatching_runtime_task() ->
                 "docs": {
                     "aliases": ["writer"],
                     "runtime_profile": "docs_profile",
-                    "capabilities": ["docs"],
+                    "dispatch": {"profile": "Best for documentation tasks."},
                 }
             },
         }

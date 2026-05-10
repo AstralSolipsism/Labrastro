@@ -812,8 +812,6 @@ class WorkItemCandidate:
     artifact_refs: list[str] = field(default_factory=list)
     scenario_refs: list[str] = field(default_factory=list)
     risk_refs: list[str] = field(default_factory=list)
-    required_capabilities: list[str] = field(default_factory=list)
-    preferred_capabilities: list[str] = field(default_factory=list)
     repo_ref: str | None = None
     workspace_ref: str | None = None
     dedupe_key: str | None = None
@@ -828,6 +826,15 @@ class WorkItemCandidate:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WorkItemCandidate":
+        removed_fields = [
+            key
+            for key in ("required_dispatch_tags", "preferred_dispatch_tags")
+            if key in data
+        ]
+        if removed_fields:
+            raise ValueError(
+                "work item legacy task-matching fields were removed; select an Agent explicitly"
+            )
         return cls(
             id=str(data.get("id") or ""),
             title=str(data.get("title") or ""),
@@ -838,8 +845,6 @@ class WorkItemCandidate:
             artifact_refs=_string_list(data.get("artifact_refs")),
             scenario_refs=_string_list(data.get("scenario_refs")),
             risk_refs=_string_list(data.get("risk_refs")),
-            required_capabilities=_string_list(data.get("required_capabilities")),
-            preferred_capabilities=_string_list(data.get("preferred_capabilities")),
             repo_ref=str(data["repo_ref"]) if data.get("repo_ref") is not None else None,
             workspace_ref=(
                 str(data["workspace_ref"]) if data.get("workspace_ref") is not None else None
@@ -868,8 +873,6 @@ class WorkItemCandidate:
             "artifact_refs": list(self.artifact_refs),
             "scenario_refs": list(self.scenario_refs),
             "risk_refs": list(self.risk_refs),
-            "required_capabilities": list(self.required_capabilities),
-            "preferred_capabilities": list(self.preferred_capabilities),
             "repo_ref": self.repo_ref,
             "workspace_ref": self.workspace_ref,
             "dedupe_key": self.dedupe_key,

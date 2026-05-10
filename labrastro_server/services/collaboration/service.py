@@ -194,8 +194,6 @@ class IssueAssignmentService:
         target_agent_id: str | None = None,
         title: str | None = None,
         prompt: str | None = None,
-        required_capabilities: list[str] | None = None,
-        preferred_capabilities: list[str] | None = None,
         task_type: str | None = None,
         workspace_root: str | None = None,
         repo_url: str | None = None,
@@ -221,8 +219,6 @@ class IssueAssignmentService:
             "issue_id": issue.id,
             "assignment_id": assignment.id,
             "assignment_source": source,
-            "required_capabilities": _string_list(required_capabilities),
-            "preferred_capabilities": _string_list(preferred_capabilities),
             "task_type": _optional(task_type),
             "workspace_root": _optional(workspace_root),
             "repo_url": _optional(repo_url),
@@ -526,7 +522,8 @@ class IssueAssignmentService:
                 {
                     "agent_id": str(agent_id),
                     "name": str(raw.get("name") or ""),
-                    "capabilities": _string_list(raw.get("capabilities")),
+                    "dispatch": _dict(raw.get("dispatch")),
+                    "capability_refs": _string_list(raw.get("capability_refs")),
                     "runtime_profile": str(raw.get("runtime_profile") or ""),
                     "matched_ref": ref,
                 }

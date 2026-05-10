@@ -199,7 +199,7 @@ def _mode_switch_hints_block(mode_switch_hints: list[str] | None) -> PromptBlock
         zone=PromptZone.SEMI_STATIC,
         order=140,
         body=(
-            "If a task requires unavailable capabilities, ask the user to switch mode with "
+            "If a task requires unavailable tools or mode features, ask the user to switch mode with "
             "`/mode switch <name>` before proceeding. Suggested modes: "
             + ", ".join(f"`{name}`" for name in mode_switch_hints)
             + "."

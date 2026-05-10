@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import inspect
 from pathlib import Path
@@ -170,7 +170,7 @@ def test_reuleauxcoder_adapter_submits_runtime_task_from_task_run_only() -> None
             "agents": {
                 "docs": {
                     "runtime_profile": "docs_profile",
-                    "capabilities": ["docs"],
+                    "dispatch": {"profile": "Best for documentation tasks."},
                 }
             },
         }
@@ -183,11 +183,13 @@ def test_reuleauxcoder_adapter_submits_runtime_task_from_task_run_only() -> None
         metadata={
             "taskflow_id": "taskflow-1",
             "work_item_description": "Write documentation",
-            "required_capabilities": ["docs"],
         },
     )
 
-    result = ReuleauxCoderTaskflowDispatcher(runtime).dispatch_task_run(task_run)
+    result = ReuleauxCoderTaskflowDispatcher(runtime).dispatch_task_run(
+        task_run,
+        executor_hint="docs",
+    )
 
     assert result.selected_executor_id == "docs"
     assert result.runtime_task_id is not None

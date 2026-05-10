@@ -18,7 +18,7 @@ class ExecutorCandidate:
     """Generic executor candidate used by Taskflow scheduling."""
 
     executor_id: str
-    capabilities: list[str] = field(default_factory=list)
+    dispatch_profile: str = ""
     runtime_profile_id: str | None = None
     execution_location: str | None = None
     running_count: int = 0
@@ -31,7 +31,9 @@ class ExecutorCandidate:
     def signals(self) -> set[str]:
         """Return all soft-matching signals exposed by this executor."""
 
-        values: set[str] = set(self.capabilities)
+        values: set[str] = set()
+        if self.dispatch_profile:
+            values.add(self.dispatch_profile)
         values.update(self.specialties)
         values.update(self.workflows)
         values.update(self.task_types)
