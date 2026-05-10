@@ -128,13 +128,13 @@ class RemoteRuntimeRoutes:
         executors = raw_executors if isinstance(raw_executors, list) else []
         worker_id = str(payload.get("worker_id") or peer_id)
         peer = self.service.relay_server.registry.get(peer_id)
-        peer_capabilities = list(peer.capabilities) if peer is not None else []
+        peer_features = list(peer.features) if peer is not None else []
         workspace_root = peer.workspace_root if peer is not None else None
         claim = self.service.runtime_control_plane.claim_task(
             worker_id=worker_id,
             executors=[str(executor) for executor in executors],
             peer_id=peer_id,
-            peer_capabilities=peer_capabilities,
+            peer_features=peer_features,
             workspace_root=workspace_root,
             wait_sec=float(payload.get("wait_sec") or 0),
         )

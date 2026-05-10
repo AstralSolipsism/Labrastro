@@ -259,7 +259,7 @@ class TestRemoteRelayHTTPService:
         relay.start()
         try:
             peer_id = relay.registry.register(
-                {"capabilities": ["tool_preview"], "cwd": "/repo"}
+                {"features": ["tool_preview"], "cwd": "/repo"}
             )
             result = relay.send_preview_request(
                 peer_id,
@@ -558,7 +558,7 @@ class TestRemoteRelayHTTPService:
                         "name": "gitnexus",
                         "command": "gitnexus",
                         "placement": "both",
-                        "capabilities": ["repo_index"],
+                        "tags": ["repo_index"],
                         "requirements": {"node": ">=20"},
                         "check": "gitnexus --version",
                         "install": "npm install -g gitnexus",
@@ -1137,7 +1137,7 @@ class TestRemoteRelayHTTPService:
             environment_cli_tools={
                 "beads": {
                     "command": "beads",
-                    "capabilities": ["issue_tracking"],
+                    "tags": ["issue_tracking"],
                     "check": "beads --version",
                     "install": "npm install -g beads",
                     "source": "npm",
@@ -1149,7 +1149,7 @@ class TestRemoteRelayHTTPService:
                 "gitnexus": EnvironmentCLIToolConfig(
                     name="gitnexus",
                     command="gitnexus",
-                    capabilities=["repo_index"],
+                    tags=["repo_index"],
                     check="gitnexus --version",
                     install="npm install -g gitnexus",
                     source="npm",
@@ -1230,7 +1230,7 @@ class TestRemoteRelayHTTPService:
             assert tools["gitnexus"]["install_prompt"] == "Use the configured npm command."
             assert tools["gitnexus"]["verify_prompt"] == "Check gitnexus version output."
             assert tools["gitnexus"]["notes"] == ["PATH changes require explicit approval."]
-            assert tools["beads"]["capabilities"] == ["issue_tracking"]
+            assert tools["beads"]["tags"] == ["issue_tracking"]
             assert tools["beads"]["install_prompt"] == "Use npm global install for beads."
             assert mcp_servers["gitnexus-mcp"]["distribution"] == "command"
             assert mcp_servers["gitnexus-mcp"]["requirements"]["node"] == ">=20"
@@ -1263,10 +1263,14 @@ class TestRemoteRelayHTTPService:
                 "agents": {
                     "environment_configurator": {
                         "runtime_profile": "environment_local",
-                        "capabilities": [
-                            "environment.check",
-                            "environment.configure",
-                        ],
+                        "capability_refs": ["environment"],
+                        "resolved_capabilities": {
+                            "permissions": [
+                                "environment.check",
+                                "environment.configure",
+                                "environment.manifest.read",
+                            ]
+                        },
                     }
                 },
             }
@@ -1330,7 +1334,7 @@ class TestRemoteRelayHTTPService:
                     "bootstrap_token": bootstrap_token,
                     "cwd": "/tmp/peer",
                     "workspace_root": "/tmp",
-                    "capabilities": ["shell", "read_file"],
+                    "features": ["shell", "read_file"],
                 },
             )
             assert status == 200
@@ -2790,7 +2794,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_capabilities_report_available_backend_surfaces(self) -> None:
+    def test_features_report_available_backend_surfaces(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
@@ -2810,28 +2814,28 @@ class TestRemoteRelayHTTPService:
         service.start()
         try:
             status, body = _json_request(
-                "GET", f"{service.base_url}/remote/capabilities"
+                "GET", f"{service.base_url}/remote/features"
             )
             assert status == 200
             assert body["ok"] is True
             assert body["api_version"] == 1
             assert isinstance(body["server_version"], str)
-            assert body["capabilities"]["sessions"] is True
-            assert body["capabilities"]["session_auto_save"] is True
-            assert body["capabilities"]["session_history_writable"] is True
-            assert body["capabilities"]["chat_stream"] is True
-            assert body["capabilities"]["taskflow"] is True
-            assert body["capabilities"]["issue_assignment"] is True
-            assert body["capabilities"]["fresh_session_without_session_hint"] is True
-            assert body["capabilities"]["peer_token_heartbeat_refresh"] is True
-            assert body["capabilities"]["agent_runtime"] == {
-                "executor_capabilities": {}
+            assert body["features"]["sessions"] is True
+            assert body["features"]["session_auto_save"] is True
+            assert body["features"]["session_history_writable"] is True
+            assert body["features"]["chat_stream"] is True
+            assert body["features"]["taskflow"] is True
+            assert body["features"]["issue_assignment"] is True
+            assert body["features"]["fresh_session_without_session_hint"] is True
+            assert body["features"]["peer_token_heartbeat_refresh"] is True
+            assert body["features"]["agent_runtime"] == {
+                "executor_features": {}
             }
         finally:
             service.stop()
             relay.stop()
 
-    def test_capabilities_report_missing_optional_handlers(self) -> None:
+    def test_features_report_missing_optional_handlers(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
@@ -2841,25 +2845,25 @@ class TestRemoteRelayHTTPService:
         )
         service.start()
         try:
-            _, body = _json_request("GET", f"{service.base_url}/remote/capabilities")
-            assert body["capabilities"]["sessions"] is False
-            assert body["capabilities"]["session_auto_save"] is True
-            assert body["capabilities"]["session_history_writable"] is False
-            assert body["capabilities"]["chat_stream"] is False
-            assert body["capabilities"]["fresh_session_without_session_hint"] is False
-            assert body["capabilities"]["peer_token_heartbeat_refresh"] is True
-            assert body["capabilities"]["agent_runtime"]["executor_capabilities"] == {}
+            _, body = _json_request("GET", f"{service.base_url}/remote/features")
+            assert body["features"]["sessions"] is False
+            assert body["features"]["session_auto_save"] is True
+            assert body["features"]["session_history_writable"] is False
+            assert body["features"]["chat_stream"] is False
+            assert body["features"]["fresh_session_without_session_hint"] is False
+            assert body["features"]["peer_token_heartbeat_refresh"] is True
+            assert body["features"]["agent_runtime"]["executor_features"] == {}
         finally:
             service.stop()
             relay.stop()
 
-    def test_capabilities_include_peer_executor_capabilities(self) -> None:
+    def test_features_include_peer_executor_features(self) -> None:
         relay = RelayServer()
         relay.registry.register(
             meta={
                 "host_info_min": {
                     "agent_runtime": {
-                        "executor_capabilities": {
+                        "executor_features": {
                             "claude": {
                                 "installed": True,
                                 "version": "2.0.0",
@@ -2881,12 +2885,12 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(relay_server=relay, bind=f"127.0.0.1:{port}")
         service.start()
         try:
-            _, body = _json_request("GET", f"{service.base_url}/remote/capabilities")
-            executor_capabilities = body["capabilities"]["agent_runtime"][
-                "executor_capabilities"
+            _, body = _json_request("GET", f"{service.base_url}/remote/features")
+            executor_features = body["features"]["agent_runtime"][
+                "executor_features"
             ]
-            assert executor_capabilities["claude"]["resume_by_id"] is True
-            assert executor_capabilities["gemini"]["installed"] is False
+            assert executor_features["claude"]["resume_by_id"] is True
+            assert executor_features["gemini"]["installed"] is False
         finally:
             service.stop()
             relay.stop()
@@ -2945,7 +2949,7 @@ class TestRemoteRelayHTTPService:
                     "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                     "cwd": "G:/repo/main",
                     "workspace_root": "G:/repo/main",
-                    "capabilities": [
+                    "features": [
                         "agent_runtime",
                         "agent_runtime.local_workspace",
                     ],
@@ -3149,7 +3153,7 @@ class TestRemoteRelayHTTPService:
                         "name": "Docs Agent",
                         "aliases": ["writer"],
                         "runtime_profile": "docs_profile",
-                        "capabilities": ["docs", "research"],
+                        "dispatch": {"profile": "Best for docs and research tasks."},
                     }
                 },
             }
@@ -3168,7 +3172,7 @@ class TestRemoteRelayHTTPService:
                     "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                     "cwd": "G:/repo/main",
                     "workspace_root": "G:/repo/main",
-                    "capabilities": ["agent_runtime"],
+                    "features": ["agent_runtime"],
                 },
             )
             peer_token = register_body["payload"]["peer_token"]
@@ -3189,8 +3193,6 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": peer_token,
                     "target_agent_id": "docs",
-                    "required_capabilities": ["docs"],
-                    "preferred_capabilities": ["research"],
                     "task_type": "docs",
                 },
             )
@@ -3298,7 +3300,7 @@ class TestRemoteRelayHTTPService:
                     "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                     "cwd": "/tmp/repo",
                     "workspace_root": "/tmp/repo",
-                    "capabilities": [
+                    "features": [
                         "agent_runtime",
                         "agent_runtime.daemon_worktree",
                     ],
@@ -3325,7 +3327,9 @@ class TestRemoteRelayHTTPService:
                             "smoke_reviewer": {
                                 "name": "Smoke Reviewer",
                                 "runtime_profile": "smoke_fake_profile",
-                                "capabilities": ["read_repo", "code_review"],
+                                "dispatch": {
+                                    "profile": "Best for smoke review tasks."
+                                },
                                 "prompt": {
                                     "system_append": (
                                         "You are the smoke reviewer agent."

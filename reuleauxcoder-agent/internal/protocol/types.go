@@ -15,7 +15,7 @@ type RegisterRequest struct {
 	HostInfoMin    map[string]any `json:"host_info_min,omitempty"`
 	CWD            string         `json:"cwd,omitempty"`
 	WorkspaceRoot  string         `json:"workspace_root,omitempty"`
-	Capabilities   []string       `json:"capabilities,omitempty"`
+	Features       []string       `json:"features,omitempty"`
 }
 
 type RegisterResponseEnvelope struct {
@@ -187,14 +187,14 @@ type EnvironmentManifestRequest struct {
 }
 
 type EnvironmentCLIToolManifest struct {
-	Name         string   `json:"name"`
-	Command      string   `json:"command,omitempty"`
-	Capabilities []string `json:"capabilities,omitempty"`
-	Check        string   `json:"check,omitempty"`
-	Install      string   `json:"install,omitempty"`
-	Version      string   `json:"version,omitempty"`
-	Source       string   `json:"source,omitempty"`
-	Description  string   `json:"description,omitempty"`
+	Name        string   `json:"name"`
+	Command     string   `json:"command,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	Check       string   `json:"check,omitempty"`
+	Install     string   `json:"install,omitempty"`
+	Version     string   `json:"version,omitempty"`
+	Source      string   `json:"source,omitempty"`
+	Description string   `json:"description,omitempty"`
 }
 
 type EnvironmentMCPServerManifest struct {

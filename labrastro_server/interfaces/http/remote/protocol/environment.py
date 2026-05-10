@@ -58,7 +58,7 @@ class EnvironmentCLIToolManifest:
     command: str = ""
     enabled: bool = True
     placement: str = "local"
-    capabilities: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     requirements: dict[str, str] = field(default_factory=dict)
     check: str = ""
     install: str = ""
@@ -82,7 +82,7 @@ class EnvironmentCLIToolManifest:
             "command": self.command,
             "enabled": self.enabled,
             "placement": self.placement,
-            "capabilities": self.capabilities,
+            "tags": self.tags,
             "requirements": dict(self.requirements),
             "check": self.check,
             "install": self.install,
@@ -105,16 +105,20 @@ class EnvironmentCLIToolManifest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "EnvironmentCLIToolManifest":
-        raw_capabilities = d.get("capabilities", [])
+        if "capabilities" in d:
+            raise ValueError(
+                "environment CLI tool manifest field capabilities was removed; use tags"
+            )
+        raw_tags = d.get("tags", [])
         raw_requirements = d.get("requirements", {})
         return cls(
             name=str(d.get("name", "")),
             command=str(d.get("command", "")),
             enabled=_bool_value(d.get("enabled", True)),
             placement=str(d.get("placement", "local") or "local"),
-            capabilities=(
-                [str(item) for item in raw_capabilities]
-                if isinstance(raw_capabilities, list)
+            tags=(
+                [str(item) for item in raw_tags]
+                if isinstance(raw_tags, list)
                 else []
             ),
             requirements=(

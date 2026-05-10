@@ -17,29 +17,21 @@ class AgentScheduleDecision:
 
 @dataclass
 class BasicAgentScheduler:
-    """Select an Agent by capability and current in-flight task count."""
+    """Select a configured Agent by current in-flight task count."""
 
     agents: dict[str, AgentConfig]
     default_agent_id: str | None = None
     running_tasks: list[TaskRecord] = field(default_factory=list)
 
-    def choose_agent(
-        self, *, required_capability: str | None = None
-    ) -> AgentScheduleDecision:
+    def choose_agent(self) -> AgentScheduleDecision:
         candidates = list(self.agents.values())
-        if required_capability:
-            candidates = [
-                agent
-                for agent in candidates
-                if required_capability in set(agent.capabilities)
-            ]
         if not candidates and self.default_agent_id in self.agents:
             return AgentScheduleDecision(
                 agent_id=str(self.default_agent_id),
                 reason="default_agent",
             )
         if not candidates:
-            raise ValueError("no agent can satisfy requested capability")
+            raise ValueError("no agent is configured")
 
         ranked = sorted(
             candidates,
@@ -55,11 +47,7 @@ class BasicAgentScheduler:
             raise RuntimeError(f"agent concurrency limit reached: {selected.id}")
         return AgentScheduleDecision(
             agent_id=selected.id,
-            reason=(
-                f"capability:{required_capability}"
-                if required_capability
-                else "lowest_running_count"
-            ),
+            reason="lowest_running_count",
         )
 
     def _running_count(self, agent_id: str) -> int:

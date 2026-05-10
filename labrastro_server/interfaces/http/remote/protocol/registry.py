@@ -37,7 +37,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("auth.devices.list", "POST", "/remote/auth/devices/list", "DeviceListRequest", "DeviceList", "bearer"),
     RemoteEndpoint("auth.devices.revoke", "POST", "/remote/auth/devices/revoke", "DeviceRevokeRequest", "DeviceResult", "bearer"),
     RemoteEndpoint("auth.audit.list", "POST", "/remote/auth/audit/list", "AuditListRequest", "AuditList", "bearer"),
-    RemoteEndpoint("peer.capabilities", "GET", "/remote/capabilities", "none", "Capabilities", "none"),
+    RemoteEndpoint("peer.features", "GET", "/remote/features", "none", "Features", "none"),
     RemoteEndpoint("peer.register", "POST", "/remote/register", "RegisterRequest", "RegisterEnvelope", "bootstrap_token"),
     RemoteEndpoint("peer.heartbeat", "POST", "/remote/heartbeat", "Heartbeat", "PeerHeartbeat", "peer_token"),
     RemoteEndpoint("peer.poll", "POST", "/remote/poll", "PeerPollRequest", "RelayEnvelope", "peer_token"),

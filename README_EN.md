@@ -144,7 +144,7 @@ The VS Code extension connects with Host URL, username, and password. After logi
 
 The multi CLI execution backend runs on the server side or inside managed peer containers. The VS Code extension does not require local Codex, Claude, Gemini, or backend console access. CLI installation, provider login state, MCP credentials, and runtime HOME/config isolation are maintained by the deployment.
 
-When a Go worker registers, it reports executor capability to the Host, including `installed`, `stream_json`, `session_discovery`, `resume_by_id`, `mcp_config`, `runtime_home_isolation`, and `limitations`. `/remote/capabilities` aggregates online peer capabilities for the extension UI. Registration only performs fast installed detection and does not synchronously run external CLI `--version`; actual CLI versions should be recorded during deployment smoke tests and fixture upgrades.
+When a Go worker registers, it reports executor features to the Host, including `installed`, `stream_json`, `session_discovery`, `resume_by_id`, `mcp_config`, `runtime_home_isolation`, and `limitations`. `/remote/features` aggregates online peer features for the extension UI. Registration only performs fast installed detection and does not synchronously run external CLI `--version`; actual CLI versions should be recorded during deployment smoke tests and fixture upgrades.
 
 Resume semantics are fixed: follow-up tasks continue the same CLI session only when executor, agent, runtime profile, workdir/branch, and `executor_session_id` all match. Retry defaults to a fresh run, and only explicit `resume_session=true` reuses the original session. Gemini keeps `resume_by_id=false` until a real resume fixture proves stable session extraction, so the UI shows fresh-run behavior.
 

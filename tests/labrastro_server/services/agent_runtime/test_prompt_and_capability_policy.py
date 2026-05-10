@@ -19,8 +19,18 @@ def test_prompt_renderer_targets_executor_native_instruction_files() -> None:
         agent_name="Code Reviewer",
         agent_md=".agents/code_reviewer/AGENT.md",
         system_append="你专注于发现风险、回归和缺失测试。",
-        capabilities=["code_review", "read_repo"],
-        mcp_servers=["github"],
+        dispatch={
+            "profile": "适合审查代码风险、阅读仓库并指出缺失测试。",
+            "examples": ["审查后端运行时变更"],
+            "avoid": ["线上发布操作"],
+        },
+        capability_refs=["github-review"],
+        resolved_capabilities={
+            "packages": [{"id": "github-review", "name": "GitHub Review"}],
+            "mcp_servers": ["github"],
+            "skills": ["code-review"],
+            "permissions": ["repo.read"],
+        },
     )
 
     codex = renderer_module.ExecutorPromptRenderer().render("codex", context)
@@ -33,7 +43,9 @@ def test_prompt_renderer_targets_executor_native_instruction_files() -> None:
     assert "GEMINI.md" in gemini.files
     assert "Code Reviewer" in codex.files["AGENTS.md"]
     assert "风险" in claude.files["CLAUDE.md"]
-    assert "code_review" in gemini.files["GEMINI.md"]
+    assert "Dispatch Profile" in gemini.files["GEMINI.md"]
+    assert "审查后端运行时变更" in gemini.files["GEMINI.md"]
+    assert "GitHub Review" in gemini.files["GEMINI.md"]
 
 
 def test_prompt_renderer_does_not_render_raw_secret_values() -> None:
@@ -68,15 +80,15 @@ def test_platform_mcp_policy_allows_only_agent_declared_servers() -> None:
     assert "filesystem" not in effective["servers"]
 
 
-def test_capability_policy_blocks_undeclared_pr_creation() -> None:
+def test_capability_package_policy_blocks_ungranted_package() -> None:
     policy_module = _policy()
 
-    policy = policy_module.AgentCapabilityPolicy(
-        platform_capabilities=["read_repo", "comment_issue", "create_pr"],
-        agent_capabilities=["read_repo", "comment_issue"],
+    policy = policy_module.CapabilityPackagePolicy(
+        available_packages=["repo-read", "issue-comment", "create-pr"],
+        granted_packages=["repo-read", "issue-comment"],
     )
 
-    assert policy.allows("read_repo") is True
-    assert policy.allows("comment_issue") is True
-    assert policy.allows("create_pr") is False
-    assert policy.explain_denial("create_pr") == "capability not granted to agent"
+    assert policy.allows("repo-read") is True
+    assert policy.allows("issue-comment") is True
+    assert policy.allows("create-pr") is False
+    assert policy.explain_denial("create-pr") == "capability package not granted to agent"

@@ -833,8 +833,8 @@ class RemoteRelayHTTPService:
                 if parsed.path.startswith("/remote/auth/"):
                     if self._handle_auth_get(parsed.path):
                         return
-                if parsed.path == "/remote/capabilities":
-                    self._handle_capabilities()
+                if parsed.path == "/remote/features":
+                    self._handle_features()
                     return
                 if parsed.path.startswith("/remote/taskflow/"):
                     self._handle_taskflow_get(parsed)
@@ -1097,9 +1097,9 @@ class RemoteRelayHTTPService:
             check = str(_env_tool_value(tool, "check", "") or "")
             if not tool_name or not command or not check:
                 continue
-            capabilities = _env_tool_value(tool, "capabilities", [])
-            if not isinstance(capabilities, list):
-                capabilities = []
+            tags = _env_tool_value(tool, "tags", [])
+            if not isinstance(tags, list):
+                tags = []
             requirements = _env_tool_value(tool, "requirements", {})
             if not isinstance(requirements, dict):
                 requirements = {}
@@ -1109,7 +1109,7 @@ class RemoteRelayHTTPService:
                     name=tool_name,
                     command=command,
                     placement=placement,
-                    capabilities=[str(item) for item in capabilities],
+                    tags=[str(item) for item in tags],
                     requirements={str(k): str(v) for k, v in requirements.items()},
                     check=check,
                     install=str(_env_tool_value(tool, "install", "") or ""),

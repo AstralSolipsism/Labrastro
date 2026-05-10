@@ -274,16 +274,16 @@ class PostgresRuntimeStore:
         worker_id: str,
         executors: list[Any] | None = None,
         peer_id: str | None = None,
-        peer_capabilities: list[str] | None = None,
+        peer_features: list[str] | None = None,
         workspace_root: str | None = None,
         lease_sec: int = 15,
     ) -> Any | None:
         from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskClaim
 
         allowed = {_coerce_executor(executor) for executor in executors or []}
-        capabilities = (
-            {str(capability) for capability in peer_capabilities}
-            if peer_capabilities is not None
+        features = (
+            {str(feature) for feature in peer_features}
+            if peer_features is not None
             else None
         )
         with self.engine.begin() as conn:
@@ -317,7 +317,7 @@ class PostgresRuntimeStore:
                 if allowed and task.executor not in allowed:
                     continue
                 if not self._worker_matches_task(
-                    task, capabilities=capabilities, workspace_root=workspace_root
+                    task, features=features, workspace_root=workspace_root
                 ):
                     continue
                 if not self._agent_concurrency_allows(conn, task):
@@ -1165,16 +1165,16 @@ class PostgresRuntimeStore:
         self,
         task: TaskRecord,
         *,
-        capabilities: set[str] | None,
+        features: set[str] | None,
         workspace_root: str | None,
     ) -> bool:
         location = task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
-        if capabilities is None:
+        if features is None:
             return True
         if location == ExecutionLocation.LOCAL_WORKSPACE:
             if (
-                "agent_runtime" not in capabilities
-                and "agent_runtime.local_workspace" not in capabilities
+                "agent_runtime" not in features
+                and "agent_runtime.local_workspace" not in features
             ):
                 return False
             bound_workspace = str(task.metadata.get("workspace_root") or "").strip()
@@ -1183,10 +1183,10 @@ class PostgresRuntimeStore:
                     bound_workspace
                 ) == _workspace_key(workspace_root)
             return True
-        location_capability = f"agent_runtime.{location.value}"
-        if location_capability in capabilities:
+        location_feature = f"agent_runtime.{location.value}"
+        if location_feature in features:
             return True
-        return "agent_runtime" in capabilities
+        return "agent_runtime" in features
 
     def _agent_concurrency_allows(self, conn: Any, task: TaskRecord) -> bool:
         raw_agent = _dict_from(_dict_from(self.runtime_snapshot.get("agents")).get(task.agent_id))
@@ -1230,8 +1230,8 @@ class PostgresRuntimeStore:
         profile_id = task.runtime_profile_id or str(raw_agent.get("runtime_profile") or "")
         raw_profile = _dict_from(profiles.get(profile_id))
         prompt = _dict_from(raw_agent.get("prompt"))
-        agent_mcp = _dict_from(raw_agent.get("mcp"))
         profile_mcp = _dict_from(raw_profile.get("mcp"))
+        resolved = _dict_from(raw_agent.get("resolved_capabilities"))
         credential_refs = {
             **{
                 str(key): str(val)
@@ -1243,7 +1243,7 @@ class PostgresRuntimeStore:
             },
         }
         servers: list[str] = []
-        for source in (profile_mcp.get("servers"), agent_mcp.get("servers")):
+        for source in (profile_mcp.get("servers"), resolved.get("mcp_servers")):
             servers.extend(_string_list_from(source))
         context = CanonicalAgentContext(
             agent_id=task.agent_id,
@@ -1252,7 +1252,9 @@ class PostgresRuntimeStore:
                 str(prompt["agent_md"]) if prompt.get("agent_md") is not None else None
             ),
             system_append=str(prompt.get("system_append") or ""),
-            capabilities=_string_list_from(raw_agent.get("capabilities")),
+            dispatch=_dict_from(raw_agent.get("dispatch")),
+            capability_refs=_string_list_from(raw_agent.get("capability_refs")),
+            resolved_capabilities=resolved,
             mcp_servers=servers,
             credential_refs=credential_refs,
         )

@@ -1,4 +1,4 @@
-"""Agent runtime capability and MCP policy helpers."""
+"""Agent runtime capability package and MCP policy helpers."""
 
 from __future__ import annotations
 
@@ -41,27 +41,24 @@ class PlatformMCPPolicy:
         return {"servers": effective}
 
 
-class AgentCapabilityPolicy:
-    """Check whether an Agent may use a platform capability."""
+class CapabilityPackagePolicy:
+    """Check whether an Agent may use a capability package grant."""
 
     def __init__(
         self,
         *,
-        platform_capabilities: list[str],
-        agent_capabilities: list[str],
+        available_packages: list[str],
+        granted_packages: list[str],
     ) -> None:
-        self.platform_capabilities = set(platform_capabilities)
-        self.agent_capabilities = set(agent_capabilities)
+        self.available_packages = set(available_packages)
+        self.granted_packages = set(granted_packages)
 
-    def allows(self, capability: str) -> bool:
-        return (
-            capability in self.platform_capabilities
-            and capability in self.agent_capabilities
-        )
+    def allows(self, package_id: str) -> bool:
+        return package_id in self.available_packages and package_id in self.granted_packages
 
-    def explain_denial(self, capability: str) -> str:
-        if capability not in self.platform_capabilities:
-            return "capability not available on platform"
-        if capability not in self.agent_capabilities:
-            return "capability not granted to agent"
-        return "capability allowed"
+    def explain_denial(self, package_id: str) -> str:
+        if package_id not in self.available_packages:
+            return "capability package not available on platform"
+        if package_id not in self.granted_packages:
+            return "capability package not granted to agent"
+        return "capability package allowed"

@@ -28,7 +28,9 @@ class CanonicalAgentContext:
     agent_name: str = ""
     agent_md: str | None = None
     system_append: str = ""
-    capabilities: list[str] = field(default_factory=list)
+    dispatch: dict[str, Any] = field(default_factory=dict)
+    capability_refs: list[str] = field(default_factory=list)
+    resolved_capabilities: dict[str, Any] = field(default_factory=dict)
     mcp_servers: list[str] = field(default_factory=list)
     credential_refs: dict[str, str] = field(default_factory=dict)
 
@@ -75,10 +77,30 @@ class ExecutorPromptRenderer:
             lines.append(f"- Agent Name: {context.agent_name}")
         if context.agent_md:
             lines.append(f"- Agent Instructions: `{context.agent_md}`")
-        if context.capabilities:
+        if context.dispatch:
             lines.append("")
-            lines.append("## Capabilities")
-            lines.extend(f"- `{capability}`" for capability in context.capabilities)
+            lines.append("## Dispatch Profile")
+            profile = str(context.dispatch.get("profile") or "").strip()
+            if profile:
+                lines.append(_redact_secret_text(profile))
+            examples = _string_list(context.dispatch.get("examples"))
+            if examples:
+                lines.append("")
+                lines.append("Example fit:")
+                lines.extend(f"- {_redact_secret_text(item)}" for item in examples)
+            avoid = _string_list(context.dispatch.get("avoid"))
+            if avoid:
+                lines.append("")
+                lines.append("Avoid assigning:")
+                lines.extend(f"- {_redact_secret_text(item)}" for item in avoid)
+        if context.capability_refs or context.resolved_capabilities:
+            lines.append("")
+            lines.append("## Granted Capabilities")
+            if context.capability_refs:
+                lines.append("")
+                lines.append("Capability packages:")
+                lines.extend(f"- `{ref}`" for ref in context.capability_refs)
+            self._append_resolved(lines, context.resolved_capabilities)
         if context.mcp_servers:
             lines.append("")
             lines.append("## MCP Servers")
@@ -88,3 +110,38 @@ class ExecutorPromptRenderer:
             lines.append("## Additional Instructions")
             lines.append(_redact_secret_text(context.system_append))
         return "\n".join(lines).strip() + "\n"
+
+    def _append_resolved(self, lines: list[str], resolved: dict[str, Any]) -> None:
+        packages = resolved.get("packages")
+        if isinstance(packages, list) and packages:
+            lines.append("")
+            lines.append("Resolved packages:")
+            for package in packages:
+                if isinstance(package, dict):
+                    package_id = str(package.get("id") or "").strip()
+                    name = str(package.get("name") or package_id).strip()
+                    label = name if not package_id or package_id == name else f"{name} (`{package_id}`)"
+                    lines.append(f"- {label}")
+                else:
+                    lines.append(f"- `{package}`")
+        sections = (
+            ("mcp_servers", "MCP servers"),
+            ("skills", "Skills"),
+            ("cli_tools", "CLI tools"),
+            ("permissions", "Permissions"),
+        )
+        for key, title in sections:
+            values = resolved.get(key)
+            if not isinstance(values, list) or not values:
+                continue
+            lines.append("")
+            lines.append(f"{title}:")
+            lines.extend(f"- `{value}`" for value in values)
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if value is None or value == "":
+        return []
+    return [str(value)]

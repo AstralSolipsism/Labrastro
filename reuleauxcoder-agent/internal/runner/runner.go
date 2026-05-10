@@ -78,15 +78,15 @@ func (r *Runner) Run(ctx context.Context) error {
 		workspaceRoot = cwd
 	}
 
-	capabilities := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "tool_preview"}
+	features := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "tool_preview"}
 	hostInfo := map[string]any{
 		"os":       runtimeOS(),
 		"arch":     runtimeArch(),
 		"hostname": runtimeHostname(),
 	}
 	if r.cfg.AgentRuntime {
-		capabilities = append(
-			capabilities,
+		features = append(
+			features,
 			"agent_runtime",
 			"agent_runtime.local_workspace",
 			"agent_runtime.daemon_worktree",
@@ -97,14 +97,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			"execution_locations":   runtimeExecutionLocations(),
 			"workspace_root":        workspaceRoot,
 			"runtime_root":          filepath.Join(workspaceRoot, ".rcoder", "agent-runtime"),
-			"executor_capabilities": runtimeExecutorCapabilities(),
+			"executor_features":     runtimeExecutorFeatures(),
 		}
 	}
 	registerResp, err := r.client.Register(ctx, protocol.RegisterRequest{
 		BootstrapToken: r.cfg.BootstrapToken,
 		CWD:            cwd,
 		WorkspaceRoot:  workspaceRoot,
-		Capabilities:   capabilities,
+		Features:       features,
 		HostInfoMin:    hostInfo,
 	})
 	if err != nil {
@@ -1016,7 +1016,7 @@ func runtimeExecutionLocations() []string {
 	return []string{"local_workspace", "daemon_worktree", "remote_server"}
 }
 
-func runtimeExecutorCapabilities() map[string]any {
+func runtimeExecutorFeatures() map[string]any {
 	return map[string]any{
 		"fake": map[string]any{
 			"installed":              true,
@@ -1030,7 +1030,7 @@ func runtimeExecutorCapabilities() map[string]any {
 			"model_arg":              false,
 			"limitations":            []string{"development executor only"},
 		},
-		"reuleauxcoder": commandExecutorCapability("rcoder", map[string]any{
+		"reuleauxcoder": commandExecutorFeature("rcoder", map[string]any{
 			"stream_json":            false,
 			"session_discovery":      true,
 			"resume_by_id":           true,
@@ -1040,7 +1040,7 @@ func runtimeExecutorCapabilities() map[string]any {
 			"model_arg":              true,
 			"limitations":            []string{"plain stdout compatibility backend"},
 		}),
-		"codex": commandExecutorCapability("codex", map[string]any{
+		"codex": commandExecutorFeature("codex", map[string]any{
 			"stream_json":            true,
 			"session_discovery":      true,
 			"resume_by_id":           true,
@@ -1051,7 +1051,7 @@ func runtimeExecutorCapabilities() map[string]any {
 			"tested_version":         "0.100.0+",
 			"limitations":            []string{"uses app-server jsonrpc_stdio transport"},
 		}),
-		"claude": commandExecutorCapability("claude", map[string]any{
+		"claude": commandExecutorFeature("claude", map[string]any{
 			"stream_json":            true,
 			"session_discovery":      true,
 			"resume_by_id":           true,
@@ -1062,7 +1062,7 @@ func runtimeExecutorCapabilities() map[string]any {
 			"tested_version":         "2.0.0+",
 			"limitations":            []string{},
 		}),
-		"gemini": commandExecutorCapability("gemini", map[string]any{
+		"gemini": commandExecutorFeature("gemini", map[string]any{
 			"stream_json":            true,
 			"session_discovery":      true,
 			"resume_by_id":           false,
@@ -1075,7 +1075,7 @@ func runtimeExecutorCapabilities() map[string]any {
 	}
 }
 
-func commandExecutorCapability(command string, values map[string]any) map[string]any {
+func commandExecutorFeature(command string, values map[string]any) map[string]any {
 	out := map[string]any{}
 	for key, value := range values {
 		out[key] = value

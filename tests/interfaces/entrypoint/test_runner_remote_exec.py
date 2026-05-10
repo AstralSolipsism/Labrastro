@@ -1,4 +1,4 @@
-"""Tests for runner integration with remote execution."""
+﻿"""Tests for runner integration with remote execution."""
 
 from __future__ import annotations
 
@@ -332,7 +332,7 @@ def _register_peer(
     base_url: str,
     bootstrap_token: str,
     cwd: str,
-    capabilities: list[str] | None = None,
+    features: list[str] | None = None,
 ) -> tuple[str, str]:
     _, register_body = _json_request(
         "POST",
@@ -341,7 +341,7 @@ def _register_peer(
             "bootstrap_token": bootstrap_token,
             "cwd": cwd,
             "workspace_root": cwd,
-            "capabilities": capabilities or [],
+            "features": features or [],
         },
     )
     payload = register_body["payload"]
@@ -1078,11 +1078,11 @@ class TestRunnerRemoteExec:
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(workspace),
             )
-            _, capabilities = _json_request(
-                "GET", f"{runner._relay_http_service.base_url}/remote/capabilities"
+            _, features = _json_request(
+                "GET", f"{runner._relay_http_service.base_url}/remote/features"
             )
-            assert capabilities["capabilities"]["session_auto_save"] is False
-            assert capabilities["capabilities"]["session_history_writable"] is False
+            assert features["features"]["session_auto_save"] is False
+            assert features["features"]["session_history_writable"] is False
 
             _, start_body = _json_request(
                 "POST",
@@ -1586,7 +1586,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                capabilities=["tool_preview"],
+                features=["tool_preview"],
             )
             _, start_body = _json_request(
                 "POST",

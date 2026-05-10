@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 import threading
@@ -420,7 +420,7 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
                 "coder": {
                     "name": "Coder",
                     "runtime_profile": "codex",
-                    "capabilities": ["code"],
+                    "dispatch": {"profile": "Best for coding tasks."},
                     "prompt": {
                         "agent_md": "docs/coder.md",
                         "system_append": "Use the repo conventions.",
@@ -475,7 +475,7 @@ def test_runtime_configure_refreshes_snapshot_without_dropping_tasks() -> None:
             "agents": {
                 "reviewer": {
                     "runtime_profile": "fake_profile",
-                    "capabilities": ["review"],
+                    "dispatch": {"profile": "Best for review tasks."},
                 }
             },
         },
@@ -508,7 +508,7 @@ def test_submit_resolves_agent_runtime_profile_defaults() -> None:
                 "reviewer": {
                     "name": "Reviewer",
                     "runtime_profile": "fake_profile",
-                    "capabilities": ["read_repo", "code_review"],
+                    "dispatch": {"profile": "Best for repository review tasks."},
                     "prompt": {"system_append": "Review carefully."},
                 }
             },
@@ -621,7 +621,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         control.claim_task(
             worker_id="worker-shell",
             executors=["codex"],
-            peer_capabilities=["shell"],
+            peer_features=["shell"],
             workspace_root="G:/repo/main",
         )
         is None
@@ -630,7 +630,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         control.claim_task(
             worker_id="worker-no-workspace",
             executors=["codex"],
-            peer_capabilities=["agent_runtime", "agent_runtime.local_workspace"],
+            peer_features=["agent_runtime", "agent_runtime.local_workspace"],
         )
         is None
     )
@@ -638,7 +638,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         control.claim_task(
             worker_id="worker-other",
             executors=["codex"],
-            peer_capabilities=["agent_runtime", "agent_runtime.local_workspace"],
+            peer_features=["agent_runtime", "agent_runtime.local_workspace"],
             workspace_root="G:/repo/other",
         )
         is None
@@ -646,7 +646,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
     claim = control.claim_task(
         worker_id="worker-local",
         executors=["codex"],
-        peer_capabilities=["agent_runtime", "agent_runtime.local_workspace"],
+        peer_features=["agent_runtime", "agent_runtime.local_workspace"],
         workspace_root="G:\\repo\\main",
     )
 
@@ -666,7 +666,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
     remote_claim = control.claim_task(
         worker_id="worker-remote",
         executors=["claude"],
-        peer_capabilities=["agent_runtime.remote_server"],
+        peer_features=["agent_runtime.remote_server"],
     )
 
     assert remote_claim is not None
@@ -688,7 +688,7 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
         worker_id="worker-1",
         executors=["fake"],
         peer_id="peer-1",
-        peer_capabilities=["agent_runtime"],
+        peer_features=["agent_runtime"],
         lease_sec=1,
     )
 
@@ -747,7 +747,7 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
         worker_id="worker-2",
         executors=["fake"],
         peer_id="peer-2",
-        peer_capabilities=["agent_runtime"],
+        peer_features=["agent_runtime"],
         lease_sec=1,
     )
 
@@ -773,7 +773,7 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
         worker_id="worker-1",
         executors=["fake"],
         peer_id="peer-1",
-        peer_capabilities=["agent_runtime"],
+        peer_features=["agent_runtime"],
     )
 
     assert claim is not None
@@ -849,7 +849,7 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
         worker_id="worker-1",
         executors=["fake"],
         peer_id="peer-1",
-        peer_capabilities=["agent_runtime"],
+        peer_features=["agent_runtime"],
     )
 
     assert claim is not None
@@ -904,7 +904,7 @@ def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
         worker_id="worker-1",
         executors=["fake"],
         peer_id="peer-1",
-        peer_capabilities=["agent_runtime"],
+        peer_features=["agent_runtime"],
     )
 
     assert claim is not None
@@ -971,19 +971,17 @@ def test_worktree_manager_rejects_paths_outside_runtime_root() -> None:
         raise AssertionError("expected WorktreeOwnershipError")
 
 
-def test_basic_scheduler_respects_capability_and_agent_limit() -> None:
+def test_basic_scheduler_selects_lowest_running_agent() -> None:
     agents = {
         "reviewer": AgentConfig(
             id="reviewer",
-            capabilities=["review"],
             max_concurrent_tasks=1,
         ),
         "coder": AgentConfig(
             id="coder",
-            capabilities=["code"],
             max_concurrent_tasks=2,
         ),
     }
     scheduler = BasicAgentScheduler(agents=agents)
 
-    assert scheduler.choose_agent(required_capability="code").agent_id == "coder"
+    assert scheduler.choose_agent().agent_id == "reviewer"

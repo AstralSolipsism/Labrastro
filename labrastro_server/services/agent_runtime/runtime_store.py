@@ -66,7 +66,7 @@ class ClaimLeaseStore(Protocol):
         worker_id: str,
         executors: list[Any] | None = None,
         peer_id: str | None = None,
-        peer_capabilities: list[str] | None = None,
+        peer_features: list[str] | None = None,
         workspace_root: str | None = None,
         lease_sec: int = 15,
     ) -> Any | None: ...

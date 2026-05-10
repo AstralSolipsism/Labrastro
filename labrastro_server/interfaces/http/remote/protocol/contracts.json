@@ -83,7 +83,7 @@
         "bootstrap_token": "bt_contract",
         "cwd": "/workspace",
         "workspace_root": "/workspace",
-        "capabilities": ["shell", "read_file"],
+        "features": ["shell", "read_file"],
         "host_info_min": {
           "os": "linux",
           "arch": "amd64"

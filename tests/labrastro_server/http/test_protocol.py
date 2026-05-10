@@ -147,14 +147,14 @@ class TestRegisterRequest:
             bootstrap_token="bt_abc",
             cwd="/tmp",
             workspace_root="/workspace",
-            capabilities=["shell", "read_file"],
+            features=["shell", "read_file"],
         )
         d = req.to_dict()
         restored = RegisterRequest.from_dict(d)
         assert restored.bootstrap_token == "bt_abc"
         assert restored.cwd == "/tmp"
         assert restored.workspace_root == "/workspace"
-        assert restored.capabilities == ["shell", "read_file"]
+        assert restored.features == ["shell", "read_file"]
 
 
 class TestRegisterResponse:
@@ -357,7 +357,7 @@ class TestEnvironmentManifest:
                 EnvironmentCLIToolManifest(
                     name="gitnexus",
                     command="gitnexus",
-                    capabilities=["repo_index"],
+                    tags=["repo_index"],
                     check="gitnexus --version",
                     install="npm install -g gitnexus",
                     version="latest",
@@ -405,7 +405,7 @@ class TestEnvironmentManifest:
         restored = EnvironmentManifestResponse.from_dict(response.to_dict())
 
         assert restored.cli_tools[0].name == "gitnexus"
-        assert restored.cli_tools[0].capabilities == ["repo_index"]
+        assert restored.cli_tools[0].tags == ["repo_index"]
         assert restored.cli_tools[0].check == "gitnexus --version"
         assert restored.cli_tools[0].install == "npm install -g gitnexus"
         assert restored.cli_tools[0].docs[0]["title"] == "GitNexus"

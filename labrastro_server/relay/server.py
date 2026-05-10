@@ -374,8 +374,8 @@ class RelayServer:
             return False
         peer.meta["mcp_tools"] = [tool.to_dict() for tool in tools if tool.name]
         peer.meta["mcp_diagnostics"] = list(diagnostics or [])
-        if tools and "mcp" not in peer.capabilities:
-            peer.capabilities.append("mcp")
+        if tools and "mcp" not in peer.features:
+            peer.features.append("mcp")
         return True
 
     def get_peer_mcp_tools(self, peer_id: str) -> list[RemoteMCPToolInfo]:
@@ -463,7 +463,7 @@ class RelayServer:
         meta = {
             "cwd": req.cwd,
             "workspace_root": req.workspace_root,
-            "capabilities": req.capabilities,
+            "features": req.features,
             "host_info_min": req.host_info_min,
         }
         peer_id = self._registry.register(meta=meta)

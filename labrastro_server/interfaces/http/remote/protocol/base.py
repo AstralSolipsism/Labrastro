@@ -42,7 +42,7 @@ class RegisterRequest:
     host_info_min: dict[str, Any] = field(default_factory=dict)
     cwd: str = "."
     workspace_root: str | None = None
-    capabilities: list[str] = field(default_factory=list)
+    features: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,7 +50,7 @@ class RegisterRequest:
             "host_info_min": self.host_info_min,
             "cwd": self.cwd,
             "workspace_root": self.workspace_root,
-            "capabilities": self.capabilities,
+            "features": self.features,
         }
 
     @classmethod
@@ -60,7 +60,7 @@ class RegisterRequest:
             host_info_min=d.get("host_info_min", {}),
             cwd=d.get("cwd", "."),
             workspace_root=d.get("workspace_root"),
-            capabilities=d.get("capabilities", []),
+            features=d.get("features", []),
         )
 
 @dataclass

@@ -54,8 +54,8 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemotePeerRoutes:
-    def _handle_capabilities(self) -> None:
-        runtime_capabilities = self._agent_runtime_capabilities()
+    def _handle_features(self) -> None:
+        runtime_features = self._agent_runtime_features()
         session_history_status = self._session_history_status()
         self._send_json(
             HTTPStatus.OK,
@@ -63,7 +63,7 @@ class RemotePeerRoutes:
                 "ok": True,
                 "api_version": 1,
                 "server_version": package_version(),
-                "capabilities": {
+                "features": {
                     "sessions": self.service.session_handler is not None,
                     "session_auto_save": session_history_status["session_auto_save"],
                     "session_history_writable": session_history_status[
@@ -76,7 +76,7 @@ class RemotePeerRoutes:
                     "fresh_session_without_session_hint": self.service.stream_chat_handler
                     is not None,
                     "peer_token_heartbeat_refresh": True,
-                    "agent_runtime": runtime_capabilities,
+                    "agent_runtime": runtime_features,
                 },
             },
         )
@@ -100,8 +100,8 @@ class RemotePeerRoutes:
             "session_history_writable": sessions_available,
         }
 
-    def _agent_runtime_capabilities(self) -> dict[str, Any]:
-        executor_capabilities: dict[str, dict[str, Any]] = {}
+    def _agent_runtime_features(self) -> dict[str, Any]:
+        executor_features: dict[str, dict[str, Any]] = {}
         for peer in self.service.relay_server.registry.list_online():
             host_info = peer.meta.get("host_info_min")
             if not isinstance(host_info, dict):
@@ -109,7 +109,7 @@ class RemotePeerRoutes:
             agent_runtime = host_info.get("agent_runtime")
             if not isinstance(agent_runtime, dict):
                 continue
-            raw = agent_runtime.get("executor_capabilities")
+            raw = agent_runtime.get("executor_features")
             if not isinstance(raw, dict):
                 continue
             for name, value in raw.items():
@@ -117,12 +117,12 @@ class RemotePeerRoutes:
                     continue
                 key = str(name)
                 next_value = dict(value)
-                current = executor_capabilities.get(key)
+                current = executor_features.get(key)
                 if current is None or (
                     current.get("installed") is not True
                     and next_value.get("installed") is True
                 ):
-                    executor_capabilities[key] = next_value
+                    executor_features[key] = next_value
                     continue
                 current_limits = {
                     str(item)
@@ -135,7 +135,7 @@ class RemotePeerRoutes:
                     if str(item).strip()
                 }
                 current["limitations"] = sorted(current_limits | next_limits)
-        return {"executor_capabilities": executor_capabilities}
+        return {"executor_features": executor_features}
 
     def _handle_register(self) -> None:
         payload = self._read_json()

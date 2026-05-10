@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -58,7 +58,7 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     claim = control.claim_task(
         worker_id="pg-worker",
         executors=["fake"],
-        peer_capabilities=["agent_runtime.daemon_worktree"],
+        peer_features=["agent_runtime.daemon_worktree"],
     )
     assert claim is not None
     assert claim.task.id == task.id
@@ -106,7 +106,7 @@ def test_postgres_runtime_store_host_restart_fails_running_task() -> None:
     claim = control.claim_task(
         worker_id="pg-worker",
         executors=["fake"],
-        peer_capabilities=["agent_runtime.daemon_worktree"],
+        peer_features=["agent_runtime.daemon_worktree"],
     )
     assert claim is not None
     assert control.heartbeat_task(

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import hmac
@@ -218,7 +218,7 @@ def test_runtime_complete_creates_github_pr_artifact() -> None:
             {
                 "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                 "cwd": "/tmp",
-                "capabilities": ["agent_runtime"],
+                "features": ["agent_runtime"],
             },
         )
         peer_token = register_body["payload"]["peer_token"]

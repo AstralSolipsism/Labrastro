@@ -15,7 +15,7 @@ class PeerInfo:
     peer_id: str
     connected_at: float
     last_seen_at: float
-    capabilities: list[str] = field(default_factory=list)
+    features: list[str] = field(default_factory=list)
     cwd: str = "."
     workspace_root: str | None = None
     status: str = "online"
@@ -42,7 +42,7 @@ class PeerRegistry:
             peer_id=peer_id,
             connected_at=now,
             last_seen_at=now,
-            capabilities=list(meta.get("capabilities", [])) if meta else [],
+            features=list(meta.get("features", [])) if meta else [],
             cwd=meta.get("cwd", ".") if meta else ".",
             workspace_root=meta.get("workspace_root") if meta else None,
             status="online",
