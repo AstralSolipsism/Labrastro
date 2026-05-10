@@ -67,7 +67,7 @@ def run_env_record_cli(args) -> int:
     tool = EnvironmentCLIToolConfig(
         name=str(args.tool_name),
         command=str(args.tool_command),
-        capabilities=[str(item) for item in args.capability],
+        tags=[str(item) for item in args.tag],
         check=str(args.check),
         install=str(args.install or ""),
         version=str(args.version) if args.version else None,

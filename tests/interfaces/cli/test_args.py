@@ -86,7 +86,7 @@ def test_parse_env_record(monkeypatch: pytest.MonkeyPatch) -> None:
             "gitnexus --version",
             "--install",
             "npm install -g gitnexus",
-            "--capability",
+            "--tag",
             "repo_index",
             "--source",
             "npm",
@@ -101,7 +101,7 @@ def test_parse_env_record(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.tool_command == "gitnexus"
     assert args.check == "gitnexus --version"
     assert args.install == "npm install -g gitnexus"
-    assert args.capability == ["repo_index"]
+    assert args.tag == ["repo_index"]
     assert args.source == "npm"
 
 
@@ -124,7 +124,7 @@ def test_parse_provider_record(monkeypatch: pytest.MonkeyPatch) -> None:
             "ANTHROPIC_API_KEY",
             "--base-url",
             "https://api.anthropic.com",
-            "--capability",
+            "--api-feature",
             "thinking=true",
         ],
     )
@@ -138,7 +138,7 @@ def test_parse_provider_record(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.provider_type == "anthropic_messages"
     assert args.compat == "deepseek"
     assert args.api_key_env == "ANTHROPIC_API_KEY"
-    assert args.capability == ["thinking=true"]
+    assert args.api_feature == ["thinking=true"]
 
 
 def test_parse_provider_list(monkeypatch: pytest.MonkeyPatch) -> None:

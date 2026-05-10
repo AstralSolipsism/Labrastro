@@ -393,8 +393,8 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
                 "provider": p.provider,
                 "provider_type": provider.type if provider else None,
                 "provider_compat": provider.compat if provider else None,
-                "provider_capabilities": (
-                    provider.capabilities.to_dict() if provider else {}
+                "provider_api_features": (
+                    provider.api_features.to_dict() if provider else {}
                 ),
                 "base_url": p.base_url or (provider.base_url if provider else None),
                 "max_tokens": p.max_tokens,
@@ -410,13 +410,13 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
                 lines.append(
                     f"- provider: `{provider.id}` ({provider.type}, compat={provider.compat})"
                 )
-                caps = [
-                    cap
-                    for cap, enabled in provider.capabilities.to_dict().items()
+                features = [
+                    feature
+                    for feature, enabled in provider.api_features.to_dict().items()
                     if enabled
                 ]
-                if caps:
-                    lines.append(f"- capabilities: `{', '.join(sorted(caps))}`")
+                if features:
+                    lines.append(f"- api_features: `{', '.join(sorted(features))}`")
             effective_base_url = p.base_url or (provider.base_url if provider else None)
             if effective_base_url:
                 lines.append(f"- base_url: `{effective_base_url}`")

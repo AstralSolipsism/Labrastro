@@ -141,7 +141,7 @@ def test_parse_config_reads_provider_backed_profiles() -> None:
                         "compat": "deepseek",
                         "api_key": "sk-ant",
                         "base_url": "https://api.anthropic.com",
-                        "capabilities": {"thinking": True},
+                        "api_features": {"thinking": True},
                     }
                 }
             },
@@ -433,7 +433,7 @@ def test_parse_config_reads_environment_cli_tools() -> None:
                 "cli_tools": {
                     "gitnexus": {
                         "command": "gitnexus",
-                        "capabilities": ["repo_index"],
+                        "tags": ["repo_index"],
                         "check": "gitnexus --version",
                         "install": "npm install -g gitnexus",
                         "version": "latest",
@@ -451,7 +451,7 @@ def test_parse_config_reads_environment_cli_tools() -> None:
 
     tool = config.environment.cli_tools["gitnexus"]
     assert tool.command == "gitnexus"
-    assert tool.capabilities == ["repo_index"]
+    assert tool.tags == ["repo_index"]
     assert tool.check == "gitnexus --version"
     assert tool.install == "npm install -g gitnexus"
     assert tool.version == "latest"
@@ -613,10 +613,9 @@ def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
     assert runtime["runtime_profiles"]["environment_local"]["runtime_home_policy"] == "per_task"
     assert runtime["runtime_profiles"]["environment_local"]["approval_mode"] == "full"
     assert "environment_configurator" in runtime["agents"]
-    assert runtime["agents"]["environment_configurator"]["capabilities"] == [
-        "environment.check",
-        "environment.configure",
-        "environment.manifest.read",
+    assert "server manifest" in runtime["agents"]["environment_configurator"]["dispatch"]["profile"]
+    assert runtime["agents"]["environment_configurator"]["capability_refs"] == [
+        "environment"
     ]
 
 

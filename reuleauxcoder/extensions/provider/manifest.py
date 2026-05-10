@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from reuleauxcoder.domain.config.models import (
-    ProviderCapabilities,
+    ProviderApiFeatures,
     ProviderConfig,
     infer_provider_compat,
 )
@@ -91,8 +91,8 @@ def run_provider_record_cli(args) -> int:
             headers=_parse_key_value_entries(list(args.header or []), "--header"),
             timeout_sec=int(args.timeout_sec),
             max_retries=int(args.max_retries),
-            capabilities=ProviderCapabilities.from_dict(
-                _parse_capability_entries(list(args.capability or [])),
+            api_features=ProviderApiFeatures.from_dict(
+                _parse_api_feature_entries(list(args.api_feature or [])),
                 provider_type=args.provider_type,
             ),
             extra=_parse_extra_entries(list(args.extra or [])),
@@ -123,12 +123,12 @@ def run_provider_list_cli(args) -> int:
         provider = providers[provider_id]
         caps = [
             key
-            for key, enabled in provider.capabilities.to_dict().items()
+            for key, enabled in provider.api_features.to_dict().items()
             if enabled
         ]
         print(
             f"{provider.id}\t{provider.type}\tcompat={provider.compat}\tapi_key={_mask(provider.api_key)}\t"
-            f"base_url={provider.base_url or '-'}\tcapabilities={','.join(sorted(caps))}"
+            f"base_url={provider.base_url or '-'}\tapi_features={','.join(sorted(caps))}"
         )
     return 0
 
@@ -170,17 +170,17 @@ def _parse_key_value_entries(entries: list[str], option_name: str) -> dict[str, 
     return result
 
 
-def _parse_capability_entries(entries: list[str]) -> dict[str, bool]:
+def _parse_api_feature_entries(entries: list[str]) -> dict[str, bool]:
     result: dict[str, bool] = {}
     for entry in entries:
         if "=" not in entry:
             raise ValueError(
-                f"invalid --capability entry, expected NAME=true|false: {entry}"
+                f"invalid --api-feature entry, expected NAME=true|false: {entry}"
             )
         key, value = entry.split("=", 1)
         key = key.strip()
         if not key:
-            raise ValueError(f"invalid --capability entry, empty name: {entry}")
+            raise ValueError(f"invalid --api-feature entry, empty name: {entry}")
         result[key] = value.strip().lower() in {"1", "true", "yes", "on"}
     return result
 

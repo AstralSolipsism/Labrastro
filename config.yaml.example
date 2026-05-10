@@ -157,19 +157,47 @@ approval:
 #       name: "Environment Configurator"
 #       description: "Checks and configures the local workspace environment from the server manifest."
 #       runtime_profile: "environment_local"
-#       capabilities: ["environment.check", "environment.configure", "environment.manifest.read"]
+#       dispatch:
+#         profile: "Best for checking and configuring local workspace environment components from the server manifest."
+#         examples:
+#           - "Check whether required CLI, MCP, and Skill components are available."
+#           - "Configure missing local tools declared by the environment manifest."
+#         avoid:
+#           - "General implementation and code review tasks."
+#       capability_refs: ["environment"]
 #     code_reviewer:
 #       name: "Code Reviewer"
 #       runtime_profile: "codex_remote"
-#       capabilities: ["code_review", "read_repo", "comment_issue"]
+#       dispatch:
+#         profile: "Best for reviewing repository changes, identifying regression risk, and writing review comments."
+#         examples:
+#           - "Review a backend runtime change for behavior regressions."
+#           - "Check whether test coverage is sufficient for a pull request."
+#         avoid:
+#           - "Tasks that require direct production deployment."
+#       capability_refs: ["github-review"]
 #       prompt:
 #         agent_md: ".agents/code_reviewer/AGENT.md"
 #         system_append: |
 #           Focus on regression risk, missing tests, and reviewable findings.
-#       mcp:
-#         servers: ["github"]
-#       skills: ["code-review"]
 #       max_concurrent_tasks: 2
+
+# Dispatch profiles describe what an Agent is good at. Capability packages are
+# reusable ability grants selected by `capability_refs`.
+# capability_packages:
+#   environment:
+#     name: "Environment Tools"
+#     description: "Read and configure the local workspace environment manifest."
+#     permissions: ["environment.check", "environment.configure", "environment.manifest.read"]
+#     source: "builtin"
+#   github-review:
+#     name: "GitHub Review"
+#     description: "Review repository changes and comment on GitHub issues."
+#     mcp_servers: ["github"]
+#     skills: ["code-review"]
+#     cli_tools: ["gitnexus"]
+#     permissions: ["repo.read", "issue.comment"]
+#     source: "local"
 
 skills:
   enabled: true
@@ -182,7 +210,7 @@ skills:
 #   cli_tools:
 #     gitnexus:
 #       command: "gitnexus"
-#       capabilities: ["repo_index"]
+#       tags: ["repo_index"]
 #       check: "gitnexus --version"
 #       install: "npm install -g gitnexus"
 #       source: "npm"

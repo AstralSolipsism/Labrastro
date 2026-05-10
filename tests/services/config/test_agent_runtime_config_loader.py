@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 import os
@@ -35,12 +35,21 @@ def test_parse_config_reads_agent_runtime_profiles_and_agents() -> None:
                     "code_reviewer": {
                         "name": "Code Reviewer",
                         "runtime_profile": "codex_remote",
-                        "capabilities": ["code_review", "read_repo"],
-                        "mcp": {"servers": ["github"]},
-                        "skills": ["code-review"],
+                        "dispatch": {
+                            "profile": "Best for repository review and regression risk analysis.",
+                            "examples": ["Review backend changes"],
+                            "avoid": ["Deploy production services"],
+                        },
+                        "capability_refs": ["github-review"],
                         "max_concurrent_tasks": 2,
                     }
                 },
+            },
+            "capability_packages": {
+                "github-review": {
+                    "name": "GitHub Review",
+                    "permissions": ["repo.read"],
+                }
             },
         }
     )
@@ -58,9 +67,12 @@ def test_parse_config_reads_agent_runtime_profiles_and_agents() -> None:
         == "cred_codex_team"
     )
     assert config.agent_runtime.agents["code_reviewer"].runtime_profile == "codex_remote"
-    assert config.agent_runtime.agents["code_reviewer"].capabilities == [
-        "code_review",
-        "read_repo",
+    assert (
+        config.agent_runtime.agents["code_reviewer"].dispatch.profile
+        == "Best for repository review and regression risk analysis."
+    )
+    assert config.agent_runtime.agents["code_reviewer"].capability_refs == [
+        "github-review",
     ]
     assert "environment_local" in config.agent_runtime.runtime_profiles
     assert "environment_configurator" in config.agent_runtime.agents
@@ -92,11 +104,9 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     assert profile.approval_mode == "full"
     agent = config.agent_runtime.agents["environment_configurator"]
     assert agent.runtime_profile == "environment_local"
-    assert agent.capabilities == [
-        "environment.check",
-        "environment.configure",
-        "environment.manifest.read",
-    ]
+    assert "environment manifest" in agent.dispatch.profile
+    assert agent.capability_refs == ["environment"]
+    assert "environment" in config.capability_packages
 
 
 def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
@@ -115,7 +125,7 @@ def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
                 "agents": {
                     "reviewer": {
                         "runtime_profile": "codex_remote",
-                        "capabilities": ["read_repo"],
+                        "dispatch": {"profile": "Old review profile"},
                     }
                 },
             }
@@ -130,7 +140,7 @@ def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
                     "claude_remote": {"executor": "claude"},
                 },
                 "agents": {
-                    "reviewer": {"capabilities": ["read_repo", "comment_issue"]},
+                    "reviewer": {"dispatch": {"profile": "New review profile"}},
                     "builder": {"runtime_profile": "claude_remote"},
                 },
             }
@@ -142,10 +152,7 @@ def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
     assert codex["model"] == "new-model"
     assert codex["credential_refs"] == {"model": "cred-old", "git": "cred-git"}
     assert "claude_remote" in merged["agent_runtime"]["runtime_profiles"]
-    assert merged["agent_runtime"]["agents"]["reviewer"]["capabilities"] == [
-        "read_repo",
-        "comment_issue",
-    ]
+    assert merged["agent_runtime"]["agents"]["reviewer"]["dispatch"]["profile"] == "New review profile"
     assert "builder" in merged["agent_runtime"]["agents"]
 
 
@@ -173,7 +180,7 @@ def test_agent_runtime_snapshot_keeps_credential_refs_but_not_plaintext_secrets(
         }
     )
 
-    snapshot = config.agent_runtime.to_runtime_snapshot()
+    snapshot = config.agent_runtime.to_runtime_snapshot(config.capability_packages)
 
     assert "cred_codex_team" in str(snapshot)
     assert "cred_repo_writer" in str(snapshot)
@@ -192,7 +199,7 @@ def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> 
                 "agents": {
                     "reviewer": {
                         "runtime_profile": "missing_profile",
-                        "capabilities": ["read_repo"],
+                        "dispatch": {"profile": "Review repository changes"},
                     }
                 }
             },
@@ -275,7 +282,7 @@ def test_admin_server_settings_update_preserves_runtime_profiles_and_agents() ->
                     "agents": {
                         "reviewer": {
                             "runtime_profile": "codex_remote",
-                            "capabilities": ["review"],
+                            "dispatch": {"profile": "Reviews code changes."},
                         }
                     },
                 }
@@ -382,7 +389,7 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
                     "agents": {
                         "reviewer": {
                             "runtime_profile": "codex_remote",
-                            "capabilities": ["review"],
+                            "dispatch": {"profile": "Reviews code changes."},
                         }
                     },
                 }
@@ -412,7 +419,7 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
                 "agents": {
                     "smoke": {
                         "runtime_profile": "fake_daemon",
-                        "capabilities": ["smoke"],
+                        "dispatch": {"profile": "Runs fake smoke tasks."},
                     }
                 },
             },

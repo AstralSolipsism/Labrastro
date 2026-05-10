@@ -179,14 +179,14 @@ class AnthropicMessagesProvider:
         if system:
             params["system"] = system
         if request.tools:
-            if not self.config.capabilities.tools:
+            if not self.config.api_features.tools:
                 raise RuntimeError(
                     f"Provider '{self.provider_id}' does not support tools"
                 )
             params["tools"] = convert_chat_tools_to_anthropic_tools(request.tools)
         if request.tool_choice:
             if request.tool_choice == "required":
-                if self.config.capabilities.tool_choice_required:
+                if self.config.api_features.tool_choice_required:
                     params["tool_choice"] = {"type": "any"}
                 else:
                     params["tool_choice"] = {"type": "auto"}
@@ -203,7 +203,7 @@ class AnthropicMessagesProvider:
                 params["tool_choice"] = {"type": "auto"}
         apply_anthropic_reasoning_effort(self.config, request, params, diagnostics)
         if request.thinking_enabled is not None:
-            if self.config.capabilities.thinking:
+            if self.config.api_features.thinking:
                 if request.thinking_enabled:
                     budget = int(self.config.extra.get("thinking_budget_tokens", 1024))
                     if not provider_manages_budget and request.max_tokens <= 1024:

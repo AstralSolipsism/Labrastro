@@ -2,6 +2,7 @@
 
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentConfig,
+    AgentDispatchConfig,
     AgentPromptConfig,
     ArtifactStatus,
     ArtifactType,
@@ -18,6 +19,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
 
 __all__ = [
     "AgentConfig",
+    "AgentDispatchConfig",
     "AgentPromptConfig",
     "ArtifactStatus",
     "ArtifactType",

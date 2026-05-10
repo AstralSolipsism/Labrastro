@@ -2,6 +2,7 @@
 
 from reuleauxcoder.domain.config.models import (
     Config,
+    CapabilityPackageConfig,
     GitHubConfig,
     MCPArtifactConfig,
     MCPDistribution,
@@ -10,7 +11,7 @@ from reuleauxcoder.domain.config.models import (
     MCPServerConfig,
     ModeConfig,
     ModelProfileConfig,
-    ProviderCapabilities,
+    ProviderApiFeatures,
     ProviderCompat,
     ProviderConfig,
     ProviderType,
@@ -19,6 +20,7 @@ from reuleauxcoder.domain.config.models import (
 
 __all__ = [
     "Config",
+    "CapabilityPackageConfig",
     "GitHubConfig",
     "MCPArtifactConfig",
     "MCPDistribution",
@@ -27,7 +29,7 @@ __all__ = [
     "MCPServerConfig",
     "ModelProfileConfig",
     "ModeConfig",
-    "ProviderCapabilities",
+    "ProviderApiFeatures",
     "ProviderCompat",
     "ProviderConfig",
     "ProviderType",

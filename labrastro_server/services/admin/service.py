@@ -12,13 +12,15 @@ from typing import Any, Callable
 from reuleauxcoder.app.runtime.agent_runtime import get_agent_runtime_limiter
 from reuleauxcoder.domain.config.models import (
     AgentRuntimeConfig,
+    CapabilityPackageConfig,
     EnvironmentCLIToolConfig,
     EnvironmentSkillConfig,
     GitHubConfig,
     MCPServerConfig,
     ModelProfileConfig,
-    ProviderCapabilities,
+    ProviderApiFeatures,
     ProviderConfig,
+    ensure_default_capability_packages,
     ensure_default_environment_agent_runtime,
     infer_provider_compat,
 )
@@ -130,16 +132,29 @@ class RemoteAdminConfigManager:
     def read_server_settings(self) -> dict[str, Any]:
         data = self._load_data()
         raw_runtime = data.get("agent_runtime", {})
+        raw_capability_packages = data.get("capability_packages", {})
         runtime = AgentRuntimeConfig.from_dict(
             ensure_default_environment_agent_runtime(
                 raw_runtime if isinstance(raw_runtime, dict) else {}
             )
         )
+        capability_packages = {
+            str(package_id): CapabilityPackageConfig.from_dict(
+                str(package_id), package_data
+            ).to_dict()
+            for package_id, package_data in ensure_default_capability_packages(
+                raw_capability_packages
+                if isinstance(raw_capability_packages, dict)
+                else {}
+            ).items()
+            if isinstance(package_data, dict)
+        }
         raw_github = data.get("github", {})
         github = GitHubConfig.from_dict(raw_github if isinstance(raw_github, dict) else {})
         return {
             "settings": {
                 "agent_runtime": runtime.to_dict(),
+                "capability_packages": capability_packages,
                 "github": github.to_dict(mask_secret=True),
             },
             "runtime": get_agent_runtime_limiter().snapshot(),
@@ -149,12 +164,19 @@ class RemoteAdminConfigManager:
     def update_server_settings(self, payload: dict[str, Any]) -> AdminConfigResult:
         raw_settings = payload.get("settings")
         raw_runtime = payload.get("agent_runtime")
+        raw_capability_packages = payload.get("capability_packages")
         raw_github = payload.get("github")
         if isinstance(raw_settings, dict) and raw_runtime is None:
             raw_runtime = raw_settings.get("agent_runtime")
+        if isinstance(raw_settings, dict) and raw_capability_packages is None:
+            raw_capability_packages = raw_settings.get("capability_packages")
         if isinstance(raw_settings, dict) and raw_github is None:
             raw_github = raw_settings.get("github")
-        if not isinstance(raw_runtime, dict) and not isinstance(raw_github, dict):
+        if (
+            not isinstance(raw_runtime, dict)
+            and not isinstance(raw_capability_packages, dict)
+            and not isinstance(raw_github, dict)
+        ):
             return AdminConfigResult(False, {"error": "server_settings_required"}, 400)
         update_mode = str(payload.get("agent_runtime_update_mode") or "merge").lower()
         if update_mode not in {"merge", "replace"}:
@@ -174,6 +196,37 @@ class RemoteAdminConfigManager:
                 if isinstance(previous_data.get("agent_runtime"), dict)
                 else {}
             )
+            previous_packages = (
+                previous_data.get("capability_packages", {})
+                if isinstance(previous_data.get("capability_packages"), dict)
+                else {}
+            )
+            raw_packages_for_parse = (
+                raw_capability_packages
+                if isinstance(raw_capability_packages, dict)
+                else previous_packages
+            )
+            try:
+                capability_packages = {
+                    str(package_id): CapabilityPackageConfig.from_dict(
+                        str(package_id), package_data
+                    )
+                    for package_id, package_data in ensure_default_capability_packages(
+                        raw_packages_for_parse
+                    ).items()
+                    if isinstance(package_data, dict)
+                }
+            except Exception as exc:
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_capability_packages", "message": str(exc)},
+                    400,
+                )
+            if isinstance(raw_capability_packages, dict):
+                data["capability_packages"] = {
+                    package_id: package.to_dict()
+                    for package_id, package in capability_packages.items()
+                }
             if isinstance(raw_runtime, dict) and update_mode == "replace":
                 for key in ("runtime_profiles", "agents"):
                     if key in raw_runtime and not isinstance(raw_runtime.get(key), dict):
@@ -205,7 +258,10 @@ class RemoteAdminConfigManager:
                         {"error": "invalid_agent_runtime", "message": str(exc)},
                         400,
                     )
-                invalid_runtime = self._validate_agent_runtime(runtime)
+                invalid_runtime = self._validate_agent_runtime(
+                    runtime,
+                    capability_packages=capability_packages,
+                )
                 if invalid_runtime is not None:
                     return invalid_runtime
                 data["agent_runtime"] = runtime.to_dict()
@@ -226,7 +282,10 @@ class RemoteAdminConfigManager:
                         {"error": "invalid_agent_runtime", "message": str(exc)},
                         400,
                     )
-                invalid_runtime = self._validate_agent_runtime(runtime)
+                invalid_runtime = self._validate_agent_runtime(
+                    runtime,
+                    capability_packages=capability_packages,
+                )
                 if invalid_runtime is not None:
                     return invalid_runtime
                 data["agent_runtime"] = runtime.to_dict()
@@ -272,7 +331,10 @@ class RemoteAdminConfigManager:
             )
 
     def _validate_agent_runtime(
-        self, runtime: AgentRuntimeConfig
+        self,
+        runtime: AgentRuntimeConfig,
+        *,
+        capability_packages: dict[str, CapabilityPackageConfig],
     ) -> AdminConfigResult | None:
         if runtime.max_running_agents < 1 or runtime.max_shells_per_agent < 1:
             return AdminConfigResult(
@@ -297,6 +359,24 @@ class RemoteAdminConfigManager:
                     "message": (
                         "agent runtime profile references must exist: "
                         + ", ".join(sorted(missing_profiles))
+                    ),
+                },
+                400,
+            )
+        missing_packages = [
+            f"{agent_id}:{package_ref}"
+            for agent_id, agent in runtime.agents.items()
+            for package_ref in agent.capability_refs
+            if package_ref not in capability_packages
+        ]
+        if missing_packages:
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "invalid_agent_runtime",
+                    "message": (
+                        "agent capability package references must exist: "
+                        + ", ".join(sorted(missing_packages))
                     ),
                 },
                 400,
@@ -451,8 +531,8 @@ class RemoteAdminConfigManager:
                 "headers": _dict_field(payload, "headers", previous),
                 "timeout_sec": int(payload.get("timeout_sec") or previous.get("timeout_sec") or 120),
                 "max_retries": int(payload.get("max_retries") or previous.get("max_retries") or 3),
-                "capabilities": ProviderCapabilities.from_dict(
-                    _dict_field(payload, "capabilities", previous),
+                "api_features": ProviderApiFeatures.from_dict(
+                    _dict_field(payload, "api_features", previous),
                     provider_type=provider_type,
                 ).to_dict(),
                 "extra": _dict_field(payload, "extra", previous),

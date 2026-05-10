@@ -17,6 +17,7 @@ from reuleauxcoder.domain.config.models import (
     EnvironmentConfig,
     EnvironmentSkillConfig,
     GitHubConfig,
+    CapabilityPackageConfig,
     MCPServerConfig,
     ModeConfig,
     ModelProfileConfig,
@@ -26,6 +27,7 @@ from reuleauxcoder.domain.config.models import (
     ProvidersConfig,
     RemoteExecConfig,
     SkillsConfig,
+    ensure_default_capability_packages,
     ensure_default_environment_agent_runtime,
 )
 from reuleauxcoder.domain.config.schema import (
@@ -360,6 +362,7 @@ class ConfigLoader:
         remote_exec_config = data.get("remote_exec", {})
         auth_config = data.get("auth", {})
         agent_runtime_config = data.get("agent_runtime", {})
+        capability_packages_config = data.get("capability_packages", {})
         persistence_config = data.get("persistence", {})
         github_config = data.get("github", {})
         environment_config = data.get("environment", {})
@@ -462,6 +465,19 @@ class ConfigLoader:
                     str(name), skill_data
                 )
 
+        capability_packages: dict[str, CapabilityPackageConfig] = {}
+        raw_capability_packages = ensure_default_capability_packages(
+            capability_packages_config
+            if isinstance(capability_packages_config, dict)
+            else {}
+        )
+        for package_id, package_data in raw_capability_packages.items():
+            if not isinstance(package_data, dict):
+                continue
+            capability_packages[str(package_id)] = CapabilityPackageConfig.from_dict(
+                str(package_id), package_data
+            )
+
         llm_params = self._resolve_llm_params(active_profile, app_config, providers)
         agent_runtime = AgentRuntimeConfig.from_dict(
             ensure_default_environment_agent_runtime(
@@ -555,6 +571,7 @@ class ConfigLoader:
                 auth_config if isinstance(auth_config, dict) else {}
             ),
             agent_runtime=agent_runtime,
+            capability_packages=capability_packages,
             persistence=PersistenceConfig.from_dict(
                 persistence_config if isinstance(persistence_config, dict) else {}
             ),
@@ -644,13 +661,28 @@ class ConfigLoader:
                         "name": "Environment Configurator",
                         "description": "Checks and configures the local workspace environment from the server manifest.",
                         "runtime_profile": "environment_local",
-                        "capabilities": [
-                            "environment.check",
-                            "environment.configure",
-                            "environment.manifest.read",
-                        ],
+                        "dispatch": {
+                            "profile": "Best for checking and configuring local workspace environment components from the server manifest.",
+                            "examples": [
+                                "Check whether required CLI, MCP, and Skill components are available.",
+                                "Configure missing local tools declared by the environment manifest.",
+                            ],
+                            "avoid": ["General implementation and code review tasks."],
+                        },
+                        "capability_refs": ["environment"],
                     }
                 },
+            },
+            "capability_packages": {
+                "environment": {
+                    "name": "Environment Tools",
+                    "description": "Read and configure the local workspace environment manifest.",
+                    "permissions": [
+                        "environment.check",
+                        "environment.configure",
+                        "environment.manifest.read",
+                    ],
+                }
             },
             "skills": {"enabled": True},
         }

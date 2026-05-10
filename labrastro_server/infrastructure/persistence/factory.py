@@ -60,16 +60,22 @@ def create_runtime_control_plane(config: Config) -> AgentRuntimeControlPlane:
     if engine is None or not config.persistence.runtime_enabled:
         return AgentRuntimeControlPlane(
             max_running_tasks=config.agent_runtime.max_running_agents,
-            runtime_snapshot=config.agent_runtime.to_runtime_snapshot(),
+            runtime_snapshot=config.agent_runtime.to_runtime_snapshot(
+                config.capability_packages
+            ),
         )
     store = PostgresRuntimeStore(
         engine,
         max_running_tasks=config.agent_runtime.max_running_agents,
-        runtime_snapshot=config.agent_runtime.to_runtime_snapshot(),
+        runtime_snapshot=config.agent_runtime.to_runtime_snapshot(
+            config.capability_packages
+        ),
     )
     return AgentRuntimeControlPlane(
         max_running_tasks=config.agent_runtime.max_running_agents,
-        runtime_snapshot=config.agent_runtime.to_runtime_snapshot(),
+        runtime_snapshot=config.agent_runtime.to_runtime_snapshot(
+            config.capability_packages
+        ),
         store=store,
     )
 

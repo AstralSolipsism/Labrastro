@@ -37,7 +37,7 @@ def test_environment_cli_tool_config_roundtrip() -> None:
     config = EnvironmentCLIToolConfig(
         name="gitnexus",
         command="gitnexus",
-        capabilities=["repo_index", "git_graph"],
+        tags=["repo_index", "git_graph"],
         check="gitnexus --version",
         install="npm install -g gitnexus",
         version="latest",

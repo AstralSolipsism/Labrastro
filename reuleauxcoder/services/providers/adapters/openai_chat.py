@@ -201,7 +201,7 @@ class OpenAIChatProvider:
         apply_openai_chat_reasoning(self.config, request, params, diagnostics)
         apply_openai_chat_thinking(self.config, request, params, diagnostics)
         if request.tools:
-            if not self.config.capabilities.tools:
+            if not self.config.api_features.tools:
                 raise RuntimeError(
                     f"Provider '{self.provider_id}' does not support tools"
                 )

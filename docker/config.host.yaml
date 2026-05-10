@@ -62,10 +62,25 @@ agent_runtime:
       name: Environment Configurator
       description: Checks and configures the local workspace environment from the server manifest.
       runtime_profile: environment_local
-      capabilities:
-        - environment.check
-        - environment.configure
-        - environment.manifest.read
+      dispatch:
+        profile: Best for checking and configuring local workspace environment components from the server manifest.
+        examples:
+          - Check whether required CLI, MCP, and Skill components are available.
+          - Configure missing local tools declared by the environment manifest.
+        avoid:
+          - General implementation and code review tasks.
+      capability_refs:
+        - environment
+
+capability_packages:
+  environment:
+    name: Environment Tools
+    description: Read and configure the local workspace environment manifest.
+    permissions:
+      - environment.check
+      - environment.configure
+      - environment.manifest.read
+    source: builtin
 
 persistence:
   backend: postgres

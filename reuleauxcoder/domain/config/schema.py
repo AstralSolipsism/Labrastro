@@ -33,7 +33,7 @@ CONFIG_SCHEMA = {
                 "headers": "dict of strings (optional)",
                 "timeout_sec": "int (default: 120)",
                 "max_retries": "int (default: 3)",
-                "capabilities": "dict of booleans (optional)",
+                "api_features": "dict of booleans (optional)",
                 "extra": "dict (optional, provider-specific settings)",
             }
         }
@@ -175,17 +175,32 @@ CONFIG_SCHEMA = {
                     "display_name": "string (optional)",
                     "parameters": "dict (optional, model runtime parameters such as max_tokens/temperature/max_context_tokens)",
                 },
-                "capabilities": "list of strings (optional)",
+                "dispatch": {
+                    "profile": "string (optional, user-authored Agent routing profile)",
+                    "examples": "list of strings (optional, example tasks this Agent fits)",
+                    "avoid": "list of strings (optional, tasks this Agent should not receive)",
+                },
+                "capability_refs": "list of strings (optional, references capability_packages)",
                 "prompt": {
                     "agent_md": "string (optional)",
                     "system_append": "string (optional)",
                 },
-                "mcp": "dict (optional, agent MCP allowlist, e.g. servers)",
-                "skills": "list of strings (optional)",
                 "max_concurrent_tasks": "int (optional)",
                 "credential_refs": "dict of strings (optional)",
             }
         },
+    },
+    "capability_packages": {
+        "package_id": {
+            "name": "string (optional)",
+            "description": "string (optional)",
+            "mcp_servers": ["server-name", "..."],
+            "skills": ["skill-name", "..."],
+            "cli_tools": ["tool-name", "..."],
+            "permissions": ["permission-name", "..."],
+            "source": "string (optional, e.g. builtin/local/market)",
+            "market": "dict (optional, package-market metadata)",
+        }
     },
     "persistence": {
         "backend": "string (optional, one of auto, memory, postgres; default auto)",
@@ -201,7 +216,7 @@ CONFIG_SCHEMA = {
                 "command": "string (required)",
                 "enabled": "bool (optional, default: true)",
                 "placement": "string (optional, one of server, local, both)",
-                "capabilities": ["capability-name", "..."],
+                "tags": ["component-tag", "..."],
                 "requirements": {"dependency": "version/range"},
                 "check": "string (required)",
                 "install": "string (optional)",

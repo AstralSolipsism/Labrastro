@@ -6,7 +6,12 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
-from reuleauxcoder.domain.agent_runtime.models import AgentConfig, RuntimeProfileConfig
+from reuleauxcoder.domain.agent_runtime.models import (
+    AgentConfig,
+    CapabilityPackageConfig,
+    RuntimeProfileConfig,
+    resolve_capability_refs,
+)
 
 
 MCPPlacement = Literal["server", "peer", "both"]
@@ -29,11 +34,30 @@ DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
     "name": "Environment Configurator",
     "description": "Checks and configures the local workspace environment from the server manifest.",
     "runtime_profile": DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
-    "capabilities": [
+    "dispatch": {
+        "profile": (
+            "Best for reading the environment manifest and checking or configuring "
+            "local workspace CLI, MCP, and Skill components from that manifest."
+        ),
+        "examples": [
+            "Check whether the current workspace satisfies the server environment manifest",
+            "Install or configure missing local tools from the manifest",
+        ],
+        "avoid": [
+            "General code review or product implementation tasks",
+        ],
+    },
+    "capability_refs": ["environment"],
+}
+DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE: dict[str, Any] = {
+    "name": "Environment Tools",
+    "description": "Read and configure the local workspace environment manifest.",
+    "permissions": [
         "environment.check",
         "environment.configure",
         "environment.manifest.read",
     ],
+    "source": "builtin",
 }
 
 
@@ -65,9 +89,26 @@ def ensure_default_environment_agent_runtime(
         for key, value in DEFAULT_ENVIRONMENT_AGENT.items():
             if key not in agent:
                 agent[key] = deepcopy(value)
-        if not isinstance(agent.get("capabilities"), list):
-            agent["capabilities"] = list(DEFAULT_ENVIRONMENT_AGENT["capabilities"])
+        if not isinstance(agent.get("dispatch"), dict):
+            agent["dispatch"] = deepcopy(DEFAULT_ENVIRONMENT_AGENT["dispatch"])
+        if not isinstance(agent.get("capability_refs"), list):
+            agent["capability_refs"] = list(DEFAULT_ENVIRONMENT_AGENT["capability_refs"])
     return runtime
+
+
+def ensure_default_capability_packages(
+    data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return capability package data with built-in packages present."""
+
+    packages = deepcopy(data) if isinstance(data, dict) else {}
+    package = packages.get("environment")
+    if not isinstance(package, dict):
+        packages["environment"] = deepcopy(DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE)
+    else:
+        for key, value in DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE.items():
+            package.setdefault(key, deepcopy(value))
+    return packages
 
 
 def normalize_provider_compat(value: Any) -> ProviderCompat:
@@ -97,8 +138,8 @@ def infer_provider_compat(base_url: str | None) -> ProviderCompat:
 
 
 @dataclass
-class ProviderCapabilities:
-    """Declared LLM provider capabilities used for request shaping."""
+class ProviderApiFeatures:
+    """Declared LLM provider API features used for request shaping."""
 
     chat: bool = True
     streaming: bool = True
@@ -126,7 +167,7 @@ class ProviderCapabilities:
         }
 
     @classmethod
-    def defaults_for(cls, provider_type: str) -> "ProviderCapabilities":
+    def defaults_for(cls, provider_type: str) -> "ProviderApiFeatures":
         normalized = provider_type.strip().lower()
         if normalized == "anthropic_messages":
             return cls(
@@ -155,7 +196,7 @@ class ProviderCapabilities:
     @classmethod
     def from_dict(
         cls, d: dict[str, Any] | None, *, provider_type: str = "openai_chat"
-    ) -> "ProviderCapabilities":
+    ) -> "ProviderApiFeatures":
         defaults = cls.defaults_for(provider_type)
         if not isinstance(d, dict):
             return defaults
@@ -179,8 +220,8 @@ class ProviderConfig:
     headers: dict[str, str] = field(default_factory=dict)
     timeout_sec: int = 120
     max_retries: int = 3
-    capabilities: ProviderCapabilities = field(
-        default_factory=lambda: ProviderCapabilities.defaults_for("openai_chat")
+    api_features: ProviderApiFeatures = field(
+        default_factory=lambda: ProviderApiFeatures.defaults_for("openai_chat")
     )
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -194,13 +235,17 @@ class ProviderConfig:
             "headers": dict(self.headers),
             "timeout_sec": self.timeout_sec,
             "max_retries": self.max_retries,
-            "capabilities": self.capabilities.to_dict(),
+            "api_features": self.api_features.to_dict(),
             "extra": dict(self.extra),
         }
         return data
 
     @classmethod
     def from_dict(cls, provider_id: str, d: dict[str, Any]) -> "ProviderConfig":
+        if "capabilities" in d:
+            raise ValueError(
+                "provider config field capabilities was removed; use api_features"
+            )
         raw_type = str(d.get("type", "openai_chat")).strip().lower()
         provider_type: ProviderType
         if raw_type in {"anthropic_messages", "openai_responses"}:
@@ -229,8 +274,8 @@ class ProviderConfig:
             ),
             timeout_sec=int(d.get("timeout_sec", 120) or 120),
             max_retries=int(d.get("max_retries", 3) or 3),
-            capabilities=ProviderCapabilities.from_dict(
-                d.get("capabilities"), provider_type=provider_type
+            api_features=ProviderApiFeatures.from_dict(
+                d.get("api_features"), provider_type=provider_type
             ),
             extra=dict(raw_extra) if isinstance(raw_extra, dict) else {},
         )
@@ -726,9 +771,26 @@ class AgentRuntimeConfig:
             }
         return data
 
-    def to_runtime_snapshot(self) -> dict[str, Any]:
+    def to_runtime_snapshot(
+        self,
+        capability_packages: dict[str, CapabilityPackageConfig] | None = None,
+    ) -> dict[str, Any]:
         """Return the server-authoritative runtime snapshot for executors."""
 
+        packages = dict(capability_packages or {})
+        if "environment" not in packages:
+            packages["environment"] = CapabilityPackageConfig.from_dict(
+                "environment",
+                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+            )
+        agents: dict[str, dict[str, Any]] = {}
+        for agent_id, agent in self.agents.items():
+            agent_dict = agent.to_dict()
+            agent_dict["resolved_capabilities"] = resolve_capability_refs(
+                agent.capability_refs,
+                packages,
+            )
+            agents[agent_id] = agent_dict
         return {
             "max_running_agents": self.max_running_agents,
             "max_shells_per_agent": self.max_shells_per_agent,
@@ -736,8 +798,10 @@ class AgentRuntimeConfig:
                 profile_id: profile.to_dict()
                 for profile_id, profile in self.runtime_profiles.items()
             },
-            "agents": {
-                agent_id: agent.to_dict() for agent_id, agent in self.agents.items()
+            "agents": agents,
+            "capability_packages": {
+                package_id: package.to_dict()
+                for package_id, package in packages.items()
             },
         }
 
@@ -888,7 +952,7 @@ class EnvironmentCLIToolConfig:
     command: str = ""
     enabled: bool = True
     placement: CLIPlacement = "local"
-    capabilities: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     requirements: dict[str, str] = field(default_factory=dict)
     check: str = ""
     install: str = ""
@@ -911,7 +975,7 @@ class EnvironmentCLIToolConfig:
             "command": self.command,
             "enabled": self.enabled,
             "placement": self.placement,
-            "capabilities": list(self.capabilities),
+            "tags": list(self.tags),
             "requirements": dict(self.requirements),
             "check": self.check,
             "install": self.install,
@@ -934,7 +998,11 @@ class EnvironmentCLIToolConfig:
 
     @classmethod
     def from_dict(cls, name: str, d: dict[str, Any]) -> "EnvironmentCLIToolConfig":
-        raw_capabilities = d.get("capabilities", [])
+        if "capabilities" in d:
+            raise ValueError(
+                "environment.cli_tools capabilities was removed; use tags for component labeling"
+            )
+        raw_tags = d.get("tags", [])
         raw_requirements = d.get("requirements", {})
         raw_placement = str(d.get("placement", "local")).lower()
         placement: CLIPlacement
@@ -947,9 +1015,9 @@ class EnvironmentCLIToolConfig:
             command=str(d.get("command", "")),
             enabled=_bool_config_value(d.get("enabled", True)),
             placement=placement,
-            capabilities=(
-                [str(item) for item in raw_capabilities]
-                if isinstance(raw_capabilities, list)
+            tags=(
+                [str(item) for item in raw_tags]
+                if isinstance(raw_tags, list)
                 else []
             ),
             requirements=(
@@ -1175,6 +1243,9 @@ class Config:
     # Server Agent runtime settings
     agent_runtime: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
 
+    # Reusable capability packages installed from local config or a future market.
+    capability_packages: dict[str, CapabilityPackageConfig] = field(default_factory=dict)
+
     # Durable persistence settings
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
 
@@ -1273,6 +1344,12 @@ class Config:
                 )
             if self.github.reconcile_interval_sec < 1:
                 errors.append("github.reconcile_interval_sec must be positive")
+        capability_packages = dict(self.capability_packages)
+        if "environment" not in capability_packages:
+            capability_packages["environment"] = CapabilityPackageConfig.from_dict(
+                "environment",
+                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+            )
         for agent_id, agent in self.agent_runtime.agents.items():
             if (
                 agent.runtime_profile
@@ -1289,6 +1366,30 @@ class Config:
                 errors.append(
                     f"agent_runtime.agents[{agent_id}].model.model is required when provider is set"
                 )
+            for package_ref in agent.capability_refs:
+                if package_ref not in capability_packages:
+                    errors.append(
+                        f"agent_runtime.agents[{agent_id}].capability_refs references missing capability package {package_ref}"
+                    )
+        mcp_names = {server.name for server in self.mcp_servers}
+        cli_tool_names = set(self.environment.cli_tools)
+        skill_names = set(self.environment.skills)
+        for package_id, package in capability_packages.items():
+            for server_name in package.mcp_servers:
+                if server_name not in mcp_names:
+                    errors.append(
+                        f"capability_packages[{package_id}].mcp_servers references missing mcp.servers entry {server_name}"
+                    )
+            for tool_name in package.cli_tools:
+                if tool_name not in cli_tool_names:
+                    errors.append(
+                        f"capability_packages[{package_id}].cli_tools references missing environment.cli_tools entry {tool_name}"
+                    )
+            for skill_name in package.skills:
+                if skill_name not in skill_names:
+                    errors.append(
+                        f"capability_packages[{package_id}].skills references missing environment.skills entry {skill_name}"
+                    )
         valid_actions = {"allow", "warn", "require_approval", "deny"}
         if (
             self.active_main_model_profile

@@ -116,6 +116,18 @@ def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
 def _reject_plaintext_secret_container(data: dict[str, Any], *, owner: str) -> None:
     secret_keys = {"secret", "secrets", "api_key", "api_keys", "token", "tokens"}
     for key in data:
@@ -123,6 +135,120 @@ def _reject_plaintext_secret_container(data: dict[str, Any], *, owner: str) -> N
             raise ValueError(
                 f"{owner} must reference secrets through credential_refs, not plaintext secrets"
             )
+
+
+@dataclass
+class CapabilityPackageConfig:
+    """Reusable Agent capability package assembled from component inventories."""
+
+    id: str
+    name: str = ""
+    description: str = ""
+    mcp_servers: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    cli_tools: list[str] = field(default_factory=list)
+    permissions: list[str] = field(default_factory=list)
+    source: str = ""
+    market: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls, package_id: str, data: dict[str, Any] | None
+    ) -> "CapabilityPackageConfig":
+        if not isinstance(data, dict):
+            data = {}
+        _reject_plaintext_secret_container(data, owner="capability package")
+        return cls(
+            id=str(package_id),
+            name=str(data.get("name", "") or ""),
+            description=str(data.get("description", "") or ""),
+            mcp_servers=_string_list(data.get("mcp_servers", [])),
+            skills=_string_list(data.get("skills", [])),
+            cli_tools=_string_list(data.get("cli_tools", [])),
+            permissions=_string_list(data.get("permissions", [])),
+            source=str(data.get("source", "") or ""),
+            market=_dict_value(data.get("market", {})),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        if self.name:
+            result["name"] = self.name
+        if self.description:
+            result["description"] = self.description
+        if self.mcp_servers:
+            result["mcp_servers"] = list(self.mcp_servers)
+        if self.skills:
+            result["skills"] = list(self.skills)
+        if self.cli_tools:
+            result["cli_tools"] = list(self.cli_tools)
+        if self.permissions:
+            result["permissions"] = list(self.permissions)
+        if self.source:
+            result["source"] = self.source
+        if self.market:
+            result["market"] = dict(self.market)
+        return result
+
+
+def resolve_capability_refs(
+    capability_refs: list[str],
+    packages: dict[str, CapabilityPackageConfig],
+) -> dict[str, Any]:
+    """Resolve package refs into executor-facing capability components."""
+
+    resolved_packages: list[dict[str, Any]] = []
+    mcp_servers: list[str] = []
+    skills: list[str] = []
+    cli_tools: list[str] = []
+    permissions: list[str] = []
+    for package_id in capability_refs:
+        package = packages.get(package_id)
+        if package is None:
+            continue
+        package_dict = package.to_dict()
+        package_dict["id"] = package.id
+        resolved_packages.append(package_dict)
+        mcp_servers.extend(package.mcp_servers)
+        skills.extend(package.skills)
+        cli_tools.extend(package.cli_tools)
+        permissions.extend(package.permissions)
+    return {
+        "packages": resolved_packages,
+        "mcp_servers": _dedupe_strings(mcp_servers),
+        "skills": _dedupe_strings(skills),
+        "cli_tools": _dedupe_strings(cli_tools),
+        "permissions": _dedupe_strings(permissions),
+    }
+
+
+@dataclass
+class AgentDispatchConfig:
+    """Open-ended user-authored dispatch profile for long-lived Agents."""
+
+    profile: str = ""
+    examples: list[str] = field(default_factory=list)
+    avoid: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AgentDispatchConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            profile=str(data.get("profile", "") or ""),
+            examples=_string_list(data.get("examples", [])),
+            avoid=_string_list(data.get("avoid", [])),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        if self.profile:
+            result["profile"] = self.profile
+        if self.examples:
+            result["examples"] = list(self.examples)
+        if self.avoid:
+            result["avoid"] = list(self.avoid)
+        return result
 
 
 @dataclass
@@ -275,11 +401,10 @@ class AgentConfig:
     name: str = ""
     description: str = ""
     runtime_profile: str = ""
-    capabilities: list[str] = field(default_factory=list)
+    dispatch: AgentDispatchConfig = field(default_factory=AgentDispatchConfig)
+    capability_refs: list[str] = field(default_factory=list)
     model: AgentModelConfig = field(default_factory=AgentModelConfig)
     prompt: AgentPromptConfig = field(default_factory=AgentPromptConfig)
-    mcp: dict[str, Any] = field(default_factory=dict)
-    skills: list[str] = field(default_factory=list)
     max_concurrent_tasks: int | None = None
     credential_refs: dict[str, str] = field(default_factory=dict)
 
@@ -288,6 +413,18 @@ class AgentConfig:
         if not isinstance(data, dict):
             data = {}
         _reject_plaintext_secret_container(data, owner="agent config")
+        removed_fields = [
+            key
+            for key in ("capabilities", "mcp", "skills", "dispatch_tags")
+            if key in data
+        ]
+        if removed_fields:
+            raise ValueError(
+                "agent config fields "
+                + ", ".join(sorted(removed_fields))
+                + " were removed; use dispatch.profile/examples/avoid for "
+                + "Agent routing profile and capability_refs for capability packages"
+            )
         raw_max = data.get("max_concurrent_tasks")
         max_concurrent_tasks = int(raw_max) if raw_max is not None else None
         return cls(
@@ -295,11 +432,10 @@ class AgentConfig:
             name=str(data.get("name", "") or ""),
             description=str(data.get("description", "") or ""),
             runtime_profile=str(data.get("runtime_profile", "") or ""),
-            capabilities=_string_list(data.get("capabilities", [])),
+            dispatch=AgentDispatchConfig.from_dict(data.get("dispatch")),
+            capability_refs=_string_list(data.get("capability_refs", [])),
             model=AgentModelConfig.from_dict(data.get("model")),
             prompt=AgentPromptConfig.from_dict(data.get("prompt")),
-            mcp=_dict_value(data.get("mcp", {})),
-            skills=_string_list(data.get("skills", [])),
             max_concurrent_tasks=max_concurrent_tasks,
             credential_refs=_string_dict(data.get("credential_refs", {})),
         )
@@ -312,18 +448,17 @@ class AgentConfig:
             result["description"] = self.description
         if self.runtime_profile:
             result["runtime_profile"] = self.runtime_profile
-        if self.capabilities:
-            result["capabilities"] = list(self.capabilities)
+        dispatch = self.dispatch.to_dict()
+        if dispatch:
+            result["dispatch"] = dispatch
+        if self.capability_refs:
+            result["capability_refs"] = list(self.capability_refs)
         model = self.model.to_dict()
         if model:
             result["model"] = model
         prompt = self.prompt.to_dict()
         if prompt:
             result["prompt"] = prompt
-        if self.mcp:
-            result["mcp"] = dict(self.mcp)
-        if self.skills:
-            result["skills"] = list(self.skills)
         if self.max_concurrent_tasks is not None:
             result["max_concurrent_tasks"] = self.max_concurrent_tasks
         if self.credential_refs:

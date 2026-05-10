@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 import pytest
 
@@ -355,7 +355,7 @@ def test_chat_provider_keeps_deepseek_forced_tool_choice_when_thinking_disabled(
             base_url="https://api.deepseek.com",
         )
     )
-    provider.config.capabilities.tool_choice_required = True
+    provider.config.api_features.tool_choice_required = True
     request = ProviderRequest(
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": "hi"}],
@@ -587,7 +587,7 @@ def test_provider_capability_downgrade_records_diagnostic() -> None:
     provider = OpenAIResponsesProvider(
         ProviderConfig(id="responses", type="openai_responses", api_key="sk-test")
     )
-    provider.config.capabilities.tool_choice_required = False
+    provider.config.api_features.tool_choice_required = False
     request = ProviderRequest(
         model="gpt-demo",
         messages=[{"role": "user", "content": "hi"}],
@@ -652,7 +652,7 @@ def test_provider_record_cli_writes_compat(tmp_path, capsys, monkeypatch) -> Non
             header=[],
             timeout_sec=120,
             max_retries=3,
-            capability=[],
+            api_feature=[],
             extra=[],
         )
     )

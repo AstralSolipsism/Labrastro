@@ -45,7 +45,7 @@ def test_runtime_profile_config_preserves_cli_isolation_and_credentials() -> Non
     assert profile.mcp["servers"] == ["github"]
 
 
-def test_agent_config_binds_runtime_profile_prompt_mcp_and_skills() -> None:
+def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> None:
     models = _models()
 
     agent = models.AgentConfig.from_dict(
@@ -54,24 +54,28 @@ def test_agent_config_binds_runtime_profile_prompt_mcp_and_skills() -> None:
             "name": "Code Reviewer",
             "description": "审查代码风险",
             "runtime_profile": "codex_remote",
-            "capabilities": ["code_review", "read_repo", "comment_issue"],
+            "dispatch": {
+                "profile": "适合审查代码风险、阅读仓库并指出缺失测试。",
+                "examples": ["审查后端运行时变更", "检查 PR 的测试覆盖"],
+                "avoid": ["线上发布操作"],
+            },
+            "capability_refs": ["github-review"],
             "prompt": {
                 "agent_md": ".agents/code_reviewer/AGENT.md",
                 "system_append": "你专注于发现风险、回归和缺失测试。",
             },
-            "mcp": {"servers": ["github"]},
-            "skills": ["code-review"],
             "max_concurrent_tasks": 2,
         },
     )
 
     assert agent.id == "code_reviewer"
     assert agent.runtime_profile == "codex_remote"
-    assert agent.capabilities == ["code_review", "read_repo", "comment_issue"]
+    assert agent.dispatch.profile.startswith("适合审查代码风险")
+    assert agent.dispatch.examples == ["审查后端运行时变更", "检查 PR 的测试覆盖"]
+    assert agent.dispatch.avoid == ["线上发布操作"]
+    assert agent.capability_refs == ["github-review"]
     assert agent.prompt.agent_md == ".agents/code_reviewer/AGENT.md"
     assert "风险" in agent.prompt.system_append
-    assert agent.mcp["servers"] == ["github"]
-    assert agent.skills == ["code-review"]
     assert agent.max_concurrent_tasks == 2
 
 
@@ -83,10 +87,62 @@ def test_agent_config_rejects_plaintext_secrets() -> None:
             "unsafe_agent",
             {
                 "runtime_profile": "codex_remote",
-                "capabilities": ["read_repo"],
+                "dispatch": {"profile": "Reads repository context."},
                 "secrets": {"OPENAI_API_KEY": "sk-should-not-be-stored"},
             },
         )
+
+
+def test_agent_config_rejects_removed_mixed_capability_fields() -> None:
+    models = _models()
+
+    with pytest.raises(ValueError, match="capabilities"):
+        models.AgentConfig.from_dict(
+            "legacy_agent",
+            {
+                "runtime_profile": "codex_remote",
+                "capabilities": ["read_repo"],
+            },
+        )
+
+    with pytest.raises(ValueError, match="dispatch_tags"):
+        models.AgentConfig.from_dict(
+            "legacy_dispatch_agent",
+            {
+                "runtime_profile": "codex_remote",
+                "dispatch_tags": ["read_repo"],
+            },
+        )
+
+
+def test_resolve_capability_refs_merges_all_packages() -> None:
+    models = _models()
+
+    packages = {
+        "repo": models.CapabilityPackageConfig.from_dict(
+            "repo",
+            {
+                "mcp_servers": ["github"],
+                "skills": ["code-review"],
+                "permissions": ["repo.read"],
+            },
+        ),
+        "runtime": models.CapabilityPackageConfig.from_dict(
+            "runtime",
+            {
+                "cli_tools": ["gitnexus"],
+                "permissions": ["repo.read", "runtime.dispatch"],
+            },
+        ),
+    }
+
+    resolved = models.resolve_capability_refs(["repo", "runtime"], packages)
+
+    assert [package["id"] for package in resolved["packages"]] == ["repo", "runtime"]
+    assert resolved["mcp_servers"] == ["github"]
+    assert resolved["skills"] == ["code-review"]
+    assert resolved["cli_tools"] == ["gitnexus"]
+    assert resolved["permissions"] == ["repo.read", "runtime.dispatch"]
 
 
 def test_task_and_artifact_status_are_independent() -> None:

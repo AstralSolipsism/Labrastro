@@ -174,7 +174,7 @@ class OpenAIResponsesProvider:
         if self.config.extra.get("send_temperature"):
             params["temperature"] = request.temperature
         if request.tools:
-            if not self.config.capabilities.tools:
+            if not self.config.api_features.tools:
                 raise RuntimeError(
                     f"Provider '{self.provider_id}' does not support tools"
                 )
@@ -182,7 +182,7 @@ class OpenAIResponsesProvider:
         if request.tool_choice:
             if (
                 request.tool_choice == "required"
-                and not self.config.capabilities.tool_choice_required
+                and not self.config.api_features.tool_choice_required
             ):
                 params["tool_choice"] = "auto"
                 diagnostics.append(
@@ -200,7 +200,7 @@ class OpenAIResponsesProvider:
             self.config, request, params, diagnostics
         )
         if request.reasoning_effort and not qwen_compat:
-            if self.config.capabilities.reasoning_effort:
+            if self.config.api_features.reasoning_effort:
                 reasoning: dict[str, Any] = {"effort": request.reasoning_effort}
                 summary = self.config.extra.get("reasoning_summary", "auto")
                 if summary:
@@ -219,7 +219,7 @@ class OpenAIResponsesProvider:
         if (
             request.thinking_enabled is not None
             and not qwen_compat
-            and not self.config.capabilities.thinking
+            and not self.config.api_features.thinking
         ):
             diagnostics.append(
                 ProviderDiagnostic(

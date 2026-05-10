@@ -80,7 +80,7 @@ def apply_openai_chat_reasoning(
             )
         )
         return
-    if config.capabilities.reasoning_effort:
+    if config.api_features.reasoning_effort:
         params["reasoning_effort"] = request.reasoning_effort
     else:
         diagnostics.append(
@@ -102,7 +102,7 @@ def apply_openai_chat_thinking(
 ) -> None:
     if request.thinking_enabled is None:
         return
-    if not config.capabilities.thinking:
+    if not config.api_features.thinking:
         diagnostics.append(
             ProviderDiagnostic(
                 code="thinking_unsupported",
@@ -176,7 +176,7 @@ def apply_openai_chat_tool_choice(
         )
     elif (
         request.tool_choice == "required"
-        and not config.capabilities.tool_choice_required
+        and not config.api_features.tool_choice_required
     ):
         params["tool_choice"] = "auto"
         diagnostics.append(

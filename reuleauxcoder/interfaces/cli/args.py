@@ -54,7 +54,7 @@ def parse_args():
     env_record.add_argument("--command", required=True, dest="tool_command")
     env_record.add_argument("--check", required=True)
     env_record.add_argument("--install")
-    env_record.add_argument("--capability", action="append", default=[])
+    env_record.add_argument("--tag", action="append", default=[])
     env_record.add_argument("--version")
     env_record.add_argument("--source")
     env_record.add_argument("--description")
@@ -89,7 +89,7 @@ def parse_args():
     provider_record.add_argument("--header", action="append", default=[])
     provider_record.add_argument("--timeout-sec", type=int, default=120)
     provider_record.add_argument("--max-retries", type=int, default=3)
-    provider_record.add_argument("--capability", action="append", default=[])
+    provider_record.add_argument("--api-feature", action="append", default=[])
     provider_record.add_argument("--extra", action="append", default=[])
 
     provider_test = provider_subparsers.add_parser(

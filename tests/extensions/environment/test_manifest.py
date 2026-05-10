@@ -20,7 +20,7 @@ def test_record_cli_tool_writes_global_manifest_shape(tmp_path: Path) -> None:
         EnvironmentCLIToolConfig(
             name="gitnexus",
             command="gitnexus",
-            capabilities=["repo_index"],
+            tags=["repo_index"],
             check="gitnexus --version",
             install="npm install -g gitnexus",
             source="npm",
@@ -31,7 +31,7 @@ def test_record_cli_tool_writes_global_manifest_shape(tmp_path: Path) -> None:
     tool = data["environment"]["cli_tools"]["gitnexus"]
     assert result.created is True
     assert tool["command"] == "gitnexus"
-    assert tool["capabilities"] == ["repo_index"]
+    assert tool["tags"] == ["repo_index"]
     assert tool["check"] == "gitnexus --version"
     assert tool["install"] == "npm install -g gitnexus"
     assert tool["source"] == "npm"
@@ -84,7 +84,7 @@ def test_run_env_record_cli_writes_default_global_manifest(
         SimpleNamespace(
             tool_name="gitnexus",
             tool_command="gitnexus",
-            capability=["repo_index"],
+            tag=["repo_index"],
             check="gitnexus --version",
             install="npm install -g gitnexus",
             version="1.2.3",
