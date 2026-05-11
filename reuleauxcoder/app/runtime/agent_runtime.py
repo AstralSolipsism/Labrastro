@@ -1,4 +1,4 @@
-"""Global server-side Agent runtime limiter."""
+﻿"""Interactive AgentRun slot limiter."""
 
 from __future__ import annotations
 
@@ -14,12 +14,12 @@ RuntimeWaitCallback = Callable[[dict[str, Any]], None]
 CancelPredicate = Callable[[], bool]
 
 
-class AgentRuntimeCancelled(RuntimeError):
-    """Raised when a queued runtime request is cancelled before it starts."""
+class AgentRunCancelled(RuntimeError):
+    """Raised when a queued interactive run is cancelled before it starts."""
 
 
-class AgentRuntimeLimiter:
-    """Coordinate global Agent slots and per-Agent shell slots."""
+class InteractiveRunLimiter:
+    """Coordinate in-process interactive AgentRun and shell slots."""
 
     def __init__(self, *, max_running_agents: int = 4, max_shells_per_agent: int = 1):
         self._max_running_agents = max(1, int(max_running_agents))
@@ -98,7 +98,7 @@ class AgentRuntimeLimiter:
                 if is_cancelled is not None and is_cancelled():
                     self._remove_from_queue(self._agent_queue, agent_id)
                     self._cond.notify_all()
-                    raise AgentRuntimeCancelled("agent_runtime_cancelled")
+                    raise AgentRunCancelled("agent_run_cancelled")
                 can_run = (
                     self._agent_queue
                     and self._agent_queue[0] == agent_id
@@ -189,7 +189,7 @@ class AgentRuntimeLimiter:
                 if is_cancelled is not None and is_cancelled():
                     self._remove_from_queue(queue, token)
                     self._cond.notify_all()
-                    raise AgentRuntimeCancelled("shell_runtime_cancelled")
+                    raise AgentRunCancelled("shell_run_cancelled")
                 can_run = (
                     queue
                     and queue[0] == token
@@ -254,9 +254,8 @@ class AgentRuntimeLimiter:
         except Exception:
             pass
 
+_GLOBAL_INTERACTIVE_RUN_LIMITER = InteractiveRunLimiter()
 
-_GLOBAL_AGENT_RUNTIME_LIMITER = AgentRuntimeLimiter()
 
-
-def get_agent_runtime_limiter() -> AgentRuntimeLimiter:
-    return _GLOBAL_AGENT_RUNTIME_LIMITER
+def get_interactive_run_limiter() -> InteractiveRunLimiter:
+    return _GLOBAL_INTERACTIVE_RUN_LIMITER

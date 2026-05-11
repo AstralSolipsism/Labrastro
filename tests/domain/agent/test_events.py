@@ -1,4 +1,4 @@
-from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
+﻿from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 
 
 def test_agent_event_chat_start_contains_user_input() -> None:
@@ -24,18 +24,18 @@ def test_agent_event_tool_call_end_keeps_full_long_result_with_preview() -> None
     assert event.data["tool_result_preview"] == "x" * 500
 
 
-def test_agent_event_subagent_completed_contains_payload() -> None:
-    event = AgentEvent.subagent_completed(
-        job_id="job-1",
-        mode="explore",
+def test_agent_event_delegated_run_completed_contains_payload() -> None:
+    event = AgentEvent.delegated_run_completed(
+        run_id="run-1",
+        agent_id="researcher",
         task="scan repo",
         status="ok",
         result="done",
         error=None,
     )
-    assert event.event_type is AgentEventType.SUBAGENT_COMPLETED
-    assert event.data["job_id"] == "job-1"
-    assert event.data["mode"] == "explore"
+    assert event.event_type is AgentEventType.DELEGATED_RUN_COMPLETED
+    assert event.data["run_id"] == "run-1"
+    assert event.data["agent_id"] == "researcher"
     assert event.data["status"] == "ok"
     assert event.data["result"] == "done"
 

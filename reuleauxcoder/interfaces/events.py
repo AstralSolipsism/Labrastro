@@ -259,7 +259,7 @@ class AgentEventBridge:
         elif event.event_type in (
             AgentEventType.TOOL_CALL_START,
             AgentEventType.TOOL_CALL_END,
-            AgentEventType.SUBAGENT_COMPLETED,
+            AgentEventType.DELEGATED_RUN_COMPLETED,
         ):
             level = UIEventLevel.DEBUG
 

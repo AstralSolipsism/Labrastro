@@ -14,7 +14,7 @@ class AgentEventType(Enum):
     STREAM_TOKEN = "stream_token"
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
-    SUBAGENT_COMPLETED = "subagent_completed"
+    DELEGATED_RUN_COMPLETED = "delegated_run_completed"
     COMPRESSION_START = "compression_start"
     COMPRESSION_END = "compression_end"
     USAGE_UPDATE = "usage_update"
@@ -141,22 +141,22 @@ class AgentEvent:
         )
 
     @classmethod
-    def subagent_completed(
+    def delegated_run_completed(
         cls,
         *,
-        job_id: str,
-        mode: str,
+        run_id: str,
+        agent_id: str,
         task: str,
         status: str,
         result: str | None = None,
         error: str | None = None,
     ) -> "AgentEvent":
-        """Create a sub-agent completion event."""
+        """Create a delegated AgentRun completion event."""
         return cls(
-            event_type=AgentEventType.SUBAGENT_COMPLETED,
+            event_type=AgentEventType.DELEGATED_RUN_COMPLETED,
             data={
-                "job_id": job_id,
-                "mode": mode,
+                "run_id": run_id,
+                "agent_id": agent_id,
                 "task": task,
                 "status": status,
                 "result": result,

@@ -167,9 +167,9 @@ class AppRunner:
 
     @staticmethod
     def _wire_agent_tool_parent(agent: Agent) -> None:
-        """Inject parent agent into the nested agent tool if present."""
+        """Inject parent agent into the delegation tool if present."""
         for tool in agent.tools:
-            if tool.name == "agent":
+            if tool.name == "delegate_agent":
                 tool._parent_agent = agent
 
     def _attach_mcp_if_configured(

@@ -50,24 +50,13 @@ def make_cli_handler(ui_interactor: UIInteractor) -> ApprovalHandler:
                 }
             )
 
-        # ── Sub-agent attribution ──
-        subagent_summary = ""
-        if req.metadata.get("is_subagent"):
-            sub_mode = req.metadata.get("subagent_mode") or "unknown"
-            sub_task = str(req.metadata.get("subagent_task") or "").strip()
-            if len(sub_task) > 200:
-                sub_task = sub_task[:180] + "..."
-            subagent_summary = f"\nSource: sub-agent (mode={sub_mode})"
-            if sub_task:
-                subagent_summary += f"\nSub-agent task: {sub_task}"
-
         # ── Blocking UI review (same thread — safe) ──
         response = ui_interactor.review(
             ReviewRequest(
                 title=f"Approval required: {req.tool_name}",
                 summary=(
                     f"Tool '{req.tool_name}' from source '{req.tool_source}'"
-                    f" requires approval.{subagent_summary}"
+                    " requires approval."
                 ),
                 sections=sections,
                 metadata={

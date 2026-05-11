@@ -1,4 +1,4 @@
-"""Remote relay bootstrap and peer chat binding helpers."""
+﻿"""Remote relay bootstrap and peer chat binding helpers."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ from reuleauxcoder.app.runtime.session_state import (
     restore_config_runtime_defaults,
 )
 from reuleauxcoder.app.runtime.agent_runtime import (
-    AgentRuntimeCancelled,
-    get_agent_runtime_limiter,
+    AgentRunCancelled,
+    get_interactive_run_limiter,
 )
 from reuleauxcoder.domain.agent.agent import Agent
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
@@ -30,7 +30,7 @@ from reuleauxcoder.domain.approval import (
     ApprovalRequest,
     PendingApproval,
 )
-from reuleauxcoder.domain.config.models import Config
+from reuleauxcoder.domain.config.models import Config, build_agent_run_snapshot
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
@@ -433,6 +433,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
     """Bind remote chat handlers for interactive peers."""
     if runner._relay_http_service is None or runner._relay_server is None:
         return
+    setattr(agent, "agent_run_control_plane", runner._relay_http_service.runtime_control_plane)
 
     relay_server: RelayServer = runner._relay_server
     config = getattr(agent, "runtime_config", None)
@@ -448,11 +449,11 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         config, sessions_dir
     )
     startup_announced: set[tuple[str, str, str]] = set()
-    agent_runtime_limiter = get_agent_runtime_limiter()
+    interactive_run_limiter = get_interactive_run_limiter()
     if config is not None:
-        agent_runtime_limiter.configure(
-            max_running_agents=config.agent_runtime.max_running_agents,
-            max_shells_per_agent=config.agent_runtime.max_shells_per_agent,
+        interactive_run_limiter.configure(
+            max_running_agents=config.run_limits.max_running_agents,
+            max_shells_per_agent=config.run_limits.max_shells_per_agent,
         )
 
     def _current_config() -> Config | None:
@@ -468,15 +469,18 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if errors:
             raise ValueError("; ".join(errors))
         runtime_config["value"] = next_config
-        agent_runtime_limiter.configure(
-            max_running_agents=next_config.agent_runtime.max_running_agents,
-            max_shells_per_agent=next_config.agent_runtime.max_shells_per_agent,
+        interactive_run_limiter.configure(
+            max_running_agents=next_config.run_limits.max_running_agents,
+            max_shells_per_agent=next_config.run_limits.max_shells_per_agent,
         )
         if runner._relay_http_service.runtime_control_plane is not None:
             runner._relay_http_service.runtime_control_plane.configure(
-                max_running_tasks=next_config.agent_runtime.max_running_agents,
-                runtime_snapshot=next_config.agent_runtime.to_runtime_snapshot(
-                    next_config.capability_packages
+                max_running_tasks=next_config.run_limits.max_running_agents,
+                runtime_snapshot=build_agent_run_snapshot(
+                    agent_registry=next_config.agent_registry,
+                    runtime_profiles=next_config.runtime_profiles,
+                    run_limits=next_config.run_limits,
+                    capability_packages=next_config.capability_packages,
                 ),
             )
         runner._relay_http_service.mcp_servers = list(next_config.mcp_servers)
@@ -635,7 +639,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 ),
             )
             active_mode = getattr(current_config, "active_mode", None)
-            agent_config = getattr(current_config.agent_runtime, "agents", {}).get(
+            agent_config = getattr(current_config.agent_registry, "agents", {}).get(
                 active_mode
             )
             agent_model = getattr(agent_config, "model", None)
@@ -846,6 +850,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if server_mcp_tools:
             peer_agent.add_tools(server_mcp_tools)
         setattr(peer_agent, "runtime_config", current_config)
+        if runner._relay_http_service is not None:
+            setattr(
+                peer_agent,
+                "agent_run_control_plane",
+                runner._relay_http_service.runtime_control_plane,
+            )
         setattr(peer_agent, "skills_service", skills_service)
         setattr(peer_agent, "skills_catalog", getattr(agent, "skills_catalog", ""))
         runner._register_hooks(peer_agent, current_config)
@@ -925,7 +935,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         runtime_agent_id = f"chat:{uuid.uuid4().hex[:12]}"
         setattr(peer_agent, "runtime_agent_id", runtime_agent_id)
         try:
-            with agent_runtime_limiter.agent_slot(
+            with interactive_run_limiter.agent_slot(
                 runtime_agent_id,
                 agent_type="chat",
                 label=peer_id,
@@ -1006,14 +1016,14 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             remote_session.append_event("runtime_status", payload)
 
         try:
-            agent_runtime_limiter.acquire_agent_slot(
+            interactive_run_limiter.acquire_agent_slot(
                 runtime_agent_id,
                 agent_type="chat",
                 label=peer_id,
                 is_cancelled=lambda: bool(getattr(remote_session, "cancel_requested", False)),
                 on_wait=_emit_runtime_status,
             )
-        except AgentRuntimeCancelled:
+        except AgentRunCancelled:
             remote_session.append_event(
                 "chat_cancelled",
                 {"reason": getattr(remote_session, "cancel_reason", "user_cancelled")},
@@ -1080,7 +1090,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     )
                 _save_peer_session(peer_agent, peer_id)
                 remote_session.append_event("chat_end", {"response": ""})
-                agent_runtime_limiter.release_agent_slot(runtime_agent_id)
+                interactive_run_limiter.release_agent_slot(runtime_agent_id)
                 return
 
         ansi_console = Console(
@@ -1341,8 +1351,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "error", {"message": event.error_message or "unknown error"}
                 )
                 return
-            elif event.event_type == AgentEventType.SUBAGENT_COMPLETED:
-                remote_session.append_event("subagent_completed", event.data)
+            elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
+                remote_session.append_event("delegated_run_completed", event.data)
                 return
 
         previous_approval = peer_agent.approval_provider
@@ -1380,7 +1390,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 peer_agent._event_handlers.remove(_on_agent_event)
             except ValueError:
                 pass
-            agent_runtime_limiter.release_agent_slot(runtime_agent_id)
+            interactive_run_limiter.release_agent_slot(runtime_agent_id)
             renderer.close()
 
     runner._relay_http_service.set_chat_handler(_chat)

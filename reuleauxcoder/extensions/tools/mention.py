@@ -16,7 +16,7 @@ class MentionAgentTool(Tool):
     description = (
         "Parse or record an @agent mention for issue/task collaboration. This "
         "tool can create mention and assignment records, but it cannot dispatch "
-        "or create runtime tasks."
+        "or create AgentRuns."
     )
     parameters = {
         "type": "object",

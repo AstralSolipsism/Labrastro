@@ -1,4 +1,4 @@
-from reuleauxcoder.domain.agent.events import AgentEvent
+﻿from reuleauxcoder.domain.agent.events import AgentEvent
 from reuleauxcoder.interfaces.events import (
     AgentEventBridge,
     UIEvent,

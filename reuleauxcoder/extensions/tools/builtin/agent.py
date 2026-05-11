@@ -1,78 +1,41 @@
-"""Sub-agent spawning tool."""
+﻿"""Delegated AgentRun spawning tool."""
 
 from __future__ import annotations
 
-from reuleauxcoder.extensions.subagent.manager import get_subagent_manager
+import json
+
+from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
 
 
 @register_tool
-class AgentTool(Tool):
-    name = "agent"
+class DelegateAgentTool(Tool):
+    name = "delegate_agent"
     description = (
-        "Spawn one or more sub-agents to handle complex sub-tasks independently. "
-        "Each sub-agent has isolated context and tool access. "
-        "Pass a list of task strings via the 'tasks' parameter: "
-        "a single-element list for one sub-agent, multiple elements for batch parallel jobs. "
-        "Single tasks support synchronous execution in any mode. "
-        "Background jobs require mode='explore'; batch tasks (multiple elements) "
-        "run as explore-mode background jobs. "
-        "Optionally set 'model' to 'sub' or 'main'. "
-        "'sub' uses the configured default sub-agent model; "
-        "'main' uses the configured main-agent model. "
-        "If omitted or invalid, 'sub' is used. "
-        "parallel_explore sets the runtime explore parallelism cap (1-4)."
+        "Delegate work to a configured persistent Agent. "
+        "The target must be an AgentConfig id from the server Agent Registry. "
+        "Each delegation creates a durable AgentRun with source='delegation'."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "tasks": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Sub-agent tasks. Use a single-element list for one task. "
-                    "Use multiple items only with mode='explore' and run_in_background=true."
-                ),
-            },
-            "mode": {
+            "agent_id": {
                 "type": "string",
-                "enum": ["explore", "execute", "verify"],
-                "description": "Sub-agent mode (default: explore)",
+                "description": "Persistent AgentConfig id to run.",
             },
-            "run_in_background": {
-                "type": "boolean",
-                "description": "Run in background; only supported for explore mode",
-            },
-            "max_rounds": {
-                "type": "integer",
-                "description": "Maximum sub-agent rounds (default: 50)",
-                "minimum": 1,
-            },
-            "timeout_seconds": {
-                "type": "integer",
-                "description": "Sub-agent timeout in seconds (default: 300)",
-                "minimum": 1,
-            },
-            "parallel_explore": {
-                "type": "integer",
-                "description": "Runtime explore parallelism cap for this parent (1-4)",
-                "minimum": 1,
-                "maximum": 4,
-            },
-            "model": {
+            "task": {
                 "type": "string",
-                "enum": ["sub", "main"],
-                "description": (
-                    "Optional model route for the sub-agent. "
-                    "'sub' uses the configured default sub-agent model; "
-                    "'main' uses the configured main-agent model. "
-                    "If omitted, defaults to 'sub'."
-                ),
+                "description": "Concrete work prompt for the delegated AgentRun.",
+            },
+            "run_mode": {
+                "type": "string",
+                "enum": ["background"],
+                "description": "Delegated AgentRuns are submitted as background work.",
             },
         },
-        "required": ["tasks"],
+        "required": ["agent_id", "task"],
     }
 
     _parent_agent = None
@@ -80,131 +43,87 @@ class AgentTool(Tool):
     def __init__(self, backend: ToolBackend | None = None):
         super().__init__(backend or LocalToolBackend())
 
-    @staticmethod
-    def _normalize_tasks(tasks: object) -> list[str]:
-        if not isinstance(tasks, list):
-            return []
-        return [
-            item.strip()
-            for item in tasks
-            if isinstance(item, str) and item.strip()
-        ]
-
     def preflight_validate(self, **kwargs) -> str | None:
-        tasks = kwargs.get("tasks")
-        mode = kwargs.get("mode", "explore")
-        run_in_background = kwargs.get("run_in_background", False)
-
-        task_list = self._normalize_tasks(tasks)
-
-        if not task_list:
-            return "Error: 'tasks' must be a non-empty list of task strings."
-
-        if run_in_background and mode != "explore":
-            return "Error: background sub-agent jobs require mode='explore'."
-
-        if len(task_list) > 1 and (mode != "explore" or not run_in_background):
-            return (
-                "Error: batch tasks require mode='explore' "
-                "and run_in_background=true."
-            )
-
-        if (
-            not get_subagent_manager(self._parent_agent).is_valid_mode(mode)
-            if self._parent_agent is not None
-            else False
-        ):
-            return f"Error: unsupported sub-agent mode '{mode}'."
-
+        agent_id = str(kwargs.get("agent_id") or "").strip()
+        task = str(kwargs.get("task") or "").strip()
+        if not agent_id:
+            return "Error: 'agent_id' is required."
+        if not task:
+            return "Error: 'task' is required."
+        if self._parent_agent is None:
+            return "Error: delegate_agent is not initialized with a parent Agent."
+        if self._runtime_control_plane() is None:
+            return "Error: AgentRun control plane is unavailable."
+        if not self._agent_exists(agent_id):
+            return f"Error: AgentConfig not found: {agent_id}"
         return None
 
     def execute(
         self,
-        tasks: list[str] | None = None,
-        mode: str = "explore",
-        run_in_background: bool = False,
-        max_rounds: int = 50,
-        timeout_seconds: int = 300,
-        parallel_explore: int | None = None,
-        model: str | None = None,
+        agent_id: str = "",
+        task: str = "",
+        run_mode: str = "background",
     ) -> str:
         if self._parent_agent is None:
-            return "Error: agent tool not initialized (no parent agent)"
-
-        return self.run_backend(
-            tasks=tasks,
-            mode=mode,
-            run_in_background=run_in_background,
-            max_rounds=max_rounds,
-            timeout_seconds=timeout_seconds,
-            parallel_explore=parallel_explore,
-            model=model,
-        )
+            return "Error: delegate_agent is not initialized with a parent Agent."
+        return self.run_backend(agent_id=agent_id, task=task, run_mode=run_mode)
 
     @backend_handler("local")
     def _execute_local(
         self,
-        tasks: list[str] | None = None,
-        mode: str = "explore",
-        run_in_background: bool = False,
-        max_rounds: int = 50,
-        timeout_seconds: int = 300,
-        parallel_explore: int | None = None,
-        model: str | None = None,
+        agent_id: str = "",
+        task: str = "",
+        run_mode: str = "background",
     ) -> str:
-        parent = self._parent_agent
-        if parent is None:
-            return "Error: agent tool not initialized (no parent agent)"
-
-        validation_error = self.preflight_validate(
-            tasks=tasks,
-            mode=mode,
-            run_in_background=run_in_background,
-        )
+        validation_error = self.preflight_validate(agent_id=agent_id, task=task)
         if validation_error:
             return validation_error
 
-        manager = get_subagent_manager(parent)
-        effective_max_rounds = max(1, int(max_rounds or manager.default_max_rounds))
-        effective_timeout = max(1, int(timeout_seconds or 300))
-        model_route = (model or "sub").strip().lower()
-        if model_route not in {"sub", "main"}:
-            model_route = "sub"
+        parent = self._parent_agent
+        control = self._runtime_control_plane()
+        parent_run_id = str(getattr(parent, "runtime_agent_id", "") or "")
+        metadata = {
+            "agent_run_source": "delegation",
+            "delegated_by_run_id": parent_run_id,
+            "run_mode": run_mode or "background",
+        }
+        current_session_id = getattr(parent, "current_session_id", None)
+        if current_session_id:
+            metadata["parent_session_id"] = str(current_session_id)
+        workspace_root = getattr(parent, "runtime_working_directory", None)
+        if workspace_root:
+            metadata["workspace_root"] = str(workspace_root)
 
-        task_list = self._normalize_tasks(tasks)
-        if len(task_list) == 1:
-            single_task = task_list[0]
-            if run_in_background:
-                job_id = manager.submit_background(
-                    parent_agent=parent,
-                    task=single_task,
-                    mode=mode,
-                    max_rounds=effective_max_rounds,
-                    timeout_seconds=effective_timeout,
-                    parallel_explore=parallel_explore,
-                    model_profile_name=model_route,
-                )
-                return f"Sub-agent job started in background: {job_id}"
-
-            return manager.run_sync(
-                parent_agent=parent,
-                task=single_task,
-                mode=mode,
-                max_rounds=effective_max_rounds,
-                timeout_seconds=effective_timeout,
-                model_profile_name=model_route,
+        run = control.submit_agent_run(
+            AgentRunRequest(
+                issue_id=f"delegation:{agent_id}",
+                agent_id=str(agent_id).strip(),
+                prompt=str(task).strip(),
+                source="delegation",
+                delegated_by_run_id=parent_run_id or None,
+                parent_run_id=parent_run_id or None,
+                workdir=str(workspace_root) if workspace_root else None,
+                metadata=metadata,
             )
+        )
+        payload = {
+            "agent_run_id": run.id,
+            "agent_id": run.agent_id,
+            "source": run.source.value,
+            "status": run.status.value,
+        }
+        return "Delegated AgentRun submitted: " + json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
 
-        job_ids: list[str] = []
-        for item in task_list:
-            job_id = manager.submit_background(
-                parent_agent=parent,
-                task=item,
-                mode=mode,
-                max_rounds=effective_max_rounds,
-                timeout_seconds=effective_timeout,
-                parallel_explore=parallel_explore,
-                model_profile_name=model_route,
-            )
-            job_ids.append(job_id)
-        return f"Started {len(job_ids)} background sub-agent jobs: {', '.join(job_ids)}"
+    def _runtime_control_plane(self):
+        parent = self._parent_agent
+        return getattr(parent, "agent_run_control_plane", None)
+
+    def _agent_exists(self, agent_id: str) -> bool:
+        config = getattr(self._parent_agent, "runtime_config", None)
+        registry = getattr(config, "agent_registry", None)
+        agents = getattr(registry, "agents", {}) if registry is not None else {}
+        return str(agent_id).strip() in agents

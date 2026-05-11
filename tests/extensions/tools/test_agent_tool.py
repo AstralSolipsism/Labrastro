@@ -1,169 +1,78 @@
-from unittest import mock
+﻿from types import SimpleNamespace
 
-from reuleauxcoder.extensions.tools.builtin.agent import AgentTool
+from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
+from reuleauxcoder.domain.agent_runtime.models import AgentConfig
+from reuleauxcoder.domain.config.models import AgentRegistryConfig, Config
+from reuleauxcoder.extensions.tools.builtin.agent import DelegateAgentTool
 
 
-class _SubagentManagerStub:
-    default_max_rounds = 50
-
+class _ControlPlaneStub:
     def __init__(self) -> None:
-        self.sync_calls: list[dict] = []
-        self.background_calls: list[dict] = []
+        self.requests: list[AgentRunRequest] = []
 
-    def is_valid_mode(self, mode: str) -> bool:
-        return mode in {"explore", "execute", "verify"}
-
-    def run_sync(self, **kwargs) -> str:
-        self.sync_calls.append(kwargs)
-        return f"sync:{kwargs['task']}"
-
-    def submit_background(self, **kwargs) -> str:
-        self.background_calls.append(kwargs)
-        return f"job-{len(self.background_calls)}"
-
-
-def _tool() -> AgentTool:
-    tool = AgentTool()
-    tool._parent_agent = object()
-    return tool
-
-
-def test_agent_tool_schema_requires_tasks_only() -> None:
-    properties = AgentTool.parameters["properties"]
-
-    assert "task" not in properties
-    assert "tasks" in properties
-    assert AgentTool.parameters["required"] == ["tasks"]
-
-
-def test_agent_tool_rejects_legacy_task_argument() -> None:
-    tool = AgentTool()
-
-    assert (
-        tool.preflight_validate(task="old")
-        == "Error: 'tasks' must be a non-empty list of task strings."
-    )
-
-
-def test_agent_tool_rejects_empty_tasks() -> None:
-    tool = AgentTool()
-
-    assert (
-        tool.preflight_validate(tasks=[])
-        == "Error: 'tasks' must be a non-empty list of task strings."
-    )
-    assert (
-        tool.preflight_validate(tasks=[" ", ""])
-        == "Error: 'tasks' must be a non-empty list of task strings."
-    )
-    assert (
-        tool.preflight_validate(tasks="scan")
-        == "Error: 'tasks' must be a non-empty list of task strings."
-    )
-
-
-def test_agent_tool_syncs_single_task() -> None:
-    manager = _SubagentManagerStub()
-    tool = _tool()
-
-    with mock.patch(
-        "reuleauxcoder.extensions.tools.builtin.agent.get_subagent_manager",
-        return_value=manager,
-    ):
-        result = tool.execute(
-            tasks=[" scan "],
-            mode="verify",
-            run_in_background=False,
-            max_rounds=3,
-            timeout_seconds=4,
-            model="main",
+    def submit_agent_run(self, request: AgentRunRequest):
+        self.requests.append(request)
+        return SimpleNamespace(
+            id="run-1",
+            agent_id=request.agent_id,
+            source=request.source,
+            status=SimpleNamespace(value="queued"),
         )
 
-    assert result == "sync:scan"
-    assert manager.sync_calls == [
-        {
-            "parent_agent": tool._parent_agent,
-            "task": "scan",
-            "mode": "verify",
-            "max_rounds": 3,
-            "timeout_seconds": 4,
-            "model_profile_name": "main",
-        }
-    ]
-    assert manager.background_calls == []
+
+def _tool() -> tuple[DelegateAgentTool, _ControlPlaneStub]:
+    control = _ControlPlaneStub()
+    config = Config(
+        api_key="test",
+        agent_registry=AgentRegistryConfig(
+            agents={
+                "reviewer": AgentConfig(
+                    id="reviewer",
+                    name="Reviewer",
+                    description="Review code changes.",
+                )
+            }
+        ),
+    )
+    parent = SimpleNamespace(
+        runtime_config=config,
+        agent_run_control_plane=control,
+        runtime_agent_id="chat:parent",
+        current_session_id="session-1",
+        runtime_working_directory="/workspace",
+    )
+    tool = DelegateAgentTool()
+    tool._parent_agent = parent
+    return tool, control
 
 
-def test_agent_tool_rejects_background_non_explore_task() -> None:
-    tool = _tool()
+def test_delegate_agent_schema_requires_agent_and_task() -> None:
+    assert DelegateAgentTool.name == "delegate_agent"
+    assert DelegateAgentTool.parameters["required"] == ["agent_id", "task"]
+    assert "tasks" not in DelegateAgentTool.parameters["properties"]
+
+
+def test_delegate_agent_rejects_missing_agent_config() -> None:
+    tool, _control = _tool()
 
     assert (
-        tool.preflight_validate(
-            tasks=["scan"],
-            mode="execute",
-            run_in_background=True,
-        )
-        == "Error: background sub-agent jobs require mode='explore'."
+        tool.preflight_validate(agent_id="missing", task="review")
+        == "Error: AgentConfig not found: missing"
     )
 
 
-def test_agent_tool_starts_single_background_task() -> None:
-    manager = _SubagentManagerStub()
-    tool = _tool()
+def test_delegate_agent_submits_agent_run() -> None:
+    tool, control = _tool()
 
-    with mock.patch(
-        "reuleauxcoder.extensions.tools.builtin.agent.get_subagent_manager",
-        return_value=manager,
-    ):
-        result = tool.execute(
-            tasks=["scan"],
-            mode="explore",
-            run_in_background=True,
-            parallel_explore=2,
-        )
+    result = tool.execute(agent_id="reviewer", task="review this diff")
 
-    assert result == "Sub-agent job started in background: job-1"
-    assert [call["task"] for call in manager.background_calls] == ["scan"]
-    assert manager.background_calls[0]["mode"] == "explore"
-    assert manager.background_calls[0]["parallel_explore"] == 2
-    assert manager.sync_calls == []
-
-
-def test_agent_tool_starts_batch_background_tasks_in_explore_mode() -> None:
-    manager = _SubagentManagerStub()
-    tool = _tool()
-
-    with mock.patch(
-        "reuleauxcoder.extensions.tools.builtin.agent.get_subagent_manager",
-        return_value=manager,
-    ):
-        result = tool.execute(
-            tasks=["a", "b"],
-            mode="explore",
-            run_in_background=True,
-        )
-
-    assert result == "Started 2 background sub-agent jobs: job-1, job-2"
-    assert [call["task"] for call in manager.background_calls] == ["a", "b"]
-    assert {call["mode"] for call in manager.background_calls} == {"explore"}
-    assert manager.sync_calls == []
-
-
-def test_agent_tool_rejects_batch_without_background_explore() -> None:
-    tool = _tool()
-
-    assert (
-        tool.preflight_validate(
-            tasks=["a", "b"],
-            mode="explore",
-            run_in_background=False,
-        )
-        == "Error: batch tasks require mode='explore' and run_in_background=true."
-    )
-    assert (
-        tool.preflight_validate(
-            tasks=["a", "b"],
-            mode="verify",
-            run_in_background=True,
-        )
-        == "Error: background sub-agent jobs require mode='explore'."
-    )
+    assert "Delegated AgentRun submitted" in result
+    assert len(control.requests) == 1
+    request = control.requests[0]
+    assert request.agent_id == "reviewer"
+    assert request.prompt == "review this diff"
+    assert request.source.value == "delegation"
+    assert request.delegated_by_run_id == "chat:parent"
+    assert request.parent_run_id == "chat:parent"
+    assert request.workdir == "/workspace"
+    assert request.metadata["parent_session_id"] == "session-1"

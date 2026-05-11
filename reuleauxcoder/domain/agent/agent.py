@@ -18,7 +18,6 @@ from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
 from reuleauxcoder.domain.config.models import ModeConfig
 from reuleauxcoder.domain.context.manager import ContextManager
 from reuleauxcoder.domain.hooks import HookBase, HookPoint, HookRegistry
-from reuleauxcoder.extensions.subagent.manager import get_subagent_manager
 from reuleauxcoder.infrastructure.platform import get_platform_info
 from reuleauxcoder.services.prompt.builder import system_prompt
 
@@ -97,7 +96,6 @@ class Agent:
 
         # Event handlers
         self._event_handlers: List[Callable[[AgentEvent], None]] = []
-        self._pending_subagent_injections: list[tuple[object, str, bool]] = []
 
         # Activate initial mode if available
         if self.available_modes:
@@ -247,112 +245,15 @@ class Agent:
                 return t
         return None
 
-    @staticmethod
-    def _format_subagent_job_message(job) -> tuple[str, bool]:
-        if job.status == "completed":
-            content = (
-                "[Background sub-agent completed]\n"
-                f"id={job.id}\n"
-                f"mode={job.mode}\n"
-                f"task={job.task}\n\n"
-                f"{job.result or '(empty)'}\n"
-                "[/Background sub-agent completed]"
-            )
-            return content, True
-
-        error_text = (
-            "[Background sub-agent failed]\n"
-            f"id={job.id}\n"
-            f"mode={job.mode}\n"
-            f"task={job.task}\n\n"
-            f"{job.error or 'unknown error'}\n"
-            "[/Background sub-agent failed]"
-        )
-        return error_text, False
-
-    def inject_subagent_job_result(self, job) -> bool:
-        """Inject one finished sub-agent job into parent history when safe."""
-        with self._state_lock:
-            if getattr(job, "injected_to_parent", False):
-                return False
-            job.injected_to_parent = True
-            content, success = self._format_subagent_job_message(job)
-            if self._collect_pending_tool_calls():
-                self._pending_subagent_injections.append((job, content, success))
-                return True
-            self.state.messages.append({"role": "assistant", "content": content})
-
-        self._emit_subagent_completion_events(job, content, success)
-        return True
-
-    def _flush_pending_subagent_injections(self) -> int:
-        """Append buffered sub-agent summaries once tool-call parity is restored."""
-        with self._state_lock:
-            if not self._pending_subagent_injections:
-                return 0
-            if self._collect_pending_tool_calls():
-                return 0
-
-            pending = list(self._pending_subagent_injections)
-            self._pending_subagent_injections.clear()
-            for _job, content, _success in pending:
-                self.state.messages.append({"role": "assistant", "content": content})
-
-        for job, content, success in pending:
-            self._emit_subagent_completion_events(job, content, success)
-        return len(pending)
-
-    def _emit_subagent_completion_events(self, job, content: str, success: bool) -> None:
-        if success:
-            self._emit_event(
-                AgentEvent.subagent_completed(
-                    job_id=job.id,
-                    mode=job.mode,
-                    task=job.task,
-                    status=job.status,
-                    result=job.result,
-                )
-            )
-        else:
-            self._emit_event(
-                AgentEvent.subagent_completed(
-                    job_id=job.id,
-                    mode=job.mode,
-                    task=job.task,
-                    status=job.status,
-                    error=job.error,
-                )
-            )
-        self._emit_event(AgentEvent.tool_call_end("agent", content, success=success))
-
-    def _inject_completed_subagent_jobs(self) -> int:
-        """Inject completed background sub-agent summaries into parent history."""
-        try:
-            manager = get_subagent_manager(self)
-        except Exception:
-            return 0
-
-        injected = 0
-        for job in manager.drain_completed_for_parent(
-            parent_state_lock=self._state_lock,
-        ):
-            if self.inject_subagent_job_result(job):
-                injected += 1
-        return injected
-
     def chat(self, user_input: str, *, clear_stop_request: bool = True) -> str:
         """Process one user message."""
         if clear_stop_request:
             self.clear_stop_request()
 
-        # Inject completed background sub-agent results before each new user turn.
-        self._inject_completed_subagent_jobs()
-
         # Repair stale dangling tool calls (e.g. after previous crash/interruption)
         self.reconcile_pending_tool_calls(
             reason="Recovered from previous interrupted turn."
         )
-        self._flush_pending_subagent_injections()
 
         self._emit_event(AgentEvent.chat_start(user_input))
 
@@ -367,7 +268,6 @@ class Agent:
             self.reconcile_pending_tool_calls(
                 reason=f"Interrupted due to {type(e).__name__}."
             )
-            self._flush_pending_subagent_injections()
             self._emit_usage_event("error")
             raise
 
@@ -413,7 +313,6 @@ class Agent:
         self.state.total_cost_usd = None
         self.state.usage_extra.clear()
         self.state.current_round = 0
-        self._pending_subagent_injections.clear()
 
     @property
     def messages(self) -> list[dict]:

@@ -277,8 +277,6 @@ class AgentLoop:
                         )
                         self._emit_usage_update()
 
-            self.agent._flush_pending_subagent_injections()
-
             # Compress if tool outputs are big
             self.agent.context.maybe_compress(
                 self.agent.state.messages,

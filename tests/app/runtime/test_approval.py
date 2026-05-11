@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 from reuleauxcoder.app.runtime.approval import (
     find_matching_rule,

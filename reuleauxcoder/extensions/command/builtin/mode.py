@@ -170,9 +170,6 @@ def _build_mode_profiles_payload(config, active_mode: str | None) -> dict:
             marker = " ✓" if is_active else ""
 
             tools = list(getattr(m, "tools", []) or [])
-            allowed_subagent_modes = list(
-                getattr(m, "allowed_subagent_modes", []) or []
-            )
             prompt_append = getattr(m, "prompt_append", "") or ""
 
             mode_items.append(
@@ -182,7 +179,6 @@ def _build_mode_profiles_payload(config, active_mode: str | None) -> dict:
                     "description": getattr(m, "description", "") or "",
                     "tools": tools,
                     "prompt_append": prompt_append,
-                    "allowed_subagent_modes": allowed_subagent_modes,
                 }
             )
 
@@ -196,14 +192,6 @@ def _build_mode_profiles_payload(config, active_mode: str | None) -> dict:
                     if "*" in tools
                     else ", ".join(f"`{t}`" for t in tools)
                     if tools
-                    else "(none)"
-                )
-            )
-            lines.append(
-                "  - allowed_subagent_modes: "
-                + (
-                    ", ".join(f"`{n}`" for n in allowed_subagent_modes)
-                    if allowed_subagent_modes
                     else "(none)"
                 )
             )

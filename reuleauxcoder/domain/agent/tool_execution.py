@@ -1,4 +1,4 @@
-"""Tool execution - handles tool calls."""
+﻿"""Tool execution - handles tool calls."""
 
 from __future__ import annotations
 from typing import TYPE_CHECKING, List
@@ -11,8 +11,8 @@ if TYPE_CHECKING:
 
 from reuleauxcoder.domain.agent.events import AgentEvent
 from reuleauxcoder.app.runtime.agent_runtime import (
-    AgentRuntimeCancelled,
-    get_agent_runtime_limiter,
+    AgentRunCancelled,
+    get_interactive_run_limiter,
 )
 from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.hooks.types import (
@@ -183,7 +183,7 @@ class ToolExecutor:
                 def _emit_shell_runtime(payload: dict) -> None:
                     self.agent._emit_event(AgentEvent.runtime_status(payload))
 
-                shell_context = get_agent_runtime_limiter().shell_slot(
+                shell_context = get_interactive_run_limiter().shell_slot(
                     agent_id,
                     tool_call_id=tool_call.id,
                     is_cancelled=getattr(
@@ -214,7 +214,7 @@ class ToolExecutor:
             message = f"Error: bad arguments for {tool_call.name}: {e}"
             self._emit_tool_end(tool_call, message, success=False, tool=tool)
             return message
-        except AgentRuntimeCancelled:
+        except AgentRunCancelled:
             message = f"Tool '{tool_call.name}' cancelled while waiting for runtime slot"
             self._emit_tool_end(tool_call, message, success=False, tool=tool)
             return message

@@ -101,8 +101,7 @@ ApprovalJudge = Callable[["ApprovalRequest"], "ApprovalDecision | None"]
 """A pre-approval judge that can short-circuit the human handler.
 
 Returns ``ApprovalDecision`` to auto-approve/deny without user input,
-or ``None`` to escalate to the human handler.  Used by sub-agents to
-let the parent LLM decide before asking the user.
+or ``None`` to escalate to the human handler.
 """
 
 
@@ -111,7 +110,7 @@ class SharedApprovalProvider(ApprovalProvider):
 
     Optional *judges* run before the human handler.  Each judge may
     return an ``ApprovalDecision`` (auto-resolve) or ``None``
-    (escalate).  Sub-agents inject a ``ParentLLMJudge`` here.
+    (escalate).
     """
 
     def __init__(
@@ -129,7 +128,7 @@ class SharedApprovalProvider(ApprovalProvider):
         return self._handler
 
     def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
-        # ── Pre-approval judges (e.g. parent LLM for sub-agents) ──
+        # ── Pre-approval judges ──
         for judge in self._judges:
             decision = judge(request)
             if decision is not None:

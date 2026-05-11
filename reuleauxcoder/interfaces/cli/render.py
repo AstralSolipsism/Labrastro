@@ -144,8 +144,8 @@ class CLIRenderer:
                 event.tool_result,
                 success=event.tool_success if event.tool_success is not None else True,
             )
-        elif event.event_type == AgentEventType.SUBAGENT_COMPLETED:
-            self._render_subagent_completed(event.data)
+        elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
+            self._render_delegated_run_completed(event.data)
         elif event.event_type == AgentEventType.CHAT_END:
             self.finalize_response(
                 event.data.get("response", ""),
@@ -270,13 +270,13 @@ class CLIRenderer:
                     )
                 )
 
-    def _render_subagent_completed(self, data: dict) -> None:
-        """Render a concise sub-agent completion notification."""
-        job_id = data.get("job_id", "?")
-        mode = data.get("mode", "?")
+    def _render_delegated_run_completed(self, data: dict) -> None:
+        """Render a concise delegated AgentRun completion notification."""
+        run_id = data.get("run_id", "?")
+        agent_id = data.get("agent_id", "?")
         status = data.get("status", "?")
-        title = f"SUBAGENT · {status.upper()}"
-        body = f"id={job_id} mode={mode}"
+        title = f"DELEGATED RUN · {status.upper()}"
+        body = f"run_id={run_id} agent_id={agent_id}"
         self.console.print(
             Panel(
                 body,

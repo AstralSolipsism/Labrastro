@@ -1,4 +1,4 @@
-"""Tests for ToolExecutor, including CWD sync behaviour."""
+﻿"""Tests for ToolExecutor, including CWD sync behaviour."""
 
 from types import SimpleNamespace
 
