@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 from reuleauxcoder.domain.config.models import Config
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore

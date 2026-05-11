@@ -1,4 +1,4 @@
-"""Tests for the fetch_capabilities builtin source reader."""
+﻿"""Tests for the fetch_capabilities builtin source reader."""
 
 from __future__ import annotations
 

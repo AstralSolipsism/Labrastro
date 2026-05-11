@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from types import SimpleNamespace
 
 from reuleauxcoder.domain.config.models import ApprovalConfig, Config, ModeConfig

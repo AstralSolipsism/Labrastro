@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 
 from reuleauxcoder.domain.hooks.base import GuardHook, ObserverHook, TransformHook
 from reuleauxcoder.domain.hooks.registry import HookRegistry

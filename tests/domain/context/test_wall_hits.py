@@ -1,4 +1,4 @@
-"""Tests for ContextManager wall-hit progressive compression state machine."""
+﻿"""Tests for ContextManager wall-hit progressive compression state machine."""
 
 from reuleauxcoder.domain.context.manager import (
     MESSAGE_TOKEN_KEY,

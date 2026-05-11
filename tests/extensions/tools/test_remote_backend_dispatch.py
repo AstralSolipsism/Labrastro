@@ -1,4 +1,4 @@
-"""Tests that builtin tools dispatch to the remote backend correctly."""
+﻿"""Tests that builtin tools dispatch to the remote backend correctly."""
 
 from __future__ import annotations
 

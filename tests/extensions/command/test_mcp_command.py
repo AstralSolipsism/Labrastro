@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 from reuleauxcoder.domain.config.models import ApprovalConfig, Config
 from reuleauxcoder.extensions.command.builtin.mcp import (

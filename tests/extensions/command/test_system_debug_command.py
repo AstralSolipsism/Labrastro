@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 from reuleauxcoder.extensions.command.builtin.system import _handle_debug, _parse_debug
 from reuleauxcoder.interfaces.events import UIEventBus

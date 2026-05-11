@@ -1,4 +1,4 @@
-from unittest import mock
+﻿from unittest import mock
 
 import reuleauxcoder.infrastructure.platform as platform_module
 from reuleauxcoder.infrastructure.platform import (

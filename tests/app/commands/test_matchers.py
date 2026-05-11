@@ -1,4 +1,4 @@
-from reuleauxcoder.app.commands.matchers import (
+﻿from reuleauxcoder.app.commands.matchers import (
     match_template,
     matches_any,
     normalize_input,

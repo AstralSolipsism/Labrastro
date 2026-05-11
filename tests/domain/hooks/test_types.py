@@ -1,4 +1,4 @@
-from reuleauxcoder.domain.hooks.types import GuardDecision
+﻿from reuleauxcoder.domain.hooks.types import GuardDecision
 
 
 def test_guard_decision_allow() -> None:

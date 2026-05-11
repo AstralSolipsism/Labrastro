@@ -1,4 +1,4 @@
-from reuleauxcoder.extensions.skills.catalog import build_skills_catalog
+﻿from reuleauxcoder.extensions.skills.catalog import build_skills_catalog
 from reuleauxcoder.extensions.skills.models import Skill
 
 

@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 
 from reuleauxcoder.app.commands.params import (
     BoolParam,

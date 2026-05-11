@@ -1,4 +1,4 @@
-"""Tests for remote execution peer registry."""
+﻿"""Tests for remote execution peer registry."""
 
 from __future__ import annotations
 

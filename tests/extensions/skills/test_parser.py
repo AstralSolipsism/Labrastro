@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 
 from reuleauxcoder.extensions.skills.parser import parse_skill_file
 

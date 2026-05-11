@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 from reuleauxcoder.app.commands.dispatcher import dispatch_command
 from reuleauxcoder.app.commands.models import CommandResult

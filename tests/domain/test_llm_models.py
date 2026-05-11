@@ -1,4 +1,4 @@
-from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
+﻿from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
 
 
 def test_llm_response_message_preserves_reasoning_content() -> None:

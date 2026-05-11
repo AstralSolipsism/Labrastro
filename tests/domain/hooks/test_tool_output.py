@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 
 from reuleauxcoder.domain.hooks.builtin.tool_output import ToolOutputTruncationHook
 from reuleauxcoder.domain.hooks.types import AfterToolExecuteContext, HookPoint

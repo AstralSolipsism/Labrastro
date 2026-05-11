@@ -1,4 +1,4 @@
-"""Tests for ShellTool CWD tracking and stale-directory recovery."""
+﻿"""Tests for ShellTool CWD tracking and stale-directory recovery."""
 
 import os
 import subprocess

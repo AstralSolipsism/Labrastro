@@ -1,1 +1,1 @@
-"""Tests for lightweight environment manifest helpers."""
+﻿"""Tests for lightweight environment manifest helpers."""
