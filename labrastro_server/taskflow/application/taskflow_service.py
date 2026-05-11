@@ -199,8 +199,8 @@ class TaskflowService:
     def confirm_goal(self, taskflow_id: str, *, confirmed_by: str = "user") -> TaskflowState:
         """Confirm the Goal before plan compilation.
 
-        Logic from ``docs/文档.md`` Section 5.4: runtime tasks are still not
-        created here; confirmation only marks the Goal snapshot ready to compile.
+        Logic from ``docs/文档.md`` Section 5.4: AgentRuns are still not created
+        here; confirmation only marks the Goal snapshot ready to compile.
         """
 
         state = self.get_taskflow_state(taskflow_id)
@@ -298,13 +298,14 @@ class TaskflowService:
                 **dict(metadata or {}),
             },
         )
+        dispatch_result: TaskflowDispatchResult | None = None
         if self.dispatcher is not None:
-            result = self.dispatcher.dispatch_task_run(
+            dispatch_result = self.dispatcher.dispatch_task_run(
                 run,
                 executor_hint=executor_hint,
                 metadata=metadata,
             )
-            self._apply_dispatch_result(run, result)
+            self._apply_dispatch_result(run, dispatch_result)
         project.add_task_run(run)
         project.add_trace_link(
             TraceLink(
@@ -318,6 +319,25 @@ class TaskflowService:
                 rationale="Taskflow dispatch created a fresh TaskRun for this WorkItem.",
             )
         )
+        agent_run_ref = (
+            dispatch_result.agent_run_ref
+            if dispatch_result is not None and isinstance(dispatch_result.agent_run_ref, dict)
+            else None
+        )
+        agent_run_id = str(agent_run_ref.get("id") or "") if agent_run_ref else ""
+        if agent_run_id:
+            project.add_trace_link(
+                TraceLink(
+                    id=_new_id("trace"),
+                    project_id=plan.project_id,
+                    source_type=TraceEntityType.TASK_RUN,
+                    source_id=run.id,
+                    target_type=TraceEntityType.AGENT_RUN,
+                    target_id=agent_run_id,
+                    relation_type=TraceRelationType.DISPATCHES,
+                    rationale="TaskRun dispatched execution to an AgentRun.",
+                )
+            )
 
         if run.id not in state.outputs.task_run_refs:
             state.outputs.task_run_refs.append(run.id)
@@ -433,10 +453,6 @@ class TaskflowService:
             "filtered": list(result.filtered),
             "score_summary": dict(result.score_summary),
         }
-        if result.runtime_task is not None:
-            run.metadata["runtime_task"] = dict(result.runtime_task)
-        if result.runtime_task_id:
-            run.runtime_task_id = result.runtime_task_id
         if result.selected_executor_id:
             run.status = TaskRunStatus.DISPATCHED
             run.metadata["selected_executor_id"] = result.selected_executor_id

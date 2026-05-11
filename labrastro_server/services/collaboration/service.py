@@ -1,4 +1,4 @@
-"""Issue Assignment and Mention Agent control-plane service."""
+﻿"""Issue Assignment and Mention Agent control-plane service."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class IssueAssignmentService:
     """Facade for Issue, Assignment, and Mention Agent lifecycle.
 
     Issue Assignment owns the structured task-entry control state. It delegates
-    actual Agent selection and RuntimeTask creation to Taskflow so capability
+    actual Agent selection and AgentRun creation to Taskflow so capability
     dispatch, audit records, and user confirmation boundaries stay centralized.
     """
 
@@ -286,7 +286,6 @@ class IssueAssignmentService:
             },
         )
         assignment.task_run_id = run.id
-        assignment.runtime_task_id = run.runtime_task_id
         assignment.status = (
             AssignmentStatus.DISPATCHED
             if run.status == TaskRunStatus.DISPATCHED

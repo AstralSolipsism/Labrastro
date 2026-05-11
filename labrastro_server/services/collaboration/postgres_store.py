@@ -140,12 +140,12 @@ class PostgresIssueAssignmentStore:
                     """
                     INSERT INTO labrastro_assignments (
                         id, issue_id, status, target_agent_id, source, reason,
-                        work_item_id, task_run_id, runtime_task_id,
+                        work_item_id, task_run_id,
                         metadata
                     ) VALUES (
                         :id, :issue_id, :status, :target_agent_id, :source,
                         :reason, :work_item_id, :task_run_id,
-                        :runtime_task_id, CAST(:metadata AS JSONB)
+                        CAST(:metadata AS JSONB)
                     )
                     """
                 ),
@@ -173,7 +173,6 @@ class PostgresIssueAssignmentStore:
                         source=:source, reason=:reason,
                         work_item_id=:work_item_id,
                         task_run_id=:task_run_id,
-                        runtime_task_id=:runtime_task_id,
                         metadata=CAST(:metadata AS JSONB),
                         updated_at=now()
                     WHERE id=:id
@@ -356,7 +355,6 @@ class PostgresIssueAssignmentStore:
             "reason": assignment.reason,
             "work_item_id": assignment.work_item_id,
             "task_run_id": assignment.task_run_id,
-            "runtime_task_id": assignment.runtime_task_id,
             "metadata": _json(assignment.metadata),
         }
 

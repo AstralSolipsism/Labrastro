@@ -148,7 +148,6 @@ class AssignmentRecord:
     reason: str = ""
     work_item_id: str | None = None
     task_run_id: str | None = None
-    runtime_task_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -179,11 +178,6 @@ class AssignmentRecord:
                 if data.get("task_run_id") is not None
                 else None
             ),
-            runtime_task_id=(
-                str(data["runtime_task_id"])
-                if data.get("runtime_task_id") is not None
-                else None
-            ),
             metadata=_dict(data.get("metadata")),
             created_at=str(data.get("created_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
@@ -199,7 +193,6 @@ class AssignmentRecord:
             "reason": self.reason,
             "work_item_id": self.work_item_id,
             "task_run_id": self.task_run_id,
-            "runtime_task_id": self.runtime_task_id,
             "metadata": dict(self.metadata),
             "created_at": self.created_at,
             "updated_at": self.updated_at,

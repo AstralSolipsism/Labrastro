@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import hmac
@@ -11,8 +11,8 @@ from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
     ReuleauxCoderTaskflowDispatcher,
 )
 from labrastro_server.services.agent_runtime.control_plane import (
-    AgentRuntimeControlPlane,
-    RuntimeTaskRequest,
+    AgentRunControlPlane,
+    AgentRunRequest,
 )
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 from labrastro_server.services.github.auth import GitHubInstallationTokenProvider
@@ -95,8 +95,8 @@ def test_installation_token_provider_caches_token() -> None:
 
 
 def test_ensure_pr_for_task_creates_pr_from_branch_artifact() -> None:
-    control = AgentRuntimeControlPlane()
-    control.submit_task(RuntimeTaskRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
+    control = AgentRunControlPlane()
+    control.submit_agent_run(AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
     control.attach_artifact(
         "task-1",
         type=ArtifactType.BRANCH.value,
@@ -130,14 +130,14 @@ def test_ensure_pr_for_task_creates_pr_from_branch_artifact() -> None:
     artifacts = control.artifacts_to_dict("task-1")
     assert artifacts[-1]["type"] == "pull_request"
     assert artifacts[-1]["status"] == "pr_created"
-    assert control.task_to_dict("task-1")["pr_url"] == "https://github.com/org/repo/pull/7"
+    assert control.agent_run_to_dict("task-1")["pr_url"] == "https://github.com/org/repo/pull/7"
     assert [event.type for event in control.list_events("task-1")][-1] == "status"
     assert store.get_pull_request("org/repo", 7) is not None
 
 
 def test_ensure_pr_for_task_records_failure_without_failing_task() -> None:
-    control = AgentRuntimeControlPlane()
-    control.submit_task(RuntimeTaskRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
+    control = AgentRunControlPlane()
+    control.submit_agent_run(AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
     control.attach_artifact(
         "task-1",
         type="branch",
@@ -158,7 +158,7 @@ def test_ensure_pr_for_task_records_failure_without_failing_task() -> None:
 
     assert result.ok is False
     assert "boom" in result.error
-    task = control.task_to_dict("task-1")
+    task = control.agent_run_to_dict("task-1")
     assert task["status"] == "queued"
     failed = control.artifacts_to_dict("task-1")[-1]
     assert failed["type"] == "pull_request"
@@ -167,8 +167,8 @@ def test_ensure_pr_for_task_records_failure_without_failing_task() -> None:
 
 
 def test_webhook_review_comment_is_idempotent_and_creates_followup_assignment() -> None:
-    control = AgentRuntimeControlPlane()
-    control.submit_task(RuntimeTaskRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
+    control = AgentRunControlPlane()
+    control.submit_agent_run(AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
     taskflow = TaskflowService(dispatcher=ReuleauxCoderTaskflowDispatcher(control))
     collaboration = IssueAssignmentService(taskflow_service=taskflow)
     store = InMemoryGitHubStore()
@@ -219,7 +219,7 @@ def test_webhook_review_comment_is_idempotent_and_creates_followup_assignment() 
     assert comments[0].work_item_id
     assignment = collaboration.load_assignment_detail(comments[0].assignment_id)
     assert assignment["work_item_id"] == comments[0].work_item_id
-    assert control.list_tasks(limit=20) == [control.task_to_dict("task-1")]
+    assert control.list_agent_runs(limit=20) == [control.agent_run_to_dict("task-1")]
     assert store.get_pull_request(record.repository, record.number) is not None
 
 

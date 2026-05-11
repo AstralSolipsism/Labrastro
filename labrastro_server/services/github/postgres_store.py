@@ -1,4 +1,4 @@
-"""Postgres-backed GitHub PR lifecycle store."""
+﻿"""Postgres-backed GitHub PR lifecycle store."""
 
 from __future__ import annotations
 
@@ -299,7 +299,7 @@ class PostgresGitHubStore:
         conn.execute(
             text(
                 """
-                UPDATE labrastro_runtime_artifacts
+                UPDATE labrastro_agent_run_artifacts
                 SET status=:status,
                     merge_status=:merge_status,
                     pr_url=:pr_url,
@@ -319,7 +319,7 @@ class PostgresGitHubStore:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_tasks
+                    UPDATE labrastro_agent_runs
                     SET issue_status='done', updated_at=now()
                     WHERE id=:task_id
                     """

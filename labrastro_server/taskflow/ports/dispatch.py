@@ -50,8 +50,7 @@ class TaskflowDispatchResult:
     score_summary: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     manual_override: bool = False
-    runtime_task_id: str | None = None
-    runtime_task: dict[str, Any] | None = None
+    agent_run_ref: dict[str, Any] | None = None
 
     @property
     def selected(self) -> bool:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pytest
 
@@ -81,7 +81,6 @@ def test_taskflow_service_runs_goal_compile_and_dispatch_flow() -> None:
     assert saved_project is not None
     assert saved_project.work_items.active_work_items[0].title == "Implement PlanCompiler"
     assert run.status == TaskRunStatus.PENDING
-    assert run.runtime_task_id is None
     assert saved_state.meta.status == TaskflowStatus.READY_FOR_DISPATCH
     assert saved_state.outputs.task_run_refs == [run.id]
 

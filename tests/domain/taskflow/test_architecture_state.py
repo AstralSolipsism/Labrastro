@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from labrastro_server.taskflow.domain.complexity import ComplexityEstimator, ComplexityLevel
 from labrastro_server.taskflow.compiler.plan_compiler import PlanCompiler

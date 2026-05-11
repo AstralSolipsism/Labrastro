@@ -12,6 +12,8 @@ from labrastro_server.taskflow.domain.project_state import (
     ProjectState,
     TaskRun,
     TaskRunStatus,
+    TraceEntityType,
+    TraceRelationType,
 )
 from labrastro_server.taskflow.domain.taskflow_state import (
     ReadinessGate,
@@ -35,8 +37,7 @@ class FakeDispatcher:
         self.calls.append(task_run)
         return TaskflowDispatchResult(
             selected_executor_id=executor_hint or "fake-executor",
-            runtime_task_id=f"runtime-{task_run.id}",
-            runtime_task={"id": f"runtime-{task_run.id}"},
+            agent_run_ref={"id": f"agent-run-{task_run.id}"},
             reason="fake-dispatched",
         )
 
@@ -112,7 +113,17 @@ def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
 
     assert dispatcher.calls == [run]
     assert run.status == TaskRunStatus.DISPATCHED
-    assert run.runtime_task_id == f"runtime-{run.id}"
+    stored = project_service.get_project_state("project-1")
+    assert stored is not None
+    links = stored.traceability.task_run_links
+    assert any(
+        link.source_type == TraceEntityType.TASK_RUN
+        and link.source_id == run.id
+        and link.target_type == TraceEntityType.AGENT_RUN
+        and link.target_id == f"agent-run-{run.id}"
+        and link.relation_type == TraceRelationType.DISPATCHES
+        for link in links
+    )
     assert service.get_taskflow_state("taskflow-1").meta.status == (
         TaskflowStatus.DISPATCHED
     )
@@ -131,8 +142,8 @@ def test_taskflow_core_and_application_do_not_import_executor_or_reuleauxcoder()
         "reuleauxcoder.",
         "reuleauxcoder\\",
         "services.agent_runtime",
-        "RuntimeTaskRequest",
-        "TaskRecord",
+        "AgentRunRequest",
+        "AgentRunRecord",
         "AgentConfig",
         "TaskDraftRecord",
     )
@@ -156,15 +167,15 @@ def test_remote_taskflow_routes_use_new_resource_names_only() -> None:
     assert "work-items" in route_source
 
 
-def test_reuleauxcoder_adapter_submits_runtime_task_from_task_run_only() -> None:
+def test_reuleauxcoder_adapter_submits_agent_run_from_task_run_only() -> None:
     from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
         ReuleauxCoderTaskflowDispatcher,
     )
     from labrastro_server.services.agent_runtime.control_plane import (
-        AgentRuntimeControlPlane,
+        AgentRunControlPlane,
     )
 
-    runtime = AgentRuntimeControlPlane(
+    runtime = AgentRunControlPlane(
         runtime_snapshot={
             "runtime_profiles": {"docs_profile": {"executor": "fake"}},
             "agents": {
@@ -188,13 +199,15 @@ def test_reuleauxcoder_adapter_submits_runtime_task_from_task_run_only() -> None
 
     result = ReuleauxCoderTaskflowDispatcher(runtime).dispatch_task_run(
         task_run,
-        executor_hint="docs",
     )
 
     assert result.selected_executor_id == "docs"
-    assert result.runtime_task_id is not None
-    runtime_task = runtime.get_task(result.runtime_task_id)
-    assert runtime_task.agent_id == "docs"
-    assert runtime_task.metadata["task_run_id"] == "task-run-1"
-    assert runtime_task.metadata["work_item_id"] == "work-1"
-    assert "taskflow_task_draft_id" not in runtime_task.metadata
+    agent_run_id = str((result.agent_run_ref or {}).get("id") or "")
+    assert agent_run_id
+    agent_run = runtime.get_agent_run(agent_run_id)
+    assert agent_run.agent_id == "docs"
+    assert agent_run.source.value == "taskflow"
+    assert agent_run.metadata["task_run_id"] == "task-run-1"
+    assert agent_run.metadata["work_item_id"] == "work-1"
+    assert agent_run.metadata["agent_run_source"] == "taskflow"
+    assert "taskflow_task_draft_id" not in agent_run.metadata

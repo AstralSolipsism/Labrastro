@@ -1,4 +1,4 @@
-"""GitHub App pull request lifecycle orchestration."""
+﻿"""GitHub App pull request lifecycle orchestration."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 from reuleauxcoder.domain.agent_runtime.models import ArtifactStatus, ArtifactType
 from reuleauxcoder.domain.config.models import GitHubConfig
 from labrastro_server.taskflow.domain.time import utc_now
-from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
+from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.agent_runtime.executor_backend import ExecutorEvent
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 from labrastro_server.services.github.client import GitHubAPIError, GitHubClient
@@ -48,7 +48,7 @@ class PullRequestService:
         config: GitHubConfig,
         store: GitHubStore,
         client: GitHubClient,
-        runtime_control_plane: AgentRuntimeControlPlane,
+        runtime_control_plane: AgentRunControlPlane,
         issue_assignment_service: IssueAssignmentService | None = None,
     ) -> None:
         self.config = config
@@ -425,9 +425,9 @@ class PullRequestService:
     def _default_pr_body(
         self, task_id: str, branch_artifact: dict[str, Any], base_ref: str
     ) -> str:
-        task = self.runtime_control_plane.task_to_dict(task_id)
+        task = self.runtime_control_plane.agent_run_to_dict(task_id)
         lines = [
-            "Agent runtime task completed.",
+            "AgentRun completed.",
             "",
             f"Task: {task_id}",
             f"Issue: {task.get('issue_id', '')}",
@@ -448,7 +448,7 @@ class PullRequestService:
         return branches[-1] if branches else None
 
     def _task_id_for_artifact(self, artifact_id: str) -> str | None:
-        for task in self.runtime_control_plane.list_tasks(limit=500):
+        for task in self.runtime_control_plane.list_agent_runs(limit=500):
             for artifact in self.runtime_control_plane.artifacts_to_dict(task["id"]):
                 if artifact.get("id") == artifact_id:
                     return str(task["id"])
@@ -472,7 +472,7 @@ class PullRequestService:
         service = self.issue_assignment_service
         if service is None:
             raise RuntimeError("issue assignment service unavailable")
-        task = self.runtime_control_plane.task_to_dict(record.task_id)
+        task = self.runtime_control_plane.agent_run_to_dict(record.task_id)
         metadata = {
             "source": "github_review_comment",
             "github_review_comment_id": comment.github_id,

@@ -134,6 +134,7 @@ class TraceEntityType(str, Enum):
     ACCEPTANCE_EXAMPLE = "acceptance_example"
     WORK_ITEM = "work_item"
     TASK_RUN = "task_run"
+    AGENT_RUN = "agent_run"
     ARTIFACT = "artifact"
     ISSUE = "issue"
     PR = "pr"
@@ -150,6 +151,7 @@ class TraceRelationType(str, Enum):
     EXPLAINS = "explains"
     SUPERSEDES = "supersedes"
     PRODUCES = "produces"
+    DISPATCHES = "dispatches"
 
 
 @dataclass(slots=True)
@@ -553,7 +555,6 @@ class TaskRun:
     project_id: str
     work_item_id: str
     goal_id: str | None = None
-    runtime_task_id: str | None = None
     status: TaskRunStatus | str = TaskRunStatus.PENDING
     executor: TaskRunExecutor | str = TaskRunExecutor.AGENT
     repo_ref: RepositoryRef | None = None
@@ -576,11 +577,6 @@ class TaskRun:
             project_id=str(data.get("project_id") or ""),
             goal_id=str(data["goal_id"]) if data.get("goal_id") is not None else None,
             work_item_id=str(data.get("work_item_id") or ""),
-            runtime_task_id=(
-                str(data["runtime_task_id"])
-                if data.get("runtime_task_id") is not None
-                else None
-            ),
             status=str(data.get("status") or TaskRunStatus.PENDING.value),
             executor=str(data.get("executor") or TaskRunExecutor.AGENT.value),
             repo_ref=(
@@ -619,7 +615,6 @@ class TaskRun:
             "project_id": self.project_id,
             "goal_id": self.goal_id,
             "work_item_id": self.work_item_id,
-            "runtime_task_id": self.runtime_task_id,
             "status": self.status.value,
             "executor": self.executor.value,
             "repo_ref": self.repo_ref.to_dict() if self.repo_ref else None,

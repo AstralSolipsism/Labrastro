@@ -6,13 +6,13 @@ from reuleauxcoder.domain.issue_assignment.models import AssignmentStatus, Menti
 from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
     ReuleauxCoderTaskflowDispatcher,
 )
-from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
+from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 from labrastro_server.services.taskflow.service import TaskflowService
 
 
-def _runtime() -> AgentRuntimeControlPlane:
-    return AgentRuntimeControlPlane(
+def _runtime() -> AgentRunControlPlane:
+    return AgentRunControlPlane(
         runtime_snapshot={
             "runtime_profiles": {
                 "docs_profile": {
@@ -46,7 +46,7 @@ def _runtime() -> AgentRuntimeControlPlane:
     )
 
 
-def _service() -> tuple[IssueAssignmentService, TaskflowService, AgentRuntimeControlPlane]:
+def _service() -> tuple[IssueAssignmentService, TaskflowService, AgentRunControlPlane]:
     runtime = _runtime()
     taskflow = TaskflowService(dispatcher=ReuleauxCoderTaskflowDispatcher(runtime))
     return IssueAssignmentService(taskflow_service=taskflow), taskflow, runtime
@@ -84,10 +84,10 @@ def test_assignment_creates_work_item_but_does_not_dispatch_before_dispatch_call
     item = _work_item(taskflow, "peer-peer-a", assignment.work_item_id)
     assert item.metadata["issue_id"] == issue.id
     assert item.metadata["assignment_id"] == assignment.id
-    assert runtime.list_tasks() == []
+    assert runtime.list_agent_runs() == []
 
 
-def test_assignment_dispatch_uses_taskflow_decision_and_runtime_metadata() -> None:
+def test_assignment_dispatch_uses_taskflow_decision_and_agent_run_metadata() -> None:
     service, taskflow, runtime = _service()
     issue = service.create_issue(
         title="Write docs",
@@ -103,16 +103,17 @@ def test_assignment_dispatch_uses_taskflow_decision_and_runtime_metadata() -> No
     dispatched = service.dispatch_assignment(assignment.id, peer_id="peer-a")
 
     assert dispatched.status == AssignmentStatus.DISPATCHED
-    assert dispatched.runtime_task_id is not None
-    task = runtime.get_task(dispatched.runtime_task_id)
+    assert dispatched.task_run_id is not None
+    agent_runs = runtime.list_agent_runs()
+    assert len(agent_runs) == 1
+    task = runtime.get_agent_run(agent_runs[0]["id"])
     assert task.agent_id == "docs"
     assert task.metadata["issue_id"] == issue.id
     assert task.metadata["assignment_id"] == assignment.id
     assert task.metadata["dispatch_source"] == "assignment"
-    assert dispatched.task_run_id is not None
 
 
-def test_assignment_without_explicit_agent_needs_assignment_and_creates_no_runtime() -> None:
+def test_assignment_without_explicit_agent_dispatches_with_default_agent_run() -> None:
     service, _taskflow, runtime = _service()
     issue = service.create_issue(
         title="Secret ops",
@@ -126,9 +127,14 @@ def test_assignment_without_explicit_agent_needs_assignment_and_creates_no_runti
 
     updated = service.dispatch_assignment(assignment.id, peer_id="peer-a")
 
-    assert updated.status == AssignmentStatus.NEEDS_ASSIGNMENT
-    assert updated.runtime_task_id is None
-    assert runtime.list_tasks() == []
+    assert updated.status == AssignmentStatus.DISPATCHED
+    assert updated.task_run_id is not None
+    agent_runs = runtime.list_agent_runs()
+    assert len(agent_runs) == 1
+    task = runtime.get_agent_run(agent_runs[0]["id"])
+    assert task.agent_id == "docs"
+    assert task.source.value == "taskflow"
+    assert task.metadata["agent_run_source"] == "taskflow"
 
 
 def test_assignment_can_be_reassigned_before_dispatch() -> None:
@@ -155,7 +161,7 @@ def test_assignment_can_be_reassigned_before_dispatch() -> None:
     assert reassigned.status == AssignmentStatus.READY
 
 
-def test_mention_resolves_alias_and_creates_assignment_but_not_runtime_task() -> None:
+def test_mention_resolves_alias_and_creates_assignment_but_not_agent_run() -> None:
     service, _taskflow, runtime = _service()
     issue = service.create_issue(
         title="Draft guide",
@@ -176,7 +182,7 @@ def test_mention_resolves_alias_and_creates_assignment_but_not_runtime_task() ->
     assignment = service.store.get_assignment(mention.assignment_id)
     assert assignment.target_agent_id == "docs"
     assert assignment.source == "mention"
-    assert runtime.list_tasks() == []
+    assert runtime.list_agent_runs() == []
 
 
 def test_mention_conflict_or_unknown_agent_needs_assignment() -> None:
