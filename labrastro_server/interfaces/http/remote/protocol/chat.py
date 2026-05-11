@@ -25,12 +25,15 @@ class ChatRequest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatRequest":
+        taskflow_id = d.get("taskflow_id")
+        if taskflow_id is None:
+            taskflow_id = d.get("taskflow_goal_id")
         return cls(
             peer_token=d["peer_token"],
             prompt=d["prompt"],
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
-            taskflow_id=d.get("taskflow_id"),
+            taskflow_id=taskflow_id,
         )
 
 @dataclass
@@ -70,13 +73,16 @@ class ChatStartRequest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatStartRequest":
+        taskflow_id = d.get("taskflow_id")
+        if taskflow_id is None:
+            taskflow_id = d.get("taskflow_goal_id")
         return cls(
             peer_token=d["peer_token"],
             prompt=d["prompt"],
             session_hint=d.get("session_hint"),
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
-            taskflow_id=d.get("taskflow_id"),
+            taskflow_id=taskflow_id,
         )
 
 @dataclass

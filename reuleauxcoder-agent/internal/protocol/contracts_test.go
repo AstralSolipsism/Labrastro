@@ -37,6 +37,28 @@ func TestRemoteContractFixturesDecodePeerProtocolSamples(t *testing.T) {
 	mustDecode(t, fixtures["error.invalid_peer_token"].Response, &ErrorResponse{})
 }
 
+func TestChatStartRequestMarshalsTaskflowID(t *testing.T) {
+	raw, err := json.Marshal(ChatStartRequest{
+		PeerToken:  "pt_1",
+		Prompt:     "continue",
+		TaskflowID: "taskflow-1",
+	})
+	if err != nil {
+		t.Fatalf("marshal ChatStartRequest: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode marshaled payload: %v", err)
+	}
+	if payload["taskflow_id"] != "taskflow-1" {
+		t.Fatalf("taskflow_id = %v, want taskflow-1", payload["taskflow_id"])
+	}
+	if _, ok := payload["taskflow_goal_id"]; ok {
+		t.Fatalf("unexpected legacy taskflow_goal_id in payload: %s", raw)
+	}
+}
+
 func loadContractFixtures(t *testing.T) map[string]contractFixture {
 	t.Helper()
 	path := filepath.Join("..", "..", "..", "labrastro_server", "interfaces", "http", "remote", "protocol", "contracts.json")

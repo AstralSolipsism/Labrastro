@@ -67,10 +67,10 @@ type DisconnectRequest struct {
 }
 
 type ChatRequest struct {
-	PeerToken      string `json:"peer_token"`
-	Prompt         string `json:"prompt"`
-	WorkflowMode   string `json:"workflow_mode,omitempty"`
-	TaskflowGoalID string `json:"taskflow_goal_id,omitempty"`
+	PeerToken    string `json:"peer_token"`
+	Prompt       string `json:"prompt"`
+	WorkflowMode string `json:"workflow_mode,omitempty"`
+	TaskflowID   string `json:"taskflow_id,omitempty"`
 }
 
 type ChatResponse struct {
@@ -79,11 +79,11 @@ type ChatResponse struct {
 }
 
 type ChatStartRequest struct {
-	PeerToken      string `json:"peer_token"`
-	Prompt         string `json:"prompt"`
-	SessionHint    string `json:"session_hint,omitempty"`
-	WorkflowMode   string `json:"workflow_mode,omitempty"`
-	TaskflowGoalID string `json:"taskflow_goal_id,omitempty"`
+	PeerToken    string `json:"peer_token"`
+	Prompt       string `json:"prompt"`
+	SessionHint  string `json:"session_hint,omitempty"`
+	WorkflowMode string `json:"workflow_mode,omitempty"`
+	TaskflowID   string `json:"taskflow_id,omitempty"`
 }
 
 type ChatStartResponse struct {

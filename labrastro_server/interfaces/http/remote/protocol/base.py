@@ -114,8 +114,61 @@ class Heartbeat:
 
 
 # ---------------------------------------------------------------------------
-# Peer MCP manifest and tool reports
+# Peer control-plane requests
 # ---------------------------------------------------------------------------
+
+@dataclass
+class PeerPollRequest:
+    peer_token: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"peer_token": self.peer_token}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PeerPollRequest":
+        return cls(peer_token=d["peer_token"])
+
+
+@dataclass
+class PeerResultRequest:
+    peer_token: str
+    request_id: str
+    type: str = "tool_result"
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "peer_token": self.peer_token,
+            "request_id": self.request_id,
+            "type": self.type,
+            "payload": self.payload,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PeerResultRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            request_id=d["request_id"],
+            type=d.get("type", "tool_result"),
+            payload=d.get("payload", {}),
+        )
+
+
+@dataclass
+class PeerDisconnectRequest:
+    peer_token: str
+    reason: str = "peer_initiated"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"peer_token": self.peer_token, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PeerDisconnectRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            reason=d.get("reason", "peer_initiated"),
+        )
+
 
 @dataclass
 class DisconnectNotice:
@@ -134,5 +187,8 @@ __all__ = [
     "RegisterResponse",
     "RegisterRejected",
     "Heartbeat",
+    "PeerPollRequest",
+    "PeerResultRequest",
+    "PeerDisconnectRequest",
     "DisconnectNotice",
 ]

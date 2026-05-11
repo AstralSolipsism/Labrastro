@@ -32,6 +32,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     MCPManifestRequest,
     MCPManifestResponse,
     MCPServerManifest,
+    PeerDisconnectRequest,
+    PeerPollRequest,
+    PeerResultRequest,
     PeerMCPToolsReport,
     RemoteMCPToolInfo,
     RegisterRejected,
@@ -140,6 +143,27 @@ class TestRemoteHTTPContract:
         EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
         EnvironmentManifestResponse.from_dict(fixtures["environment.manifest"]["response"])
 
+    def test_registry_matches_actual_peer_token_control_plane_routes(self) -> None:
+        registry = {endpoint["name"]: endpoint for endpoint in endpoint_registry()}
+
+        assert registry["mcp.artifact"]["auth"] == "peer_token"
+        assert (
+            registry["artifacts.get"]["path"]
+            == "/remote/artifacts/{os}/{arch}/{artifact_name}"
+        )
+        assert registry["peer.disconnect"]["request_model"] == "PeerDisconnectRequest"
+        for name in (
+            "taskflow.get",
+            "taskflow.post",
+            "issues.get",
+            "issues.post",
+            "assignments.get",
+            "assignments.post",
+            "mentions.get",
+            "mentions.post",
+        ):
+            assert registry[name]["auth"] == "peer_token"
+
 
 class TestRegisterRequest:
     def test_roundtrip(self) -> None:
@@ -186,6 +210,44 @@ class TestHeartbeat:
         assert restored.ts == 1234.5
 
 
+class TestPeerControlPlaneRequests:
+    def test_poll_request_roundtrip(self) -> None:
+        req = PeerPollRequest(peer_token="pt_1")
+
+        restored = PeerPollRequest.from_dict(req.to_dict())
+
+        assert restored.peer_token == "pt_1"
+
+    def test_result_request_roundtrip(self) -> None:
+        req = PeerResultRequest(
+            peer_token="pt_1",
+            request_id="req-1",
+            type="tool_result",
+            payload={"ok": True},
+        )
+
+        restored = PeerResultRequest.from_dict(req.to_dict())
+
+        assert restored.peer_token == "pt_1"
+        assert restored.request_id == "req-1"
+        assert restored.type == "tool_result"
+        assert restored.payload == {"ok": True}
+
+    def test_disconnect_request_roundtrip(self) -> None:
+        req = PeerDisconnectRequest(peer_token="pt_1", reason="shutdown")
+
+        restored = PeerDisconnectRequest.from_dict(req.to_dict())
+
+        assert restored.peer_token == "pt_1"
+        assert restored.reason == "shutdown"
+
+    def test_disconnect_request_defaults_reason(self) -> None:
+        restored = PeerDisconnectRequest.from_dict({"peer_token": "pt_1"})
+
+        assert restored.peer_token == "pt_1"
+        assert restored.reason == "peer_initiated"
+
+
 class TestChatRequest:
     def test_roundtrip_preserves_mode_and_workflow(self) -> None:
         req = ChatRequest(
@@ -203,6 +265,19 @@ class TestChatRequest:
         assert restored.mode == "taskflow"
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
+
+    def test_accepts_legacy_taskflow_goal_id_input(self) -> None:
+        restored = ChatRequest.from_dict(
+            {
+                "peer_token": "pt_1",
+                "prompt": "continue",
+                "taskflow_goal_id": "taskflow-legacy",
+            }
+        )
+
+        assert restored.taskflow_id == "taskflow-legacy"
+        assert "taskflow_goal_id" not in restored.to_dict()
+        assert restored.to_dict()["taskflow_id"] == "taskflow-legacy"
 
 
 class TestChatStartRequest:
@@ -224,6 +299,19 @@ class TestChatStartRequest:
         assert restored.mode == "taskflow"
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
+
+    def test_accepts_legacy_taskflow_goal_id_input(self) -> None:
+        restored = ChatStartRequest.from_dict(
+            {
+                "peer_token": "pt_1",
+                "prompt": "continue",
+                "taskflow_goal_id": "taskflow-legacy",
+            }
+        )
+
+        assert restored.taskflow_id == "taskflow-legacy"
+        assert "taskflow_goal_id" not in restored.to_dict()
+        assert restored.to_dict()["taskflow_id"] == "taskflow-legacy"
 
 
 class TestChatStatusProtocol:
