@@ -12,5 +12,12 @@ services:
       - "8765:8765"
     volumes:
       - ../.rcoder:/app/.rcoder
+      - /var/run/docker.sock:/var/run/docker.sock
     tty: true
     stdin_open: true
+    networks:
+      - ezcode-net
+
+networks:
+  ezcode-net:
+    name: ezcode-net

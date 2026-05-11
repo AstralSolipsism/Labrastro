@@ -1,4 +1,4 @@
-"""Dependency providers and context models for the shared app runner."""
+﻿"""Dependency providers and context models for the shared app runner."""
 
 from __future__ import annotations
 
@@ -34,8 +34,9 @@ from labrastro_server.infrastructure.persistence.factory import (
     create_taskflow_service,
 )
 from reuleauxcoder.services.config.loader import ConfigLoader
-from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
+from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.auth.service import AuthService, validate_auth_config
+from labrastro_server.services.sandbox import DockerSandboxProvider, SandboxProfile
 from reuleauxcoder.services.llm.client import LLM
 from reuleauxcoder.services.llm.factory import build_llm_from_settings
 
@@ -221,7 +222,7 @@ def _default_create_remote_http_service(
         create_auth_store(config),
         issue_bootstrap_token=lambda ttl: relay_server.issue_bootstrap_token(ttl_sec=ttl),
     )
-    return RemoteRelayHTTPService(
+    service = RemoteRelayHTTPService(
         relay_server=relay_server,
         bind=config.remote_exec.relay_bind,
         ui_bus=ui_bus,
@@ -239,6 +240,30 @@ def _default_create_remote_http_service(
         github_pr_service=github_pr_service,
         persistence_maintenance_service=persistence_maintenance_service,
     )
+    sandbox_config = getattr(config, "sandbox_provider", None)
+    if sandbox_config is not None and sandbox_config.type == "docker":
+        if not sandbox_config.host_base_url:
+            raise RuntimeError(
+                "sandbox_provider.host_base_url is required when sandbox_provider.type is docker"
+            )
+        provider = DockerSandboxProvider(
+            host_base_url=sandbox_config.host_base_url,
+            bootstrap_token_factory=lambda: relay_server.issue_bootstrap_token(
+                ttl_sec=config.remote_exec.bootstrap_token_ttl_sec
+            ),
+        )
+        runtime_control_plane.configure_sandbox_provider(
+            provider,
+            SandboxProfile(
+                image=sandbox_config.worker_image,
+                cpu_limit=sandbox_config.cpu_limit,
+                memory_limit=sandbox_config.memory_limit,
+                network=sandbox_config.network,
+                workspace_volume_prefix=sandbox_config.workspace_volume_root,
+                idle_ttl_seconds=sandbox_config.idle_ttl_seconds,
+            ),
+        )
+    return service
 
 
 @dataclass

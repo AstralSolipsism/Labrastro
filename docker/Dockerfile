@@ -34,6 +34,7 @@ RUN set -eux; \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        docker.io \
         gettext-base \
         git \
         g++ \
