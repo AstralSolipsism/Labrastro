@@ -2,7 +2,7 @@
 
 Source: ``docs/文档.md`` Section 6. This service intentionally starts with an
 in-memory implementation so the new architecture skeleton can be exercised
-without forcing the existing Postgres Taskflow store to migrate in the same
+without forcing the pending Postgres Taskflow store wiring to land in the same
 change.
 """
 

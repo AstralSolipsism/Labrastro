@@ -4,6 +4,8 @@
 
 This repository is the backend foundation for the Labrastro ecosystem. It is derived from the [RC-CHN/ReuleauxCoder](https://github.com/RC-CHN/ReuleauxCoder) fork lineage, keeps the ReuleauxCoder kernel boundary intact, and adds Labrastro-specific remote relay, session persistence, provider management, MCP distribution, environment manifests, Agent Runtime, and task control plane.
 
+The VS Code/Webview entrypoint lives in the workspace-root `dogcode` repository. It already has the MVP foundation for login, settings, chat, sessions, AgentRun, peer orchestration, and Taskflow chat mode. This repository is the ReuleauxCoder/Labrastro server side: the backend control plane, protocol contract, and execution foundation.
+
 Repository: <https://github.com/AstralSolipsism/Labrastro>
 
 ## Naming Boundary
@@ -31,7 +33,8 @@ Labrastro-owned control-plane names use the new brand:
 - **Remote Host/Peer relay** where the host runs as `rcoder --server` and peers join through bootstrap tokens.
 - **Agent Runtime control plane** for runtime profiles, executors, models, MCP, skills, credentials, workspace policies, and approval boundaries.
 - **Task and artifact lifecycle** for task, artifact, branch, PR, review, and follow-up states.
-- **Server-side persistence** with file session storage plus Postgres migrations, runtime store, session store, and task state management.
+- **VS Code/Webview MVP** in the workspace-root `dogcode` repository, covering login, settings, chat, sessions, AgentRun, peer orchestration, and Taskflow chat mode.
+- **Server-side persistence** with file session storage plus Postgres migrations and wired runtime, session, auth, collaboration, and GitHub PR lifecycle stores. Taskflow tables exist, but Taskflow store wiring is still under construction.
 - **Go worker execution surface** through `reuleauxcoder-agent` for CLI subprocesses, worktrees, repo cache, publishing, and long-running tasks.
 
 ## Deployment
@@ -79,6 +82,15 @@ docker compose up -d --build
 docker compose logs -f labrastro-host
 ```
 
+The base compose profile is no-database compatible: `LABRASTRO_DATABASE_URL` may be empty, and `docker compose up -d --build` should still start. This mode is intended for local, development, and single-instance evaluation, with explicit degradation:
+
+- Auth uses the file store and depends on the `.rcoder` volume for accounts and refresh tokens.
+- Sessions use file storage and depend on the `.rcoder` / session volume for snapshots.
+- AgentRun, Taskflow, ProjectState, Issue, Assignment, and Mention state use in-process storage or degraded behavior in the current implementation and are not recoverable after restart.
+- GitHub PR lifecycle and review follow-up require Postgres.
+- Peer registry, peer tokens, and the relay pending queue remain single-instance in-memory state.
+- The Postgres overlay is not yet full production Taskflow persistence. Taskflow tables exist, but Taskflow store wiring is still pending.
+
 ### Production Exposure
 
 The expected production shape is to run Labrastro as an HTTP service inside the container and terminate HTTPS at the deployment layer, for example with Nginx, Caddy, Traefik, or Cloudflare:
@@ -98,6 +110,8 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --buil
 
 The config template reads `LABRASTRO_DATABASE_URL` for database connectivity.
 
+With the Postgres overlay enabled, the wired runtime/session/auth/collaboration/GitHub control-plane state can use Postgres. Production-grade Taskflow recovery still depends on the future Taskflow store wiring.
+
 ## Remote Login
 
 Configure remote relay and account authentication in `.rcoder/config.yaml` on the host:
@@ -113,7 +127,7 @@ remote_exec:
 auth:
   enabled: true
   token_secret: <long-random-secret>
-  store_backend: postgres
+  store_backend: auto
   password_min_length: 6
   login_rate_limit_count: 5
   superadmins:
@@ -121,7 +135,7 @@ auth:
       password_hash: <pbkdf2-password-hash>
 ```
 
-`store_backend: postgres` uses Postgres tables
+With `store_backend: auto`, auth uses Postgres when `persistence.database_url` is configured and falls back to the file store when it is empty. Explicit `store_backend: postgres` uses Postgres tables
 `labrastro_auth_users`, `labrastro_auth_devices`, `labrastro_auth_refresh_tokens`, and `labrastro_auth_audit_events`
 The first administrator must come from backend config. The frontend does not initialize the system.
 
