@@ -48,7 +48,6 @@ modes:
       description: "Planning-first mode; keep implementation changes minimal unless asked."
       tools: ["read_file", "glob", "grep"]
       prompt_append: "Focus on architecture, trade-offs, and actionable implementation plans."
-      allowed_subagent_modes: ["explore"]
 
 approval:
   default_mode: "require_approval"
@@ -65,7 +64,7 @@ approval:
       action: "require_approval"
     - tool_name: "shell"
       action: "require_approval"
-    - tool_name: "agent"
+    - tool_name: "delegate_agent"
       action: "require_approval"
     - tool_source: "mcp"
       action: "require_approval"
@@ -128,30 +127,33 @@ approval:
 # cli:
 #   # history_file: "~/.rcoder/history"
 
-# Optional server-authoritative Agent runtime snapshot.
+# Optional server-authoritative Agent Registry and runtime profiles.
 # Agent config references credential IDs only; do not put plaintext API keys here.
-# agent_runtime:
+# run_limits:
 #   max_running_agents: 4
 #   max_shells_per_agent: 1
-#   runtime_profiles:
-#     environment_local:
-#       executor: "reuleauxcoder"
-#       execution_location: "local_workspace"
-#       runtime_home_policy: "per_task"
-#       approval_mode: "full"
-#     codex_remote:
-#       executor: "codex"
-#       execution_location: "remote_server"
-#       model: "gpt-5.2-codex"
-#       command: "codex"
-#       runtime_home_policy: "per_task"
-#       approval_mode: "autonomous"
-#       config_isolation: "per_agent"
-#       credential_refs:
-#         model: "cred_codex_team"
-#         git: "cred_github_repo_writer"
-#       mcp:
-#         servers: ["github"]
+#
+# runtime_profiles:
+#   environment_local:
+#     executor: "reuleauxcoder"
+#     execution_location: "local_workspace"
+#     runtime_home_policy: "per_task"
+#     approval_mode: "full"
+#   codex_remote:
+#     executor: "codex"
+#     execution_location: "remote_server"
+#     model: "gpt-5.2-codex"
+#     command: "codex"
+#     runtime_home_policy: "per_task"
+#     approval_mode: "autonomous"
+#     config_isolation: "per_agent"
+#     credential_refs:
+#       model: "cred_codex_team"
+#       git: "cred_github_repo_writer"
+#     mcp:
+#       servers: ["github"]
+#
+# agent_registry:
 #   agents:
 #     environment_configurator:
 #       name: "Environment Configurator"
@@ -198,6 +200,15 @@ approval:
 #     cli_tools: ["gitnexus"]
 #     permissions: ["repo.read", "issue.comment"]
 #     source: "local"
+#
+# Optional execution-room provider for on-demand AgentRun worker sessions.
+# sandbox_provider:
+#   type: "docker"
+#   host_base_url: "http://labrastro-host:8765"
+#   worker_image: "labrastro-host:test"
+#   workspace_volume_root: "ezcode-workspaces"
+#   network: "ezcode-net"
+#   idle_ttl_seconds: 3600
 
 skills:
   enabled: true

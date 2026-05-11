@@ -1,7 +1,7 @@
-from reuleauxcoder.domain.config.models import (
+﻿from reuleauxcoder.domain.config.models import (
     ApprovalConfig,
     ApprovalRuleConfig,
-    AgentRuntimeConfig,
+    AgentRegistryConfig,
     Config,
     EnvironmentCLIToolConfig,
     MCPArtifactConfig,
@@ -195,14 +195,12 @@ def test_mode_config_from_dict_normalizes_invalid_fields() -> None:
             "description": None,
             "tools": ["shell", 123],
             "prompt_append": None,
-            "allowed_subagent_modes": "explore",
         },
     )
     assert mode.name == "coder"
     assert mode.description == ""
     assert mode.tools == ["shell", "123"]
     assert mode.prompt_append == ""
-    assert mode.allowed_subagent_modes == []
 
 
 def test_config_validate_collects_multiple_errors() -> None:
@@ -313,7 +311,7 @@ def test_config_validate_accepts_agent_default_model_provider_reference() -> Non
                 )
             }
         ),
-        agent_runtime=AgentRuntimeConfig(
+        agent_registry=AgentRegistryConfig(
             agents={
                 "coder": AgentConfig(
                     id="coder",
@@ -330,7 +328,7 @@ def test_config_validate_rejects_missing_agent_default_model_provider() -> None:
     config = Config(
         api_key="",
         providers=ProvidersConfig(),
-        agent_runtime=AgentRuntimeConfig(
+        agent_registry=AgentRegistryConfig(
             agents={
                 "coder": AgentConfig(
                     id="coder",
@@ -342,7 +340,7 @@ def test_config_validate_rejects_missing_agent_default_model_provider() -> None:
 
     errors = config.validate()
 
-    assert "agent_runtime.agents[coder].model.provider must exist in providers.items" in errors
+    assert "agent_registry.agents[coder].model.provider must exist in providers.items" in errors
 
 
 def test_config_is_valid_for_minimal_valid_configuration() -> None:
@@ -351,6 +349,22 @@ def test_config_is_valid_for_minimal_valid_configuration() -> None:
         approval=ApprovalConfig(default_mode="allow"),
     )
     assert config.is_valid() is True
+
+
+def test_sandbox_provider_config_defaults_and_validation() -> None:
+    config = Config(api_key="key")
+
+    assert config.sandbox_provider.type == "none"
+    assert config.sandbox_provider.worker_image == "labrastro-host:test"
+    assert config.validate() == []
+
+    invalid = Config(api_key="key")
+    invalid.sandbox_provider.type = "bad"
+    invalid.sandbox_provider.idle_ttl_seconds = 0
+
+    errors = invalid.validate()
+    assert "sandbox_provider.type must be one of docker, external, k8s, none" in errors
+    assert "sandbox_provider.idle_ttl_seconds must be positive" in errors
 
 
 def test_config_supports_llm_debug_trace_flag() -> None:

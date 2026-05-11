@@ -1,4 +1,4 @@
-"""Helpers for session-scoped runtime state persistence and restore."""
+﻿"""Helpers for session-scoped runtime state persistence and restore."""
 
 from __future__ import annotations
 
@@ -79,8 +79,8 @@ def get_runtime_approval_config(config: Config, agent: Agent) -> ApprovalConfig:
 def _agent_model_binding(config: Config, agent_id: str | None):
     if not agent_id:
         return None
-    runtime = getattr(config, "agent_runtime", None)
-    agents = getattr(runtime, "agents", {}) if runtime is not None else {}
+    registry = getattr(config, "agent_registry", None)
+    agents = getattr(registry, "agents", {}) if registry is not None else {}
     agent_config = agents.get(agent_id) if isinstance(agents, dict) else None
     model = getattr(agent_config, "model", None)
     return model if getattr(model, "configured", False) else None

@@ -7,7 +7,7 @@ from typing import Optional
 import yaml
 
 from reuleauxcoder.domain.config.models import (
-    AgentRuntimeConfig,
+    AgentRegistryConfig,
     AuthConfig,
     ApprovalConfig,
     ApprovalRuleConfig,
@@ -26,9 +26,12 @@ from reuleauxcoder.domain.config.models import (
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
+    RunLimitsConfig,
+    RuntimeProfilesConfig,
+    SandboxProviderConfig,
     SkillsConfig,
     ensure_default_capability_packages,
-    ensure_default_environment_agent_runtime,
+    ensure_default_environment_agent_registry,
 )
 from reuleauxcoder.domain.config.schema import (
     BUILTIN_MODES,
@@ -361,9 +364,12 @@ class ConfigLoader:
         context_config = data.get("context", {})
         remote_exec_config = data.get("remote_exec", {})
         auth_config = data.get("auth", {})
-        agent_runtime_config = data.get("agent_runtime", {})
+        agent_registry_config = data.get("agent_registry", {})
+        runtime_profiles_config = data.get("runtime_profiles", {})
+        run_limits_config = data.get("run_limits", {})
         capability_packages_config = data.get("capability_packages", {})
         persistence_config = data.get("persistence", {})
+        sandbox_provider_config = data.get("sandbox_provider", {})
         github_config = data.get("github", {})
         environment_config = data.get("environment", {})
         if not isinstance(environment_config, dict):
@@ -479,10 +485,14 @@ class ConfigLoader:
             )
 
         llm_params = self._resolve_llm_params(active_profile, app_config, providers)
-        agent_runtime = AgentRuntimeConfig.from_dict(
-            ensure_default_environment_agent_runtime(
-                agent_runtime_config if isinstance(agent_runtime_config, dict) else {}
-            )
+        agent_registry_data, runtime_profiles_data = ensure_default_environment_agent_registry(
+            agent_registry_config if isinstance(agent_registry_config, dict) else {},
+            runtime_profiles_config if isinstance(runtime_profiles_config, dict) else {},
+        )
+        agent_registry = AgentRegistryConfig.from_dict(agent_registry_data)
+        runtime_profiles = RuntimeProfilesConfig.from_dict(runtime_profiles_data)
+        run_limits = RunLimitsConfig.from_dict(
+            run_limits_config if isinstance(run_limits_config, dict) else {}
         )
 
         return Config(
@@ -570,10 +580,17 @@ class ConfigLoader:
             auth=AuthConfig.from_dict(
                 auth_config if isinstance(auth_config, dict) else {}
             ),
-            agent_runtime=agent_runtime,
+            agent_registry=agent_registry,
+            runtime_profiles=runtime_profiles,
+            run_limits=run_limits,
             capability_packages=capability_packages,
             persistence=PersistenceConfig.from_dict(
                 persistence_config if isinstance(persistence_config, dict) else {}
+            ),
+            sandbox_provider=SandboxProviderConfig.from_dict(
+                sandbox_provider_config
+                if isinstance(sandbox_provider_config, dict)
+                else {}
             ),
             github=GitHubConfig.from_dict(
                 github_config if isinstance(github_config, dict) else {}
@@ -627,7 +644,6 @@ class ConfigLoader:
                         "description": m["description"],
                         "tools": list(m["tools"]),
                         "prompt_append": m["prompt_append"],
-                        "allowed_subagent_modes": list(m["allowed_subagent_modes"]),
                     }
                     for name, m in sorted(BUILTIN_MODES.items())
                 },
@@ -641,21 +657,23 @@ class ConfigLoader:
                     {"tool_name": "write_file", "action": "require_approval"},
                     {"tool_name": "edit_file", "action": "require_approval"},
                     {"tool_name": "shell", "action": "require_approval"},
-                    {"tool_name": "agent", "action": "require_approval"},
+                    {"tool_name": "delegate_agent", "action": "require_approval"},
                     {"tool_source": "mcp", "action": "require_approval"},
                 ],
             },
-            "agent_runtime": {
+            "run_limits": {
                 "max_running_agents": 4,
                 "max_shells_per_agent": 1,
-                "runtime_profiles": {
-                    "environment_local": {
-                        "executor": "reuleauxcoder",
-                        "execution_location": "local_workspace",
-                        "runtime_home_policy": "per_task",
-                        "approval_mode": "full",
-                    }
-                },
+            },
+            "runtime_profiles": {
+                "environment_local": {
+                    "executor": "reuleauxcoder",
+                    "execution_location": "local_workspace",
+                    "runtime_home_policy": "per_task",
+                    "approval_mode": "full",
+                }
+            },
+            "agent_registry": {
                 "agents": {
                     "environment_configurator": {
                         "name": "Environment Configurator",
@@ -683,6 +701,14 @@ class ConfigLoader:
                         "environment.manifest.read",
                     ],
                 }
+            },
+            "sandbox_provider": {
+                "type": "docker",
+                "host_base_url": "http://labrastro-host:8765",
+                "worker_image": "labrastro-host:test",
+                "workspace_volume_root": "ezcode-workspaces",
+                "network": "",
+                "idle_ttl_seconds": 3600,
             },
             "skills": {"enabled": True},
         }
@@ -713,7 +739,6 @@ class ConfigLoader:
                     "description": m["description"],
                     "tools": list(m["tools"]),
                     "prompt_append": m["prompt_append"],
-                    "allowed_subagent_modes": list(m["allowed_subagent_modes"]),
                 }
                 for name, m in sorted(builtin_modes.items())
             }

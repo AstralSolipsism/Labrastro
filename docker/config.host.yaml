@@ -19,10 +19,6 @@ modes:
       tools:
         - '*'
       prompt_append: Prioritize making concrete code changes and verifying them with commands/tests when appropriate.
-      allowed_subagent_modes:
-        - planner
-        - debugger
-        - coder
 
 remote_exec:
   enabled: true
@@ -48,15 +44,18 @@ auth:
     - username: ${LABRASTRO_SUPERADMIN_USERNAME}
       password_hash: ${LABRASTRO_SUPERADMIN_PASSWORD_HASH}
 
-agent_runtime:
+run_limits:
   max_running_agents: 4
   max_shells_per_agent: 1
-  runtime_profiles:
-    environment_local:
-      executor: reuleauxcoder
-      execution_location: local_workspace
-      runtime_home_policy: per_task
-      approval_mode: full
+
+runtime_profiles:
+  environment_local:
+    executor: reuleauxcoder
+    execution_location: local_workspace
+    runtime_home_policy: per_task
+    approval_mode: full
+
+agent_registry:
   agents:
     environment_configurator:
       name: Environment Configurator
@@ -88,6 +87,14 @@ persistence:
   auto_migrate: true
   runtime_enabled: true
   sessions_enabled: true
+
+sandbox_provider:
+  type: docker
+  host_base_url: ${LABRASTRO_SANDBOX_HOST_BASE_URL}
+  worker_image: labrastro-host:test
+  workspace_volume_root: ezcode-workspaces
+  network: ezcode-net
+  idle_ttl_seconds: 3600
   retention_days: 0
 
 session:

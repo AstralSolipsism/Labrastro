@@ -1,36 +1,39 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from copy import deepcopy
 import os
 
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
+from reuleauxcoder.domain.config.models import build_agent_run_snapshot
 from reuleauxcoder.services.config.loader import ConfigLoader
 
 
-def test_parse_config_reads_agent_runtime_profiles_and_agents() -> None:
+def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     config = ConfigLoader()._parse_config(
         {
             "models": {
                 "active_main": "main",
                 "profiles": {"main": {"model": "gpt", "api_key": "key"}},
             },
-            "agent_runtime": {
+            "run_limits": {
                 "max_running_agents": 8,
                 "max_shells_per_agent": 2,
-                "runtime_profiles": {
-                    "codex_remote": {
-                        "executor": "codex",
-                        "execution_location": "remote_server",
-                        "model": "gpt-5.2-codex",
-                        "command": "codex",
-                        "runtime_home_policy": "per_task",
-                        "config_isolation": "per_agent",
-                        "credential_refs": {
-                            "model": "cred_codex_team",
-                            "git": "cred_github_repo_writer",
-                        },
-                    }
-                },
+            },
+            "runtime_profiles": {
+                "codex_remote": {
+                    "executor": "codex",
+                    "execution_location": "remote_server",
+                    "model": "gpt-5.2-codex",
+                    "command": "codex",
+                    "runtime_home_policy": "per_task",
+                    "config_isolation": "per_agent",
+                    "credential_refs": {
+                        "model": "cred_codex_team",
+                        "git": "cred_github_repo_writer",
+                    },
+                }
+            },
+            "agent_registry": {
                 "agents": {
                     "code_reviewer": {
                         "name": "Code Reviewer",
@@ -54,28 +57,28 @@ def test_parse_config_reads_agent_runtime_profiles_and_agents() -> None:
         }
     )
 
-    assert config.agent_runtime.max_running_agents == 8
-    assert config.agent_runtime.max_shells_per_agent == 2
-    assert config.agent_runtime.runtime_profiles["codex_remote"].executor.value == "codex"
+    assert config.run_limits.max_running_agents == 8
+    assert config.run_limits.max_shells_per_agent == 2
+    assert config.runtime_profiles.profiles["codex_remote"].executor.value == "codex"
     assert (
-        config.agent_runtime.runtime_profiles["codex_remote"]
+        config.runtime_profiles.profiles["codex_remote"]
         .execution_location.value
         == "remote_server"
     )
     assert (
-        config.agent_runtime.runtime_profiles["codex_remote"].credential_refs["model"]
+        config.runtime_profiles.profiles["codex_remote"].credential_refs["model"]
         == "cred_codex_team"
     )
-    assert config.agent_runtime.agents["code_reviewer"].runtime_profile == "codex_remote"
+    assert config.agent_registry.agents["code_reviewer"].runtime_profile == "codex_remote"
     assert (
-        config.agent_runtime.agents["code_reviewer"].dispatch.profile
+        config.agent_registry.agents["code_reviewer"].dispatch.profile
         == "Best for repository review and regression risk analysis."
     )
-    assert config.agent_runtime.agents["code_reviewer"].capability_refs == [
+    assert config.agent_registry.agents["code_reviewer"].capability_refs == [
         "github-review",
     ]
-    assert "environment_local" in config.agent_runtime.runtime_profiles
-    assert "environment_configurator" in config.agent_runtime.agents
+    assert "environment_local" in config.runtime_profiles.profiles
+    assert "environment_configurator" in config.agent_registry.agents
 
 
 def test_parse_config_injects_environment_configurator_by_default() -> None:
@@ -85,43 +88,43 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
                 "active_main": "main",
                 "profiles": {"main": {"model": "gpt", "api_key": "key"}},
             },
-            "agent_runtime": {
-                "runtime_profiles": {
-                    "codex_remote": {
-                        "executor": "codex",
-                        "execution_location": "remote_server",
-                    }
-                },
+            "runtime_profiles": {
+                "codex_remote": {
+                    "executor": "codex",
+                    "execution_location": "remote_server",
+                }
+            },
+            "agent_registry": {
                 "agents": {},
             },
         }
     )
 
-    profile = config.agent_runtime.runtime_profiles["environment_local"]
+    profile = config.runtime_profiles.profiles["environment_local"]
     assert profile.executor.value == "reuleauxcoder"
     assert profile.execution_location.value == "local_workspace"
     assert profile.runtime_home_policy == "per_task"
     assert profile.approval_mode == "full"
-    agent = config.agent_runtime.agents["environment_configurator"]
+    agent = config.agent_registry.agents["environment_configurator"]
     assert agent.runtime_profile == "environment_local"
     assert "environment manifest" in agent.dispatch.profile
     assert agent.capability_refs == ["environment"]
     assert "environment" in config.capability_packages
 
 
-def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
+def test_merge_dicts_merges_agent_registry_maps_by_id() -> None:
     loader = ConfigLoader()
 
     merged = loader._merge_dicts(
         {
-            "agent_runtime": {
-                "runtime_profiles": {
-                    "codex_remote": {
-                        "executor": "codex",
-                        "model": "old-model",
-                        "credential_refs": {"model": "cred-old"},
-                    }
-                },
+            "runtime_profiles": {
+                "codex_remote": {
+                    "executor": "codex",
+                    "model": "old-model",
+                    "credential_refs": {"model": "cred-old"},
+                }
+            },
+            "agent_registry": {
                 "agents": {
                     "reviewer": {
                         "runtime_profile": "codex_remote",
@@ -131,14 +134,14 @@ def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
             }
         },
         {
-            "agent_runtime": {
-                "runtime_profiles": {
-                    "codex_remote": {
-                        "model": "new-model",
-                        "credential_refs": {"git": "cred-git"},
-                    },
-                    "claude_remote": {"executor": "claude"},
+            "runtime_profiles": {
+                "codex_remote": {
+                    "model": "new-model",
+                    "credential_refs": {"git": "cred-git"},
                 },
+                "claude_remote": {"executor": "claude"},
+            },
+            "agent_registry": {
                 "agents": {
                     "reviewer": {"dispatch": {"profile": "New review profile"}},
                     "builder": {"runtime_profile": "claude_remote"},
@@ -147,29 +150,29 @@ def test_merge_dicts_merges_agent_runtime_maps_by_id() -> None:
         },
     )
 
-    codex = merged["agent_runtime"]["runtime_profiles"]["codex_remote"]
+    codex = merged["runtime_profiles"]["codex_remote"]
     assert codex["executor"] == "codex"
     assert codex["model"] == "new-model"
     assert codex["credential_refs"] == {"model": "cred-old", "git": "cred-git"}
-    assert "claude_remote" in merged["agent_runtime"]["runtime_profiles"]
-    assert merged["agent_runtime"]["agents"]["reviewer"]["dispatch"]["profile"] == "New review profile"
-    assert "builder" in merged["agent_runtime"]["agents"]
+    assert "claude_remote" in merged["runtime_profiles"]
+    assert merged["agent_registry"]["agents"]["reviewer"]["dispatch"]["profile"] == "New review profile"
+    assert "builder" in merged["agent_registry"]["agents"]
 
 
-def test_agent_runtime_snapshot_keeps_credential_refs_but_not_plaintext_secrets() -> None:
+def test_agent_run_snapshot_keeps_credential_refs_but_not_plaintext_secrets() -> None:
     config = ConfigLoader()._parse_config(
         {
             "models": {
                 "active_main": "main",
                 "profiles": {"main": {"model": "gpt", "api_key": "key"}},
             },
-            "agent_runtime": {
-                "runtime_profiles": {
-                    "codex_remote": {
-                        "executor": "codex",
-                        "credential_refs": {"model": "cred_codex_team"},
-                    }
-                },
+            "runtime_profiles": {
+                "codex_remote": {
+                    "executor": "codex",
+                    "credential_refs": {"model": "cred_codex_team"},
+                }
+            },
+            "agent_registry": {
                 "agents": {
                     "reviewer": {
                         "runtime_profile": "codex_remote",
@@ -180,7 +183,12 @@ def test_agent_runtime_snapshot_keeps_credential_refs_but_not_plaintext_secrets(
         }
     )
 
-    snapshot = config.agent_runtime.to_runtime_snapshot(config.capability_packages)
+    snapshot = build_agent_run_snapshot(
+        agent_registry=config.agent_registry,
+        runtime_profiles=config.runtime_profiles,
+        run_limits=config.run_limits,
+        capability_packages=config.capability_packages,
+    )
 
     assert "cred_codex_team" in str(snapshot)
     assert "cred_repo_writer" in str(snapshot)
@@ -195,7 +203,7 @@ def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> 
                 "active_main": "main",
                 "profiles": {"main": {"model": "gpt", "api_key": "key"}},
             },
-            "agent_runtime": {
+            "agent_registry": {
                 "agents": {
                     "reviewer": {
                         "runtime_profile": "missing_profile",
@@ -209,7 +217,7 @@ def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> 
     errors = config.validate()
 
     assert (
-        "agent_runtime.agents[reviewer].runtime_profile must exist in runtime_profiles"
+        "agent_registry.agents[reviewer].runtime_profile must exist in runtime_profiles"
         in errors
     )
 
@@ -269,16 +277,18 @@ def test_admin_server_settings_update_preserves_runtime_profiles_and_agents() ->
         def __init__(self) -> None:
             super().__init__(config_path=None)
             self.data = {
-                "agent_runtime": {
+                "run_limits": {
                     "max_running_agents": 4,
                     "max_shells_per_agent": 1,
-                    "runtime_profiles": {
-                        "codex_remote": {
-                            "executor": "codex",
-                            "model": "old-model",
-                            "credential_refs": {"model": "cred-model"},
-                        }
-                    },
+                },
+                "runtime_profiles": {
+                    "codex_remote": {
+                        "executor": "codex",
+                        "model": "old-model",
+                        "credential_refs": {"model": "cred-model"},
+                    }
+                },
+                "agent_registry": {
                     "agents": {
                         "reviewer": {
                             "runtime_profile": "codex_remote",
@@ -299,17 +309,16 @@ def test_admin_server_settings_update_preserves_runtime_profiles_and_agents() ->
     manager = MemoryAdminManager()
 
     result = manager.update_server_settings(
-        {"agent_runtime": {"max_running_agents": 2}}
+        {"run_limits": {"max_running_agents": 2}}
     )
 
     assert result.ok is True
-    runtime = manager.data["agent_runtime"]
-    assert runtime["max_running_agents"] == 2
-    assert runtime["runtime_profiles"]["codex_remote"]["executor"] == "codex"
-    assert runtime["runtime_profiles"]["codex_remote"]["credential_refs"] == {
+    assert manager.data["run_limits"]["max_running_agents"] == 2
+    assert manager.data["runtime_profiles"]["codex_remote"]["executor"] == "codex"
+    assert manager.data["runtime_profiles"]["codex_remote"]["credential_refs"] == {
         "model": "cred-model"
     }
-    assert runtime["agents"]["reviewer"]["runtime_profile"] == "codex_remote"
+    assert manager.data["agent_registry"]["agents"]["reviewer"]["runtime_profile"] == "codex_remote"
 
 
 def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None:
@@ -330,7 +339,7 @@ def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None
                     }
                 },
                 "modes": {"active": "coder", "profiles": {"coder": {}}},
-                "agent_runtime": {
+                "agent_registry": {
                     "agents": {
                         "coder": {
                             "name": "Coder",
@@ -366,7 +375,7 @@ def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None
         "parameters": {},
     }
     assert "environment_configurator" in status["agent_profiles"]
-    environment_agent = status["server_settings"]["agent_runtime"]["agents"][
+    environment_agent = status["server_settings"]["agent_registry"]["agents"][
         "environment_configurator"
     ]
     assert environment_agent["runtime_profile"] == "environment_local"
@@ -377,15 +386,17 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
         def __init__(self) -> None:
             super().__init__(config_path=None)
             self.data = {
-                "agent_runtime": {
+                "run_limits": {
                     "max_running_agents": 4,
                     "max_shells_per_agent": 2,
-                    "runtime_profiles": {
-                        "codex_remote": {
-                            "executor": "codex",
-                            "execution_location": "remote_server",
-                        }
-                    },
+                },
+                "runtime_profiles": {
+                    "codex_remote": {
+                        "executor": "codex",
+                        "execution_location": "remote_server",
+                    }
+                },
+                "agent_registry": {
                     "agents": {
                         "reviewer": {
                             "runtime_profile": "codex_remote",
@@ -407,15 +418,16 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
 
     result = manager.update_server_settings(
         {
-            "agent_runtime_update_mode": "replace",
-            "agent_runtime": {
+            "run_limits": {
                 "max_running_agents": 3,
-                "runtime_profiles": {
-                    "fake_daemon": {
-                        "executor": "fake",
-                        "execution_location": "daemon_worktree",
-                    }
-                },
+            },
+            "runtime_profiles": {
+                "fake_daemon": {
+                    "executor": "fake",
+                    "execution_location": "daemon_worktree",
+                }
+            },
+            "agent_registry": {
                 "agents": {
                     "smoke": {
                         "runtime_profile": "fake_daemon",
@@ -427,18 +439,17 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
     )
 
     assert result.ok is True
-    runtime = manager.data["agent_runtime"]
-    assert runtime["max_running_agents"] == 3
-    assert runtime["max_shells_per_agent"] == 2
-    assert set(runtime["runtime_profiles"]) == {"fake_daemon", "environment_local"}
-    assert set(runtime["agents"]) == {"smoke", "environment_configurator"}
+    assert manager.data["run_limits"]["max_running_agents"] == 3
+    assert manager.data["run_limits"]["max_shells_per_agent"] == 2
+    assert set(manager.data["runtime_profiles"]) == {"fake_daemon", "environment_local"}
+    assert set(manager.data["agent_registry"]["agents"]) == {"smoke", "environment_configurator"}
 
 
 def test_admin_server_settings_update_rejects_missing_agent_profile() -> None:
     class MemoryAdminManager(RemoteAdminConfigManager):
         def __init__(self) -> None:
             super().__init__(config_path=None)
-            self.data = {"agent_runtime": {}}
+            self.data = {"agent_registry": {}, "runtime_profiles": {}}
 
         def _load_data(self) -> dict:
             return deepcopy(self.data)
@@ -449,15 +460,14 @@ def test_admin_server_settings_update_rejects_missing_agent_profile() -> None:
 
     result = MemoryAdminManager().update_server_settings(
         {
-            "agent_runtime_update_mode": "replace",
-            "agent_runtime": {
-                "runtime_profiles": {},
-                "agents": {"reviewer": {"runtime_profile": "missing"}},
+            "runtime_profiles": {},
+            "agent_registry": {
+                "agents": {"reviewer": {"runtime_profile": "missing"}}
             },
         }
     )
 
     assert result.ok is False
     assert result.status == 400
-    assert result.payload["error"] == "invalid_agent_runtime"
+    assert result.payload["error"] == "invalid_agent_registry"
     assert "reviewer" in result.payload["message"]

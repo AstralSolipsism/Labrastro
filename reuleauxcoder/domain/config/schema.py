@@ -45,7 +45,6 @@ CONFIG_SCHEMA = {
                 "description": "string (optional)",
                 "tools": "list of strings (optional, default: all tools)",
                 "prompt_append": "string (optional)",
-                "allowed_subagent_modes": "list of strings (optional)",
             }
         },
     },
@@ -147,23 +146,25 @@ CONFIG_SCHEMA = {
             }
         ],
     },
-    "agent_runtime": {
+    "run_limits": {
         "max_running_agents": "int (default: 4, global server-side Agent concurrency limit)",
         "max_shells_per_agent": "int (default: 1, per-Agent shell concurrency limit)",
-        "runtime_profiles": {
-            "profile_id": {
-                "executor": "string (one of reuleauxcoder, fake, codex, claude, gemini)",
-                "execution_location": "string (one of remote_server, local_workspace)",
-                "command": "string (optional, CLI command for external executors)",
-                "args": "list of strings (optional)",
-                "env": "dict of strings (optional, non-secret process env)",
-                "runtime_home_policy": "string (optional, e.g. per_task)",
-                "approval_mode": "string (optional, e.g. autonomous)",
-                "config_isolation": "string (optional, e.g. per_agent)",
-                "credential_refs": "dict of strings (optional, references server-managed secrets)",
-                "mcp": "dict (optional, executor-native MCP settings rendered from platform config)",
-            }
+    },
+    "runtime_profiles": {
+        "profile_id": {
+            "executor": "string (one of reuleauxcoder, fake, codex, claude, gemini)",
+            "execution_location": "string (one of remote_server, local_workspace)",
+            "command": "string (optional, CLI command for external executors)",
+            "args": "list of strings (optional)",
+            "env": "dict of strings (optional, non-secret process env)",
+            "runtime_home_policy": "string (optional, e.g. per_task)",
+            "approval_mode": "string (optional, e.g. autonomous)",
+            "config_isolation": "string (optional, e.g. per_agent)",
+            "credential_refs": "dict of strings (optional, references server-managed secrets)",
+            "mcp": "dict (optional, executor-native MCP settings rendered from platform config)",
         },
+    },
+    "agent_registry": {
         "agents": {
             "agent_id": {
                 "name": "string (optional)",
@@ -266,7 +267,6 @@ BUILTIN_MODES = {
             "Prioritize making concrete code changes and verifying them with commands/tests "
             "when appropriate."
         ),
-        "allowed_subagent_modes": ["explore", "execute", "verify"],
     },
     "planner": {
         "description": "Planning-first mode; focus on analysis and implementation plans.",
@@ -275,7 +275,6 @@ BUILTIN_MODES = {
             "Focus on analysis, architecture, and step-by-step plans. Avoid file mutations "
             "unless explicitly requested."
         ),
-        "allowed_subagent_modes": ["explore"],
     },
     "debugger": {
         "description": "Debugging mode focused on diagnosis and verification.",
@@ -284,7 +283,6 @@ BUILTIN_MODES = {
             "Focus on root-cause analysis, minimal repro steps, and targeted fixes with "
             "clear verification."
         ),
-        "allowed_subagent_modes": ["explore", "verify"],
     },
     "taskflow": {
         "description": "Background long-task planning and dispatch mode.",
@@ -293,7 +291,6 @@ BUILTIN_MODES = {
             "Guide the user from a fuzzy goal into decisions, acceptance criteria, "
             "issue drafts, task drafts, dispatch, and completion review."
         ),
-        "allowed_subagent_modes": ["explore", "verify"],
     },
 }
 
@@ -314,7 +311,7 @@ DEFAULTS = {
         {"tool_name": "write_file", "action": "require_approval"},
         {"tool_name": "edit_file", "action": "require_approval"},
         {"tool_name": "shell", "action": "require_approval"},
-        {"tool_name": "agent", "action": "require_approval"},
+        {"tool_name": "delegate_agent", "action": "require_approval"},
         {"tool_source": "mcp", "mcp_server": "filesystem", "action": "warn"},
         {"tool_source": "mcp", "action": "require_approval"},
     ],

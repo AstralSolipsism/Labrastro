@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -161,7 +161,7 @@ def test_parse_config_reads_provider_backed_profiles() -> None:
     assert config.providers.items["anthropic-main"].type == "anthropic_messages"
     assert config.providers.items["anthropic-main"].compat == "deepseek"
     assert config.model_profiles["main"].provider == "anthropic-main"
-    assert "coder" not in config.agent_runtime.agents
+    assert "coder" not in config.agent_registry.agents
     assert config.api_key == "sk-ant"
     assert config.base_url == "https://api.anthropic.com"
 
@@ -192,7 +192,7 @@ def test_parse_config_keeps_existing_agent_default_model() -> None:
                 },
             },
             "modes": {"profiles": {"coder": {}}},
-            "agent_runtime": {
+            "agent_registry": {
                 "agents": {
                     "coder": {
                         "name": "Coder",
@@ -207,7 +207,7 @@ def test_parse_config_keeps_existing_agent_default_model() -> None:
         }
     )
 
-    coder_model = config.agent_runtime.agents["coder"].model
+    coder_model = config.agent_registry.agents["coder"].model
     assert coder_model.provider == "deepseek"
     assert coder_model.model == "V4PRO"
     assert coder_model.display_name == "V4 Pro"
@@ -604,17 +604,18 @@ def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
     assert data["models"]["profiles"]["default"]["api_key"] == "your-api-key-here"
     assert "modes" in data
     assert data["modes"]["active"] == "coder"
-    runtime = data["agent_runtime"]
-    assert runtime["runtime_profiles"]["environment_local"]["executor"] == "reuleauxcoder"
+    runtime_profiles = data["runtime_profiles"]
+    agent_registry = data["agent_registry"]
+    assert runtime_profiles["environment_local"]["executor"] == "reuleauxcoder"
     assert (
-        runtime["runtime_profiles"]["environment_local"]["execution_location"]
+        runtime_profiles["environment_local"]["execution_location"]
         == "local_workspace"
     )
-    assert runtime["runtime_profiles"]["environment_local"]["runtime_home_policy"] == "per_task"
-    assert runtime["runtime_profiles"]["environment_local"]["approval_mode"] == "full"
-    assert "environment_configurator" in runtime["agents"]
-    assert "server manifest" in runtime["agents"]["environment_configurator"]["dispatch"]["profile"]
-    assert runtime["agents"]["environment_configurator"]["capability_refs"] == [
+    assert runtime_profiles["environment_local"]["runtime_home_policy"] == "per_task"
+    assert runtime_profiles["environment_local"]["approval_mode"] == "full"
+    assert "environment_configurator" in agent_registry["agents"]
+    assert "server manifest" in agent_registry["agents"]["environment_configurator"]["dispatch"]["profile"]
+    assert agent_registry["agents"]["environment_configurator"]["capability_refs"] == [
         "environment"
     ]
 

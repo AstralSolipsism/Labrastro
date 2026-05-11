@@ -61,15 +61,18 @@ DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE: dict[str, Any] = {
 }
 
 
-def ensure_default_environment_agent_runtime(
-    data: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Return agent_runtime data with the current system environment Agent present."""
+def ensure_default_environment_agent_registry(
+    agent_registry_data: dict[str, Any] | None,
+    runtime_profiles_data: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return Agent Registry and runtime profile data with the environment Agent present."""
 
-    runtime = deepcopy(data) if isinstance(data, dict) else {}
-    raw_profiles = runtime.get("runtime_profiles")
-    profiles = raw_profiles if isinstance(raw_profiles, dict) else {}
-    runtime["runtime_profiles"] = profiles
+    registry = deepcopy(agent_registry_data) if isinstance(agent_registry_data, dict) else {}
+    profiles = (
+        deepcopy(runtime_profiles_data)
+        if isinstance(runtime_profiles_data, dict)
+        else {}
+    )
     profile = profiles.get(DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID)
     if not isinstance(profile, dict):
         profiles[DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID] = deepcopy(
@@ -79,9 +82,9 @@ def ensure_default_environment_agent_runtime(
         for key, value in DEFAULT_ENVIRONMENT_RUNTIME_PROFILE.items():
             profile.setdefault(key, deepcopy(value))
 
-    raw_agents = runtime.get("agents")
+    raw_agents = registry.get("agents")
     agents = raw_agents if isinstance(raw_agents, dict) else {}
-    runtime["agents"] = agents
+    registry["agents"] = agents
     agent = agents.get(DEFAULT_ENVIRONMENT_AGENT_ID)
     if not isinstance(agent, dict):
         agents[DEFAULT_ENVIRONMENT_AGENT_ID] = deepcopy(DEFAULT_ENVIRONMENT_AGENT)
@@ -93,7 +96,7 @@ def ensure_default_environment_agent_runtime(
             agent["dispatch"] = deepcopy(DEFAULT_ENVIRONMENT_AGENT["dispatch"])
         if not isinstance(agent.get("capability_refs"), list):
             agent["capability_refs"] = list(DEFAULT_ENVIRONMENT_AGENT["capability_refs"])
-    return runtime
+    return registry, profiles
 
 
 def ensure_default_capability_packages(
@@ -565,23 +568,16 @@ class ModeConfig:
     description: str = ""
     tools: list[str] = field(default_factory=list)
     prompt_append: str = ""
-    allowed_subagent_modes: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "ModeConfig":
         """Create from dictionary format."""
         tools = d.get("tools", [])
-        allowed_subagent_modes = d.get("allowed_subagent_modes", [])
         return cls(
             name=name,
             description=d.get("description", "") or "",
             tools=[str(t) for t in tools] if isinstance(tools, list) else [],
             prompt_append=d.get("prompt_append", "") or "",
-            allowed_subagent_modes=(
-                [str(m) for m in allowed_subagent_modes]
-                if isinstance(allowed_subagent_modes, list)
-                else []
-            ),
         )
 
 
@@ -747,81 +743,65 @@ class AuthConfig:
 
 
 @dataclass
-class AgentRuntimeConfig:
-    """Server-side Agent runtime settings and runtime snapshot config."""
+class RunLimitsConfig:
+    """Concurrency limits for interactive AgentRun and shell slots."""
 
     max_running_agents: int = 4
     max_shells_per_agent: int = 1
-    runtime_profiles: dict[str, RuntimeProfileConfig] = field(default_factory=dict)
-    agents: dict[str, AgentConfig] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "RunLimitsConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            max_running_agents=int(data.get("max_running_agents", 4) or 4),
+            max_shells_per_agent=int(data.get("max_shells_per_agent", 1) or 1),
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "max_running_agents": self.max_running_agents,
-            "max_shells_per_agent": self.max_shells_per_agent,
-        }
-        if self.runtime_profiles:
-            data["runtime_profiles"] = {
-                profile_id: profile.to_dict()
-                for profile_id, profile in self.runtime_profiles.items()
-            }
-        if self.agents:
-            data["agents"] = {
-                agent_id: agent.to_dict() for agent_id, agent in self.agents.items()
-            }
-        return data
-
-    def to_runtime_snapshot(
-        self,
-        capability_packages: dict[str, CapabilityPackageConfig] | None = None,
-    ) -> dict[str, Any]:
-        """Return the server-authoritative runtime snapshot for executors."""
-
-        packages = dict(capability_packages or {})
-        if "environment" not in packages:
-            packages["environment"] = CapabilityPackageConfig.from_dict(
-                "environment",
-                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
-            )
-        agents: dict[str, dict[str, Any]] = {}
-        for agent_id, agent in self.agents.items():
-            agent_dict = agent.to_dict()
-            agent_dict["resolved_capabilities"] = resolve_capability_refs(
-                agent.capability_refs,
-                packages,
-            )
-            agents[agent_id] = agent_dict
         return {
             "max_running_agents": self.max_running_agents,
             "max_shells_per_agent": self.max_shells_per_agent,
-            "runtime_profiles": {
-                profile_id: profile.to_dict()
-                for profile_id, profile in self.runtime_profiles.items()
-            },
-            "agents": agents,
-            "capability_packages": {
-                package_id: package.to_dict()
-                for package_id, package in packages.items()
-            },
         }
 
+
+@dataclass
+class RuntimeProfilesConfig:
+    """Top-level runtime profile registry."""
+
+    profiles: dict[str, RuntimeProfileConfig] = field(default_factory=dict)
+
     @classmethod
-    def from_dict(cls, d: dict[str, Any] | None) -> "AgentRuntimeConfig":
-        if not isinstance(d, dict):
-            return cls()
-        raw_profiles = d.get("runtime_profiles", {})
-        runtime_profiles = (
+    def from_dict(cls, data: dict[str, Any] | None) -> "RuntimeProfilesConfig":
+        profiles = (
             {
                 str(profile_id): RuntimeProfileConfig.from_dict(
                     str(profile_id), profile_data
                 )
-                for profile_id, profile_data in raw_profiles.items()
+                for profile_id, profile_data in data.items()
                 if isinstance(profile_data, dict)
             }
-            if isinstance(raw_profiles, dict)
+            if isinstance(data, dict)
             else {}
         )
-        raw_agents = d.get("agents", {})
+        return cls(profiles=profiles)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            profile_id: profile.to_dict()
+            for profile_id, profile in self.profiles.items()
+        }
+
+
+@dataclass
+class AgentRegistryConfig:
+    """Persistent Agent registry."""
+
+    agents: dict[str, AgentConfig] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AgentRegistryConfig":
+        raw_agents = data.get("agents", {}) if isinstance(data, dict) else {}
         agents = (
             {
                 str(agent_id): AgentConfig.from_dict(str(agent_id), agent_data)
@@ -831,12 +811,49 @@ class AgentRuntimeConfig:
             if isinstance(raw_agents, dict)
             else {}
         )
-        return cls(
-            max_running_agents=int(d.get("max_running_agents", 4) or 4),
-            max_shells_per_agent=int(d.get("max_shells_per_agent", 1) or 1),
-            runtime_profiles=runtime_profiles,
-            agents=agents,
+        return cls(agents=agents)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agents": {
+                agent_id: agent.to_dict() for agent_id, agent in self.agents.items()
+            }
+        }
+
+
+def build_agent_run_snapshot(
+    *,
+    agent_registry: AgentRegistryConfig,
+    runtime_profiles: RuntimeProfilesConfig,
+    run_limits: RunLimitsConfig,
+    capability_packages: dict[str, CapabilityPackageConfig] | None = None,
+) -> dict[str, Any]:
+    """Return the server-authoritative AgentRun snapshot for executors."""
+
+    packages = dict(capability_packages or {})
+    if "environment" not in packages:
+        packages["environment"] = CapabilityPackageConfig.from_dict(
+            "environment",
+            DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
         )
+    agents: dict[str, dict[str, Any]] = {}
+    for agent_id, agent in agent_registry.agents.items():
+        agent_dict = agent.to_dict()
+        agent_dict["resolved_capabilities"] = resolve_capability_refs(
+            agent.capability_refs,
+            packages,
+        )
+        agents[agent_id] = agent_dict
+    return {
+        "max_running_agents": run_limits.max_running_agents,
+        "max_shells_per_agent": run_limits.max_shells_per_agent,
+        "runtime_profiles": runtime_profiles.to_dict(),
+        "agents": agents,
+        "capability_packages": {
+            package_id: package.to_dict()
+            for package_id, package in packages.items()
+        },
+    }
 
 
 @dataclass
@@ -887,6 +904,57 @@ class PersistenceConfig:
             "snapshot_compress_threshold_bytes": self.snapshot_compress_threshold_bytes,
             "maintenance_interval_sec": self.maintenance_interval_sec,
         }
+
+
+@dataclass
+class SandboxProviderConfig:
+    """Execution-room provider used for on-demand AgentRun sessions."""
+
+    type: str = "none"
+    host_base_url: str = ""
+    worker_image: str = "labrastro-host:test"
+    workspace_volume_root: str = "ezcode-workspaces"
+    network: str = ""
+    cpu_limit: str = ""
+    memory_limit: str = ""
+    idle_ttl_seconds: int = 3600
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SandboxProviderConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            type=str(data.get("type", "none") or "none"),
+            host_base_url=str(data.get("host_base_url", "") or ""),
+            worker_image=str(
+                data.get("worker_image", "labrastro-host:test")
+                or "labrastro-host:test"
+            ),
+            workspace_volume_root=str(
+                data.get("workspace_volume_root", "ezcode-workspaces")
+                or "ezcode-workspaces"
+            ),
+            network=str(data.get("network", "") or ""),
+            cpu_limit=str(data.get("cpu_limit", "") or ""),
+            memory_limit=str(data.get("memory_limit", "") or ""),
+            idle_ttl_seconds=int(data.get("idle_ttl_seconds", 3600) or 3600),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "type": self.type,
+            "host_base_url": self.host_base_url,
+            "worker_image": self.worker_image,
+            "workspace_volume_root": self.workspace_volume_root,
+            "idle_ttl_seconds": self.idle_ttl_seconds,
+        }
+        if self.network:
+            data["network"] = self.network
+        if self.cpu_limit:
+            data["cpu_limit"] = self.cpu_limit
+        if self.memory_limit:
+            data["memory_limit"] = self.memory_limit
+        return data
 
 
 @dataclass
@@ -1240,14 +1308,19 @@ class Config:
     # Remote host authentication settings
     auth: AuthConfig = field(default_factory=AuthConfig)
 
-    # Server Agent runtime settings
-    agent_runtime: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
+    # Persistent Agent definitions, runtime profiles, and AgentRun limits.
+    agent_registry: AgentRegistryConfig = field(default_factory=AgentRegistryConfig)
+    runtime_profiles: RuntimeProfilesConfig = field(default_factory=RuntimeProfilesConfig)
+    run_limits: RunLimitsConfig = field(default_factory=RunLimitsConfig)
 
     # Reusable capability packages installed from local config or a future market.
     capability_packages: dict[str, CapabilityPackageConfig] = field(default_factory=dict)
 
     # Durable persistence settings
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+
+    # On-demand execution-room provider.
+    sandbox_provider: SandboxProviderConfig = field(default_factory=SandboxProviderConfig)
 
     # GitHub App pull request lifecycle settings
     github: GitHubConfig = field(default_factory=GitHubConfig)
@@ -1271,10 +1344,10 @@ class Config:
             errors.append("tool_output_max_chars must be positive")
         if self.tool_output_max_lines < 1:
             errors.append("tool_output_max_lines must be positive")
-        if self.agent_runtime.max_running_agents < 1:
-            errors.append("agent_runtime.max_running_agents must be positive")
-        if self.agent_runtime.max_shells_per_agent < 1:
-            errors.append("agent_runtime.max_shells_per_agent must be positive")
+        if self.run_limits.max_running_agents < 1:
+            errors.append("run_limits.max_running_agents must be positive")
+        if self.run_limits.max_shells_per_agent < 1:
+            errors.append("run_limits.max_shells_per_agent must be positive")
         if self.remote_exec.enabled and self.remote_exec.host_mode:
             if not self.auth.enabled:
                 errors.append("auth.enabled is required for remote host mode")
@@ -1323,6 +1396,14 @@ class Config:
             )
         if self.persistence.maintenance_interval_sec < 1:
             errors.append("persistence.maintenance_interval_sec must be positive")
+        if self.sandbox_provider.type not in {"docker", "external", "k8s", "none"}:
+            errors.append("sandbox_provider.type must be one of docker, external, k8s, none")
+        if self.sandbox_provider.idle_ttl_seconds < 1:
+            errors.append("sandbox_provider.idle_ttl_seconds must be positive")
+        if self.sandbox_provider.type == "docker" and not self.sandbox_provider.host_base_url:
+            errors.append(
+                "sandbox_provider.host_base_url is required when sandbox_provider.type is docker"
+            )
         if self.github.enabled:
             if self.persistence.backend == "memory" or not self.persistence.database_url:
                 errors.append(
@@ -1350,26 +1431,26 @@ class Config:
                 "environment",
                 DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
             )
-        for agent_id, agent in self.agent_runtime.agents.items():
+        for agent_id, agent in self.agent_registry.agents.items():
             if (
                 agent.runtime_profile
-                and agent.runtime_profile not in self.agent_runtime.runtime_profiles
+                and agent.runtime_profile not in self.runtime_profiles.profiles
             ):
                 errors.append(
-                    f"agent_runtime.agents[{agent_id}].runtime_profile must exist in runtime_profiles"
+                    f"agent_registry.agents[{agent_id}].runtime_profile must exist in runtime_profiles"
                 )
             if agent.model.provider and agent.model.provider not in self.providers.items:
                 errors.append(
-                    f"agent_runtime.agents[{agent_id}].model.provider must exist in providers.items"
+                    f"agent_registry.agents[{agent_id}].model.provider must exist in providers.items"
                 )
             if agent.model.provider and not agent.model.model:
                 errors.append(
-                    f"agent_runtime.agents[{agent_id}].model.model is required when provider is set"
+                    f"agent_registry.agents[{agent_id}].model.model is required when provider is set"
                 )
             for package_ref in agent.capability_refs:
                 if package_ref not in capability_packages:
                     errors.append(
-                        f"agent_runtime.agents[{agent_id}].capability_refs references missing capability package {package_ref}"
+                        f"agent_registry.agents[{agent_id}].capability_refs references missing capability package {package_ref}"
                     )
         mcp_names = {server.name for server in self.mcp_servers}
         cli_tool_names = set(self.environment.cli_tools)
