@@ -225,27 +225,29 @@ class IssueAssignmentService:
             "execution_location": _optional(execution_location),
             **dict(metadata or {}),
         }
-        self.taskflow_service.clarify_goal(
+        acceptance_id = f"acceptance-{assignment.id}"
+        self.taskflow_service.record_discovery_turn(
             taskflow_id,
+            actor="issue_assignment",
+            examples=[
+                {
+                    "id": acceptance_id,
+                    "title": f"Assignment accepted: {title or issue.title}",
+                    "then": ["The assignment creates a traceable WorkItem."],
+                    "observable_outputs": ["work_item", "task_run"],
+                }
+            ],
             work_item_candidates=[
                 WorkItemCandidate(
                     id=assignment.id,
                     title=(title or issue.title),
                     description=(prompt or issue.description or issue.title),
                     type="implementation",
+                    acceptance_refs=[acceptance_id],
                     dedupe_key=f"{issue.id}:{assignment.id}",
                     metadata=candidate_metadata,
                 )
             ],
-            readiness_gates=[
-                ReadinessGate(
-                    id=f"gate-{assignment.id}",
-                    name="assignment-ready",
-                    passed=True,
-                    rationale="Issue assignment created an explicit WorkItem candidate.",
-                )
-            ],
-            readiness_score=90,
         )
         self.taskflow_service.confirm_goal(taskflow_id, confirmed_by="issue_assignment")
         plan = self.taskflow_service.compile_goal(taskflow_id)
@@ -275,9 +277,23 @@ class IssueAssignmentService:
         if not assignment.work_item_id:
             raise ValueError("assignment has no work item")
         dispatch_source = "mention" if assignment.source == "mention" else "assignment"
+        taskflow_id = issue.taskflow_id or self._ensure_backing_goal(issue, peer_id=peer_id)
+        dispatch_decision = self.taskflow_service.request_dispatch_decision(
+            taskflow_id,
+            work_item_ids=[assignment.work_item_id],
+            actor=peer_id or dispatch_source,
+            rationale=f"{dispatch_source} dispatch requested.",
+            metadata={"dispatch_source": dispatch_source, "assignment_id": assignment.id},
+        )
+        self.taskflow_service.confirm_dispatch_decision(
+            taskflow_id,
+            decision_id=dispatch_decision.id,
+            actor=peer_id or dispatch_source,
+        )
         run = self.taskflow_service.dispatch_task_run(
-            issue.taskflow_id or self._ensure_backing_goal(issue, peer_id=peer_id),
+            taskflow_id,
             work_item_id=assignment.work_item_id,
+            dispatch_decision_id=dispatch_decision.id,
             executor_hint=assignment.target_agent_id,
             metadata={
                 "issue_id": issue.id,
