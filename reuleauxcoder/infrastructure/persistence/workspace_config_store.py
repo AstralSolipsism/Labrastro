@@ -51,7 +51,7 @@ class WorkspaceConfigStore:
         return self._path
 
     def save_active_sub_model_profile(self, profile_name: str) -> Path:
-        """Persist active sub-agent model profile into workspace ``config.yaml``."""
+        """Persist active delegated-run model profile into workspace ``config.yaml``."""
         try:
             data = load_yaml_config(self._path)
         except FileNotFoundError:

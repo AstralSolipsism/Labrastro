@@ -1,4 +1,4 @@
-import json
+﻿import json
 
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import HookPoint
@@ -211,10 +211,10 @@ def test_sanitize_messages_backfills_missing_reasoning_for_non_tool_assistant_in
     None
 ):
     """Non-tool-call assistant lacking reasoning_content in a tool-call turn
-    (e.g. injected sub-agent results) must receive a placeholder when
+    (e.g. injected delegated-run status notes) must receive a placeholder when
     reasoning_replay_mode='tool_calls'."""
     messages = [
-        {"role": "user", "content": "send sub-agents"},
+        {"role": "user", "content": "delegate work"},
         {
             "role": "assistant",
             "content": None,
@@ -223,14 +223,14 @@ def test_sanitize_messages_backfills_missing_reasoning_for_non_tool_assistant_in
                 {
                     "id": "tool_1",
                     "type": "function",
-                    "function": {"name": "agent", "arguments": '{"tasks":["..."],"run_in_background":true}'},
+                    "function": {"name": "delegate_agent", "arguments": '{"agent_id":"researcher","task":"..."}'},
                 }
             ],
         },
         {"role": "tool", "tool_call_id": "tool_1", "content": "started jobs"},
         {
             "role": "assistant",
-            "content": "[Background sub-agent completed]...",
+            "content": "[Delegated AgentRun submitted]...",
             # No reasoning_content — injected by system
         },
         {"role": "user", "content": "are they done?"},
