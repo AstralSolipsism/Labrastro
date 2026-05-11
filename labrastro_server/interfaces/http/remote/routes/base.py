@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import gzip
 import json
@@ -47,7 +47,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
-from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskRequest
+from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,

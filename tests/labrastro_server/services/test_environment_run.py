@@ -7,7 +7,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     EnvironmentManifestResponse,
 )
 from labrastro_server.services.agent_runtime.control_plane import (
-    AgentRuntimeControlPlane,
+    AgentRunControlPlane,
 )
 from labrastro_server.services.environment_run import (
     EnvironmentRunError,
@@ -15,8 +15,8 @@ from labrastro_server.services.environment_run import (
 )
 
 
-def _control(*, agents: dict | None = None) -> AgentRuntimeControlPlane:
-    return AgentRuntimeControlPlane(
+def _control(*, agents: dict | None = None) -> AgentRunControlPlane:
+    return AgentRunControlPlane(
         runtime_snapshot={
             "runtime_profiles": {
                 "environment_local": {
@@ -64,7 +64,7 @@ def test_environment_run_uses_default_agent_and_sets_check_metadata() -> None:
         workspace_root="/repo",
     )
 
-    task = control.get_task(result.task.id)
+    task = control.get_agent_run(result.agent_run.id)
     assert result.agent_id == "environment_configurator"
     assert task.trigger_mode.value == "environment_config"
     assert task.metadata["workflow"] == "environment_config"
@@ -92,7 +92,7 @@ def test_environment_run_configure_includes_install_command() -> None:
         agent_id="environment_configurator",
     )
 
-    task = control.get_task(result.task.id)
+    task = control.get_agent_run(result.agent_run.id)
     assert task.metadata["environment_mode"] == "configure"
     assert {
         "entry_id": "cli:gitnexus",

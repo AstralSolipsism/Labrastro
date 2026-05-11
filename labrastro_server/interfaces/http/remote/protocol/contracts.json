@@ -266,9 +266,9 @@
       }
     },
     {
-      "name": "runtime.claim",
+      "name": "agent_runs.claim",
       "method": "POST",
-      "path": "/remote/runtime/claim",
+      "path": "/remote/agent-runs/claim",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
@@ -281,9 +281,9 @@
       }
     },
     {
-      "name": "runtime.events",
+      "name": "agent_runs.events",
       "method": "GET",
-      "path": "/remote/agent-runtime/tasks/{task_id}/events",
+      "path": "/remote/agent-runs/{agent_run_id}/events",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
@@ -294,7 +294,7 @@
         "ok": true,
         "events": [
           {
-            "task_id": "task_contract",
+            "agent_run_id": "task_contract",
             "seq": 1,
             "type": "queued",
             "payload": {}
@@ -305,14 +305,14 @@
       }
     },
     {
-      "name": "runtime.complete",
+      "name": "agent_runs.complete",
       "method": "POST",
-      "path": "/remote/runtime/complete",
+      "path": "/remote/agent-runs/complete",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
         "request_id": "run_contract",
-        "task_id": "task_contract",
+        "agent_run_id": "task_contract",
         "worker_id": "worker_contract",
         "status": "completed",
         "output": "done",
@@ -325,9 +325,9 @@
       }
     },
     {
-      "name": "admin.runtime.submit",
+      "name": "admin.agent_runs.submit",
       "method": "POST",
-      "path": "/remote/admin/runtime/submit",
+      "path": "/remote/admin/agent-runs/submit",
       "auth": "bearer",
       "request": {
         "issue_id": "manual",
@@ -356,7 +356,7 @@
       "response": {
         "ok": true,
         "settings": {
-          "agent_runtime": {},
+          "agent_runs": {},
           "github": {}
         },
         "runtime": {},

@@ -1,4 +1,4 @@
-"""Environment configuration runs submitted through the Agent runtime."""
+﻿"""Environment configuration runs submitted through AgentRun."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from labrastro_server.interfaces.http.remote.protocol import (
     EnvironmentManifestResponse,
 )
 from labrastro_server.services.agent_runtime.control_plane import (
-    AgentRuntimeControlPlane,
-    RuntimeTaskRequest,
+    AgentRunControlPlane,
+    AgentRunRequest,
 )
-from reuleauxcoder.domain.agent_runtime.models import TaskRecord, TriggerMode
+from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord, TriggerMode
 from reuleauxcoder.domain.config.models import DEFAULT_ENVIRONMENT_AGENT_ID
 
 
@@ -44,16 +44,16 @@ class EnvironmentRunError(Exception):
 
 @dataclass(frozen=True)
 class EnvironmentRunResult:
-    task: TaskRecord
+    agent_run: AgentRunRecord
     agent_id: str
     entry_ids: list[str]
     manifest_hash: str
 
 
 class EnvironmentRunService:
-    """Submit environment check/configure work as a normal Agent task."""
+    """Submit environment check/configure work as a normal AgentRun."""
 
-    def __init__(self, runtime_control_plane: AgentRuntimeControlPlane) -> None:
+    def __init__(self, runtime_control_plane: AgentRunControlPlane) -> None:
         self.runtime_control_plane = runtime_control_plane
 
     def submit(
@@ -104,6 +104,7 @@ class EnvironmentRunService:
         )
         metadata = {
             "workflow": ENVIRONMENT_WORKFLOW,
+            "agent_run_source": "environment",
             "environment_mode": normalized_mode,
             "entry_ids": list(selected_ids),
             "manifest_hash": manifest_hash,
@@ -111,18 +112,19 @@ class EnvironmentRunService:
         }
         if workspace_root:
             metadata["workspace_root"] = workspace_root
-        task = self.runtime_control_plane.submit_task(
-            RuntimeTaskRequest(
+        agent_run = self.runtime_control_plane.submit_agent_run(
+            AgentRunRequest(
                 issue_id=f"environment-{normalized_mode}",
                 agent_id=selected_agent_id,
                 prompt=prompt,
+                source="environment",
                 trigger_mode=TriggerMode.ENVIRONMENT_CONFIG,
                 workdir=workspace_root or None,
                 metadata=metadata,
             )
         )
         return EnvironmentRunResult(
-            task=task,
+            agent_run=agent_run,
             agent_id=selected_agent_id,
             entry_ids=selected_ids,
             manifest_hash=manifest_hash,

@@ -1,4 +1,4 @@
-"""Admin helpers for the remote relay HTTP service."""
+﻿"""Admin helpers for the remote relay HTTP service."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from reuleauxcoder.app.runtime.agent_runtime import get_agent_runtime_limiter
+from reuleauxcoder.app.runtime.agent_runtime import get_interactive_run_limiter
 from reuleauxcoder.domain.config.models import (
-    AgentRuntimeConfig,
+    AgentRegistryConfig,
     CapabilityPackageConfig,
     EnvironmentCLIToolConfig,
     EnvironmentSkillConfig,
@@ -20,8 +20,11 @@ from reuleauxcoder.domain.config.models import (
     ModelProfileConfig,
     ProviderApiFeatures,
     ProviderConfig,
+    RunLimitsConfig,
+    RuntimeProfilesConfig,
+    SandboxProviderConfig,
     ensure_default_capability_packages,
-    ensure_default_environment_agent_runtime,
+    ensure_default_environment_agent_registry,
     infer_provider_compat,
 )
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULT_ACTIVE_MODE
@@ -74,7 +77,7 @@ class RemoteAdminConfigManager:
             "modes": modes["modes"],
             "active_mode": modes["active_mode"],
             "server_settings": self.read_server_settings()["settings"],
-            "agent_runtime": get_agent_runtime_limiter().snapshot(),
+            "agent_runs": get_interactive_run_limiter().snapshot(),
         }
 
     def config_etag(self, data: dict[str, Any] | None = None) -> str:
@@ -108,17 +111,11 @@ class RemoteAdminConfigManager:
             item = profile_items.get(name)
             mode = item if isinstance(item, dict) else {}
             tools = mode.get("tools", [])
-            allowed_subagent_modes = mode.get("allowed_subagent_modes", [])
             modes.append(
                 {
                     "name": str(name),
                     "description": str(mode.get("description") or ""),
                     "tools": [str(tool) for tool in tools] if isinstance(tools, list) else [],
-                    "allowed_subagent_modes": (
-                        [str(item) for item in allowed_subagent_modes]
-                        if isinstance(allowed_subagent_modes, list)
-                        else []
-                    ),
                     "prompt_append": str(mode.get("prompt_append") or ""),
                 }
             )
@@ -129,15 +126,32 @@ class RemoteAdminConfigManager:
             active_mode = ""
         return {"modes": modes, "active_mode": active_mode or None}
 
+    def _agent_settings_from_data(
+        self,
+        data: dict[str, Any],
+    ) -> tuple[AgentRegistryConfig, RuntimeProfilesConfig, RunLimitsConfig]:
+        registry_data, profiles_data = ensure_default_environment_agent_registry(
+            data.get("agent_registry", {})
+            if isinstance(data.get("agent_registry"), dict)
+            else {},
+            data.get("runtime_profiles", {})
+            if isinstance(data.get("runtime_profiles"), dict)
+            else {},
+        )
+        return (
+            AgentRegistryConfig.from_dict(registry_data),
+            RuntimeProfilesConfig.from_dict(profiles_data),
+            RunLimitsConfig.from_dict(
+                data.get("run_limits", {})
+                if isinstance(data.get("run_limits"), dict)
+                else {}
+            ),
+        )
+
     def read_server_settings(self) -> dict[str, Any]:
         data = self._load_data()
-        raw_runtime = data.get("agent_runtime", {})
         raw_capability_packages = data.get("capability_packages", {})
-        runtime = AgentRuntimeConfig.from_dict(
-            ensure_default_environment_agent_runtime(
-                raw_runtime if isinstance(raw_runtime, dict) else {}
-            )
-        )
+        agent_registry, runtime_profiles, run_limits = self._agent_settings_from_data(data)
         capability_packages = {
             str(package_id): CapabilityPackageConfig.from_dict(
                 str(package_id), package_data
@@ -151,51 +165,55 @@ class RemoteAdminConfigManager:
         }
         raw_github = data.get("github", {})
         github = GitHubConfig.from_dict(raw_github if isinstance(raw_github, dict) else {})
+        raw_sandbox = data.get("sandbox_provider", {})
+        sandbox_provider = SandboxProviderConfig.from_dict(
+            raw_sandbox if isinstance(raw_sandbox, dict) else {}
+        )
         return {
             "settings": {
-                "agent_runtime": runtime.to_dict(),
+                "agent_registry": agent_registry.to_dict(),
+                "runtime_profiles": runtime_profiles.to_dict(),
+                "run_limits": run_limits.to_dict(),
                 "capability_packages": capability_packages,
                 "github": github.to_dict(mask_secret=True),
+                "sandbox_provider": sandbox_provider.to_dict(),
             },
-            "runtime": get_agent_runtime_limiter().snapshot(),
+            "agent_runs": get_interactive_run_limiter().snapshot(),
             "config_etag": self.config_etag(data),
         }
 
     def update_server_settings(self, payload: dict[str, Any]) -> AdminConfigResult:
         raw_settings = payload.get("settings")
-        raw_runtime = payload.get("agent_runtime")
+        raw_agent_registry = payload.get("agent_registry")
+        raw_runtime_profiles = payload.get("runtime_profiles")
+        raw_run_limits = payload.get("run_limits")
         raw_capability_packages = payload.get("capability_packages")
         raw_github = payload.get("github")
-        if isinstance(raw_settings, dict) and raw_runtime is None:
-            raw_runtime = raw_settings.get("agent_runtime")
+        raw_sandbox = payload.get("sandbox_provider")
+        if isinstance(raw_settings, dict) and raw_agent_registry is None:
+            raw_agent_registry = raw_settings.get("agent_registry")
+        if isinstance(raw_settings, dict) and raw_runtime_profiles is None:
+            raw_runtime_profiles = raw_settings.get("runtime_profiles")
+        if isinstance(raw_settings, dict) and raw_run_limits is None:
+            raw_run_limits = raw_settings.get("run_limits")
         if isinstance(raw_settings, dict) and raw_capability_packages is None:
             raw_capability_packages = raw_settings.get("capability_packages")
         if isinstance(raw_settings, dict) and raw_github is None:
             raw_github = raw_settings.get("github")
+        if isinstance(raw_settings, dict) and raw_sandbox is None:
+            raw_sandbox = raw_settings.get("sandbox_provider")
         if (
-            not isinstance(raw_runtime, dict)
+            not isinstance(raw_agent_registry, dict)
+            and not isinstance(raw_runtime_profiles, dict)
+            and not isinstance(raw_run_limits, dict)
             and not isinstance(raw_capability_packages, dict)
             and not isinstance(raw_github, dict)
+            and not isinstance(raw_sandbox, dict)
         ):
             return AdminConfigResult(False, {"error": "server_settings_required"}, 400)
-        update_mode = str(payload.get("agent_runtime_update_mode") or "merge").lower()
-        if update_mode not in {"merge", "replace"}:
-            return AdminConfigResult(
-                False,
-                {
-                    "error": "invalid_agent_runtime_update_mode",
-                    "message": "agent_runtime_update_mode must be merge or replace",
-                },
-                400,
-            )
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
-            previous_runtime = (
-                previous_data.get("agent_runtime", {})
-                if isinstance(previous_data.get("agent_runtime"), dict)
-                else {}
-            )
             previous_packages = (
                 previous_data.get("capability_packages", {})
                 if isinstance(previous_data.get("capability_packages"), dict)
@@ -227,68 +245,78 @@ class RemoteAdminConfigManager:
                     package_id: package.to_dict()
                     for package_id, package in capability_packages.items()
                 }
-            if isinstance(raw_runtime, dict) and update_mode == "replace":
-                for key in ("runtime_profiles", "agents"):
-                    if key in raw_runtime and not isinstance(raw_runtime.get(key), dict):
-                        return AdminConfigResult(
-                            False,
-                            {
-                                "error": "invalid_agent_runtime",
-                                "message": f"agent_runtime.{key} must be an object",
-                            },
-                            400,
-                        )
-                merged_runtime = ConfigLoader()._merge_dicts(
-                    previous_runtime,
-                    raw_runtime,
-                )
-                for key in ("runtime_profiles", "agents"):
-                    if key in raw_runtime:
-                        merged_runtime[key] = deepcopy(raw_runtime[key])
-                merged = {"agent_runtime": merged_runtime}
-                try:
-                    runtime = AgentRuntimeConfig.from_dict(
-                        ensure_default_environment_agent_runtime(
-                            merged["agent_runtime"]
-                        )
+            agent_settings_changed = any(
+                isinstance(value, dict)
+                for value in (raw_agent_registry, raw_runtime_profiles, raw_run_limits)
+            )
+            if agent_settings_changed:
+                if raw_agent_registry is not None and not isinstance(raw_agent_registry, dict):
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_agent_registry", "message": "agent_registry must be an object"},
+                        400,
                     )
+                if raw_runtime_profiles is not None and not isinstance(raw_runtime_profiles, dict):
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_runtime_profiles", "message": "runtime_profiles must be an object"},
+                        400,
+                    )
+                if raw_run_limits is not None and not isinstance(raw_run_limits, dict):
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_run_limits", "message": "run_limits must be an object"},
+                        400,
+                    )
+                merged_registry = (
+                    raw_agent_registry
+                    if isinstance(raw_agent_registry, dict)
+                    else (
+                        previous_data.get("agent_registry", {})
+                        if isinstance(previous_data.get("agent_registry"), dict)
+                        else {}
+                    )
+                )
+                merged_profiles = (
+                    raw_runtime_profiles
+                    if isinstance(raw_runtime_profiles, dict)
+                    else (
+                        previous_data.get("runtime_profiles", {})
+                        if isinstance(previous_data.get("runtime_profiles"), dict)
+                        else {}
+                    )
+                )
+                merged_limits = ConfigLoader()._merge_dicts(
+                    previous_data.get("run_limits", {})
+                    if isinstance(previous_data.get("run_limits"), dict)
+                    else {},
+                    raw_run_limits if isinstance(raw_run_limits, dict) else {},
+                )
+                registry_data, profile_data = ensure_default_environment_agent_registry(
+                    merged_registry,
+                    merged_profiles,
+                )
+                try:
+                    agent_registry = AgentRegistryConfig.from_dict(registry_data)
+                    runtime_profiles = RuntimeProfilesConfig.from_dict(profile_data)
+                    run_limits = RunLimitsConfig.from_dict(merged_limits)
                 except Exception as exc:
                     return AdminConfigResult(
                         False,
-                        {"error": "invalid_agent_runtime", "message": str(exc)},
+                        {"error": "invalid_agent_settings", "message": str(exc)},
                         400,
                     )
-                invalid_runtime = self._validate_agent_runtime(
-                    runtime,
+                invalid_runtime = self._validate_agent_settings(
+                    agent_registry,
+                    runtime_profiles,
+                    run_limits,
                     capability_packages=capability_packages,
                 )
                 if invalid_runtime is not None:
                     return invalid_runtime
-                data["agent_runtime"] = runtime.to_dict()
-            elif isinstance(raw_runtime, dict):
-                merged = ConfigLoader()._merge_dicts(
-                    {"agent_runtime": previous_runtime},
-                    {"agent_runtime": raw_runtime},
-                )
-                try:
-                    runtime = AgentRuntimeConfig.from_dict(
-                        ensure_default_environment_agent_runtime(
-                            merged["agent_runtime"]
-                        )
-                    )
-                except Exception as exc:
-                    return AdminConfigResult(
-                        False,
-                        {"error": "invalid_agent_runtime", "message": str(exc)},
-                        400,
-                    )
-                invalid_runtime = self._validate_agent_runtime(
-                    runtime,
-                    capability_packages=capability_packages,
-                )
-                if invalid_runtime is not None:
-                    return invalid_runtime
-                data["agent_runtime"] = runtime.to_dict()
+                data["agent_registry"] = agent_registry.to_dict()
+                data["runtime_profiles"] = runtime_profiles.to_dict()
+                data["run_limits"] = run_limits.to_dict()
             if isinstance(raw_github, dict):
                 previous_github = (
                     previous_data.get("github", {})
@@ -317,47 +345,95 @@ class RemoteAdminConfigManager:
                         400,
                     )
                 data["github"] = github.to_dict()
+            if isinstance(raw_sandbox, dict):
+                previous_sandbox = (
+                    previous_data.get("sandbox_provider", {})
+                    if isinstance(previous_data.get("sandbox_provider"), dict)
+                    else {}
+                )
+                merged_sandbox = ConfigLoader()._merge_dicts(
+                    previous_sandbox,
+                    raw_sandbox,
+                )
+                try:
+                    sandbox_provider = SandboxProviderConfig.from_dict(merged_sandbox)
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_sandbox_provider", "message": str(exc)},
+                        400,
+                    )
+                if sandbox_provider.type not in {"docker", "external", "k8s", "none"}:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_sandbox_provider",
+                            "message": "sandbox_provider.type must be one of docker, external, k8s, none",
+                        },
+                        400,
+                    )
+                if sandbox_provider.idle_ttl_seconds < 1:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_sandbox_provider",
+                            "message": "sandbox_provider.idle_ttl_seconds must be positive",
+                        },
+                        400,
+                    )
+                if sandbox_provider.type == "docker" and not sandbox_provider.host_base_url:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_sandbox_provider",
+                            "message": "sandbox_provider.host_base_url is required when sandbox_provider.type is docker",
+                        },
+                        400,
+                    )
+                data["sandbox_provider"] = sandbox_provider.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
-            if isinstance(raw_runtime, dict):
-                get_agent_runtime_limiter().configure(
-                    max_running_agents=runtime.max_running_agents,
-                    max_shells_per_agent=runtime.max_shells_per_agent,
+            if agent_settings_changed:
+                get_interactive_run_limiter().configure(
+                    max_running_agents=run_limits.max_running_agents,
+                    max_shells_per_agent=run_limits.max_shells_per_agent,
                 )
             return AdminConfigResult(
                 True,
                 {"ok": True, **self.read_server_settings()},
             )
 
-    def _validate_agent_runtime(
+    def _validate_agent_settings(
         self,
-        runtime: AgentRuntimeConfig,
+        agent_registry: AgentRegistryConfig,
+        runtime_profiles: RuntimeProfilesConfig,
+        run_limits: RunLimitsConfig,
         *,
         capability_packages: dict[str, CapabilityPackageConfig],
     ) -> AdminConfigResult | None:
-        if runtime.max_running_agents < 1 or runtime.max_shells_per_agent < 1:
+        if run_limits.max_running_agents < 1 or run_limits.max_shells_per_agent < 1:
             return AdminConfigResult(
                 False,
                 {
-                    "error": "invalid_agent_runtime",
-                    "message": "agent_runtime limits must be positive integers",
+                    "error": "invalid_run_limits",
+                    "message": "run_limits values must be positive integers",
                 },
                 400,
             )
         missing_profiles = [
             agent_id
-            for agent_id, agent in runtime.agents.items()
+            for agent_id, agent in agent_registry.agents.items()
             if agent.runtime_profile
-            and agent.runtime_profile not in runtime.runtime_profiles
+            and agent.runtime_profile not in runtime_profiles.profiles
         ]
         if missing_profiles:
             return AdminConfigResult(
                 False,
                 {
-                    "error": "invalid_agent_runtime",
+                    "error": "invalid_agent_registry",
                     "message": (
-                        "agent runtime profile references must exist: "
+                        "Agent runtime_profile references must exist: "
                         + ", ".join(sorted(missing_profiles))
                     ),
                 },
@@ -365,7 +441,7 @@ class RemoteAdminConfigManager:
             )
         missing_packages = [
             f"{agent_id}:{package_ref}"
-            for agent_id, agent in runtime.agents.items()
+            for agent_id, agent in agent_registry.agents.items()
             for package_ref in agent.capability_refs
             if package_ref not in capability_packages
         ]
@@ -373,7 +449,7 @@ class RemoteAdminConfigManager:
             return AdminConfigResult(
                 False,
                 {
-                    "error": "invalid_agent_runtime",
+                    "error": "invalid_agent_registry",
                     "message": (
                         "agent capability package references must exist: "
                         + ", ".join(sorted(missing_packages))
@@ -884,11 +960,15 @@ class RemoteAdminConfigManager:
     def _agent_profile_views(
         self, data: dict[str, Any], active_mode: str | None
     ) -> dict[str, Any]:
-        raw_runtime = data.get("agent_runtime", {})
-        runtime = ensure_default_environment_agent_runtime(
-            raw_runtime if isinstance(raw_runtime, dict) else {}
+        registry, _profiles = ensure_default_environment_agent_registry(
+            data.get("agent_registry", {})
+            if isinstance(data.get("agent_registry"), dict)
+            else {},
+            data.get("runtime_profiles", {})
+            if isinstance(data.get("runtime_profiles"), dict)
+            else {},
         )
-        raw_agents = runtime.get("agents", {})
+        raw_agents = registry.get("agents", {})
         agents = deepcopy(raw_agents) if isinstance(raw_agents, dict) else {}
         mode_names = self._mode_names(data)
         for agent_id in mode_names:

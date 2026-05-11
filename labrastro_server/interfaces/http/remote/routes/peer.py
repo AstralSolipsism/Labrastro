@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import gzip
 import json
@@ -46,7 +46,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
-from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskRequest
+from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
@@ -55,7 +55,7 @@ from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemotePeerRoutes:
     def _handle_features(self) -> None:
-        runtime_features = self._agent_runtime_features()
+        agent_run_features = self._agent_run_features()
         session_history_status = self._session_history_status()
         self._send_json(
             HTTPStatus.OK,
@@ -76,7 +76,7 @@ class RemotePeerRoutes:
                     "fresh_session_without_session_hint": self.service.stream_chat_handler
                     is not None,
                     "peer_token_heartbeat_refresh": True,
-                    "agent_runtime": runtime_features,
+            "agent_runs": agent_run_features,
                 },
             },
         )
@@ -100,16 +100,16 @@ class RemotePeerRoutes:
             "session_history_writable": sessions_available,
         }
 
-    def _agent_runtime_features(self) -> dict[str, Any]:
+    def _agent_run_features(self) -> dict[str, Any]:
         executor_features: dict[str, dict[str, Any]] = {}
         for peer in self.service.relay_server.registry.list_online():
             host_info = peer.meta.get("host_info_min")
             if not isinstance(host_info, dict):
                 continue
-            agent_runtime = host_info.get("agent_runtime")
-            if not isinstance(agent_runtime, dict):
+            agent_runs = host_info.get("agent_runs")
+            if not isinstance(agent_runs, dict):
                 continue
-            raw = agent_runtime.get("executor_features")
+            raw = agent_runs.get("executor_features")
             if not isinstance(raw, dict):
                 continue
             for name, value in raw.items():

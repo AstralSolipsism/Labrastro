@@ -1,4 +1,4 @@
-"""Tests for the HTTP transport adapter around the remote relay host."""
+﻿"""Tests for the HTTP transport adapter around the remote relay host."""
 
 from __future__ import annotations
 
@@ -31,12 +31,15 @@ from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
 from reuleauxcoder.domain.config.models import (
     EnvironmentCLIToolConfig,
-    AgentRuntimeConfig,
+    AgentRegistryConfig,
+    RuntimeProfilesConfig,
+    RunLimitsConfig,
+    build_agent_run_snapshot,
     MCPArtifactConfig,
     MCPLaunchConfig,
     MCPServerConfig,
 )
-from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
+from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatResponse,
@@ -68,6 +71,17 @@ from reuleauxcoder.interfaces.events import UIEventBus
 
 
 TEST_ADMIN_TOKEN = "test-admin-token"
+
+
+def _agent_run_settings_from_config(data: dict) -> tuple[RunLimitsConfig, dict]:
+    run_limits = RunLimitsConfig.from_dict(data.get("run_limits", {}))
+    runtime_profiles = RuntimeProfilesConfig.from_dict(data.get("runtime_profiles", {}))
+    agent_registry = AgentRegistryConfig.from_dict(data.get("agent_registry", {}))
+    return run_limits, build_agent_run_snapshot(
+        agent_registry=agent_registry,
+        runtime_profiles=runtime_profiles,
+        run_limits=run_limits,
+    )
 TEST_ADMIN_HEADERS = {"Authorization": f"Bearer {TEST_ADMIN_TOKEN}"}
 
 
@@ -1248,11 +1262,11 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_environment_run_endpoint_submits_agent_runtime_task(self) -> None:
+    def test_environment_run_endpoint_submits_agent_run(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        control = AgentRuntimeControlPlane(
+        control = AgentRunControlPlane(
             runtime_snapshot={
                 "runtime_profiles": {
                     "environment_local": {
@@ -1302,19 +1316,19 @@ class TestRemoteRelayHTTPService:
             )
 
             assert status == 200
-            task = body["task"]
+            agent_run = body["agent_run"]
             assert body["ok"] is True
             assert body["agent_id"] == "environment_configurator"
-            assert task["trigger_mode"] == "environment_config"
-            assert task["metadata"]["workflow"] == "environment_config"
-            assert task["metadata"]["environment_mode"] == "configure"
+            assert agent_run["trigger_mode"] == "environment_config"
+            assert agent_run["metadata"]["workflow"] == "environment_config"
+            assert agent_run["metadata"]["environment_mode"] == "configure"
             assert {
                 "entry_id": "cli:gitnexus",
                 "kind": "cli",
                 "name": "gitnexus",
                 "phase": "install",
                 "command": "npm install -g gitnexus",
-            } in task["metadata"]["allowed_commands"]
+            } in agent_run["metadata"]["allowed_commands"]
         finally:
             service.stop()
             relay.stop()
@@ -2828,7 +2842,7 @@ class TestRemoteRelayHTTPService:
             assert body["features"]["issue_assignment"] is True
             assert body["features"]["fresh_session_without_session_hint"] is True
             assert body["features"]["peer_token_heartbeat_refresh"] is True
-            assert body["features"]["agent_runtime"] == {
+            assert body["features"]["agent_runs"] == {
                 "executor_features": {}
             }
         finally:
@@ -2852,7 +2866,7 @@ class TestRemoteRelayHTTPService:
             assert body["features"]["chat_stream"] is False
             assert body["features"]["fresh_session_without_session_hint"] is False
             assert body["features"]["peer_token_heartbeat_refresh"] is True
-            assert body["features"]["agent_runtime"]["executor_features"] == {}
+            assert body["features"]["agent_runs"]["executor_features"] == {}
         finally:
             service.stop()
             relay.stop()
@@ -2862,7 +2876,7 @@ class TestRemoteRelayHTTPService:
         relay.registry.register(
             meta={
                 "host_info_min": {
-                    "agent_runtime": {
+                    "agent_runs": {
                         "executor_features": {
                             "claude": {
                                 "installed": True,
@@ -2886,7 +2900,7 @@ class TestRemoteRelayHTTPService:
         service.start()
         try:
             _, body = _json_request("GET", f"{service.base_url}/remote/features")
-            executor_features = body["features"]["agent_runtime"][
+            executor_features = body["features"]["agent_runs"][
                 "executor_features"
             ]
             assert executor_features["claude"]["resume_by_id"] is True
@@ -2934,7 +2948,7 @@ class TestRemoteRelayHTTPService:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        control = AgentRuntimeControlPlane()
+        control = AgentRunControlPlane()
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
@@ -2950,8 +2964,8 @@ class TestRemoteRelayHTTPService:
                     "cwd": "G:/repo/main",
                     "workspace_root": "G:/repo/main",
                     "features": [
-                        "agent_runtime",
-                        "agent_runtime.local_workspace",
+                        "agent_runs",
+                        "agent_runs.local_workspace",
                     ],
                 },
             )
@@ -2960,9 +2974,9 @@ class TestRemoteRelayHTTPService:
 
             _, submit_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/runtime/submit",
+                f"{service.base_url}/remote/admin/agent-runs/submit",
                 {
-                    "task_id": "task-http-runtime",
+                    "agent_run_id": "task-http-runtime",
                     "issue_id": "issue-1",
                     "agent_id": "coder",
                     "prompt": "run fake",
@@ -2976,7 +2990,7 @@ class TestRemoteRelayHTTPService:
 
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/claim",
+                f"{service.base_url}/remote/agent-runs/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -2985,15 +2999,15 @@ class TestRemoteRelayHTTPService:
             )
             claim = claim_body["claim"]
             assert claim is not None
-            assert claim["task"]["id"] == "task-http-runtime"
+            assert claim["agent_run"]["id"] == "task-http-runtime"
 
             _, heartbeat_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/heartbeat",
+                f"{service.base_url}/remote/agent-runs/heartbeat",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
-                    "task_id": "task-http-runtime",
+                    "agent_run_id": "task-http-runtime",
                     "worker_id": "worker-1",
                 },
             )
@@ -3002,11 +3016,11 @@ class TestRemoteRelayHTTPService:
 
             _, session_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/session",
+                f"{service.base_url}/remote/agent-runs/session",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
-                    "task_id": "task-http-runtime",
+                    "agent_run_id": "task-http-runtime",
                     "worker_id": "worker-1",
                     "workdir": "G:/repo/main/.rcoder/agent-runtime/ws/task/workdir/repo",
                     "branch": "agent/coder/task-http",
@@ -3018,11 +3032,11 @@ class TestRemoteRelayHTTPService:
 
             _, event_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/event",
+                f"{service.base_url}/remote/agent-runs/event",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
-                    "task_id": "task-http-runtime",
+                    "agent_run_id": "task-http-runtime",
                     "worker_id": "worker-1",
                     "type": "text",
                     "text": "hello",
@@ -3032,8 +3046,8 @@ class TestRemoteRelayHTTPService:
 
             _, admin_events = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/runtime/events",
-                {"task_id": "task-http-runtime", "after_seq": 0, "limit": 2},
+                f"{service.base_url}/remote/admin/agent-runs/events",
+                {"agent_run_id": "task-http-runtime", "after_seq": 0, "limit": 2},
                 headers=admin_headers,
             )
             assert len(admin_events["events"]) == 2
@@ -3042,7 +3056,7 @@ class TestRemoteRelayHTTPService:
 
             _, peer_events = _json_request(
                 "GET",
-                f"{service.base_url}/remote/agent-runtime/tasks/task-http-runtime/events?peer_token={peer_token}&after_seq=0&limit=2",
+                f"{service.base_url}/remote/agent-runs/task-http-runtime/events?peer_token={peer_token}&after_seq=0&limit=2",
             )
             assert len(peer_events["events"]) == 2
             assert peer_events["next_seq"] == peer_events["events"][-1]["seq"]
@@ -3051,11 +3065,11 @@ class TestRemoteRelayHTTPService:
             try:
                 _json_request(
                     "POST",
-                    f"{service.base_url}/remote/runtime/event",
+                    f"{service.base_url}/remote/agent-runs/event",
                     {
                         "peer_token": peer_token,
                         "request_id": claim["request_id"],
-                        "task_id": "task-http-runtime",
+                        "agent_run_id": "task-http-runtime",
                         "worker_id": "other-worker",
                         "type": "text",
                         "text": "bad",
@@ -3067,19 +3081,19 @@ class TestRemoteRelayHTTPService:
 
             _, cancel_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/runtime/cancel",
-                {"task_id": "task-http-runtime", "reason": "user_stop"},
+                f"{service.base_url}/remote/admin/agent-runs/cancel",
+                {"agent_run_id": "task-http-runtime", "reason": "user_stop"},
                 headers=admin_headers,
             )
-            assert cancel_body == {"ok": True, "task_id": "task-http-runtime"}
+            assert cancel_body == {"ok": True, "agent_run_id": "task-http-runtime"}
 
             _, cancelled_heartbeat = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/heartbeat",
+                f"{service.base_url}/remote/agent-runs/heartbeat",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
-                    "task_id": "task-http-runtime",
+                    "agent_run_id": "task-http-runtime",
                     "worker_id": "worker-1",
                 },
             )
@@ -3089,11 +3103,11 @@ class TestRemoteRelayHTTPService:
 
             _, complete_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/complete",
+                f"{service.base_url}/remote/agent-runs/complete",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
-                    "task_id": "task-http-runtime",
+                    "agent_run_id": "task-http-runtime",
                     "worker_id": "worker-1",
                     "status": "cancelled",
                     "output": "",
@@ -3101,7 +3115,7 @@ class TestRemoteRelayHTTPService:
                     "events": [
                         {
                             "request_id": claim["request_id"],
-                            "task_id": "task-http-runtime",
+                            "agent_run_id": "task-http-runtime",
                             "worker_id": "worker-1",
                             "type": "status",
                             "data": {"status": "cancelled"},
@@ -3113,17 +3127,17 @@ class TestRemoteRelayHTTPService:
 
             _, retry_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/runtime/retry",
+                f"{service.base_url}/remote/admin/agent-runs/retry",
                 {
-                    "task_id": "task-http-runtime",
-                    "new_task_id": "task-http-runtime-retry",
+                    "agent_run_id": "task-http-runtime",
+                    "new_agent_run_id": "task-http-runtime-retry",
                 },
                 headers=admin_headers,
             )
             assert retry_body["ok"] is True
-            assert retry_body["task"]["id"] == "task-http-runtime-retry"
-            assert retry_body["task"]["status"] == "queued"
-            assert retry_body["task"]["metadata"]["retry_of"] == "task-http-runtime"
+            assert retry_body["agent_run"]["id"] == "task-http-runtime-retry"
+            assert retry_body["agent_run"]["status"] == "queued"
+            assert retry_body["agent_run"]["metadata"]["retry_of"] == "task-http-runtime"
         finally:
             service.stop()
             relay.stop()
@@ -3140,7 +3154,7 @@ class TestRemoteRelayHTTPService:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        control = AgentRuntimeControlPlane(
+        control = AgentRunControlPlane(
             runtime_snapshot={
                 "runtime_profiles": {
                     "docs_profile": {
@@ -3172,7 +3186,7 @@ class TestRemoteRelayHTTPService:
                     "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                     "cwd": "G:/repo/main",
                     "workspace_root": "G:/repo/main",
-                    "features": ["agent_runtime"],
+                    "features": ["agent_runs"],
                 },
             )
             peer_token = register_body["payload"]["peer_token"]
@@ -3198,7 +3212,7 @@ class TestRemoteRelayHTTPService:
             )
             assignment = assignment_body["assignment"]
             assert assignment["status"] == "ready"
-            assert control.list_tasks() == []
+            assert control.list_agent_runs() == []
 
             _, reassigned_body = _json_request(
                 "POST",
@@ -3230,7 +3244,7 @@ class TestRemoteRelayHTTPService:
             )
             assert mention_body["mention"]["status"] == "ready"
             assert mention_body["mention"]["assignment_id"]
-            assert control.list_tasks() == []
+            assert control.list_agent_runs() == []
 
             _, dispatch_body = _json_request(
                 "POST",
@@ -3239,7 +3253,10 @@ class TestRemoteRelayHTTPService:
             )
             dispatched = dispatch_body["assignment"]
             assert dispatched["status"] == "dispatched"
-            task = control.get_task(dispatched["runtime_task_id"])
+            assert dispatched["task_run_id"]
+            agent_runs = control.list_agent_runs()
+            assert len(agent_runs) == 1
+            task = control.get_agent_run(agent_runs[0]["id"])
             assert task.metadata["dispatch_source"] == "assignment"
             assert task.metadata["issue_id"] == issue_id
 
@@ -3249,6 +3266,19 @@ class TestRemoteRelayHTTPService:
             )
             assert issue_detail["assignments"][0]["id"] == assignment["id"]
             assert issue_detail["taskflow"]["outputs"]["task_run_refs"]
+            state = service.taskflow_service.get_taskflow_state(
+                issue_detail["issue"]["taskflow_id"]
+            )
+            project = service.taskflow_service.project_service.get_project_state(
+                state.meta.project_id
+            )
+            assert project is not None
+            assert any(
+                link.source_id == dispatched["task_run_id"]
+                and link.target_id == task.id
+                and link.relation_type.value == "dispatches"
+                for link in project.traceability.task_run_links
+            )
 
             _, events_body = _json_request(
                 "GET",
@@ -3269,12 +3299,12 @@ class TestRemoteRelayHTTPService:
         config_path = tmp_path / "config.host.yaml"
         save_yaml_config(
             config_path,
-            {"agent_runtime": {"max_running_agents": 1, "max_shells_per_agent": 1}},
+            {"run_limits": {"max_running_agents": 1, "max_shells_per_agent": 1}},
         )
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        control = AgentRuntimeControlPlane()
+        control = AgentRunControlPlane()
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
@@ -3284,10 +3314,10 @@ class TestRemoteRelayHTTPService:
 
         def reload_runtime_config() -> None:
             data = load_yaml_config(config_path)
-            runtime = AgentRuntimeConfig.from_dict(data.get("agent_runtime", {}))
+            run_limits, runtime_snapshot = _agent_run_settings_from_config(data)
             control.configure(
-                max_running_tasks=runtime.max_running_agents,
-                runtime_snapshot=runtime.to_runtime_snapshot(),
+                max_running_tasks=run_limits.max_running_agents,
+                runtime_snapshot=runtime_snapshot,
             )
 
         service.admin_manager.reload_handler = reload_runtime_config
@@ -3301,8 +3331,8 @@ class TestRemoteRelayHTTPService:
                     "cwd": "/tmp/repo",
                     "workspace_root": "/tmp/repo",
                     "features": [
-                        "agent_runtime",
-                        "agent_runtime.daemon_worktree",
+                        "agent_runs",
+                        "agent_runs.daemon_worktree",
                     ],
                 },
             )
@@ -3313,16 +3343,18 @@ class TestRemoteRelayHTTPService:
                 "POST",
                 f"{service.base_url}/remote/admin/server-settings/update",
                 {
-                    "agent_runtime": {
+                    "run_limits": {
                         "max_running_agents": 4,
                         "max_shells_per_agent": 1,
-                        "runtime_profiles": {
+                    },
+                    "runtime_profiles": {
                             "smoke_fake_profile": {
                                 "executor": "fake",
                                 "execution_location": "daemon_worktree",
                                 "credential_refs": {"model": "smoke_model_ref"},
                             }
-                        },
+                    },
+                    "agent_registry": {
                         "agents": {
                             "smoke_reviewer": {
                                 "name": "Smoke Reviewer",
@@ -3346,9 +3378,9 @@ class TestRemoteRelayHTTPService:
 
             _, submit_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/runtime/submit",
+                f"{service.base_url}/remote/admin/agent-runs/submit",
                 {
-                    "task_id": "task-agent-only",
+                    "agent_run_id": "task-agent-only",
                     "issue_id": "issue-1",
                     "agent_id": "smoke_reviewer",
                     "prompt": "run smoke",
@@ -3356,13 +3388,13 @@ class TestRemoteRelayHTTPService:
                 headers=admin_headers,
             )
             assert submit_body["ok"] is True
-            assert submit_body["task"]["executor"] == "fake"
-            assert submit_body["task"]["execution_location"] == "daemon_worktree"
-            assert submit_body["task"]["runtime_profile_id"] == "smoke_fake_profile"
+            assert submit_body["agent_run"]["executor"] == "fake"
+            assert submit_body["agent_run"]["execution_location"] == "daemon_worktree"
+            assert submit_body["agent_run"]["runtime_profile_id"] == "smoke_fake_profile"
 
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/runtime/claim",
+                f"{service.base_url}/remote/agent-runs/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -3400,28 +3432,30 @@ class TestRemoteRelayHTTPService:
         save_yaml_config(
             config_path,
             {
-                "agent_runtime": {
+                "run_limits": {
                     "max_running_agents": 2,
                     "max_shells_per_agent": 1,
-                    "runtime_profiles": {
-                        "old_profile": {
-                            "executor": "fake",
-                            "execution_location": "daemon_worktree",
-                        }
-                    },
-                    "agents": {"old_agent": {"runtime_profile": "old_profile"}},
-                }
+                },
+                "runtime_profiles": {
+                    "old_profile": {
+                        "executor": "fake",
+                        "execution_location": "daemon_worktree",
+                    }
+                },
+                "agent_registry": {
+                    "agents": {"old_agent": {"runtime_profile": "old_profile"}}
+                },
             },
         )
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        runtime = AgentRuntimeConfig.from_dict(
-            load_yaml_config(config_path).get("agent_runtime", {})
+        run_limits, runtime_snapshot = _agent_run_settings_from_config(
+            load_yaml_config(config_path)
         )
-        control = AgentRuntimeControlPlane(
-            max_running_tasks=runtime.max_running_agents,
-            runtime_snapshot=runtime.to_runtime_snapshot(),
+        control = AgentRunControlPlane(
+            max_running_tasks=run_limits.max_running_agents,
+            runtime_snapshot=runtime_snapshot,
         )
         service = RemoteRelayHTTPService(
             relay_server=relay,
@@ -3432,10 +3466,10 @@ class TestRemoteRelayHTTPService:
 
         def reload_runtime_config() -> None:
             data = load_yaml_config(config_path)
-            runtime = AgentRuntimeConfig.from_dict(data.get("agent_runtime", {}))
+            run_limits, runtime_snapshot = _agent_run_settings_from_config(data)
             control.configure(
-                max_running_tasks=runtime.max_running_agents,
-                runtime_snapshot=runtime.to_runtime_snapshot(),
+                max_running_tasks=run_limits.max_running_agents,
+                runtime_snapshot=runtime_snapshot,
             )
 
         service.admin_manager.reload_handler = reload_runtime_config
@@ -3445,22 +3479,24 @@ class TestRemoteRelayHTTPService:
                 "POST",
                 f"{service.base_url}/remote/admin/server-settings/update",
                 {
-                    "agent_runtime_update_mode": "replace",
-                    "agent_runtime": {
+                    "run_limits": {
                         "max_running_agents": 3,
-                        "runtime_profiles": {},
-                        "agents": {},
                     },
+                    "runtime_profiles": {},
+                    "agent_registry": {"agents": {}},
                 },
                 headers=TEST_ADMIN_HEADERS,
             )
 
             assert update_body["ok"] is True
-            runtime_settings = update_body["settings"]["agent_runtime"]
-            assert runtime_settings["max_running_agents"] == 3
-            assert runtime_settings["max_shells_per_agent"] == 1
-            assert set(runtime_settings["runtime_profiles"]) == {"environment_local"}
-            assert set(runtime_settings["agents"]) == {"environment_configurator"}
+            assert update_body["settings"]["run_limits"]["max_running_agents"] == 3
+            assert update_body["settings"]["run_limits"]["max_shells_per_agent"] == 1
+            assert set(update_body["settings"]["runtime_profiles"]) == {
+                "environment_local"
+            }
+            assert set(update_body["settings"]["agent_registry"]["agents"]) == {
+                "environment_configurator"
+            }
             assert control.max_running_tasks == 3
             assert set(control.runtime_snapshot["runtime_profiles"]) == {
                 "environment_local"
@@ -3474,7 +3510,7 @@ class TestRemoteRelayHTTPService:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        control = AgentRuntimeControlPlane(
+        control = AgentRunControlPlane(
             runtime_snapshot={
                 "agents": {"smoke_reviewer": {"runtime_profile": "missing_profile"}}
             }
@@ -3489,9 +3525,9 @@ class TestRemoteRelayHTTPService:
             try:
                 _json_request(
                     "POST",
-                    f"{service.base_url}/remote/admin/runtime/submit",
+                    f"{service.base_url}/remote/admin/agent-runs/submit",
                     {
-                        "task_id": "task-missing-profile",
+                        "agent_run_id": "task-missing-profile",
                         "issue_id": "issue-1",
                         "agent_id": "smoke_reviewer",
                         "prompt": "run smoke",
@@ -3501,7 +3537,7 @@ class TestRemoteRelayHTTPService:
             except HTTPError as exc:
                 body = json.loads(exc.read().decode("utf-8"))
                 assert exc.code == 400
-                assert body["error"] == "invalid_runtime_task"
+                assert body["error"] == "invalid_agent_run"
                 assert "missing_profile" not in body["message"]
             else:
                 raise AssertionError("submit should reject missing runtime profile")
@@ -3598,13 +3634,13 @@ class TestRemoteRelayHTTPService:
             relay.stop()
 
     @pytest.mark.skipif(not _GO_AVAILABLE, reason="go toolchain is not installed")
-    def test_go_agent_runtime_fake_daemon_worktree_end_to_end(
+    def test_go_agent_run_worker_fake_daemon_worktree_end_to_end(
         self, tmp_path: Path
     ) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        control = AgentRuntimeControlPlane()
+        control = AgentRunControlPlane()
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
@@ -3645,9 +3681,9 @@ class TestRemoteRelayHTTPService:
                 str(repo),
                 "--poll-interval",
                 "100ms",
-                "--agent-runtime",
-                "--runtime-worker-id",
-                "worker-runtime-1",
+                "--agent-run-worker",
+                "--worker-session-id",
+                "worker-session-1",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -3663,9 +3699,9 @@ class TestRemoteRelayHTTPService:
             admin_headers = TEST_ADMIN_HEADERS
             _, submit = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/runtime/submit",
+                f"{service.base_url}/remote/admin/agent-runs/submit",
                 {
-                    "task_id": "task-go-runtime-worktree",
+                    "agent_run_id": "task-go-runtime-worktree",
                     "issue_id": "issue-1",
                     "agent_id": "coder",
                     "prompt": "hello from fake runtime",
@@ -3688,10 +3724,10 @@ class TestRemoteRelayHTTPService:
             assert submit["ok"] is True
 
             deadline = time.time() + 25
-            task = control.get_task("task-go-runtime-worktree")
+            task = control.get_agent_run("task-go-runtime-worktree")
             while time.time() < deadline and not task.is_terminal:
                 time.sleep(0.2)
-                task = control.get_task("task-go-runtime-worktree")
+                task = control.get_agent_run("task-go-runtime-worktree")
 
             assert task.status.value == "completed"
             assert task.output == "hello from fake runtime"

@@ -15,8 +15,8 @@ from labrastro_server.interfaces.http.remote.service import (
 from labrastro_server.relay.server import RelayServer
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.agent_runtime.control_plane import (
-    AgentRuntimeControlPlane,
-    RuntimeTaskRequest,
+    AgentRunControlPlane,
+    AgentRunRequest,
 )
 from labrastro_server.services.github.in_memory_store import InMemoryGitHubStore
 from labrastro_server.services.github.service import PullRequestService
@@ -93,7 +93,7 @@ def test_github_webhook_rejects_bad_signature() -> None:
         private_key_path="app.pem",
         webhook_secret="secret",
     )
-    runtime = AgentRuntimeControlPlane()
+    runtime = AgentRunControlPlane()
     pr_service = PullRequestService(
         config=config,
         store=InMemoryGitHubStore(),
@@ -155,7 +155,7 @@ def test_github_webhook_accepts_signed_delivery_once() -> None:
         config=config,
         store=InMemoryGitHubStore(),
         client=FakeGitHubClient(),  # type: ignore[arg-type]
-        runtime_control_plane=AgentRuntimeControlPlane(),
+        runtime_control_plane=AgentRunControlPlane(),
     )
     service = RemoteRelayHTTPService(
         relay_server=relay,
@@ -183,13 +183,13 @@ def test_github_webhook_accepts_signed_delivery_once() -> None:
         relay.stop()
 
 
-def test_runtime_complete_creates_github_pr_artifact() -> None:
+def test_agent_run_complete_creates_github_pr_artifact() -> None:
     relay = RelayServer()
     relay.start()
     port = _free_port()
-    runtime = AgentRuntimeControlPlane()
-    runtime.submit_task(
-        RuntimeTaskRequest(
+    runtime = AgentRunControlPlane()
+    runtime.submit_agent_run(
+        AgentRunRequest(
             issue_id="issue-1",
             agent_id="coder",
             prompt="run",
@@ -218,13 +218,13 @@ def test_runtime_complete_creates_github_pr_artifact() -> None:
             {
                 "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                 "cwd": "/tmp",
-                "features": ["agent_runtime"],
+                "features": ["agent_runs"],
             },
         )
         peer_token = register_body["payload"]["peer_token"]
         _, claim_body = _json_request(
             "POST",
-            f"{service.base_url}/remote/runtime/claim",
+            f"{service.base_url}/remote/agent-runs/claim",
             {
                 "peer_token": peer_token,
                 "worker_id": "worker-1",
@@ -235,11 +235,11 @@ def test_runtime_complete_creates_github_pr_artifact() -> None:
 
         _, complete = _json_request(
             "POST",
-            f"{service.base_url}/remote/runtime/complete",
+            f"{service.base_url}/remote/agent-runs/complete",
             {
                 "peer_token": peer_token,
                 "request_id": claim["request_id"],
-                "task_id": "task-pr",
+                "agent_run_id": "task-pr",
                 "worker_id": "worker-1",
                 "status": "completed",
                 "output": "done",

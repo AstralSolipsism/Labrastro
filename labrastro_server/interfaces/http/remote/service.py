@@ -75,7 +75,7 @@ from labrastro_server.interfaces.http.remote.routes.collaboration import RemoteC
 from labrastro_server.interfaces.http.remote.routes.github import RemoteGitHubRoutes
 from labrastro_server.interfaces.http.remote.routes.manifests import RemoteManifestRoutes
 from labrastro_server.interfaces.http.remote.routes.peer import RemotePeerRoutes
-from labrastro_server.interfaces.http.remote.routes.runtime import RemoteRuntimeRoutes
+from labrastro_server.interfaces.http.remote.routes.agent_runs import RemoteAgentRunRoutes
 from labrastro_server.interfaces.http.remote.routes.sessions import RemoteSessionRoutes
 from labrastro_server.interfaces.http.remote.routes.taskflow import RemoteTaskflowRoutes
 from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
@@ -578,9 +578,9 @@ class RemoteRelayHTTPService:
         )
         self._chat_gc_stop = threading.Event()
         self._chat_gc_thread: threading.Thread | None = None
-        self._runtime_recovery_stop = threading.Event()
-        self._runtime_recovery_thread: threading.Thread | None = None
-        self._runtime_recovery_interval_sec = 2.0
+        self._agent_run_recovery_stop = threading.Event()
+        self._agent_run_recovery_thread: threading.Thread | None = None
+        self._agent_run_recovery_interval_sec = 2.0
         self._github_reconcile_stop = threading.Event()
         self._github_reconcile_thread: threading.Thread | None = None
         self.relay_server._send_fn = self._enqueue_outbound
@@ -602,7 +602,7 @@ class RemoteRelayHTTPService:
         self._thread.start()
         self._start_chat_gc()
         self._start_persistence_maintenance()
-        self._start_runtime_recovery()
+        self._start_agent_run_recovery()
         self._start_github_reconcile()
         if self.ui_bus is not None:
             self.ui_bus.info(
@@ -612,7 +612,7 @@ class RemoteRelayHTTPService:
 
     def stop(self) -> None:
         self._stop_github_reconcile()
-        self._stop_runtime_recovery()
+        self._stop_agent_run_recovery()
         self._stop_persistence_maintenance()
         self._stop_chat_gc()
         if self._server is None:
@@ -624,30 +624,30 @@ class RemoteRelayHTTPService:
             self._thread = None
         self._server = None
 
-    def _start_runtime_recovery(self) -> None:
+    def _start_agent_run_recovery(self) -> None:
         if self.runtime_control_plane is None:
             return
-        if self._runtime_recovery_thread is not None:
+        if self._agent_run_recovery_thread is not None:
             return
-        self._runtime_recovery_stop.clear()
+        self._agent_run_recovery_stop.clear()
 
         def loop() -> None:
-            while not self._runtime_recovery_stop.wait(
-                self._runtime_recovery_interval_sec
+            while not self._agent_run_recovery_stop.wait(
+                self._agent_run_recovery_interval_sec
             ):
                 try:
-                    self.runtime_control_plane.recover_stale_tasks()
+                    self.runtime_control_plane.recover_stale_agent_runs()
                 except Exception:
                     continue
 
-        self._runtime_recovery_thread = threading.Thread(target=loop, daemon=True)
-        self._runtime_recovery_thread.start()
+        self._agent_run_recovery_thread = threading.Thread(target=loop, daemon=True)
+        self._agent_run_recovery_thread.start()
 
-    def _stop_runtime_recovery(self) -> None:
-        self._runtime_recovery_stop.set()
-        if self._runtime_recovery_thread is not None:
-            self._runtime_recovery_thread.join(timeout=3)
-            self._runtime_recovery_thread = None
+    def _stop_agent_run_recovery(self) -> None:
+        self._agent_run_recovery_stop.set()
+        if self._agent_run_recovery_thread is not None:
+            self._agent_run_recovery_thread.join(timeout=3)
+            self._agent_run_recovery_thread = None
 
     def _start_persistence_maintenance(self) -> None:
         service = self.persistence_maintenance_service
@@ -815,7 +815,7 @@ class RemoteRelayHTTPService:
             RemoteAdminRoutes,
             RemoteSessionRoutes,
             RemoteChatRoutes,
-            RemoteRuntimeRoutes,
+            RemoteAgentRunRoutes,
             RemoteGitHubRoutes,
             RemoteCollaborationRoutes,
             RemoteTaskflowRoutes,
@@ -848,8 +848,8 @@ class RemoteRelayHTTPService:
                 if parsed.path.startswith("/remote/mentions/"):
                     self._handle_issue_assignment_get(parsed)
                     return
-                if parsed.path.startswith("/remote/agent-runtime/tasks/"):
-                    self._handle_runtime_events_get(parsed)
+                if parsed.path.startswith("/remote/agent-runs/"):
+                    self._handle_agent_run_events_get(parsed)
                     return
                 if parsed.path.startswith("/remote/artifacts/"):
                     self._handle_artifact(parsed.path)
@@ -894,20 +894,20 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/environment/manifest":
                     self._handle_environment_manifest()
                     return
-                if parsed.path == "/remote/runtime/claim":
-                    self._handle_runtime_claim()
+                if parsed.path == "/remote/agent-runs/claim":
+                    self._handle_agent_run_claim()
                     return
-                if parsed.path == "/remote/runtime/event":
-                    self._handle_runtime_event()
+                if parsed.path == "/remote/agent-runs/event":
+                    self._handle_agent_run_event()
                     return
-                if parsed.path == "/remote/runtime/heartbeat":
-                    self._handle_runtime_heartbeat()
+                if parsed.path == "/remote/agent-runs/heartbeat":
+                    self._handle_agent_run_heartbeat()
                     return
-                if parsed.path == "/remote/runtime/session":
-                    self._handle_runtime_session()
+                if parsed.path == "/remote/agent-runs/session":
+                    self._handle_agent_run_session()
                     return
-                if parsed.path == "/remote/runtime/complete":
-                    self._handle_runtime_complete()
+                if parsed.path == "/remote/agent-runs/complete":
+                    self._handle_agent_run_complete()
                     return
                 if parsed.path == "/remote/disconnect":
                     self._handle_disconnect()

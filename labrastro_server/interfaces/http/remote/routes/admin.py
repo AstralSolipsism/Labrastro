@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import gzip
 import json
@@ -47,7 +47,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
-from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskRequest
+from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
@@ -96,11 +96,11 @@ class RemoteAdminRoutes:
                 result = {"ok": True, **self.service.admin_manager.status()}
                 self._send_json(HTTPStatus.OK, result)
                 return
-            if path == "/remote/admin/runtime/submit":
+            if path == "/remote/admin/agent-runs/submit":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
                 metadata = (
@@ -113,11 +113,12 @@ class RemoteAdminRoutes:
                         "workspace_root", str(payload["workspace_root"])
                     )
                 try:
-                    task = self.service.runtime_control_plane.submit_task(
-                        RuntimeTaskRequest(
+                    agent_run = self.service.runtime_control_plane.submit_agent_run(
+                        AgentRunRequest(
                             issue_id=str(payload.get("issue_id") or "manual"),
                             agent_id=str(payload.get("agent_id") or "default"),
                             prompt=str(payload.get("prompt") or ""),
+                            source=optional_payload_str(payload, "source") or "manual",
                             executor=optional_payload_str(payload, "executor"),
                             execution_location=optional_payload_str(
                                 payload, "execution_location"
@@ -133,22 +134,22 @@ class RemoteAdminRoutes:
                             model=optional_payload_str(payload, "model"),
                             metadata=metadata,
                         ),
-                        task_id=optional_payload_str(payload, "task_id"),
+                        task_id=optional_payload_str(payload, "agent_run_id"),
                     )
                 except ValueError as exc:
                     del exc
                     self._send_error(
                         HTTPStatus.BAD_REQUEST,
-                        "invalid_runtime_task",
-                        "invalid runtime task",
+                        "invalid_agent_run",
+                        "invalid AgentRun",
                     )
                     return
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "task": self.service.runtime_control_plane.task_to_dict(
-                            task.id
+                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
+                            agent_run.id
                         ),
                     },
                 )
@@ -157,7 +158,7 @@ class RemoteAdminRoutes:
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
                 entry_ids = payload.get("entry_ids", [])
@@ -196,16 +197,16 @@ class RemoteAdminRoutes:
                     del exc
                     self._send_error(
                         HTTPStatus.BAD_REQUEST,
-                        "invalid_environment_task",
-                        "invalid environment task",
+                        "invalid_environment_agent_run",
+                        "invalid environment AgentRun",
                     )
                     return
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "task": self.service.runtime_control_plane.task_to_dict(
-                            result.task.id
+                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
+                            result.agent_run.id
                         ),
                         "agent_id": result.agent_id,
                         "entry_ids": result.entry_ids,
@@ -213,14 +214,14 @@ class RemoteAdminRoutes:
                     },
                 )
                 return
-            if path == "/remote/admin/runtime/events":
+            if path == "/remote/admin/agent-runs/events":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
-                task_id = str(payload.get("task_id") or "")
+                task_id = str(payload.get("agent_run_id") or "")
                 after_seq = int(payload.get("after_seq") or 0)
                 limit = clamp_event_limit(int(payload.get("limit") or 200))
                 events = self.service.runtime_control_plane.list_events(
@@ -244,77 +245,77 @@ class RemoteAdminRoutes:
                     },
                 )
                 return
-            if path == "/remote/admin/runtime/cancel":
+            if path == "/remote/admin/agent-runs/cancel":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
-                task_id = str(payload.get("task_id") or "")
+                task_id = str(payload.get("agent_run_id") or "")
                 if not task_id:
-                    self._send_error(HTTPStatus.BAD_REQUEST, "task_id_required")
+                    self._send_error(HTTPStatus.BAD_REQUEST, "agent_run_id_required")
                     return
-                ok = self.service.runtime_control_plane.cancel_task(
+                ok = self.service.runtime_control_plane.cancel_agent_run(
                     task_id,
                     reason=str(payload.get("reason") or "user_cancelled"),
                 )
-                self._send_json(HTTPStatus.OK, {"ok": ok, "task_id": task_id})
+                self._send_json(HTTPStatus.OK, {"ok": ok, "agent_run_id": task_id})
                 return
-            if path == "/remote/admin/runtime/retry":
+            if path == "/remote/admin/agent-runs/retry":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
-                task_id = str(payload.get("task_id") or "")
+                task_id = str(payload.get("agent_run_id") or "")
                 if not task_id:
-                    self._send_error(HTTPStatus.BAD_REQUEST, "task_id_required")
+                    self._send_error(HTTPStatus.BAD_REQUEST, "agent_run_id_required")
                     return
                 try:
-                    retry = self.service.runtime_control_plane.retry_task(
+                    retry = self.service.runtime_control_plane.retry_agent_run(
                         task_id,
-                        new_task_id=(
-                            str(payload["new_task_id"])
-                            if payload.get("new_task_id") is not None
+                        new_agent_run_id=(
+                            str(payload["new_agent_run_id"])
+                            if payload.get("new_agent_run_id") is not None
                             else None
                         ),
                         resume_session=payload.get("resume_session") is True,
                     )
                 except KeyError:
-                    self._send_error(HTTPStatus.NOT_FOUND, "task_not_found")
+                    self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
                     return
                 except ValueError as exc:
                     del exc
                     self._send_error(
                         HTTPStatus.BAD_REQUEST,
-                        "task_not_retryable",
-                        "task is not retryable",
+                        "agent_run_not_retryable",
+                        "AgentRun is not retryable",
                     )
                     return
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "task": self.service.runtime_control_plane.task_to_dict(
+                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
                             retry.id
                         ),
                     },
                 )
                 return
-            if path == "/remote/admin/runtime/tasks/list":
+            if path == "/remote/admin/agent-runs/list":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "tasks": self.service.runtime_control_plane.list_tasks(
+                        "agent_runs": self.service.runtime_control_plane.list_agent_runs(
                             status=optional_payload_str(payload, "status"),
                             agent_id=optional_payload_str(payload, "agent_id"),
                             issue_id=optional_payload_str(payload, "issue_id"),
@@ -326,24 +327,24 @@ class RemoteAdminRoutes:
                     },
                 )
                 return
-            if path == "/remote/admin/runtime/tasks/load":
+            if path == "/remote/admin/agent-runs/load":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runtime_unavailable",
+                        "agent_runs_unavailable",
                     )
                     return
-                task_id = str(payload.get("task_id") or "")
+                task_id = str(payload.get("agent_run_id") or "")
                 if not task_id:
-                    self._send_error(HTTPStatus.BAD_REQUEST, "task_id_required")
+                    self._send_error(HTTPStatus.BAD_REQUEST, "agent_run_id_required")
                     return
                 try:
-                    detail = self.service.runtime_control_plane.load_task_detail(
+                    detail = self.service.runtime_control_plane.load_agent_run_detail(
                         task_id,
                         event_limit=int(payload.get("event_limit") or 100),
                     )
                 except KeyError:
-                    self._send_error(HTTPStatus.NOT_FOUND, "task_not_found")
+                    self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
                     return
                 github_pr_service = self.service.github_pr_service
                 if github_pr_service is not None:
@@ -561,8 +562,9 @@ class RemoteAdminRoutes:
             settings = payload.get("settings")
             if isinstance(settings, dict):
                 targets.extend(str(key) for key in settings if str(key).strip())
-            if isinstance(payload.get("agent_runtime"), dict):
-                targets.append("agent_runtime")
+            for key in ("agent_registry", "runtime_profiles", "run_limits", "sandbox_provider"):
+                if isinstance(payload.get(key), dict):
+                    targets.append(key)
             if isinstance(payload.get("github"), dict):
                 targets.append("github")
             return operation, ",".join(sorted(set(targets))) or "server_settings"
@@ -652,9 +654,9 @@ class RemoteAdminRoutes:
         read_paths = {
             "/remote/admin/status",
             "/remote/admin/github/status",
-            "/remote/admin/runtime/events",
-            "/remote/admin/runtime/tasks/list",
-            "/remote/admin/runtime/tasks/load",
+            "/remote/admin/agent-runs/events",
+            "/remote/admin/agent-runs/list",
+            "/remote/admin/agent-runs/load",
             "/remote/admin/server-settings/read",
             "/remote/admin/providers/list",
             "/remote/admin/providers/models",
