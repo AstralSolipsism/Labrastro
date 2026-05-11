@@ -132,38 +132,38 @@ func (c *HTTPClient) EnvironmentManifest(ctx context.Context, req protocol.Envir
 	return resp, nil
 }
 
-func (c *HTTPClient) ClaimAgentRuntimeTask(ctx context.Context, req protocol.AgentRuntimeClaimRequest) (protocol.AgentRuntimeClaimResponse, error) {
-	var resp protocol.AgentRuntimeClaimResponse
-	if err := c.postJSON(ctx, "/remote/runtime/claim", req, &resp); err != nil {
-		return protocol.AgentRuntimeClaimResponse{}, err
+func (c *HTTPClient) ClaimAgentRun(ctx context.Context, req protocol.AgentRunClaimRequest) (protocol.AgentRunClaimResponse, error) {
+	var resp protocol.AgentRunClaimResponse
+	if err := c.postJSON(ctx, "/remote/agent-runs/claim", req, &resp); err != nil {
+		return protocol.AgentRunClaimResponse{}, err
 	}
 	return resp, nil
 }
 
-func (c *HTTPClient) SendAgentRuntimeEvent(ctx context.Context, req protocol.AgentRuntimeEventReport) error {
-	return c.postJSON(ctx, "/remote/runtime/event", req, nil)
+func (c *HTTPClient) SendAgentRunEvent(ctx context.Context, req protocol.AgentRunEventReport) error {
+	return c.postJSON(ctx, "/remote/agent-runs/event", req, nil)
 }
 
-func (c *HTTPClient) AgentRuntimeHeartbeat(ctx context.Context, req protocol.AgentRuntimeHeartbeatRequest) (protocol.AgentRuntimeHeartbeatResponse, error) {
-	var resp protocol.AgentRuntimeHeartbeatResponse
-	if err := c.postJSON(ctx, "/remote/runtime/heartbeat", req, &resp); err != nil {
-		return protocol.AgentRuntimeHeartbeatResponse{}, err
+func (c *HTTPClient) AgentRunHeartbeat(ctx context.Context, req protocol.AgentRunHeartbeatRequest) (protocol.AgentRunHeartbeatResponse, error) {
+	var resp protocol.AgentRunHeartbeatResponse
+	if err := c.postJSON(ctx, "/remote/agent-runs/heartbeat", req, &resp); err != nil {
+		return protocol.AgentRunHeartbeatResponse{}, err
 	}
 	return resp, nil
 }
 
-func (c *HTTPClient) PinAgentRuntimeSession(ctx context.Context, req protocol.AgentRuntimeSessionPinRequest) (protocol.AgentRuntimeSessionPinResponse, error) {
-	var resp protocol.AgentRuntimeSessionPinResponse
-	if err := c.postJSON(ctx, "/remote/runtime/session", req, &resp); err != nil {
-		return protocol.AgentRuntimeSessionPinResponse{}, err
+func (c *HTTPClient) PinAgentRunSession(ctx context.Context, req protocol.AgentRunSessionPinRequest) (protocol.AgentRunSessionPinResponse, error) {
+	var resp protocol.AgentRunSessionPinResponse
+	if err := c.postJSON(ctx, "/remote/agent-runs/session", req, &resp); err != nil {
+		return protocol.AgentRunSessionPinResponse{}, err
 	}
 	return resp, nil
 }
 
-func (c *HTTPClient) CompleteAgentRuntimeTask(ctx context.Context, req protocol.AgentRuntimeCompleteRequest) (protocol.AgentRuntimeCompleteResponse, error) {
-	var resp protocol.AgentRuntimeCompleteResponse
-	if err := c.postJSON(ctx, "/remote/runtime/complete", req, &resp); err != nil {
-		return protocol.AgentRuntimeCompleteResponse{}, err
+func (c *HTTPClient) CompleteAgentRun(ctx context.Context, req protocol.AgentRunCompleteRequest) (protocol.AgentRunCompleteResponse, error) {
+	var resp protocol.AgentRunCompleteResponse
+	if err := c.postJSON(ctx, "/remote/agent-runs/complete", req, &resp); err != nil {
+		return protocol.AgentRunCompleteResponse{}, err
 	}
 	return resp, nil
 }

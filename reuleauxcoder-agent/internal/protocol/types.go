@@ -283,27 +283,27 @@ type CleanupResult struct {
 	ErrorMessage string   `json:"error_message,omitempty"`
 }
 
-type AgentRuntimeClaimRequest struct {
+type AgentRunClaimRequest struct {
 	PeerToken string   `json:"peer_token"`
 	WorkerID  string   `json:"worker_id,omitempty"`
 	Executors []string `json:"executors,omitempty"`
 	WaitSec   int      `json:"wait_sec,omitempty"`
 }
 
-type AgentRuntimeClaimResponse struct {
-	Claim *AgentRuntimeClaim `json:"claim,omitempty"`
+type AgentRunClaimResponse struct {
+	Claim *AgentRunClaim `json:"claim,omitempty"`
 }
 
-type AgentRuntimeClaim struct {
+type AgentRunClaim struct {
 	RequestID       string          `json:"request_id"`
 	WorkerID        string          `json:"worker_id"`
-	Task            map[string]any  `json:"task"`
+	AgentRun        map[string]any  `json:"agent_run"`
 	ExecutorRequest ExecutorRequest `json:"executor_request"`
 	RuntimeSnapshot map[string]any  `json:"runtime_snapshot,omitempty"`
 }
 
 type ExecutorRequest struct {
-	TaskID            string         `json:"task_id"`
+	TaskID            string         `json:"agent_run_id"`
 	AgentID           string         `json:"agent_id"`
 	Executor          string         `json:"executor"`
 	Prompt            string         `json:"prompt"`
@@ -317,68 +317,68 @@ type ExecutorRequest struct {
 	Metadata          map[string]any `json:"metadata,omitempty"`
 }
 
-type AgentRuntimeEventReport struct {
+type AgentRunEventReport struct {
 	PeerToken string         `json:"peer_token"`
 	RequestID string         `json:"request_id,omitempty"`
-	TaskID    string         `json:"task_id"`
+	TaskID    string         `json:"agent_run_id"`
 	WorkerID  string         `json:"worker_id,omitempty"`
 	Type      string         `json:"type"`
 	Text      string         `json:"text,omitempty"`
 	Data      map[string]any `json:"data,omitempty"`
 }
 
-type AgentRuntimeTaskEvent struct {
-	TaskID  string         `json:"task_id"`
+type AgentRunEvent struct {
+	TaskID  string         `json:"agent_run_id"`
 	Seq     int            `json:"seq"`
 	Type    string         `json:"type"`
 	Payload map[string]any `json:"payload,omitempty"`
 }
 
-type AgentRuntimeEventsResponse struct {
-	OK      bool                    `json:"ok"`
-	Events  []AgentRuntimeTaskEvent `json:"events,omitempty"`
-	NextSeq int                     `json:"next_seq"`
-	HasMore bool                    `json:"has_more"`
+type AgentRunEventsResponse struct {
+	OK      bool            `json:"ok"`
+	Events  []AgentRunEvent `json:"events,omitempty"`
+	NextSeq int             `json:"next_seq"`
+	HasMore bool            `json:"has_more"`
 }
 
-type AgentRuntimeHeartbeatRequest struct {
+type AgentRunHeartbeatRequest struct {
 	PeerToken string `json:"peer_token"`
 	RequestID string `json:"request_id"`
-	TaskID    string `json:"task_id"`
+	TaskID    string `json:"agent_run_id"`
 	WorkerID  string `json:"worker_id"`
 	LeaseSec  int    `json:"lease_sec,omitempty"`
 }
 
-type AgentRuntimeHeartbeatResponse struct {
+type AgentRunHeartbeatResponse struct {
 	OK              bool   `json:"ok"`
 	CancelRequested bool   `json:"cancel_requested"`
 	Reason          string `json:"reason,omitempty"`
 	LeaseSec        int    `json:"lease_sec,omitempty"`
 }
 
-type AgentRuntimeCompleteRequest struct {
-	PeerToken string                    `json:"peer_token"`
-	RequestID string                    `json:"request_id"`
-	TaskID    string                    `json:"task_id"`
-	WorkerID  string                    `json:"worker_id,omitempty"`
-	Status    string                    `json:"status"`
-	Output    string                    `json:"output,omitempty"`
-	Error     string                    `json:"error,omitempty"`
-	SessionID string                    `json:"executor_session_id,omitempty"`
-	Usage     map[string]any            `json:"usage,omitempty"`
-	Artifacts []map[string]any          `json:"artifacts,omitempty"`
-	Events    []AgentRuntimeEventReport `json:"events,omitempty"`
+type AgentRunCompleteRequest struct {
+	PeerToken string                `json:"peer_token"`
+	RequestID string                `json:"request_id"`
+	TaskID    string                `json:"agent_run_id"`
+	WorkerID  string                `json:"worker_id,omitempty"`
+	Status    string                `json:"status"`
+	Output    string                `json:"output,omitempty"`
+	Error     string                `json:"error,omitempty"`
+	SessionID string                `json:"executor_session_id,omitempty"`
+	Usage     map[string]any        `json:"usage,omitempty"`
+	Artifacts []map[string]any      `json:"artifacts,omitempty"`
+	Events    []AgentRunEventReport `json:"events,omitempty"`
 }
 
-type AgentRuntimeCompleteResponse struct {
+type AgentRunCompleteResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
 
-type AgentRuntimeSessionPinRequest struct {
+type AgentRunSessionPinRequest struct {
 	PeerToken         string `json:"peer_token"`
 	RequestID         string `json:"request_id"`
-	TaskID            string `json:"task_id"`
+	TaskID            string `json:"agent_run_id"`
 	WorkerID          string `json:"worker_id"`
 	Workdir           string `json:"workdir,omitempty"`
 	Branch            string `json:"branch,omitempty"`
@@ -387,7 +387,7 @@ type AgentRuntimeSessionPinRequest struct {
 	ExecutorSessionID string `json:"executor_session_id,omitempty"`
 }
 
-type AgentRuntimeSessionPinResponse struct {
+type AgentRunSessionPinResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }

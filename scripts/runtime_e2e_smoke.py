@@ -1,11 +1,11 @@
-﻿#!/usr/bin/env python3
-"""End-to-end smoke orchestration for Labrastro Agent Runtime persistence.
+#!/usr/bin/env python3
+"""End-to-end smoke orchestration for Labrastro AgentRun persistence.
 
 The script has two halves:
 - local `remote` mode packages the current source tree, uploads it over SSH,
   and starts the server-side runner.
 - server-side `server-steps` mode performs backup, deploy, Postgres wiring,
-  runtime worker lifecycle checks, and persistence checks.
+  AgentRun worker lifecycle checks, and persistence checks.
 
 Secrets are read from environment variables or stdin JSON and are masked from
 logs/reports.
@@ -53,8 +53,8 @@ SOURCE_EXCLUDES = [
     ".pytest_tmp/**",
     ".codex_tmp_session_tests",
     ".codex_tmp_session_tests/**",
-    ".agent_runtime_test_tmp",
-    ".agent_runtime_test_tmp/**",
+    ".agent_run_test_tmp",
+    ".agent_run_test_tmp/**",
     ".rcoder",
     ".rcoder/**",
     "__pycache__",
@@ -67,11 +67,11 @@ SOURCE_EXCLUDES = [
 ]
 
 REQUIRED_TABLES = [
-    "labrastro_runtime_tasks",
-    "labrastro_runtime_events",
-    "labrastro_runtime_claims",
-    "labrastro_runtime_sessions",
-    "labrastro_runtime_artifacts",
+    "labrastro_agent_runs",
+    "labrastro_agent_run_events",
+    "labrastro_agent_run_claims",
+    "labrastro_agent_run_sessions",
+    "labrastro_agent_run_artifacts",
     "labrastro_sessions",
     "labrastro_session_snapshots",
     "labrastro_taskflow_goals",
@@ -91,7 +91,7 @@ REQUIRED_TABLES = [
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled", "blocked", "timeout"}
 SMOKE_PERSISTENCE_RE = re.compile(
-    r"\n# runtime_e2e_smoke [^\n]+\npersistence:\n(?:  .*(?:\n|$))*"
+    r"\n# agent_run_e2e_smoke [^\n]+\npersistence:\n(?:  .*(?:\n|$))*"
 )
 DEFAULT_SMOKE_DATABASE = "ezcode_smoke"
 
@@ -273,7 +273,7 @@ class ServerRunner:
             raise SystemExit(f"Unsafe Postgres user: {self.pg_user}")
         self.incoming = self.root / "incoming"
         self.backup_dir = self.root / "backups" / self.timestamp
-        self.smoke_dir = self.root / "runtime-smoke" / self.timestamp
+        self.smoke_dir = self.root / "agent-run-smoke" / self.timestamp
         self.report: dict[str, Any] = {
             "timestamp": self.timestamp,
             "root": str(self.root),
@@ -302,11 +302,11 @@ class ServerRunner:
         self.compose_path: Path | None = None
         self.compose_service = ""
         self.host_url = "http://127.0.0.1:8765"
-        self.original_agent_runtime: dict[str, Any] = {}
+        self.original_agent_settings: dict[str, Any] = {}
         self.worker_proc: subprocess.Popen[str] | None = None
 
     def log(self, message: str) -> None:
-        print_masked(self.masker, f"[runtime-smoke] {message}")
+        print_masked(self.masker, f"[agent-run-smoke] {message}")
 
     def record_step(self, name: str, status: str = "ok", **extra: Any) -> None:
         safe_extra = json.loads(self.masker.mask(json.dumps(extra, ensure_ascii=False)))
@@ -425,7 +425,7 @@ class ServerRunner:
             {
                 "username": self.auth_username,
                 "password": self.auth_password,
-                "device_label": "runtime_e2e_smoke",
+                "device_label": "agent_run_e2e_smoke",
             },
             timeout=60,
         )
@@ -687,7 +687,7 @@ class ServerRunner:
         block = textwrap.dedent(
             f"""
 
-            # runtime_e2e_smoke {self.timestamp}
+            # agent_run_e2e_smoke {self.timestamp}
             persistence:
               backend: postgres
               database_url: {database_url}
@@ -865,48 +865,57 @@ class ServerRunner:
         self.log("configure smoke runtime profile and agent")
         read = self.admin_json("/remote/admin/server-settings/read")
         settings = read.get("settings") or read
-        runtime = copy.deepcopy(settings.get("agent_runtime") or {})
-        removed_stale = self.strip_smoke_agent_runtime_entries(runtime)
-        self.original_agent_runtime = copy.deepcopy(runtime)
+        run_limits = copy.deepcopy(settings.get("run_limits") or {})
+        runtime_profiles = copy.deepcopy(settings.get("runtime_profiles") or {})
+        agent_registry = copy.deepcopy(settings.get("agent_registry") or {})
+        removed_stale = self.strip_smoke_agent_entries(
+            runtime_profiles,
+            agent_registry,
+        )
+        self.original_agent_settings = {
+            "run_limits": copy.deepcopy(run_limits),
+            "runtime_profiles": copy.deepcopy(runtime_profiles),
+            "agent_registry": copy.deepcopy(agent_registry),
+        }
         profile_id = f"zz_smoke_runtime_{self.timestamp.lower()}"
         agent_id = f"zz_smoke_agent_{self.timestamp.lower()}"
         shadow_agent_id = f"zz_smoke_agent_shadow_{self.timestamp.lower()}"
-        runtime.setdefault("max_running_agents", 4)
-        runtime.setdefault("max_shells_per_agent", 1)
-        runtime.setdefault("runtime_profiles", {})
-        runtime.setdefault("agents", {})
-        runtime["runtime_profiles"][profile_id] = {
+        run_limits.setdefault("max_running_agents", 4)
+        run_limits.setdefault("max_shells_per_agent", 1)
+        agent_registry.setdefault("agents", {})
+        runtime_profiles[profile_id] = {
             "executor": "fake",
             "execution_location": "daemon_worktree",
             "runtime_home_policy": "per_task",
             "credential_refs": {"model": "smoke_model_ref"},
         }
-        runtime["agents"][agent_id] = {
-            "name": "Runtime Smoke Agent",
+        agent_registry["agents"][agent_id] = {
+            "name": "AgentRun Smoke Agent",
             "runtime_profile": profile_id,
             "dispatch": {
-                "profile": "Best for runtime smoke review tasks.",
+                "profile": "Best for AgentRun smoke review tasks.",
                 "examples": ["Run the fake executor smoke review flow."],
                 "avoid": ["Production deployment tasks."],
             },
-            "prompt": {"system_append": "Runtime smoke test agent."},
+            "prompt": {"system_append": "AgentRun smoke test agent."},
             "max_concurrent_tasks": 1,
         }
-        runtime["agents"][shadow_agent_id] = {
-            "name": "Runtime Smoke Agent",
+        agent_registry["agents"][shadow_agent_id] = {
+            "name": "AgentRun Smoke Agent",
             "runtime_profile": profile_id,
             "dispatch": {
                 "profile": "Shadow Agent used only for ambiguous mention smoke tests.",
                 "avoid": ["Normal task dispatch."],
             },
-            "prompt": {"system_append": "Runtime smoke ambiguous mention shadow."},
+            "prompt": {"system_append": "AgentRun smoke ambiguous mention shadow."},
             "max_concurrent_tasks": 1,
         }
         update = self.admin_json(
             "/remote/admin/server-settings/update",
             {
-                "agent_runtime_update_mode": "replace",
-                "agent_runtime": runtime,
+                "run_limits": run_limits,
+                "runtime_profiles": runtime_profiles,
+                "agent_registry": agent_registry,
             },
         )
         if update.get("ok") is not True:
@@ -925,9 +934,13 @@ class ServerRunner:
         )
         return profile_id, agent_id
 
-    def strip_smoke_agent_runtime_entries(self, runtime: dict[str, Any]) -> dict[str, int]:
-        profiles = runtime.setdefault("runtime_profiles", {})
-        agents = runtime.setdefault("agents", {})
+    def strip_smoke_agent_entries(
+        self,
+        runtime_profiles: dict[str, Any],
+        agent_registry: dict[str, Any],
+    ) -> dict[str, int]:
+        profiles = runtime_profiles
+        agents = agent_registry.setdefault("agents", {})
         removed_profiles = 0
         removed_agents = 0
         if isinstance(profiles, dict):
@@ -942,25 +955,22 @@ class ServerRunner:
                     removed_agents += 1
         return {"runtime_profiles": removed_profiles, "agents": removed_agents}
 
-    def restore_agent_runtime(self) -> None:
-        if not self.original_agent_runtime:
+    def restore_agent_settings(self) -> None:
+        if not self.original_agent_settings:
             return
-        self.log("restore original agent_runtime config")
+        self.log("restore original Agent registry config")
         try:
             result = self.admin_json(
                 "/remote/admin/server-settings/update",
-                {
-                    "agent_runtime_update_mode": "replace",
-                    "agent_runtime": self.original_agent_runtime,
-                },
+                self.original_agent_settings,
             )
             if result.get("ok") is not True:
-                self.record_step("restore_agent_runtime", "failed", response=result)
-                raise RuntimeError(f"restore_agent_runtime failed: {result}")
+                self.record_step("restore_agent_settings", "failed", response=result)
+                raise RuntimeError(f"restore_agent_settings failed: {result}")
             else:
-                self.record_step("restore_agent_runtime")
+                self.record_step("restore_agent_settings")
         except Exception as exc:  # noqa: BLE001
-            self.record_step("restore_agent_runtime", "failed", error=str(exc))
+            self.record_step("restore_agent_settings", "failed", error=str(exc))
             raise
 
     def create_git_fixture(self) -> dict[str, str]:
@@ -1010,7 +1020,7 @@ class ServerRunner:
               if [ -f {q(self.smoke_dir / "gh_sleep")} ]; then
                 sleep "$(cat {q(self.smoke_dir / "gh_sleep")})"
               fi
-              echo "https://example.test/pr/labrastro-runtime-smoke"
+              echo "https://example.test/pr/labrastro-agent-run-smoke"
               exit 0
             fi
             echo "unsupported fake gh command: $@" >&2
@@ -1078,8 +1088,8 @@ class ServerRunner:
                 str(peer_info),
                 "--poll-interval",
                 "200ms",
-                "--agent-runtime",
-                "--runtime-worker-id",
+                "--agent-run-worker",
+                "--worker-session-id",
                 worker_id,
             ],
             stdout=stdout_path.open("w", encoding="utf-8"),
@@ -1129,8 +1139,8 @@ class ServerRunner:
                 "bootstrap_token": token,
                 "cwd": fixture["repo"],
                 "workspace_root": fixture["repo"],
-                "features": features or ["agent_runtime"],
-                "metadata": {"runtime_smoke_peer": suffix},
+                "features": features or ["agent_runs"],
+                "metadata": {"agent_run_smoke_peer": suffix},
             },
         )
         peer_token = str((body.get("payload") or {}).get("peer_token") or "")
@@ -1163,25 +1173,25 @@ class ServerRunner:
         suffix: str,
         extra_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        metadata = self.runtime_task_metadata(fixture, suffix=suffix)
+        metadata = self.agent_run_metadata(fixture, suffix=suffix)
         if extra_metadata:
             metadata.update(extra_metadata)
         body = self.admin_json(
-            "/remote/admin/runtime/submit",
+            "/remote/admin/agent-runs/submit",
             {
-                "task_id": task_id,
-                "issue_id": f"runtime-smoke-{self.timestamp}",
+                "agent_run_id": task_id,
+                "issue_id": f"agent-run-smoke-{self.timestamp}",
                 "agent_id": agent_id,
-                "prompt": f"runtime smoke {suffix}",
+                "prompt": f"AgentRun smoke {suffix}",
                 "metadata": metadata,
             },
         )
         if body.get("ok") is not True:
-            raise RuntimeError(f"runtime submit failed: {body}")
+            raise RuntimeError(f"AgentRun submit failed: {body}")
         self.record_step("submit_task", task_id=task_id)
         return body
 
-    def runtime_task_metadata(
+    def agent_run_metadata(
         self,
         fixture: dict[str, str],
         *,
@@ -1190,12 +1200,12 @@ class ServerRunner:
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "repo_url": fixture["repo_url"],
-            "workspace_id": f"runtime-smoke-{self.timestamp}",
-            "prompt_files": {"AGENTS.md": "Runtime smoke test only.\n"},
+            "workspace_id": f"agent-run-smoke-{self.timestamp}",
+            "prompt_files": {"AGENTS.md": "AgentRun smoke test only.\n"},
             "fake_files": {f"agent-output-{suffix}.txt": f"created by {suffix}\n"},
-            "pr_body": f"Runtime smoke {suffix}",
-            "pr_title": f"Runtime smoke {suffix}",
-            "commit_message": f"agent: runtime smoke {suffix}",
+            "pr_body": f"AgentRun smoke {suffix}",
+            "pr_title": f"AgentRun smoke {suffix}",
+            "commit_message": f"agent: AgentRun smoke {suffix}",
             "pr_enabled": False,
         }
         if extra:
@@ -1204,8 +1214,8 @@ class ServerRunner:
 
     def load_task(self, task_id: str) -> dict[str, Any]:
         return self.admin_json(
-            "/remote/admin/runtime/tasks/load",
-            {"task_id": task_id, "event_limit": 200},
+            "/remote/admin/agent-runs/load",
+            {"agent_run_id": task_id, "event_limit": 200},
         )
 
     def poll_task(self, task_id: str, *, timeout_sec: int = 90) -> dict[str, Any]:
@@ -1213,11 +1223,30 @@ class ServerRunner:
         detail: dict[str, Any] = {}
         while time.time() < deadline:
             detail = self.load_task(task_id)
-            status = str((detail.get("task") or {}).get("status") or "")
+            status = str((detail.get("agent_run") or {}).get("status") or "")
             if status in TERMINAL_STATUSES:
                 return detail
             time.sleep(1)
         raise RuntimeError(f"task {task_id} did not finish, last detail={detail}")
+
+    def find_agent_run_id_for_task_run(
+        self,
+        task_run_id: str,
+        *,
+        timeout_sec: int = 30,
+    ) -> str:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            body = self.admin_json(
+                "/remote/admin/agent-runs/list",
+                {"limit": 200},
+            )
+            for row in body.get("agent_runs") or []:
+                metadata = row.get("metadata") if isinstance(row, dict) else {}
+                if isinstance(metadata, dict) and metadata.get("task_run_id") == task_run_id:
+                    return str(row.get("id") or "")
+            time.sleep(1)
+        raise RuntimeError(f"AgentRun not found for TaskRun {task_run_id}")
 
     def claim_task_until(
         self,
@@ -1235,7 +1264,7 @@ class ServerRunner:
             attempts += 1
             claim = self.http_json(
                 "POST",
-                "/remote/runtime/claim",
+                "/remote/agent-runs/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": worker_id,
@@ -1244,7 +1273,7 @@ class ServerRunner:
                 },
             ).get("claim")
             if claim:
-                claimed_task = (claim.get("task") or {}).get("id")
+                claimed_task = (claim.get("agent_run") or {}).get("id")
                 if claimed_task != task_id:
                     raise RuntimeError(
                         f"manual worker claimed unexpected task {claimed_task}; expected {task_id}"
@@ -1257,7 +1286,7 @@ class ServerRunner:
                 )
                 return claim
             last_detail = self.load_task(task_id)
-            status = str((last_detail.get("task") or {}).get("status") or "")
+            status = str((last_detail.get("agent_run") or {}).get("status") or "")
             if status in TERMINAL_STATUSES:
                 raise RuntimeError(
                     f"task {task_id} reached terminal status before manual claim: {status}"
@@ -1294,8 +1323,8 @@ class ServerRunner:
             happy_id = f"task-happy-{self.timestamp.lower()}"
             self.submit_task(happy_id, agent_id, fixture, suffix="happy")
             happy = self.poll_task(happy_id, timeout_sec=120)
-            if happy["task"]["status"] != "completed":
-                raise RuntimeError(f"happy task did not complete: {happy['task']}")
+            if happy["agent_run"]["status"] != "completed":
+                raise RuntimeError(f"happy AgentRun did not complete: {happy['agent_run']}")
             self.assert_task_labels(
                 happy_id,
                 happy,
@@ -1319,27 +1348,27 @@ class ServerRunner:
             )
             self.wait_for_label(cancel_id, "running", timeout_sec=90)
             cancel_body = self.admin_json(
-                "/remote/admin/runtime/cancel",
-                {"task_id": cancel_id, "reason": "runtime_smoke_cancel"},
+                "/remote/admin/agent-runs/cancel",
+                {"agent_run_id": cancel_id, "reason": "agent_run_smoke_cancel"},
             )
             if cancel_body.get("ok") is not True:
                 raise RuntimeError(f"cancel failed: {cancel_body}")
             cancel_detail = self.poll_task(cancel_id, timeout_sec=90)
-            status = str(cancel_detail["task"]["status"])
+            status = str(cancel_detail["agent_run"]["status"])
             if status not in {"cancelled", "canceled"}:
-                raise RuntimeError(f"cancel task status mismatch: {cancel_detail['task']}")
+                raise RuntimeError(f"cancel AgentRun status mismatch: {cancel_detail['agent_run']}")
             self.report["tasks"]["cancel"] = self.summarize_task(cancel_detail)
 
             retry_id = f"task-retry-{self.timestamp.lower()}"
             retry = self.admin_json(
-                "/remote/admin/runtime/retry",
-                {"task_id": cancel_id, "new_task_id": retry_id},
+                "/remote/admin/agent-runs/retry",
+                {"agent_run_id": cancel_id, "new_agent_run_id": retry_id},
             )
             if retry.get("ok") is not True:
                 raise RuntimeError(f"retry failed: {retry}")
             retry_detail = self.poll_task(retry_id, timeout_sec=120)
-            if retry_detail["task"]["status"] != "completed":
-                raise RuntimeError(f"retry task did not complete: {retry_detail['task']}")
+            if retry_detail["agent_run"]["status"] != "completed":
+                raise RuntimeError(f"retry AgentRun did not complete: {retry_detail['agent_run']}")
             self.report["tasks"]["retry"] = self.summarize_task(retry_detail)
             self.record_step("worker_lifecycle")
         finally:
@@ -1369,189 +1398,175 @@ class ServerRunner:
         self, peer_token: str, fixture: dict[str, str], agent_id: str
     ) -> None:
         suffix = self.timestamp.lower()
+        taskflow_id = f"taskflow-smoke-{suffix}"
         goal_id = f"goal-smoke-{suffix}"
-        issue_draft_id = f"issue-draft-smoke-{suffix}"
-        draft_id = f"task-draft-smoke-{suffix}"
-        goal = self.peer_post(
-            "/remote/taskflow/goals",
+        candidate_id = f"candidate-smoke-{suffix}"
+        created = self.peer_post(
+            "/remote/taskflow/taskflows",
             peer_token,
             {
+                "taskflow_id": taskflow_id,
                 "goal_id": goal_id,
-                "title": "Runtime smoke Taskflow goal",
-                "prompt": "Turn this smoke request into a confirmed runtime task.",
-                "metadata": {"runtime_smoke": self.timestamp},
+                "project_id": f"project-smoke-{suffix}",
+                "raw_goal": "Turn this smoke request into a confirmed AgentRun.",
+                "metadata": {"agent_run_smoke": self.timestamp},
             },
-        )["goal"]
-        if goal["id"] != goal_id:
-            raise RuntimeError(f"taskflow goal id mismatch: {goal}")
+        )["taskflow"]
+        if created["meta"]["taskflow_id"] != taskflow_id:
+            raise RuntimeError(f"taskflow id mismatch: {created}")
 
-        brief = self.peer_post(
-            f"/remote/taskflow/goals/{goal_id}/brief",
+        clarified = self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/clarify",
             peer_token,
             {
-                "summary": "Smoke brief for Taskflow dispatch.",
-                "decision_points": [
+                "goal_statement": "Run the fake executor smoke path.",
+                "success_criteria": ["AgentRun completes through Taskflow dispatch."],
+                "work_item_candidates": [
                     {
-                        "id": f"decision-smoke-{suffix}",
-                        "question": "Run fake executor smoke?",
-                        "status": "resolved",
+                        "id": candidate_id,
+                        "title": "AgentRun smoke Taskflow task",
+                        "description": "Dispatch through Taskflow into AgentRun.",
+                        "type": "implementation",
+                        "repo_ref": fixture["repo_url"],
+                        "metadata": self.agent_run_metadata(
+                            fixture, suffix="taskflow"
+                        ),
                     }
                 ],
-                "issue_drafts": [
+                "readiness_gates": [
                     {
-                        "id": issue_draft_id,
-                        "title": "Runtime smoke issue draft",
-                        "description": "Dispatch through Taskflow into Runtime.",
-                        "task_drafts": [
-                            {
-                                "id": draft_id,
-                                "title": "Runtime smoke Taskflow task",
-                                "prompt": "runtime smoke taskflow",
-                                "task_type": "code_review",
-                                "execution_location": "daemon_worktree",
-                                "repo_url": fixture["repo_url"],
-                                "metadata": self.runtime_task_metadata(
-                                    fixture, suffix="taskflow"
-                                ),
-                            }
-                        ],
+                        "id": f"gate-smoke-{suffix}",
+                        "name": "smoke-ready",
+                        "passed": True,
+                        "rationale": "Smoke fixture and Agent are configured.",
                     }
                 ],
-                "ready": True,
+                "readiness_score": 90,
             },
-        )
-        if brief["goal"]["status"] != "ready":
-            raise RuntimeError(f"taskflow brief did not mark goal ready: {brief}")
-        pre_dispatch = self.peer_get(f"/remote/taskflow/goals/{goal_id}", peer_token)
-        draft = self._single_by_id(pre_dispatch.get("task_drafts") or [], draft_id)
-        if draft.get("runtime_task_id"):
-            raise RuntimeError(f"taskflow created runtime task before dispatch: {draft}")
+        )["taskflow"]
+        if clarified["meta"]["status"] != "clarifying":
+            raise RuntimeError(f"taskflow clarify did not update state: {clarified}")
 
         confirmed = self.peer_post(
-            f"/remote/taskflow/goals/{goal_id}/confirm", peer_token
-        )
-        if confirmed["goal"]["status"] != "confirmed":
+            f"/remote/taskflow/taskflows/{taskflow_id}/confirm", peer_token
+        )["taskflow"]
+        if confirmed["meta"]["status"] != "confirmed":
             raise RuntimeError(f"taskflow goal was not confirmed: {confirmed}")
 
+        plan = self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/compile", peer_token
+        )["plan"]
+        work_item_id = str(plan["work_item_candidates"][0]["work_item_id"])
         dispatch = self.peer_post(
-            f"/remote/taskflow/task-drafts/{draft_id}/dispatch",
+            f"/remote/taskflow/taskflows/{taskflow_id}/work-items/{work_item_id}/dispatch",
             peer_token,
-            {"executor_hint": agent_id},
-        )
-        decision = dispatch["decision"]
-        runtime_task_id = decision.get("runtime_task_id")
-        if decision.get("selected_agent_id") != agent_id or not runtime_task_id:
-            raise RuntimeError(f"taskflow dispatch did not select smoke agent: {decision}")
-        detail = self.poll_task(str(runtime_task_id), timeout_sec=120)
-        if detail["task"]["status"] != "completed":
-            raise RuntimeError(f"taskflow runtime task did not complete: {detail['task']}")
-        task_metadata = detail["task"].get("metadata") or {}
-        if task_metadata.get("dispatch_source") != "taskflow":
-            raise RuntimeError(f"taskflow runtime metadata missing source: {task_metadata}")
-        if task_metadata.get("taskflow_goal_id") != goal_id:
-            raise RuntimeError(f"taskflow runtime metadata missing goal id: {task_metadata}")
-        runtime_events = self.peer_get(
-            f"/remote/agent-runtime/tasks/{runtime_task_id}/events",
-            peer_token,
-            {"after_seq": 0},
-        )
-        if "queued" not in {event.get("type") for event in runtime_events.get("events") or []}:
-            raise RuntimeError(f"taskflow runtime events missing queued: {runtime_events}")
-        taskflow_events = self.peer_get(
-            f"/remote/taskflow/goals/{goal_id}/events",
+            {
+                "executor_hint": agent_id,
+                "metadata": self.agent_run_metadata(fixture, suffix="taskflow"),
+            },
+        )["task_run"]
+        if dispatch.get("status") != "dispatched":
+            raise RuntimeError(f"taskflow dispatch did not dispatch TaskRun: {dispatch}")
+        agent_run_id = self.find_agent_run_id_for_task_run(str(dispatch["id"]))
+        detail = self.poll_task(agent_run_id, timeout_sec=120)
+        if detail["agent_run"]["status"] != "completed":
+            raise RuntimeError(f"taskflow AgentRun did not complete: {detail['agent_run']}")
+        agent_run_metadata = detail["agent_run"].get("metadata") or {}
+        if agent_run_metadata.get("dispatch_source") != "taskflow":
+            raise RuntimeError(f"taskflow AgentRun metadata missing source: {agent_run_metadata}")
+        if agent_run_metadata.get("taskflow_id") != taskflow_id:
+            raise RuntimeError(f"taskflow AgentRun metadata missing taskflow id: {agent_run_metadata}")
+        agent_run_events = self.peer_get(
+            f"/remote/agent-runs/{agent_run_id}/events",
             peer_token,
             {"after_seq": 0},
         )
-        if not {
-            "goal_created",
-            "brief_recorded",
-            "goal_confirmed",
-            "task_draft_dispatched",
-        }.issubset({event.get("type") for event in taskflow_events.get("events") or []}):
-            raise RuntimeError(f"taskflow events incomplete: {taskflow_events}")
+        if "queued" not in {event.get("type") for event in agent_run_events.get("events") or []}:
+            raise RuntimeError(f"taskflow AgentRun events missing queued: {agent_run_events}")
 
         self.run_taskflow_negative_paths(peer_token, fixture)
         self.report["tasks"]["taskflow"] = self.summarize_task(detail)
         self.report["flows"]["taskflow"] = {
+            "taskflow_id": taskflow_id,
             "goal_id": goal_id,
-            "issue_draft_id": issue_draft_id,
-            "task_draft_id": draft_id,
-            "dispatch_decision_id": decision.get("id"),
-            "runtime_task_id": runtime_task_id,
+            "candidate_id": candidate_id,
+            "work_item_id": work_item_id,
+            "task_run_id": dispatch["id"],
+            "agent_run_id": agent_run_id,
         }
-        self.record_step("taskflow_e2e", runtime_task_id=runtime_task_id)
+        self.record_step("taskflow_e2e", agent_run_id=agent_run_id)
 
     def run_taskflow_negative_paths(
         self, peer_token: str, fixture: dict[str, str]
     ) -> None:
         suffix = self.timestamp.lower()
-        blocked_goal_id = f"goal-blocked-{suffix}"
-        blocked_draft_id = f"task-draft-blocked-{suffix}"
+        blocked_taskflow_id = f"taskflow-blocked-{suffix}"
+        blocked_candidate_id = f"candidate-blocked-{suffix}"
         self.peer_post(
-            "/remote/taskflow/goals",
+            "/remote/taskflow/taskflows",
             peer_token,
             {
-                "goal_id": blocked_goal_id,
-                "title": "Blocked Taskflow goal",
-                "prompt": "This should need assignment.",
+                "taskflow_id": blocked_taskflow_id,
+                "goal_id": f"goal-blocked-{suffix}",
+                "project_id": f"project-blocked-{suffix}",
+                "raw_goal": "This should fail readiness before dispatch.",
             },
         )
         self.peer_post(
-            f"/remote/taskflow/goals/{blocked_goal_id}/brief",
+            f"/remote/taskflow/taskflows/{blocked_taskflow_id}/clarify",
             peer_token,
             {
-                "summary": "No Agent has this required capability.",
-                "task_drafts": [
+                "work_item_candidates": [
                     {
-                        "id": blocked_draft_id,
+                        "id": blocked_candidate_id,
                         "title": "Impossible task",
                         "prompt": "cannot dispatch",
                         "repo_url": fixture["repo_url"],
                     }
                 ],
-                "ready": True,
+                "readiness_gates": [
+                    {
+                        "id": f"gate-blocked-{suffix}",
+                        "name": "blocked",
+                        "passed": False,
+                        "rationale": "Intentional smoke readiness failure.",
+                    }
+                ],
+                "readiness_score": 20,
             },
         )
-        self.peer_post(f"/remote/taskflow/goals/{blocked_goal_id}/confirm", peer_token)
-        blocked = self.peer_post(
-            f"/remote/taskflow/task-drafts/{blocked_draft_id}/dispatch", peer_token
-        )["decision"]
-        if blocked.get("runtime_task_id") or blocked.get("status") != "needs_assignment":
-            raise RuntimeError(f"blocked taskflow dispatch mismatch: {blocked}")
-
-        cancelled_goal_id = f"goal-cancelled-{suffix}"
-        self.peer_post(
-            "/remote/taskflow/goals",
-            peer_token,
-            {
-                "goal_id": cancelled_goal_id,
-                "title": "Cancelled Taskflow goal",
-                "prompt": "This should not confirm after cancellation.",
-            },
-        )
-        self.peer_post(
-            f"/remote/taskflow/goals/{cancelled_goal_id}/cancel",
-            peer_token,
-            {"reason": "runtime_smoke_cancel_goal"},
-        )
+        self.peer_post(f"/remote/taskflow/taskflows/{blocked_taskflow_id}/confirm", peer_token)
+        plan = self.peer_post(
+            f"/remote/taskflow/taskflows/{blocked_taskflow_id}/compile", peer_token
+        )["plan"]
+        work_item_id = str(plan["work_item_candidates"][0]["work_item_id"])
         self.expect_peer_failure(
             "POST",
-            f"/remote/taskflow/goals/{cancelled_goal_id}/confirm",
+            f"/remote/taskflow/taskflows/{blocked_taskflow_id}/work-items/{work_item_id}/dispatch",
             peer_token,
             status=400,
         )
 
+        self.peer_post(
+            "/remote/taskflow/taskflows",
+            peer_token,
+            {
+                "taskflow_id": f"taskflow-forbidden-{suffix}",
+                "goal_id": f"goal-forbidden-{suffix}",
+                "project_id": f"project-forbidden-{suffix}",
+                "raw_goal": "Cross-peer access check.",
+            },
+        )
         peer_b = self.register_manual_peer(fixture, suffix="taskflow-forbidden")
         self.expect_peer_failure(
             "GET",
-            f"/remote/taskflow/goals/{blocked_goal_id}",
+            f"/remote/taskflow/taskflows/taskflow-forbidden-{suffix}",
             peer_b,
             status=403,
         )
         self.report["flows"]["taskflow_negative"] = {
-            "needs_assignment_goal_id": blocked_goal_id,
-            "needs_assignment_draft_id": blocked_draft_id,
-            "cancelled_goal_id": cancelled_goal_id,
+            "blocked_taskflow_id": blocked_taskflow_id,
+            "blocked_candidate_id": blocked_candidate_id,
             "cross_peer_forbidden": True,
         }
 
@@ -1566,9 +1581,9 @@ class ServerRunner:
             peer_token,
             {
                 "issue_id": issue_id,
-                "title": "Runtime smoke issue",
+                "title": "AgentRun smoke issue",
                 "description": "Create assignment and dispatch through Taskflow.",
-                "metadata": {"runtime_smoke": self.timestamp},
+                "metadata": {"agent_run_smoke": self.timestamp},
             },
         )["issue"]
         if issue["id"] != issue_id:
@@ -1580,24 +1595,24 @@ class ServerRunner:
             {
                 "assignment_id": assignment_id,
                 "target_agent_id": agent_id,
-                "title": "Runtime smoke assignment",
-                "prompt": "runtime smoke assignment",
+                "title": "AgentRun smoke assignment",
+                "prompt": "AgentRun smoke assignment",
                 "task_type": "code_review",
                 "execution_location": "daemon_worktree",
                 "repo_url": fixture["repo_url"],
-                "reason": "runtime smoke manual assignment",
-                "metadata": self.runtime_task_metadata(
+                "reason": "AgentRun smoke manual assignment",
+                "metadata": self.agent_run_metadata(
                     fixture, suffix="assignment"
                 ),
             },
         )["assignment"]
-        if assignment["status"] != "ready" or assignment.get("runtime_task_id"):
-            raise RuntimeError(f"assignment should be ready without runtime task: {assignment}")
+        if assignment["status"] != "ready" or assignment.get("task_run_id"):
+            raise RuntimeError(f"assignment should be ready without AgentRun dispatch: {assignment}")
 
         reassigned = self.peer_post(
             f"/remote/assignments/{assignment_id}/assign",
             peer_token,
-            {"agent_id": agent_id, "reason": "runtime smoke confirmation"},
+            {"agent_id": agent_id, "reason": "AgentRun smoke confirmation"},
         )["assignment"]
         if reassigned.get("target_agent_id") != agent_id:
             raise RuntimeError(f"assignment reassign failed: {reassigned}")
@@ -1605,11 +1620,14 @@ class ServerRunner:
         dispatch = self.peer_post(
             f"/remote/assignments/{assignment_id}/dispatch", peer_token
         )["assignment"]
-        assignment_task_id = dispatch.get("runtime_task_id")
-        if dispatch.get("status") != "dispatched" or not assignment_task_id:
+        assignment_task_run_id = dispatch.get("task_run_id")
+        if dispatch.get("status") != "dispatched" or not assignment_task_run_id:
             raise RuntimeError(f"assignment dispatch failed: {dispatch}")
-        assignment_detail = self.poll_task(str(assignment_task_id), timeout_sec=120)
-        assignment_metadata = assignment_detail["task"].get("metadata") or {}
+        assignment_agent_run_id = self.find_agent_run_id_for_task_run(
+            str(assignment_task_run_id)
+        )
+        assignment_detail = self.poll_task(str(assignment_agent_run_id), timeout_sec=120)
+        assignment_metadata = assignment_detail["agent_run"].get("metadata") or {}
         for key, expected in {
             "dispatch_source": "assignment",
             "issue_id": issue_id,
@@ -1617,7 +1635,7 @@ class ServerRunner:
         }.items():
             if assignment_metadata.get(key) != expected:
                 raise RuntimeError(
-                    f"assignment runtime metadata mismatch for {key}: {assignment_metadata}"
+                    f"assignment AgentRun metadata mismatch for {key}: {assignment_metadata}"
                 )
 
         parse = self.peer_post(
@@ -1639,7 +1657,7 @@ class ServerRunner:
         ambiguous = self.peer_post(
             "/remote/mentions/parse",
             peer_token,
-            {"raw_text": "please help", "agent_ref": "Runtime Smoke Agent"},
+            {"raw_text": "please help", "agent_ref": "AgentRun Smoke Agent"},
         )["mention"]
         if ambiguous.get("reason") != "alias_ambiguous":
             raise RuntimeError(f"ambiguous mention did not report conflict: {ambiguous}")
@@ -1650,8 +1668,8 @@ class ServerRunner:
             {
                 "issue_id": issue_id,
                 "raw_text": f"@{agent_id} please draft this.",
-                "prompt": "runtime smoke mention",
-                "metadata": self.runtime_task_metadata(fixture, suffix="mention"),
+                "prompt": "AgentRun smoke mention",
+                "metadata": self.agent_run_metadata(fixture, suffix="mention"),
             },
         )["mention"]
         mention_assignment_id = mention.get("assignment_id")
@@ -1661,11 +1679,14 @@ class ServerRunner:
         mention_dispatch = self.peer_post(
             f"/remote/assignments/{mention_assignment_id}/dispatch", peer_token
         )["assignment"]
-        mention_task_id = mention_dispatch.get("runtime_task_id")
-        if mention_dispatch.get("status") != "dispatched" or not mention_task_id:
+        mention_task_run_id = mention_dispatch.get("task_run_id")
+        if mention_dispatch.get("status") != "dispatched" or not mention_task_run_id:
             raise RuntimeError(f"mention assignment dispatch failed: {mention_dispatch}")
-        mention_detail = self.poll_task(str(mention_task_id), timeout_sec=120)
-        mention_metadata = mention_detail["task"].get("metadata") or {}
+        mention_agent_run_id = self.find_agent_run_id_for_task_run(
+            str(mention_task_run_id)
+        )
+        mention_detail = self.poll_task(str(mention_agent_run_id), timeout_sec=120)
+        mention_metadata = mention_detail["agent_run"].get("metadata") or {}
         for key, expected in {
             "dispatch_source": "mention",
             "issue_id": issue_id,
@@ -1674,7 +1695,7 @@ class ServerRunner:
         }.items():
             if mention_metadata.get(key) != expected:
                 raise RuntimeError(
-                    f"mention runtime metadata mismatch for {key}: {mention_metadata}"
+                    f"mention AgentRun metadata mismatch for {key}: {mention_metadata}"
                 )
 
         issue_detail = self.peer_get(f"/remote/issues/{issue_id}", peer_token)
@@ -1723,10 +1744,12 @@ class ServerRunner:
         self.report["flows"]["issue_assignment_mention"] = {
             "issue_id": issue_id,
             "assignment_id": assignment_id,
-            "assignment_runtime_task_id": assignment_task_id,
+            "assignment_task_run_id": assignment_task_run_id,
+            "assignment_agent_run_id": assignment_agent_run_id,
             "mention_id": mention["id"],
             "mention_assignment_id": mention_assignment_id,
-            "mention_runtime_task_id": mention_task_id,
+            "mention_task_run_id": mention_task_run_id,
+            "mention_agent_run_id": mention_agent_run_id,
             "blocked_issue_id": blocked_issue_id,
             "blocked_assignment_id": blocked_assignment_id,
             "mention_not_found": missing.get("reason"),
@@ -1735,8 +1758,8 @@ class ServerRunner:
         }
         self.record_step(
             "issue_assignment_mention_e2e",
-            assignment_runtime_task_id=assignment_task_id,
-            mention_runtime_task_id=mention_task_id,
+            assignment_agent_run_id=assignment_agent_run_id,
+            mention_agent_run_id=mention_agent_run_id,
         )
 
     def _single_by_id(self, items: list[Any], item_id: str) -> dict[str, Any]:
@@ -1752,14 +1775,14 @@ class ServerRunner:
             detail = self.load_task(task_id)
             if label in self.event_labels(detail):
                 return detail
-            status = str((detail.get("task") or {}).get("status") or "")
+            status = str((detail.get("agent_run") or {}).get("status") or "")
             if status in TERMINAL_STATUSES:
-                raise RuntimeError(f"task {task_id} reached {status} before label {label}")
+                raise RuntimeError(f"AgentRun {task_id} reached {status} before label {label}")
             time.sleep(1)
-        raise RuntimeError(f"task {task_id} did not reach label {label}; last={detail}")
+        raise RuntimeError(f"AgentRun {task_id} did not reach label {label}; last={detail}")
 
     def summarize_task(self, detail: dict[str, Any]) -> dict[str, Any]:
-        task = detail.get("task") or {}
+        task = detail.get("agent_run") or {}
         return {
             "id": task.get("id"),
             "status": task.get("status"),
@@ -1788,8 +1811,8 @@ class ServerRunner:
                 "cwd": fixture["repo"],
                 "workspace_root": fixture["repo"],
                 "features": [
-                    "agent_runtime",
-                    "agent_runtime.daemon_worktree",
+                    "agent_runs",
+                    "agent_runs.daemon_worktree",
                 ],
             },
         )
@@ -1810,11 +1833,11 @@ class ServerRunner:
         self.masker.add(request_id)
         hb = self.http_json(
             "POST",
-            "/remote/runtime/heartbeat",
+            "/remote/agent-runs/heartbeat",
             {
                 "peer_token": peer_token,
                 "request_id": request_id,
-                "task_id": task_id,
+                "agent_run_id": task_id,
                 "worker_id": "manual-recovery-worker",
                 "lease_sec": 30,
             },
@@ -1824,8 +1847,8 @@ class ServerRunner:
         self.restart_host()
         self.login()
         detail = self.load_task(task_id)
-        if detail["task"]["status"] != "failed":
-            raise RuntimeError(f"recovery task was not marked failed: {detail['task']}")
+        if detail["agent_run"]["status"] != "failed":
+            raise RuntimeError(f"recovery AgentRun was not marked failed: {detail['agent_run']}")
         if "host_recovered_task_failed" not in self.event_labels(detail):
             raise RuntimeError(f"recovery event missing: {detail.get('events')}")
         self.report["tasks"]["restart_recovery"] = self.summarize_task(detail)
@@ -1862,7 +1885,7 @@ class ServerRunner:
             sid = store.save(
                 messages=[{{"role": "user", "content": "runtime session smoke {self.timestamp}"}}],
                 model="smoke-model",
-                fingerprint="runtime-smoke:{self.timestamp}",
+                fingerprint="agent-run-smoke:{self.timestamp}",
             )
             store.save_snapshot(sid, {{"turns": [{{"id": "turn-1"}}], "traceNodes": [{{"id": "node-1"}}], "traceEdges": []}})
             snapshot, error = store.load_snapshot(sid)
@@ -1886,7 +1909,7 @@ class ServerRunner:
             raise RuntimeError(f"session persistence smoke failed: {data}")
         self.restart_host()
         session_count = self.psql(
-            "SELECT count(*) FROM labrastro_sessions WHERE fingerprint='runtime-smoke:" + self.timestamp + "'",
+            "SELECT count(*) FROM labrastro_sessions WHERE fingerprint='agent-run-smoke:" + self.timestamp + "'",
             database=self.db_name,
         ).stdout.strip()
         snapshot_count = self.psql(
@@ -2010,7 +2033,7 @@ class ServerRunner:
             self.stop_worker()
             if success:
                 try:
-                    self.restore_agent_runtime()
+                    self.restore_agent_settings()
                 except Exception as exc:  # noqa: BLE001
                     self.report["error"] = self.masker.mask(str(exc))
                     self.record_step("failed", "failed", error=str(exc))
@@ -2064,7 +2087,7 @@ def remote(args: argparse.Namespace) -> int:
     timestamp = args.timestamp or utc_timestamp()
     masker = Masker([ssh_password, pg_password, auth_password])
     repo_root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(prefix="labrastro-runtime-smoke-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="labrastro-agent-run-smoke-") as tmp:
         tmp_path = Path(tmp)
         archive = create_source_archive(repo_root, timestamp, tmp_path)
         print_masked(masker, f"archive={archive} size={archive.stat().st_size}")
@@ -2073,7 +2096,7 @@ def remote(args: argparse.Namespace) -> int:
             incoming = f"{args.root.rstrip('/')}/incoming"
             ssh.run_checked(f"mkdir -p {q(incoming)}")
             remote_archive = f"{incoming}/labrastro-src-{timestamp}.tgz"
-            remote_script = f"{incoming}/runtime_e2e_smoke-{timestamp}.py"
+            remote_script = f"{incoming}/agent_run_e2e_smoke-{timestamp}.py"
             ssh.put(archive, remote_archive)
             ssh.put(Path(__file__).resolve(), remote_script)
             ssh.run_checked(f"chmod 700 {q(remote_script)}")

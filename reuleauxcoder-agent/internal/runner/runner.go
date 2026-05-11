@@ -33,8 +33,8 @@ type Config struct {
 	PeerInfoFile    string
 	PollInterval    time.Duration
 	Interactive     bool
-	AgentRuntime    bool
-	RuntimeWorkerID string
+	AgentRun        bool
+	WorkerSessionID string
 }
 
 type Runner struct {
@@ -84,20 +84,20 @@ func (r *Runner) Run(ctx context.Context) error {
 		"arch":     runtimeArch(),
 		"hostname": runtimeHostname(),
 	}
-	if r.cfg.AgentRuntime {
+	if r.cfg.AgentRun {
 		features = append(
 			features,
-			"agent_runtime",
-			"agent_runtime.local_workspace",
-			"agent_runtime.daemon_worktree",
-			"agent_runtime.remote_server",
+			"agent_runs",
+			"agent_runs.local_workspace",
+			"agent_runs.daemon_worktree",
+			"agent_runs.remote_server",
 		)
-		hostInfo["agent_runtime"] = map[string]any{
-			"executors":             runtimeExecutors(),
-			"execution_locations":   runtimeExecutionLocations(),
-			"workspace_root":        workspaceRoot,
-			"runtime_root":          filepath.Join(workspaceRoot, ".rcoder", "agent-runtime"),
-			"executor_features":     runtimeExecutorFeatures(),
+		hostInfo["agent_runs"] = map[string]any{
+			"executors":           runtimeExecutors(),
+			"execution_locations": runtimeExecutionLocations(),
+			"workspace_root":      workspaceRoot,
+			"runtime_root":        filepath.Join(workspaceRoot, ".rcoder", "agent-runs"),
+			"executor_features":   runtimeExecutorFeatures(),
 		}
 	}
 	registerResp, err := r.client.Register(ctx, protocol.RegisterRequest{
@@ -142,8 +142,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	}()
 
 	go r.heartbeatLoop(childCtx, registerResp.PeerToken, heartbeatInterval)
-	if r.cfg.AgentRuntime {
-		return r.runAgentRuntimeLoop(childCtx, registerResp.PeerToken, pollInterval, workspaceRoot)
+	if r.cfg.AgentRun {
+		return r.runAgentRunLoop(childCtx, registerResp.PeerToken, pollInterval, workspaceRoot)
 	}
 
 	r.mcp = mcp.NewSupervisor(r.client, registerResp.PeerToken, workspaceRoot)
@@ -187,13 +187,13 @@ func writePeerInfoFile(path string, resp protocol.RegisterResponse) error {
 	return os.WriteFile(path, payload, 0o600)
 }
 
-func (r *Runner) runAgentRuntimeLoop(ctx context.Context, peerToken string, pollInterval time.Duration, workspaceRoot string) error {
-	workerID := r.cfg.RuntimeWorkerID
+func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInterval time.Duration, workspaceRoot string) error {
+	workerID := r.cfg.WorkerSessionID
 	if strings.TrimSpace(workerID) == "" {
 		workerID = "peer-runtime"
 	}
 	backend := agentruntime.SubprocessBackend{}
-	runtimeRoot := filepath.Join(workspaceRoot, ".rcoder", "agent-runtime")
+	runtimeRoot := filepath.Join(workspaceRoot, ".rcoder", "agent-runs")
 	workspaceID := runtimeWorkspaceID(workspaceRoot)
 	for {
 		select {
@@ -203,7 +203,7 @@ func (r *Runner) runAgentRuntimeLoop(ctx context.Context, peerToken string, poll
 		}
 
 		claimCtx, cancelClaim := context.WithTimeout(ctx, 30*time.Second)
-		claimResp, err := r.client.ClaimAgentRuntimeTask(claimCtx, protocol.AgentRuntimeClaimRequest{
+		claimResp, err := r.client.ClaimAgentRun(claimCtx, protocol.AgentRunClaimRequest{
 			PeerToken: peerToken,
 			WorkerID:  workerID,
 			Executors: runtimeExecutors(),
@@ -228,7 +228,7 @@ func (r *Runner) runAgentRuntimeLoop(ctx context.Context, peerToken string, poll
 		manager, resolved, resolveErr := agentruntime.ResolveRunWithExecEnv(req, claim.RuntimeSnapshot, runtimeRoot, workspaceID)
 		if resolveErr == nil {
 			req = resolved.Request
-			resolved, resolveErr = r.prepareAgentRuntimeRun(
+			resolved, resolveErr = r.prepareAgentRunRun(
 				taskCtx,
 				peerToken,
 				claim.RequestID,
@@ -324,7 +324,7 @@ func (r *Runner) runAgentRuntimeLoop(ctx context.Context, peerToken string, poll
 				result.Error = "execution cancelled"
 			}
 		}
-		completeReq := protocol.AgentRuntimeCompleteRequest{
+		completeReq := protocol.AgentRunCompleteRequest{
 			PeerToken: peerToken,
 			RequestID: claim.RequestID,
 			TaskID:    req.TaskID,
@@ -344,7 +344,7 @@ func (r *Runner) runAgentRuntimeLoop(ctx context.Context, peerToken string, poll
 			}
 		}
 		completeCtx, cancelComplete := context.WithTimeout(context.Background(), 30*time.Second)
-		_, completeErr := r.client.CompleteAgentRuntimeTask(completeCtx, completeReq)
+		_, completeErr := r.client.CompleteAgentRun(completeCtx, completeReq)
 		cancelComplete()
 		if completeErr != nil {
 			return fmt.Errorf("agent runtime complete failed: %w", completeErr)
@@ -355,7 +355,7 @@ func (r *Runner) runAgentRuntimeLoop(ctx context.Context, peerToken string, poll
 func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, requestID, taskID string, cancel context.CancelFunc) {
 	send := func() bool {
 		heartbeatCtx, cancelHeartbeat := context.WithTimeout(context.Background(), 10*time.Second)
-		resp, err := r.client.AgentRuntimeHeartbeat(heartbeatCtx, protocol.AgentRuntimeHeartbeatRequest{
+		resp, err := r.client.AgentRunHeartbeat(heartbeatCtx, protocol.AgentRunHeartbeatRequest{
 			PeerToken: peerToken,
 			RequestID: requestID,
 			TaskID:    taskID,
@@ -368,12 +368,12 @@ func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, 
 			return false
 		}
 		if !resp.OK {
-			log.Printf("agent runtime heartbeat rejected task_id=%s reason=%s", taskID, resp.Reason)
+			log.Printf("AgentRun heartbeat rejected agent_run_id=%s reason=%s", taskID, resp.Reason)
 			cancel()
 			return true
 		}
 		if resp.CancelRequested {
-			log.Printf("agent runtime cancellation requested task_id=%s reason=%s", taskID, resp.Reason)
+			log.Printf("AgentRun cancellation requested agent_run_id=%s reason=%s", taskID, resp.Reason)
 			cancel()
 			return true
 		}
@@ -404,7 +404,7 @@ func (e blockedRunError) Error() string {
 	return e.reason
 }
 
-func (r *Runner) prepareAgentRuntimeRun(
+func (r *Runner) prepareAgentRunRun(
 	ctx context.Context,
 	peerToken string,
 	requestID string,
@@ -529,7 +529,7 @@ func eventThreadID(event agentruntime.Event) string {
 func (r *Runner) pinRuntimeSession(ctx context.Context, peerToken, requestID, workerID, taskID, workdir, branch, repoURL, cachePath, executorSessionID string) error {
 	sessionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, err := r.client.PinAgentRuntimeSession(sessionCtx, protocol.AgentRuntimeSessionPinRequest{
+	_, err := r.client.PinAgentRunSession(sessionCtx, protocol.AgentRunSessionPinRequest{
 		PeerToken:         peerToken,
 		RequestID:         requestID,
 		TaskID:            taskID,
@@ -546,7 +546,7 @@ func (r *Runner) pinRuntimeSession(ctx context.Context, peerToken, requestID, wo
 func (r *Runner) sendRuntimeEvent(ctx context.Context, peerToken, requestID, workerID, taskID string, event agentruntime.Event) error {
 	eventCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return r.client.SendAgentRuntimeEvent(eventCtx, protocol.AgentRuntimeEventReport{
+	return r.client.SendAgentRunEvent(eventCtx, protocol.AgentRunEventReport{
 		PeerToken: peerToken,
 		RequestID: requestID,
 		TaskID:    taskID,
@@ -574,10 +574,10 @@ func runtimeRunRequest(req protocol.ExecutorRequest) agentruntime.RunRequest {
 	}
 }
 
-func runtimeEvents(peerToken, requestID, workerID, taskID string, events []agentruntime.Event) []protocol.AgentRuntimeEventReport {
-	reports := make([]protocol.AgentRuntimeEventReport, 0, len(events))
+func runtimeEvents(peerToken, requestID, workerID, taskID string, events []agentruntime.Event) []protocol.AgentRunEventReport {
+	reports := make([]protocol.AgentRunEventReport, 0, len(events))
 	for _, event := range events {
-		reports = append(reports, protocol.AgentRuntimeEventReport{
+		reports = append(reports, protocol.AgentRunEventReport{
 			PeerToken: peerToken,
 			RequestID: requestID,
 			TaskID:    taskID,

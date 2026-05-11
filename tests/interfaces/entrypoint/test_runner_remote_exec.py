@@ -17,7 +17,7 @@ _URLOPEN = request.build_opener(request.ProxyHandler({})).open
 
 from reuleauxcoder.domain.agent.events import AgentEvent
 from reuleauxcoder.domain.config.models import (
-    AgentRuntimeConfig,
+    AgentRegistryConfig,
     AuthConfig,
     AuthSuperadminConfig,
     Config,
@@ -28,6 +28,8 @@ from reuleauxcoder.domain.config.models import (
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
+    RunLimitsConfig,
+    RuntimeProfilesConfig,
 )
 from labrastro_server.services.auth.crypto import hash_password
 from reuleauxcoder.domain.session.models import Session, SessionRuntimeState
@@ -717,7 +719,7 @@ class TestRunnerRemoteExec:
                     "relay_bind": relay_bind,
                 },
                 "auth": _test_auth_config(tmp_path).to_dict(),
-                "agent_runtime": {
+                "run_limits": {
                     "max_running_agents": 1,
                     "max_shells_per_agent": 1,
                 },
@@ -736,9 +738,9 @@ class TestRunnerRemoteExec:
                     relay_bind=str(remote_exec.get("relay_bind", relay_bind)),
                 ),
                 auth=AuthConfig.from_dict(data.get("auth", {})),
-                agent_runtime=AgentRuntimeConfig.from_dict(
-                    data.get("agent_runtime", {})
-                ),
+                agent_registry=AgentRegistryConfig.from_dict(data.get("agent_registry", {})),
+                runtime_profiles=RuntimeProfilesConfig.from_dict(data.get("runtime_profiles", {})),
+                run_limits=RunLimitsConfig.from_dict(data.get("run_limits", {})),
                 modes={
                     "coder": ModeConfig(
                         name="coder", description="Default coding mode"
@@ -769,21 +771,21 @@ class TestRunnerRemoteExec:
                 "POST",
                 f"{runner._relay_http_service.base_url}/remote/admin/server-settings/update",
                 {
-                    "agent_runtime": {
+                    "run_limits": {
                         "max_running_agents": 4,
                         "max_shells_per_agent": 1,
-                        "runtime_profiles": {
-                            "smoke_fake_profile": {
-                                "executor": "fake",
-                                "execution_location": "daemon_worktree",
-                            }
-                        },
+                    },
+                    "runtime_profiles": {
+                        "smoke_fake_profile": {
+                            "executor": "fake",
+                            "execution_location": "daemon_worktree",
+                        }
+                    },
+                    "agent_registry": {
                         "agents": {
-                            "smoke_reviewer": {
-                                "runtime_profile": "smoke_fake_profile"
-                            }
-                        },
-                    }
+                            "smoke_reviewer": {"runtime_profile": "smoke_fake_profile"}
+                        }
+                    },
                 },
                 headers={"Authorization": f"Bearer {access_token}"},
             )

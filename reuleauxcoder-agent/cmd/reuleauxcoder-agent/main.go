@@ -19,8 +19,8 @@ func main() {
 		peerInfoFile    string
 		pollInterval    time.Duration
 		interactive     bool
-		agentRuntime    bool
-		runtimeWorkerID string
+		agentRun        bool
+		workerSessionID string
 	)
 
 	flag.StringVar(&host, "host", "", "Remote relay host base URL")
@@ -30,8 +30,8 @@ func main() {
 	flag.StringVar(&peerInfoFile, "peer-info-file", "", "Write peer registration info to this JSON file")
 	flag.DurationVar(&pollInterval, "poll-interval", 500*time.Millisecond, "Polling interval when no work is available")
 	flag.BoolVar(&interactive, "interactive", false, "Run interactive chat loop proxied through host")
-	flag.BoolVar(&agentRuntime, "agent-runtime", false, "Run Agent Runtime worker loop")
-	flag.StringVar(&runtimeWorkerID, "runtime-worker-id", "", "Stable Agent Runtime worker id")
+	flag.BoolVar(&agentRun, "agent-run-worker", false, "Run AgentRun worker loop")
+	flag.StringVar(&workerSessionID, "worker-session-id", "", "Stable worker session id")
 	flag.Parse()
 
 	if host == "" {
@@ -51,8 +51,8 @@ func main() {
 		PeerInfoFile:    peerInfoFile,
 		PollInterval:    pollInterval,
 		Interactive:     interactive,
-		AgentRuntime:    agentRuntime,
-		RuntimeWorkerID: runtimeWorkerID,
+		AgentRun:        agentRun,
+		WorkerSessionID: workerSessionID,
 	})
 	if err := r.Run(context.Background()); err != nil {
 		log.Printf("agent exited with error: %v", err)

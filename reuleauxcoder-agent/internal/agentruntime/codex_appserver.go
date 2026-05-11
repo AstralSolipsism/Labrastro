@@ -1,4 +1,4 @@
-package agentruntime
+﻿package agentruntime
 
 import (
 	"bufio"
@@ -85,8 +85,8 @@ func executeCodexAppServer(ctx context.Context, req RunRequest, opts RunOptions,
 
 	if _, err := rpc.request(runCtx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
-			"name":    "reuleauxcoder-agent-runtime",
-			"title":   "ReuleauxCoder Agent Runtime",
+			"name":    "reuleauxcoder-agent-runs",
+			"title":   "ReuleauxCoder AgentRun",
 			"version": "0.1.0",
 		},
 		"capabilities": map[string]any{"experimentalApi": true},
