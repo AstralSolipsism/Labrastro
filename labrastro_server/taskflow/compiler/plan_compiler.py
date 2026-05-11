@@ -23,8 +23,13 @@ from labrastro_server.taskflow.domain.project_state import (
     WorkItemType,
 )
 from labrastro_server.taskflow.domain.taskflow_state import (
+    AcceptanceExample,
+    BriefVersionRecord,
     ConfirmationState,
+    DecisionRecord,
+    ExampleRecord,
     RiskRecord,
+    RuleRecord,
     ScenarioRecord,
     TaskflowState,
     WorkItemCandidate,
@@ -181,17 +186,81 @@ class PlanCompiler:
                         rationale=f"Decision {decision_ref} shapes {compiled.title}.",
                     )
                 )
-            for acceptance_ref in compiled.acceptance_refs or compiled.scenario_refs:
+            decision_index = self._decision_index(taskflow_state)
+            for decision_ref in compiled.decision_refs:
+                for answer_ref in decision_index.get(decision_ref, {}).get("answer_refs", []):
+                    decision_links.append(
+                        TraceLink(
+                            id=_new_id("trace"),
+                            project_id=taskflow_state.meta.project_id,
+                            source_type=TraceEntityType.DECISION_ANSWER,
+                            source_id=str(answer_ref),
+                            target_type=TraceEntityType.WORK_ITEM,
+                            target_id=compiled.work_item_id,
+                            relation_type=TraceRelationType.EXPLAINS,
+                            rationale=f"Decision answer {answer_ref} shapes {compiled.title}.",
+                        )
+                    )
+
+            example_ids, scenario_ids = self._acceptance_source_ids(taskflow_state)
+            for acceptance_ref in sorted(set(compiled.acceptance_refs)):
                 acceptance_links.append(
                     TraceLink(
                         id=_new_id("trace"),
                         project_id=taskflow_state.meta.project_id,
-                        source_type=TraceEntityType.ACCEPTANCE_EXAMPLE,
+                        source_type=(
+                            TraceEntityType.SCENARIO
+                            if acceptance_ref in scenario_ids and acceptance_ref not in example_ids
+                            else TraceEntityType.EXAMPLE
+                        ),
                         source_id=acceptance_ref,
                         target_type=TraceEntityType.WORK_ITEM,
                         target_id=compiled.work_item_id,
                         relation_type=TraceRelationType.VALIDATES,
-                        rationale=f"Acceptance/scenario {acceptance_ref} validates {compiled.title}.",
+                        rationale=f"Acceptance example {acceptance_ref} validates {compiled.title}.",
+                    )
+                )
+            for scenario_ref in sorted(set(compiled.scenario_refs)):
+                acceptance_links.append(
+                    TraceLink(
+                        id=_new_id("trace"),
+                        project_id=taskflow_state.meta.project_id,
+                        source_type=TraceEntityType.SCENARIO,
+                        source_id=scenario_ref,
+                        target_type=TraceEntityType.WORK_ITEM,
+                        target_id=compiled.work_item_id,
+                        relation_type=TraceRelationType.VALIDATES,
+                        rationale=f"Scenario {scenario_ref} validates {compiled.title}.",
+                    )
+                )
+            for rule_ref in compiled.metadata.get("acceptance", {}).get("rule_ids", []):
+                acceptance_links.append(
+                    TraceLink(
+                        id=_new_id("trace"),
+                        project_id=taskflow_state.meta.project_id,
+                        source_type=TraceEntityType.RULE,
+                        source_id=str(rule_ref),
+                        target_type=TraceEntityType.WORK_ITEM,
+                        target_id=compiled.work_item_id,
+                        relation_type=TraceRelationType.VALIDATES,
+                        rationale=f"Rule {rule_ref} constrains {compiled.title}.",
+                    )
+                )
+            brief_version = compiled.metadata.get("acceptance", {}).get(
+                "source_brief_version"
+            )
+            if brief_version is not None:
+                brief = self._confirmed_current_brief(taskflow_state)
+                acceptance_links.append(
+                    TraceLink(
+                        id=_new_id("trace"),
+                        project_id=taskflow_state.meta.project_id,
+                        source_type=TraceEntityType.BRIEF,
+                        source_id=brief.id if brief is not None else f"brief-v{brief_version}",
+                        target_type=TraceEntityType.WORK_ITEM,
+                        target_id=compiled.work_item_id,
+                        relation_type=TraceRelationType.EXPLAINS,
+                        rationale=f"Brief v{brief_version} produced {compiled.title}.",
                     )
                 )
 
@@ -236,7 +305,7 @@ class PlanCompiler:
         # reuses a WorkItem, while dispatch still creates a fresh TaskRun later.
         reusable = project.find_work_item_by_dedupe_key(dedupe_key)
         if reusable is not None:
-            return self._compiled_from_reuse(candidate, reusable, dedupe_key)
+            return self._compiled_from_reuse(candidate, reusable, dedupe_key, state)
 
         similar = project.find_similar_work_items(
             title=candidate.title, type=candidate.type.value
@@ -246,6 +315,7 @@ class PlanCompiler:
             return self._compiled_from_new(
                 candidate,
                 dedupe_key,
+                state,
                 derived_from=base.id,
                 rationale=(
                     "Similar title/type found, but acceptance boundary is distinct; "
@@ -256,12 +326,19 @@ class PlanCompiler:
         return self._compiled_from_new(
             candidate,
             dedupe_key,
+            state,
             rationale="No reusable WorkItem matched the dedupe key.",
         )
 
     def _compiled_from_reuse(
-        self, candidate: WorkItemCandidate, item: WorkItem, dedupe_key: str
+        self,
+        candidate: WorkItemCandidate,
+        item: WorkItem,
+        dedupe_key: str,
+        state: TaskflowState,
     ) -> CompiledWorkItemCandidate:
+        metadata = dict(candidate.metadata)
+        metadata.setdefault("acceptance", self._acceptance_metadata(state, candidate))
         return CompiledWorkItemCandidate(
             candidate_id=candidate.id,
             title=candidate.title,
@@ -279,13 +356,14 @@ class PlanCompiler:
             scenario_refs=list(candidate.scenario_refs),
             risk_refs=list(candidate.risk_refs),
             depends_on=list(candidate.depends_on or item.depends_on),
-            metadata=dict(candidate.metadata),
+            metadata=metadata,
         )
 
     def _compiled_from_new(
         self,
         candidate: WorkItemCandidate,
         dedupe_key: str,
+        state: TaskflowState,
         *,
         derived_from: str | None = None,
         rationale: str,
@@ -293,6 +371,8 @@ class PlanCompiler:
         depends_on = list(candidate.depends_on)
         if derived_from and derived_from not in depends_on:
             depends_on.append(derived_from)
+        metadata = {"derived_from": derived_from, **dict(candidate.metadata)}
+        metadata.setdefault("acceptance", self._acceptance_metadata(state, candidate))
         return CompiledWorkItemCandidate(
             candidate_id=candidate.id,
             title=candidate.title,
@@ -310,17 +390,81 @@ class PlanCompiler:
             scenario_refs=list(candidate.scenario_refs),
             risk_refs=list(candidate.risk_refs),
             depends_on=depends_on,
-            metadata={"derived_from": derived_from, **dict(candidate.metadata)},
+            metadata=metadata,
         )
 
     def _candidate_pool(self, state: TaskflowState) -> list[WorkItemCandidate]:
-        if state.outputs.work_item_candidates:
-            return list(state.outputs.work_item_candidates)
-        generated: list[WorkItemCandidate] = []
-        for scenario in state.clarification.scenarios:
-            generated.append(self._candidate_from_scenario(state, scenario))
-        for risk in state.design.risks:
-            if risk.impact == "high":
+        brief = self._confirmed_current_brief(state)
+        explicit = (
+            [WorkItemCandidate.from_dict(item) for item in brief.work_item_candidates]
+            if brief is not None and brief.work_item_candidates
+            else list(state.outputs.work_item_candidates)
+        )
+        generated: list[WorkItemCandidate] = list(explicit)
+        represented_acceptance = {
+            ref
+            for candidate in explicit
+            for ref in [*candidate.acceptance_refs, *candidate.scenario_refs]
+        }
+        scenarios = (
+            [ScenarioRecord.from_dict(item) for item in brief.scenarios]
+            if brief is not None
+            else list(state.clarification.scenarios)
+        )
+        examples = (
+            [ExampleRecord.from_dict(item) for item in brief.examples]
+            if brief is not None
+            else list(state.clarification.examples)
+        )
+        acceptance_examples = (
+            [AcceptanceExample.from_dict(item) for item in brief.acceptance_examples]
+            if brief is not None
+            else list(state.clarification.acceptance_examples)
+        )
+        risks = (
+            [RiskRecord.from_dict(item) for item in brief.risks]
+            if brief is not None
+            else list(state.design.risks)
+        )
+        for scenario in scenarios:
+            if scenario.id not in represented_acceptance:
+                generated.append(self._candidate_from_scenario(state, scenario))
+        for example in examples:
+            if example.id in represented_acceptance:
+                continue
+            generated.append(
+                WorkItemCandidate(
+                    id=f"example-{example.id}",
+                    title=f"Implement example: {example.title}",
+                    description="\n".join([*example.given, *example.when, *example.then]),
+                    type=WorkItemType.IMPLEMENTATION,
+                    acceptance_refs=[example.id],
+                    scenario_refs=[example.id],
+                    dedupe_key=f"{state.meta.project_id}:implementation:{_normalize(example.title)}",
+                )
+            )
+        for example in acceptance_examples:
+            if example.id in represented_acceptance:
+                continue
+            generated.append(
+                WorkItemCandidate(
+                    id=f"acceptance-{example.id}",
+                    title=f"Implement acceptance: {example.title}",
+                    description="\n".join([*example.given, *example.when, *example.then]),
+                    type=WorkItemType.IMPLEMENTATION,
+                    acceptance_refs=[example.id],
+                    scenario_refs=([example.scenario_ref] if example.scenario_ref else []),
+                    dedupe_key=f"{state.meta.project_id}:implementation:{_normalize(example.title)}",
+                )
+            )
+        represented_risks = {
+            risk_ref for candidate in explicit for risk_ref in candidate.risk_refs
+        }
+        for risk in risks:
+            if (
+                str(risk.impact).lower() in {"high", "critical"}
+                and risk.id not in represented_risks
+            ):
                 generated.append(self._candidate_from_risk(state, risk))
         return generated
 
@@ -343,10 +487,20 @@ class PlanCompiler:
             id=f"risk-{risk.id}",
             title=f"Mitigate risk: {risk.statement}",
             description=risk.mitigation or risk.statement,
-            type=WorkItemType.RESEARCH,
+            type=self._risk_work_item_type(risk),
             risk_refs=[risk.id],
-            dedupe_key=f"{state.meta.project_id}:research:{_normalize(risk.statement)}",
+            dedupe_key=f"{state.meta.project_id}:risk:{_normalize(risk.statement)}",
         )
+
+    def _risk_work_item_type(self, risk: RiskRecord) -> WorkItemType:
+        text = f"{risk.statement} {risk.mitigation}".lower()
+        if any(token in text for token in ("ops", "rollout", "deploy", "runbook")):
+            return WorkItemType.OPS
+        if any(token in text for token in ("test", "coverage", "regression")):
+            return WorkItemType.TEST
+        if any(token in text for token in ("research", "investigate")):
+            return WorkItemType.RESEARCH
+        return WorkItemType.SPIKE
 
     def _dedupe_key(self, state: TaskflowState, candidate: WorkItemCandidate) -> str:
         """Build the baseline dedupe key from docs/文档.md Section 5.6 signals."""
@@ -362,6 +516,138 @@ class PlanCompiler:
             ",".join(sorted(candidate.artifact_refs)),
         ]
         return ":".join(part for part in parts if part)
+
+    def _acceptance_metadata(
+        self, state: TaskflowState, candidate: WorkItemCandidate
+    ) -> dict[str, Any]:
+        rule_ids: list[str] = []
+        definition_of_done: list[str] = []
+        test_suggestions: list[str] = []
+        observable_outputs: list[str] = []
+
+        example_ids = {
+            *candidate.acceptance_refs,
+            *candidate.scenario_refs,
+        }
+        brief = self._confirmed_current_brief(state)
+        examples = (
+            [ExampleRecord.from_dict(item) for item in brief.examples]
+            if brief is not None
+            else list(state.clarification.examples)
+        )
+        acceptance_examples = (
+            [AcceptanceExample.from_dict(item) for item in brief.acceptance_examples]
+            if brief is not None
+            else list(state.clarification.acceptance_examples)
+        )
+        rules = (
+            [RuleRecord.from_dict(item) for item in brief.rules]
+            if brief is not None
+            else list(state.clarification.rules)
+        )
+        decisions = (
+            [DecisionRecord.from_dict(item) for item in brief.decisions]
+            if brief is not None
+            else list(state.design.local_decisions)
+        )
+        risks = (
+            [RiskRecord.from_dict(item) for item in brief.risks]
+            if brief is not None
+            else list(state.design.risks)
+        )
+        for example in examples:
+            if example.id in example_ids:
+                if example.rule_id and example.rule_id not in rule_ids:
+                    rule_ids.append(example.rule_id)
+                for item in example.then:
+                    if item not in definition_of_done:
+                        definition_of_done.append(item)
+                if example.title and not test_suggestions:
+                    test_suggestions.append(f"Verify example: {example.title}")
+                for output in example.observable_outputs:
+                    if output not in observable_outputs:
+                        observable_outputs.append(output)
+        for example in acceptance_examples:
+            if example.id in example_ids:
+                if example.rule_id and example.rule_id not in rule_ids:
+                    rule_ids.append(example.rule_id)
+                if example.scenario_ref and example.scenario_ref not in candidate.scenario_refs:
+                    candidate.scenario_refs.append(example.scenario_ref)
+                for item in example.definition_of_done:
+                    if item not in definition_of_done:
+                        definition_of_done.append(item)
+                for item in example.test_suggestions:
+                    if item not in test_suggestions:
+                        test_suggestions.append(item)
+                for output in example.observable_outputs:
+                    if output not in observable_outputs:
+                        observable_outputs.append(output)
+        for rule in rules:
+            refs = {*rule.example_ids, *rule.scenario_ids}
+            if refs.intersection(example_ids) and rule.id not in rule_ids:
+                rule_ids.append(rule.id)
+        for decision in decisions:
+            if set(decision.linked_rule_ids).difference(rule_ids) and decision.id in candidate.decision_refs:
+                for rule_id in decision.linked_rule_ids:
+                    if rule_id not in rule_ids:
+                        rule_ids.append(rule_id)
+
+        risk_level = "medium"
+        for risk in risks:
+            if risk.id in candidate.risk_refs:
+                risk_level = risk.impact
+                break
+
+        return {
+            "source_brief_version": state.outputs.confirmed_brief_version,
+            "rule_ids": rule_ids,
+            "scenario_ids": list(candidate.scenario_refs),
+            "definition_of_done": definition_of_done,
+            "test_suggestions": test_suggestions,
+            "observable_outputs": observable_outputs,
+            "risk_level": risk_level,
+            "estimated_size": candidate.metadata.get("estimated_size"),
+        }
+
+    def _confirmed_current_brief(
+        self, state: TaskflowState
+    ) -> BriefVersionRecord | None:
+        if state.outputs.current_brief_version != state.outputs.confirmed_brief_version:
+            return None
+        for brief in state.outputs.brief_versions:
+            if brief.version == state.outputs.confirmed_brief_version:
+                return brief
+        return None
+
+    def _decision_index(self, state: TaskflowState) -> dict[str, dict[str, Any]]:
+        brief = self._confirmed_current_brief(state)
+        if brief is not None:
+            return {str(item.get("id")): item for item in brief.decisions}
+        return {decision.id: decision.to_dict() for decision in state.design.local_decisions}
+
+    def _acceptance_source_ids(
+        self, state: TaskflowState
+    ) -> tuple[set[str], set[str]]:
+        brief = self._confirmed_current_brief(state)
+        if brief is not None:
+            examples = {
+                str(item.get("id"))
+                for item in [*brief.examples, *brief.acceptance_examples]
+                if str(item.get("id") or "").strip()
+            }
+            scenarios = {
+                str(item.get("id"))
+                for item in brief.scenarios
+                if str(item.get("id") or "").strip()
+            }
+            return examples, scenarios
+        return (
+            {
+                *[example.id for example in state.clarification.examples],
+                *[example.id for example in state.clarification.acceptance_examples],
+            },
+            {scenario.id for scenario in state.clarification.scenarios},
+        )
 
 
 __all__ = ["CompiledWorkItemCandidate", "PlanCompiler", "PlanDraft"]

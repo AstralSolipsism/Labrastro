@@ -6,6 +6,8 @@ from labrastro_server.taskflow.domain.complexity import (
     ComplexityEstimate,
     ComplexityEstimator,
     ComplexityLevel,
+    RecipePolicy,
+    RecipePolicyRegistry,
 )
 from labrastro_server.taskflow.domain.project_state import *  # noqa: F403
 from labrastro_server.taskflow.domain.taskflow_state import *  # noqa: F403
@@ -14,6 +16,8 @@ __all__ = [
     "ComplexityEstimate",
     "ComplexityEstimator",
     "ComplexityLevel",
+    "RecipePolicy",
+    "RecipePolicyRegistry",
     *_project_state.__all__,
     *_taskflow_state.__all__,
 ]

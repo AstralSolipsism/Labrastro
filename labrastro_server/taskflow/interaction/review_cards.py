@@ -172,7 +172,12 @@ class CardRenderer:
                         {
                             "id": decision.id,
                             "topic": decision.topic,
-                            "options": list(decision.options),
+                            "options": [
+                                option.to_dict()
+                                if hasattr(option, "to_dict")
+                                else {"id": str(option), "label": str(option)}
+                                for option in decision.options
+                            ],
                             "recommended": decision.recommended,
                             "chosen": decision.chosen,
                             "rationale": decision.rationale,
