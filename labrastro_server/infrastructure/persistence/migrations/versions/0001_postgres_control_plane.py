@@ -13,7 +13,7 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_tasks (
+        CREATE TABLE IF NOT EXISTS labrastro_agent_runs (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
@@ -24,7 +24,7 @@ def upgrade() -> None:
             executor TEXT,
             execution_location TEXT,
             output TEXT,
-            parent_task_id TEXT REFERENCES labrastro_runtime_tasks(id) ON DELETE SET NULL,
+            parent_task_id TEXT REFERENCES labrastro_agent_runs(id) ON DELETE SET NULL,
             trigger_comment_id TEXT,
             branch_name TEXT,
             pr_url TEXT,
@@ -49,8 +49,8 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_events (
-            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_events (
+            task_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
             seq BIGINT NOT NULL,
             type TEXT NOT NULL,
             payload JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -62,9 +62,9 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_claims (
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_claims (
             request_id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
             worker_id TEXT NOT NULL,
             peer_id TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
@@ -80,15 +80,15 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_labrastro_runtime_claims_active_task
-            ON labrastro_runtime_claims(task_id)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_labrastro_agent_run_claims_active_task
+            ON labrastro_agent_run_claims(task_id)
             WHERE status = 'active'
         """
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_sessions (
-            task_id TEXT PRIMARY KEY REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_sessions (
+            task_id TEXT PRIMARY KEY REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
             agent_id TEXT NOT NULL,
             executor TEXT NOT NULL,
             execution_location TEXT NOT NULL,
@@ -104,9 +104,9 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_artifacts (
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_artifacts (
             id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
             type TEXT NOT NULL,
             status TEXT NOT NULL,
             branch_name TEXT,
@@ -123,8 +123,8 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_cancel_requests (
-            task_id TEXT PRIMARY KEY REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_cancel_requests (
+            task_id TEXT PRIMARY KEY REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
             reason TEXT NOT NULL,
             requested_by TEXT,
             requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -134,7 +134,7 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_runtime_locks (
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_locks (
             name TEXT PRIMARY KEY,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
@@ -142,7 +142,7 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        INSERT INTO labrastro_runtime_locks(name)
+        INSERT INTO labrastro_agent_run_locks(name)
         VALUES ('global_claim')
         ON CONFLICT (name) DO NOTHING
         """
@@ -197,27 +197,27 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_labrastro_runtime_tasks_claim
-            ON labrastro_runtime_tasks(status, created_at)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_runs_claim
+            ON labrastro_agent_runs(status, created_at)
             WHERE status = 'queued'
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_labrastro_runtime_tasks_status_updated
-            ON labrastro_runtime_tasks(status, updated_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_runs_status_updated
+            ON labrastro_agent_runs(status, updated_at DESC)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_labrastro_runtime_tasks_agent_issue
-            ON labrastro_runtime_tasks(agent_id, issue_id, status)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_runs_agent_issue
+            ON labrastro_agent_runs(agent_id, issue_id, status)
         """
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_labrastro_runtime_events_task_seq
-            ON labrastro_runtime_events(task_id, seq)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_run_events_task_seq
+            ON labrastro_agent_run_events(task_id, seq)
         """
     )
     op.execute(
@@ -233,11 +233,11 @@ def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS labrastro_session_trace_events")
     op.execute("DROP TABLE IF EXISTS labrastro_session_snapshots")
     op.execute("DROP TABLE IF EXISTS labrastro_sessions")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_locks")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_cancel_requests")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_artifacts")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_sessions")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_claims")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_events")
-    op.execute("DROP TABLE IF EXISTS labrastro_runtime_tasks")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_locks")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_cancel_requests")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_artifacts")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_sessions")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_claims")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_events")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_runs")
 

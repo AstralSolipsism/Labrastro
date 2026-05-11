@@ -1,4 +1,4 @@
-"""Task and artifact lifecycle helpers for Agent runtime tasks."""
+﻿"""Task and artifact lifecycle helpers for AgentRuns."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ArtifactType,
     MergeStatus,
     TaskArtifact,
-    TaskRecord,
+    AgentRunRecord,
     TaskStatus,
     TriggerMode,
 )
@@ -29,7 +29,7 @@ class IssueStatus(str, Enum):
 class TaskLifecycleState:
     """In-memory lifecycle state for one task and its artifacts."""
 
-    task: TaskRecord
+    task: AgentRunRecord
     artifacts: dict[str, TaskArtifact] = field(default_factory=dict)
     issue_status: IssueStatus = IssueStatus.OPEN
 
@@ -42,7 +42,7 @@ class TaskLifecycleState:
         agent_id: str,
     ) -> "TaskLifecycleState":
         return cls(
-            task=TaskRecord(
+            task=AgentRunRecord(
                 id=task_id,
                 issue_id=issue_id,
                 agent_id=agent_id,
@@ -77,7 +77,7 @@ class TaskLifecycleState:
         self.artifacts[artifact_id] = artifact
         return artifact
 
-    def complete_task(self, *, output: str) -> None:
+    def complete_agent_run(self, *, output: str) -> None:
         self.task.status = TaskStatus.COMPLETED
         self.task.output = output
         self.issue_status = (
@@ -96,9 +96,9 @@ class TaskLifecycleState:
 
     def create_followup_task_from_comment(
         self, *, comment_id: str, agent_id: str
-    ) -> TaskRecord:
+    ) -> AgentRunRecord:
         artifact = self._primary_pull_request_artifact()
-        return TaskRecord(
+        return AgentRunRecord(
             id=f"{self.task.id}:{comment_id}",
             issue_id=self.task.issue_id,
             agent_id=agent_id,

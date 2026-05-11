@@ -1,4 +1,4 @@
-"""Executor backend abstraction for Agent runtime tasks."""
+﻿"""Executor backend abstraction for AgentRuns."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _coerce_event_type(value: ExecutorEventType | str) -> ExecutorEventType:
 
 @dataclass
 class ExecutorRunRequest:
-    """Executor-neutral request to start or resume an Agent runtime task."""
+    """Executor-neutral request to start or resume an AgentRun."""
 
     task_id: str
     agent_id: str
@@ -71,7 +71,7 @@ class ExecutorRunRequest:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "task_id": self.task_id,
+            "agent_run_id": self.task_id,
             "agent_id": self.agent_id,
             "executor": self.executor.value,
             "prompt": self.prompt,
@@ -88,7 +88,7 @@ class ExecutorRunRequest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExecutorRunRequest":
         return cls(
-            task_id=str(data["task_id"]),
+            task_id=str(data["agent_run_id"]),
             agent_id=str(data["agent_id"]),
             executor=str(data["executor"]),
             prompt=str(data.get("prompt", "") or ""),
@@ -182,7 +182,7 @@ class ExecutorRunResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "task_id": self.task_id,
+            "agent_run_id": self.task_id,
             "status": self.status,
             "output": self.output,
             "executor_session_id": self.executor_session_id,
@@ -195,7 +195,7 @@ class ExecutorRunResult:
     def from_dict(cls, data: dict[str, Any]) -> "ExecutorRunResult":
         raw_events = data.get("events", [])
         return cls(
-            task_id=str(data["task_id"]),
+            task_id=str(data["agent_run_id"]),
             status=str(data.get("status", "")),
             output=str(data.get("output", "") or ""),
             executor_session_id=(

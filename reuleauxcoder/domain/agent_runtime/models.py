@@ -33,6 +33,16 @@ class TriggerMode(str, Enum):
     ENVIRONMENT_CONFIG = "environment_config"
 
 
+class AgentRunSource(str, Enum):
+    """Product-facing source for one Agent execution record."""
+
+    CHAT = "chat"
+    DELEGATION = "delegation"
+    TASKFLOW = "taskflow"
+    ENVIRONMENT = "environment"
+    MANUAL = "manual"
+
+
 class TaskStatus(str, Enum):
     """Task execution lifecycle status."""
 
@@ -400,6 +410,8 @@ class AgentConfig:
     id: str
     name: str = ""
     description: str = ""
+    role: str = ""
+    entrypoint: bool = False
     runtime_profile: str = ""
     dispatch: AgentDispatchConfig = field(default_factory=AgentDispatchConfig)
     capability_refs: list[str] = field(default_factory=list)
@@ -431,6 +443,8 @@ class AgentConfig:
             id=str(agent_id),
             name=str(data.get("name", "") or ""),
             description=str(data.get("description", "") or ""),
+            role=str(data.get("role", "") or ""),
+            entrypoint=bool(data.get("entrypoint", False)),
             runtime_profile=str(data.get("runtime_profile", "") or ""),
             dispatch=AgentDispatchConfig.from_dict(data.get("dispatch")),
             capability_refs=_string_list(data.get("capability_refs", [])),
@@ -446,6 +460,10 @@ class AgentConfig:
             result["name"] = self.name
         if self.description:
             result["description"] = self.description
+        if self.role:
+            result["role"] = self.role
+        if self.entrypoint:
+            result["entrypoint"] = self.entrypoint
         if self.runtime_profile:
             result["runtime_profile"] = self.runtime_profile
         dispatch = self.dispatch.to_dict()
@@ -467,12 +485,17 @@ class AgentConfig:
 
 
 @dataclass
-class TaskRecord:
-    """One execution attempt by an Agent."""
+class AgentRunRecord:
+    """One execution attempt by an Agent.
+
+    Chat, delegation, TaskFlow, environment, and manual execution all converge
+    here so every Agent execution has the same durable shape.
+    """
 
     id: str
     issue_id: str
     agent_id: str
+    source: AgentRunSource = AgentRunSource.MANUAL
     trigger_mode: TriggerMode = TriggerMode.ISSUE_TASK
     status: TaskStatus = TaskStatus.QUEUED
     prompt: str = ""
@@ -487,9 +510,15 @@ class TaskRecord:
     worker_id: str | None = None
     executor_session_id: str | None = None
     workdir: str | None = None
+    sandbox_id: str | None = None
+    sandbox_session_id: str | None = None
+    workspace_ref: str | None = None
+    delegated_by_run_id: str | None = None
+    parent_run_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.source = AgentRunSource(_enum_value(self.source) or AgentRunSource.MANUAL)
         self.trigger_mode = TriggerMode(_enum_value(self.trigger_mode))
         self.status = TaskStatus(_enum_value(self.status))
         if self.executor is not None:
@@ -507,7 +536,6 @@ class TaskRecord:
             TaskStatus.CANCELLED,
             TaskStatus.BLOCKED,
         }
-
 
 @dataclass
 class TaskArtifact:

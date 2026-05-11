@@ -1,4 +1,4 @@
-"""Background maintenance for Postgres persistence growth controls."""
+﻿"""Background maintenance for Postgres persistence growth controls."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
 class PersistenceMaintenanceResult:
     snapshot_versions_deleted: int = 0
     snapshot_retention_deleted: int = 0
-    runtime_events_deleted: int = 0
+    agent_run_events_deleted: int = 0
 
 
 class PersistenceMaintenanceService:
@@ -67,7 +67,7 @@ class PersistenceMaintenanceService:
             result.snapshot_versions_deleted = self._delete_snapshot_overflow(conn)
             if self.retention_days > 0:
                 result.snapshot_retention_deleted = self._delete_old_snapshots(conn)
-                result.runtime_events_deleted = self._delete_old_terminal_events(conn)
+                result.agent_run_events_deleted = self._delete_old_terminal_events(conn)
         return result
 
     def _delete_snapshot_overflow(self, conn: Any) -> int:
@@ -112,8 +112,8 @@ class PersistenceMaintenanceService:
     def _delete_old_terminal_events(self, conn: Any) -> int:
         query = text(
             """
-            DELETE FROM labrastro_runtime_events events
-            USING labrastro_runtime_tasks tasks
+            DELETE FROM labrastro_agent_run_events events
+            USING labrastro_agent_runs tasks
             WHERE events.task_id = tasks.id
               AND tasks.status IN ('completed', 'failed', 'cancelled', 'blocked')
               AND events.created_at < now() - (:days * interval '1 day')

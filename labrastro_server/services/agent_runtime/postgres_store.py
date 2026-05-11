@@ -1,4 +1,4 @@
-"""Postgres-backed Agent Runtime control-plane store."""
+﻿"""Postgres-backed AgentRun control-plane store."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ from typing import Any
 import json
 
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentRunSource,
     ArtifactStatus,
     ArtifactType,
     ExecutionLocation,
     ExecutorType,
     MergeStatus,
     TaskArtifact,
-    TaskRecord,
+    AgentRunRecord,
     TaskSessionRef,
     TaskStatus,
     TriggerMode,
@@ -74,7 +75,7 @@ def _workspace_key(value: str | None) -> str:
     return str(value or "").strip().replace("\\", "/").rstrip("/").lower()
 
 
-def _can_resume_from_parent(request: Any, parent: TaskRecord) -> bool:
+def _can_resume_from_parent(request: Any, parent: AgentRunRecord) -> bool:
     if not parent.executor_session_id:
         return False
     return (
@@ -133,11 +134,13 @@ def _jsonable_row(row: Any) -> dict[str, Any]:
     return result
 
 
-def _task_to_dict(task: TaskRecord) -> dict[str, Any]:
+def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
     return {
         "id": task.id,
+        "agent_run_id": task.id,
         "issue_id": task.issue_id,
         "agent_id": task.agent_id,
+        "source": task.source.value,
         "trigger_mode": task.trigger_mode.value,
         "status": task.status.value,
         "prompt": task.prompt,
@@ -154,6 +157,11 @@ def _task_to_dict(task: TaskRecord) -> dict[str, Any]:
         "worker_id": task.worker_id,
         "executor_session_id": task.executor_session_id,
         "workdir": task.workdir,
+        "sandbox_id": task.sandbox_id,
+        "sandbox_session_id": task.sandbox_session_id,
+        "workspace_ref": task.workspace_ref,
+        "delegated_by_run_id": task.delegated_by_run_id,
+        "parent_run_id": task.parent_run_id,
         "metadata": dict(task.metadata),
     }
 
@@ -174,8 +182,8 @@ def _artifact_to_dict(artifact: TaskArtifact) -> dict[str, Any]:
     }
 
 
-class PostgresRuntimeStore:
-    """Durable runtime task queue with Postgres transaction semantics."""
+class PostgresAgentRunStore:
+    """Durable AgentRun queue with Postgres transaction semantics."""
 
     def __init__(
         self,
@@ -195,7 +203,7 @@ class PostgresRuntimeStore:
         with self.engine.begin() as conn:
             conn.execute(
                 text(
-                    "INSERT INTO labrastro_runtime_locks(name) VALUES ('global_claim') "
+                    "INSERT INTO labrastro_agent_run_locks(name) VALUES ('global_claim') "
                     "ON CONFLICT (name) DO NOTHING"
                 )
             )
@@ -212,15 +220,27 @@ class PostgresRuntimeStore:
         if runtime_snapshot is not None:
             self.runtime_snapshot = dict(runtime_snapshot)
 
-    def submit_task(self, request: Any, *, task_id: str | None = None) -> TaskRecord:
+    def submit_agent_run(self, request: Any, *, task_id: str | None = None) -> AgentRunRecord:
         request = self._resolve_request(request)
         metadata = dict(request.metadata)
+        metadata.setdefault("agent_run_source", request.source.value)
+        if request.sandbox_id:
+            metadata.setdefault("sandbox_id", request.sandbox_id)
+        if request.sandbox_session_id:
+            metadata.setdefault("sandbox_session_id", request.sandbox_session_id)
+        if request.workspace_ref:
+            metadata.setdefault("workspace_ref", request.workspace_ref)
+        if request.delegated_by_run_id:
+            metadata.setdefault("delegated_by_run_id", request.delegated_by_run_id)
+        if request.parent_run_id:
+            metadata.setdefault("parent_run_id", request.parent_run_id)
         if request.model is not None:
             metadata.setdefault("model", request.model)
-        task = TaskRecord(
+        task = AgentRunRecord(
             id=task_id or _new_id("task"),
             issue_id=request.issue_id,
             agent_id=request.agent_id,
+            source=request.source,
             trigger_mode=request.trigger_mode,
             status=TaskStatus.QUEUED,
             prompt=request.prompt,
@@ -233,13 +253,18 @@ class PostgresRuntimeStore:
             pr_url=request.pr_url,
             executor_session_id=request.executor_session_id,
             workdir=request.workdir,
+            sandbox_id=request.sandbox_id,
+            sandbox_session_id=request.sandbox_session_id,
+            workspace_ref=request.workspace_ref,
+            delegated_by_run_id=request.delegated_by_run_id,
+            parent_run_id=request.parent_run_id or request.parent_task_id,
             metadata=metadata,
         )
         with self.engine.begin() as conn:
             conn.execute(
                 text(
                     """
-                    INSERT INTO labrastro_runtime_tasks (
+                    INSERT INTO labrastro_agent_runs (
                         id, issue_id, agent_id, trigger_mode, status, prompt,
                         runtime_profile_id, executor, execution_location,
                         parent_task_id, trigger_comment_id, branch_name, pr_url,
@@ -254,7 +279,7 @@ class PostgresRuntimeStore:
                     """
                 ),
                 {
-                    **_task_to_dict(task),
+                    **_agent_run_to_dict(task),
                     "trigger_mode": task.trigger_mode.value,
                     "status": task.status.value,
                     "executor": task.executor.value if task.executor else None,
@@ -265,10 +290,10 @@ class PostgresRuntimeStore:
                     "runtime_snapshot": _json(self.runtime_snapshot),
                 },
             )
-            self._append_event(conn, task.id, "queued", {"task": _task_to_dict(task)})
+            self._append_event(conn, task.id, "queued", {"agent_run": _agent_run_to_dict(task)})
         return task
 
-    def claim_task(
+    def claim_agent_run(
         self,
         *,
         worker_id: str,
@@ -278,7 +303,7 @@ class PostgresRuntimeStore:
         workspace_root: str | None = None,
         lease_sec: int = 15,
     ) -> Any | None:
-        from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskClaim
+        from labrastro_server.services.agent_runtime.control_plane import AgentRunClaim
 
         allowed = {_coerce_executor(executor) for executor in executors or []}
         features = (
@@ -288,13 +313,13 @@ class PostgresRuntimeStore:
         )
         with self.engine.begin() as conn:
             conn.execute(
-                text("SELECT name FROM labrastro_runtime_locks WHERE name='global_claim' FOR UPDATE")
+                text("SELECT name FROM labrastro_agent_run_locks WHERE name='global_claim' FOR UPDATE")
             ).first()
             self._recover_stale_with_conn(conn)
             running = conn.execute(
                 text(
                     """
-                    SELECT count(*) FROM labrastro_runtime_tasks
+                    SELECT count(*) FROM labrastro_agent_runs
                     WHERE status IN ('dispatched', 'running', 'waiting_approval')
                     """
                 )
@@ -304,7 +329,7 @@ class PostgresRuntimeStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT * FROM labrastro_runtime_tasks
+                    SELECT * FROM labrastro_agent_runs
                     WHERE status = 'queued'
                     ORDER BY created_at ASC
                     LIMIT 100
@@ -329,7 +354,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE labrastro_runtime_tasks
+                        UPDATE labrastro_agent_runs
                         SET status='dispatched', worker_id=:worker_id,
                             dispatched_at=COALESCE(dispatched_at, now()),
                             updated_at=now()
@@ -343,7 +368,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO labrastro_runtime_claims (
+                        INSERT INTO labrastro_agent_run_claims (
                             request_id, task_id, worker_id, peer_id, status,
                             lease_sec, lease_deadline, last_heartbeat_at,
                             runtime_snapshot, metadata
@@ -379,7 +404,7 @@ class PostgresRuntimeStore:
                         "lease_sec": effective_lease,
                     },
                 )
-                return RuntimeTaskClaim(
+                return AgentRunClaim(
                     request_id=request_id,
                     worker_id=worker_id,
                     task=task,
@@ -405,7 +430,7 @@ class PostgresRuntimeStore:
                 )
         return None
 
-    def heartbeat_task(
+    def heartbeat_agent_run(
         self,
         *,
         request_id: str,
@@ -436,7 +461,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_claims
+                    UPDATE labrastro_agent_run_claims
                     SET last_heartbeat_at=now(),
                         lease_deadline=now() + (:lease_sec * interval '1 second'),
                         lease_sec=:lease_sec
@@ -445,12 +470,12 @@ class PostgresRuntimeStore:
                 ),
                 {"request_id": request_id, "lease_sec": effective_lease},
             )
-            task = self.get_task(task_id)
+            task = self.get_agent_run(task_id)
             if task.status == TaskStatus.DISPATCHED:
                 conn.execute(
                     text(
                         """
-                        UPDATE labrastro_runtime_tasks
+                        UPDATE labrastro_agent_runs
                         SET status='running',
                             started_at=COALESCE(started_at, now()),
                             updated_at=now()
@@ -482,7 +507,7 @@ class PostgresRuntimeStore:
                 return False, "claim_not_found"
             return self._claim_owner_ok(row, task_id, worker_id, peer_id)
 
-    def recover_stale_tasks(self, *, now: float | None = None) -> list[str]:
+    def recover_stale_agent_runs(self, *, now: float | None = None) -> list[str]:
         with self.engine.begin() as conn:
             return self._recover_stale_with_conn(conn, now=now)
 
@@ -492,7 +517,7 @@ class PostgresRuntimeStore:
             rows = conn.execute(
                 text(
                     """
-                    SELECT id FROM labrastro_runtime_tasks
+                    SELECT id FROM labrastro_agent_runs
                     WHERE status IN ('dispatched', 'running', 'waiting_approval')
                     FOR UPDATE
                     """
@@ -504,7 +529,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE labrastro_runtime_tasks
+                        UPDATE labrastro_agent_runs
                         SET status='failed', failure_reason='host_restarted',
                             output=COALESCE(output, 'host restarted while task was in flight'),
                             completed_at=now(), updated_at=now()
@@ -516,7 +541,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE labrastro_runtime_claims
+                        UPDATE labrastro_agent_run_claims
                         SET status='released', released_at=now()
                         WHERE task_id=:task_id AND status='active'
                         """
@@ -532,7 +557,7 @@ class PostgresRuntimeStore:
         return recovered
 
     def pin_session(self, task_id: str, session: TaskSessionRef) -> None:
-        task = self.get_task(task_id)
+        task = self.get_agent_run(task_id)
         with self.engine.begin() as conn:
             self._pin_session_with_conn(conn, task, session, metadata={})
 
@@ -608,7 +633,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE labrastro_runtime_tasks
+                        UPDATE labrastro_agent_runs
                         SET status='blocked', metadata=CAST(:metadata AS JSONB), updated_at=now()
                         WHERE id=:task_id
                         """
@@ -635,7 +660,7 @@ class PostgresRuntimeStore:
                     conn.execute(
                         text(
                             """
-                            UPDATE labrastro_runtime_tasks
+                            UPDATE labrastro_agent_runs
                             SET status=:status, updated_at=now()
                             WHERE id=:task_id
                             """
@@ -644,7 +669,7 @@ class PostgresRuntimeStore:
                     )
             return True, ""
 
-    def complete_claimed_task(
+    def complete_claimed_agent_run(
         self,
         task_id: str,
         result: ExecutorRunResult,
@@ -653,7 +678,7 @@ class PostgresRuntimeStore:
         worker_id: str,
         peer_id: str | None = None,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> tuple[bool, str, TaskRecord | None]:
+    ) -> tuple[bool, str, AgentRunRecord | None]:
         with self.engine.begin() as conn:
             row = self._active_claim(conn, request_id)
             if row is None:
@@ -661,15 +686,15 @@ class PostgresRuntimeStore:
             ok, reason = self._claim_owner_ok(row, task_id, worker_id, peer_id)
             if not ok:
                 return False, reason, None
-        return True, "", self.complete_task(task_id, result, artifacts=artifacts)
+        return True, "", self.complete_agent_run(task_id, result, artifacts=artifacts)
 
-    def complete_task(
+    def complete_agent_run(
         self,
         task_id: str,
         result: ExecutorRunResult,
         *,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> TaskRecord:
+    ) -> AgentRunRecord:
         with self.engine.begin() as conn:
             task = self._task_from_row(self._task_row(conn, task_id))
             expanded_events = [
@@ -713,7 +738,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_tasks
+                    UPDATE labrastro_agent_runs
                     SET status=:status, output=:output,
                         executor_session_id=COALESCE(:executor_session_id, executor_session_id),
                         issue_status=:issue_status,
@@ -765,32 +790,33 @@ class PostgresRuntimeStore:
                 conn,
                 task_id,
                 status,
-                {"result": result.to_dict(), "task": _task_to_dict(task)},
+                {"result": result.to_dict(), "agent_run": _agent_run_to_dict(task)},
             )
             self._release_claims(conn, task_id, status="completed")
             self._resolve_cancel(conn, task_id)
             return task
 
-    def retry_task(
+    def retry_agent_run(
         self,
         task_id: str,
         *,
-        new_task_id: str | None = None,
+        new_agent_run_id: str | None = None,
         resume_session: bool = False,
-    ) -> TaskRecord:
-        task = self.get_task(task_id)
+    ) -> AgentRunRecord:
+        task = self.get_agent_run(task_id)
         if not task.is_terminal:
-            raise ValueError("only terminal runtime tasks can be retried")
+            raise ValueError("only terminal AgentRuns can be retried")
         metadata = dict(task.metadata)
         metadata["retry_of"] = task.id
         metadata["attempt"] = int(metadata.get("attempt", 1) or 1) + 1
-        from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskRequest
+        from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
 
-        return self.submit_task(
-            RuntimeTaskRequest(
+        return self.submit_agent_run(
+            AgentRunRequest(
                 issue_id=task.issue_id,
                 agent_id=task.agent_id,
                 prompt=task.prompt,
+                source=task.source,
                 executor=task.executor or ExecutorType.REULEAUXCODER,
                 execution_location=(
                     task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
@@ -802,6 +828,11 @@ class PostgresRuntimeStore:
                 branch_name=task.branch_name,
                 pr_url=task.pr_url,
                 workdir=task.workdir,
+                sandbox_id=task.sandbox_id,
+                sandbox_session_id=task.sandbox_session_id,
+                workspace_ref=task.workspace_ref,
+                delegated_by_run_id=task.delegated_by_run_id,
+                parent_run_id=task.parent_run_id,
                 executor_session_id=task.executor_session_id
                 if resume_session
                 else None,
@@ -810,15 +841,15 @@ class PostgresRuntimeStore:
                 else None,
                 metadata=metadata,
             ),
-            task_id=new_task_id,
+            task_id=new_agent_run_id,
         )
 
-    def fail_task(self, task_id: str, *, error: str) -> TaskRecord:
+    def fail_agent_run(self, task_id: str, *, error: str) -> AgentRunRecord:
         with self.engine.begin() as conn:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_tasks
+                    UPDATE labrastro_agent_runs
                     SET status='failed', output=:error, failure_reason='manual',
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
@@ -829,13 +860,29 @@ class PostgresRuntimeStore:
             self._append_event(conn, task_id, "failed", {"error": error})
             self._release_claims(conn, task_id, status="released")
             self._resolve_cancel(conn, task_id)
-        return self.get_task(task_id)
+        return self.get_agent_run(task_id)
 
-    def cancel_task(self, task_id: str, *, reason: str = "user_cancelled") -> bool:
-        task = self.get_task(task_id)
+    def cancel_agent_run(self, task_id: str, *, reason: str = "user_cancelled") -> bool:
+        task = self.get_agent_run(task_id)
         if task.is_terminal:
             return False
         with self.engine.begin() as conn:
+            if task.sandbox_session_id:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_agent_runs
+                        SET status='cancelled', cancel_reason=:reason,
+                            completed_at=now(), updated_at=now()
+                        WHERE id=:task_id
+                        """
+                    ),
+                    {"task_id": task_id, "reason": reason},
+                )
+                self._append_event(conn, task_id, "cancelled", {"reason": reason})
+                self._release_claims(conn, task_id, status="cancelled")
+                self._resolve_cancel(conn, task_id)
+                return True
             if task.status in {
                 TaskStatus.DISPATCHED,
                 TaskStatus.RUNNING,
@@ -844,7 +891,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO labrastro_runtime_cancel_requests(task_id, reason)
+                        INSERT INTO labrastro_agent_run_cancel_requests(task_id, reason)
                         VALUES (:task_id, :reason)
                         ON CONFLICT (task_id) DO UPDATE
                         SET reason=EXCLUDED.reason, requested_at=now(), resolved_at=NULL
@@ -862,7 +909,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_tasks
+                    UPDATE labrastro_agent_runs
                     SET status='cancelled', cancel_reason=:reason,
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
@@ -879,13 +926,13 @@ class PostgresRuntimeStore:
             return self._attach_artifact_with_conn(conn, task_id, **kwargs)
 
     def create_or_update_pr(self, task_id: str, *, diff: str = "") -> TaskArtifact:
-        task = self.get_task(task_id)
+        task = self.get_agent_run(task_id)
         pr = self.pr_flow.create_or_update(task, diff=diff)
         with self.engine.begin() as conn:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_tasks
+                    UPDATE labrastro_agent_runs
                     SET branch_name=:branch_name, pr_url=:pr_url, updated_at=now()
                     WHERE id=:task_id
                     """
@@ -910,7 +957,7 @@ class PostgresRuntimeStore:
         after_seq: int = 0,
         limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
     ) -> list[Any]:
-        from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskEvent
+        from labrastro_server.services.agent_runtime.control_plane import AgentRunEvent
 
         limit = clamp_event_limit(limit)
         with self.engine.begin() as conn:
@@ -918,7 +965,7 @@ class PostgresRuntimeStore:
                 text(
                     """
                     SELECT task_id, seq, type, payload
-                    FROM labrastro_runtime_events
+                    FROM labrastro_agent_run_events
                     WHERE task_id=:task_id AND seq > :after_seq
                     ORDER BY seq ASC
                     LIMIT :limit
@@ -927,7 +974,7 @@ class PostgresRuntimeStore:
                 {"task_id": task_id, "after_seq": after_seq, "limit": limit},
             ).mappings()
             return [
-                RuntimeTaskEvent(
+                AgentRunEvent(
                     task_id=str(row["task_id"]),
                     seq=int(row["seq"]),
                     type=str(row["type"]),
@@ -939,22 +986,22 @@ class PostgresRuntimeStore:
     def list_artifacts(self, task_id: str) -> list[TaskArtifact]:
         with self.engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT * FROM labrastro_runtime_artifacts WHERE task_id=:task_id"),
+                text("SELECT * FROM labrastro_agent_run_artifacts WHERE task_id=:task_id"),
                 {"task_id": task_id},
             ).mappings()
             return [self._artifact_from_row(row) for row in rows]
 
-    def get_task(self, task_id: str) -> TaskRecord:
+    def get_agent_run(self, task_id: str) -> AgentRunRecord:
         with self.engine.begin() as conn:
             return self._task_from_row(self._task_row(conn, task_id))
 
-    def task_to_dict(self, task_id: str) -> dict[str, Any]:
-        return _task_to_dict(self.get_task(task_id))
+    def agent_run_to_dict(self, task_id: str) -> dict[str, Any]:
+        return _agent_run_to_dict(self.get_agent_run(task_id))
 
     def artifacts_to_dict(self, task_id: str) -> list[dict[str, Any]]:
         return [_artifact_to_dict(artifact) for artifact in self.list_artifacts(task_id)]
 
-    def list_tasks(self, **filters: Any) -> list[dict[str, Any]]:
+    def list_agent_runs(self, **filters: Any) -> list[dict[str, Any]]:
         clauses = ["deleted_at IS NULL" if False else "1=1"]
         params: dict[str, Any] = {"limit": max(1, min(500, int(filters.get("limit") or 50)))}
         for key in ("status", "agent_id", "issue_id"):
@@ -968,7 +1015,7 @@ class PostgresRuntimeStore:
             rows = conn.execute(
                 text(
                     f"""
-                    SELECT * FROM labrastro_runtime_tasks
+                    SELECT * FROM labrastro_agent_runs
                     WHERE {' AND '.join(clauses)}
                     ORDER BY created_at DESC
                     LIMIT :limit
@@ -976,21 +1023,21 @@ class PostgresRuntimeStore:
                 ),
                 params,
             ).mappings()
-            return [_task_to_dict(self._task_from_row(row)) for row in rows]
+            return [_agent_run_to_dict(self._task_from_row(row)) for row in rows]
 
-    def load_task_detail(
+    def load_agent_run_detail(
         self,
         task_id: str,
         *,
         event_limit: int = DEFAULT_RUNTIME_EVENT_LIMIT,
     ) -> dict[str, Any]:
-        from labrastro_server.services.agent_runtime.control_plane import RuntimeTaskEvent
+        from labrastro_server.services.agent_runtime.control_plane import AgentRunEvent
 
         event_limit = clamp_event_limit(event_limit)
         with self.engine.begin() as conn:
             task = self._task_from_row(self._task_row(conn, task_id))
             session = conn.execute(
-                text("SELECT * FROM labrastro_runtime_sessions WHERE task_id=:task_id"),
+                text("SELECT * FROM labrastro_agent_run_sessions WHERE task_id=:task_id"),
                 {"task_id": task_id},
             ).mappings().first()
             claim = conn.execute(
@@ -999,7 +1046,7 @@ class PostgresRuntimeStore:
                     SELECT request_id, task_id, worker_id, peer_id, status,
                            lease_sec, lease_deadline, last_heartbeat_at, claimed_at,
                            released_at, metadata
-                    FROM labrastro_runtime_claims
+                    FROM labrastro_agent_run_claims
                     WHERE task_id=:task_id
                     ORDER BY claimed_at DESC
                     LIMIT 1
@@ -1013,7 +1060,7 @@ class PostgresRuntimeStore:
                     SELECT task_id, seq, type, payload
                     FROM (
                         SELECT task_id, seq, type, payload
-                        FROM labrastro_runtime_events
+                        FROM labrastro_agent_run_events
                         WHERE task_id=:task_id
                         ORDER BY seq DESC
                         LIMIT :limit
@@ -1024,7 +1071,7 @@ class PostgresRuntimeStore:
                 {"task_id": task_id, "limit": event_limit},
             ).mappings().all()
         events = [
-            RuntimeTaskEvent(
+            AgentRunEvent(
                 task_id=str(row["task_id"]),
                 seq=int(row["seq"]),
                 type=str(row["type"]),
@@ -1033,7 +1080,7 @@ class PostgresRuntimeStore:
             for row in event_rows
         ]
         return {
-            "task": _task_to_dict(task),
+            "agent_run": _agent_run_to_dict(task),
             "artifacts": self.artifacts_to_dict(task_id),
             "session": _jsonable_row(session) if session is not None else None,
             "claim": _jsonable_row(claim) if claim is not None else None,
@@ -1041,7 +1088,7 @@ class PostgresRuntimeStore:
         }
 
     def _resolve_request(self, request: Any) -> Any:
-        parent = self.get_task(request.parent_task_id) if request.parent_task_id else None
+        parent = self.get_agent_run(request.parent_task_id) if request.parent_task_id else None
         if parent is not None:
             if request.runtime_profile_id is None:
                 request.runtime_profile_id = parent.runtime_profile_id
@@ -1090,7 +1137,7 @@ class PostgresRuntimeStore:
         seq = conn.execute(
             text(
                 """
-                UPDATE labrastro_runtime_tasks
+                UPDATE labrastro_agent_runs
                 SET next_event_seq=next_event_seq + 1, updated_at=now()
                 WHERE id=:task_id
                 RETURNING next_event_seq - 1 AS seq
@@ -1101,7 +1148,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                INSERT INTO labrastro_runtime_events(task_id, seq, type, payload)
+                INSERT INTO labrastro_agent_run_events(task_id, seq, type, payload)
                 VALUES (:task_id, :seq, :type, CAST(:payload AS JSONB))
                 """
             ),
@@ -1115,18 +1162,20 @@ class PostgresRuntimeStore:
 
     def _task_row(self, conn: Any, task_id: str) -> Any:
         row = conn.execute(
-            text("SELECT * FROM labrastro_runtime_tasks WHERE id=:task_id"),
+            text("SELECT * FROM labrastro_agent_runs WHERE id=:task_id"),
             {"task_id": task_id},
         ).mappings().first()
         if row is None:
-            raise KeyError(f"runtime task not found: {task_id}")
+            raise KeyError(f"AgentRun not found: {task_id}")
         return row
 
-    def _task_from_row(self, row: Any) -> TaskRecord:
-        return TaskRecord(
+    def _task_from_row(self, row: Any) -> AgentRunRecord:
+        metadata = _dict_from(row["metadata"])
+        return AgentRunRecord(
             id=str(row["id"]),
             issue_id=str(row["issue_id"]),
             agent_id=str(row["agent_id"]),
+            source=AgentRunSource(str(metadata.get("agent_run_source") or "manual")),
             trigger_mode=TriggerMode(str(row["trigger_mode"])),
             status=TaskStatus(str(row["status"])),
             prompt=str(row["prompt"] or ""),
@@ -1141,7 +1190,12 @@ class PostgresRuntimeStore:
             worker_id=row["worker_id"],
             executor_session_id=row["executor_session_id"],
             workdir=row["workdir"],
-            metadata=_dict_from(row["metadata"]),
+            sandbox_id=metadata.get("sandbox_id"),
+            sandbox_session_id=metadata.get("sandbox_session_id"),
+            workspace_ref=metadata.get("workspace_ref"),
+            delegated_by_run_id=metadata.get("delegated_by_run_id"),
+            parent_run_id=metadata.get("parent_run_id") or row["parent_task_id"],
+            metadata=metadata,
         )
 
     def _artifact_from_row(self, row: Any) -> TaskArtifact:
@@ -1163,7 +1217,7 @@ class PostgresRuntimeStore:
 
     def _worker_matches_task(
         self,
-        task: TaskRecord,
+        task: AgentRunRecord,
         *,
         features: set[str] | None,
         workspace_root: str | None,
@@ -1173,8 +1227,8 @@ class PostgresRuntimeStore:
             return True
         if location == ExecutionLocation.LOCAL_WORKSPACE:
             if (
-                "agent_runtime" not in features
-                and "agent_runtime.local_workspace" not in features
+                "agent_runs" not in features
+                and "agent_runs.local_workspace" not in features
             ):
                 return False
             bound_workspace = str(task.metadata.get("workspace_root") or "").strip()
@@ -1183,12 +1237,12 @@ class PostgresRuntimeStore:
                     bound_workspace
                 ) == _workspace_key(workspace_root)
             return True
-        location_feature = f"agent_runtime.{location.value}"
+        location_feature = f"agent_runs.{location.value}"
         if location_feature in features:
             return True
-        return "agent_runtime" in features
+        return "agent_runs" in features
 
-    def _agent_concurrency_allows(self, conn: Any, task: TaskRecord) -> bool:
+    def _agent_concurrency_allows(self, conn: Any, task: AgentRunRecord) -> bool:
         raw_agent = _dict_from(_dict_from(self.runtime_snapshot.get("agents")).get(task.agent_id))
         raw_limit = raw_agent.get("max_concurrent_tasks")
         if raw_limit is None:
@@ -1202,7 +1256,7 @@ class PostgresRuntimeStore:
         count = conn.execute(
             text(
                 """
-                SELECT count(*) FROM labrastro_runtime_tasks
+                SELECT count(*) FROM labrastro_agent_runs
                 WHERE agent_id=:agent_id
                   AND status IN ('dispatched', 'running', 'waiting_approval')
                 """
@@ -1211,7 +1265,7 @@ class PostgresRuntimeStore:
         ).scalar_one()
         return int(count) < limit
 
-    def _executor_metadata(self, task: TaskRecord) -> dict[str, Any]:
+    def _executor_metadata(self, task: AgentRunRecord) -> dict[str, Any]:
         metadata = dict(task.metadata)
         rendered = self._render_prompt_for_task(
             task, task.executor or ExecutorType.REULEAUXCODER
@@ -1223,7 +1277,7 @@ class PostgresRuntimeStore:
                 metadata.setdefault("system_prompt", rendered.metadata["system_prompt"])
         return metadata
 
-    def _render_prompt_for_task(self, task: TaskRecord, executor: ExecutorType) -> Any:
+    def _render_prompt_for_task(self, task: AgentRunRecord, executor: ExecutorType) -> Any:
         agents = _dict_from(self.runtime_snapshot.get("agents"))
         profiles = _dict_from(self.runtime_snapshot.get("runtime_profiles"))
         raw_agent = _dict_from(agents.get(task.agent_id))
@@ -1264,7 +1318,7 @@ class PostgresRuntimeStore:
         return conn.execute(
             text(
                 """
-                SELECT * FROM labrastro_runtime_claims
+                SELECT * FROM labrastro_agent_run_claims
                 WHERE request_id=:request_id AND status='active'
                 """
             ),
@@ -1287,7 +1341,7 @@ class PostgresRuntimeStore:
         reason = conn.execute(
             text(
                 """
-                SELECT reason FROM labrastro_runtime_cancel_requests
+                SELECT reason FROM labrastro_agent_run_cancel_requests
                 WHERE task_id=:task_id AND resolved_at IS NULL
                 """
             ),
@@ -1304,7 +1358,7 @@ class PostgresRuntimeStore:
         rows = conn.execute(
             text(
                 f"""
-                SELECT * FROM labrastro_runtime_claims
+                SELECT * FROM labrastro_agent_run_claims
                 WHERE status='active' AND lease_deadline <= {deadline_expr}
                 FOR UPDATE
                 """
@@ -1323,7 +1377,7 @@ class PostgresRuntimeStore:
                 conn.execute(
                     text(
                         """
-                        UPDATE labrastro_runtime_tasks
+                        UPDATE labrastro_agent_runs
                         SET status='queued', worker_id=NULL, updated_at=now()
                         WHERE id=:task_id
                         """
@@ -1344,7 +1398,7 @@ class PostgresRuntimeStore:
             conn.execute(
                 text(
                     """
-                    UPDATE labrastro_runtime_claims
+                    UPDATE labrastro_agent_run_claims
                     SET status='expired', released_at=now()
                     WHERE request_id=:request_id
                     """
@@ -1356,7 +1410,7 @@ class PostgresRuntimeStore:
     def _pin_session_with_conn(
         self,
         conn: Any,
-        task: TaskRecord,
+        task: AgentRunRecord,
         session: TaskSessionRef,
         *,
         metadata: dict[str, Any],
@@ -1364,7 +1418,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                UPDATE labrastro_runtime_tasks
+                UPDATE labrastro_agent_runs
                 SET status=CASE WHEN status='dispatched' THEN 'running' ELSE status END,
                     executor_session_id=COALESCE(:executor_session_id, executor_session_id),
                     workdir=COALESCE(:workdir, workdir),
@@ -1384,7 +1438,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                INSERT INTO labrastro_runtime_sessions (
+                INSERT INTO labrastro_agent_run_sessions (
                     task_id, agent_id, executor, execution_location, issue_id,
                     workdir, branch, executor_session_id, metadata
                 ) VALUES (
@@ -1392,13 +1446,13 @@ class PostgresRuntimeStore:
                     :workdir, :branch, :executor_session_id, CAST(:metadata AS JSONB)
                 )
                 ON CONFLICT (task_id) DO UPDATE SET
-                    workdir=COALESCE(EXCLUDED.workdir, labrastro_runtime_sessions.workdir),
-                    branch=COALESCE(EXCLUDED.branch, labrastro_runtime_sessions.branch),
+                    workdir=COALESCE(EXCLUDED.workdir, labrastro_agent_run_sessions.workdir),
+                    branch=COALESCE(EXCLUDED.branch, labrastro_agent_run_sessions.branch),
                     executor_session_id=COALESCE(
                         EXCLUDED.executor_session_id,
-                        labrastro_runtime_sessions.executor_session_id
+                        labrastro_agent_run_sessions.executor_session_id
                     ),
-                    metadata=labrastro_runtime_sessions.metadata || EXCLUDED.metadata,
+                    metadata=labrastro_agent_run_sessions.metadata || EXCLUDED.metadata,
                     updated_at=now()
                 """
             ),
@@ -1430,14 +1484,14 @@ class PostgresRuntimeStore:
     def _upsert_session_with_conn(
         self,
         conn: Any,
-        task: TaskRecord,
+        task: AgentRunRecord,
         *,
         executor_session_id: str,
     ) -> None:
         conn.execute(
             text(
                 """
-                INSERT INTO labrastro_runtime_sessions (
+                INSERT INTO labrastro_agent_run_sessions (
                     task_id, agent_id, executor, execution_location, issue_id,
                     workdir, branch, executor_session_id, metadata
                 ) VALUES (
@@ -1445,8 +1499,8 @@ class PostgresRuntimeStore:
                     :workdir, :branch, :executor_session_id, CAST('{}' AS JSONB)
                 )
                 ON CONFLICT (task_id) DO UPDATE SET
-                    workdir=COALESCE(EXCLUDED.workdir, labrastro_runtime_sessions.workdir),
-                    branch=COALESCE(EXCLUDED.branch, labrastro_runtime_sessions.branch),
+                    workdir=COALESCE(EXCLUDED.workdir, labrastro_agent_run_sessions.workdir),
+                    branch=COALESCE(EXCLUDED.branch, labrastro_agent_run_sessions.branch),
                     executor_session_id=EXCLUDED.executor_session_id,
                     updated_at=now()
                 """
@@ -1480,7 +1534,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                INSERT INTO labrastro_runtime_artifacts (
+                INSERT INTO labrastro_agent_run_artifacts (
                     id, task_id, type, status, branch_name, pr_url, content,
                     path, metadata, merge_status, merged_by
                 ) VALUES (
@@ -1510,7 +1564,7 @@ class PostgresRuntimeStore:
         if artifact.type == ArtifactType.PULL_REQUEST:
             set_parts.append("issue_status='in_review'")
         conn.execute(
-            text(f"UPDATE labrastro_runtime_tasks SET {', '.join(set_parts)} WHERE id=:task_id"),
+            text(f"UPDATE labrastro_agent_runs SET {', '.join(set_parts)} WHERE id=:task_id"),
             updates,
         )
         self._append_event(conn, task_id, "artifact_attached", {"artifact": _artifact_to_dict(artifact)})
@@ -1520,7 +1574,7 @@ class PostgresRuntimeStore:
         count = conn.execute(
             text(
                 """
-                SELECT count(*) FROM labrastro_runtime_artifacts
+                SELECT count(*) FROM labrastro_agent_run_artifacts
                 WHERE task_id=:task_id AND type='pull_request'
                   AND status NOT IN ('merged', 'closed')
                 """
@@ -1533,7 +1587,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                UPDATE labrastro_runtime_claims
+                UPDATE labrastro_agent_run_claims
                 SET status=:status, released_at=now()
                 WHERE task_id=:task_id AND status='active'
                 """
@@ -1545,7 +1599,7 @@ class PostgresRuntimeStore:
         conn.execute(
             text(
                 """
-                UPDATE labrastro_runtime_cancel_requests
+                UPDATE labrastro_agent_run_cancel_requests
                 SET resolved_at=now()
                 WHERE task_id=:task_id AND resolved_at IS NULL
                 """

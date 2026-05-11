@@ -40,7 +40,6 @@ def upgrade() -> None:
             reason TEXT NOT NULL DEFAULT '',
             work_item_id TEXT,
             task_run_id TEXT,
-            runtime_task_id TEXT REFERENCES labrastro_runtime_tasks(id) ON DELETE SET NULL,
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -1,11 +1,15 @@
-"""Persistence factory functions for optional Postgres-backed stores."""
+﻿"""Persistence factory functions for optional Postgres-backed stores."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from reuleauxcoder.domain.config.models import Config, PersistenceConfig
+from reuleauxcoder.domain.config.models import (
+    Config,
+    PersistenceConfig,
+    build_agent_run_snapshot,
+)
 from labrastro_server.infrastructure.persistence.db import create_postgres_engine
 from labrastro_server.infrastructure.persistence.migration import run_migrations
 from labrastro_server.infrastructure.persistence.maintenance import (
@@ -15,8 +19,8 @@ from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
-from labrastro_server.services.agent_runtime.control_plane import AgentRuntimeControlPlane
-from labrastro_server.services.agent_runtime.postgres_store import PostgresRuntimeStore
+from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
+from labrastro_server.services.agent_runtime.postgres_store import PostgresAgentRunStore
 from labrastro_server.services.auth.file_store import FileAuthStore
 from labrastro_server.services.auth.postgres_store import PostgresAuthStore
 from labrastro_server.services.collaboration.in_memory_store import (
@@ -55,33 +59,33 @@ def _engine_for(config: Config) -> Any | None:
     return create_postgres_engine(persistence.database_url)
 
 
-def create_runtime_control_plane(config: Config) -> AgentRuntimeControlPlane:
+def create_runtime_control_plane(config: Config) -> AgentRunControlPlane:
+    snapshot = build_agent_run_snapshot(
+        agent_registry=config.agent_registry,
+        runtime_profiles=config.runtime_profiles,
+        run_limits=config.run_limits,
+        capability_packages=config.capability_packages,
+    )
     engine = _engine_for(config)
     if engine is None or not config.persistence.runtime_enabled:
-        return AgentRuntimeControlPlane(
-            max_running_tasks=config.agent_runtime.max_running_agents,
-            runtime_snapshot=config.agent_runtime.to_runtime_snapshot(
-                config.capability_packages
-            ),
+        return AgentRunControlPlane(
+            max_running_tasks=config.run_limits.max_running_agents,
+            runtime_snapshot=snapshot,
         )
-    store = PostgresRuntimeStore(
+    store = PostgresAgentRunStore(
         engine,
-        max_running_tasks=config.agent_runtime.max_running_agents,
-        runtime_snapshot=config.agent_runtime.to_runtime_snapshot(
-            config.capability_packages
-        ),
+        max_running_tasks=config.run_limits.max_running_agents,
+        runtime_snapshot=snapshot,
     )
-    return AgentRuntimeControlPlane(
-        max_running_tasks=config.agent_runtime.max_running_agents,
-        runtime_snapshot=config.agent_runtime.to_runtime_snapshot(
-            config.capability_packages
-        ),
+    return AgentRunControlPlane(
+        max_running_tasks=config.run_limits.max_running_agents,
+        runtime_snapshot=snapshot,
         store=store,
     )
 
 
 def create_taskflow_service(
-    config: Config, *, runtime_control_plane: AgentRuntimeControlPlane | None = None
+    config: Config, *, runtime_control_plane: AgentRunControlPlane | None = None
 ) -> TaskflowService:
     dispatcher = (
         ReuleauxCoderTaskflowDispatcher(runtime_control_plane)
@@ -106,7 +110,7 @@ def create_issue_assignment_service(
 def create_github_pull_request_service(
     config: Config,
     *,
-    runtime_control_plane: AgentRuntimeControlPlane,
+    runtime_control_plane: AgentRunControlPlane,
     issue_assignment_service: IssueAssignmentService | None = None,
 ) -> PullRequestService | None:
     if not config.github.enabled:

@@ -15,8 +15,8 @@ def upgrade() -> None:
         """
         CREATE TABLE IF NOT EXISTS labrastro_github_pull_requests (
             id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
-            artifact_id TEXT REFERENCES labrastro_runtime_artifacts(id) ON DELETE SET NULL,
+            task_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
+            artifact_id TEXT REFERENCES labrastro_agent_run_artifacts(id) ON DELETE SET NULL,
             repository TEXT NOT NULL,
             owner TEXT NOT NULL,
             repo TEXT NOT NULL,
@@ -46,7 +46,7 @@ def upgrade() -> None:
             github_id TEXT NOT NULL UNIQUE,
             pr_record_id TEXT NOT NULL
                 REFERENCES labrastro_github_pull_requests(id) ON DELETE CASCADE,
-            task_id TEXT NOT NULL REFERENCES labrastro_runtime_tasks(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
             repository TEXT NOT NULL,
             pr_number INTEGER NOT NULL,
             author TEXT NOT NULL DEFAULT '',

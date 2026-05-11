@@ -1,4 +1,4 @@
-"""Add snapshot retention and compression support."""
+﻿"""Add snapshot retention and compression support."""
 
 from __future__ import annotations
 
@@ -56,14 +56,14 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_labrastro_runtime_events_created_at
-            ON labrastro_runtime_events(created_at)
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_run_events_created_at
+            ON labrastro_agent_run_events(created_at)
         """
     )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS idx_labrastro_runtime_events_created_at")
+    op.execute("DROP INDEX IF EXISTS idx_labrastro_agent_run_events_created_at")
     op.execute("DROP INDEX IF EXISTS idx_labrastro_session_snapshots_created_at")
     op.execute("DROP INDEX IF EXISTS idx_labrastro_session_snapshots_session_version")
     op.execute(

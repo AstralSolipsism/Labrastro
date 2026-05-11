@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import importlib
 
@@ -148,7 +148,7 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
 def test_task_and_artifact_status_are_independent() -> None:
     models = _models()
 
-    task = models.TaskRecord(
+    task = models.AgentRunRecord(
         id="task-1",
         issue_id="issue-1",
         agent_id="code_reviewer",
@@ -174,7 +174,7 @@ def test_task_and_artifact_status_are_independent() -> None:
 def test_non_code_task_allows_report_artifact_without_branch_or_pr() -> None:
     models = _models()
 
-    task = models.TaskRecord(
+    task = models.AgentRunRecord(
         id="task-2",
         issue_id="issue-2",
         agent_id="researcher",

@@ -1,4 +1,4 @@
-"""Storage protocols for Agent Runtime control-plane state."""
+﻿"""Storage protocols for Agent Runtime control-plane state."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from reuleauxcoder.domain.agent_runtime.models import (
     TaskArtifact,
-    TaskRecord,
+    AgentRunRecord,
     TaskSessionRef,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
@@ -32,7 +32,7 @@ def clamp_event_limit(
     return max(1, min(MAX_RUNTIME_EVENT_LIMIT, value))
 
 
-class TaskQueueStore(Protocol):
+class AgentRunQueueStore(Protocol):
     max_running_tasks: int
     runtime_snapshot: dict[str, Any]
 
@@ -43,15 +43,15 @@ class TaskQueueStore(Protocol):
         runtime_snapshot: dict[str, Any] | None = None,
     ) -> None: ...
 
-    def submit_task(self, request: Any, *, task_id: str | None = None) -> TaskRecord: ...
+    def submit_agent_run(self, request: Any, *, task_id: str | None = None) -> AgentRunRecord: ...
 
-    def get_task(self, task_id: str) -> TaskRecord: ...
+    def get_agent_run(self, task_id: str) -> AgentRunRecord: ...
 
-    def task_to_dict(self, task_id: str) -> dict[str, Any]: ...
+    def agent_run_to_dict(self, task_id: str) -> dict[str, Any]: ...
 
-    def list_tasks(self, **filters: Any) -> list[dict[str, Any]]: ...
+    def list_agent_runs(self, **filters: Any) -> list[dict[str, Any]]: ...
 
-    def load_task_detail(
+    def load_agent_run_detail(
         self,
         task_id: str,
         *,
@@ -60,7 +60,7 @@ class TaskQueueStore(Protocol):
 
 
 class ClaimLeaseStore(Protocol):
-    def claim_task(
+    def claim_agent_run(
         self,
         *,
         worker_id: str,
@@ -71,7 +71,7 @@ class ClaimLeaseStore(Protocol):
         lease_sec: int = 15,
     ) -> Any | None: ...
 
-    def heartbeat_task(
+    def heartbeat_agent_run(
         self,
         *,
         request_id: str,
@@ -90,10 +90,10 @@ class ClaimLeaseStore(Protocol):
         peer_id: str | None = None,
     ) -> tuple[bool, str]: ...
 
-    def recover_stale_tasks(self, *, now: float | None = None) -> list[str]: ...
+    def recover_stale_agent_runs(self, *, now: float | None = None) -> list[str]: ...
 
 
-class RuntimeEventLog(Protocol):
+class AgentRunEventLog(Protocol):
     def append_executor_event(
         self,
         task_id: str,
@@ -113,7 +113,7 @@ class RuntimeEventLog(Protocol):
     ) -> list[Any]: ...
 
 
-class RuntimeArtifactStore(Protocol):
+class AgentRunArtifactStore(Protocol):
     def attach_artifact(self, task_id: str, **kwargs: Any) -> TaskArtifact: ...
 
     def list_artifacts(self, task_id: str) -> list[TaskArtifact]: ...
@@ -121,7 +121,7 @@ class RuntimeArtifactStore(Protocol):
     def artifacts_to_dict(self, task_id: str) -> list[dict[str, Any]]: ...
 
 
-class RuntimeSessionStore(Protocol):
+class AgentRunSessionStore(Protocol):
     def pin_session(self, task_id: str, session: TaskSessionRef) -> None: ...
 
     def pin_claimed_session(
@@ -154,17 +154,17 @@ class GitHubPRLifecycle(Protocol):
     def create_or_update_pr(self, task_id: str, *, diff: str = "") -> TaskArtifact: ...
 
 
-class RuntimeStore(
-    TaskQueueStore,
+class AgentRunStore(
+    AgentRunQueueStore,
     ClaimLeaseStore,
-    RuntimeEventLog,
-    RuntimeArtifactStore,
-    RuntimeSessionStore,
+    AgentRunEventLog,
+    AgentRunArtifactStore,
+    AgentRunSessionStore,
     EnvironmentWorkflow,
     GitHubPRLifecycle,
     Protocol,
 ):
-    def complete_claimed_task(
+    def complete_claimed_agent_run(
         self,
         task_id: str,
         result: ExecutorRunResult,
@@ -173,24 +173,24 @@ class RuntimeStore(
         worker_id: str,
         peer_id: str | None = None,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> tuple[bool, str, TaskRecord | None]: ...
+    ) -> tuple[bool, str, AgentRunRecord | None]: ...
 
-    def complete_task(
+    def complete_agent_run(
         self,
         task_id: str,
         result: ExecutorRunResult,
         *,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> TaskRecord: ...
+    ) -> AgentRunRecord: ...
 
-    def retry_task(
+    def retry_agent_run(
         self,
         task_id: str,
         *,
-        new_task_id: str | None = None,
+        new_agent_run_id: str | None = None,
         resume_session: bool = False,
-    ) -> TaskRecord: ...
+    ) -> AgentRunRecord: ...
 
-    def fail_task(self, task_id: str, *, error: str) -> TaskRecord: ...
+    def fail_agent_run(self, task_id: str, *, error: str) -> AgentRunRecord: ...
 
-    def cancel_task(self, task_id: str, *, reason: str = "user_cancelled") -> bool: ...
+    def cancel_agent_run(self, task_id: str, *, reason: str = "user_cancelled") -> bool: ...

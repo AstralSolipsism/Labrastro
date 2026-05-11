@@ -1,10 +1,10 @@
-"""Basic HR-style scheduling helpers for Agent runtime tasks."""
+﻿"""Basic HR-style scheduling helpers for AgentRuns."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from reuleauxcoder.domain.agent_runtime.models import AgentConfig, TaskRecord, TaskStatus
+from reuleauxcoder.domain.agent_runtime.models import AgentConfig, AgentRunRecord, TaskStatus
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,7 @@ class BasicAgentScheduler:
 
     agents: dict[str, AgentConfig]
     default_agent_id: str | None = None
-    running_tasks: list[TaskRecord] = field(default_factory=list)
+    running_tasks: list[AgentRunRecord] = field(default_factory=list)
 
     def choose_agent(self) -> AgentScheduleDecision:
         candidates = list(self.agents.values())

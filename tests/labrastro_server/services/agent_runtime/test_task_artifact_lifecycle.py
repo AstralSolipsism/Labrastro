@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import importlib
 
@@ -23,7 +23,7 @@ def test_completing_task_does_not_mark_pull_request_as_merged() -> None:
         status="pr_created",
     )
 
-    state.complete_task(output="PR 已创建，等待审核")
+    state.complete_agent_run(output="PR 已创建，等待审核")
 
     assert state.task.status.value == "completed"
     assert state.artifacts["artifact-1"].status.value == "pr_created"
@@ -46,7 +46,7 @@ def test_user_merge_updates_artifact_without_rewriting_task_result() -> None:
         pr_url="https://example.test/pr/1",
         status="pr_created",
     )
-    state.complete_task(output="PR 已创建，等待审核")
+    state.complete_agent_run(output="PR 已创建，等待审核")
     state.mark_artifact_merged("artifact-1", actor_user_id="user-1")
 
     assert state.task.status.value == "completed"
@@ -99,7 +99,7 @@ def test_non_code_task_can_complete_with_report_artifact_only() -> None:
         content="调研结论",
         status="generated",
     )
-    state.complete_task(output="已完成调研")
+    state.complete_agent_run(output="已完成调研")
 
     assert state.task.status.value == "completed"
     assert state.artifacts["artifact-2"].type.value == "report"
@@ -123,7 +123,7 @@ def test_publish_failure_artifact_is_preserved_without_blocking_completion() -> 
         content="gh pr create failed",
         metadata={"stage": "pr_create"},
     )
-    state.complete_task(output="executor completed")
+    state.complete_agent_run(output="executor completed")
 
     assert state.task.status.value == "completed"
     assert state.artifacts["artifact-failed"].status.value == "failed"
