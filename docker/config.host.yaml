@@ -34,7 +34,7 @@ remote_exec:
 auth:
   enabled: true
   token_secret: ${LABRASTRO_AUTH_TOKEN_SECRET}
-  store_backend: postgres
+  store_backend: auto
   store_path: .rcoder/auth.json
   password_min_length: 6
   password_max_length: 256
@@ -82,7 +82,7 @@ capability_packages:
     source: builtin
 
 persistence:
-  backend: postgres
+  backend: auto
   database_url: ${LABRASTRO_DATABASE_URL}
   auto_migrate: true
   runtime_enabled: true

@@ -75,6 +75,29 @@ def test_host_config_keeps_session_auto_save_enabled() -> None:
     assert data["session"]["auto_save"] is True
 
 
+def test_host_config_uses_auto_persistence_without_database_url(monkeypatch) -> None:
+    monkeypatch.setenv("RCODER_MODEL", "gpt-test")
+    monkeypatch.setenv("RCODER_API_KEY", "sk-test")
+    monkeypatch.setenv("RCODER_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("LABRASTRO_AUTH_TOKEN_SECRET", "test-secret")
+    monkeypatch.setenv("LABRASTRO_SUPERADMIN_USERNAME", "admin")
+    monkeypatch.setenv(
+        "LABRASTRO_SUPERADMIN_PASSWORD_HASH",
+        "pbkdf2_sha256$260000$salt$hash",
+    )
+    monkeypatch.delenv("LABRASTRO_DATABASE_URL", raising=False)
+    config_path = Path(__file__).resolve().parents[3] / "docker" / "config.host.yaml"
+
+    loader = ConfigLoader()
+    data = loader._expand_env_refs(loader._load_yaml(config_path))
+    config = loader._parse_config(data)
+
+    assert config.auth.store_backend == "auto"
+    assert config.persistence.backend == "auto"
+    assert config.persistence.database_url == ""
+    assert "persistence.database_url is required when backend is postgres" not in config.validate()
+
+
 def test_parse_config_selects_active_profiles_and_modes() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
