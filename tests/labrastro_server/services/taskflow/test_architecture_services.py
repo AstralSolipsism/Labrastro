@@ -65,12 +65,40 @@ def test_taskflow_service_runs_goal_compile_and_dispatch_flow() -> None:
         ],
         readiness_score=90,
     )
+    service.record_discovery_turn(
+        state.meta.taskflow_id,
+        examples=[
+            {
+                "id": "acceptance-1",
+                "title": "PlanCompiler acceptance",
+                "then": ["Compiler emits traceable WorkItem candidates."],
+            }
+        ],
+        decisions=[
+            {
+                "id": "decision-1",
+                "question": "Should PlanCompiler be implemented?",
+                "chosen": "yes",
+            }
+        ],
+    )
     confirmed = service.confirm_goal(state.meta.taskflow_id, confirmed_by="user")
 
     plan = service.compile_goal(confirmed.meta.taskflow_id)
+    dispatch_decision = service.request_dispatch_decision(
+        confirmed.meta.taskflow_id,
+        work_item_ids=[plan.work_item_candidates[0].work_item_id],
+        actor="user",
+    )
+    service.confirm_dispatch_decision(
+        confirmed.meta.taskflow_id,
+        decision_id=dispatch_decision.id,
+        actor="user",
+    )
     run = service.dispatch_task_run(
         confirmed.meta.taskflow_id,
         work_item_id=plan.work_item_candidates[0].work_item_id,
+        dispatch_decision_id=dispatch_decision.id,
         executor=TaskRunExecutor.AGENT,
     )
     saved_project = project_service.get_project_state("project-1")
@@ -105,22 +133,40 @@ def test_taskflow_service_blocks_dispatch_when_readiness_gate_fails() -> None:
                 title="Implement incomplete work",
                 description="Missing readiness evidence.",
                 type="implementation",
+                acceptance_refs=["acceptance-1"],
+            )
+        ],
+        assumptions=[
+            Assumption(
+                id="assumption-1",
+                statement="This goal is intentionally incomplete.",
+                state=ConfirmationState.CONFIRMED_BY_USER,
             )
         ],
         readiness_score=30,
         readiness_gates=[
-            ReadinessGate(
-                id="gate-1",
-                name="acceptance-coverage",
-                passed=False,
-                rationale="No acceptance examples are confirmed.",
-            )
+                ReadinessGate(
+                    id="gate-1",
+                    name="acceptance-coverage",
+                    passed=True,
+                    rationale="Acceptance example is present.",
+                )
+        ],
+    )
+    service.record_discovery_turn(
+        state.meta.taskflow_id,
+        examples=[
+            {
+                "id": "acceptance-1",
+                "title": "Incomplete work is observable",
+                "then": ["A dispatch decision is still required."],
+            }
         ],
     )
     service.confirm_goal(state.meta.taskflow_id)
     service.compile_goal(state.meta.taskflow_id)
 
-    with pytest.raises(ValueError, match="readiness gate failed"):
+    with pytest.raises(ValueError, match="dispatch_decision_id"):
         service.dispatch_task_run(
             state.meta.taskflow_id,
             work_item_id="work-candidate-1",

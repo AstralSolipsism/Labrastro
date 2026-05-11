@@ -3148,6 +3148,257 @@ class TestRemoteRelayHTTPService:
         assert "task-drafts" not in route_source
         assert "taskflows" in route_source
         assert "work-items" in route_source
+
+    def test_taskflow_http_api_records_discovery_and_confirms_brief(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "G:/repo/main",
+                    "workspace_root": "G:/repo/main",
+                    "features": ["agent_runs"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _, create_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows",
+                {
+                    "peer_token": peer_token,
+                    "project_id": "project-1",
+                    "raw_goal": "Build taskflow discovery API.",
+                    "taskflow_id": "taskflow-http",
+                    "goal_id": "goal-http",
+                },
+            )
+            assert create_body["ok"] is True
+
+            _, discovery_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/discovery-turn",
+                {
+                    "peer_token": peer_token,
+                    "rules": [
+                        {
+                            "id": "rule-confirm-before-dispatch",
+                            "statement": "Dispatch requires confirmed brief.",
+                        }
+                    ],
+                    "examples": [
+                        {
+                            "id": "example-confirmed-brief",
+                            "rule_id": "rule-confirm-before-dispatch",
+                            "title": "Confirmed brief allows compile",
+                        }
+                    ],
+                    "decisions": [
+                        {
+                            "id": "decision-boundary",
+                            "question": "What boundary is confirmed?",
+                            "options": [{"id": "brief", "label": "Brief"}],
+                            "recommended": "brief",
+                            "linked_rule_ids": ["rule-confirm-before-dispatch"],
+                        }
+                    ],
+                    "work_item_candidates": [
+                        {
+                            "id": "candidate-1",
+                            "title": "Implement API write path",
+                            "description": "Add discovery and brief actions.",
+                            "acceptance_refs": ["example-confirmed-brief"],
+                            "decision_refs": ["decision-boundary"],
+                            "scenario_refs": ["example-confirmed-brief"],
+                        }
+                    ],
+                },
+            )
+            assert discovery_body["taskflow"]["outputs"]["current_brief_version"] == 1
+
+            _, answer_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/decisions/decision-boundary/answer",
+                {
+                    "peer_token": peer_token,
+                    "selected_option_id": "brief",
+                    "answer": "brief",
+                },
+            )
+            assert answer_body["taskflow"]["outputs"]["current_brief_version"] == 2
+
+            _, ready_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/brief/ready",
+                {"peer_token": peer_token, "version": 2},
+            )
+            assert ready_body["taskflow"]["outputs"]["brief_versions"][-1]["status"] == "ready"
+
+            _, confirm_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/brief/confirm",
+                {"peer_token": peer_token, "version": 2},
+            )
+            assert confirm_body["taskflow"]["outputs"]["confirmed_brief_version"] == 2
+
+            _, compile_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/compile",
+                {"peer_token": peer_token},
+            )
+            assert compile_body["ok"] is True
+            compiled = compile_body["plan"]["work_item_candidates"][0]
+            assert compiled["metadata"]["acceptance"]["source_brief_version"] == 2
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/work-items/{compiled['work_item_id']}/dispatch",
+                    {"peer_token": peer_token},
+                )
+                assert False, "expected HTTPError"
+            except HTTPError as exc:
+                assert exc.code == 400
+
+            _, request_dispatch_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/dispatch-decisions",
+                {
+                    "peer_token": peer_token,
+                    "work_item_ids": [compiled["work_item_id"]],
+                    "actor": "user",
+                },
+            )
+            dispatch_decision = request_dispatch_body["dispatch_decision"]
+            assert dispatch_decision["status"] == "requested"
+
+            _, confirm_dispatch_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/dispatch-decisions/{dispatch_decision['id']}/confirm",
+                {"peer_token": peer_token, "actor": "user"},
+            )
+            assert (
+                confirm_dispatch_body["taskflow"]["outputs"]["dispatch_decisions"][-1]["status"]
+                == "confirmed"
+            )
+
+            _, dispatch_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/work-items/{compiled['work_item_id']}/dispatch",
+                {
+                    "peer_token": peer_token,
+                    "dispatch_decision_id": dispatch_decision["id"],
+                },
+            )
+            assert dispatch_body["task_run"]["dispatch_ref_id"] == dispatch_decision["id"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_taskflow_http_api_records_and_overrides_complexity(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "G:/repo/main",
+                    "workspace_root": "G:/repo/main",
+                    "features": ["agent_runs"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows",
+                {
+                    "peer_token": peer_token,
+                    "project_id": "project-1",
+                    "raw_goal": "Build public plugin API with migration risk.",
+                    "taskflow_id": "taskflow-complexity-http",
+                    "goal_id": "goal-complexity-http",
+                },
+            )
+
+            _, evidence_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-complexity-http/complexity/evidence",
+                {
+                    "peer_token": peer_token,
+                    "evidence": [
+                        {
+                            "id": "evidence-public-api",
+                            "dimension": "interface_impact",
+                            "source_type": "goal",
+                            "source_id": "goal-complexity-http",
+                            "score_delta": 2,
+                            "rationale": "Public API contract affects consumers.",
+                        }
+                    ],
+                },
+            )
+            estimate = evidence_body["taskflow"]["compiler"]["complexity_estimate"]
+            assert estimate["level"] == "L2"
+            assert "public-interface-floor" in estimate["hard_escalations"]
+            assert "api_contract" in estimate["required_artifacts"]
+
+            _, override_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-complexity-http/complexity/override",
+                {
+                    "peer_token": peer_token,
+                    "level": "L3",
+                    "reason": "Architectural governance required.",
+                    "actor": "architect",
+                },
+            )
+            override_estimate = override_body["taskflow"]["compiler"]["complexity_estimate"]
+            assert override_estimate["level"] == "L3"
+            assert override_estimate["overridden_by"] == "architect"
+            assert (
+                override_body["taskflow"]["outputs"]["brief_versions"][-1]["complexity_estimate"]["level"]
+                == "L3"
+            )
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/taskflow/taskflows/taskflow-complexity-http/complexity/evidence",
+                    {
+                        "peer_token": peer_token,
+                        "evidence": [
+                            {
+                                "id": "bad-evidence",
+                                "dimension": "not_a_dimension",
+                                "source_type": "goal",
+                                "score_delta": 1,
+                            }
+                        ],
+                    },
+                )
+                assert False, "expected HTTPError"
+            except HTTPError as exc:
+                assert exc.code == 400
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_issue_assignment_and_mention_http_api_reuses_taskflow_dispatch(
         self,
     ) -> None:

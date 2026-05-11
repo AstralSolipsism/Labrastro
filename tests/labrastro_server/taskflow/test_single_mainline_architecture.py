@@ -89,6 +89,7 @@ def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
                 title="Implement compiler service",
                 description="Use ProjectState and TaskflowState as the only truth.",
                 type="implementation",
+                acceptance_refs=["acceptance-compiler-service"],
                 dedupe_key="project-1:implementation:compiler-service",
             )
         ],
@@ -102,12 +103,33 @@ def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
         ],
         readiness_score=90,
     )
+    service.record_discovery_turn(
+        state.meta.taskflow_id,
+        examples=[
+            {
+                "id": "acceptance-compiler-service",
+                "title": "Compiler service acceptance",
+                "then": ["The compiler service dispatches through the neutral port."],
+            }
+        ],
+    )
     service.confirm_goal("taskflow-1")
     plan = service.compile_goal("taskflow-1")
+    dispatch_decision = service.request_dispatch_decision(
+        "taskflow-1",
+        work_item_ids=[plan.work_item_candidates[0].work_item_id],
+        actor="user",
+    )
+    service.confirm_dispatch_decision(
+        "taskflow-1",
+        decision_id=dispatch_decision.id,
+        actor="user",
+    )
 
     run = service.dispatch_task_run(
         "taskflow-1",
         work_item_id=plan.work_item_candidates[0].work_item_id,
+        dispatch_decision_id=dispatch_decision.id,
         executor_hint="fake-executor",
     )
 
