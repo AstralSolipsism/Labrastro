@@ -18,6 +18,9 @@ from labrastro_server.infrastructure.persistence.maintenance import (
 from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
+from labrastro_server.infrastructure.persistence.postgres_taskflow_store import (
+    PostgresTaskflowStore,
+)
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.agent_runtime.postgres_store import PostgresAgentRunStore
@@ -37,6 +40,7 @@ from labrastro_server.services.github.service import PullRequestService
 from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
     ReuleauxCoderTaskflowDispatcher,
 )
+from labrastro_server.taskflow.application.project_service import ProjectService
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 
@@ -92,7 +96,15 @@ def create_taskflow_service(
         if runtime_control_plane is not None
         else None
     )
-    return TaskflowService(dispatcher=dispatcher)
+    engine = _engine_for(config)
+    if engine is None:
+        return TaskflowService(dispatcher=dispatcher)
+    store = PostgresTaskflowStore(engine)
+    return TaskflowService(
+        dispatcher=dispatcher,
+        project_service=ProjectService(store=store),
+        state_store=store,
+    )
 
 
 def create_issue_assignment_service(

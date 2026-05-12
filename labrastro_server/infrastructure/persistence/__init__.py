@@ -15,9 +15,13 @@ from labrastro_server.infrastructure.persistence.maintenance import (
 from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
+from labrastro_server.infrastructure.persistence.postgres_taskflow_store import (
+    PostgresTaskflowStore,
+)
 
 __all__ = [
     "PostgresSessionStore",
+    "PostgresTaskflowStore",
     "PersistenceMaintenanceResult",
     "PersistenceMaintenanceService",
     "create_postgres_engine",
