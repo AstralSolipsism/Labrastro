@@ -71,6 +71,9 @@ def discover_hook_specs() -> list[HookSpec]:
     """
     # Ensure builtin hooks are imported so decorators run
     from reuleauxcoder.domain.hooks.builtin import (
+        MemoryContextHook,
+        MemorySessionSaveHook,
+        MemoryToolCaptureHook,
         ToolOutputTruncationHook,
         ToolPolicyGuardHook,
         ProjectContextHook,
