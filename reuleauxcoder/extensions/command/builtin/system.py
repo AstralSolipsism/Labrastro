@@ -24,6 +24,10 @@ from reuleauxcoder.app.runtime.session_state import (
     restore_config_runtime_defaults,
 )
 from reuleauxcoder.domain.context.manager import estimate_tokens
+from reuleauxcoder.extensions.command.builtin.sessions import (
+    _build_session_save_data,
+    _emit_session_save_hooks,
+)
 from labrastro_server.infrastructure.persistence.factory import (
     create_session_store as create_configured_session_store,
 )
@@ -162,6 +166,13 @@ def _handle_exit(command, ctx) -> CommandResult:
             fingerprint=get_session_fingerprint(ctx.config, ctx.agent),
         )
         session_id = sid
+        _emit_session_save_hooks(
+            ctx.agent,
+            sid,
+            session_data=_build_session_save_data(
+                ctx.agent, sid, get_session_fingerprint(ctx.config, ctx.agent)
+            ),
+        )
         ctx.ui_bus.info(f"Session auto-saved: {sid}")
     return CommandResult(action="exit", session_id=session_id)
 

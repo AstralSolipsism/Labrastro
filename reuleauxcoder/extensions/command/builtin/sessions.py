@@ -26,6 +26,7 @@ from reuleauxcoder.app.runtime.session_state import (
     restore_config_runtime_defaults,
 )
 from reuleauxcoder.domain.hooks import HookPoint, SessionSaveContext
+from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from labrastro_server.infrastructure.persistence.factory import (
     create_session_store as create_configured_session_store,
 )
@@ -258,7 +259,11 @@ def _handle_save_session(command, ctx) -> CommandResult:
         runtime_state=build_session_runtime_state(ctx.config, ctx.agent),
         fingerprint=fingerprint,
     )
-    _emit_session_save_hooks(ctx.agent, session_id)
+    _emit_session_save_hooks(
+        ctx.agent,
+        session_id,
+        session_data=_build_session_save_data(ctx.agent, session_id, fingerprint),
+    )
     ctx.ui_bus.success(
         f"Session saved: {session_id}", kind=UIEventKind.SESSION, session_id=session_id
     )
@@ -290,7 +295,11 @@ def _handle_new_session(command, ctx) -> CommandResult:
             fingerprint=fingerprint,
         )
         previous_session_id = sid
-        _emit_session_save_hooks(ctx.agent, sid)
+        _emit_session_save_hooks(
+            ctx.agent,
+            sid,
+            session_data=_build_session_save_data(ctx.agent, sid, fingerprint),
+        )
         ctx.ui_bus.info(
             f"Session auto-saved: {sid}", kind=UIEventKind.SESSION, session_id=sid
         )
@@ -363,11 +372,35 @@ def register_actions(registry: ActionRegistry) -> None:
     )
 
 
-def _emit_session_save_hooks(agent, session_id: str) -> None:
+def _build_session_save_data(agent, session_id: str, fingerprint: str) -> dict:
+    """Build the lifecycle payload for SESSION_SAVE observers."""
+    model = getattr(getattr(agent, "llm", None), "model", None)
+    config_model = getattr(getattr(agent, "runtime_config", None), "model", None)
+    return {
+        "session_id": session_id,
+        "messages": [dict(message) for message in getattr(agent, "messages", [])],
+        "model": model or config_model,
+        "active_mode": getattr(agent, "active_mode", None),
+        "total_prompt_tokens": getattr(agent.state, "total_prompt_tokens", 0),
+        "total_completion_tokens": getattr(agent.state, "total_completion_tokens", 0),
+        "fingerprint": fingerprint,
+        "memory_scope": memory_metadata_from_agent(agent),
+    }
+
+
+def _emit_session_save_hooks(
+    agent,
+    session_id: str,
+    *,
+    session_data: dict | None = None,
+    metadata: dict | None = None,
+) -> None:
     """Emit SESSION_SAVE lifecycle hooks."""
     context = SessionSaveContext(
         hook_point=HookPoint.SESSION_SAVE,
         session_id=session_id,
+        session_data=dict(session_data or {}),
+        metadata=dict(metadata or {}),
     )
     for decision in agent.hook_registry.run_guards(HookPoint.SESSION_SAVE, context):
         if not decision.allowed:
