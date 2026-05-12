@@ -3299,6 +3299,20 @@ class TestRemoteRelayHTTPService:
                 },
             )
             assert dispatch_body["task_run"]["dispatch_ref_id"] == dispatch_decision["id"]
+
+            _, runtime_body = _json_request(
+                "GET",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/runtime?peer_token={peer_token}",
+            )
+            assert runtime_body["ok"] is True
+            assert runtime_body["taskflow_id"] == "taskflow-http"
+            assert runtime_body["task_runs"][0]["task_run"]["id"] == dispatch_body["task_run"]["id"]
+            assert runtime_body["task_runs"][0]["work_item"]["id"] == compiled["work_item_id"]
+            assert (
+                runtime_body["task_runs"][0]["dispatch_decision"]["id"]
+                == dispatch_decision["id"]
+            )
+            assert runtime_body["task_runs"][0]["liveness"]["state"] == "agent_selection_required"
         finally:
             service.stop()
             relay.stop()
@@ -3395,6 +3409,78 @@ class TestRemoteRelayHTTPService:
                 assert False, "expected HTTPError"
             except HTTPError as exc:
                 assert exc.code == 400
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_taskflow_http_api_returns_and_scans_complexity(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "repo"
+        workspace.mkdir()
+        (workspace / "package.json").write_text(
+            '{"dependencies":{"express":"^4.0.0"}}',
+            encoding="utf-8",
+        )
+        routes = workspace / "src" / "routes"
+        routes.mkdir(parents=True)
+        (routes / "users.ts").write_text(
+            "export async function GET() { return Response.json({}) }",
+            encoding="utf-8",
+        )
+
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": str(workspace),
+                    "workspace_root": str(workspace),
+                    "features": ["agent_runs"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows",
+                {
+                    "peer_token": peer_token,
+                    "project_id": "project-1",
+                    "raw_goal": "Expose a public users API.",
+                    "taskflow_id": "taskflow-complexity-scan-http",
+                    "goal_id": "goal-complexity-scan-http",
+                },
+            )
+
+            _, scan_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-complexity-scan-http/complexity/scan-repo",
+                {
+                    "peer_token": peer_token,
+                    "workspace_path": str(workspace),
+                    "repository_id": "repo-http",
+                },
+            )
+            estimate = scan_body["complexity"]["estimate"]
+            assert "interface_impact" in estimate["dominant_dimensions"]
+            assert estimate["scan_refs"]
+            assert any(
+                item["source_type"] == "repo_static_analysis"
+                for item in estimate["evidence"]
+            )
+
+            _, get_body = _json_request(
+                "GET",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-complexity-scan-http/complexity?peer_token={peer_token}",
+            )
+            assert get_body["complexity"]["estimate"]["scan_refs"] == estimate["scan_refs"]
         finally:
             service.stop()
             relay.stop()
