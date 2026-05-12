@@ -110,6 +110,15 @@ class ComplexityAssessmentService:
             signal_evidence=signal_evidence,
             evidence=list(evidence),
             dimension_details=list(estimate.dimension_details),
+            confidence=estimate.confidence,
+            dominant_dimensions=list(estimate.dominant_dimensions),
+            unknown_dimensions=list(estimate.unknown_dimensions),
+            needs_more_evidence=estimate.needs_more_evidence,
+            explanation=estimate.explanation,
+            scan_refs=list(estimate.scan_refs),
+            question_packs=list(estimate.question_packs),
+            plan_slicing_policy=estimate.plan_slicing_policy,
+            dispatch_safety_policy=estimate.dispatch_safety_policy,
             level_floor=estimate.level_floor,
             hard_escalations=list(estimate.hard_escalations),
             recipe_policy_id=policy.policy_id,
@@ -118,9 +127,8 @@ class ComplexityAssessmentService:
             completed_steps=completed_steps,
             skipped_steps=skipped_steps,
             required_artifacts=list(policy.required_artifacts),
-            rationale=(
-                f"Complexity score {estimate.score} selected {policy.recipe_id}."
-            ),
+            rationale=estimate.explanation
+            or f"Complexity score {estimate.score} selected {policy.recipe_id}.",
             overridden_by=state.compiler.complexity_overridden_by,
             override_reason=state.compiler.complexity_override_reason,
         )
@@ -201,6 +209,15 @@ class ComplexityAssessmentService:
             recipe_steps=list(steps),
             dimension_scores=dict(estimate.dimension_scores),
             dimension_details=list(estimate.dimension_details),
+            confidence=estimate.confidence,
+            dominant_dimensions=list(estimate.dominant_dimensions),
+            unknown_dimensions=list(estimate.unknown_dimensions),
+            needs_more_evidence=estimate.needs_more_evidence,
+            explanation=estimate.explanation,
+            scan_refs=list(estimate.scan_refs),
+            question_packs=list(estimate.question_packs),
+            plan_slicing_policy=estimate.plan_slicing_policy,
+            dispatch_safety_policy=estimate.dispatch_safety_policy,
             level_floor=estimate.level_floor,
             hard_escalations=hard_escalations,
         )

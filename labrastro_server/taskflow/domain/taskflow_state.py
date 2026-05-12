@@ -1318,6 +1318,14 @@ class ComplexityEstimateRecord:
     evidence: list[ComplexityEvidenceRecord] = field(default_factory=list)
     dimension_details: list[ComplexityDimensionScore] = field(default_factory=list)
     confidence: float | None = None
+    dominant_dimensions: list[str] = field(default_factory=list)
+    unknown_dimensions: list[str] = field(default_factory=list)
+    needs_more_evidence: bool = False
+    explanation: str = ""
+    scan_refs: list[str] = field(default_factory=list)
+    question_packs: list[str] = field(default_factory=list)
+    plan_slicing_policy: str = ""
+    dispatch_safety_policy: str = ""
     level_floor: str = ""
     hard_escalations: list[str] = field(default_factory=list)
     recipe_policy_id: str = ""
@@ -1358,6 +1366,14 @@ class ComplexityEstimateRecord:
             confidence=(
                 float(data["confidence"]) if data.get("confidence") is not None else None
             ),
+            dominant_dimensions=_string_list(data.get("dominant_dimensions")),
+            unknown_dimensions=_string_list(data.get("unknown_dimensions")),
+            needs_more_evidence=bool(data.get("needs_more_evidence")),
+            explanation=str(data.get("explanation") or ""),
+            scan_refs=_string_list(data.get("scan_refs")),
+            question_packs=_string_list(data.get("question_packs")),
+            plan_slicing_policy=str(data.get("plan_slicing_policy") or ""),
+            dispatch_safety_policy=str(data.get("dispatch_safety_policy") or ""),
             level_floor=str(data.get("level_floor") or ""),
             hard_escalations=_string_list(data.get("hard_escalations")),
             recipe_policy_id=str(data.get("recipe_policy_id") or ""),
@@ -1386,6 +1402,14 @@ class ComplexityEstimateRecord:
             "evidence": [item.to_dict() for item in self.evidence],
             "dimension_details": [item.to_dict() for item in self.dimension_details],
             "confidence": self.confidence,
+            "dominant_dimensions": list(self.dominant_dimensions),
+            "unknown_dimensions": list(self.unknown_dimensions),
+            "needs_more_evidence": bool(self.needs_more_evidence),
+            "explanation": self.explanation,
+            "scan_refs": list(self.scan_refs),
+            "question_packs": list(self.question_packs),
+            "plan_slicing_policy": self.plan_slicing_policy,
+            "dispatch_safety_policy": self.dispatch_safety_policy,
             "level_floor": self.level_floor,
             "hard_escalations": list(self.hard_escalations),
             "recipe_policy_id": self.recipe_policy_id,
