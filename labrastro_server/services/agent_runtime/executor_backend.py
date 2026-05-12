@@ -11,6 +11,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ExecutorType,
     TaskSessionRef,
 )
+from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 
 
 class ExecutorEventType(str, Enum):
@@ -273,6 +274,7 @@ class ReuleauxCoderExecutorBackend:
 
     def start(self, request: ExecutorRunRequest) -> ExecutorRunResult:
         agent = self._create_agent(request)
+        self._bind_memory_scope(request, agent)
         self._active_agents[request.task_id] = agent
         return self._run_agent(request, agent)
 
@@ -289,6 +291,7 @@ class ReuleauxCoderExecutorBackend:
             prompt=prompt,
         )
         agent = self._create_agent(request)
+        self._bind_memory_scope(request, agent)
         if request.executor_session_id:
             setattr(agent, "current_session_id", request.executor_session_id)
         self._active_agents[request.task_id] = agent
@@ -332,6 +335,22 @@ class ReuleauxCoderExecutorBackend:
             output=output,
             executor_session_id=getattr(agent, "current_session_id", None),
             events=events,
+        )
+
+    @staticmethod
+    def _bind_memory_scope(request: ExecutorRunRequest, agent: Any) -> None:
+        metadata = dict(request.metadata or {})
+        bind_memory_scope_to_agent(
+            agent,
+            owner_agent_id=request.agent_id,
+            memory_namespace=request.agent_id,
+            project_id=metadata.get("project_id"),
+            workspace_id=metadata.get("workspace_id") or request.workdir,
+            repo_id=metadata.get("repo_id"),
+            goal_id=metadata.get("goal_id"),
+            task_id=request.task_id,
+            taskflow_id=metadata.get("taskflow_id"),
+            issue_id=request.issue_id,
         )
 
     @staticmethod
