@@ -8,6 +8,10 @@ from labrastro_server.taskflow.application.discovery_service import DiscoverySer
 from labrastro_server.taskflow.application.project_service import ProjectService
 from labrastro_server.taskflow.application.readiness_service import ReadinessService
 from labrastro_server.taskflow.application.review_service import ReviewService
+from labrastro_server.taskflow.application.runtime_projection_service import (
+    TaskRunLivenessService,
+    TaskflowRuntimeProjectionService,
+)
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 __all__ = [
@@ -17,5 +21,7 @@ __all__ = [
     "ProjectService",
     "ReadinessService",
     "ReviewService",
+    "TaskRunLivenessService",
+    "TaskflowRuntimeProjectionService",
     "TaskflowService",
 ]

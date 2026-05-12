@@ -29,8 +29,15 @@ from labrastro_server.taskflow.application.complexity_service import (
 from labrastro_server.taskflow.application.discovery_service import DiscoveryService
 from labrastro_server.taskflow.application.readiness_service import ReadinessService
 from labrastro_server.taskflow.application.review_service import ReviewService
+from labrastro_server.taskflow.application.runtime_projection_service import (
+    TaskflowRuntimeProjectionService,
+)
 from labrastro_server.taskflow.domain.complexity import ComplexityEstimator
 from labrastro_server.taskflow.domain.complexity_signals import ComplexitySignalExtractor
+from labrastro_server.taskflow.domain.repo_static_analysis import (
+    RepoScanSnapshot,
+    RepoStaticAnalyzer,
+)
 from labrastro_server.taskflow.domain.events import append_taskflow_event
 from labrastro_server.taskflow.domain.time import utc_now
 from labrastro_server.taskflow.compiler.plan_compiler import (
@@ -98,11 +105,13 @@ class TaskflowService:
         complexity_estimator: ComplexityEstimator | None = None,
         complexity_signal_extractor: ComplexitySignalExtractor | None = None,
         complexity_service: ComplexityAssessmentService | None = None,
+        repo_static_analyzer: RepoStaticAnalyzer | None = None,
         discovery_service: DiscoveryService | None = None,
         brief_service: BriefService | None = None,
         readiness_service: ReadinessService | None = None,
         review_service: ReviewService | None = None,
         card_renderer: CardRenderer | None = None,
+        runtime_projection_service: TaskflowRuntimeProjectionService | None = None,
         dispatcher: TaskflowDispatcher | None = None,
         state_store: TaskflowStateStore | None = None,
     ) -> None:
@@ -116,11 +125,15 @@ class TaskflowService:
             extractor=self.complexity_signal_extractor,
             estimator=self.complexity_estimator,
         )
+        self.repo_static_analyzer = repo_static_analyzer or RepoStaticAnalyzer()
         self.discovery_service = discovery_service or DiscoveryService()
         self.brief_service = brief_service or BriefService()
         self.readiness_service = readiness_service or ReadinessService()
         self.review_service = review_service or ReviewService()
         self.card_renderer = card_renderer or CardRenderer()
+        self.runtime_projection_service = (
+            runtime_projection_service or TaskflowRuntimeProjectionService()
+        )
         self.dispatcher = dispatcher
         self.state_store = state_store or InMemoryTaskflowStateStore()
         self._compiled_plans: dict[str, PlanDraft] = {}
@@ -349,6 +362,63 @@ class TaskflowService:
         self.brief_service.sync_diagnostics(state)
         self.save_taskflow_state(state)
         return self.get_taskflow_state(taskflow_id)
+
+    def get_complexity_assessment(self, taskflow_id: str) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_project_state(state.meta.project_id)
+        repo_scans: list[Any] = []
+        if project is not None:
+            raw = project.knowledge_base.reusable_context.get("repo_scan_snapshots")
+            repo_scans = list(raw) if isinstance(raw, list) else []
+        estimate = state.compiler.complexity_estimate
+        return {
+            "estimate": estimate.to_dict() if estimate is not None else None,
+            "readiness_gates": [gate.to_dict() for gate in state.compiler.readiness_gates],
+            "required_artifacts": list(state.compiler.required_artifacts),
+            "repo_scans": repo_scans,
+        }
+
+    def scan_repo_complexity(
+        self,
+        taskflow_id: str,
+        *,
+        workspace_path: str | None = None,
+        repository_id: str = "",
+    ) -> TaskflowState:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        snapshot = self.repo_static_analyzer.scan(
+            workspace_path=workspace_path,
+            repository_id=repository_id,
+            goal_hints=[
+                state.intent.goal_statement,
+                *state.intent.success_criteria,
+                *state.intent.scope_in,
+            ],
+        )
+        self._record_repo_scan_snapshot(project, snapshot)
+        self.project_service.save_project_state(project)
+        self._refresh_derived_state(state, project)
+        self.brief_service.compile_draft(state, actor="repo_static_analyzer")
+        self._refresh_derived_state(state, project)
+        self.brief_service.sync_diagnostics(state)
+        self.save_taskflow_state(state)
+        return self.get_taskflow_state(taskflow_id)
+
+    def _record_repo_scan_snapshot(
+        self, project: ProjectState, snapshot: RepoScanSnapshot
+    ) -> None:
+        context = project.knowledge_base.reusable_context
+        raw = context.get("repo_scan_snapshots")
+        snapshots = list(raw) if isinstance(raw, list) else []
+        next_snapshot = snapshot.to_dict()
+        for index, item in enumerate(snapshots):
+            if isinstance(item, dict) and item.get("id") == snapshot.id:
+                snapshots[index] = next_snapshot
+                break
+        else:
+            snapshots.append(next_snapshot)
+        context["repo_scan_snapshots"] = snapshots[-20:]
 
     def record_rule_example(
         self,
@@ -854,6 +924,24 @@ class TaskflowService:
 
         return self.card_renderer.render(self.get_taskflow_state(taskflow_id))
 
+    def get_runtime_projection(
+        self,
+        taskflow_id: str,
+        *,
+        runtime_control_plane: Any | None = None,
+        event_limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return Taskflow TaskRun runtime state projected from ProjectState."""
+
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        return self.runtime_projection_service.project(
+            taskflow=state,
+            project=project,
+            runtime_control_plane=runtime_control_plane,
+            event_limit=event_limit,
+        )
+
     def _load_project_context(self, state: TaskflowState, project: ProjectState) -> None:
         state.refs.project_context_refs = [
             "project_profile",
@@ -983,6 +1071,8 @@ class TaskflowService:
             "filtered": list(result.filtered),
             "score_summary": dict(result.score_summary),
         }
+        if result.agent_run_ref:
+            run.metadata["agent_run_ref"] = dict(result.agent_run_ref)
         if result.selected_executor_id:
             run.status = TaskRunStatus.DISPATCHED
             run.metadata["selected_executor_id"] = result.selected_executor_id
