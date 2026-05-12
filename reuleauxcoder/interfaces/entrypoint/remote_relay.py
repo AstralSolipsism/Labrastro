@@ -23,6 +23,7 @@ from reuleauxcoder.app.runtime.agent_runtime import (
     get_interactive_run_limiter,
 )
 from reuleauxcoder.domain.agent.agent import Agent
+from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 from reuleauxcoder.domain.approval import (
     ApprovalDecision,
@@ -850,6 +851,11 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if server_mcp_tools:
             peer_agent.add_tools(server_mcp_tools)
         setattr(peer_agent, "runtime_config", current_config)
+        bind_memory_scope_to_agent(
+            peer_agent,
+            owner_agent_id=f"peer:{peer_id}",
+            memory_namespace=f"peer:{peer_id}",
+        )
         if runner._relay_http_service is not None:
             setattr(
                 peer_agent,
@@ -995,6 +1001,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "taskflow_started", {"taskflow": state.to_dict()}
                 )
             setattr(peer_agent, "workflow_mode", TASKFLOW_WORKFLOW_MODE)
+            setattr(peer_agent, "memory_project_id", f"peer-{peer_id}")
+            setattr(peer_agent, "memory_taskflow_id", taskflow_id)
             setattr(
                 peer_agent,
                 "workflow_prompt_append",

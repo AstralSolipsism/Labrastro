@@ -20,6 +20,7 @@ from reuleauxcoder.domain.hooks.types import (
     BeforeToolExecuteContext,
     HookPoint,
 )
+from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from reuleauxcoder.extensions.tools.registry import get_tool
 
 
@@ -63,7 +64,9 @@ class ToolExecutor:
             hook_point=HookPoint.BEFORE_TOOL_EXECUTE,
             tool_call=tc,
             round_index=self.agent.state.current_round,
+            session_id=getattr(self.agent, "current_session_id", None),
             metadata={
+                **memory_metadata_from_agent(self.agent),
                 "tool_source": getattr(
                     tool, "tool_source", "builtin" if tool is not None else "unknown"
                 ),
@@ -200,6 +203,14 @@ class ToolExecutor:
                 tool_call=tool_call,
                 result=result,
                 round_index=self.agent.state.current_round,
+                session_id=getattr(self.agent, "current_session_id", None),
+                metadata={
+                    **memory_metadata_from_agent(self.agent),
+                    "tool_source": getattr(
+                        tool, "tool_source", "builtin" if tool is not None else "unknown"
+                    ),
+                    "mcp_server": getattr(tool, "server_name", None),
+                },
             )
             after_context = self.agent.hook_registry.run_transforms(
                 HookPoint.AFTER_TOOL_EXECUTE,

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from reuleauxcoder.domain.llm.models import LLMResponse
 
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
+from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 
 
 class AgentLoop:
@@ -190,6 +191,7 @@ class AgentLoop:
                 hook_registry=self.agent.hook_registry,
                 session_id=getattr(self.agent, "current_session_id", None),
                 metadata={
+                    **memory_metadata_from_agent(self.agent),
                     "round_index": round_num,
                     "active_mode": self.agent.active_mode,
                     "pending_tool_calls": len(self.agent._collect_pending_tool_calls()),
@@ -304,6 +306,7 @@ class AgentLoop:
             hook_registry=self.agent.hook_registry,
             session_id=getattr(self.agent, "current_session_id", None),
             metadata={
+                **memory_metadata_from_agent(self.agent),
                 "round_index": self.agent.state.current_round,
                 "active_mode": self.agent.active_mode,
                 "summary_phase": True,

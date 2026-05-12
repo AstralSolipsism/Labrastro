@@ -32,6 +32,7 @@ from reuleauxcoder.domain.hooks import (
     discover_hook_specs,
     instantiate_hooks,
 )
+from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 from reuleauxcoder.extensions.mcp.manager import MCPManager
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
@@ -146,6 +147,12 @@ class AppRunner:
         setattr(agent, "runtime_config", config)
         setattr(agent, "current_session_id", None)
         setattr(agent, "session_fingerprint", get_session_fingerprint(config, agent))
+        bind_memory_scope_to_agent(
+            agent,
+            owner_agent_id=getattr(config.memory, "default_agent_id", "core"),
+            memory_namespace=getattr(config.memory, "default_namespace", "") or None,
+            workspace_id=str(Path.cwd()),
+        )
         agent.context._ui_bus = ui_bus
 
         self._register_hooks(agent, config)
