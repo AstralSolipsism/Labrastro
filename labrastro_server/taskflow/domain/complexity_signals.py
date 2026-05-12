@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from labrastro_server.taskflow.domain.project_state import ProjectState
+from labrastro_server.taskflow.domain.repo_static_analysis import RepoScanSnapshot
 from labrastro_server.taskflow.domain.taskflow_state import (
     ComplexityEvidenceRecord,
     TaskflowState,
@@ -285,7 +286,7 @@ class ComplexitySignalExtractor:
             add(
                 "business_impact",
                 "project",
-                project.meta.project_id,
+                project.project_id,
                 1,
                 "Multiple stakeholders.",
                 source_path="project.project_profile.stakeholders",
@@ -314,10 +315,17 @@ class ComplexitySignalExtractor:
             add(
                 "org_collaboration",
                 "project",
-                project.meta.project_id,
+                project.project_id,
                 1,
                 "Multiple repositories.",
                 source_path="project.project_profile.repositories",
+            )
+
+        for snapshot in self._repo_scan_snapshots(project):
+            evidence.extend(
+                snapshot.to_evidence(
+                    brief_version=state.outputs.current_brief_version,
+                )
             )
 
         if any(item.dimension == "data_impact" and item.score_delta >= 2 for item in evidence) or any(
@@ -333,6 +341,16 @@ class ComplexitySignalExtractor:
             )
 
         return evidence
+
+    def _repo_scan_snapshots(self, project: ProjectState) -> list[RepoScanSnapshot]:
+        raw = project.knowledge_base.reusable_context.get("repo_scan_snapshots")
+        if not isinstance(raw, list):
+            return []
+        snapshots: list[RepoScanSnapshot] = []
+        for item in raw:
+            if isinstance(item, dict):
+                snapshots.append(RepoScanSnapshot.from_dict(item))
+        return snapshots
 
 
 __all__ = ["ComplexitySignalExtractor", "ComplexitySignals"]
