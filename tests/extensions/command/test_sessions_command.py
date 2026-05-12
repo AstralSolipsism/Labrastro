@@ -2,7 +2,9 @@
 from types import SimpleNamespace
 
 from reuleauxcoder.domain.config.models import ApprovalConfig, Config
+from reuleauxcoder.domain.hooks.base import ObserverHook
 from reuleauxcoder.domain.hooks.registry import HookRegistry
+from reuleauxcoder.domain.hooks.types import HookPoint, SessionSaveContext
 from reuleauxcoder.domain.session.models import SessionRuntimeState
 from reuleauxcoder.extensions.command.builtin.sessions import (
     ListSessionsCommand,
@@ -214,3 +216,32 @@ def test_manual_save_ignores_auto_save_disabled(tmp_path: Path) -> None:
     loaded = SessionStore(tmp_path).load(result.session_id)
     assert loaded is not None
     assert loaded.messages[0]["content"] == "manual"
+
+
+def test_session_save_hooks_receive_full_session_data(tmp_path: Path) -> None:
+    captured: list[dict] = []
+
+    class CaptureSessionSave(ObserverHook[SessionSaveContext]):
+        def run(self, context: SessionSaveContext) -> None:
+            captured.append(dict(context.session_data))
+
+    ctx = _build_ctx(tmp_path)
+    ctx.agent.messages.append({"role": "user", "content": "capture me"})
+    ctx.agent.state.total_prompt_tokens = 3
+    ctx.agent.state.total_completion_tokens = 5
+    ctx.agent.active_mode = "coder"
+    ctx.agent.hook_registry.register(
+        HookPoint.SESSION_SAVE, CaptureSessionSave(name="capture_session_save")
+    )
+
+    result = _handle_save_session(SaveSessionCommand(), ctx)
+
+    assert result.session_id
+    assert captured
+    assert captured[0]["session_id"] == result.session_id
+    assert captured[0]["messages"][0]["content"] == "capture me"
+    assert captured[0]["model"] == "base-model"
+    assert captured[0]["active_mode"] == "coder"
+    assert captured[0]["total_prompt_tokens"] == 3
+    assert captured[0]["total_completion_tokens"] == 5
+    assert captured[0]["fingerprint"] == "local"
