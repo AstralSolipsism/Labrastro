@@ -633,6 +633,44 @@ class ContextConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """Agent-scoped private memory provider configuration."""
+
+    enabled: bool = True
+    backend: str = "sqlite"
+    store_path: str = ".rcoder/memory.sqlite3"
+    default_agent_id: str = "core"
+    default_namespace: str = ""
+    token_budget: int = 800
+    capture_enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            backend=str(data.get("backend", "sqlite") or "sqlite"),
+            store_path=str(data.get("store_path", ".rcoder/memory.sqlite3") or ".rcoder/memory.sqlite3"),
+            default_agent_id=str(data.get("default_agent_id", "core") or "core"),
+            default_namespace=str(data.get("default_namespace", "") or ""),
+            token_budget=int(data.get("token_budget", 800) or 800),
+            capture_enabled=bool(data.get("capture_enabled", True)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "backend": self.backend,
+            "store_path": self.store_path,
+            "default_agent_id": self.default_agent_id,
+            "default_namespace": self.default_namespace,
+            "token_budget": self.token_budget,
+            "capture_enabled": self.capture_enabled,
+        }
+
+
+@dataclass
 class RemoteExecConfig:
     """Remote execution relay configuration."""
 
@@ -1302,6 +1340,9 @@ class Config:
     # Context compression settings
     context: ContextConfig = field(default_factory=ContextConfig)
 
+    # Agent-scoped private memory settings
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+
     # Remote execution settings
     remote_exec: RemoteExecConfig = field(default_factory=RemoteExecConfig)
 
@@ -1344,6 +1385,18 @@ class Config:
             errors.append("tool_output_max_chars must be positive")
         if self.tool_output_max_lines < 1:
             errors.append("tool_output_max_lines must be positive")
+        if self.memory.backend not in {"sqlite", "postgres", "memory"}:
+            errors.append("memory.backend must be one of sqlite, postgres, memory")
+        if self.memory.enabled and not self.memory.default_agent_id.strip():
+            errors.append("memory.default_agent_id is required when memory.enabled is true")
+        if (
+            self.memory.enabled
+            and self.memory.backend == "postgres"
+            and not self.persistence.database_url
+        ):
+            errors.append("memory.backend postgres requires persistence.database_url")
+        if self.memory.token_budget < 1:
+            errors.append("memory.token_budget must be positive")
         if self.run_limits.max_running_agents < 1:
             errors.append("run_limits.max_running_agents must be positive")
         if self.run_limits.max_shells_per_agent < 1:

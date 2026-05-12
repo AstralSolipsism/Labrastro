@@ -18,6 +18,7 @@ from reuleauxcoder.domain.config.models import (
     EnvironmentSkillConfig,
     GitHubConfig,
     CapabilityPackageConfig,
+    MemoryConfig,
     MCPServerConfig,
     ModeConfig,
     ModelProfileConfig,
@@ -362,6 +363,7 @@ class ConfigLoader:
         skills_config = data.get("skills", {})
         prompt_config = data.get("prompt", {})
         context_config = data.get("context", {})
+        memory_config = data.get("memory", {})
         remote_exec_config = data.get("remote_exec", {})
         auth_config = data.get("auth", {})
         agent_registry_config = data.get("agent_registry", {})
@@ -555,6 +557,9 @@ class ConfigLoader:
                 token_fudge_factor=context_config.get(
                     "token_fudge_factor", DEFAULTS["token_fudge_factor"]
                 ),
+            ),
+            memory=MemoryConfig.from_dict(
+                memory_config if isinstance(memory_config, dict) else {}
             ),
             remote_exec=RemoteExecConfig(
                 enabled=bool(remote_exec_config.get("enabled", False)),

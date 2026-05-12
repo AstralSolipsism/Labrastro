@@ -89,6 +89,15 @@ CONFIG_SCHEMA = {
         "snip_min_lines": "int (default: 6, min line count to trigger snip)",
         "summarize_keep_recent_turns": "int (default: 5, number of recent user turns to protect during summarize)",
     },
+    "memory": {
+        "enabled": "bool (default: true, ReuleauxCoder core executor private memory provide)",
+        "backend": "string (one of sqlite, postgres, memory; default sqlite)",
+        "store_path": "string (default: .rcoder/memory.sqlite3 for sqlite development backend)",
+        "default_agent_id": "string (default: core, stable owner for direct core chats)",
+        "default_namespace": "string (optional, defaults to owner_agent_id)",
+        "token_budget": "int (default: 800, max private memory tokens injected per request)",
+        "capture_enabled": "bool (default: true, enqueue session/tool capture jobs)",
+    },
     "mcp": {
         "servers": {
             "server_name": {
