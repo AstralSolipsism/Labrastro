@@ -50,6 +50,23 @@ class RemoteTaskflowRoutes:
             if (
                 len(parts) == 5
                 and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "complexity"
+            ):
+                state = self.service.taskflow_service.get_taskflow_state(parts[3])
+                _assert_taskflow_peer(state, peer_id)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "complexity": self.service.taskflow_service.get_complexity_assessment(
+                            parts[3]
+                        ),
+                    },
+                )
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
                 and parts[4] == "review-cards"
             ):
                 state = self.service.taskflow_service.get_taskflow_state(parts[3])
@@ -59,6 +76,19 @@ class RemoteTaskflowRoutes:
                     HTTPStatus.OK,
                     {"ok": True, "review_cards": [card.to_dict() for card in cards]},
                 )
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "runtime"
+            ):
+                state = self.service.taskflow_service.get_taskflow_state(parts[3])
+                _assert_taskflow_peer(state, peer_id)
+                projection = self.service.taskflow_service.get_runtime_projection(
+                    parts[3],
+                    runtime_control_plane=self.service.runtime_control_plane,
+                )
+                self._send_json(HTTPStatus.OK, projection)
                 return
         except KeyError as exc:
             self._send_json(
@@ -282,12 +312,28 @@ class RemoteTaskflowRoutes:
                     state = self.service.taskflow_service.refresh_complexity_assessment(
                         taskflow_id
                     )
+                elif parts[5] == "scan-repo":
+                    state = self.service.taskflow_service.scan_repo_complexity(
+                        taskflow_id,
+                        workspace_path=(
+                            str(payload["workspace_path"])
+                            if payload.get("workspace_path") is not None
+                            else None
+                        ),
+                        repository_id=str(payload.get("repository_id") or ""),
+                    )
                 else:
                     state = None
                 if state is not None:
                     self._send_json(
                         HTTPStatus.OK,
-                        {"ok": True, "taskflow": state.to_dict()},
+                        {
+                            "ok": True,
+                            "taskflow": state.to_dict(),
+                            "complexity": self.service.taskflow_service.get_complexity_assessment(
+                                taskflow_id
+                            ),
+                        },
                     )
                     return
             if (
