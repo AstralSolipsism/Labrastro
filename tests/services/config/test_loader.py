@@ -68,6 +68,30 @@ def test_parse_config_defaults_session_auto_save_enabled() -> None:
     assert config.session_auto_save is True
 
 
+def test_parse_config_reads_memory_provider_settings() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "memory": {
+                "enabled": True,
+                "backend": "sqlite",
+                "store_path": ".rcoder/test-memory.sqlite3",
+                "default_agent_id": "core",
+                "default_namespace": "core-private",
+                "token_budget": 512,
+                "capture_enabled": True,
+            }
+        }
+    )
+
+    assert config.memory.enabled is True
+    assert config.memory.backend == "sqlite"
+    assert config.memory.store_path == ".rcoder/test-memory.sqlite3"
+    assert config.memory.default_agent_id == "core"
+    assert config.memory.default_namespace == "core-private"
+    assert config.memory.token_budget == 512
+    assert config.memory.capture_enabled is True
+
+
 def test_host_config_keeps_session_auto_save_enabled() -> None:
     config_path = Path(__file__).resolve().parents[3] / "docker" / "config.host.yaml"
     data = ConfigLoader()._load_yaml(config_path)
