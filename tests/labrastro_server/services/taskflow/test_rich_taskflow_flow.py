@@ -4,13 +4,20 @@ import pytest
 
 from labrastro_server.taskflow.application.project_service import ProjectService
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
-from labrastro_server.taskflow.domain.project_state import ProjectState, TraceEntityType, WorkItemType
+from labrastro_server.taskflow.domain.project_state import (
+    ProjectState,
+    RepositoryRef,
+    Stakeholder,
+    TraceEntityType,
+    WorkItemType,
+)
 from labrastro_server.taskflow.domain.taskflow_state import (
     BriefStatus,
     DecisionOption,
     RiskRecord,
     TaskflowEventType,
 )
+from labrastro_server.taskflow.ports.dispatch import TaskflowDispatchResult
 
 
 def _service() -> TaskflowService:
@@ -19,6 +26,98 @@ def _service() -> TaskflowService:
         ProjectState.new(project_id="project-1", name="Taskflow")
     )
     return TaskflowService(project_service=project_service)
+
+
+class _FakeDispatcher:
+    def dispatch_task_run(
+        self,
+        task_run,
+        *,
+        executor_hint: str | None = None,
+        metadata: dict | None = None,
+    ) -> TaskflowDispatchResult:
+        return TaskflowDispatchResult(
+            selected_executor_id="agent-1",
+            reason="agent_run_submitted",
+            agent_run_ref={
+                "id": f"agent-run-{task_run.id}",
+                "status": "queued",
+                "agent_id": "agent-1",
+            },
+        )
+
+
+class _FakeRuntimeControlPlane:
+    def load_agent_run_detail(self, task_id: str, *, event_limit: int = 50) -> dict:
+        return {
+            "agent_run": {
+                "id": task_id,
+                "task_id": task_id,
+                "agent_id": "agent-1",
+                "status": "running",
+            },
+            "events": [
+                {
+                    "id": "event-1",
+                    "event_type": "started",
+                    "message": "Agent run started.",
+                }
+            ],
+            "artifacts": [
+                {
+                    "id": "artifact-1",
+                    "type": "log",
+                    "title": "Runtime log",
+                    "uri": "memory://runtime-log",
+                }
+            ],
+            "claim": {"status": "active"},
+            "session": {"id": "session-1"},
+        }
+
+
+def _prepare_dispatchable_taskflow(
+    service: TaskflowService,
+    *,
+    taskflow_id: str = "taskflow-1",
+):
+    state = service.start_taskflow(
+        project_id="project-1",
+        raw_goal="Dispatch observable taskflow work.",
+        taskflow_id=taskflow_id,
+        goal_id="goal-1",
+    )
+    service.record_discovery_turn(
+        state.meta.taskflow_id,
+        work_item_candidates=[
+            {
+                "id": "candidate-1",
+                "title": "Implement runtime projection",
+                "description": "Show TaskRun and AgentRun state in Taskflow.",
+                "acceptance_refs": ["acceptance-runtime"],
+            }
+        ],
+        examples=[
+            {
+                "id": "acceptance-runtime",
+                "title": "Runtime projection accepted",
+                "then": ["The Taskflow panel shows live execution state."],
+            }
+        ],
+    )
+    service.confirm_goal(state.meta.taskflow_id)
+    plan = service.compile_goal(state.meta.taskflow_id)
+    decision = service.request_dispatch_decision(
+        state.meta.taskflow_id,
+        work_item_ids=[plan.work_item_candidates[0].work_item_id],
+        actor="user",
+    )
+    service.confirm_dispatch_decision(
+        state.meta.taskflow_id,
+        decision_id=decision.id,
+        actor="user",
+    )
+    return state, plan, decision
 
 
 def test_discovery_turn_answer_decision_and_confirmed_brief_compile_to_acceptance_metadata() -> None:
@@ -439,6 +538,65 @@ def test_dispatch_can_reconstruct_plan_from_persisted_state_after_service_rebuil
     assert run.dispatch_ref_id == dispatch_decision.id
 
 
+def test_runtime_projection_links_task_run_work_item_decision_agent_events_and_artifacts() -> None:
+    project_service = ProjectService()
+    project_service.save_project_state(
+        ProjectState.new(project_id="project-1", name="Taskflow")
+    )
+    service = TaskflowService(
+        project_service=project_service,
+        dispatcher=_FakeDispatcher(),
+    )
+    state, plan, decision = _prepare_dispatchable_taskflow(service)
+    run = service.dispatch_task_run(
+        state.meta.taskflow_id,
+        work_item_id=plan.work_item_candidates[0].work_item_id,
+        dispatch_decision_id=decision.id,
+    )
+
+    projection = service.get_runtime_projection(
+        state.meta.taskflow_id,
+        runtime_control_plane=_FakeRuntimeControlPlane(),
+    )
+
+    assert projection["ok"] is True
+    assert projection["taskflow_id"] == state.meta.taskflow_id
+    assert projection["liveness_summary"]["counts"]["running"] == 1
+    item = projection["task_runs"][0]
+    assert item["task_run"]["id"] == run.id
+    assert item["work_item"]["id"] == plan.work_item_candidates[0].work_item_id
+    assert item["dispatch_decision"]["id"] == decision.id
+    assert item["agent_run"]["id"] == f"agent-run-{run.id}"
+    assert item["events"][0]["event_type"] == "started"
+    assert item["artifacts"][0]["id"] == "artifact-1"
+    assert item["liveness"]["state"] == "running"
+
+
+def test_runtime_projection_keeps_pending_task_run_visible_without_runtime_control_plane() -> None:
+    service = _service()
+    state, plan, decision = _prepare_dispatchable_taskflow(
+        service,
+        taskflow_id="taskflow-no-runtime",
+    )
+    run = service.dispatch_task_run(
+        state.meta.taskflow_id,
+        work_item_id=plan.work_item_candidates[0].work_item_id,
+        dispatch_decision_id=decision.id,
+    )
+
+    projection = service.get_runtime_projection(state.meta.taskflow_id)
+
+    assert projection["ok"] is True
+    assert projection["liveness_summary"]["counts"]["agent_selection_required"] == 1
+    item = projection["task_runs"][0]
+    assert item["task_run"]["id"] == run.id
+    assert item["agent_run"] is None
+    assert item["events"] == []
+    assert item["artifacts"] == []
+    assert item["liveness"]["state"] == "agent_selection_required"
+    assert item["liveness"]["reason"]
+
+
 def test_plugin_goal_gets_evidence_based_l1_complexity_floor() -> None:
     service = _service()
     state = service.start_taskflow(
@@ -561,3 +719,110 @@ def test_complexity_override_records_rationale_and_versions_brief() -> None:
     assert "governance" in estimate.override_reason
     assert updated.outputs.current_brief_version != before
     assert updated.outputs.brief_versions[-1].complexity_estimate["level"] == "L3"
+
+
+def test_project_topology_signals_use_project_id_without_meta_attribute() -> None:
+    project = ProjectState.new(project_id="project-1", name="Taskflow")
+    project.project_profile.stakeholders.extend(
+        [
+            Stakeholder(id="product", name="Product"),
+            Stakeholder(id="ops", name="Ops"),
+        ]
+    )
+    project.project_profile.repositories.extend(
+        [
+            RepositoryRef(id="api", name="api"),
+            RepositoryRef(id="web", name="web"),
+        ]
+    )
+    project_service = ProjectService()
+    project_service.save_project_state(project)
+    service = TaskflowService(project_service=project_service)
+
+    state = service.start_taskflow(
+        project_id="project-1",
+        raw_goal="Coordinate a cross-repository rollout.",
+        taskflow_id="taskflow-topology",
+        goal_id="goal-topology",
+    )
+
+    estimate = state.compiler.complexity_estimate
+    assert estimate is not None
+    assert any(
+        item.source_type == "project" and item.source_id == "project-1"
+        for item in estimate.evidence
+    )
+    assert "org_collaboration" in estimate.dimension_scores
+
+
+def test_repo_static_scan_becomes_formal_complexity_evidence(tmp_path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        '{"scripts":{"test":"vitest"},"dependencies":{"express":"^4.0.0"}}',
+        encoding="utf-8",
+    )
+    (workspace / "tsconfig.json").write_text("{}", encoding="utf-8")
+    routes = workspace / "src" / "routes"
+    routes.mkdir(parents=True)
+    (routes / "users.ts").write_text(
+        "export async function GET() { return Response.json({ ok: true }) }\n",
+        encoding="utf-8",
+    )
+    migrations = workspace / "migrations"
+    migrations.mkdir()
+    (migrations / "001_add_users.sql").write_text(
+        "ALTER TABLE users ADD COLUMN nickname text;\n",
+        encoding="utf-8",
+    )
+    workflow = workspace / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "deploy.yml").write_text("name: deploy\n", encoding="utf-8")
+
+    service = _service()
+    state = service.start_taskflow(
+        project_id="project-1",
+        raw_goal="Add a public user profile API with a schema migration and rollout.",
+        taskflow_id="taskflow-repo-scan",
+        goal_id="goal-repo-scan",
+    )
+
+    scanned = service.scan_repo_complexity(
+        state.meta.taskflow_id,
+        workspace_path=str(workspace),
+        repository_id="repo-main",
+    )
+    estimate = scanned.compiler.complexity_estimate
+
+    assert estimate is not None
+    assert estimate.scan_refs
+    assert {"interface_impact", "data_impact", "ops_impact"}.issubset(
+        set(estimate.dominant_dimensions)
+    )
+    assert {"api_contract", "migration_plan", "runbook"}.issubset(
+        set(estimate.required_artifacts)
+    )
+    assert estimate.confidence is not None and estimate.confidence >= 0.5
+    assert "repo static analysis" in estimate.explanation.lower()
+    assert any(
+        item.source_type == "repo_static_analysis"
+        and item.metadata.get("repository_id") == "repo-main"
+        for item in estimate.evidence
+    )
+
+
+def test_complexity_control_plane_reports_unknown_dimensions() -> None:
+    service = _service()
+    state = service.start_taskflow(
+        project_id="project-1",
+        raw_goal="Make the workflow better.",
+        taskflow_id="taskflow-unknowns",
+        goal_id="goal-unknowns",
+    )
+
+    estimate = state.compiler.complexity_estimate
+
+    assert estimate is not None
+    assert estimate.needs_more_evidence is True
+    assert "interface_impact" in estimate.unknown_dimensions
+    assert "evidence" in estimate.explanation.lower()
