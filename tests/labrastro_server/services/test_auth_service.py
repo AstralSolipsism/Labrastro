@@ -54,6 +54,35 @@ def _service(tmp_path: Path, *, access_ttl: int = 900) -> tuple[AuthService, Fil
     return service, store
 
 
+def test_bootstrap_token_passes_principal_claims(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def issue_bootstrap_token(ttl: int, claims: dict | None = None) -> str:
+        captured["ttl"] = ttl
+        captured["claims"] = dict(claims or {})
+        return f"bt_claims_{ttl}"
+
+    store = FileAuthStore(tmp_path / "auth.json")
+    service = AuthService(
+        _config(tmp_path / "auth.json"),
+        store,
+        issue_bootstrap_token=issue_bootstrap_token,
+    )
+    session = service.login("admin", TEST_PASSWORD, "VS Code")
+
+    result = service.bootstrap_token(session.principal, 123)
+
+    assert result["bootstrap_token"] == "bt_claims_123"
+    assert captured["ttl"] == 123
+    assert captured["claims"] == {
+        "user_id": session.principal.user_id,
+        "username": "admin",
+        "role": "superadmin",
+        "device_id": session.principal.device_id,
+        "scopes": list(session.principal.effective_scopes()),
+    }
+
+
 def test_password_hash_and_token_hash_are_verifiable_without_raw_secret() -> None:
     password_hash = hash_password(TEST_PASSWORD, iterations=1000)
 

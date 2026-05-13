@@ -50,6 +50,25 @@ class TestRegistration:
         finally:
             srv.stop()
 
+    def test_register_carries_bootstrap_claims_into_peer_meta(self) -> None:
+        srv = RelayServer()
+        srv.start()
+        try:
+            bt = srv.issue_bootstrap_token(
+                ttl_sec=60,
+                claims={"user_id": "u1", "username": "alice", "device_id": "d1"},
+            )
+            resp = srv._on_register(RegisterRequest(bootstrap_token=bt, cwd="/tmp"))
+            peer = srv.registry.get(resp.peer_id)
+            assert peer is not None
+            assert peer.meta["auth_principal"] == {
+                "user_id": "u1",
+                "username": "alice",
+                "device_id": "d1",
+            }
+        finally:
+            srv.stop()
+
     def test_register_uses_configured_peer_token_ttl(self) -> None:
         srv = RelayServer(peer_token_ttl_sec=0)
         srv.start()

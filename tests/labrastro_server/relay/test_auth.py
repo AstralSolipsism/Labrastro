@@ -14,23 +14,35 @@ class TestBootstrapToken:
         tm = TokenManager()
         token = tm.issue_bootstrap_token(ttl_sec=300)
         assert token.startswith("bt_")
-        assert tm.consume_bootstrap_token(token) is True
+        assert tm.consume_bootstrap_token(token) == {}
+
+    def test_issue_and_consume_with_claims(self) -> None:
+        tm = TokenManager()
+        token = tm.issue_bootstrap_token(
+            ttl_sec=300,
+            claims={"user_id": "u1", "username": "alice", "device_id": "d1"},
+        )
+        assert tm.consume_bootstrap_token(token) == {
+            "user_id": "u1",
+            "username": "alice",
+            "device_id": "d1",
+        }
 
     def test_consume_twice_fails(self) -> None:
         tm = TokenManager()
         token = tm.issue_bootstrap_token(ttl_sec=300)
-        assert tm.consume_bootstrap_token(token) is True
-        assert tm.consume_bootstrap_token(token) is False
+        assert tm.consume_bootstrap_token(token) == {}
+        assert tm.consume_bootstrap_token(token) is None
 
     def test_expired_token_fails(self) -> None:
         tm = TokenManager()
         token = tm.issue_bootstrap_token(ttl_sec=0)
         time.sleep(0.05)
-        assert tm.consume_bootstrap_token(token) is False
+        assert tm.consume_bootstrap_token(token) is None
 
     def test_unknown_token_fails(self) -> None:
         tm = TokenManager()
-        assert tm.consume_bootstrap_token("bt_nope") is False
+        assert tm.consume_bootstrap_token("bt_nope") is None
 
     def test_no_plaintext_in_mask(self) -> None:
         tm = TokenManager()
@@ -92,7 +104,7 @@ class TestPruneExpired:
         time.sleep(0.05)
         removed = tm.prune_expired()
         assert removed == 2
-        assert tm.consume_bootstrap_token(bt) is False
+        assert tm.consume_bootstrap_token(bt) is None
         assert tm.verify_peer_token(pt) is None
 
     def test_keeps_valid(self) -> None:
@@ -101,5 +113,5 @@ class TestPruneExpired:
         pt = tm.issue_peer_token("p1", ttl_sec=3600)
         removed = tm.prune_expired()
         assert removed == 0
-        assert tm.consume_bootstrap_token(bt) is True
+        assert tm.consume_bootstrap_token(bt) == {}
         assert tm.verify_peer_token(pt) == "p1"
