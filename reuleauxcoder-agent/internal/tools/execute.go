@@ -37,33 +37,37 @@ func Execute(
 	currentCWD string,
 	onStream func(protocol.ToolStreamChunk),
 ) protocol.ExecToolResult {
-	return ExecuteWithContext(context.Background(), req, currentCWD, onStream)
+	return ExecuteWithContext(context.Background(), req, currentCWD, currentCWD, onStream)
 }
 
 func ExecuteWithContext(
 	ctx context.Context,
 	req protocol.ExecToolRequest,
 	currentCWD string,
+	workspaceRoot string,
 	onStream func(protocol.ToolStreamChunk),
 ) protocol.ExecToolResult {
 	cwd, staleWarning := resolveRequestedCWD(currentCWD, req.CWD)
 
+	var result protocol.ExecToolResult
 	switch req.ToolName {
 	case "shell":
-		return prependWarning(runShell(ctx, req.Args, cwd, req.TimeoutSec, onStream), staleWarning)
+		result = runShell(ctx, req.Args, cwd, req.TimeoutSec, onStream)
 	case "read_file":
-		return prependWarning(readFile(req.Args, cwd), staleWarning)
+		result = readFile(req.Args, cwd)
 	case "write_file":
-		return prependWarning(writeFile(req.Args, cwd, req.ExpectedState), staleWarning)
+		result = writeFile(req.Args, cwd, req.ExpectedState)
 	case "edit_file":
-		return prependWarning(editFile(req.Args, cwd, req.ExpectedState), staleWarning)
+		result = editFile(req.Args, cwd, req.ExpectedState)
 	case "glob":
-		return prependWarning(globFiles(req.Args, cwd), staleWarning)
+		result = globFiles(req.Args, cwd)
 	case "grep":
-		return prependWarning(grepFiles(req.Args, cwd), staleWarning)
+		result = grepFiles(req.Args, cwd)
 	default:
-		return errorResult("REMOTE_TOOL_ERROR", fmt.Sprintf("unsupported tool %q", req.ToolName))
+		result = errorResult("REMOTE_TOOL_ERROR", fmt.Sprintf("unsupported tool %q", req.ToolName))
 	}
+	result = prependWarning(result, staleWarning)
+	return finalizeToolResult(req, result, workspaceRoot)
 }
 
 func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPreviewResult {
@@ -255,7 +259,6 @@ func runShell(
 	if strings.TrimSpace(out) == "" {
 		out = "(no output)"
 	}
-	out = truncateOutput(out)
 	return protocol.ExecToolResult{OK: true, Result: out, Meta: map[string]any{"exit_code": exitCode}}
 }
 
@@ -333,16 +336,94 @@ func commonGitBashPaths() []string {
 }
 
 const maxOutputChars = 15_000
-const keepHeadChars = 6_000
-const keepTailChars = 3_000
+const maxOutputLines = 2_000
 
-func truncateOutput(out string) string {
-	if len(out) <= maxOutputChars {
-		return out
+func finalizeToolResult(req protocol.ExecToolRequest, result protocol.ExecToolResult, workspaceRoot string) protocol.ExecToolResult {
+	if !result.OK || result.Result == "" {
+		return result
 	}
-	return out[:keepHeadChars] +
-		fmt.Sprintf("\n\n... truncated (%d chars total) ...\n\n", len(out)) +
-		out[len(out)-keepTailChars:]
+	if shouldBypassOutputFinalizer(req) {
+		return result
+	}
+	lineCount := len(strings.Split(result.Result, "\n"))
+	charCount := len(result.Result)
+	if lineCount <= maxOutputLines && charCount <= maxOutputChars {
+		return result
+	}
+	if strings.TrimSpace(workspaceRoot) == "" {
+		return errorResult("REMOTE_PROTOCOL_ERROR", "workspace_root is required for remote peer tool output archiving")
+	}
+	archivePath, err := archiveToolOutput(workspaceRoot, req.ToolName, result.Result)
+	if err != nil {
+		return errorResult("REMOTE_TOOL_ERROR", err.Error())
+	}
+	truncatedLines := strings.Split(result.Result, "\n")
+	if len(truncatedLines) > maxOutputLines {
+		truncatedLines = truncatedLines[:maxOutputLines]
+	}
+	truncated := strings.Join(truncatedLines, "\n")
+	if len(truncated) > maxOutputChars {
+		truncated = strings.TrimRight(truncated[:maxOutputChars], " \t\r\n")
+	}
+	result.Result = strings.Join([]string{
+		fmt.Sprintf("[truncated] Tool output exceeded limits (%d lines, %d chars).", lineCount, charCount),
+		fmt.Sprintf("Showing first %d lines and up to %d chars.", min(lineCount, maxOutputLines), maxOutputChars),
+		fmt.Sprintf("Full output saved to: %s", archivePath),
+		"To recover the full archived output, call read_file on that path with override=true.",
+		"",
+		"--- BEGIN TRUNCATED OUTPUT ---",
+		truncated,
+		"--- END TRUNCATED OUTPUT ---",
+	}, "\n")
+	if result.Meta == nil {
+		result.Meta = map[string]any{}
+	}
+	result.Meta["tool_output_path"] = archivePath
+	return result
+}
+
+func shouldBypassOutputFinalizer(req protocol.ExecToolRequest) bool {
+	if req.ToolName != "read_file" {
+		return false
+	}
+	override, _ := req.Args["override"].(bool)
+	return override
+}
+
+func archiveToolOutput(workspaceRoot, toolName, content string) (string, error) {
+	dayDir := filepath.Join(workspaceRoot, ".rcoder", "tool-outputs", time.Now().Format("2006-01-02"))
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		return "", err
+	}
+	safeTool := sanitizeArchiveName(toolName)
+	if safeTool == "" {
+		safeTool = "tool"
+	}
+	filename := fmt.Sprintf("%s-%d.txt", safeTool, time.Now().UnixNano())
+	path := filepath.Join(dayDir, filename)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func sanitizeArchiveName(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func readFile(args map[string]any, cwd string) protocol.ExecToolResult {

@@ -14,6 +14,7 @@ class AgentEventType(Enum):
     STREAM_TOKEN = "stream_token"
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
+    TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
     DELEGATED_RUN_COMPLETED = "delegated_run_completed"
     COMPRESSION_START = "compression_start"
     COMPRESSION_END = "compression_end"
@@ -35,7 +36,6 @@ class AgentEvent:
     tool_call_id: Optional[str] = None
     tool_args: Optional[dict] = None
     tool_result: Optional[str] = None
-    tool_success: Optional[bool] = None
 
     # Error specific fields
     error_message: Optional[str] = None
@@ -80,7 +80,6 @@ class AgentEvent:
         tool_name: str,
         result: str,
         *,
-        success: bool = True,
         tool_call_id: str | None = None,
         tool_source: str | None = None,
         meta: dict[str, Any] | None = None,
@@ -91,7 +90,6 @@ class AgentEvent:
             tool_name=tool_name,
             tool_call_id=tool_call_id,
             tool_result=result,
-            tool_success=success,
             data={
                 **({"tool_source": tool_source} if tool_source else {}),
                 **(
@@ -101,6 +99,30 @@ class AgentEvent:
                 ),
                 **({"meta": meta} if meta else {}),
             },
+        )
+
+    @classmethod
+    def tool_call_protocol_error(
+        cls,
+        tool_name: str,
+        *,
+        tool_call_id: str | None = None,
+        code: str,
+        message: str,
+    ) -> "AgentEvent":
+        """Create a protocol error event for a tool call that did not return."""
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "code": code,
+            "message": message,
+        }
+        return cls(
+            event_type=AgentEventType.TOOL_CALL_PROTOCOL_ERROR,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+            error_message=message,
         )
 
     @classmethod

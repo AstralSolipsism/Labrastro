@@ -58,6 +58,7 @@ class Agent:
         self.config = config
         self.max_context_tokens = max_context_tokens
         self.max_rounds = max_rounds
+        self.runtime_execution_target = "local"
 
         # Mode state
         self.available_modes: dict[str, ModeConfig] = dict(available_modes or {})

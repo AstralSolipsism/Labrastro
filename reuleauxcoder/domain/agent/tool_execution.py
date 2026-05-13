@@ -39,7 +39,6 @@ class ToolExecutor:
         tc: "ToolCall",
         result: str,
         *,
-        success: bool = True,
         tool: object | None = None,
         meta: dict | None = None,
     ) -> None:
@@ -47,7 +46,6 @@ class ToolExecutor:
             AgentEvent.tool_call_end(
                 tc.name,
                 result,
-                success=success,
                 tool_call_id=tc.id,
                 tool_source=self._tool_source(tool),
                 meta=meta,
@@ -83,14 +81,14 @@ class ToolExecutor:
         denied = next((d for d in guard_decisions if not d.allowed), None)
         if denied is not None:
             message = denied.reason or f"Tool '{tc.name}' blocked by guard hook"
-            self._emit_tool_end(tc, message, success=False, tool=tool)
+            self._emit_tool_end(tc, message, tool=tool)
             return message
 
         preflight_error = (
             tool.preflight_validate(**tc.arguments) if tool is not None else None
         )
         if preflight_error:
-            self._emit_tool_end(tc, preflight_error, success=False, tool=tool)
+            self._emit_tool_end(tc, preflight_error, tool=tool)
             return preflight_error
 
         if not self.agent.is_tool_allowed_in_mode(tc.name):
@@ -108,7 +106,7 @@ class ToolExecutor:
                 message = (
                     f"Tool '{tc.name}' is not available in current mode '{mode_name}'"
                 )
-            self._emit_tool_end(tc, message, success=False, tool=tool)
+            self._emit_tool_end(tc, message, tool=tool)
             return message
 
         approval_required = next(
@@ -121,7 +119,7 @@ class ToolExecutor:
                     approval_required.reason
                     or f"Tool '{tc.name}' requires approval, but no approval provider is configured"
                 )
-                self._emit_tool_end(tc, message, success=False, tool=tool)
+                self._emit_tool_end(tc, message, tool=tool)
                 return message
             try:
                 decision = provider.request_approval(
@@ -137,14 +135,14 @@ class ToolExecutor:
                 )
             except (KeyboardInterrupt, EOFError):
                 message = f"Tool '{tc.name}' approval interrupted by user"
-                self._emit_tool_end(tc, message, success=False, tool=tool)
+                self._emit_tool_end(tc, message, tool=tool)
                 return message
 
             if not decision.approved:
                 message = (
                     decision.reason or f"Tool '{tc.name}' denied by approval provider"
                 )
-                self._emit_tool_end(tc, message, success=False, tool=tool)
+                self._emit_tool_end(tc, message, tool=tool)
                 return message
 
         before_context = self.agent.hook_registry.run_transforms(
@@ -164,11 +162,15 @@ class ToolExecutor:
 
         if tool is None:
             message = f"Error: unknown tool '{tool_call.name}'"
-            self._emit_tool_end(tool_call, message, success=False, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool)
             return message
 
         backend = getattr(tool, "backend", None)
         context = getattr(backend, "context", None)
+        backend_id = getattr(backend, "backend_id", None)
+        execution_target = getattr(context, "execution_target", None) or (
+            "local" if backend_id in (None, "local") else str(backend_id)
+        )
         previous_tool_call_id = getattr(context, "current_tool_call_id", None)
         if context is not None:
             try:
@@ -210,6 +212,8 @@ class ToolExecutor:
                         tool, "tool_source", "builtin" if tool is not None else "unknown"
                     ),
                     "mcp_server": getattr(tool, "server_name", None),
+                    "backend_id": backend_id,
+                    "execution_target": execution_target,
                 },
             )
             after_context = self.agent.hook_registry.run_transforms(
@@ -223,15 +227,15 @@ class ToolExecutor:
             return after_context.result
         except TypeError as e:
             message = f"Error: bad arguments for {tool_call.name}: {e}"
-            self._emit_tool_end(tool_call, message, success=False, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool)
             return message
         except AgentRunCancelled:
             message = f"Tool '{tool_call.name}' cancelled while waiting for runtime slot"
-            self._emit_tool_end(tool_call, message, success=False, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool)
             return message
         except Exception as e:
             message = f"Error executing {tool_call.name}: {e}"
-            self._emit_tool_end(tool_call, message, success=False, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool)
             return message
         finally:
             if context is not None:

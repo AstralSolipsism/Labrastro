@@ -159,16 +159,23 @@ class ToolStreamChunk:
     chunk_type: str  # "stdout" | "stderr" | "exit"
     data: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
+    tool_call_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"chunk_type": self.chunk_type, "data": self.data, "meta": self.meta}
+        return {
+            "chunk_type": self.chunk_type,
+            "data": self.data,
+            "meta": self.meta,
+            "tool_call_id": self.tool_call_id,
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ToolStreamChunk":
         return cls(
             chunk_type=d["chunk_type"],
             data=d.get("data", ""),
-            meta=d.get("meta", {}),
+            meta=d.get("meta", {}) if isinstance(d.get("meta", {}), dict) else {},
+            tool_call_id=d.get("tool_call_id"),
         )
 
 

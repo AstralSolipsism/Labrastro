@@ -6,7 +6,11 @@ from reuleauxcoder.domain.llm.models import ToolCall
 
 
 def _ctx(
-    file_path: str, result: str, *, override: bool = False
+    file_path: str,
+    result: str,
+    *,
+    override: bool = False,
+    metadata: dict | None = None,
 ) -> AfterToolExecuteContext:
     return AfterToolExecuteContext(
         hook_point=HookPoint.AFTER_TOOL_EXECUTE,
@@ -17,6 +21,7 @@ def _ctx(
         ),
         result=result,
         round_index=1,
+        metadata=metadata or {},
     )
 
 
@@ -77,3 +82,38 @@ def test_tool_output_does_not_bypass_non_markdown_under_skills(
     out = hook.run(ctx)
 
     assert "[truncated]" in out.result
+
+
+def test_tool_output_bypasses_remote_peer_results() -> None:
+    hook = ToolOutputTruncationHook(max_chars=20, max_lines=2, store_full_output=True)
+    long_text = "line1\nline2\nline3\nline4"
+
+    ctx = _ctx(
+        "/tmp/remote-output.txt",
+        long_text,
+        metadata={"execution_target": "remote_peer", "backend_id": "remote_relay"},
+    )
+    out = hook.run(ctx)
+
+    assert out.result == long_text
+
+
+def test_tool_output_archives_non_peer_long_output_under_server_store(tmp_path: Path) -> None:
+    hook = ToolOutputTruncationHook(
+        max_chars=20,
+        max_lines=2,
+        store_full_output=True,
+        store_dir=str(tmp_path),
+    )
+    long_text = "line1\nline2\nline3\nline4"
+
+    ctx = _ctx(
+        "/tmp/local-output.txt",
+        long_text,
+        metadata={"execution_target": "local", "backend_id": "local"},
+    )
+    out = hook.run(ctx)
+
+    assert "[truncated]" in out.result
+    assert f"Full output saved to: {tmp_path}" in out.result
+    assert list(tmp_path.glob("*/*.txt"))

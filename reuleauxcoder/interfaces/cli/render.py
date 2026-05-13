@@ -101,7 +101,6 @@ class _ToolCallBlock:
     name: str
     args: dict | None
     result: str | None = None
-    success: bool = True
 
 
 @dataclass
@@ -139,11 +138,7 @@ class CLIRenderer:
         elif event.event_type == AgentEventType.TOOL_CALL_START:
             self._render_tool_start(event.tool_name, event.tool_args)
         elif event.event_type == AgentEventType.TOOL_CALL_END:
-            self._render_tool_end(
-                event.tool_name,
-                event.tool_result,
-                success=event.tool_success if event.tool_success is not None else True,
-            )
+            self._render_tool_end(event.tool_name, event.tool_result)
         elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
             self._render_delegated_run_completed(event.data)
         elif event.event_type == AgentEventType.CHAT_END:
@@ -243,12 +238,10 @@ class CLIRenderer:
             )
         )
 
-    def _render_tool_end(
-        self, name: str, result: str | None, success: bool = True
-    ) -> None:
+    def _render_tool_end(self, name: str, result: str | None) -> None:
         """Render tool call result."""
         self._completed_blocks.append(
-            _ToolCallBlock(name=name, args=None, result=result, success=success)
+            _ToolCallBlock(name=name, args=None, result=result)
         )
         if not result:
             return
@@ -257,18 +250,7 @@ class CLIRenderer:
             self._render_diff(result)
         else:
             display = self._compact_tool_output(name, result)
-            if success:
-                self.console.print(f"[dim]{_escape_markup(display)}[/dim]")
-            else:
-                self.console.print(
-                    Panel(
-                        f"[red]{_escape_markup(display)}[/red]",
-                        title=f"TOOL ERROR · {name}",
-                        border_style="red",
-                        box=box.ROUNDED,
-                        padding=(0, 1),
-                    )
-                )
+            self.console.print(f"[dim]{_escape_markup(display)}[/dim]")
 
     def _render_delegated_run_completed(self, data: dict) -> None:
         """Render a concise delegated AgentRun completion notification."""

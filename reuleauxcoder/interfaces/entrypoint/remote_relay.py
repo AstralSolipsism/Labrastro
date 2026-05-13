@@ -53,6 +53,34 @@ from labrastro_server.services.taskflow.service import (
     TASKFLOW_WORKFLOW_MODE,
 )
 
+REMOTE_PREVIEW_TOOLS = {"write_file", "edit_file"}
+
+
+class RemoteToolProtocolError(RuntimeError):
+    """Protocol boundary error for remote peer tool lifecycle events."""
+
+    def __init__(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        code: str,
+        message: str,
+    ):
+        super().__init__(message)
+        self.tool_name = tool_name
+        self.tool_call_id = tool_call_id
+        self.code = code
+        self.message = message
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "tool_name": self.tool_name,
+            "tool_call_id": self.tool_call_id,
+            "code": self.code,
+            "message": self.message,
+        }
+
 
 def _stable_digest(value: Any) -> str:
     encoded = json.dumps(
@@ -517,6 +545,30 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 )
         return f"remote:{machine_key}:{workspace_root or '.'}"
 
+    def _peer_runtime_context(peer_id: str) -> dict[str, Any]:
+        peer = relay_server.registry.get(peer_id)
+        if peer is None:
+            raise ValueError(f"remote peer '{peer_id}' is not online")
+        host_info = peer.meta.get("host_info_min") if isinstance(peer.meta, dict) else None
+        if not isinstance(host_info, dict):
+            raise ValueError("remote peer registration missing host_info_min")
+        for key in ("os", "shell"):
+            value = host_info.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"remote peer registration missing host_info_min.{key}")
+        if not isinstance(peer.cwd, str) or not peer.cwd.strip():
+            raise ValueError("remote peer registration missing cwd")
+        if not isinstance(peer.workspace_root, str) or not peer.workspace_root.strip():
+            raise ValueError("remote peer registration missing workspace_root")
+        if not isinstance(peer.features, list):
+            raise ValueError("remote peer registration missing features")
+        return {
+            "cwd": peer.cwd,
+            "workspace_root": peer.workspace_root,
+            "features": list(peer.features),
+            "host_info_min": dict(host_info),
+        }
+
     def _session_history_status() -> dict[str, bool]:
         current_config = _current_config()
         session_auto_save = bool(
@@ -871,11 +923,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         runner._register_hooks(peer_agent, current_config)
         runner._wire_agent_tool_parent(peer_agent)
 
-        peer = relay_server.registry.get(peer_id)
-        workspace_root = peer.workspace_root if peer is not None else None
-        runtime_cwd = workspace_root or (peer.cwd if peer is not None else None)
-        if runtime_cwd:
-            setattr(peer_agent, "runtime_working_directory", runtime_cwd)
+        peer_context = _peer_runtime_context(peer_id)
+        workspace_root = peer_context["workspace_root"]
+        runtime_cwd = peer_context["cwd"]
+        setattr(peer_agent, "runtime_execution_target", "remote_peer")
+        setattr(peer_agent, "runtime_peer_context", peer_context)
+        setattr(peer_agent, "runtime_working_directory", runtime_cwd)
         for tool_info in relay_server.get_peer_mcp_tools(peer_id):
             peer_agent.add_tools([RemotePeerMCPTool(peer_backend, tool_info)])
         for tool in peer_agent.tools:
@@ -887,8 +940,9 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 continue
             context.peer_id = peer_id
             context.remote_stream_handler = remote_stream_handler
-            if workspace_root:
-                context.workspace_root = workspace_root
+            context.execution_target = "remote_peer"
+            context.cwd = runtime_cwd
+            context.workspace_root = workspace_root
 
         fingerprint = _peer_fingerprint(peer_id)
         setattr(peer_agent, "session_fingerprint", fingerprint)
@@ -1262,53 +1316,85 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
         def _build_remote_preview(
             request: ApprovalRequest,
+            tool_call_id: str | None,
         ) -> tuple[list[dict[str, Any]], ToolPreviewResult | None, str | None]:
-            backend = _remote_backend()
-            if (
-                backend is None
-                or request.tool_name not in {"write_file", "edit_file"}
-                or not _peer_supports_tool_preview()
-            ):
+            if request.tool_name not in REMOTE_PREVIEW_TOOLS:
                 section = _args_section(request)
                 return ([section] if section else []), None, "preview_unavailable"
 
-            preview = backend.preview_tool(request.tool_name, dict(request.tool_args))
-            if preview.ok:
-                if preview.sections:
-                    return preview.sections, preview, None
-                if preview.diff:
-                    return (
-                        [
-                            {
-                                "id": "diff",
-                                "title": "Proposed file diff",
-                                "kind": "diff",
-                                "content": preview.diff,
-                                "path": preview.resolved_path,
-                                "resolved_path": preview.resolved_path,
-                                "original_text": preview.original_text,
-                                "modified_text": preview.modified_text,
-                            }
-                        ],
-                        preview,
-                        None,
-                    )
+            backend = _remote_backend()
+            if backend is None:
+                raise RemoteToolProtocolError(
+                    tool_name=request.tool_name,
+                    tool_call_id=tool_call_id,
+                    code="REMOTE_BACKEND_MISSING",
+                    message="remote peer tool backend is not available",
+                )
+            if not _peer_supports_tool_preview():
+                raise RemoteToolProtocolError(
+                    tool_name=request.tool_name,
+                    tool_call_id=tool_call_id,
+                    code="REMOTE_PREVIEW_REQUIRED",
+                    message=(
+                        f"remote peer must support tool_preview before approving "
+                        f"{request.tool_name}"
+                    ),
+                )
 
-            sections: list[dict[str, Any]] = []
-            section = _args_section(request)
-            if section is not None:
-                sections.append(section)
-            sections.append(
-                {
-                    "id": "preview",
-                    "title": "Preview unavailable",
-                    "kind": "text",
-                    "content": preview.error_message
-                    or preview.error_code
-                    or "Peer could not build a preview.",
-                }
+            preview = backend.preview_tool(request.tool_name, dict(request.tool_args))
+            if not preview.ok:
+                raise RemoteToolProtocolError(
+                    tool_name=request.tool_name,
+                    tool_call_id=tool_call_id,
+                    code="REMOTE_PREVIEW_FAILED",
+                    message=(
+                        preview.error_message
+                        or preview.error_code
+                        or "remote peer could not build a tool preview"
+                    ),
+                )
+            if preview.sections:
+                return preview.sections, preview, None
+            if preview.diff.strip():
+                return (
+                    [
+                        {
+                            "id": "diff",
+                            "title": "Proposed file diff",
+                            "kind": "diff",
+                            "content": preview.diff,
+                            "path": preview.resolved_path,
+                            "resolved_path": preview.resolved_path,
+                            "original_text": preview.original_text,
+                            "modified_text": preview.modified_text,
+                        }
+                    ],
+                    preview,
+                    None,
+                )
+            raise RemoteToolProtocolError(
+                tool_name=request.tool_name,
+                tool_call_id=tool_call_id,
+                code="REMOTE_PREVIEW_EMPTY",
+                message="remote peer preview did not include diff or sections",
             )
-            return sections, preview, preview.error_message or "preview_unavailable"
+
+        def _emit_protocol_error(
+            *,
+            tool_name: str,
+            tool_call_id: str | None,
+            code: str,
+            message: str,
+        ) -> None:
+            remote_session.append_event(
+                "tool_call_protocol_error",
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "code": code,
+                    "message": message,
+                },
+            )
 
         class _RemoteApprovalProvider(ApprovalProvider):
             def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
@@ -1326,8 +1412,19 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             ) -> ApprovalDecision:
                 approval_id = str(uuid.uuid4())
                 tool_call_id = str(request.metadata.get("tool_call_id") or "")
+                try:
+                    sections, preview, preview_error = _build_remote_preview(
+                        request, tool_call_id or None
+                    )
+                except RemoteToolProtocolError as exc:
+                    _emit_protocol_error(
+                        tool_name=exc.tool_name,
+                        tool_call_id=exc.tool_call_id,
+                        code=exc.code,
+                        message=exc.message,
+                    )
+                    raise
                 remote_session.register_approval(approval_id)
-                sections, preview, preview_error = _build_remote_preview(request)
                 payload = {
                     "approval_id": approval_id,
                     "tool_call_id": tool_call_id,
@@ -1375,11 +1472,15 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         def _on_remote_stream(
             tool_name: str, chunk: Any, tool_call_id: str | None = None
         ) -> None:
-            resolved_tool_call_id = tool_call_id
+            resolved_tool_call_id = tool_call_id or getattr(chunk, "tool_call_id", None)
             if not resolved_tool_call_id:
-                candidates = active_tool_calls_by_name.get(tool_name) or []
-                if candidates:
-                    resolved_tool_call_id = candidates[-1]
+                _emit_protocol_error(
+                    tool_name=tool_name,
+                    tool_call_id=None,
+                    code="REMOTE_TOOL_CALL_ID_REQUIRED",
+                    message="remote peer tool stream is missing tool_call_id",
+                )
+                return
             remote_session.append_event(
                 "tool_call_stream",
                 {
@@ -1391,6 +1492,10 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "meta": getattr(chunk, "meta", {}),
                 },
             )
+
+        backend = _remote_backend()
+        if backend is not None and isinstance(backend.context, ExecutionContext):
+            backend.context.remote_stream_handler = _on_remote_stream
 
         def _on_agent_event(event: AgentEvent) -> None:
             if event.event_type == AgentEventType.STREAM_TOKEN:
@@ -1434,6 +1539,14 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 )
                 return
             elif event.event_type == AgentEventType.TOOL_CALL_END:
+                if not event.tool_call_id:
+                    _emit_protocol_error(
+                        tool_name=event.tool_name or "tool",
+                        tool_call_id=None,
+                        code="REMOTE_TOOL_CALL_ID_REQUIRED",
+                        message="remote peer tool end event is missing tool_call_id",
+                    )
+                    return
                 if event.tool_name and event.tool_call_id:
                     candidates = active_tool_calls_by_name.get(event.tool_name)
                     if candidates and event.tool_call_id in candidates:
@@ -1443,12 +1556,20 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     {
                         "tool_name": event.tool_name,
                         "tool_call_id": event.tool_call_id,
-                        "tool_success": event.tool_success,
                         "tool_result": event.tool_result or "",
                         "tool_source": event.data.get("tool_source"),
                         "meta": event.data.get("meta") or {},
                         "ended_at": event.timestamp,
                     },
+                )
+                return
+            elif event.event_type == AgentEventType.TOOL_CALL_PROTOCOL_ERROR:
+                payload = dict(event.data)
+                _emit_protocol_error(
+                    tool_name=str(payload.get("tool_name") or event.tool_name or "tool"),
+                    tool_call_id=payload.get("tool_call_id") or event.tool_call_id,
+                    code=str(payload.get("code") or "REMOTE_PROTOCOL_ERROR"),
+                    message=str(payload.get("message") or event.error_message or "remote tool protocol error"),
                 )
                 return
             elif event.event_type == AgentEventType.ERROR:
@@ -1484,6 +1605,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "response": result,
                     "response_rendered": assistant_content_emitted["value"],
                 },
+            )
+        except RemoteToolProtocolError as exc:
+            _flush_output()
+            _save_peer_session(peer_agent, peer_id)
+            remote_session.append_event(
+                "error", {"message": exc.message, "code": exc.code}
             )
         except Exception as exc:
             _flush_output()

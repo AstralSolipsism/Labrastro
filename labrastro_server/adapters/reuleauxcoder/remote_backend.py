@@ -31,7 +31,7 @@ class RemoteRelayToolBackend(ToolBackend):
         context: ExecutionContext | None = None,
         ui_bus: UIEventBus | None = None,
     ):
-        super().__init__(context or ExecutionContext(execution_target="remote"))
+        super().__init__(context or ExecutionContext(execution_target="remote_peer"))
         self.relay_server = relay_server
         self.ui_bus = ui_bus
         self._approved_preview_states: dict[str, dict[str, Any]] = {}
@@ -142,12 +142,9 @@ class RemoteRelayToolBackend(ToolBackend):
                 return
             if callable(remote_stream_handler):
                 try:
-                    remote_stream_handler(tool_name, chunk, tool_call_id)
+                    remote_stream_handler(tool_name, chunk, chunk.tool_call_id)
                 except Exception:
-                    try:
-                        remote_stream_handler(tool_name, chunk)
-                    except Exception:
-                        pass
+                    pass
             if tool_name == "shell" and self.ui_bus is not None:
                 self.ui_bus.info(
                     "",

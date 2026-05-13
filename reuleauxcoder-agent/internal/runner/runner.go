@@ -83,6 +83,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		"os":       runtimeOS(),
 		"arch":     runtimeArch(),
 		"hostname": runtimeHostname(),
+		"shell":    runtimeShell(),
 	}
 	if r.cfg.AgentRun {
 		features = append(
@@ -152,7 +153,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.cfg.Interactive {
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- r.runPollLoop(childCtx, registerResp.PeerToken, cwd, pollInterval)
+			errCh <- r.runPollLoop(childCtx, registerResp.PeerToken, cwd, workspaceRoot, pollInterval)
 		}()
 
 		if err := r.runInteractiveLoop(childCtx, registerResp.PeerToken); err != nil {
@@ -169,7 +170,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return nil
 	}
 
-	return r.runPollLoop(childCtx, registerResp.PeerToken, cwd, pollInterval)
+	return r.runPollLoop(childCtx, registerResp.PeerToken, cwd, workspaceRoot, pollInterval)
 }
 
 func writePeerInfoFile(path string, resp protocol.RegisterResponse) error {
@@ -601,7 +602,7 @@ func runtimeUsage(usage map[string]agentruntime.TokenUsage) map[string]any {
 	return out
 }
 
-func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd string, pollInterval time.Duration) error {
+func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd, workspaceRoot string, pollInterval time.Duration) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -632,6 +633,12 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd string, pollInt
 				}
 				continue
 			}
+			if result, invalid := execToolProtocolError(execReq); invalid {
+				if sendErr := r.sendToolResult(ctx, peerToken, env.RequestID, result); sendErr != nil {
+					return sendErr
+				}
+				continue
+			}
 			execCtx, cancelExec := context.WithCancel(ctx)
 			r.registerActiveRequest(env.RequestID, cancelExec)
 			go func(requestID string, execReq protocol.ExecToolRequest) {
@@ -644,13 +651,8 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd string, pollInt
 						result = r.mcp.Execute(execReq.Args)
 					}
 				} else {
-					result = tools.ExecuteWithContext(execCtx, execReq, cwd, func(chunk protocol.ToolStreamChunk) {
-						if chunk.Meta == nil {
-							chunk.Meta = map[string]any{}
-						}
-						if execReq.ToolCallID != "" {
-							chunk.Meta["tool_call_id"] = execReq.ToolCallID
-						}
+					result = tools.ExecuteWithContext(execCtx, execReq, cwd, workspaceRoot, func(chunk protocol.ToolStreamChunk) {
+						chunk = attachToolCallIDToStreamChunk(chunk, execReq.ToolCallID)
 						if sendErr := r.sendToolStream(context.Background(), peerToken, requestID, chunk); sendErr != nil {
 							log.Printf("stream send failed: %v", sendErr)
 						}
@@ -659,9 +661,7 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd string, pollInt
 				if result.Meta == nil {
 					result.Meta = map[string]any{}
 				}
-				if execReq.ToolCallID != "" {
-					result.Meta["tool_call_id"] = execReq.ToolCallID
-				}
+				result.Meta["tool_call_id"] = execReq.ToolCallID
 				if sendErr := r.sendToolResult(context.Background(), peerToken, requestID, result); sendErr != nil {
 					log.Printf("tool result send failed: %v", sendErr)
 				}
@@ -702,6 +702,26 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd string, pollInt
 			time.Sleep(pollInterval)
 		}
 	}
+}
+
+func execToolProtocolError(req protocol.ExecToolRequest) (protocol.ExecToolResult, bool) {
+	if strings.TrimSpace(req.ToolCallID) != "" {
+		return protocol.ExecToolResult{}, false
+	}
+	return protocol.ExecToolResult{
+		OK:           false,
+		ErrorCode:    "REMOTE_PROTOCOL_ERROR",
+		ErrorMessage: "exec_tool request missing tool_call_id",
+	}, true
+}
+
+func attachToolCallIDToStreamChunk(chunk protocol.ToolStreamChunk, toolCallID string) protocol.ToolStreamChunk {
+	chunk.ToolCallID = toolCallID
+	if chunk.Meta == nil {
+		chunk.Meta = map[string]any{}
+	}
+	chunk.Meta["tool_call_id"] = toolCallID
+	return chunk
 }
 
 func (r *Runner) registerActiveRequest(requestID string, cancel context.CancelFunc) {
@@ -1006,6 +1026,19 @@ func runtimeHostname() string {
 		return ""
 	}
 	return hostname
+}
+
+func runtimeShell() string {
+	if runtime.GOOS != "windows" {
+		return "sh"
+	}
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
+	}
+	if _, err := exec.LookPath("pwsh"); err == nil {
+		return "pwsh"
+	}
+	return "powershell.exe"
 }
 
 func runtimeExecutors() []string {

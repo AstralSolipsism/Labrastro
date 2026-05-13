@@ -621,11 +621,18 @@ class TestToolPreview:
 
 class TestToolStreamChunk:
     def test_roundtrip(self) -> None:
-        chunk = ToolStreamChunk(chunk_type="stdout", data="hello", meta={"seq": 1})
+        chunk = ToolStreamChunk(
+            chunk_type="stdout",
+            data="hello",
+            meta={"seq": 1},
+            tool_call_id="call-1",
+        )
         d = chunk.to_dict()
         restored = ToolStreamChunk.from_dict(d)
         assert restored.chunk_type == "stdout"
         assert restored.data == "hello"
+        assert restored.meta == {"seq": 1}
+        assert restored.tool_call_id == "call-1"
 
 
 class TestDisconnectNotice:

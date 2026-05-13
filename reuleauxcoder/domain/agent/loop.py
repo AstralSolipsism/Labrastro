@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import platform
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from reuleauxcoder.domain.agent.agent import Agent
@@ -26,10 +26,7 @@ class AgentLoop:
 
     def _runtime_tail_message(self) -> dict:
         """Build ephemeral runtime context appended only at send time."""
-        uname = platform.uname()
-        runtime_cwd = (
-            getattr(self.agent, "runtime_working_directory", None) or os.getcwd()
-        )
+        runtime_context = self._runtime_context()
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         now_local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         content = (
@@ -38,16 +35,70 @@ class AgentLoop:
             "It is NOT a user message — do not reply to it directly.\n"
             f"- UTC time: {now_utc}\n"
             f"- Local time: {now_local}\n"
-            f"- Working directory: {runtime_cwd}\n"
-            f"- OS: {uname.system} {uname.release} ({uname.machine})\n"
-            f"- Python: {platform.python_version()}\n"
-            f"- Shell: {self._shell}\n"
+            + "\n".join(runtime_context)
+            + "\n"
             "Local time represents the user's current time at this turn.\n"
             "Always use Local time as the source of truth for all time-related reasoning.\n"
             "UTC time is provided only for reference.\n"
             "</system_context>"
         )
         return {"role": "user", "content": content}
+
+    def _runtime_context(self) -> list[str]:
+        execution_target = str(
+            getattr(self.agent, "runtime_execution_target", "local") or "local"
+        )
+        if execution_target == "remote_peer":
+            return self._remote_peer_runtime_context()
+        return self._local_runtime_context(execution_target)
+
+    def _local_runtime_context(self, execution_target: str) -> list[str]:
+        uname = platform.uname()
+        runtime_cwd = (
+            getattr(self.agent, "runtime_working_directory", None) or os.getcwd()
+        )
+        return [
+            f"- Execution target: {execution_target}",
+            f"- Working directory: {runtime_cwd}",
+            f"- OS: {uname.system} {uname.release} ({uname.machine})",
+            f"- Python: {platform.python_version()}",
+            f"- Shell: {self._shell}",
+        ]
+
+    def _remote_peer_runtime_context(self) -> list[str]:
+        context = getattr(self.agent, "runtime_peer_context", None)
+        if not isinstance(context, dict):
+            raise RuntimeError("remote peer runtime context is missing")
+
+        cwd = self._required_runtime_string(context, "cwd")
+        workspace_root = self._required_runtime_string(context, "workspace_root")
+        host_info = context.get("host_info_min")
+        if not isinstance(host_info, dict):
+            raise RuntimeError("remote peer runtime context is missing host_info_min")
+
+        os_name = self._required_runtime_string(host_info, "os")
+        shell = self._required_runtime_string(host_info, "shell")
+        arch = str(host_info.get("arch") or "").strip()
+        features = context.get("features")
+        if not isinstance(features, list):
+            raise RuntimeError("remote peer runtime context is missing features")
+
+        os_label = f"{os_name} ({arch})" if arch else os_name
+        return [
+            "- Execution target: remote_peer",
+            f"- Working directory: {cwd}",
+            f"- Workspace root: {workspace_root}",
+            f"- OS: {os_label}",
+            f"- Shell: {shell}",
+            f"- Peer features: {', '.join(str(item) for item in features)}",
+        ]
+
+    @staticmethod
+    def _required_runtime_string(source: dict[str, Any], key: str) -> str:
+        value = source.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"remote peer runtime context is missing {key}")
+        return value
 
     def _full_messages(self) -> list[dict]:
         """Get full messages including system prompt and ephemeral runtime tail."""

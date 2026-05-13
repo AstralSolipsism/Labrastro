@@ -54,6 +54,9 @@ class ToolOutputTruncationHook(TransformHook[AfterToolExecuteContext]):
         if tool_call is None:
             return context
 
+        if context.metadata.get("execution_target") == "remote_peer":
+            return context
+
         if self._should_bypass_truncation(tool_call.name, tool_call.arguments):
             return context
 

@@ -88,10 +88,29 @@ func TestExecuteShellReturnsRemoteCancelledWhenContextCancelled(t *testing.T) {
 		ToolName:   "shell",
 		Args:       map[string]any{"command": "echo should-not-run"},
 		TimeoutSec: 30,
-	}, t.TempDir(), nil)
+	}, t.TempDir(), t.TempDir(), nil)
 
 	if result.OK || result.ErrorCode != "REMOTE_CANCELLED" {
 		t.Fatalf("result = %#v, want REMOTE_CANCELLED", result)
+	}
+}
+
+func TestExecuteShellNonZeroExitReturnsToolOutput(t *testing.T) {
+	dir := t.TempDir()
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName: "shell",
+		Args:     map[string]any{"command": "exit 7"},
+	}, dir, nil)
+
+	if !result.OK {
+		t.Fatalf("result = %#v, want OK tool result", result)
+	}
+	if result.Meta["exit_code"] != 7 {
+		t.Fatalf("exit_code = %#v, want 7", result.Meta["exit_code"])
+	}
+	if !strings.Contains(result.Result, "[exit code: 7]") {
+		t.Fatalf("result output = %q, want exit code text", result.Result)
 	}
 }
 
@@ -298,19 +317,70 @@ func TestGlobSupportsGlobstarAndSortsByNewestMtime(t *testing.T) {
 	}
 }
 
-func TestTruncateOutputKeepsHeadAndTail(t *testing.T) {
-	out := strings.Repeat("h", maxOutputChars) + strings.Repeat("t", keepTailChars+100)
-	truncated := truncateOutput(out)
+func TestExecuteArchivesLongOutputUnderWorkspaceRoot(t *testing.T) {
+	cwd := t.TempDir()
+	workspaceRoot := t.TempDir()
+	target := filepath.Join(cwd, "large.txt")
+	content := strings.Repeat("alpha", maxOutputChars+100)
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	if len(truncated) >= len(out) {
-		t.Fatalf("output was not truncated")
+	result := ExecuteWithContext(context.Background(), protocol.ExecToolRequest{
+		ToolName: "read_file",
+		Args: map[string]any{
+			"file_path": "large.txt",
+		},
+	}, cwd, workspaceRoot, nil)
+
+	if !result.OK {
+		t.Fatalf("execute failed: %#v", result)
 	}
-	if !strings.Contains(truncated, "... truncated (") {
-		t.Fatalf("missing truncation marker: %q", truncated)
+	if !strings.Contains(result.Result, "[truncated] Tool output exceeded limits") {
+		t.Fatalf("missing truncation summary: %q", result.Result)
 	}
-	if !strings.HasPrefix(truncated, strings.Repeat("h", 20)) || !strings.HasSuffix(truncated, strings.Repeat("t", 20)) {
-		t.Fatalf("truncated output did not preserve head and tail")
+	path := archivedPathFromResult(t, result.Result)
+	if !strings.HasPrefix(filepath.Clean(path), filepath.Join(workspaceRoot, ".rcoder", "tool-outputs")) {
+		t.Fatalf("archive path %q is not under workspace root %q", path, workspaceRoot)
 	}
+	archived, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(archived) != joinNumbered(strings.Split(strings.TrimSuffix(content, "\n"), "\n"), 0) {
+		t.Fatalf("archived content mismatch")
+	}
+}
+
+func TestExecuteRequiresWorkspaceRootForLongOutputArchiving(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "large.txt")
+	if err := os.WriteFile(target, []byte(strings.Repeat("x", maxOutputChars+100)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := ExecuteWithContext(context.Background(), protocol.ExecToolRequest{
+		ToolName: "read_file",
+		Args: map[string]any{
+			"file_path": "large.txt",
+		},
+	}, dir, "", nil)
+
+	if result.OK || result.ErrorCode != "REMOTE_PROTOCOL_ERROR" {
+		t.Fatalf("result = %#v, want missing workspace root protocol error", result)
+	}
+}
+
+func archivedPathFromResult(t *testing.T, result string) string {
+	t.Helper()
+	for _, line := range strings.Split(result, "\n") {
+		const prefix = "Full output saved to: "
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	t.Fatalf("archive path missing from result: %q", result)
+	return ""
 }
 
 func expectedStateFromPreview(preview protocol.ToolPreviewResult) map[string]any {

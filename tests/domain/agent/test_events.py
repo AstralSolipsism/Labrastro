@@ -16,12 +16,32 @@ def test_agent_event_tool_call_start_contains_name_and_args() -> None:
 
 def test_agent_event_tool_call_end_keeps_full_long_result_with_preview() -> None:
     result = "x" * 600
-    event = AgentEvent.tool_call_end("read_file", result, success=False)
+    event = AgentEvent.tool_call_end("read_file", result)
     assert event.event_type is AgentEventType.TOOL_CALL_END
     assert event.tool_name == "read_file"
-    assert event.tool_success is False
+    removed_field = "tool_" + "success"
+    assert not hasattr(event, removed_field)
     assert event.tool_result == result
     assert event.data["tool_result_preview"] == "x" * 500
+
+
+def test_agent_event_tool_call_protocol_error_contains_payload() -> None:
+    event = AgentEvent.tool_call_protocol_error(
+        "write_file",
+        tool_call_id="call-1",
+        code="REMOTE_PREVIEW_REQUIRED",
+        message="remote peer must provide a tool preview",
+    )
+
+    assert event.event_type is AgentEventType.TOOL_CALL_PROTOCOL_ERROR
+    assert event.tool_name == "write_file"
+    assert event.tool_call_id == "call-1"
+    assert event.data == {
+        "tool_name": "write_file",
+        "tool_call_id": "call-1",
+        "code": "REMOTE_PREVIEW_REQUIRED",
+        "message": "remote peer must provide a tool preview",
+    }
 
 
 def test_agent_event_delegated_run_completed_contains_payload() -> None:

@@ -254,7 +254,10 @@ class AgentEventBridge:
     def on_agent_event(self, event: AgentEvent) -> None:
         """Translate an agent event into a UI event envelope."""
         level = UIEventLevel.INFO
-        if event.event_type == AgentEventType.ERROR:
+        if event.event_type in (
+            AgentEventType.ERROR,
+            AgentEventType.TOOL_CALL_PROTOCOL_ERROR,
+        ):
             level = UIEventLevel.ERROR
         elif event.event_type in (
             AgentEventType.TOOL_CALL_START,
@@ -274,8 +277,9 @@ class AgentEventBridge:
                     "tool_name": event.tool_name,
                     "tool_args": event.tool_args,
                     "tool_result": event.tool_result,
-                    "tool_success": event.tool_success,
                     "error_message": event.error_message,
+                    "tool_call_id": event.tool_call_id,
+                    "code": event.data.get("code"),
                 },
             )
         )

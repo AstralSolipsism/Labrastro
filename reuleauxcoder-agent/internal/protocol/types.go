@@ -272,9 +272,10 @@ type ToolPreviewResult struct {
 }
 
 type ToolStreamChunk struct {
-	ChunkType string         `json:"chunk_type"`
-	Data      string         `json:"data,omitempty"`
-	Meta      map[string]any `json:"meta,omitempty"`
+	ChunkType  string         `json:"chunk_type"`
+	Data       string         `json:"data,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Meta       map[string]any `json:"meta,omitempty"`
 }
 
 type CleanupResult struct {

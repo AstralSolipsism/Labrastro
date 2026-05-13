@@ -41,7 +41,10 @@ from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
-from labrastro_server.interfaces.http.remote.protocol import ToolPreviewResult
+from labrastro_server.interfaces.http.remote.protocol import (
+    ToolPreviewResult,
+    ToolStreamChunk,
+)
 from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
@@ -335,6 +338,7 @@ def _register_peer(
     bootstrap_token: str,
     cwd: str,
     features: list[str] | None = None,
+    host_info_min: dict | None = None,
 ) -> tuple[str, str]:
     _, register_body = _json_request(
         "POST",
@@ -344,6 +348,13 @@ def _register_peer(
             "cwd": cwd,
             "workspace_root": cwd,
             "features": features or [],
+            "host_info_min": host_info_min
+            or {
+                "os": "test-os",
+                "arch": "test-arch",
+                "shell": "test-shell",
+                "hostname": "test-peer",
+            },
         },
     )
     payload = register_body["payload"]
@@ -1470,13 +1481,17 @@ class TestRunnerRemoteExec:
             emit(
                 agent,
                 AgentEvent.tool_call_start(
-                    "read_file", {"file_path": str(workspace / "decision.md")}
+                    "read_file",
+                    {"file_path": str(workspace / "decision.md")},
+                    tool_call_id="call-read-1",
                 ),
             )
             emit(
                 agent,
                 AgentEvent.tool_call_end(
-                    "read_file", long_result, success=True
+                    "read_file",
+                    long_result,
+                    tool_call_id="call-read-1",
                 ),
             )
             return "done"
@@ -1525,6 +1540,7 @@ class TestRunnerRemoteExec:
                 and event["payload"].get("tool_name") == "read_file"
                 and event["payload"].get("tool_result") == long_result
                 and len(event["payload"].get("tool_result", "")) > 500
+                and ("tool_" + "success") not in event["payload"]
                 for event in events
             )
             assert any(
@@ -1643,6 +1659,234 @@ class TestRunnerRemoteExec:
                 and event["payload"].get("response") == "approved"
                 for event in events
             )
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_write_approval_requires_peer_preview_capability(
+        self, tmp_path: Path
+    ) -> None:
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="write_file",
+                    tool_args={"file_path": "demo.txt", "content": "host\n"},
+                    tool_source="builtin",
+                    reason="confirm write",
+                    metadata={"tool_call_id": "call-write-1"},
+                )
+            )
+            return "unexpected"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=[],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "write"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+
+            assert not any(event["type"] == "approval_request" for event in events)
+            protocol_events = [
+                event for event in events if event["type"] == "tool_call_protocol_error"
+            ]
+            assert protocol_events
+            payload = protocol_events[0]["payload"]
+            assert payload["tool_name"] == "write_file"
+            assert payload["tool_call_id"] == "call-write-1"
+            assert payload["code"] == "REMOTE_PREVIEW_REQUIRED"
+            assert any(event["type"] == "error" for event in events)
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_write_approval_rejects_empty_peer_preview(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        def fake_preview(self, peer_id, request, timeout_sec=None):
+            return ToolPreviewResult(ok=True, sections=[], diff="")
+
+        monkeypatch.setattr(RelayServer, "send_preview_request", fake_preview)
+
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="write_file",
+                    tool_args={"file_path": "demo.txt", "content": "host\n"},
+                    tool_source="builtin",
+                    reason="confirm write",
+                    metadata={"tool_call_id": "call-write-empty"},
+                )
+            )
+            return "unexpected"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=["tool_preview"],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "write"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+
+            assert not any(event["type"] == "approval_request" for event in events)
+            protocol_events = [
+                event for event in events if event["type"] == "tool_call_protocol_error"
+            ]
+            assert protocol_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_shell_approval_does_not_require_peer_preview(
+        self, tmp_path: Path
+    ) -> None:
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            decision = agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="shell",
+                    tool_args={"command": "pwd"},
+                    tool_source="builtin",
+                    reason="confirm shell",
+                    metadata={"tool_call_id": "call-shell-1"},
+                )
+            )
+            return "approved" if decision.approved else "denied"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}", chat_behavior=chat_behavior
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=[],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "shell"},
+            )
+            cursor = 0
+            approval_payload: dict | None = None
+            deadline = time.time() + 3
+            while time.time() < deadline and approval_payload is None:
+                _, stream_body = _json_request(
+                    "POST",
+                    f"{runner._relay_http_service.base_url}/remote/chat/stream",
+                    {
+                        "peer_token": peer_token,
+                        "chat_id": start_body["chat_id"],
+                        "cursor": cursor,
+                        "timeout_sec": 0.5,
+                    },
+                )
+                cursor = stream_body["next_cursor"]
+                for event in stream_body["events"]:
+                    if event["type"] == "approval_request":
+                        approval_payload = event["payload"]
+                        break
+            assert approval_payload is not None
+            assert approval_payload["tool_name"] == "shell"
+            assert approval_payload["preview_unavailable"] is True
+
+            _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/approval/reply",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": start_body["chat_id"],
+                    "approval_id": approval_payload["approval_id"],
+                    "decision": "deny_once",
+                },
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+            assert not any(
+                event["type"] == "tool_call_protocol_error" for event in events
+            )
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_stream_without_tool_call_id_is_protocol_error(
+        self, tmp_path: Path
+    ) -> None:
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            backend = agent.tools[0].backend
+            backend.context.remote_stream_handler(
+                "shell",
+                ToolStreamChunk(chunk_type="stdout", data="hello"),
+                None,
+            )
+            return "done"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            load_tools=lambda backend: [SimpleNamespace(name="shell", backend=backend)],
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "stream"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+
+            assert not any(event["type"] == "tool_call_stream" for event in events)
+            protocol_events = [
+                event for event in events if event["type"] == "tool_call_protocol_error"
+            ]
+            assert protocol_events
+            assert protocol_events[0]["payload"]["code"] == "REMOTE_TOOL_CALL_ID_REQUIRED"
+            assert protocol_events[0]["payload"]["tool_name"] == "shell"
         finally:
             runner.cleanup(ctx.agent)
 
@@ -1832,6 +2076,52 @@ class TestRunnerRemoteExec:
             )
             end_event = [event for event in events if event["type"] == "chat_end"][-1]
             assert end_event["payload"]["response"] == f"cwd:{tmp_path}"
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_stream_chat_uses_peer_registered_runtime_context(
+        self, tmp_path: Path
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            captured["target"] = getattr(agent, "runtime_execution_target", None)
+            captured["context"] = getattr(agent, "runtime_peer_context", None)
+            return "ok"
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{_free_port()}", chat_behavior=chat_behavior
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                host_info_min={
+                    "os": "windows",
+                    "arch": "amd64",
+                    "shell": "bash",
+                    "hostname": "peer-box",
+                },
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hello"},
+            )
+            _collect_stream_events(
+                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+            )
+
+            assert captured["target"] == "remote_peer"
+            peer_context = captured["context"]
+            assert isinstance(peer_context, dict)
+            assert peer_context["cwd"] == str(tmp_path)
+            assert peer_context["workspace_root"] == str(tmp_path)
+            assert peer_context["host_info_min"]["os"] == "windows"
+            assert peer_context["host_info_min"]["arch"] == "amd64"
+            assert peer_context["host_info_min"]["shell"] == "bash"
         finally:
             runner.cleanup(ctx.agent)
 

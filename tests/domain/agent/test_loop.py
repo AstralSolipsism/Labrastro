@@ -78,6 +78,46 @@ def test_agent_loop_runtime_working_directory_override() -> None:
     assert "- Working directory: /tmp/remote-workspace" in messages[-1]["content"]
 
 
+def test_agent_loop_remote_peer_runtime_context_uses_peer_registration() -> None:
+    agent = _AgentStub()
+    agent.runtime_execution_target = "remote_peer"
+    agent.runtime_peer_context = {
+        "cwd": "D:\\work\\repo",
+        "workspace_root": "D:\\work\\repo",
+        "features": ["shell", "read_file"],
+        "host_info_min": {
+            "os": "windows",
+            "arch": "amd64",
+            "shell": "bash",
+            "hostname": "devbox",
+        },
+    }
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="server-shell")
+
+    messages = loop._full_messages()
+
+    content = messages[-1]["content"]
+    assert "- Execution target: remote_peer" in content
+    assert "- Working directory: D:\\work\\repo" in content
+    assert "- Workspace root: D:\\work\\repo" in content
+    assert "- OS: windows (amd64)" in content
+    assert "- Shell: bash" in content
+    assert "server-shell" not in content
+
+
+def test_agent_loop_remote_peer_runtime_context_requires_peer_registration() -> None:
+    agent = _AgentStub()
+    agent.runtime_execution_target = "remote_peer"
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    try:
+        loop._full_messages()
+    except RuntimeError as exc:
+        assert "remote peer runtime context is missing" in str(exc)
+    else:
+        raise AssertionError("remote_peer context without registration must fail")
+
+
 def test_system_prompt_includes_taskflow_only_when_workflow_is_active() -> None:
     normal = system_prompt([_Tool("read_file", "Read file")])
     taskflow = system_prompt(

@@ -69,7 +69,7 @@ def test_cli_renderer_tracks_completed_content_and_tool_blocks() -> None:
 
     renderer.on_event(AgentEvent.stream_token("hello"))
     renderer.on_event(AgentEvent.tool_call_start("shell", {"command": "pwd"}))
-    renderer.on_event(AgentEvent.tool_call_end("shell", "ok", success=True))
+    renderer.on_event(AgentEvent.tool_call_end("shell", "ok"))
 
     assert renderer._active_content_block is None
     assert len(renderer._completed_blocks) == 3
@@ -77,7 +77,6 @@ def test_cli_renderer_tracks_completed_content_and_tool_blocks() -> None:
     assert renderer._completed_blocks[1].name == "shell"
     assert renderer._completed_blocks[1].args == {"command": "pwd"}
     assert renderer._completed_blocks[2].result == "ok"
-    assert renderer._completed_blocks[2].success is True
 
 
 def test_cli_renderer_tracks_notification_block_after_stream() -> None:
