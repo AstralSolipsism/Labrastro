@@ -328,6 +328,76 @@ class SQLiteMemoryRepository:
             conn.commit()
         return [self._item_from_row(row) for row in rows]
 
+    def search_related_projects(
+        self,
+        scope: MemoryScope,
+        query: MemoryQuery,
+        exclude_project_ids: set[str],
+        limit: int,
+    ) -> list[MemoryItem]:
+        clauses = [
+            "owner_agent_id=?",
+            "memory_namespace=?",
+            "status='active'",
+        ]
+        params: list[Any] = [scope.owner_agent_id, scope.memory_namespace]
+        excluded = [str(value) for value in exclude_project_ids if str(value).strip()]
+        if excluded:
+            clauses.append(
+                f"project_id NOT IN ({', '.join('?' for _ in excluded)})"
+            )
+            params.extend(excluded)
+        if query.type_filter:
+            clauses.append("type=?")
+            params.append(str(query.type_filter))
+        text = str(query.query or "").strip()
+        if text:
+            clauses.append("(content LIKE ? OR abstract LIKE ?)")
+            like = f"%{text}%"
+            params.extend([like, like])
+        params.append(max(1, int(limit or 1)))
+        with self._connect() as conn:
+            sql = f"""
+                SELECT * FROM memory_items
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at DESC, id ASC
+                LIMIT ?
+                """
+            rows = conn.execute(sql, params).fetchall()
+            if not rows and text:
+                fallback_clauses = [
+                    clause
+                    for clause in clauses
+                    if clause != "(content LIKE ? OR abstract LIKE ?)"
+                ]
+                fallback_params = params[:-3] + [params[-1]]
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM memory_items
+                    WHERE {' AND '.join(fallback_clauses)}
+                    ORDER BY updated_at DESC, id ASC
+                    LIMIT ?
+                    """,
+                    fallback_params,
+                ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO memory_access_events (
+                        access_id, owner_agent_id, memory_namespace, item_id, query, event_type
+                    ) VALUES (?, ?, ?, ?, ?, 'provide')
+                    """,
+                    (
+                        f"memacc_{uuid.uuid4().hex}",
+                        scope.owner_agent_id,
+                        scope.memory_namespace,
+                        row["id"],
+                        text,
+                    ),
+                )
+            conn.commit()
+        return [self._item_from_row(row) for row in rows]
+
     def enqueue_capture_job(
         self, scope: MemoryScope, event: MemoryCaptureEvent
     ) -> MemoryCaptureReceipt:
@@ -588,6 +658,88 @@ class PostgresMemoryRepository:
             "limit": max(1, int(query.limit or 1)),
             "query": str(query.query or "").strip(),
         }
+        if query.type_filter:
+            clauses.append("type=:type_filter")
+            params["type_filter"] = str(query.type_filter)
+        if params["query"]:
+            clauses.append("(content ILIKE :query_like OR abstract ILIKE :query_like)")
+            params["query_like"] = f"%{params['query']}%"
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                sql_text(
+                    f"""
+                    SELECT * FROM memory_items
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY updated_at DESC, id ASC
+                    LIMIT :limit
+                    """
+                ),
+                params,
+            ).mappings().all()
+            if not rows and params["query"]:
+                fallback_clauses = [
+                    clause
+                    for clause in clauses
+                    if clause != "(content ILIKE :query_like OR abstract ILIKE :query_like)"
+                ]
+                rows = conn.execute(
+                    sql_text(
+                        f"""
+                        SELECT * FROM memory_items
+                        WHERE {' AND '.join(fallback_clauses)}
+                        ORDER BY updated_at DESC, id ASC
+                        LIMIT :limit
+                        """
+                    ),
+                    params,
+                ).mappings().all()
+            for row in rows:
+                conn.execute(
+                    sql_text(
+                        """
+                        INSERT INTO memory_access_events (
+                            access_id, owner_agent_id, memory_namespace,
+                            item_id, query, event_type
+                        ) VALUES (
+                            :access_id, :owner_agent_id, :memory_namespace,
+                            :item_id, :query, 'provide'
+                        )
+                        """
+                    ),
+                    {
+                        "access_id": f"memacc_{uuid.uuid4().hex}",
+                        "owner_agent_id": scope.owner_agent_id,
+                        "memory_namespace": scope.memory_namespace,
+                        "item_id": row["id"],
+                        "query": params["query"],
+                    },
+                )
+        return [self._item_from_mapping(dict(row)) for row in rows]
+
+    def search_related_projects(
+        self,
+        scope: MemoryScope,
+        query: MemoryQuery,
+        exclude_project_ids: set[str],
+        limit: int,
+    ) -> list[MemoryItem]:
+        clauses = [
+            "owner_agent_id=:owner_agent_id",
+            "memory_namespace=:memory_namespace",
+            "status='active'",
+        ]
+        params: dict[str, Any] = {
+            "owner_agent_id": scope.owner_agent_id,
+            "memory_namespace": scope.memory_namespace,
+            "limit": max(1, int(limit or 1)),
+            "query": str(query.query or "").strip(),
+        }
+        for index, value in enumerate(
+            str(item) for item in exclude_project_ids if str(item).strip()
+        ):
+            key = f"excluded_project_{index}"
+            clauses.append(f"project_id != :{key}")
+            params[key] = value
         if query.type_filter:
             clauses.append("type=:type_filter")
             params["type_filter"] = str(query.type_filter)

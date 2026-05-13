@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 
 
+MAIN_CHAT_MEMORY_NAMESPACE = "main-chat"
+GLOBAL_MEMORY_PROJECT_ID = "__global__"
+ACCOUNT_MEMORY_OWNER_PREFIX = "account:"
+
+
 def memory_metadata_from_agent(agent: Any) -> dict[str, str]:
     """Extract memory scope metadata from a ReuleauxCoder core agent."""
 
@@ -26,7 +31,7 @@ def memory_metadata_from_agent(agent: Any) -> dict[str, str]:
     workspace_id = getattr(agent, "memory_workspace_id", None) or getattr(
         agent, "workspace_id", None
     )
-    if not workspace_id:
+    if not workspace_id and not getattr(agent, "memory_disable_workspace_fallback", False):
         runtime_cwd = getattr(agent, "runtime_working_directory", None)
         workspace_id = str(Path(str(runtime_cwd)).resolve()) if runtime_cwd else ""
     values = {
@@ -79,3 +84,37 @@ def bind_memory_scope_to_agent(
     ):
         if value is not None:
             setattr(agent, attr, str(value))
+
+
+def bind_main_chat_memory_scope_to_agent(agent: Any, *, peer_info: Any) -> bool:
+    """Bind the user-facing main chat agent to account-scoped memory.
+
+    Returns True when an authenticated account identity was available. Other
+    agent types should keep using bind_memory_scope_to_agent directly.
+    """
+
+    meta = getattr(peer_info, "meta", None)
+    principal = meta.get("auth_principal") if isinstance(meta, dict) else None
+    if not isinstance(principal, dict):
+        return False
+    user_id = str(principal.get("user_id") or "").strip()
+    if not user_id:
+        return False
+    bind_memory_scope_to_agent(
+        agent,
+        owner_agent_id=f"{ACCOUNT_MEMORY_OWNER_PREFIX}{user_id}",
+        memory_namespace=MAIN_CHAT_MEMORY_NAMESPACE,
+        project_id=GLOBAL_MEMORY_PROJECT_ID,
+        workspace_id="",
+        repo_id="",
+    )
+    setattr(agent, "memory_disable_workspace_fallback", True)
+    setattr(agent, "memory_scope_kind", "main_chat_account")
+    setattr(agent, "memory_account_user_id", user_id)
+    username = str(principal.get("username") or "").strip()
+    if username:
+        setattr(agent, "memory_account_username", username)
+    device_id = str(principal.get("device_id") or "").strip()
+    if device_id:
+        setattr(agent, "memory_account_device_id", device_id)
+    return True

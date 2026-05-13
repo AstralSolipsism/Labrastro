@@ -13,6 +13,11 @@ from reuleauxcoder.domain.memory.models import (
     MemoryQuery,
     MemoryScope,
 )
+from reuleauxcoder.domain.memory.runtime import (
+    ACCOUNT_MEMORY_OWNER_PREFIX,
+    GLOBAL_MEMORY_PROJECT_ID,
+    MAIN_CHAT_MEMORY_NAMESPACE,
+)
 
 
 class MemoryRepository(Protocol):
@@ -52,14 +57,15 @@ class MemoryProvider:
         if cached is not None:
             return cached
 
-        items = self.repository.search(
-            scope,
-            MemoryQuery(
-                query=request.query,
-                limit=request.limit,
-                type_filter=request.type_filter,
-            ),
+        query = MemoryQuery(
+            query=request.query,
+            limit=request.limit,
+            type_filter=request.type_filter,
         )
+        if self._is_account_main_chat(scope):
+            items = self._search_account_main_chat(scope, query)
+        else:
+            items = self.repository.search(scope, query)
         selected = self._fit_budget(items, request.token_budget)
         bundle = MemoryBundle(
             scope=scope,
@@ -93,3 +99,70 @@ class MemoryProvider:
             selected.append(item)
             used += estimate
         return selected
+
+    @staticmethod
+    def _is_account_main_chat(scope: MemoryScope) -> bool:
+        return (
+            scope.owner_agent_id.startswith(ACCOUNT_MEMORY_OWNER_PREFIX)
+            and scope.memory_namespace == MAIN_CHAT_MEMORY_NAMESPACE
+        )
+
+    @staticmethod
+    def _main_chat_scope(scope: MemoryScope, project_id: str) -> MemoryScope:
+        return MemoryScope(
+            owner_agent_id=scope.owner_agent_id,
+            memory_namespace=scope.memory_namespace,
+            project_id=project_id,
+            workspace_id="",
+            repo_id="",
+            goal_id="",
+            task_id="",
+            session_id=scope.session_id,
+            sensitivity=scope.sensitivity,
+        )
+
+    def _search_account_main_chat(
+        self, scope: MemoryScope, query: MemoryQuery
+    ) -> list[MemoryItem]:
+        remaining = max(1, int(query.limit or 1))
+        seen: set[str] = set()
+        items: list[MemoryItem] = []
+
+        def append_from(search_scope: MemoryScope, limit: int) -> None:
+            if limit <= 0:
+                return
+            for item in self.repository.search(
+                search_scope,
+                MemoryQuery(
+                    query=query.query,
+                    limit=limit,
+                    type_filter=query.type_filter,
+                ),
+            ):
+                if item.id in seen:
+                    continue
+                seen.add(item.id)
+                items.append(item)
+
+        global_scope = self._main_chat_scope(scope, GLOBAL_MEMORY_PROJECT_ID)
+        append_from(global_scope, remaining)
+        remaining = max(0, remaining - len(items))
+
+        current_project = scope.project_id.strip()
+        if current_project and current_project != GLOBAL_MEMORY_PROJECT_ID:
+            append_from(self._main_chat_scope(scope, current_project), remaining)
+            remaining = max(0, int(query.limit or 1) - len(items))
+
+        related_search = getattr(self.repository, "search_related_projects", None)
+        if remaining > 0 and str(query.query or "").strip() and callable(related_search):
+            excluded = {GLOBAL_MEMORY_PROJECT_ID}
+            if current_project:
+                excluded.add(current_project)
+            for item in related_search(scope, query, excluded, remaining):
+                if item.id in seen:
+                    continue
+                seen.add(item.id)
+                items.append(item)
+                if len(items) >= int(query.limit or 1):
+                    break
+        return items
