@@ -154,7 +154,13 @@ class MemoryProvider:
             remaining = max(0, int(query.limit or 1) - len(items))
 
         related_search = getattr(self.repository, "search_related_projects", None)
-        if remaining > 0 and str(query.query or "").strip() and callable(related_search):
+        if (
+            remaining > 0
+            and current_project
+            and current_project != GLOBAL_MEMORY_PROJECT_ID
+            and str(query.query or "").strip()
+            and callable(related_search)
+        ):
             excluded = {GLOBAL_MEMORY_PROJECT_ID}
             if current_project:
                 excluded.add(current_project)
