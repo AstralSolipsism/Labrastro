@@ -348,7 +348,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
     lines.append("- `/model set-main <profile>` → set global default main model")
     lines.append("- `/model set-sub <profile>` → set global default delegated-run model")
     lines.append(
-        "- `delegate_agent(agent_id=..., task=...)` → route durable delegated work to the selected AgentConfig"
+        "- `delegate_agent(agent_id, task)` → route durable delegated work to the selected AgentConfig"
     )
     lines.append("")
 

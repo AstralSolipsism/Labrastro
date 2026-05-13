@@ -1,4 +1,4 @@
-﻿"""Delegated AgentRun spawning tool."""
+﻿"""Delegated AgentRun submission tool."""
 
 from __future__ import annotations
 
