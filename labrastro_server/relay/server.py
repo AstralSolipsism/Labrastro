@@ -457,7 +457,8 @@ class RelayServer:
     # ------------------------------------------------------------------
 
     def _on_register(self, req: RegisterRequest) -> RegisterResponse | RegisterRejected:
-        if not self._token_manager.consume_bootstrap_token(req.bootstrap_token):
+        claims = self._token_manager.consume_bootstrap_token(req.bootstrap_token)
+        if claims is None:
             raise RegisterRejectedError("Invalid or expired bootstrap token")
 
         meta = {
@@ -466,6 +467,8 @@ class RelayServer:
             "features": req.features,
             "host_info_min": req.host_info_min,
         }
+        if claims:
+            meta["auth_principal"] = dict(claims)
         peer_id = self._registry.register(meta=meta)
         peer_token = self._token_manager.issue_peer_token(
             peer_id, ttl_sec=self._peer_token_ttl_sec
@@ -480,9 +483,13 @@ class RelayServer:
     # Token helpers
     # ------------------------------------------------------------------
 
-    def issue_bootstrap_token(self, ttl_sec: int = 300) -> str:
+    def issue_bootstrap_token(
+        self, ttl_sec: int = 300, claims: dict | None = None
+    ) -> str:
         """Host API: issue a one-time bootstrap token for a new peer."""
-        return self._token_manager.issue_bootstrap_token(ttl_sec=ttl_sec)
+        return self._token_manager.issue_bootstrap_token(
+            ttl_sec=ttl_sec, claims=claims
+        )
 
     # ------------------------------------------------------------------
     # Maintenance

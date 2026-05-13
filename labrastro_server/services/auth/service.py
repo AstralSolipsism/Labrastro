@@ -55,7 +55,7 @@ class AuthService:
         config: AuthConfig,
         store: AuthStore,
         *,
-        issue_bootstrap_token: Callable[[int], str],
+        issue_bootstrap_token: Callable[..., str],
     ) -> None:
         self.config = config
         self.store = store
@@ -209,7 +209,17 @@ class AuthService:
 
     def bootstrap_token(self, principal: AuthPrincipal, ttl_sec: int) -> dict[str, Any]:
         self.require_scopes(principal, {"peer:bootstrap"})
-        token = self.issue_bootstrap_token(ttl_sec)
+        claims = {
+            "user_id": principal.user_id,
+            "username": principal.username,
+            "role": principal.role,
+            "device_id": principal.device_id,
+            "scopes": list(principal.effective_scopes()),
+        }
+        try:
+            token = self.issue_bootstrap_token(ttl_sec, claims)
+        except TypeError:
+            token = self.issue_bootstrap_token(ttl_sec)
         self._audit(
             "bootstrap_token_issued",
             user_id=principal.user_id,

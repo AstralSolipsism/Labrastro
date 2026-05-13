@@ -220,7 +220,9 @@ def _default_create_remote_http_service(
     auth_service = AuthService(
         config.auth,
         create_auth_store(config),
-        issue_bootstrap_token=lambda ttl: relay_server.issue_bootstrap_token(ttl_sec=ttl),
+        issue_bootstrap_token=lambda ttl, claims=None: relay_server.issue_bootstrap_token(
+            ttl_sec=ttl, claims=claims
+        ),
     )
     service = RemoteRelayHTTPService(
         relay_server=relay_server,

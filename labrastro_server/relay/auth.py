@@ -5,6 +5,7 @@ from __future__ import annotations
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from labrastro_server.relay.errors import AuthError, RegisterRejectedError
 
@@ -15,6 +16,7 @@ class _TokenEntry:
     expires_at: float
     used: bool = False
     peer_id: str | None = None
+    claims: dict[str, Any] = field(default_factory=dict)
 
 
 class TokenManager:
@@ -28,27 +30,30 @@ class TokenManager:
     # Bootstrap token
     # ------------------------------------------------------------------
 
-    def issue_bootstrap_token(self, ttl_sec: int = 300) -> str:
+    def issue_bootstrap_token(
+        self, ttl_sec: int = 300, claims: dict[str, Any] | None = None
+    ) -> str:
         """Issue a new one-time bootstrap token."""
         token = "bt_" + secrets.token_urlsafe(32)
         entry = _TokenEntry(
             token=token,
             expires_at=time.time() + ttl_sec,
+            claims=dict(claims or {}),
         )
         self._bootstrap[token] = entry
         return token
 
-    def consume_bootstrap_token(self, token: str) -> bool:
-        """Consume a bootstrap token. Returns True if valid and not expired."""
+    def consume_bootstrap_token(self, token: str) -> dict[str, Any] | None:
+        """Consume a bootstrap token. Returns claims if valid, None otherwise."""
         entry = self._bootstrap.get(token)
         if entry is None:
-            return False
+            return None
         if entry.used:
-            return False
+            return None
         if time.time() > entry.expires_at:
-            return False
+            return None
         entry.used = True
-        return True
+        return dict(entry.claims)
 
     # ------------------------------------------------------------------
     # Peer token
