@@ -1,5 +1,7 @@
 ﻿import json
 
+import pytest
+
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import HookPoint
 from reuleauxcoder.domain.hooks.builtin.project_context import ProjectContextHook
@@ -375,6 +377,14 @@ def test_llm_chat_applies_project_context_hook_to_provider_request(
         "hook-injected-context" in str(message.get("content") or "")
         for message in captured["messages"]
     )
+
+
+def test_llm_can_initialize_without_api_key_and_fails_on_chat() -> None:
+    llm = LLM(model="demo-model", api_key="")
+
+    assert llm.client is None
+    with pytest.raises(RuntimeError, match="No model provider API key is configured"):
+        llm.chat([{"role": "user", "content": "Hi"}])
 
 
 def test_hook_request_override_merge_protects_provider_payload_keys() -> None:
