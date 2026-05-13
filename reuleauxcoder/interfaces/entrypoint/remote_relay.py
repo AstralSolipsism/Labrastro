@@ -15,6 +15,7 @@ from rich.console import Console
 from reuleauxcoder.app.runtime.session_state import (
     apply_agent_default_model,
     apply_session_runtime_state,
+    apply_session_model_override,
     build_session_runtime_state,
     restore_config_runtime_defaults,
 )
@@ -23,7 +24,10 @@ from reuleauxcoder.app.runtime.agent_runtime import (
     get_interactive_run_limiter,
 )
 from reuleauxcoder.domain.agent.agent import Agent
-from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
+from reuleauxcoder.domain.memory.runtime import (
+    bind_main_chat_memory_scope_to_agent,
+    bind_memory_scope_to_agent,
+)
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 from reuleauxcoder.domain.approval import (
     ApprovalDecision,
@@ -916,6 +920,11 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         setattr(peer_agent, "current_session_id", session_store.generate_session_id())
         return peer_agent
 
+    def _bind_main_chat_account_memory_scope(peer_agent: Agent, peer_id: str) -> None:
+        peer = relay_server.registry.get(peer_id)
+        if peer is not None:
+            bind_main_chat_memory_scope_to_agent(peer_agent, peer_info=peer)
+
     def _save_peer_session(peer_agent: Agent, peer_id: str) -> None:
         current_config = _current_config()
         if (
@@ -936,8 +945,92 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         )
         setattr(peer_agent, "current_session_id", sid)
 
+    def _apply_remote_chat_model_override(
+        peer_agent: Agent,
+        peer_id: str,
+        remote_session: Any,
+    ) -> bool:
+        provider_id = str(getattr(remote_session, "provider_id", "") or "").strip()
+        model_id = str(getattr(remote_session, "model_id", "") or "").strip()
+        parameters = getattr(remote_session, "model_parameters", None)
+        if not isinstance(parameters, dict):
+            parameters = {}
+        if not provider_id and not model_id:
+            return True
+        if not provider_id or not model_id:
+            remote_session.append_event(
+                "error",
+                {
+                    "message": "provider_model_required",
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                },
+            )
+            remote_session.append_event("chat_end", {"response": ""})
+            return False
+        current_config = _current_config()
+        if current_config is None:
+            remote_session.append_event("error", {"message": "config_unavailable"})
+            remote_session.append_event("chat_end", {"response": ""})
+            return False
+        session_id = str(
+            getattr(peer_agent, "current_session_id", None)
+            or getattr(remote_session, "session_hint", None)
+            or ""
+        ).strip()
+        result = switch_session_model(
+            current_config,
+            session_store,
+            _peer_fingerprint(peer_id),
+            {
+                "session_id": session_id,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "parameters": dict(parameters),
+            },
+            snapshot_loader=_load_session_snapshot,
+        )
+        if not result.get("ok"):
+            remote_session.append_event(
+                "error",
+                {
+                    "message": str(result.get("error") or "model_override_failed"),
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "status": result.get("_status"),
+                },
+            )
+            remote_session.append_event("chat_end", {"response": ""})
+            return False
+        resolved_session_id = str(result.get("session_id") or session_id).strip()
+        if resolved_session_id:
+            setattr(peer_agent, "current_session_id", resolved_session_id)
+            remote_session.session_id = resolved_session_id
+        try:
+            apply_session_model_override(
+                current_config,
+                peer_agent,
+                provider=provider_id,
+                model=model_id,
+                display_name=model_id,
+                parameters=parameters,
+            )
+        except Exception as exc:
+            remote_session.append_event(
+                "error",
+                {
+                    "message": str(exc),
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                },
+            )
+            remote_session.append_event("chat_end", {"response": ""})
+            return False
+        return True
+
     def _chat(peer_id: str, prompt: str) -> ChatResponse:
         peer_agent = _create_peer_agent(peer_id)
+        _bind_main_chat_account_memory_scope(peer_agent, peer_id)
         runtime_agent_id = f"chat:{uuid.uuid4().hex[:12]}"
         setattr(peer_agent, "runtime_agent_id", runtime_agent_id)
         try:
@@ -1008,6 +1101,10 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 "workflow_prompt_append",
                 f"{TASKFLOW_SYSTEM_PROMPT}\nCurrent Taskflow taskflow_id: `{taskflow_id}`.",
             )
+        else:
+            _bind_main_chat_account_memory_scope(peer_agent, peer_id)
+        if not _apply_remote_chat_model_override(peer_agent, peer_id, remote_session):
+            return
         remote_session.set_cancel_callback(
             lambda reason: (
                 peer_agent.request_stop(),

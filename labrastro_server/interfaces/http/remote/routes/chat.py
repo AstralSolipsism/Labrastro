@@ -102,6 +102,9 @@ class RemoteChatRoutes:
                 mode=req.mode,
                 workflow_mode=workflow_mode,
                 taskflow_id=req.taskflow_id,
+                provider_id=req.provider_id,
+                model_id=req.model_id,
+                model_parameters=req.parameters,
             )
             session.append_event(
                 "chat_start",
@@ -110,6 +113,8 @@ class RemoteChatRoutes:
                     "mode": req.mode,
                     "workflow_mode": workflow_mode,
                     "taskflow_id": req.taskflow_id,
+                    "provider_id": req.provider_id,
+                    "model_id": req.model_id,
                 },
             )
             session.mark_running()
@@ -183,6 +188,9 @@ class RemoteChatRoutes:
             mode=req.mode,
             workflow_mode=workflow_mode,
             taskflow_id=req.taskflow_id,
+            provider_id=req.provider_id,
+            model_id=req.model_id,
+            model_parameters=req.parameters,
         )
         session.append_event(
             "chat_start",
@@ -191,6 +199,8 @@ class RemoteChatRoutes:
                 "mode": req.mode,
                 "workflow_mode": workflow_mode,
                 "taskflow_id": req.taskflow_id,
+                "provider_id": req.provider_id,
+                "model_id": req.model_id,
             },
         )
         session.mark_running()

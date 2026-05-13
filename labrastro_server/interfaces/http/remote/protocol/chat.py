@@ -12,6 +12,9 @@ class ChatRequest:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {"peer_token": self.peer_token, "prompt": self.prompt}
@@ -21,6 +24,12 @@ class ChatRequest:
             payload["workflow_mode"] = self.workflow_mode
         if self.taskflow_id is not None:
             payload["taskflow_id"] = self.taskflow_id
+        if self.provider_id is not None:
+            payload["provider_id"] = self.provider_id
+        if self.model_id is not None:
+            payload["model_id"] = self.model_id
+        if self.parameters:
+            payload["parameters"] = dict(self.parameters)
         return payload
 
     @classmethod
@@ -28,12 +37,16 @@ class ChatRequest:
         taskflow_id = d.get("taskflow_id")
         if taskflow_id is None:
             taskflow_id = d.get("taskflow_goal_id")
+        parameters = d.get("parameters")
         return cls(
             peer_token=d["peer_token"],
             prompt=d["prompt"],
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
             taskflow_id=taskflow_id,
+            provider_id=d.get("provider_id") or d.get("providerId"),
+            model_id=d.get("model_id") or d.get("modelId"),
+            parameters=parameters if isinstance(parameters, dict) else {},
         )
 
 @dataclass
@@ -56,6 +69,9 @@ class ChatStartRequest:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -69,6 +85,12 @@ class ChatStartRequest:
             payload["workflow_mode"] = self.workflow_mode
         if self.taskflow_id is not None:
             payload["taskflow_id"] = self.taskflow_id
+        if self.provider_id is not None:
+            payload["provider_id"] = self.provider_id
+        if self.model_id is not None:
+            payload["model_id"] = self.model_id
+        if self.parameters:
+            payload["parameters"] = dict(self.parameters)
         return payload
 
     @classmethod
@@ -76,6 +98,7 @@ class ChatStartRequest:
         taskflow_id = d.get("taskflow_id")
         if taskflow_id is None:
             taskflow_id = d.get("taskflow_goal_id")
+        parameters = d.get("parameters")
         return cls(
             peer_token=d["peer_token"],
             prompt=d["prompt"],
@@ -83,6 +106,9 @@ class ChatStartRequest:
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
             taskflow_id=taskflow_id,
+            provider_id=d.get("provider_id") or d.get("providerId"),
+            model_id=d.get("model_id") or d.get("modelId"),
+            parameters=parameters if isinstance(parameters, dict) else {},
         )
 
 @dataclass

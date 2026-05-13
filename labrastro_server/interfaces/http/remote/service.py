@@ -251,6 +251,9 @@ class _RemoteChatSession:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    model_parameters: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
     status: str = "created"
     last_error: str | None = None
@@ -710,8 +713,12 @@ class RemoteRelayHTTPService:
             self._github_reconcile_thread.join(timeout=3)
             self._github_reconcile_thread = None
 
-    def issue_bootstrap_token(self, ttl_sec: int = 300) -> str:
-        return self.relay_server.issue_bootstrap_token(ttl_sec=ttl_sec)
+    def issue_bootstrap_token(
+        self, ttl_sec: int = 300, claims: dict[str, Any] | None = None
+    ) -> str:
+        return self.relay_server.issue_bootstrap_token(
+            ttl_sec=ttl_sec, claims=claims
+        )
 
     def set_chat_handler(
         self, handler: Callable[[str, str], ChatResponse] | None
@@ -738,6 +745,9 @@ class RemoteRelayHTTPService:
         mode: str | None = None,
         workflow_mode: str | None = None,
         taskflow_id: str | None = None,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        model_parameters: dict[str, Any] | None = None,
     ) -> _RemoteChatSession:
         self._gc_chat_sessions()
         session = _RemoteChatSession(
@@ -747,6 +757,9 @@ class RemoteRelayHTTPService:
             mode=mode,
             workflow_mode=workflow_mode,
             taskflow_id=taskflow_id,
+            provider_id=provider_id,
+            model_id=model_id,
+            model_parameters=dict(model_parameters or {}),
             artifact_root=self._chat_artifact_root,
             max_events=self._chat_max_events,
             max_payload_bytes=self._chat_max_payload_bytes,

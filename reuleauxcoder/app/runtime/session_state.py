@@ -117,6 +117,27 @@ def _apply_model_binding(
     setattr(agent, "active_main_model_profile", None)
 
 
+def apply_session_model_override(
+    config: Config,
+    agent: Agent,
+    *,
+    provider: str,
+    model: str,
+    display_name: str = "",
+    parameters: dict | None = None,
+) -> None:
+    """Apply an explicit user-selected session model to a live agent."""
+    _apply_model_binding(
+        config,
+        agent,
+        provider=provider,
+        model=model,
+        display_name=display_name,
+        parameters=parameters,
+    )
+    setattr(agent, "session_model_overridden", True)
+
+
 def apply_agent_default_model(config: Config, agent: Agent) -> bool:
     """Apply the current Agent Profile default model to a live agent."""
     agent_id = getattr(agent, "active_mode", None) or getattr(config, "active_mode", None)
