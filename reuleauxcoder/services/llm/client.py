@@ -180,6 +180,7 @@ class LLM:
         self.base_url = self.provider_config.base_url if provider_config else base_url
         self.client: Any = None
         self._provider = None
+        self._provider_unavailable_reason = ""
         self._rebuild_provider()
 
     def _rebuild_provider(self) -> None:
@@ -187,6 +188,15 @@ class LLM:
         self.provider_type = self.provider_config.type
         self.api_key = self.provider_config.api_key
         self.base_url = self.provider_config.base_url
+        self._provider_unavailable_reason = ""
+        if not self.api_key:
+            self._provider = None
+            self.client = None
+            self._provider_unavailable_reason = (
+                "No model provider API key is configured. Configure a provider "
+                "and model profile before starting chat."
+            )
+            return
         self._provider = self._provider_manager.create(self.provider_config)
         self.client = getattr(self._provider, "client", None)
 
@@ -242,6 +252,8 @@ class LLM:
     def _prepare_provider(self):
         if self._provider is None:
             self._rebuild_provider()
+        if self._provider is None:
+            raise RuntimeError(self._provider_unavailable_reason)
         if isinstance(self._provider, OpenAIChatProvider):
             self._provider.call_with_retry = self._call_with_retry
         return self._provider
