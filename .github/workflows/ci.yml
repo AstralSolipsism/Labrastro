@@ -37,3 +37,97 @@ jobs:
 
       - name: Build distributions
         run: uv build
+
+  postgres-taskflow-ubuntu:
+    name: postgres-taskflow (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: labrastro
+          POSTGRES_PASSWORD: labrastro
+          POSTGRES_DB: labrastro_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      LABRASTRO_TEST_DATABASE_URL: postgresql://labrastro:labrastro@127.0.0.1:5432/labrastro_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      - name: Run Postgres Taskflow tests
+        run: uv run pytest -q tests/labrastro_server/services/taskflow/test_postgres_taskflow_store.py
+
+  postgres-taskflow-windows:
+    name: postgres-taskflow (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      - name: Locate PostgreSQL tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $initdb = Get-ChildItem -Path "C:\Program Files\PostgreSQL" -Filter initdb.exe -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $initdb) {
+            choco install postgresql -y --no-progress --params '/Password:postgres'
+            $initdb = Get-ChildItem -Path "C:\Program Files\PostgreSQL" -Filter initdb.exe -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+          }
+          if (-not $initdb) {
+            throw "PostgreSQL initdb.exe was not found after installation."
+          }
+          Split-Path $initdb.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Start local PostgreSQL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pgBin = Split-Path (Get-Command initdb.exe).Source
+          $pgData = Join-Path $env:RUNNER_TEMP "taskflow-postgres-data"
+          $pgLog = Join-Path $env:RUNNER_TEMP "taskflow-postgres.log"
+          Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue | Stop-Service -Force
+          & "$pgBin\initdb.exe" -D $pgData --auth=trust --username=postgres
+          & "$pgBin\pg_ctl.exe" -D $pgData -o "-F -p 5432" -l $pgLog start
+          & "$pgBin\createdb.exe" -h 127.0.0.1 -p 5432 -U postgres labrastro_test
+          "LABRASTRO_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/labrastro_test" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run Postgres Taskflow tests
+        run: uv run pytest -q tests/labrastro_server/services/taskflow/test_postgres_taskflow_store.py

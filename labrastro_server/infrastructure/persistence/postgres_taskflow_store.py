@@ -127,7 +127,7 @@ class PostgresTaskflowStore:
                     "taskflow_id": state.meta.taskflow_id,
                     "project_id": state.meta.project_id,
                     "goal_id": state.meta.goal_id,
-                    "status": state.status.value,
+                    "status": state.meta.status.value,
                     "state": _json(payload),
                     "schema_version": state.meta.schema_version,
                 },

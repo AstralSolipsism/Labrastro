@@ -46,7 +46,7 @@ def test_postgres_taskflow_store_recovers_complexity_evidence_and_estimate(tmp_p
         taskflow_id="taskflow-pg-complexity",
         goal_id="goal-pg-complexity",
     )
-    service.scan_repo_complexity(
+    scanned = service.scan_repo_complexity(
         state.meta.taskflow_id,
         workspace_path=str(workspace),
         repository_id="repo-pg",
@@ -56,6 +56,7 @@ def test_postgres_taskflow_store_recovers_complexity_evidence_and_estimate(tmp_p
     restored = reloaded.get_taskflow_state("taskflow-pg-complexity")
     project = reloaded.project_service.get_project_state("project-pg-taskflow")
 
+    assert restored.meta.status == scanned.meta.status
     assert restored.compiler.complexity_estimate is not None
     assert restored.compiler.complexity_estimate.scan_refs
     assert any(
@@ -63,4 +64,5 @@ def test_postgres_taskflow_store_recovers_complexity_evidence_and_estimate(tmp_p
         for item in restored.compiler.complexity_estimate.evidence
     )
     assert project is not None
+    assert project.project_id == "project-pg-taskflow"
     assert project.knowledge_base.reusable_context.get("repo_scan_snapshots")
