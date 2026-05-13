@@ -68,6 +68,7 @@ Edit `.env` and set at least:
 LABRASTRO_AUTH_TOKEN_SECRET=
 LABRASTRO_SUPERADMIN_USERNAME=admin
 LABRASTRO_SUPERADMIN_PASSWORD_HASH=
+LABRASTRO_DATABASE_URL=postgresql://USER:PASSWORD@POSTGRES_HOST:5432/DB
 LABRASTRO_SANDBOX_HOST_BASE_URL=http://labrastro-host:8765
 ```
 
@@ -80,14 +81,15 @@ docker compose up -d --build
 docker compose logs -f labrastro-host
 ```
 
-The base compose profile is no-database compatible: `LABRASTRO_DATABASE_URL` may be empty, and `docker compose up -d --build` should still start. This mode is intended for local, development, and single-instance evaluation, with explicit degradation:
+Docker compose no longer ships a built-in Postgres overlay and does not start a database container. Full control-plane validation must explicitly point `LABRASTRO_DATABASE_URL` at an existing Postgres instance.
+
+When `LABRASTRO_DATABASE_URL` is empty, the base compose profile remains no-database compatible. This mode is intended for local, development, and single-instance evaluation, with explicit degradation:
 
 - Auth uses the file store and depends on the `.rcoder` volume for accounts and refresh tokens.
 - Sessions use file storage and depend on the `.rcoder` / session volume for snapshots.
 - AgentRun, Taskflow, ProjectState, Issue, Assignment, and Mention state use in-process storage or degraded behavior in the current implementation and are not recoverable after restart.
 - GitHub PR lifecycle and review follow-up require Postgres.
 - Peer registry, peer tokens, and the relay pending queue remain single-instance in-memory state.
-- The Postgres overlay is not yet full production Taskflow persistence. Taskflow tables exist, but Taskflow store wiring is still pending.
 
 ### Production Exposure
 
@@ -99,16 +101,9 @@ https://labrastro.example.com -> Nginx/Caddy -> labrastro-host:8765
 
 This is the intended deployment model. Labrastro owns account authentication, authorization, token lifecycle, and audit behavior. TLS certificates, HSTS, DNS, public ports, firewall rules, IP allowlists, and reverse-proxy logs are deployment-layer responsibilities. Not listening for HTTPS directly inside the application does not make Remote Auth, Remote Relay / Peer, or the Admin control plane incomplete.
 
-For Postgres-backed control-plane state:
+For Postgres-backed control-plane state, set `LABRASTRO_DATABASE_URL` in `.env` before starting the host. The config template reads that environment variable for database connectivity.
 
-```bash
-cd /data/labrastro/src/docker
-docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
-```
-
-The config template reads `LABRASTRO_DATABASE_URL` for database connectivity.
-
-With the Postgres overlay enabled, the wired runtime/session/auth/collaboration/GitHub control-plane state can use Postgres. Production-grade Taskflow recovery still depends on the future Taskflow store wiring.
+With Postgres configured, the wired runtime/session/auth/collaboration/GitHub control-plane state can use Postgres. Production-grade Taskflow recovery still depends on the future Taskflow store wiring.
 
 ## Remote Login
 

@@ -125,6 +125,7 @@ cp .env.example .env
 LABRASTRO_AUTH_TOKEN_SECRET=
 LABRASTRO_SUPERADMIN_USERNAME=admin
 LABRASTRO_SUPERADMIN_PASSWORD_HASH=
+LABRASTRO_DATABASE_URL=postgresql://USER:PASSWORD@POSTGRES_HOST:5432/DB
 LABRASTRO_SANDBOX_HOST_BASE_URL=http://labrastro-host:8765
 ```
 
@@ -135,22 +136,17 @@ docker compose up -d --build
 docker compose logs -f labrastro-host
 ```
 
-基础 compose 默认是无数据库兼容模式：`LABRASTRO_DATABASE_URL` 可以留空，`docker compose up -d --build` 仍应能启动。此模式适合本地、开发和单实例试用，但会有明确降级：
+Docker compose 不再提供内置 Postgres overlay，也不会自己拉起数据库容器。完整控制面验证必须通过 `.env` 中的 `LABRASTRO_DATABASE_URL` 显式指向已有 Postgres。
+
+`LABRASTRO_DATABASE_URL` 留空时仍是无数据库兼容模式，适合本地、开发和单实例试用，但会有明确降级：
 
 - Auth 使用 file store，依赖 `.rcoder` volume 保存账号和 refresh token。
 - Session 使用文件 store，依赖 `.rcoder` / session volume 保存会话快照。
 - AgentRun、Taskflow、ProjectState、Issue、Assignment、Mention 在当前实现中会使用进程内状态或能力降级，重启后不可恢复。
 - GitHub PR lifecycle 和 review follow-up 需要 Postgres。
 - peer registry、peer token、relay pending queue 仍是单实例内存态。
-- Postgres overlay 当前不等于完整 Taskflow 生产持久化；Taskflow 表已存在，但 Taskflow store wiring 尚未完成。
 
-需要 Postgres 控制面时：
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
-```
-
-启用 Postgres 后，已 wiring 的 runtime/session/auth/collaboration/GitHub 控制面状态可进入 Postgres。Taskflow 的生产级状态恢复仍以后续 store wiring 为准。
+配置 Postgres 后，已 wiring 的 runtime/session/auth/collaboration/GitHub 控制面状态可进入 Postgres。Taskflow 的生产级状态恢复仍以后续 store wiring 为准。
 
 生产环境推荐让 Labrastro 在容器内监听 HTTP，再由 Nginx、Caddy、Traefik 或 Cloudflare 等部署层组件终止 HTTPS：
 
