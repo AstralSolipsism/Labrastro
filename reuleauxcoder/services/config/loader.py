@@ -329,11 +329,12 @@ class ConfigLoader:
             if explicit_data:
                 config_data = self._merge_dicts(config_data, explicit_data)
 
-        # Require explicit model/runtime config even if builtin modes are present
+        # Require explicit model/runtime config for local CLI usage. Remote host mode
+        # can bootstrap without a model so admins can configure providers via UI.
         has_runtime_config = any(
             key in config_data and config_data.get(key) for key in ("models", "app")
         )
-        if not has_runtime_config:
+        if not has_runtime_config and not self._is_remote_host_mode_config(config_data):
             self._generate_example_global_config()
             raise ExampleConfigError(
                 f"\n  Welcome to ReuleauxCoder! \U0001F389\n\n"
@@ -625,6 +626,16 @@ class ConfigLoader:
             return False
         meta = global_data.get("meta")
         return isinstance(meta, dict) and bool(meta.get("example"))
+
+    @staticmethod
+    def _is_remote_host_mode_config(data: dict) -> bool:
+        """Return true when config explicitly starts a remote host control plane."""
+        if not isinstance(data, dict):
+            return False
+        remote_exec = data.get("remote_exec")
+        if not isinstance(remote_exec, dict):
+            return False
+        return bool(remote_exec.get("enabled")) and bool(remote_exec.get("host_mode"))
 
     def _generate_example_global_config(self) -> None:
         """Generate an example config at the global config path."""

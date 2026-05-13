@@ -1,16 +1,3 @@
-models:
-  active_main: host-main
-  profiles:
-    host-main:
-      model: ${RCODER_MODEL}
-      api_key: ${RCODER_API_KEY}
-      base_url: ${RCODER_BASE_URL}
-      max_tokens: 4096
-      temperature: 0.0
-      max_context_tokens: 128000
-      preserve_reasoning_content: true
-      backfill_reasoning_content_for_tool_calls: false
-
 modes:
   active: coder
   profiles:

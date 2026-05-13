@@ -1372,10 +1372,11 @@ class Config:
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = []
+        is_remote_host_mode = self.remote_exec.enabled and self.remote_exec.host_mode
         has_provider_backed_key = any(
             provider.api_key for provider in self.providers.items.values()
         )
-        if not self.api_key and not has_provider_backed_key:
+        if not is_remote_host_mode and not self.api_key and not has_provider_backed_key:
             errors.append("api_key is required")
         if self.max_tokens < 1:
             errors.append("max_tokens must be positive")
