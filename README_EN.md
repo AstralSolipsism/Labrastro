@@ -65,15 +65,13 @@ cp .env.example .env
 Edit `.env` and set at least:
 
 ```text
-RCODER_MODEL=
-RCODER_BASE_URL=
-RCODER_API_KEY=
 LABRASTRO_AUTH_TOKEN_SECRET=
 LABRASTRO_SUPERADMIN_USERNAME=admin
 LABRASTRO_SUPERADMIN_PASSWORD_HASH=
+LABRASTRO_SANDBOX_HOST_BASE_URL=http://labrastro-host:8765
 ```
 
-Generate the password hash with `rcoder auth hash-password`, then place it in `LABRASTRO_SUPERADMIN_PASSWORD_HASH`.
+Generate the password hash with `rcoder auth hash-password`, then place it in `LABRASTRO_SUPERADMIN_PASSWORD_HASH`. Escape `$` as `$$` in Docker `.env` files so Compose does not treat hash segments as variable references. Model providers and model profiles are managed from the frontend Admin settings, so they are not required Docker startup variables.
 
 Start the host:
 

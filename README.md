@@ -122,15 +122,13 @@ cp .env.example .env
 `.env` 至少需要配置：
 
 ```text
-RCODER_MODEL=
-RCODER_BASE_URL=
-RCODER_API_KEY=
 LABRASTRO_AUTH_TOKEN_SECRET=
 LABRASTRO_SUPERADMIN_USERNAME=admin
 LABRASTRO_SUPERADMIN_PASSWORD_HASH=
+LABRASTRO_SANDBOX_HOST_BASE_URL=http://labrastro-host:8765
 ```
 
-密码哈希可通过 `rcoder auth hash-password` 生成。启动 Host：
+密码哈希可通过 `rcoder auth hash-password` 生成；写入 Docker `.env` 时需要把 hash 里的 `$` 写成 `$$`，避免 Compose 当作变量插值。模型 Provider 与模型 Profile 可在前端 Admin 配置中维护，不需要作为 Docker 启动必填项。启动 Host：
 
 ```bash
 docker compose up -d --build
