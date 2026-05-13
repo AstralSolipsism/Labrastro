@@ -2,6 +2,8 @@
     ApprovalConfig,
     ApprovalRuleConfig,
     AgentRegistryConfig,
+    AuthConfig,
+    AuthSuperadminConfig,
     Config,
     EnvironmentCLIToolConfig,
     MCPArtifactConfig,
@@ -357,6 +359,31 @@ def test_sandbox_provider_config_defaults_and_validation() -> None:
     assert config.sandbox_provider.type == "none"
     assert config.sandbox_provider.worker_image == "labrastro-host:test"
     assert config.validate() == []
+
+
+def test_config_validate_allows_remote_host_without_model_key() -> None:
+    config = Config(
+        api_key="",
+        remote_exec=RemoteExecConfig(enabled=True, host_mode=True),
+        auth=AuthConfig(
+            enabled=True,
+            token_secret="test-secret",
+            superadmins=[
+                AuthSuperadminConfig(
+                    username="admin",
+                    password_hash="pbkdf2_sha256$260000$salt$hash",
+                )
+            ],
+        ),
+    )
+
+    assert "api_key is required" not in config.validate()
+
+
+def test_config_validate_still_requires_model_key_outside_remote_host() -> None:
+    config = Config(api_key="")
+
+    assert "api_key is required" in config.validate()
 
     invalid = Config(api_key="key")
     invalid.sandbox_provider.type = "bad"

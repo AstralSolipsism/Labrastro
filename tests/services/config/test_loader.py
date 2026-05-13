@@ -5,6 +5,7 @@ import pytest
 
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError
+from reuleauxcoder.services.config.loader import ExampleConfigError
 
 
 def test_load_yaml_returns_empty_dict_for_missing_file(tmp_path: Path) -> None:
@@ -100,14 +101,18 @@ def test_host_config_keeps_session_auto_save_enabled() -> None:
 
 
 def test_host_config_uses_auto_persistence_without_database_url(monkeypatch) -> None:
-    monkeypatch.setenv("RCODER_MODEL", "gpt-test")
-    monkeypatch.setenv("RCODER_API_KEY", "sk-test")
-    monkeypatch.setenv("RCODER_BASE_URL", "https://example.test/v1")
+    monkeypatch.delenv("RCODER_MODEL", raising=False)
+    monkeypatch.delenv("RCODER_API_KEY", raising=False)
+    monkeypatch.delenv("RCODER_BASE_URL", raising=False)
     monkeypatch.setenv("LABRASTRO_AUTH_TOKEN_SECRET", "test-secret")
     monkeypatch.setenv("LABRASTRO_SUPERADMIN_USERNAME", "admin")
     monkeypatch.setenv(
         "LABRASTRO_SUPERADMIN_PASSWORD_HASH",
         "pbkdf2_sha256$260000$salt$hash",
+    )
+    monkeypatch.setenv(
+        "LABRASTRO_SANDBOX_HOST_BASE_URL",
+        "http://labrastro-host:8765",
     )
     monkeypatch.delenv("LABRASTRO_DATABASE_URL", raising=False)
     config_path = Path(__file__).resolve().parents[3] / "docker" / "config.host.yaml"
@@ -119,6 +124,8 @@ def test_host_config_uses_auto_persistence_without_database_url(monkeypatch) -> 
     assert config.auth.store_backend == "auto"
     assert config.persistence.backend == "auto"
     assert config.persistence.database_url == ""
+    assert config.model_profiles == {}
+    assert "api_key is required" not in config.validate()
     assert "persistence.database_url is required when backend is postgres" not in config.validate()
 
 
@@ -630,6 +637,54 @@ def test_is_example_config_detects_example_flag() -> None:
     assert not ConfigLoader._is_example_config({"meta": {}})
     assert not ConfigLoader._is_example_config({"meta": {"example": False}})
     assert not ConfigLoader._is_example_config({"models": {"profiles": {}}})
+
+
+def test_load_allows_explicit_remote_host_without_models(tmp_path: Path) -> None:
+    config_path = tmp_path / "host.yaml"
+    config_path.write_text(
+        """
+remote_exec:
+  enabled: true
+  host_mode: true
+auth:
+  enabled: true
+  token_secret: test-secret
+  superadmins:
+    - username: admin
+      password_hash: pbkdf2_sha256$260000$salt$hash
+sandbox_provider:
+  type: docker
+  host_base_url: http://labrastro-host:8765
+""".strip(),
+        encoding="utf-8",
+    )
+    global_path = tmp_path / "home" / "config.yaml"
+    workspace_path = tmp_path / "workspace" / ".rcoder" / "config.yaml"
+
+    with patch.object(ConfigLoader, "GLOBAL_CONFIG_PATH", global_path), patch.object(
+        ConfigLoader, "WORKSPACE_CONFIG_PATH", workspace_path
+    ):
+        config = ConfigLoader(config_path).load()
+
+    assert config.remote_exec.enabled is True
+    assert config.remote_exec.host_mode is True
+    assert config.model_profiles == {}
+    assert "api_key is required" not in config.validate()
+
+
+def test_load_still_requires_runtime_config_for_non_host_config(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "local.yaml"
+    config_path.write_text("session:\n  auto_save: true\n", encoding="utf-8")
+    global_path = tmp_path / "home" / "config.yaml"
+    workspace_path = tmp_path / "workspace" / ".rcoder" / "config.yaml"
+
+    with patch.object(ConfigLoader, "GLOBAL_CONFIG_PATH", global_path), patch.object(
+        ConfigLoader, "WORKSPACE_CONFIG_PATH", workspace_path
+    ):
+        with pytest.raises(ExampleConfigError):
+            ConfigLoader(config_path).load()
 
 
 def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
