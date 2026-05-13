@@ -3,14 +3,14 @@ set -eu
 
 : "${LABRASTRO_AUTH_TOKEN_SECRET:?LABRASTRO_AUTH_TOKEN_SECRET is required}"
 : "${LABRASTRO_SUPERADMIN_USERNAME:?LABRASTRO_SUPERADMIN_USERNAME is required}"
-: "${LABRASTRO_SUPERADMIN_PASSWORD_HASH:?LABRASTRO_SUPERADMIN_PASSWORD_HASH is required}"
+: "${LABRASTRO_SUPERADMIN_PASSWORD:?LABRASTRO_SUPERADMIN_PASSWORD is required}"
 : "${LABRASTRO_SANDBOX_HOST_BASE_URL:?LABRASTRO_SANDBOX_HOST_BASE_URL is required}"
 
 CONFIG_PATH="${RCODER_CONFIG_PATH:-/app/.rcoder/config.host.yaml}"
 CONFIG_DIR="$(dirname "$CONFIG_PATH")"
 
 mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_PATH" ]; then
+if [ -z "${RCODER_CONFIG_PATH:-}" ] || [ ! -f "$CONFIG_PATH" ]; then
   envsubst < /app/docker/config.host.yaml.template > "$CONFIG_PATH"
 fi
 

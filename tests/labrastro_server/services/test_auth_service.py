@@ -38,7 +38,7 @@ def _config(path: Path, *, access_ttl: int = 900) -> AuthConfig:
         superadmins=[
             AuthSuperadminConfig(
                 username="admin",
-                password_hash=hash_password(TEST_PASSWORD, iterations=1000),
+                password=TEST_PASSWORD,
             )
         ],
     )

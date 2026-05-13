@@ -70,7 +70,7 @@ def _auth_service(tmp_path: Path, relay: RelayServer) -> AuthService:
             superadmins=[
                 AuthSuperadminConfig(
                     username="admin",
-                    password_hash=hash_password(TEST_PASSWORD, iterations=1000),
+                    password=TEST_PASSWORD,
                 )
             ],
         ),

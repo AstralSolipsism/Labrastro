@@ -106,10 +106,7 @@ def test_host_config_uses_auto_persistence_without_database_url(monkeypatch) -> 
     monkeypatch.delenv("RCODER_BASE_URL", raising=False)
     monkeypatch.setenv("LABRASTRO_AUTH_TOKEN_SECRET", "test-secret")
     monkeypatch.setenv("LABRASTRO_SUPERADMIN_USERNAME", "admin")
-    monkeypatch.setenv(
-        "LABRASTRO_SUPERADMIN_PASSWORD_HASH",
-        "pbkdf2_sha256$260000$salt$hash",
-    )
+    monkeypatch.setenv("LABRASTRO_SUPERADMIN_PASSWORD", "plain-admin-password")
     monkeypatch.setenv(
         "LABRASTRO_SANDBOX_HOST_BASE_URL",
         "http://labrastro-host:8765",
@@ -124,6 +121,7 @@ def test_host_config_uses_auto_persistence_without_database_url(monkeypatch) -> 
     assert config.auth.store_backend == "auto"
     assert config.persistence.backend == "auto"
     assert config.persistence.database_url == ""
+    assert config.auth.superadmins[0].password == "plain-admin-password"
     assert config.model_profiles == {}
     assert "api_key is required" not in config.validate()
     assert "persistence.database_url is required when backend is postgres" not in config.validate()
@@ -351,7 +349,7 @@ def test_parse_config_reads_remote_exec_settings() -> None:
                 "superadmins": [
                     {
                         "username": "admin",
-                        "password_hash": "pbkdf2_sha256$260000$salt$hash",
+                        "password": "plain-admin-password",
                     }
                 ],
             },
@@ -375,6 +373,7 @@ def test_parse_config_reads_remote_exec_settings() -> None:
     assert config.auth.login_rate_limit_count == 3
     assert config.auth.login_rate_limit_window_sec == 600
     assert config.auth.superadmins[0].username == "admin"
+    assert config.auth.superadmins[0].password == "plain-admin-password"
 
 
 def test_parse_config_reads_peer_mcp_artifacts() -> None:
@@ -651,7 +650,7 @@ auth:
   token_secret: test-secret
   superadmins:
     - username: admin
-      password_hash: pbkdf2_sha256$260000$salt$hash
+      password: plain-admin-password
 sandbox_provider:
   type: docker
   host_base_url: http://labrastro-host:8765

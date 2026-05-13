@@ -29,7 +29,7 @@ auth:
   login_rate_limit_window_sec: 900
   superadmins:
     - username: ${LABRASTRO_SUPERADMIN_USERNAME}
-      password_hash: ${LABRASTRO_SUPERADMIN_PASSWORD_HASH}
+      password: ${LABRASTRO_SUPERADMIN_PASSWORD}
 
 run_limits:
   max_running_agents: 4

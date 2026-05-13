@@ -151,7 +151,7 @@ CONFIG_SCHEMA = {
         "superadmins": [
             {
                 "username": "string",
-                "password_hash": "string (pbkdf2_sha256 hash)",
+                "password": "string (plain login password)",
             }
         ],
     },

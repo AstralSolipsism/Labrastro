@@ -519,11 +519,20 @@ class AuthService:
             user_id = existing.id if existing is not None else "usr_" + uuid.uuid4().hex
             created_at = existing.created_at if existing is not None else now
             last_login_at = existing.last_login_at if existing is not None else None
+            password_hash = (
+                existing.password_hash
+                if existing is not None
+                and verify_password(item.password, existing.password_hash)
+                else hash_password(
+                    item.password,
+                    iterations=self.config.password_hash_iterations,
+                )
+            )
             self.store.upsert_user(
                 AuthUser(
                     id=user_id,
                     username=username,
-                    password_hash=item.password_hash,
+                    password_hash=password_hash,
                     role="superadmin",
                     scopes=(),
                     enabled=True,
@@ -720,8 +729,12 @@ def validate_auth_config(config: AuthConfig) -> list[str]:
     for item in config.superadmins:
         if not item.username.strip():
             errors.append("auth.superadmins.username is required")
-        if not item.password_hash.strip():
-            errors.append("auth.superadmins.password_hash is required")
+        if not item.password:
+            errors.append("auth.superadmins.password is required")
+        elif len(item.password) < password_min or len(item.password) > password_max:
+            errors.append(
+                "auth.superadmins.password must satisfy auth password length policy"
+            )
         if item.role not in AUTH_ROLES:
             errors.append("auth.superadmins.role must be superadmin")
         if item.role != "superadmin":

@@ -31,11 +31,9 @@ from reuleauxcoder.domain.config.models import (
     RunLimitsConfig,
     RuntimeProfilesConfig,
 )
-from labrastro_server.services.auth.crypto import hash_password
 from reuleauxcoder.domain.session.models import Session, SessionRuntimeState
 
 TEST_AUTH_PASSWORD = "admin-password"
-TEST_AUTH_PASSWORD_HASH = hash_password(TEST_AUTH_PASSWORD, iterations=1000)
 from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
@@ -95,7 +93,7 @@ def _test_auth_config(store_dir: Path | None = None) -> AuthConfig:
         superadmins=[
             AuthSuperadminConfig(
                 username="admin",
-                password_hash=TEST_AUTH_PASSWORD_HASH,
+                password=TEST_AUTH_PASSWORD,
             )
         ],
     )

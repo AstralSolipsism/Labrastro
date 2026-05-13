@@ -162,7 +162,7 @@ class ConfigLoader:
                 for index, item in enumerate(raw_superadmins):
                     if not isinstance(item, dict):
                         continue
-                    for field in ("username", "password_hash"):
+                    for field in ("username", "password"):
                         if field in item:
                             value = str(item.get(field) or "").strip()
                             if value:

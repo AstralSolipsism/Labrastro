@@ -371,7 +371,7 @@ def test_config_validate_allows_remote_host_without_model_key() -> None:
             superadmins=[
                 AuthSuperadminConfig(
                     username="admin",
-                    password_hash="pbkdf2_sha256$260000$salt$hash",
+                    password="plain-admin-password",
                 )
             ],
         ),

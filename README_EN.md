@@ -67,12 +67,12 @@ Edit `.env` and set at least:
 ```text
 LABRASTRO_AUTH_TOKEN_SECRET=
 LABRASTRO_SUPERADMIN_USERNAME=admin
-LABRASTRO_SUPERADMIN_PASSWORD_HASH=
+LABRASTRO_SUPERADMIN_PASSWORD=
 LABRASTRO_DATABASE_URL=postgresql://USER:PASSWORD@POSTGRES_HOST:5432/DB
 LABRASTRO_SANDBOX_HOST_BASE_URL=http://labrastro-host:8765
 ```
 
-Generate the password hash with `rcoder auth hash-password`, then place it in `LABRASTRO_SUPERADMIN_PASSWORD_HASH`. Escape `$` as `$$` in Docker `.env` files so Compose does not treat hash segments as variable references. Model providers and model profiles are managed from the frontend Admin settings, so they are not required Docker startup variables.
+`LABRASTRO_SUPERADMIN_PASSWORD` is the plaintext admin login password. Model providers and model profiles are managed from the frontend Admin settings, so they are not required Docker startup variables.
 
 Start the host:
 
@@ -125,17 +125,16 @@ auth:
   login_rate_limit_count: 5
   superadmins:
     - username: admin
-      password_hash: <pbkdf2-password-hash>
+      password: <plain-login-password>
 ```
 
 With `store_backend: auto`, auth uses Postgres when `persistence.database_url` is configured and falls back to the file store when it is empty. Explicit `store_backend: postgres` uses Postgres tables
 `labrastro_auth_users`, `labrastro_auth_devices`, `labrastro_auth_refresh_tokens`, and `labrastro_auth_audit_events`
 The first administrator must come from backend config. The frontend does not initialize the system.
 
-Generate and verify auth config:
+Verify auth config:
 
 ```bash
-uv run rcoder auth hash-password
 uv run rcoder auth verify-config --config .rcoder/config.yaml
 ```
 

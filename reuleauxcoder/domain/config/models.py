@@ -690,7 +690,7 @@ class AuthSuperadminConfig:
     """Configured superadmin account."""
 
     username: str = ""
-    password_hash: str = ""
+    password: str = ""
     role: str = "superadmin"
 
     @classmethod
@@ -699,14 +699,14 @@ class AuthSuperadminConfig:
             return cls()
         return cls(
             username=str(data.get("username", "") or ""),
-            password_hash=str(data.get("password_hash", "") or ""),
+            password=str(data.get("password", "") or ""),
             role=str(data.get("role", "superadmin") or "superadmin"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "username": self.username,
-            "password_hash": self.password_hash,
+            "password": self.password,
             "role": self.role,
         }
 
@@ -1429,8 +1429,8 @@ class Config:
             for superadmin in self.auth.superadmins:
                 if not superadmin.username.strip():
                     errors.append("auth.superadmins.username is required")
-                if not superadmin.password_hash.strip():
-                    errors.append("auth.superadmins.password_hash is required")
+                if not superadmin.password:
+                    errors.append("auth.superadmins.password is required")
                 if superadmin.role != "superadmin":
                     errors.append("auth.superadmins entries must use role superadmin")
         valid_persistence_backends = {"auto", "memory", "postgres"}
