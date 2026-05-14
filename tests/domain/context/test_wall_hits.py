@@ -6,6 +6,7 @@ from reuleauxcoder.domain.context.manager import (
     estimate_message_tokens,
     estimate_tokens,
 )
+from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 
 
 def _make_long_tool_output(lines: int = 20, extra_chars: int = 1600) -> dict:
@@ -207,3 +208,72 @@ class TestWallHitStateMachine:
         assert manager._snip_hit_count == 0
         assert not manager._snip_exhausted
         assert manager.max_tokens == 2000
+
+    def test_maybe_compress_emits_context_ui_events(self) -> None:
+        """Automatic compression should emit before/after context UI events."""
+        ui_bus = UIEventBus()
+        manager = ContextManager(max_tokens=1000, ui_bus=ui_bus)
+        manager._collapse_at = 1
+        messages = [_make_user_message(100) for _ in range(8)]
+
+        assert manager.maybe_compress(messages, llm=None) is True
+
+        context_events = [
+            event for event in ui_bus._history if event.kind == UIEventKind.CONTEXT
+        ]
+        assert [event.data["phase"] for event in context_events] == ["before", "after"]
+        assert context_events[0].data["applied_layers"] == ["hard_collapse"]
+        assert context_events[1].data["before_message_count"] == 8
+        assert context_events[1].data["after_message_count"] < 8
+
+    def test_force_compress_success_emits_context_ui_events(self) -> None:
+        """Manual force compression should use the same detailed UI event path."""
+
+        class SummaryLLM:
+            def chat(self, messages, **kwargs):
+                return type("Response", (), {"content": "summary"})()
+
+        cases = [
+            ("snip", _make_snippable_tool_messages(6), None, "snip_tool_outputs"),
+            (
+                "summarize",
+                [{"role": "user", "content": f"message {i}"} for i in range(5)],
+                SummaryLLM(),
+                "summarize_old",
+            ),
+            (
+                "collapse",
+                [{"role": "user", "content": f"message {i}"} for i in range(5)],
+                None,
+                "hard_collapse",
+            ),
+        ]
+
+        for strategy, messages, llm, layer in cases:
+            ui_bus = UIEventBus()
+            manager = ContextManager(
+                ui_bus=ui_bus,
+                summarize_keep_recent_turns=2,
+            )
+
+            assert manager.force_compress(messages, strategy, llm=llm) is True
+
+            context_events = [
+                event for event in ui_bus._history if event.kind == UIEventKind.CONTEXT
+            ]
+            assert [event.data["phase"] for event in context_events] == [
+                "before",
+                "after",
+            ]
+            assert context_events[0].data["applied_layers"] == [layer]
+            assert context_events[1].data["applied_layers"] == [layer]
+
+    def test_strategy_description_uses_configured_recent_turn_count(self) -> None:
+        manager = ContextManager(summarize_keep_recent_turns=7)
+
+        strategy = manager._describe_strategy(["summarize_old"])
+        summarize_policy = next(
+            item for item in strategy["policy"] if item["layer"] == "summarize_old"
+        )
+
+        assert "most recent 7 user turns" in summarize_policy["description"]

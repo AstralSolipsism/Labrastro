@@ -16,6 +16,8 @@ class AgentEventType(Enum):
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
     DELEGATED_RUN_COMPLETED = "delegated_run_completed"
+    # User-visible context compression lifecycle events are currently emitted via
+    # UIEventKind.CONTEXT so CLI, remote relay, and webview can share one UI path.
     COMPRESSION_START = "compression_start"
     COMPRESSION_END = "compression_end"
     USAGE_UPDATE = "usage_update"

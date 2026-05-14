@@ -361,11 +361,24 @@ class ContextManager:
         llm: Optional["LLM"] = None,
     ) -> bool:
         """Force one specific compression strategy regardless of thresholds."""
+        before_tokens = self.get_context_tokens(messages)
+        before_message_count = len(messages)
+        before_snapshot = self._snapshot_messages(messages)
+        applied_layer: str | None = None
+
         if strategy == "snip":
             changed = self._snip_tool_outputs(messages)
             if changed:
                 self._last_compact_tokens = estimate_tokens(messages, token_fudge_factor=self._token_fudge_factor)
                 self._last_compact_strategy = "snip"
+                applied_layer = "snip_tool_outputs"
+                self._emit_compression_events(
+                    before_tokens=before_tokens,
+                    before_message_count=before_message_count,
+                    before_snapshot=before_snapshot,
+                    after_messages=messages,
+                    applied_layers=[applied_layer],
+                )
             return changed
         if strategy == "summarize":
             changed = self._summarize_old(
@@ -374,6 +387,14 @@ class ContextManager:
             if changed:
                 self._last_compact_tokens = estimate_tokens(messages, token_fudge_factor=self._token_fudge_factor)
                 self._last_compact_strategy = "summarize"
+                applied_layer = "summarize_old"
+                self._emit_compression_events(
+                    before_tokens=before_tokens,
+                    before_message_count=before_message_count,
+                    before_snapshot=before_snapshot,
+                    after_messages=messages,
+                    applied_layers=[applied_layer],
+                )
             return changed
         if strategy == "collapse":
             if len(messages) <= 4:
@@ -381,6 +402,14 @@ class ContextManager:
             self._hard_collapse(messages, llm)
             self._last_compact_tokens = estimate_tokens(messages, token_fudge_factor=self._token_fudge_factor)
             self._last_compact_strategy = "collapse"
+            applied_layer = "hard_collapse"
+            self._emit_compression_events(
+                before_tokens=before_tokens,
+                before_message_count=before_message_count,
+                before_snapshot=before_snapshot,
+                after_messages=messages,
+                applied_layers=[applied_layer],
+            )
             return True
         return False
 
@@ -620,7 +649,7 @@ class ContextManager:
                 {
                     "layer": "summarize_old",
                     "threshold": self._summarize_at,
-                    "description": "When context usage exceeds 70% of the budget and enough history exists, summarize older conversation and keep the most recent 20 user turns.",
+                    "description": f"When context usage exceeds 70% of the budget and enough history exists, summarize older conversation and keep the most recent {self._summarize_keep_recent_turns} user turns.",
                 },
                 {
                     "layer": "hard_collapse",
