@@ -4,8 +4,6 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from labrastro_server.taskflow.application.project_service import ProjectService
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 from labrastro_server.taskflow.domain.project_state import (
@@ -16,9 +14,7 @@ from labrastro_server.taskflow.domain.project_state import (
     TraceRelationType,
 )
 from labrastro_server.taskflow.domain.taskflow_state import (
-    ReadinessGate,
     TaskflowStatus,
-    WorkItemCandidate,
 )
 from labrastro_server.taskflow.ports.dispatch import TaskflowDispatchResult
 
@@ -47,10 +43,14 @@ def test_single_taskflow_service_exposes_only_new_mainline_api() -> None:
 
     expected = {
         "start_taskflow",
-        "clarify_goal",
-        "render_review_cards",
-        "confirm_goal",
+        "record_discovery_turn",
+        "render_review_cards_v1",
+        "compile_brief_draft",
+        "mark_brief_ready",
+        "confirm_brief",
         "compile_goal",
+        "request_dispatch_decision",
+        "confirm_dispatch_decision",
         "dispatch_task_run",
     }
     old_api = {
@@ -63,6 +63,28 @@ def test_single_taskflow_service_exposes_only_new_mainline_api() -> None:
 
     assert expected <= {name for name, _ in inspect.getmembers(service, inspect.ismethod)}
     assert old_api.isdisjoint(dir(service))
+    assert "clarify_goal" not in dir(service)
+    assert "confirm_goal" not in dir(service)
+    assert "answer_question" not in dir(service)
+    assert "answer_decision" not in dir(service)
+    assert "answer_review_card" not in dir(service)
+    assert "render_review_cards" not in dir(service)
+
+
+def _confirm_current_brief(
+    service: TaskflowService,
+    taskflow_id: str,
+    *,
+    actor: str = "user",
+):
+    state = service.compile_brief_draft(taskflow_id, actor=actor)
+    version = state.outputs.current_brief_version
+    state = service.mark_brief_ready(taskflow_id, version=version, actor=actor)
+    return service.confirm_brief(
+        taskflow_id,
+        version=state.outputs.current_brief_version,
+        actor=actor,
+    )
 
 
 def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
@@ -81,28 +103,6 @@ def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
         taskflow_id="taskflow-1",
         goal_id="goal-1",
     )
-    service.clarify_goal(
-        state.meta.taskflow_id,
-        work_item_candidates=[
-            WorkItemCandidate(
-                id="candidate-1",
-                title="Implement compiler service",
-                description="Use ProjectState and TaskflowState as the only truth.",
-                type="implementation",
-                acceptance_refs=["acceptance-compiler-service"],
-                dedupe_key="project-1:implementation:compiler-service",
-            )
-        ],
-        readiness_gates=[
-            ReadinessGate(
-                id="gate-1",
-                name="ready",
-                passed=True,
-                rationale="The work item candidate is explicit.",
-            )
-        ],
-        readiness_score=90,
-    )
     service.record_discovery_turn(
         state.meta.taskflow_id,
         examples=[
@@ -112,8 +112,18 @@ def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
                 "then": ["The compiler service dispatches through the neutral port."],
             }
         ],
+        work_item_candidates=[
+            {
+                "id": "candidate-1",
+                "title": "Implement compiler service",
+                "description": "Use ProjectState and TaskflowState as the only truth.",
+                "type": "implementation",
+                "acceptance_refs": ["acceptance-compiler-service"],
+                "dedupe_key": "project-1:implementation:compiler-service",
+            }
+        ],
     )
-    service.confirm_goal("taskflow-1")
+    _confirm_current_brief(service, "taskflow-1")
     plan = service.compile_goal("taskflow-1")
     dispatch_decision = service.request_dispatch_decision(
         "taskflow-1",
@@ -152,10 +162,22 @@ def test_taskflow_service_dispatches_task_run_through_neutral_port() -> None:
 
 
 def test_old_taskflow_service_aliases_are_removed() -> None:
-    import labrastro_server.services.taskflow as legacy_exports
+    import importlib
 
-    assert not hasattr(legacy_exports, "CompilerTaskflowService")
-    assert legacy_exports.TaskflowService is TaskflowService
+    try:
+        old_exports = importlib.import_module("labrastro_server.services.taskflow")
+    except ModuleNotFoundError:
+        old_exports = None
+
+    if old_exports is not None:
+        assert not hasattr(old_exports, "CompilerTaskflowService")
+        assert not hasattr(old_exports, "TaskflowService")
+    try:
+        importlib.import_module("labrastro_server.services.taskflow.service")
+    except ModuleNotFoundError:
+        pass
+    else:  # pragma: no cover - guardrail for accidental compatibility restore
+        raise AssertionError("old taskflow service import path should not resolve")
 
 
 def test_taskflow_core_and_application_do_not_import_executor_or_reuleauxcoder() -> None:
@@ -185,6 +207,11 @@ def test_remote_taskflow_routes_use_new_resource_names_only() -> None:
     assert "task-drafts" not in route_source
     assert "record_brief" not in route_source
     assert "dispatch_task_draft" not in route_source
+    assert 'action == "clarify"' not in route_source
+    assert 'action == "confirm"' not in route_source
+    assert 'parts[4] == "review-cards"' not in route_source
+    assert 'parts[4] == "questions"' not in route_source
+    assert 'parts[4] == "decisions"' not in route_source
     assert "taskflows" in route_source
     assert "work-items" in route_source
 
