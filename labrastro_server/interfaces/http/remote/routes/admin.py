@@ -376,6 +376,15 @@ class RemoteAdminRoutes:
                 )
                 self._send_json(result.status, result.payload)
                 return
+            if path == "/remote/admin/diagnostics/tool-arguments/stats":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "tool_argument_validation": self.service.admin_manager.tool_argument_validation_stats(),
+                    },
+                )
+                return
             if path == "/remote/admin/providers/list":
                 result = {"ok": True, **self.service.admin_manager.list_providers()}
                 self._send_json(HTTPStatus.OK, result)
@@ -565,6 +574,8 @@ class RemoteAdminRoutes:
             for key in ("agent_registry", "runtime_profiles", "run_limits", "sandbox_provider"):
                 if isinstance(payload.get(key), dict):
                     targets.append(key)
+            if isinstance(payload.get("diagnostics"), dict):
+                targets.append("diagnostics")
             if isinstance(payload.get("github"), dict):
                 targets.append("github")
             return operation, ",".join(sorted(set(targets))) or "server_settings"
@@ -658,6 +669,7 @@ class RemoteAdminRoutes:
             "/remote/admin/agent-runs/list",
             "/remote/admin/agent-runs/load",
             "/remote/admin/server-settings/read",
+            "/remote/admin/diagnostics/tool-arguments/stats",
             "/remote/admin/providers/list",
             "/remote/admin/providers/models",
             "/remote/admin/models/list",

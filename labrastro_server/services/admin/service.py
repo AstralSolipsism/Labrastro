@@ -13,6 +13,7 @@ from reuleauxcoder.app.runtime.agent_runtime import get_interactive_run_limiter
 from reuleauxcoder.domain.config.models import (
     AgentRegistryConfig,
     CapabilityPackageConfig,
+    DiagnosticsConfig,
     EnvironmentCLIToolConfig,
     EnvironmentSkillConfig,
     GitHubConfig,
@@ -30,6 +31,9 @@ from reuleauxcoder.domain.config.models import (
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
+from reuleauxcoder.services.llm.diagnostics import (
+    summarize_tool_argument_validation_events,
+)
 from reuleauxcoder.services.providers.manager import ProviderManager
 
 
@@ -169,6 +173,10 @@ class RemoteAdminConfigManager:
         sandbox_provider = SandboxProviderConfig.from_dict(
             raw_sandbox if isinstance(raw_sandbox, dict) else {}
         )
+        raw_diagnostics = data.get("diagnostics", {})
+        diagnostics = DiagnosticsConfig.from_dict(
+            raw_diagnostics if isinstance(raw_diagnostics, dict) else {}
+        )
         return {
             "settings": {
                 "agent_registry": agent_registry.to_dict(),
@@ -177,10 +185,14 @@ class RemoteAdminConfigManager:
                 "capability_packages": capability_packages,
                 "github": github.to_dict(mask_secret=True),
                 "sandbox_provider": sandbox_provider.to_dict(),
+                "diagnostics": diagnostics.to_dict(),
             },
             "agent_runs": get_interactive_run_limiter().snapshot(),
             "config_etag": self.config_etag(data),
         }
+
+    def tool_argument_validation_stats(self) -> dict[str, Any]:
+        return summarize_tool_argument_validation_events()
 
     def update_server_settings(self, payload: dict[str, Any]) -> AdminConfigResult:
         raw_settings = payload.get("settings")
@@ -190,6 +202,7 @@ class RemoteAdminConfigManager:
         raw_capability_packages = payload.get("capability_packages")
         raw_github = payload.get("github")
         raw_sandbox = payload.get("sandbox_provider")
+        raw_diagnostics = payload.get("diagnostics")
         if isinstance(raw_settings, dict) and raw_agent_registry is None:
             raw_agent_registry = raw_settings.get("agent_registry")
         if isinstance(raw_settings, dict) and raw_runtime_profiles is None:
@@ -202,6 +215,8 @@ class RemoteAdminConfigManager:
             raw_github = raw_settings.get("github")
         if isinstance(raw_settings, dict) and raw_sandbox is None:
             raw_sandbox = raw_settings.get("sandbox_provider")
+        if isinstance(raw_settings, dict) and raw_diagnostics is None:
+            raw_diagnostics = raw_settings.get("diagnostics")
         if (
             not isinstance(raw_agent_registry, dict)
             and not isinstance(raw_runtime_profiles, dict)
@@ -209,6 +224,7 @@ class RemoteAdminConfigManager:
             and not isinstance(raw_capability_packages, dict)
             and not isinstance(raw_github, dict)
             and not isinstance(raw_sandbox, dict)
+            and not isinstance(raw_diagnostics, dict)
         ):
             return AdminConfigResult(False, {"error": "server_settings_required"}, 400)
         with self._lock:
@@ -391,6 +407,18 @@ class RemoteAdminConfigManager:
                         400,
                     )
                 data["sandbox_provider"] = sandbox_provider.to_dict()
+            if isinstance(raw_diagnostics, dict):
+                previous_diagnostics = (
+                    previous_data.get("diagnostics", {})
+                    if isinstance(previous_data.get("diagnostics"), dict)
+                    else {}
+                )
+                merged_diagnostics = ConfigLoader()._merge_dicts(
+                    previous_diagnostics,
+                    raw_diagnostics,
+                )
+                diagnostics = DiagnosticsConfig.from_dict(merged_diagnostics)
+                data["diagnostics"] = diagnostics.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error

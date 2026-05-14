@@ -365,6 +365,24 @@
       }
     },
     {
+      "name": "admin.diagnostics.tool_arguments.stats",
+      "method": "POST",
+      "path": "/remote/admin/diagnostics/tool-arguments/stats",
+      "auth": "bearer",
+      "request": {},
+      "response": {
+        "ok": true,
+        "tool_argument_validation": {
+          "totals": {
+            "events": 0,
+            "invalid": 0,
+            "repaired": 0
+          },
+          "by_model": []
+        }
+      }
+    },
+    {
       "name": "admin.providers.list",
       "method": "POST",
       "path": "/remote/admin/providers/list",

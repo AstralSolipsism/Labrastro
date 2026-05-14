@@ -13,6 +13,7 @@ from reuleauxcoder.domain.config.models import (
     ApprovalRuleConfig,
     Config,
     ContextConfig,
+    DiagnosticsConfig,
     EnvironmentCLIToolConfig,
     EnvironmentConfig,
     EnvironmentSkillConfig,
@@ -372,6 +373,7 @@ class ConfigLoader:
         run_limits_config = data.get("run_limits", {})
         capability_packages_config = data.get("capability_packages", {})
         persistence_config = data.get("persistence", {})
+        diagnostics_config = data.get("diagnostics", {})
         sandbox_provider_config = data.get("sandbox_provider", {})
         github_config = data.get("github", {})
         environment_config = data.get("environment", {})
@@ -592,6 +594,9 @@ class ConfigLoader:
             capability_packages=capability_packages,
             persistence=PersistenceConfig.from_dict(
                 persistence_config if isinstance(persistence_config, dict) else {}
+            ),
+            diagnostics=DiagnosticsConfig.from_dict(
+                diagnostics_config if isinstance(diagnostics_config, dict) else {}
             ),
             sandbox_provider=SandboxProviderConfig.from_dict(
                 sandbox_provider_config

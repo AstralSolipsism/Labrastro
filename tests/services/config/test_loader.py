@@ -69,6 +69,23 @@ def test_parse_config_defaults_session_auto_save_enabled() -> None:
     assert config.session_auto_save is True
 
 
+def test_parse_config_reads_tool_argument_diagnostics_settings() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "diagnostics": {
+                "tool_argument_validation": {
+                    "enabled": False,
+                    "record_clean": True,
+                }
+            }
+        }
+    )
+
+    settings = config.diagnostics.tool_argument_validation
+    assert settings.enabled is False
+    assert settings.record_clean is True
+
+
 def test_parse_config_reads_memory_provider_settings() -> None:
     config = ConfigLoader()._parse_config(
         {

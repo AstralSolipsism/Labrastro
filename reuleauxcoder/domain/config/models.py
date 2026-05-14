@@ -945,6 +945,54 @@ class PersistenceConfig:
 
 
 @dataclass
+class ToolArgumentValidationDiagnosticsConfig:
+    """Tool argument validation telemetry settings."""
+
+    enabled: bool = True
+    record_clean: bool = False
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any] | None
+    ) -> "ToolArgumentValidationDiagnosticsConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            record_clean=bool(data.get("record_clean", False)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "record_clean": self.record_clean,
+        }
+
+
+@dataclass
+class DiagnosticsConfig:
+    """Diagnostics and telemetry settings."""
+
+    tool_argument_validation: ToolArgumentValidationDiagnosticsConfig = field(
+        default_factory=ToolArgumentValidationDiagnosticsConfig
+    )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "DiagnosticsConfig":
+        raw = data.get("tool_argument_validation", {}) if isinstance(data, dict) else {}
+        return cls(
+            tool_argument_validation=ToolArgumentValidationDiagnosticsConfig.from_dict(
+                raw if isinstance(raw, dict) else {}
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool_argument_validation": self.tool_argument_validation.to_dict(),
+        }
+
+
+@dataclass
 class SandboxProviderConfig:
     """Execution-room provider used for on-demand AgentRun sessions."""
 
@@ -1359,6 +1407,9 @@ class Config:
 
     # Durable persistence settings
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+
+    # Diagnostics and telemetry settings
+    diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
     # On-demand execution-room provider.
     sandbox_provider: SandboxProviderConfig = field(default_factory=SandboxProviderConfig)

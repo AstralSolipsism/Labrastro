@@ -133,6 +133,11 @@ approval:
 #   max_running_agents: 4
 #   max_shells_per_agent: 1
 #
+# diagnostics:
+#   tool_argument_validation:
+#     enabled: true        # Record malformed/repaired tool argument calls.
+#     record_clean: false  # Keep false; clean calls should not be persisted.
+#
 # runtime_profiles:
 #   environment_local:
 #     executor: "reuleauxcoder"

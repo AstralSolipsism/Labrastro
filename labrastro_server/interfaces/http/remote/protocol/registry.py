@@ -73,6 +73,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("admin.environment.run", "POST", "/remote/admin/environment/run", "EnvironmentRunRequest", "AgentRunResponse", "bearer"),
     RemoteEndpoint("admin.server_settings.read", "POST", "/remote/admin/server-settings/read", "Empty", "ServerSettings", "bearer"),
     RemoteEndpoint("admin.server_settings.update", "POST", "/remote/admin/server-settings/update", "ServerSettingsUpdateRequest", "ServerSettings", "bearer"),
+    RemoteEndpoint("admin.diagnostics.tool_arguments.stats", "POST", "/remote/admin/diagnostics/tool-arguments/stats", "Empty", "ToolArgumentValidationStats", "bearer"),
     RemoteEndpoint("admin.providers.list", "POST", "/remote/admin/providers/list", "Empty", "ProviderList", "bearer"),
     RemoteEndpoint("admin.providers.record", "POST", "/remote/admin/providers/record", "ProviderRecordRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.providers.test", "POST", "/remote/admin/providers/test", "ProviderTestRequest", "AdminMutationResult", "bearer"),
