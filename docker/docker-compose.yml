@@ -17,7 +17,11 @@ services:
     stdin_open: true
     networks:
       - ezcode-net
+      - labrastro-data-net
 
 networks:
   ezcode-net:
     name: ezcode-net
+  labrastro-data-net:
+    name: ${LABRASTRO_DOCKER_EXTERNAL_NETWORK:-1panel-network}
+    external: true
