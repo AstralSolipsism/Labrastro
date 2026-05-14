@@ -3,7 +3,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.runtime_e2e_smoke import DEFAULT_SMOKE_DATABASE, ServerRunner
+from scripts.runtime_e2e_smoke import DEFAULT_SMOKE_DATABASE, REQUIRED_TABLES, ServerRunner
 
 
 def _args(tmp_path: Path, *, database_name: str | None = None) -> SimpleNamespace:
@@ -41,3 +41,10 @@ def test_create_database_recreates_smoke_database(tmp_path: Path) -> None:
         ("CREATE DATABASE ezcode_smoke", "postgres"),
     ]
     assert dsn.endswith("/ezcode_smoke")
+
+
+def test_required_tables_match_current_taskflow_snapshot_schema() -> None:
+    assert "labrastro_taskflow_projects" in REQUIRED_TABLES
+    assert "labrastro_taskflow_states" in REQUIRED_TABLES
+    assert "labrastro_taskflow_events" in REQUIRED_TABLES
+    assert "labrastro_taskflow_goals" not in REQUIRED_TABLES

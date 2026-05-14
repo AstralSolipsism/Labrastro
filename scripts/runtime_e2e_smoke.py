@@ -74,11 +74,8 @@ REQUIRED_TABLES = [
     "labrastro_agent_run_artifacts",
     "labrastro_sessions",
     "labrastro_session_snapshots",
-    "labrastro_taskflow_goals",
-    "labrastro_taskflow_briefs",
-    "labrastro_taskflow_issue_drafts",
-    "labrastro_taskflow_task_drafts",
-    "labrastro_taskflow_dispatch_decisions",
+    "labrastro_taskflow_projects",
+    "labrastro_taskflow_states",
     "labrastro_taskflow_events",
     "labrastro_issues",
     "labrastro_assignments",
@@ -90,14 +87,17 @@ REQUIRED_TABLES = [
 ]
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled", "blocked", "timeout"}
+SMOKE_AUTH_RE = re.compile(
+    r"\n# agent_run_e2e_smoke_auth [^\n]+\nauth:\n(?:  .*(?:\n|$))*"
+)
 SMOKE_PERSISTENCE_RE = re.compile(
-    r"\n# agent_run_e2e_smoke [^\n]+\npersistence:\n(?:  .*(?:\n|$))*"
+    r"\n# agent_run_e2e_smoke(?:_persistence)? [^\n]+\npersistence:\n(?:  .*(?:\n|$))*"
 )
 DEFAULT_SMOKE_DATABASE = "ezcode_smoke"
 
 
 def utc_timestamp() -> str:
-    return dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def q(value: str | Path) -> str:
@@ -110,6 +110,17 @@ def is_safe_identifier(value: str) -> bool:
 
 def compact_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def yaml_string(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def env_file_value(value: str) -> str:
+    text = str(value)
+    if re.search(r"\s|#|['\"]", text):
+        return json.dumps(text, ensure_ascii=False)
+    return text
 
 
 @dataclass
@@ -291,13 +302,18 @@ class ServerRunner:
         }
         self.access_token = ""
         self.refresh_token = ""
+        self.database_url = ""
         self.auth_username = secrets_payload.get("auth_username") or os.environ.get(
-            "LABRASTRO_SUPERADMIN_USERNAME", "admin"
+            "LABRASTRO_SUPERADMIN_USERNAME", "superadmin"
         )
         self.auth_password = secrets_payload.get("auth_password") or os.environ.get(
             "LABRASTRO_SUPERADMIN_PASSWORD", ""
         )
         self.masker.add(self.auth_password)
+        if self.auth_username:
+            os.environ["LABRASTRO_SUPERADMIN_USERNAME"] = self.auth_username
+        if self.auth_password:
+            os.environ["LABRASTRO_SUPERADMIN_PASSWORD"] = self.auth_password
         self.config_path: Path | None = None
         self.compose_path: Path | None = None
         self.compose_service = ""
@@ -314,7 +330,7 @@ class ServerRunner:
             {
                 "name": name,
                 "status": status,
-                "at": dt.datetime.utcnow().isoformat() + "Z",
+                "at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 **safe_extra,
             }
         )
@@ -354,6 +370,41 @@ class ServerRunner:
 
     def bash(self, script: str, *, check: bool = True, timeout: int | None = None) -> CommandResult:
         return self.run_cmd(["bash", "-lc", script], check=check, timeout=timeout)
+
+    def compose_override(self) -> str | None:
+        if not self.compose_service or not self.auth_password:
+            return None
+        environment = {
+            "RCODER_CONFIG_PATH": "/app/.rcoder/config.host.yaml",
+            "LABRASTRO_SUPERADMIN_USERNAME": self.auth_username,
+            "LABRASTRO_SUPERADMIN_PASSWORD": self.auth_password,
+        }
+        if self.database_url:
+            environment["LABRASTRO_DATABASE_URL"] = self.database_url
+            environment["LABRASTRO_AUTO_MIGRATE"] = "true"
+        return compact_json(
+            {
+                "services": {
+                    self.compose_service: {
+                        "environment": environment
+                    }
+                }
+            }
+        )
+
+    def run_compose(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        timeout: int | None = None,
+    ) -> CommandResult:
+        argv = ["docker", "compose", "-f", str(self.compose_path)]
+        input_text = self.compose_override()
+        if input_text:
+            argv.extend(["-f", "-"])
+        argv.extend(args)
+        return self.run_cmd(argv, check=check, timeout=timeout, input_text=input_text)
 
     def http_json(
         self,
@@ -653,6 +704,7 @@ class ServerRunner:
         self.psql(f"CREATE DATABASE {self.db_name}", database="postgres")
         dsn = f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_container}:5432/{self.db_name}"
         self.masker.add(dsn)
+        self.database_url = dsn
         self.record_step("create_database", database=self.db_name)
         return dsn
 
@@ -679,18 +731,33 @@ class ServerRunner:
         assert self.config_path is not None
         self.log("patch persistence config")
         original = self.config_path.read_text(encoding="utf-8")
-        cleaned = SMOKE_PERSISTENCE_RE.sub("\n", original).rstrip()
+        cleaned = SMOKE_PERSISTENCE_RE.sub("\n", SMOKE_AUTH_RE.sub("\n", original)).rstrip()
         (self.backup_dir / "active-config-before-persistence.yaml").write_text(
             original,
             encoding="utf-8",
         )
+        token_secret = self.resolve_config_secret("token_secret") or "${LABRASTRO_AUTH_TOKEN_SECRET}"
         block = textwrap.dedent(
             f"""
 
-            # agent_run_e2e_smoke {self.timestamp}
+            # agent_run_e2e_smoke_auth {self.timestamp}
+            auth:
+              enabled: true
+              token_secret: {yaml_string(token_secret)}
+              store_backend: auto
+              store_path: ".rcoder/auth.json"
+              password_min_length: 6
+              password_max_length: 256
+              login_rate_limit_count: 5
+              login_rate_limit_window_sec: 900
+              superadmins:
+                - username: "${{LABRASTRO_SUPERADMIN_USERNAME}}"
+                  password: "${{LABRASTRO_SUPERADMIN_PASSWORD}}"
+
+            # agent_run_e2e_smoke_persistence {self.timestamp}
             persistence:
               backend: postgres
-              database_url: {database_url}
+              database_url: {yaml_string(database_url)}
               auto_migrate: true
               runtime_enabled: true
               sessions_enabled: true
@@ -699,6 +766,41 @@ class ServerRunner:
         )
         self.config_path.write_text(cleaned + block + "\n", encoding="utf-8")
         self.record_step("patch_config", config=str(self.config_path), database_url="***")
+
+    def write_runtime_env_file(self) -> None:
+        assert self.compose_path is not None
+        env_path = self.compose_path.parent / ".env"
+        values = {
+            "RCODER_CONFIG_PATH": "/app/.rcoder/config.host.yaml",
+            "LABRASTRO_SUPERADMIN_USERNAME": self.auth_username,
+            "LABRASTRO_SUPERADMIN_PASSWORD": self.auth_password,
+            "LABRASTRO_DATABASE_URL": self.database_url,
+            "LABRASTRO_AUTO_MIGRATE": "true",
+        }
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+        seen: set[str] = set()
+        updated: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in line:
+                updated.append(line)
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key in values:
+                updated.append(f"{key}={env_file_value(values[key])}")
+                seen.add(key)
+            else:
+                updated.append(line)
+        for key, value in values.items():
+            if key not in seen:
+                updated.append(f"{key}={env_file_value(value)}")
+        env_path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+        try:
+            env_path.chmod(0o600)
+        except OSError:
+            pass
+        self.record_step("write_runtime_env", path=str(env_path), keys=sorted(values))
 
     def cleanup_generated_global_example_config(self) -> None:
         home_config = self.root / "home" / ".rcoder" / "config.yaml"
@@ -753,6 +855,19 @@ class ServerRunner:
         self.bash(f"tar -xzf {q(archive)} -C {q(stage)}", timeout=120)
         src = self.root / "src"
         if src.exists():
+            for rel in (".rcoder", "docker/.env", ".env"):
+                runtime_path = src / rel
+                staged_path = stage / rel
+                if not runtime_path.exists() or staged_path.exists():
+                    continue
+                staged_path.parent.mkdir(parents=True, exist_ok=True)
+                self.bash(f"cp -a {q(runtime_path)} {q(staged_path)}", timeout=120)
+                self.record_step(
+                    "preserve_runtime_config",
+                    source=str(runtime_path),
+                    target=str(staged_path),
+                )
+        if src.exists():
             self.bash(f"mv {q(src)} {q(previous)}", timeout=120)
         self.bash(f"mv {q(stage)} {q(src)}", timeout=120)
         base_dockerfile = src / "docker" / "Dockerfile"
@@ -779,32 +894,11 @@ class ServerRunner:
                 timeout=1800,
             )
             self.record_step("build_base_image", image=base_image)
-        self.run_cmd(
-            [
-                "docker",
-                "compose",
-                "-f",
-                str(self.compose_path),
-                "build",
-                self.compose_service,
-            ],
-            timeout=1800,
-        )
+        self.run_compose(["build", self.compose_service], timeout=1800)
         self.record_step("deploy_source", compose_service=self.compose_service)
 
     def start_host(self) -> None:
-        self.run_cmd(
-            [
-                "docker",
-                "compose",
-                "-f",
-                str(self.compose_path),
-                "up",
-                "-d",
-                self.compose_service,
-            ],
-            timeout=300,
-        )
+        self.run_compose(["up", "-d", self.compose_service], timeout=300)
         self.ensure_network()
         self.run_cmd(["docker", "restart", self.host_container], timeout=120)
         self.wait_http_ready()
@@ -1140,6 +1234,12 @@ class ServerRunner:
                 "cwd": fixture["repo"],
                 "workspace_root": fixture["repo"],
                 "features": features or ["agent_runs"],
+                "host_info_min": {
+                    "os": "linux",
+                    "arch": "amd64",
+                    "shell": "bash",
+                    "hostname": f"manual-smoke-{suffix}",
+                },
                 "metadata": {"agent_run_smoke_peer": suffix},
             },
         )
@@ -1207,6 +1307,7 @@ class ServerRunner:
             "pr_title": f"AgentRun smoke {suffix}",
             "commit_message": f"agent: AgentRun smoke {suffix}",
             "pr_enabled": False,
+            "skip_sandbox": True,
         }
         if extra:
             metadata.update(extra)
@@ -1358,6 +1459,12 @@ class ServerRunner:
             if status not in {"cancelled", "canceled"}:
                 raise RuntimeError(f"cancel AgentRun status mismatch: {cancel_detail['agent_run']}")
             self.report["tasks"]["cancel"] = self.summarize_task(cancel_detail)
+            self.stop_worker()
+            self.start_worker(
+                fixture,
+                fake_gh,
+                worker_id=f"smoke-retry-{self.timestamp.lower()}",
+            )
 
             retry_id = f"task-retry-{self.timestamp.lower()}"
             retry = self.admin_json(
@@ -1401,6 +1508,7 @@ class ServerRunner:
         taskflow_id = f"taskflow-smoke-{suffix}"
         goal_id = f"goal-smoke-{suffix}"
         candidate_id = f"candidate-smoke-{suffix}"
+        acceptance_id = f"acceptance-smoke-{suffix}"
         created = self.peer_post(
             "/remote/taskflow/taskflows",
             peer_token,
@@ -1416,11 +1524,18 @@ class ServerRunner:
             raise RuntimeError(f"taskflow id mismatch: {created}")
 
         clarified = self.peer_post(
-            f"/remote/taskflow/taskflows/{taskflow_id}/clarify",
+            f"/remote/taskflow/taskflows/{taskflow_id}/discovery-turn",
             peer_token,
             {
                 "goal_statement": "Run the fake executor smoke path.",
                 "success_criteria": ["AgentRun completes through Taskflow dispatch."],
+                "examples": [
+                    {
+                        "id": acceptance_id,
+                        "title": "Taskflow dispatch accepted",
+                        "then": ["Taskflow dispatch creates a completed AgentRun."],
+                    }
+                ],
                 "work_item_candidates": [
                     {
                         "id": candidate_id,
@@ -1428,6 +1543,7 @@ class ServerRunner:
                         "description": "Dispatch through Taskflow into AgentRun.",
                         "type": "implementation",
                         "repo_ref": fixture["repo_url"],
+                        "acceptance_refs": [acceptance_id],
                         "metadata": self.agent_run_metadata(
                             fixture, suffix="taskflow"
                         ),
@@ -1444,23 +1560,32 @@ class ServerRunner:
                 "readiness_score": 90,
             },
         )["taskflow"]
-        if clarified["meta"]["status"] != "clarifying":
-            raise RuntimeError(f"taskflow clarify did not update state: {clarified}")
+        if clarified["outputs"].get("current_brief_version") is None:
+            raise RuntimeError(f"taskflow discovery did not produce a brief: {clarified}")
 
-        confirmed = self.peer_post(
-            f"/remote/taskflow/taskflows/{taskflow_id}/confirm", peer_token
-        )["taskflow"]
+        confirmed = self.confirm_taskflow_brief(taskflow_id, peer_token)
         if confirmed["meta"]["status"] != "confirmed":
-            raise RuntimeError(f"taskflow goal was not confirmed: {confirmed}")
+            raise RuntimeError(f"taskflow brief was not confirmed: {confirmed}")
 
         plan = self.peer_post(
             f"/remote/taskflow/taskflows/{taskflow_id}/compile", peer_token
         )["plan"]
         work_item_id = str(plan["work_item_candidates"][0]["work_item_id"])
+        dispatch_decision = self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/dispatch-decisions",
+            peer_token,
+            {"work_item_ids": [work_item_id], "actor": "user"},
+        )["dispatch_decision"]
+        self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/dispatch-decisions/{dispatch_decision['id']}/confirm",
+            peer_token,
+            {"actor": "user"},
+        )
         dispatch = self.peer_post(
             f"/remote/taskflow/taskflows/{taskflow_id}/work-items/{work_item_id}/dispatch",
             peer_token,
             {
+                "dispatch_decision_id": dispatch_decision["id"],
                 "executor_hint": agent_id,
                 "metadata": self.agent_run_metadata(fixture, suffix="taskflow"),
             },
@@ -1496,6 +1621,29 @@ class ServerRunner:
         }
         self.record_step("taskflow_e2e", agent_run_id=agent_run_id)
 
+    def confirm_taskflow_brief(self, taskflow_id: str, peer_token: str) -> dict[str, Any]:
+        state = self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/brief/compile",
+            peer_token,
+            {"actor": "agent"},
+        )["taskflow"]
+        version = state.get("outputs", {}).get("current_brief_version")
+        if version is None:
+            raise RuntimeError(f"brief compile did not produce a current version: {state}")
+        state = self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/brief/ready",
+            peer_token,
+            {"version": version, "actor": "agent"},
+        )["taskflow"]
+        return self.peer_post(
+            f"/remote/taskflow/taskflows/{taskflow_id}/brief/confirm",
+            peer_token,
+            {
+                "version": state.get("outputs", {}).get("current_brief_version", version),
+                "actor": "user",
+            },
+        )["taskflow"]
+
     def run_taskflow_negative_paths(
         self, peer_token: str, fixture: dict[str, str]
     ) -> None:
@@ -1513,29 +1661,28 @@ class ServerRunner:
             },
         )
         self.peer_post(
-            f"/remote/taskflow/taskflows/{blocked_taskflow_id}/clarify",
+            f"/remote/taskflow/taskflows/{blocked_taskflow_id}/discovery-turn",
             peer_token,
             {
+                "examples": [
+                    {
+                        "id": f"acceptance-blocked-{suffix}",
+                        "title": "Blocked dispatch accepted",
+                        "then": ["Dispatch remains blocked until a decision is confirmed."],
+                    }
+                ],
                 "work_item_candidates": [
                     {
                         "id": blocked_candidate_id,
                         "title": "Impossible task",
-                        "prompt": "cannot dispatch",
-                        "repo_url": fixture["repo_url"],
+                        "description": "Cannot dispatch without an explicit dispatch decision.",
+                        "repo_ref": fixture["repo_url"],
+                        "acceptance_refs": [f"acceptance-blocked-{suffix}"],
                     }
                 ],
-                "readiness_gates": [
-                    {
-                        "id": f"gate-blocked-{suffix}",
-                        "name": "blocked",
-                        "passed": False,
-                        "rationale": "Intentional smoke readiness failure.",
-                    }
-                ],
-                "readiness_score": 20,
             },
         )
-        self.peer_post(f"/remote/taskflow/taskflows/{blocked_taskflow_id}/confirm", peer_token)
+        self.confirm_taskflow_brief(blocked_taskflow_id, peer_token)
         plan = self.peer_post(
             f"/remote/taskflow/taskflows/{blocked_taskflow_id}/compile", peer_token
         )["plan"]
@@ -1731,8 +1878,15 @@ class ServerRunner:
         blocked_dispatch = self.peer_post(
             f"/remote/assignments/{blocked_assignment_id}/dispatch", peer_token
         )["assignment"]
-        if blocked_dispatch.get("status") != "needs_assignment":
-            raise RuntimeError(f"blocked assignment did not need assignment: {blocked_dispatch}")
+        blocked_task_run_id = blocked_dispatch.get("task_run_id")
+        if blocked_dispatch.get("status") != "dispatched" or not blocked_task_run_id:
+            raise RuntimeError(f"default assignment dispatch failed: {blocked_dispatch}")
+        blocked_agent_run_id = self.find_agent_run_id_for_task_run(str(blocked_task_run_id))
+        blocked_detail = self.poll_task(str(blocked_agent_run_id), timeout_sec=120)
+        if blocked_detail["agent_run"]["status"] != "completed":
+            raise RuntimeError(
+                f"default assignment AgentRun did not complete: {blocked_detail['agent_run']}"
+            )
 
         peer_b = self.register_manual_peer(fixture, suffix="issue-forbidden")
         self.expect_peer_failure(
@@ -1741,6 +1895,7 @@ class ServerRunner:
 
         self.report["tasks"]["assignment"] = self.summarize_task(assignment_detail)
         self.report["tasks"]["mention"] = self.summarize_task(mention_detail)
+        self.report["tasks"]["default_assignment"] = self.summarize_task(blocked_detail)
         self.report["flows"]["issue_assignment_mention"] = {
             "issue_id": issue_id,
             "assignment_id": assignment_id,
@@ -1752,6 +1907,8 @@ class ServerRunner:
             "mention_agent_run_id": mention_agent_run_id,
             "blocked_issue_id": blocked_issue_id,
             "blocked_assignment_id": blocked_assignment_id,
+            "blocked_task_run_id": blocked_task_run_id,
+            "blocked_agent_run_id": blocked_agent_run_id,
             "mention_not_found": missing.get("reason"),
             "mention_ambiguous": ambiguous.get("reason"),
             "cross_peer_forbidden": True,
@@ -1814,6 +1971,12 @@ class ServerRunner:
                     "agent_runs",
                     "agent_runs.daemon_worktree",
                 ],
+                "host_info_min": {
+                    "os": "linux",
+                    "arch": "amd64",
+                    "shell": "bash",
+                    "hostname": "manual-recovery-worker",
+                },
             },
         )
         peer_token = register.get("payload", {}).get("peer_token")
@@ -1981,11 +2144,7 @@ class ServerRunner:
                 self.bash(f"cp -a {q(self.backup_dir / 'src')} {q(self.root / 'src')}")
             if self.config_path and (self.backup_dir / "active-config-before-persistence.yaml").exists():
                 shutil.copy2(self.backup_dir / "active-config-before-persistence.yaml", self.config_path)
-            self.run_cmd(
-                ["docker", "compose", "-f", str(self.compose_path), "up", "-d", self.compose_service],
-                check=False,
-                timeout=300,
-            )
+            self.run_compose(["up", "-d", self.compose_service], check=False, timeout=300)
             self.record_step("rollback")
         except Exception as exc:  # noqa: BLE001
             self.record_step("rollback", "failed", error=str(exc))
@@ -2001,6 +2160,7 @@ class ServerRunner:
             self.deploy_source()
             self.config_path = self.discover_config_path()
             self.append_persistence_config(dsn)
+            self.write_runtime_env_file()
             self.cleanup_generated_global_example_config()
             self.start_host()
             self.verify_service()
@@ -2082,7 +2242,7 @@ def dry_run(args: argparse.Namespace) -> int:
 def remote(args: argparse.Namespace) -> int:
     ssh_password = load_secret_from_env(args.ssh_password_env, "SSH password")
     pg_password = load_secret_from_env(args.pg_password_env, "Postgres password")
-    auth_username = os.environ.get("LABRASTRO_SUPERADMIN_USERNAME", "admin")
+    auth_username = os.environ.get("LABRASTRO_SUPERADMIN_USERNAME", "superadmin")
     auth_password = os.environ.get("LABRASTRO_SUPERADMIN_PASSWORD", "")
     timestamp = args.timestamp or utc_timestamp()
     masker = Masker([ssh_password, pg_password, auth_password])
