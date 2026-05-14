@@ -170,7 +170,9 @@ class TestRemoteBackendDispatch:
 
             # inject tool result
             assert len(received) == 1
-            req_id = received[0][1].request_id
+            outbound = received[0][1]
+            req_id = outbound.request_id
+            assert outbound.payload["tool_call_id"].startswith("manual-shell-")
             from labrastro_server.interfaces.http.remote.protocol import RelayEnvelope
 
             env = RelayEnvelope(
@@ -206,6 +208,7 @@ class TestRemoteBackendDispatch:
             )
             backend = RemoteRelayToolBackend(relay_server=srv)
             backend.context.peer_id = resp.peer_id
+            backend.context.current_tool_call_id = "call-mcp-1"
             tool = RemotePeerMCPTool(
                 backend,
                 RemoteMCPToolInfo(
@@ -231,6 +234,7 @@ class TestRemoteBackendDispatch:
 
             assert len(received) == 1
             env = received[0][1]
+            assert env.payload["tool_call_id"] == "call-mcp-1"
             assert env.payload["tool_name"] == "mcp"
             assert env.payload["args"]["server_name"] == "docs"
             assert env.payload["args"]["tool_name"] == "search"

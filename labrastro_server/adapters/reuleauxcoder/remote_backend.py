@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from labrastro_server.relay.errors import (
@@ -54,20 +55,19 @@ class RemoteRelayToolBackend(ToolBackend):
         else:
             timeout = 30
 
+        tool_call_id = self._resolve_tool_call_id(tool_name)
         request = ExecToolRequest(
             tool_name=tool_name,
             args=args,
             cwd=self.context.cwd,
             timeout_sec=timeout,
-            tool_call_id=self.context.current_tool_call_id,
+            tool_call_id=tool_call_id,
             expected_state=self._approved_preview_states.pop(
                 self._request_key(tool_name, args), {}
             ),
         )
 
-        stream_handler = self._build_stream_handler(
-            tool_name, self.context.current_tool_call_id
-        )
+        stream_handler = self._build_stream_handler(tool_name, tool_call_id)
 
         try:
             result = self.relay_server.send_exec_request(
@@ -142,7 +142,11 @@ class RemoteRelayToolBackend(ToolBackend):
                 return
             if callable(remote_stream_handler):
                 try:
-                    remote_stream_handler(tool_name, chunk, chunk.tool_call_id)
+                    remote_stream_handler(
+                        tool_name,
+                        chunk,
+                        chunk.tool_call_id or tool_call_id,
+                    )
                 except Exception:
                     pass
             if tool_name == "shell" and self.ui_bus is not None:
@@ -156,6 +160,12 @@ class RemoteRelayToolBackend(ToolBackend):
                 )
 
         return _handle
+
+    def _resolve_tool_call_id(self, tool_name: str) -> str:
+        current = self.context.current_tool_call_id
+        if isinstance(current, str) and current.strip():
+            return current.strip()
+        return f"manual-{tool_name}-{uuid.uuid4().hex}"
 
     def _request_key(self, tool_name: str, args: dict[str, Any]) -> str:
         return json.dumps(
