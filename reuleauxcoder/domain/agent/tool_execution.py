@@ -10,6 +10,11 @@ if TYPE_CHECKING:
     from reuleauxcoder.domain.llm.models import ToolCall
 
 from reuleauxcoder.domain.agent.events import AgentEvent
+from reuleauxcoder.domain.agent.tool_arguments import (
+    format_tool_argument_retry_message,
+    policy_for_provider,
+    validate_and_repair_tool_arguments,
+)
 from reuleauxcoder.app.runtime.agent_runtime import (
     AgentRunCancelled,
     get_interactive_run_limiter,
@@ -22,6 +27,7 @@ from reuleauxcoder.domain.hooks.types import (
 )
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from reuleauxcoder.extensions.tools.registry import get_tool
+from reuleauxcoder.services.llm.diagnostics import persist_tool_argument_validation_event
 
 
 class ToolExecutor:
@@ -51,6 +57,69 @@ class ToolExecutor:
                 meta=meta,
             )
         )
+
+    @staticmethod
+    def _bad_arguments_message(tool_name: str, detail: str) -> str:
+        return f"Error: bad arguments for {tool_name}: {detail}"
+
+    @staticmethod
+    def _validation_meta(validation: object | None) -> dict | None:
+        if validation is None:
+            return None
+        to_dict = getattr(validation, "to_dict", None)
+        if not callable(to_dict):
+            return None
+        return {"tool_argument_validation": to_dict()}
+
+    def _tool_argument_context(self, tc: "ToolCall", tool: object | None) -> dict:
+        llm = getattr(self.agent, "llm", None)
+        provider_config = getattr(llm, "provider_config", None)
+        return {
+            "session_id": getattr(self.agent, "current_session_id", None),
+            "round_index": getattr(self.agent.state, "current_round", None),
+            "tool": tc.name,
+            "tool_call_id": tc.id,
+            "tool_source": self._tool_source(tool),
+            "mcp_server": getattr(tool, "server_name", None),
+            "provider_id": getattr(llm, "provider_id", None),
+            "provider_type": getattr(llm, "provider_type", None),
+            "compat": getattr(provider_config, "compat", None),
+            "model": getattr(llm, "model", None),
+        }
+
+    def _persist_validation(self, validation: object, context: dict) -> None:
+        diagnostics = getattr(getattr(self.agent, "config", None), "diagnostics", None)
+        tool_argument_validation = getattr(
+            diagnostics, "tool_argument_validation", None
+        )
+        if getattr(tool_argument_validation, "enabled", True) is False:
+            return
+        has_diagnostics = getattr(validation, "has_diagnostics", None)
+        if has_diagnostics is False and not getattr(
+            tool_argument_validation, "record_clean", False
+        ):
+            return
+        if isinstance(validation, dict):
+            final_valid = bool(validation.get("final_valid"))
+            has_payload = bool(
+                validation.get("initial_issues")
+                or validation.get("final_issues")
+                or validation.get("repairs")
+                or validation.get("provider_diagnostics")
+            )
+            if (
+                final_valid
+                and not has_payload
+                and not getattr(tool_argument_validation, "record_clean", False)
+            ):
+                return
+        try:
+            persist_tool_argument_validation_event(
+                validation=validation,
+                metadata=context,
+            )
+        except Exception:
+            pass
 
     def execute(self, tc: "ToolCall") -> str:
         """Execute a single tool call."""
@@ -84,11 +153,81 @@ class ToolExecutor:
             self._emit_tool_end(tc, message, tool=tool)
             return message
 
-        preflight_error = (
-            tool.preflight_validate(**tc.arguments) if tool is not None else None
+        argument_error = getattr(tc, "argument_error", None)
+        if argument_error:
+            parse_validation = {
+                "tool_name": tc.name,
+                "policy": "provider_parse",
+                "final_valid": False,
+                "initial_issues": [
+                    {
+                        "path": "$",
+                        "field": None,
+                        "code": "invalid_tool_arguments",
+                        "expected": "object",
+                        "actual": "invalid",
+                        "receivedPreview": "",
+                        "severity": "error",
+                        "repairable": False,
+                        "message": str(argument_error),
+                    }
+                ],
+                "final_issues": [],
+                "repairs": [],
+                "provider_diagnostics": list(
+                    getattr(tc, "argument_diagnostics", None) or []
+                ),
+            }
+            self._persist_validation(parse_validation, self._tool_argument_context(tc, tool))
+            message = self._bad_arguments_message(tc.name, str(argument_error))
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                meta={
+                    "tool_argument_validation": {
+                        "tool_name": tc.name,
+                        "final_valid": False,
+                        "provider_argument_error": str(argument_error),
+                        "provider_diagnostics": list(
+                            getattr(tc, "argument_diagnostics", None) or []
+                        ),
+                    }
+                },
+            )
+            return message
+
+        validation_context = self._tool_argument_context(tc, tool)
+        validation = validate_and_repair_tool_arguments(
+            tool_name=tc.name,
+            arguments=tc.arguments,
+            schema=getattr(tool, "parameters", None),
+            policy=policy_for_provider(
+                compat=validation_context.get("compat"),
+                model=validation_context.get("model"),
+            ),
         )
+        self._persist_validation(validation, validation_context)
+        validation_meta = self._validation_meta(validation)
+        if not validation.final_valid:
+            message = self._bad_arguments_message(
+                tc.name,
+                format_tool_argument_retry_message(tc.name, validation.final_issues),
+            )
+            self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+            return message
+        tc.arguments = validation.arguments
+
+        try:
+            preflight_error = (
+                tool.preflight_validate(**tc.arguments) if tool is not None else None
+            )
+        except TypeError as e:
+            message = self._bad_arguments_message(tc.name, str(e))
+            self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+            return message
         if preflight_error:
-            self._emit_tool_end(tc, preflight_error, tool=tool)
+            self._emit_tool_end(tc, preflight_error, tool=tool, meta=validation_meta)
             return preflight_error
 
         if not self.agent.is_tool_allowed_in_mode(tc.name):
@@ -106,7 +245,7 @@ class ToolExecutor:
                 message = (
                     f"Tool '{tc.name}' is not available in current mode '{mode_name}'"
                 )
-            self._emit_tool_end(tc, message, tool=tool)
+            self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
             return message
 
         approval_required = next(
@@ -119,7 +258,7 @@ class ToolExecutor:
                     approval_required.reason
                     or f"Tool '{tc.name}' requires approval, but no approval provider is configured"
                 )
-                self._emit_tool_end(tc, message, tool=tool)
+                self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
                 return message
             try:
                 decision = provider.request_approval(
@@ -135,14 +274,14 @@ class ToolExecutor:
                 )
             except (KeyboardInterrupt, EOFError):
                 message = f"Tool '{tc.name}' approval interrupted by user"
-                self._emit_tool_end(tc, message, tool=tool)
+                self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
                 return message
 
             if not decision.approved:
                 message = (
                     decision.reason or f"Tool '{tc.name}' denied by approval provider"
                 )
-                self._emit_tool_end(tc, message, tool=tool)
+                self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
                 return message
 
         before_context = self.agent.hook_registry.run_transforms(
@@ -162,7 +301,7 @@ class ToolExecutor:
 
         if tool is None:
             message = f"Error: unknown tool '{tool_call.name}'"
-            self._emit_tool_end(tool_call, message, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
             return message
 
         backend = getattr(tool, "backend", None)
@@ -223,19 +362,21 @@ class ToolExecutor:
             self.agent.hook_registry.run_observers(
                 HookPoint.AFTER_TOOL_EXECUTE, after_context
             )
-            self._emit_tool_end(tool_call, after_context.result, tool=tool)
+            self._emit_tool_end(
+                tool_call, after_context.result, tool=tool, meta=validation_meta
+            )
             return after_context.result
         except TypeError as e:
             message = f"Error: bad arguments for {tool_call.name}: {e}"
-            self._emit_tool_end(tool_call, message, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
             return message
         except AgentRunCancelled:
             message = f"Tool '{tool_call.name}' cancelled while waiting for runtime slot"
-            self._emit_tool_end(tool_call, message, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
             return message
         except Exception as e:
             message = f"Error executing {tool_call.name}: {e}"
-            self._emit_tool_end(tool_call, message, tool=tool)
+            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
             return message
         finally:
             if context is not None:

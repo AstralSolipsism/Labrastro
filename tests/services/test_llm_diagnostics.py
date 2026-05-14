@@ -1,9 +1,13 @@
 ﻿from pathlib import Path
 
 from reuleauxcoder.services.llm.diagnostics import (
+    aggregate_tool_argument_validation_events,
     persist_llm_error_diagnostic,
+    persist_tool_argument_validation_event,
     snapshot_messages,
+    summarize_tool_argument_validation_events,
 )
+from reuleauxcoder.domain.agent.tool_arguments import validate_and_repair_tool_arguments
 
 
 def test_snapshot_messages_keeps_last_10_and_truncates_content() -> None:
@@ -45,3 +49,42 @@ def test_persist_llm_error_diagnostic_writes_json(tmp_path: Path, monkeypatch) -
     assert '"session_id": "session_test"' in content
     assert '"tool_names": [' in content
     assert '"round_index": 2' in content
+
+
+def test_tool_argument_validation_telemetry_aggregates_by_model_tool_and_issue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    validation = validate_and_repair_tool_arguments(
+        tool_name="write_file",
+        arguments={},
+        schema={
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+    )
+
+    path = persist_tool_argument_validation_event(
+        validation=validation,
+        metadata={
+            "model": "deepseek-v4-pro",
+            "tool": "write_file",
+            "provider_id": "deepseek",
+        },
+    )
+
+    counts = aggregate_tool_argument_validation_events(path)
+
+    assert counts["model=deepseek-v4-pro|tool=write_file|final_valid=false"] == 1
+    assert (
+        counts[
+            "issue|model=deepseek-v4-pro|tool=write_file|code=missing_required|path=$.content"
+        ]
+        == 1
+    )
+
+    summary = summarize_tool_argument_validation_events(path)
+    assert summary["totals"] == {"events": 1, "invalid": 1, "repaired": 0}
+    assert summary["by_model"][0]["name"] == "deepseek-v4-pro"
+    assert summary["issues"][0]["code"] == "missing_required"
