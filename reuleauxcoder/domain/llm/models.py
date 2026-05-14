@@ -11,6 +11,8 @@ class ToolCall:
     id: str
     name: str
     arguments: dict
+    argument_error: str | None = None
+    argument_diagnostics: list[dict] = field(default_factory=list)
 
 
 @dataclass

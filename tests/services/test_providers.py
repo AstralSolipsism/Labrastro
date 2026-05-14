@@ -244,6 +244,217 @@ def test_chat_provider_parses_reasoning_delta_field() -> None:
     assert response.content == "done"
 
 
+def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_1",
+                                function=SimpleNamespace(
+                                    name="write_file",
+                                    arguments='{"file_path":"demo.md",',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                function=SimpleNamespace(
+                                    name=None,
+                                    arguments='"content":"hello"}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        ),
+    ]
+    provider.call_with_retry = lambda _params: iter(events)
+
+    response = provider.chat(
+        ProviderRequest(model="deepseek-demo", messages=[{"role": "user", "content": "hi"}])
+    )
+
+    assert response.tool_calls[0].name == "write_file"
+    assert response.tool_calls[0].arguments == {
+        "file_path": "demo.md",
+        "content": "hello",
+    }
+    assert response.tool_calls[0].argument_error is None
+    assert response.provider_extra["tool_argument_diagnostics"] == []
+
+
+def test_chat_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_1",
+                                function=SimpleNamespace(
+                                    name="write_file",
+                                    arguments="",
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+    ]
+    provider.call_with_retry = lambda _params: iter(events)
+
+    response = provider.chat(
+        ProviderRequest(model="deepseek-demo", messages=[{"role": "user", "content": "hi"}])
+    )
+
+    assert response.tool_calls[0].arguments == {}
+    assert response.tool_calls[0].argument_error == "missing tool arguments"
+    assert response.diagnostics[0].code == "invalid_tool_arguments"
+    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "write_file"
+
+
+def test_chat_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_1",
+                                function=SimpleNamespace(
+                                    name="write_file",
+                                    arguments='{"file_path":',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+    ]
+    provider.call_with_retry = lambda _params: iter(events)
+
+    response = provider.chat(
+        ProviderRequest(model="deepseek-demo", messages=[{"role": "user", "content": "hi"}])
+    )
+
+    assert response.tool_calls[0].arguments == {}
+    assert response.tool_calls[0].argument_error == "invalid JSON arguments: Expecting value"
+    diagnostic = response.provider_extra["tool_argument_diagnostics"][0]
+    assert diagnostic["code"] == "invalid_tool_arguments"
+    assert diagnostic["raw_arguments"] == '{"file_path":'
+
+
+def test_responses_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
+    provider = OpenAIResponsesProvider(
+        ProviderConfig(id="responses", type="openai_responses", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="item_1",
+                call_id="call_1",
+                name="write_file",
+                arguments='{"file_path":',
+            ),
+        ),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(id="resp_1", usage=None),
+        ),
+    ]
+    provider.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_params: iter(events))
+    )
+
+    response = provider.chat(
+        ProviderRequest(model="gpt-demo", messages=[{"role": "user", "content": "hi"}])
+    )
+
+    assert response.tool_calls[0].argument_error == "invalid JSON arguments: Expecting value"
+    assert response.diagnostics[0].code == "invalid_tool_arguments"
+    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_call_id"] == "call_1"
+
+
+def test_anthropic_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
+    provider = AnthropicMessagesProvider(
+        ProviderConfig(id="anthropic", type="anthropic_messages", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(
+                type="tool_use",
+                id="call_1",
+                name="write_file",
+            ),
+        )
+    ]
+    provider.client = SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **_params: iter(events))
+    )
+
+    response = provider.chat(
+        ProviderRequest(model="claude-demo", messages=[{"role": "user", "content": "hi"}])
+    )
+
+    assert response.tool_calls[0].argument_error == "missing tool arguments"
+    assert response.diagnostics[0].code == "invalid_tool_arguments"
+    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "write_file"
+
+
 def test_chat_provider_parses_deepseek_cache_usage_fields() -> None:
     provider = OpenAIChatProvider(
         ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from openai import OpenAI
@@ -15,6 +14,9 @@ from reuleauxcoder.domain.providers.models import (
     ProviderResponse,
 )
 from reuleauxcoder.services.providers.compat import apply_openai_responses_qwen
+from reuleauxcoder.services.providers.tool_arguments import (
+    parse_provider_tool_arguments,
+)
 
 
 def convert_chat_tools_to_responses_tools(tools: list[dict[str, Any]]) -> list[dict]:
@@ -341,18 +343,20 @@ class OpenAIResponsesProvider:
                 raise RuntimeError(str(getattr(error, "message", error)))
 
         parsed: list[ToolCall] = []
-        for raw in tool_calls.values():
-            try:
-                arguments = json.loads(raw.get("args") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            parsed.append(
-                ToolCall(
-                    id=raw.get("id") or f"tool_call_{len(parsed)}",
-                    name=raw.get("name") or "",
-                    arguments=arguments,
-                )
+        tool_argument_diagnostics: list[dict[str, Any]] = []
+        for index, raw in enumerate(tool_calls.values()):
+            tool_call_id = raw.get("id") or f"tool_call_{len(parsed)}"
+            tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
+                index=index,
+                tool_call_id=tool_call_id,
+                tool_name=raw.get("name") or "",
+                raw_arguments=raw.get("args") or "",
             )
+            if diagnostic:
+                tool_argument_diagnostics.append(diagnostic)
+            if provider_diagnostic:
+                diagnostics.append(provider_diagnostic)
+            parsed.append(tool_call)
         return ProviderResponse(
             content="".join(content_parts),
             reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
@@ -369,6 +373,7 @@ class OpenAIResponsesProvider:
             provider_extra={
                 "request_params": dict(params),
                 "debug_stream_events": debug_events,
+                "tool_argument_diagnostics": tool_argument_diagnostics,
             },
         )
 

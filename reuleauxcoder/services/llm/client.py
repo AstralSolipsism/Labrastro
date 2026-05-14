@@ -437,9 +437,21 @@ class LLM:
                         "reasoning_received": reasoning_received,
                         "reasoning_chars": len(response.reasoning_content or ""),
                         "tool_calls": [
-                            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                            {
+                                "id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                                "argument_error": getattr(tc, "argument_error", None),
+                                "argument_diagnostics": list(
+                                    getattr(tc, "argument_diagnostics", None) or []
+                                ),
+                            }
                             for tc in response.tool_calls
                         ],
+                        "tool_argument_diagnostics": list(
+                            response.provider_extra.get("tool_argument_diagnostics")
+                            or []
+                        ),
                         "usage": {
                             "prompt_tokens": response.prompt_tokens,
                             "completion_tokens": response.completion_tokens,

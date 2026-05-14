@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 
@@ -26,6 +25,9 @@ from reuleauxcoder.services.providers.compat import (
     apply_openai_chat_thinking,
     apply_openai_chat_tool_choice,
     should_omit_openai_chat_temperature,
+)
+from reuleauxcoder.services.providers.tool_arguments import (
+    parse_provider_tool_arguments,
 )
 
 
@@ -297,16 +299,23 @@ class OpenAIChatProvider:
                                 tc_map[idx]["args"] += tc_delta.function.arguments
 
             parsed: list[ToolCall] = []
+            tool_argument_diagnostics: list[dict[str, Any]] = []
             for idx in sorted(tc_map):
                 raw = tc_map[idx]
                 tool_call_id = raw.get("id") or f"tool_call_{idx}"
-                try:
-                    args = json.loads(raw["args"])
-                except (json.JSONDecodeError, KeyError):
-                    args = {}
-                parsed.append(
-                    ToolCall(id=tool_call_id, name=raw["name"], arguments=args)
+                raw_args = raw.get("args", "")
+                tool_name = str(raw.get("name") or "")
+                tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
+                    index=idx,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    raw_arguments=str(raw_args),
                 )
+                if diagnostic:
+                    tool_argument_diagnostics.append(diagnostic)
+                if provider_diagnostic:
+                    diagnostics.append(provider_diagnostic)
+                parsed.append(tool_call)
 
             return ProviderResponse(
                 content="".join(content_parts),
@@ -326,6 +335,7 @@ class OpenAIChatProvider:
                     "request_params": dict(params),
                     "debug_stream_events": debug_stream_events,
                     "stream_options_enabled": debug_stream_options_enabled,
+                    "tool_argument_diagnostics": tool_argument_diagnostics,
                 },
             )
         finally:

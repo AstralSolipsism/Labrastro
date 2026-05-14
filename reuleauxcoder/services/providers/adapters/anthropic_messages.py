@@ -16,6 +16,9 @@ from reuleauxcoder.services.providers.compat import (
     apply_anthropic_reasoning_effort,
     deepseek_anthropic_budget_is_provider_managed,
 )
+from reuleauxcoder.services.providers.tool_arguments import (
+    parse_provider_tool_arguments,
+)
 
 
 def convert_chat_tools_to_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict]:
@@ -344,18 +347,20 @@ class AnthropicMessagesProvider:
                 continue
 
         parsed: list[ToolCall] = []
-        for raw in tool_blocks.values():
-            try:
-                arguments = json.loads(raw.get("args") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            parsed.append(
-                ToolCall(
-                    id=raw.get("id") or f"tool_call_{len(parsed)}",
-                    name=raw.get("name") or "",
-                    arguments=arguments,
-                )
+        tool_argument_diagnostics: list[dict[str, Any]] = []
+        for index, raw in enumerate(tool_blocks.values()):
+            tool_call_id = raw.get("id") or f"tool_call_{len(parsed)}"
+            tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
+                index=index,
+                tool_call_id=tool_call_id,
+                tool_name=raw.get("name") or "",
+                raw_arguments=raw.get("args") or "",
             )
+            if diagnostic:
+                tool_argument_diagnostics.append(diagnostic)
+            if provider_diagnostic:
+                diagnostics.append(provider_diagnostic)
+            parsed.append(tool_call)
         return ProviderResponse(
             content="".join(content_parts),
             reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
@@ -372,6 +377,7 @@ class AnthropicMessagesProvider:
             provider_extra={
                 "request_params": dict(params),
                 "debug_stream_events": debug_events,
+                "tool_argument_diagnostics": tool_argument_diagnostics,
             },
         )
 
