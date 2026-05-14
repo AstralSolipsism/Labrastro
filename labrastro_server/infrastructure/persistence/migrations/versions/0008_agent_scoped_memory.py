@@ -67,7 +67,7 @@ def upgrade() -> None:
         DO $$
         BEGIN
             CREATE EXTENSION IF NOT EXISTS vector;
-        EXCEPTION WHEN undefined_file THEN
+        EXCEPTION WHEN undefined_file OR feature_not_supported THEN
             RAISE NOTICE 'pgvector extension is unavailable; memory_embeddings.embedding will be omitted';
         END
         $$;

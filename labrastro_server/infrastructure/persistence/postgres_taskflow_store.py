@@ -101,6 +101,28 @@ class PostgresTaskflowStore:
             state = json.loads(state)
         return TaskflowState.from_dict(dict(state))
 
+    def list_taskflow_states(self, *, project_id: str | None = None) -> list[TaskflowState]:
+        where = "WHERE project_id=:project_id" if project_id is not None else ""
+        params = {"project_id": project_id} if project_id is not None else {}
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT state FROM labrastro_taskflow_states
+                    {where}
+                    ORDER BY updated_at DESC
+                    """
+                ),
+                params,
+            ).mappings().all()
+        states: list[TaskflowState] = []
+        for row in rows:
+            state = row["state"]
+            if isinstance(state, str):
+                state = json.loads(state)
+            states.append(TaskflowState.from_dict(dict(state)))
+        return states
+
     def save_taskflow_state(self, state: TaskflowState) -> None:
         payload = state.to_dict()
         with self.engine.begin() as conn:
@@ -132,6 +154,31 @@ class PostgresTaskflowStore:
                     "schema_version": state.meta.schema_version,
                 },
             )
+            if payload.get("events"):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO labrastro_taskflow_events (
+                            event_id, taskflow_id, project_id, goal_id, event_type,
+                            actor, payload, metadata, created_at
+                        )
+                        SELECT
+                            event->>'id',
+                            event->>'taskflow_id',
+                            event->>'project_id',
+                            event->>'goal_id',
+                            event->>'type',
+                            COALESCE(event->>'actor', ''),
+                            COALESCE(event->'payload', '{}'::jsonb),
+                            COALESCE(event->'metadata', '{}'::jsonb),
+                            COALESCE((event->>'created_at')::timestamptz, now())
+                        FROM jsonb_array_elements(CAST(:events AS JSONB)) AS event
+                        WHERE COALESCE(event->>'id', '') <> ''
+                        ON CONFLICT (event_id) DO NOTHING
+                        """
+                    ),
+                    {"events": _json(payload.get("events"))},
+                )
 
 
 __all__ = ["PostgresTaskflowStore"]

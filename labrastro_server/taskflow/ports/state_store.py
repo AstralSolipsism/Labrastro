@@ -17,6 +17,9 @@ class TaskflowStateStore(Protocol):
     def save_taskflow_state(self, state: TaskflowState) -> None:
         """Persist a TaskflowState snapshot."""
 
+    def list_taskflow_states(self, *, project_id: str | None = None) -> list[TaskflowState]:
+        """Return TaskflowState snapshots, optionally filtered by project."""
+
 
 class InMemoryTaskflowStateStore:
     """Thread-safe in-memory TaskflowState store for development and tests."""
@@ -42,6 +45,17 @@ class InMemoryTaskflowStateStore:
             self._states[state.meta.taskflow_id] = TaskflowState.from_dict(
                 state.to_dict()
             )
+
+    def list_taskflow_states(self, *, project_id: str | None = None) -> list[TaskflowState]:
+        """Return defensive copies of known TaskflowState snapshots."""
+
+        with self._lock:
+            states = list(self._states.values())
+            if project_id is not None:
+                states = [
+                    state for state in states if state.meta.project_id == project_id
+                ]
+            return [TaskflowState.from_dict(state.to_dict()) for state in states]
 
 
 __all__ = ["InMemoryTaskflowStateStore", "TaskflowStateStore"]
