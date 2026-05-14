@@ -9,6 +9,18 @@ from labrastro_server.taskflow.application.project_service import ProjectService
 from labrastro_server.taskflow.application.readiness_service import ReadinessService
 from labrastro_server.taskflow.application.review_service import ReviewService
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
+from labrastro_server.taskflow.application.compiler_review_service import (
+    CompilerReviewService,
+)
+from labrastro_server.taskflow.application.project_memory_service import (
+    ProjectMemoryService,
+)
+from labrastro_server.taskflow.application.projector_preview_service import (
+    ProjectorPreviewService,
+)
+from labrastro_server.taskflow.application.workspace_projection_service import (
+    WorkspaceProjectionService,
+)
 
 __all__ = [
     "BriefService",
@@ -17,5 +29,9 @@ __all__ = [
     "ProjectService",
     "ReadinessService",
     "ReviewService",
+    "CompilerReviewService",
+    "ProjectMemoryService",
+    "ProjectorPreviewService",
+    "WorkspaceProjectionService",
     "TaskflowService",
 ]

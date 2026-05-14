@@ -76,6 +76,22 @@ class _FakeRuntimeControlPlane:
         }
 
 
+def _confirm_current_brief(
+    service: TaskflowService,
+    taskflow_id: str,
+    *,
+    actor: str = "user",
+):
+    state = service.compile_brief_draft(taskflow_id, actor=actor)
+    version = state.outputs.current_brief_version
+    state = service.mark_brief_ready(taskflow_id, version=version, actor=actor)
+    return service.confirm_brief(
+        taskflow_id,
+        version=state.outputs.current_brief_version,
+        actor=actor,
+    )
+
+
 def _prepare_dispatchable_taskflow(
     service: TaskflowService,
     *,
@@ -105,7 +121,7 @@ def _prepare_dispatchable_taskflow(
             }
         ],
     )
-    service.confirm_goal(state.meta.taskflow_id)
+    _confirm_current_brief(service, state.meta.taskflow_id)
     plan = service.compile_goal(state.meta.taskflow_id)
     decision = service.request_dispatch_decision(
         state.meta.taskflow_id,
@@ -189,18 +205,19 @@ def test_discovery_turn_answer_decision_and_confirmed_brief_compile_to_acceptanc
     )
     assert state.outputs.current_brief_version == 1
 
-    state = service.answer_decision(
+    answer = service.answer_review_card_v1(
         state.meta.taskflow_id,
-        decision_id="decision-confirm-boundary",
-        selected_option_id="brief",
-        answer="brief",
-        rationale="Brief confirmation is the clean execution boundary.",
+        card_id=f"{state.meta.taskflow_id}:decision:decision-confirm-boundary",
+        action="accept",
         actor="user",
+        comment="Brief confirmation is the clean execution boundary.",
     )
+    state = service.get_taskflow_state(state.meta.taskflow_id)
 
+    assert answer.card_id.endswith("decision-confirm-boundary")
     assert state.design.local_decisions[0].chosen == "brief"
     assert state.outputs.current_brief_version == 2
-    assert any(event.type == TaskflowEventType.DECISION_ANSWERED for event in state.events)
+    assert any(event.type == TaskflowEventType.REVIEW_CARD_ANSWERED for event in state.events)
 
     with pytest.raises(ValueError, match="confirmed brief"):
         service.compile_goal(state.meta.taskflow_id)
@@ -283,7 +300,7 @@ def test_brief_snapshot_is_immutable_and_compile_requires_fresh_confirmation() -
         service.compile_goal(state.meta.taskflow_id)
 
 
-def test_review_card_answer_records_decision_answer_and_new_brief_version() -> None:
+def test_review_card_v1_answer_records_decision_answer_and_new_brief_version() -> None:
     service = _service()
     state = service.start_taskflow(
         project_id="project-1",
@@ -303,10 +320,10 @@ def test_review_card_answer_records_decision_answer_and_new_brief_version() -> N
         ],
     )
 
-    answer = service.answer_review_card(
+    answer = service.answer_review_card_v1(
         state.meta.taskflow_id,
         card_id=f"{state.meta.taskflow_id}:decision:decision-review",
-        action="accept_recommendation",
+        action="accept",
         actor="user",
     )
     updated = service.get_taskflow_state(state.meta.taskflow_id)
@@ -316,7 +333,6 @@ def test_review_card_answer_records_decision_answer_and_new_brief_version() -> N
     assert updated.design.local_decisions[0].answer_refs
     assert updated.outputs.current_brief_version == 2
     assert any(event.type == TaskflowEventType.REVIEW_CARD_ANSWERED for event in updated.events)
-    assert any(event.type == TaskflowEventType.DECISION_ANSWERED for event in updated.events)
 
 
 def test_high_risk_question_blocks_compile_until_answered() -> None:
@@ -362,12 +378,14 @@ def test_high_risk_question_blocks_compile_until_answered() -> None:
     with pytest.raises(ValueError, match="unresolved high-risk"):
         service.compile_goal(state.meta.taskflow_id)
 
-    answered = service.answer_question(
+    answer = service.answer_review_card_v1(
         state.meta.taskflow_id,
-        question_id="question-data-migration",
-        answer="No migration is required.",
+        card_id=f"{state.meta.taskflow_id}:question:question-data-migration",
+        action="edit",
+        value="No migration is required.",
         actor="user",
     )
+    answered = service.get_taskflow_state(state.meta.taskflow_id)
     service.mark_brief_ready(state.meta.taskflow_id)
     service.confirm_brief(
         state.meta.taskflow_id,
@@ -511,7 +529,7 @@ def test_dispatch_can_reconstruct_plan_from_persisted_state_after_service_rebuil
             }
         ],
     )
-    service.confirm_goal(state.meta.taskflow_id)
+    _confirm_current_brief(service, state.meta.taskflow_id)
     plan = service.compile_goal(state.meta.taskflow_id)
     dispatch_decision = service.request_dispatch_decision(
         state.meta.taskflow_id,

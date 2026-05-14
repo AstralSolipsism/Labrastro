@@ -8,7 +8,7 @@ from labrastro_server.taskflow.domain.project_state import (
     WorkItemStatus,
     WorkItemType,
 )
-from labrastro_server.taskflow.interaction.review_cards import CardRenderer
+from labrastro_server.taskflow.interaction.review_cards_v1 import ReviewCardV1Renderer
 from labrastro_server.taskflow.domain.taskflow_state import (
     Assumption,
     ConfirmationState,
@@ -102,7 +102,7 @@ def test_complexity_estimator_selects_risk_driven_recipe() -> None:
     assert "compile_plan" in estimate.recipe_steps
 
 
-def test_card_renderer_projects_assumptions_scope_and_decisions() -> None:
+def test_review_card_v1_renderer_projects_assumptions_and_decisions() -> None:
     state = TaskflowState.new(
         taskflow_id="taskflow-1",
         project_id="project-1",
@@ -132,16 +132,13 @@ def test_card_renderer_projects_assumptions_scope_and_decisions() -> None:
         )
     )
 
-    cards = CardRenderer().render(state)
+    cards = ReviewCardV1Renderer().render(state)
 
-    assert [card.card_type for card in cards] == [
-        "assumption",
-        "scope",
-        "decision",
-    ]
-    assert cards[0].items[0]["id"] == "assumption-1"
-    assert cards[1].items[0]["included"] == ["AssumptionCard", "ScopeCard", "DecisionCard"]
-    assert cards[2].items[0]["recommended"] == "typed-card"
+    assert [card.kind for card in cards] == ["assumption", "decision"]
+    assert cards[0].source_refs == ["assumption-1"]
+    assert cards[0].actions[0].id == "accept"
+    assert cards[1].source_refs == ["decision-1"]
+    assert cards[1].recommended_answer == "typed-card"
 
 
 def test_plan_compiler_reuses_existing_work_items_and_preserves_traceability() -> None:

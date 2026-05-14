@@ -156,6 +156,8 @@ class PlanCompiler:
 
         for candidate in candidates:
             compiled = self._compile_candidate(candidate, taskflow_state, project_state)
+            if compiled is None:
+                continue
             compiled_candidates.append(compiled)
 
             # Logic from docs/文档.md Section 5.8: every Goal/WorkItem relation
@@ -298,21 +300,68 @@ class PlanCompiler:
         candidate: WorkItemCandidate,
         state: TaskflowState,
         project: ProjectState,
-    ) -> CompiledWorkItemCandidate:
+    ) -> CompiledWorkItemCandidate | None:
         dedupe_key = candidate.dedupe_key or self._dedupe_key(state, candidate)
+        override = self._compiler_review_override(state, candidate.id)
+        override_action = str(override.get("action") or "")
+        override_reason = str(override.get("reason") or "")
+        override_value = override.get("value")
+
+        if override_action == "reject":
+            return None
+
+        if override_action == "force_reuse":
+            work_item_id = ""
+            if isinstance(override_value, dict):
+                work_item_id = str(override_value.get("work_item_id") or "").strip()
+            else:
+                work_item_id = str(override_value or "").strip()
+            reusable = self._work_item(project, work_item_id)
+            if reusable is not None:
+                compiled = self._compiled_from_reuse(candidate, reusable, dedupe_key, state)
+                compiled.rationale = self._override_rationale(
+                    "Forced reuse",
+                    override_reason,
+                    compiled.rationale,
+                )
+                compiled.metadata["compiler_review_override"] = dict(override)
+                return compiled
+
+        if override_action == "force_create":
+            compiled = self._compiled_from_new(
+                candidate,
+                f"{dedupe_key}:force-create",
+                state,
+                rationale=self._override_rationale(
+                    "Forced create",
+                    override_reason,
+                    "Compiler review required a separate WorkItem boundary.",
+                ),
+            )
+            compiled.work_item_id = f"work-{candidate.id}-force-create"
+            compiled.metadata["compiler_review_override"] = dict(override)
+            return compiled
 
         # Logic from docs/文档.md Section 5.6: exact logical delivery match
         # reuses a WorkItem, while dispatch still creates a fresh TaskRun later.
         reusable = project.find_work_item_by_dedupe_key(dedupe_key)
         if reusable is not None:
-            return self._compiled_from_reuse(candidate, reusable, dedupe_key, state)
+            compiled = self._compiled_from_reuse(candidate, reusable, dedupe_key, state)
+            if override_action == "split":
+                compiled.rationale = self._override_rationale(
+                    "Split requested",
+                    override_reason,
+                    compiled.rationale,
+                )
+                compiled.metadata["compiler_review_override"] = dict(override)
+            return compiled
 
         similar = project.find_similar_work_items(
             title=candidate.title, type=candidate.type.value
         )
         if similar and candidate.acceptance_refs:
             base = similar[0]
-            return self._compiled_from_new(
+            compiled = self._compiled_from_new(
                 candidate,
                 dedupe_key,
                 state,
@@ -322,13 +371,29 @@ class PlanCompiler:
                     "create derived WorkItem."
                 ),
             )
+            if override_action == "split":
+                compiled.rationale = self._override_rationale(
+                    "Split requested",
+                    override_reason,
+                    compiled.rationale,
+                )
+                compiled.metadata["compiler_review_override"] = dict(override)
+            return compiled
 
-        return self._compiled_from_new(
+        compiled = self._compiled_from_new(
             candidate,
             dedupe_key,
             state,
             rationale="No reusable WorkItem matched the dedupe key.",
         )
+        if override_action == "split":
+            compiled.rationale = self._override_rationale(
+                "Split requested",
+                override_reason,
+                compiled.rationale,
+            )
+            compiled.metadata["compiler_review_override"] = dict(override)
+        return compiled
 
     def _compiled_from_reuse(
         self,
@@ -624,6 +689,32 @@ class PlanCompiler:
         if brief is not None:
             return {str(item.get("id")): item for item in brief.decisions}
         return {decision.id: decision.to_dict() for decision in state.design.local_decisions}
+
+    def _compiler_review_override(
+        self, state: TaskflowState, candidate_id: str
+    ) -> dict[str, Any]:
+        overrides = state.compiler.traceability_index.get("compiler_review_overrides")
+        if isinstance(overrides, dict):
+            override = overrides.get(candidate_id)
+            if isinstance(override, dict):
+                return dict(override)
+        return {}
+
+    def _work_item(self, project: ProjectState, work_item_id: str) -> WorkItem | None:
+        if not work_item_id:
+            return None
+        for item in project.list_work_items():
+            if item.id == work_item_id:
+                return item
+        return None
+
+    def _override_rationale(
+        self, label: str, reason: str, base_rationale: str
+    ) -> str:
+        reason = reason.strip()
+        if reason:
+            return f"{label}: {reason}. {base_rationale}"
+        return f"{label}. {base_rationale}"
 
     def _acceptance_source_ids(
         self, state: TaskflowState

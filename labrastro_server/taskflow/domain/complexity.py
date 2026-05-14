@@ -180,9 +180,9 @@ class ComplexityEstimator:
                 ComplexityEvidenceRecord(
                     id=f"complexity-{dimension}",
                     dimension=dimension,
-                    source_type="legacy_signal",
+                    source_type="mapping_signal",
                     score_delta=self._score(value),
-                    rationale=f"Legacy signal {dimension}.",
+                    rationale=f"Mapping signal {dimension}.",
                 )
                 for dimension, value in evidence.items()
             ]

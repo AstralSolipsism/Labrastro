@@ -65,7 +65,14 @@ def _record_discovery(service: TaskflowService) -> str:
 
 def _confirmed_plan(service: TaskflowService):
     taskflow_id = _record_discovery(service)
-    service.confirm_goal(taskflow_id)
+    state = service.compile_brief_draft(taskflow_id, actor="user")
+    version = state.outputs.current_brief_version
+    state = service.mark_brief_ready(taskflow_id, version=version, actor="user")
+    service.confirm_brief(
+        taskflow_id,
+        version=state.outputs.current_brief_version,
+        actor="user",
+    )
     plan = service.compile_goal(taskflow_id)
     return taskflow_id, plan
 

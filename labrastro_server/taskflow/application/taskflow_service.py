@@ -5,12 +5,12 @@ from ``docs/文档.md`` Section 5:
 
 1. start_taskflow
 2. load_project_context
-3. clarify_goal
-4. confirm_goal
+3. record_discovery_turn
+4. compile/ready/confirm brief
 5. compile_goal
 6. create/reuse WorkItem
 7. create GoalWorkLink
-8. readiness gate
+8. request/confirm dispatch decision
 9. dispatch TaskRun
 10. update traceability and persist project deltas
 """
@@ -32,6 +32,19 @@ from labrastro_server.taskflow.application.review_service import ReviewService
 from labrastro_server.taskflow.application.runtime_projection_service import (
     TaskflowRuntimeProjectionService,
 )
+from labrastro_server.taskflow.application.compiler_review_service import (
+    CompilerReviewService,
+)
+from labrastro_server.taskflow.application.project_memory_service import (
+    ProjectMemoryService,
+)
+from labrastro_server.taskflow.application.projector_preview_service import (
+    ProjectorPreviewService,
+)
+from labrastro_server.taskflow.application.staleness import mark_taskflow_stale
+from labrastro_server.taskflow.application.workspace_projection_service import (
+    WorkspaceProjectionService,
+)
 from labrastro_server.taskflow.domain.complexity import ComplexityEstimator
 from labrastro_server.taskflow.domain.complexity_signals import ComplexitySignalExtractor
 from labrastro_server.taskflow.domain.repo_static_analysis import (
@@ -40,6 +53,13 @@ from labrastro_server.taskflow.domain.repo_static_analysis import (
 )
 from labrastro_server.taskflow.domain.events import append_taskflow_event
 from labrastro_server.taskflow.domain.time import utc_now
+
+TASKFLOW_WORKFLOW_MODE = "taskflow"
+TASKFLOW_SYSTEM_PROMPT = (
+    "You are running in Taskflow mode. Keep the conversation focused on "
+    "clarifying the current goal, surfacing assumptions, and preparing the "
+    "TaskflowState for compilation into WorkItems."
+)
 from labrastro_server.taskflow.compiler.plan_compiler import (
     CompiledWorkItemCandidate,
     PlanCompiler,
@@ -56,7 +76,10 @@ from labrastro_server.taskflow.domain.project_state import (
     WorkItem,
     WorkItemStatus,
 )
-from labrastro_server.taskflow.interaction.review_cards import CardRenderer, ReviewCard
+from labrastro_server.taskflow.interaction.review_cards_v1 import (
+    ReviewCardV1,
+    ReviewCardV1Renderer,
+)
 from labrastro_server.taskflow.domain.taskflow_state import (
     Assumption,
     AcceptanceExample,
@@ -67,7 +90,6 @@ from labrastro_server.taskflow.domain.taskflow_state import (
     DispatchDecisionStatus,
     ExampleRecord,
     OpenQuestion,
-    ReadinessGate,
     ReviewCardAnswer,
     RuleRecord,
     ScenarioRecord,
@@ -110,7 +132,11 @@ class TaskflowService:
         brief_service: BriefService | None = None,
         readiness_service: ReadinessService | None = None,
         review_service: ReviewService | None = None,
-        card_renderer: CardRenderer | None = None,
+        card_v1_renderer: ReviewCardV1Renderer | None = None,
+        compiler_review_service: CompilerReviewService | None = None,
+        project_memory_service: ProjectMemoryService | None = None,
+        projector_preview_service: ProjectorPreviewService | None = None,
+        workspace_projection_service: WorkspaceProjectionService | None = None,
         runtime_projection_service: TaskflowRuntimeProjectionService | None = None,
         dispatcher: TaskflowDispatcher | None = None,
         state_store: TaskflowStateStore | None = None,
@@ -130,7 +156,21 @@ class TaskflowService:
         self.brief_service = brief_service or BriefService()
         self.readiness_service = readiness_service or ReadinessService()
         self.review_service = review_service or ReviewService()
-        self.card_renderer = card_renderer or CardRenderer()
+        self.card_v1_renderer = card_v1_renderer or ReviewCardV1Renderer()
+        self.compiler_review_service = (
+            compiler_review_service or CompilerReviewService()
+        )
+        self.project_memory_service = project_memory_service or ProjectMemoryService()
+        self.projector_preview_service = (
+            projector_preview_service or ProjectorPreviewService()
+        )
+        self.workspace_projection_service = (
+            workspace_projection_service
+            or WorkspaceProjectionService(
+                project_memory_service=self.project_memory_service,
+                projector_preview_service=self.projector_preview_service,
+            )
+        )
         self.runtime_projection_service = (
             runtime_projection_service or TaskflowRuntimeProjectionService()
         )
@@ -256,62 +296,6 @@ class TaskflowService:
         self._refresh_derived_state(state, project)
         self.brief_service.sync_diagnostics(state)
         state.meta.status = TaskflowStatus.CLARIFYING
-        self.save_taskflow_state(state)
-        return self.get_taskflow_state(taskflow_id)
-
-    def answer_question(
-        self,
-        taskflow_id: str,
-        *,
-        question_id: str,
-        answer: str | list[str],
-        actor: str = "user",
-        rationale: str = "",
-        confidence: float | None = None,
-    ) -> TaskflowState:
-        state = self.get_taskflow_state(taskflow_id)
-        project = self.project_service.get_or_create_project_state(state.meta.project_id)
-        self.discovery_service.answer_question(
-            state,
-            question_id=question_id,
-            answer=answer,
-            actor=actor,
-            rationale=rationale,
-            confidence=confidence,
-        )
-        self._refresh_derived_state(state, project)
-        self.brief_service.compile_draft(state, actor=actor)
-        self._refresh_derived_state(state, project)
-        self.brief_service.sync_diagnostics(state)
-        self.save_taskflow_state(state)
-        return self.get_taskflow_state(taskflow_id)
-
-    def answer_decision(
-        self,
-        taskflow_id: str,
-        *,
-        decision_id: str,
-        selected_option_id: str | None = None,
-        answer: str | list[str] | None = None,
-        rationale: str = "",
-        actor: str = "user",
-        source: str = "api",
-    ) -> TaskflowState:
-        state = self.get_taskflow_state(taskflow_id)
-        project = self.project_service.get_or_create_project_state(state.meta.project_id)
-        self.discovery_service.answer_decision(
-            state,
-            decision_id=decision_id,
-            selected_option_id=selected_option_id,
-            answer=answer,
-            rationale=rationale,
-            actor=actor,
-            source=source,
-        )
-        self._refresh_derived_state(state, project)
-        self.brief_service.compile_draft(state, actor=actor)
-        self._refresh_derived_state(state, project)
-        self.brief_service.sync_diagnostics(state)
         self.save_taskflow_state(state)
         return self.get_taskflow_state(taskflow_id)
 
@@ -483,107 +467,6 @@ class TaskflowService:
         self.save_taskflow_state(state)
         return self.get_taskflow_state(taskflow_id)
 
-    def answer_review_card(
-        self,
-        taskflow_id: str,
-        *,
-        card_id: str,
-        action: str,
-        value: Any = None,
-        actor: str = "user",
-        comment: str = "",
-    ) -> ReviewCardAnswer:
-        state = self.get_taskflow_state(taskflow_id)
-        project = self.project_service.get_or_create_project_state(state.meta.project_id)
-        answer = self.review_service.answer_card(
-            state,
-            card_id=card_id,
-            action=action,
-            value=value,
-            actor=actor,
-            comment=comment,
-        )
-        if action in {"accept_recommendation", "choose_option"} and ":decision:" in card_id:
-            decision_id = card_id.rsplit(":", 1)[-1]
-            selected = value
-            if selected is None:
-                for decision in state.design.local_decisions:
-                    if decision.id == decision_id:
-                        selected = decision.recommended
-                        break
-            self.discovery_service.answer_decision(
-                state,
-                decision_id=decision_id,
-                selected_option_id=str(selected) if selected is not None else None,
-                answer=str(selected) if selected is not None else None,
-                rationale=comment,
-                actor=actor,
-                source="review_card",
-            )
-        self._refresh_derived_state(state, project)
-        self.brief_service.compile_draft(state, actor=actor)
-        self._refresh_derived_state(state, project)
-        self.brief_service.sync_diagnostics(state)
-        self.save_taskflow_state(state)
-        return answer
-
-    def clarify_goal(
-        self,
-        taskflow_id: str,
-        *,
-        goal_statement: str | None = None,
-        background_delta: str | None = None,
-        scope_in: Sequence[str] | None = None,
-        scope_out: Sequence[str] | None = None,
-        deferred_scope: Sequence[str] | None = None,
-        success_criteria: Sequence[str] | None = None,
-        assumptions: Sequence[Assumption | dict[str, Any]] | None = None,
-        work_item_candidates: Sequence[WorkItemCandidate | dict[str, Any]] | None = None,
-        readiness_gates: Sequence[ReadinessGate | dict[str, Any]] | None = None,
-        readiness_score: int | None = None,
-    ) -> TaskflowState:
-        """Compatibility entrypoint that delegates structured writes."""
-
-        self.record_discovery_turn(
-            taskflow_id,
-            actor="agent",
-            goal_statement=goal_statement,
-            background_delta=background_delta,
-            scope_in=scope_in,
-            scope_out=scope_out,
-            deferred_scope=deferred_scope,
-            success_criteria=success_criteria,
-            assumptions=assumptions,
-            work_item_candidates=work_item_candidates,
-        )
-        state = self.get_taskflow_state(taskflow_id)
-        if readiness_gates is not None:
-            state.compiler.readiness_gates = [
-                item
-                if isinstance(item, ReadinessGate)
-                else ReadinessGate.from_dict(dict(item))
-                for item in readiness_gates
-            ]
-        if readiness_score is not None:
-            state.compiler.readiness_score = max(0, min(100, int(readiness_score)))
-        self.save_taskflow_state(state)
-        return self.get_taskflow_state(taskflow_id)
-
-    def confirm_goal(self, taskflow_id: str, *, confirmed_by: str = "user") -> TaskflowState:
-        """Confirm the current brief before plan compilation."""
-
-        state = self.get_taskflow_state(taskflow_id)
-        if state.outputs.current_brief_version is None:
-            self.compile_brief_draft(taskflow_id, actor=confirmed_by)
-        state = self.get_taskflow_state(taskflow_id)
-        current = state.outputs.current_brief_version
-        self.mark_brief_ready(taskflow_id, version=current, actor=confirmed_by)
-        return self.confirm_brief(
-            taskflow_id,
-            version=current,
-            actor=confirmed_by,
-        )
-
     def compile_goal(self, taskflow_id: str) -> PlanDraft:
         """Compile the confirmed Goal and persist ProjectState deltas."""
 
@@ -627,6 +510,7 @@ class TaskflowService:
         state.compiler.traceability_index["compiled_work_items"] = [
             item.work_item_id for item in compiled_by_id.values()
         ]
+        self.compiler_review_service.build_decisions(state, project, plan)
         append_taskflow_event(
             state,
             TaskflowEventType.PLAN_COMPILED,
@@ -664,6 +548,7 @@ class TaskflowService:
         project = self.project_service.get_or_create_project_state(state.meta.project_id)
         self._refresh_derived_state(state, project)
         self._assert_current_brief_confirmed(state)
+        self.compiler_review_service.assert_current(state)
         if not state.outputs.plan_drafts:
             raise ValueError("taskflow goal must be compiled before dispatch confirmation")
         blockers = state.failed_compile_gates()
@@ -768,6 +653,7 @@ class TaskflowService:
         project = self.project_service.get_or_create_project_state(state.meta.project_id)
         if not dispatch_decision_id:
             raise ValueError("dispatch_decision_id is required before dispatch")
+        self.compiler_review_service.assert_current(state)
         dispatch_decision = self._confirmed_dispatch_decision(
             state,
             dispatch_decision_id,
@@ -919,10 +805,178 @@ class TaskflowService:
         self.save_taskflow_state(state)
         return run
 
-    def render_review_cards(self, taskflow_id: str) -> list[ReviewCard]:
-        """Render review cards for the current TaskflowState."""
+    def render_review_cards_v1(self, taskflow_id: str) -> list[ReviewCardV1]:
+        """Render unified V1 review cards for the current TaskflowState."""
 
-        return self.card_renderer.render(self.get_taskflow_state(taskflow_id))
+        return self.card_v1_renderer.render(self.get_taskflow_state(taskflow_id))
+
+    def answer_review_card_v1(
+        self,
+        taskflow_id: str,
+        *,
+        card_id: str,
+        action: str,
+        value: Any = None,
+        actor: str = "user",
+        comment: str = "",
+    ) -> ReviewCardAnswer:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        answer = self.review_service.answer_card_v1(
+            state,
+            card_id=card_id,
+            action=action,
+            value=value,
+            actor=actor,
+            comment=comment,
+        )
+        if action == "reopen":
+            mark_taskflow_stale(
+                state,
+                reason=f"review card reopened: {card_id}",
+                source="review_card_v1",
+                source_refs=[card_id],
+            )
+        if action != "discuss":
+            self._refresh_derived_state(state, project)
+            self.brief_service.compile_draft(state, actor=actor)
+            self._refresh_derived_state(state, project)
+            self.brief_service.sync_diagnostics(state)
+        self.save_taskflow_state(state)
+        return answer
+
+    def get_project_memory_view(self, taskflow_id: str) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        return {
+            "ok": True,
+            "project_memory": self.project_memory_service.view(project),
+        }
+
+    def preview_project_memory_patch(
+        self,
+        taskflow_id: str,
+        *,
+        actor: str,
+        reason: str,
+        source: str,
+        operations: Sequence[Any],
+    ) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        proposal = self.project_memory_service.preview_patch(
+            project,
+            actor=actor,
+            reason=reason,
+            source=source,
+            operations=list(operations),
+        )
+        proposal = self.project_memory_service.record_pending_patch(project, proposal)
+        append_taskflow_event(
+            state,
+            TaskflowEventType.PROJECT_MEMORY_PATCH_PROPOSED,
+            actor=actor,
+            payload=proposal,
+        )
+        self.project_service.save_project_state(project)
+        self.save_taskflow_state(state)
+        return {"ok": True, "proposal": proposal}
+
+    def apply_project_memory_patch(
+        self,
+        taskflow_id: str,
+        *,
+        proposal_id: str | None = None,
+        actor: str,
+        reason: str,
+        source: str,
+        operations: Sequence[Any],
+    ) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        proposal = self.project_memory_service.apply_patch(
+            state,
+            project,
+            proposal_id=proposal_id,
+            actor=actor,
+            reason=reason,
+            source=source,
+            operations=list(operations),
+        )
+        self.project_service.save_project_state(project)
+        self._mark_related_project_taskflows_stale(
+            state,
+            reason="Project Memory changed",
+            source="project_memory_patch",
+            source_refs=[proposal["id"]],
+        )
+        self.save_taskflow_state(state)
+        return {
+            "ok": True,
+            "proposal": proposal,
+            "taskflow": self.get_taskflow_state(taskflow_id).to_dict(),
+            "project_memory": self.project_memory_service.view(project),
+        }
+
+    def review_compiler_decision(
+        self,
+        taskflow_id: str,
+        *,
+        decision_id: str,
+        action: str,
+        actor: str = "user",
+        reason: str = "",
+        value: Any = None,
+    ) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        decision = self.compiler_review_service.review_decision(
+            state,
+            project=project,
+            decision_id=decision_id,
+            action=action,
+            actor=actor,
+            reason=reason,
+            value=value,
+        )
+        self.save_taskflow_state(state)
+        return {"ok": True, "compiler_decision": decision, "taskflow": state.to_dict()}
+
+    def get_projector_preview(
+        self, taskflow_id: str, *, target: str = "openspec"
+    ) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        return {
+            "ok": True,
+            "projector_preview": self.projector_preview_service.preview(
+                taskflow=state,
+                project=project,
+                target=target,
+            ),
+        }
+
+    def get_workspace_v1(
+        self,
+        taskflow_id: str,
+        *,
+        runtime_control_plane: Any | None = None,
+        event_limit: int = 50,
+    ) -> dict[str, Any]:
+        state = self.get_taskflow_state(taskflow_id)
+        project = self.project_service.get_or_create_project_state(state.meta.project_id)
+        runtime = self.runtime_projection_service.project(
+            taskflow=state,
+            project=project,
+            runtime_control_plane=runtime_control_plane,
+            event_limit=event_limit,
+        )
+        return self.workspace_projection_service.project(
+            taskflow=state,
+            project=project,
+            review_cards=self.card_v1_renderer.render(state),
+            runtime_projection=runtime,
+        )
 
     def get_runtime_projection(
         self,
@@ -973,6 +1027,27 @@ class TaskflowService:
         assessment = self.complexity_service.assess(state, project)
         self.readiness_service.refresh(state, assessment)
 
+    def _mark_related_project_taskflows_stale(
+        self,
+        current: TaskflowState,
+        *,
+        reason: str,
+        source: str,
+        source_refs: list[str],
+    ) -> None:
+        for state in self.state_store.list_taskflow_states(
+            project_id=current.meta.project_id
+        ):
+            if state.meta.taskflow_id == current.meta.taskflow_id:
+                continue
+            mark_taskflow_stale(
+                state,
+                reason=reason,
+                source=source,
+                source_refs=source_refs,
+            )
+            self.save_taskflow_state(state)
+
     def _assert_current_brief_confirmed(self, state: TaskflowState) -> None:
         if state.outputs.current_brief_version != state.outputs.confirmed_brief_version:
             raise ValueError("current brief version must be confirmed before compile")
@@ -1001,6 +1076,8 @@ class TaskflowService:
         decision = self._dispatch_decision(state, decision_id)
         if decision.status != DispatchDecisionStatus.CONFIRMED:
             raise ValueError("dispatch decision must be confirmed before dispatch")
+        if decision.metadata.get("stale"):
+            raise ValueError("dispatch decision is stale; request dispatch review again")
         if decision.brief_version != state.outputs.confirmed_brief_version:
             raise ValueError("dispatch decision brief version is no longer current")
         if work_item_id not in decision.work_item_ids:
@@ -1079,4 +1156,4 @@ class TaskflowService:
         run.updated_at = utc_now()
 
 
-__all__ = ["TaskflowService"]
+__all__ = ["TASKFLOW_SYSTEM_PROMPT", "TASKFLOW_WORKFLOW_MODE", "TaskflowService"]

@@ -12,6 +12,18 @@ from labrastro_server.taskflow.application.runtime_projection_service import (
     TaskRunLivenessService,
     TaskflowRuntimeProjectionService,
 )
+from labrastro_server.taskflow.application.compiler_review_service import (
+    CompilerReviewService,
+)
+from labrastro_server.taskflow.application.project_memory_service import (
+    ProjectMemoryService,
+)
+from labrastro_server.taskflow.application.projector_preview_service import (
+    ProjectorPreviewService,
+)
+from labrastro_server.taskflow.application.workspace_projection_service import (
+    WorkspaceProjectionService,
+)
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 __all__ = [
@@ -23,5 +35,9 @@ __all__ = [
     "ReviewService",
     "TaskRunLivenessService",
     "TaskflowRuntimeProjectionService",
+    "CompilerReviewService",
+    "ProjectMemoryService",
+    "ProjectorPreviewService",
+    "WorkspaceProjectionService",
     "TaskflowService",
 ]

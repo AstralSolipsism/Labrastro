@@ -9,13 +9,23 @@ from labrastro_server.taskflow.domain.project_state import (
     TaskRunExecutor,
     TaskRunStatus,
 )
-from labrastro_server.taskflow.domain.taskflow_state import (
-    Assumption,
-    ConfirmationState,
-    ReadinessGate,
-    TaskflowStatus,
-    WorkItemCandidate,
-)
+from labrastro_server.taskflow.domain.taskflow_state import TaskflowStatus
+
+
+def _confirm_current_brief(
+    service: TaskflowService,
+    taskflow_id: str,
+    *,
+    actor: str = "user",
+):
+    state = service.compile_brief_draft(taskflow_id, actor=actor)
+    version = state.outputs.current_brief_version
+    state = service.mark_brief_ready(taskflow_id, version=version, actor=actor)
+    return service.confirm_brief(
+        taskflow_id,
+        version=state.outputs.current_brief_version,
+        actor=actor,
+    )
 
 
 def test_taskflow_service_runs_goal_compile_and_dispatch_flow() -> None:
@@ -31,42 +41,19 @@ def test_taskflow_service_runs_goal_compile_and_dispatch_flow() -> None:
         taskflow_id="taskflow-1",
         goal_id="goal-1",
     )
-    service.clarify_goal(
+    service.record_discovery_turn(
         state.meta.taskflow_id,
         scope_in=["ProjectState", "TaskflowState", "PlanCompiler"],
         scope_out=["Frontend rendering"],
         success_criteria=["Compiler emits traceable WorkItem candidates."],
         assumptions=[
-            Assumption(
-                id="assumption-1",
-                statement="TaskDraft becomes a WorkItem candidate.",
-                impact="high",
-                state=ConfirmationState.CONFIRMED_BY_USER,
-            )
+            {
+                "id": "assumption-1",
+                "statement": "TaskDraft becomes a WorkItem candidate.",
+                "impact": "high",
+                "state": "confirmed_by_user",
+            }
         ],
-        work_item_candidates=[
-            WorkItemCandidate(
-                id="candidate-1",
-                title="Implement PlanCompiler",
-                description="Compile TaskflowState into WorkItem candidates and links.",
-                type="implementation",
-                acceptance_refs=["acceptance-1"],
-                decision_refs=["decision-1"],
-                dedupe_key="project-1:implementation:plan-compiler",
-            )
-        ],
-        readiness_gates=[
-            ReadinessGate(
-                id="gate-1",
-                name="dispatch-readiness",
-                passed=True,
-                rationale="Goal, scope, acceptance, and candidate work item exist.",
-            )
-        ],
-        readiness_score=90,
-    )
-    service.record_discovery_turn(
-        state.meta.taskflow_id,
         examples=[
             {
                 "id": "acceptance-1",
@@ -81,8 +68,19 @@ def test_taskflow_service_runs_goal_compile_and_dispatch_flow() -> None:
                 "chosen": "yes",
             }
         ],
+        work_item_candidates=[
+            {
+                "id": "candidate-1",
+                "title": "Implement PlanCompiler",
+                "description": "Compile TaskflowState into WorkItem candidates and links.",
+                "type": "implementation",
+                "acceptance_refs": ["acceptance-1"],
+                "decision_refs": ["decision-1"],
+                "dedupe_key": "project-1:implementation:plan-compiler",
+            }
+        ],
     )
-    confirmed = service.confirm_goal(state.meta.taskflow_id, confirmed_by="user")
+    confirmed = _confirm_current_brief(service, state.meta.taskflow_id, actor="user")
 
     plan = service.compile_goal(confirmed.meta.taskflow_id)
     dispatch_decision = service.request_dispatch_decision(
@@ -125,36 +123,24 @@ def test_taskflow_service_blocks_dispatch_when_readiness_gate_fails() -> None:
         taskflow_id="taskflow-1",
         goal_id="goal-1",
     )
-    service.clarify_goal(
-        state.meta.taskflow_id,
-        work_item_candidates=[
-            WorkItemCandidate(
-                id="candidate-1",
-                title="Implement incomplete work",
-                description="Missing readiness evidence.",
-                type="implementation",
-                acceptance_refs=["acceptance-1"],
-            )
-        ],
-        assumptions=[
-            Assumption(
-                id="assumption-1",
-                statement="This goal is intentionally incomplete.",
-                state=ConfirmationState.CONFIRMED_BY_USER,
-            )
-        ],
-        readiness_score=30,
-        readiness_gates=[
-                ReadinessGate(
-                    id="gate-1",
-                    name="acceptance-coverage",
-                    passed=True,
-                    rationale="Acceptance example is present.",
-                )
-        ],
-    )
     service.record_discovery_turn(
         state.meta.taskflow_id,
+        work_item_candidates=[
+            {
+                "id": "candidate-1",
+                "title": "Implement incomplete work",
+                "description": "Missing readiness evidence.",
+                "type": "implementation",
+                "acceptance_refs": ["acceptance-1"],
+            }
+        ],
+        assumptions=[
+            {
+                "id": "assumption-1",
+                "statement": "This goal is intentionally incomplete.",
+                "state": "confirmed_by_user",
+            }
+        ],
         examples=[
             {
                 "id": "acceptance-1",
@@ -163,7 +149,7 @@ def test_taskflow_service_blocks_dispatch_when_readiness_gate_fails() -> None:
             }
         ],
     )
-    service.confirm_goal(state.meta.taskflow_id)
+    _confirm_current_brief(service, state.meta.taskflow_id)
     service.compile_goal(state.meta.taskflow_id)
 
     with pytest.raises(ValueError, match="dispatch_decision_id"):

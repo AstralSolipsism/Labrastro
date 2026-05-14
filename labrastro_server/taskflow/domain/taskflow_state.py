@@ -163,6 +163,10 @@ class TaskflowEventType(str, Enum):
     PLAN_REOPENED = "plan_reopened"
     PLAN_REBASED = "plan_rebased"
     REVIEW_CARD_ANSWERED = "review_card_answered"
+    REVIEW_CARD_REOPENED = "review_card_reopened"
+    PROJECT_MEMORY_PATCH_PROPOSED = "project_memory_patch_proposed"
+    PROJECT_MEMORY_PATCH_APPLIED = "project_memory_patch_applied"
+    COMPILER_DECISION_REVIEWED = "compiler_decision_reviewed"
     COMPLEXITY_EVIDENCE_RECORDED = "complexity_evidence_recorded"
     COMPLEXITY_ASSESSED = "complexity_assessed"
     COMPLEXITY_OVERRIDDEN = "complexity_overridden"
@@ -1854,7 +1858,7 @@ class WorkItemCandidate:
         ]
         if removed_fields:
             raise ValueError(
-                "work item legacy task-matching fields were removed; select an Agent explicitly"
+                "work item task-matching fields are unsupported; select an Agent explicitly"
             )
         return cls(
             id=str(data.get("id") or ""),
@@ -1919,6 +1923,7 @@ class TaskflowOutputs:
     issue_map: list[dict[str, Any]] = field(default_factory=list)
     review_card_answers: list[ReviewCardAnswer] = field(default_factory=list)
     dispatch_decisions: list[DispatchDecisionRecord] = field(default_factory=list)
+    compiler_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskflowOutputs":
@@ -1958,6 +1963,9 @@ class TaskflowOutputs:
                 DispatchDecisionRecord.from_dict(_dict(item))
                 for item in _list(data.get("dispatch_decisions"))
             ],
+            compiler_decisions=[
+                _dict(item) for item in _list(data.get("compiler_decisions"))
+            ],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1980,6 +1988,9 @@ class TaskflowOutputs:
             ],
             "dispatch_decisions": [
                 item.to_dict() for item in self.dispatch_decisions
+            ],
+            "compiler_decisions": [
+                _serialize(item) for item in self.compiler_decisions
             ],
         }
 
