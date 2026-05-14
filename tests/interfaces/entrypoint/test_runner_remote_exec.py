@@ -213,8 +213,72 @@ class MemorySessionStore:
         snapshot = self.snapshots.get(_session_id)
         return (dict(snapshot), None) if snapshot is not None else (None, None)
 
-    def save_snapshot(self, session_id: str, snapshot: dict) -> None:
+    def save_snapshot(
+        self, session_id: str, snapshot: dict, event_seq: int | None = None
+    ) -> None:
+        if event_seq is not None:
+            snapshot = {**snapshot, "eventSeq": event_seq}
         self.snapshots[session_id] = dict(snapshot)
+
+    def load_snapshot_record(self, session_id: str) -> tuple[dict | None, str | None, int]:
+        snapshot, error = self.load_snapshot(session_id)
+        return snapshot, error, int((snapshot or {}).get("eventSeq") or 0)
+
+    def append_trace_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict | None = None,
+        *,
+        chat_id: str | None = None,
+        chat_seq: int | None = None,
+        source: str = "remote_chat",
+        replayable: bool = True,
+    ) -> int:
+        events = getattr(self, "trace_events", None)
+        if events is None:
+            self.trace_events = {}
+            events = self.trace_events
+        session_events = events.setdefault(session_id, [])
+        seq = len(session_events) + 1
+        session_events.append(
+            {
+                "session_id": session_id,
+                "session_event_seq": seq,
+                "seq": chat_seq or seq,
+                "chat_id": chat_id,
+                "chat_seq": chat_seq,
+                "type": event_type,
+                "payload": payload or {},
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return seq
+
+    def list_trace_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        replayable_only: bool = True,
+    ) -> list[dict]:
+        events = list(getattr(self, "trace_events", {}).get(session_id, []))
+        events = [
+            event
+            for event in events
+            if event["session_event_seq"] > after_seq
+            and (not replayable_only or event.get("replayable") is not False)
+        ]
+        return events[:limit] if limit is not None else events
+
+    def latest_trace_event_seq(self, session_id: str) -> int:
+        events = getattr(self, "trace_events", {}).get(session_id, [])
+        return max([0, *[event["session_event_seq"] for event in events]])
+
+    def delete_trace_events(self, session_id: str) -> bool:
+        return getattr(self, "trace_events", {}).pop(session_id, None) is not None
 
     def delete_snapshot(self, _session_id: str) -> None:
         self.snapshots.pop(_session_id, None)
@@ -295,6 +359,34 @@ def _build_runner_with_fake_agent(
     providers: ProvidersConfig | None = None,
     session_store=None,
 ) -> AppRunner:
+    default_providers = ProvidersConfig(
+        items={
+            "fake": ProviderConfig(
+                id="fake",
+                api_key="key",
+                base_url="https://api.fake.test",
+            )
+        }
+    )
+    default_model_profiles = {
+        "fake-main": ModelProfileConfig(
+            name="fake-main",
+            model="fake-model",
+            api_key="key",
+            provider="fake",
+            max_tokens=2048,
+            max_context_tokens=128000,
+        )
+    }
+
+    default_dependencies = AppDependencies()
+
+    def create_remote_http_service(config, relay, ui_bus):
+        service = default_dependencies.create_remote_http_service(config, relay, ui_bus)
+        if service is not None:
+            service.require_explicit_chat_model = False
+        return service
+
     config = Config(
         api_key="key",
         remote_exec=RemoteExecConfig(
@@ -308,9 +400,11 @@ def _build_runner_with_fake_agent(
         active_mode="coder",
         session_dir=session_dir,
         session_auto_save=session_auto_save,
-        model_profiles=model_profiles or {},
-        active_main_model_profile=active_main_model_profile,
-        providers=providers or ProvidersConfig(),
+        model_profiles=model_profiles if model_profiles is not None else default_model_profiles,
+        active_main_model_profile=active_main_model_profile or (
+            "fake-main" if model_profiles is None else None
+        ),
+        providers=providers or default_providers,
     )
     config.skills.enabled = False
     return AppRunner(
@@ -322,10 +416,11 @@ def _build_runner_with_fake_agent(
             create_agent=lambda llm, _tools, _config: FakeAgent(
                 llm, tools=_tools, chat_behavior=chat_behavior
             ),
+            create_remote_http_service=create_remote_http_service,
             create_configured_session_store=(
                 (lambda _config, _sessions_dir: session_store)
                 if session_store is not None
-                else AppDependencies().create_configured_session_store
+                else default_dependencies.create_configured_session_store
             ),
         ),
     )
@@ -1225,6 +1320,8 @@ class TestRunnerRemoteExec:
             )
             assert loaded["metadata"]["id"] == session_id
             assert loaded["snapshot"]["turns"][0]["userMessage"]["text"] == "hello"
+            assert loaded["latest_event_seq"] >= loaded["snapshot_event_seq"]
+            assert isinstance(loaded["events_after_snapshot"], list)
 
             _, deleted = _json_request(
                 "POST",
@@ -1549,6 +1646,62 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
+    def test_runner_stream_chat_forwards_context_ui_events(
+        self, tmp_path: Path
+    ) -> None:
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            assert agent.context._ui_bus is not None
+            agent.context._ui_bus.info(
+                "Context auto-compression triggered at 900 tokens / 8 messages.",
+                kind=UIEventKind.CONTEXT,
+                phase="before",
+                trigger_tokens=900,
+                trigger_message_count=8,
+                applied_layers=["hard_collapse"],
+            )
+            agent.context._ui_bus.success(
+                "Context auto-compression completed: 900 → 300 tokens, 8 → 6 messages.",
+                kind=UIEventKind.CONTEXT,
+                phase="after",
+                before_tokens=900,
+                after_tokens=300,
+                applied_layers=["hard_collapse"],
+            )
+            return "done"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}", chat_behavior=chat_behavior
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "compress"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+            )
+            context_events = [
+                event for event in events if event["type"] == "context_event"
+            ]
+
+            assert [event["payload"]["phase"] for event in context_events] == [
+                "before",
+                "after",
+            ]
+            assert context_events[0]["payload"]["kind"] == "context"
+            assert context_events[0]["payload"]["applied_layers"] == ["hard_collapse"]
+            assert context_events[1]["payload"]["after_tokens"] == 300
+        finally:
+            runner.cleanup(ctx.agent)
+
     def test_runner_remote_approval_uses_peer_preview(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -1710,6 +1863,12 @@ class TestRunnerRemoteExec:
             assert payload["tool_call_id"] == "call-write-1"
             assert payload["code"] == "REMOTE_PREVIEW_REQUIRED"
             assert any(event["type"] == "error" for event in events)
+            failed_events = [
+                event for event in events if event["type"] == "chat_failed"
+            ]
+            assert failed_events
+            assert failed_events[0]["payload"]["code"] == "REMOTE_PREVIEW_REQUIRED"
+            assert failed_events[0]["payload"]["recoverable"] is False
         finally:
             runner.cleanup(ctx.agent)
 
@@ -1763,6 +1922,10 @@ class TestRunnerRemoteExec:
                 event for event in events if event["type"] == "tool_call_protocol_error"
             ]
             assert protocol_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
+            failed_events = [
+                event for event in events if event["type"] == "chat_failed"
+            ]
+            assert failed_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
         finally:
             runner.cleanup(ctx.agent)
 

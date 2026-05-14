@@ -96,6 +96,15 @@ class _BufferedChatEvent:
     size_bytes: int
 
 
+SessionTraceEventSink = Callable[
+    [str, str, dict[str, Any], str | None, int | None, str, bool], int | None
+]
+
+
+def _is_replayable_chat_event(event_type: str) -> bool:
+    return event_type not in {"assistant_delta", "usage_update", "run_stats"}
+
+
 class _ChatEventBuffer:
     def __init__(
         self,
@@ -273,8 +282,10 @@ class _RemoteChatSession:
     max_events: int = 1000
     max_payload_bytes: int = 256 * 1024
     max_total_bytes: int = 4 * 1024 * 1024
+    trace_event_sink: SessionTraceEventSink | None = None
     last_activity_at: float = field(default_factory=time.time)
     _event_buffer: _ChatEventBuffer = field(init=False, repr=False)
+    _pending_trace_events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.session_id is None:
@@ -297,18 +308,18 @@ class _RemoteChatSession:
         with self.cond:
             seq = self.seq_next
             self.seq_next += 1
-            self._event_buffer.append(
-                {
-                    "chat_id": self.chat_id,
-                    "seq": seq,
-                    "type": event_type,
-                    "payload": payload or {},
-                }
-            )
+            event = {
+                "chat_id": self.chat_id,
+                "seq": seq,
+                "type": event_type,
+                "payload": payload or {},
+            }
             if isinstance(payload, dict):
                 session_id = payload.get("session_id")
                 if isinstance(session_id, str) and session_id:
                     self.session_id = session_id
+            self._persist_or_queue_trace_event(event)
+            self._event_buffer.append(event)
             if event_type == "error":
                 self.status = "error"
                 message = (payload or {}).get("message") if isinstance(payload, dict) else None
@@ -320,6 +331,44 @@ class _RemoteChatSession:
             self.last_activity_at = time.time()
             self.cond.notify_all()
             return seq
+
+    def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
+        if not _is_replayable_chat_event(str(event.get("type") or "")):
+            return
+        if self.session_id:
+            self._flush_pending_trace_events()
+            self._persist_trace_event(event)
+            return
+        self._pending_trace_events.append(dict(event))
+
+    def _flush_pending_trace_events(self) -> None:
+        if not self.session_id or not self._pending_trace_events:
+            return
+        pending = self._pending_trace_events
+        self._pending_trace_events = []
+        for event in pending:
+            self._persist_trace_event(event)
+
+    def _persist_trace_event(self, event: dict[str, Any]) -> None:
+        if not self.session_id or self.trace_event_sink is None:
+            return
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        try:
+            session_event_seq = self.trace_event_sink(
+                self.session_id,
+                str(event.get("type") or ""),
+                payload,
+                self.chat_id,
+                int(event.get("seq") or 0),
+                "remote_chat",
+                True,
+            )
+        except Exception:
+            return
+        if session_event_seq is not None:
+            event["session_event_seq"] = int(session_event_seq)
 
     def wait_events(
         self, cursor: int, timeout_sec: float
@@ -519,6 +568,7 @@ class RemoteRelayHTTPService:
         self.chat_handler = chat_handler
         self.stream_chat_handler = stream_chat_handler
         self.session_handler = session_handler
+        self.session_trace_event_sink: SessionTraceEventSink | None = None
         self.session_history_status_provider = session_history_status_provider
         if auth_service is None:
             raise ValueError("auth_service is required")
@@ -768,10 +818,16 @@ class RemoteRelayHTTPService:
             max_events=self._chat_max_events,
             max_payload_bytes=self._chat_max_payload_bytes,
             max_total_bytes=self._chat_max_total_bytes,
+            trace_event_sink=getattr(self, "session_trace_event_sink", None),
         )
         with self._chat_sessions_lock:
             self._chat_sessions[session.chat_id] = session
         return session
+
+    def set_session_trace_event_sink(
+        self, sink: SessionTraceEventSink | None
+    ) -> None:
+        self.session_trace_event_sink = sink
 
     def _gc_chat_sessions(self) -> None:
         now = time.time()

@@ -26,6 +26,7 @@ _GO_AVAILABLE = shutil.which("go") is not None
 
 from labrastro_server.interfaces.http.remote.service import (
     RemoteRelayHTTPService as _RemoteRelayHTTPService,
+    _RemoteChatSession,
 )
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
@@ -177,6 +178,59 @@ def _peer_register_payload(
             "hostname": "test-peer",
         },
     }
+
+
+def test_remote_chat_session_flushes_pending_replayable_events_when_session_id_arrives(
+    tmp_path: Path,
+) -> None:
+    persisted: list[dict] = []
+
+    def sink(
+        session_id: str,
+        event_type: str,
+        payload: dict,
+        chat_id: str | None,
+        chat_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        seq = len(persisted) + 1
+        persisted.append(
+            {
+                "session_id": session_id,
+                "type": event_type,
+                "payload": payload,
+                "chat_id": chat_id,
+                "chat_seq": chat_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return seq
+
+    session = _RemoteChatSession(
+        chat_id="chat-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        trace_event_sink=sink,
+    )
+
+    session.append_event("chat_start", {"prompt": "hi"})
+    session.append_event("assistant_delta", {"content": "ignored"})
+    assert persisted == []
+
+    session.append_event("remote_peer_ready", {"session_id": "session-1"})
+    session.append_event("chat_end", {"response": "done"})
+
+    assert [event["type"] for event in persisted] == [
+        "chat_start",
+        "remote_peer_ready",
+        "chat_end",
+    ]
+    assert [event["session_id"] for event in persisted] == ["session-1"] * 3
+    event_by_type = {event["type"]: event for event in session.events}
+    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 2
+    assert event_by_type["chat_end"]["session_event_seq"] == 3
 
 
 def _raw_request(
@@ -845,6 +899,105 @@ class TestRemoteRelayHTTPService:
             audit_text = json.dumps(events)
             assert "sk-secret-value" not in audit_text
             assert "***" in audit_text
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_diagnostics_settings_and_tool_argument_stats(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        diagnostics_dir = tmp_path / ".rcoder" / "diagnostics"
+        diagnostics_dir.mkdir(parents=True)
+        (diagnostics_dir / "tool_argument_validation.jsonl").write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-05-14 20:00:00",
+                    "metadata": {
+                        "provider_id": "deepseek",
+                        "compat": "deepseek",
+                        "model": "deepseek-v4",
+                        "tool": "write_file",
+                    },
+                    "validation": {
+                        "tool_name": "write_file",
+                        "final_valid": False,
+                        "initial_issues": [
+                            {
+                                "code": "missing_required",
+                                "path": "$.content",
+                                "expected": "string",
+                                "actual": "missing",
+                            }
+                        ],
+                        "repairs": [
+                            {
+                                "action": "optional_null_omitted",
+                                "path": "$.encoding",
+                            }
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        config_path = tmp_path / "config.yaml"
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, read_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/server-settings/read",
+                {},
+                headers=TEST_ADMIN_HEADERS,
+            )
+            diagnostics = read_body["settings"]["diagnostics"]["tool_argument_validation"]
+            assert diagnostics == {"enabled": True, "record_clean": False}
+
+            _, update_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/server-settings/update",
+                {
+                    "settings": {
+                        "diagnostics": {
+                            "tool_argument_validation": {"enabled": False}
+                        }
+                    }
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert update_body["ok"] is True
+            assert (
+                update_body["settings"]["diagnostics"]["tool_argument_validation"][
+                    "enabled"
+                ]
+                is False
+            )
+            assert load_yaml_config(config_path)["diagnostics"][
+                "tool_argument_validation"
+            ] == {"enabled": False, "record_clean": False}
+
+            _, stats_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/diagnostics/tool-arguments/stats",
+                {},
+                headers=TEST_ADMIN_HEADERS,
+            )
+            stats = stats_body["tool_argument_validation"]
+            assert stats["totals"] == {"events": 1, "invalid": 1, "repaired": 1}
+            assert stats["by_model"][0]["name"] == "deepseek-v4"
+            assert stats["issues"][0]["path"] == "$.content"
+            assert stats["repairs"][0]["action"] == "optional_null_omitted"
         finally:
             service.stop()
             relay.stop()
@@ -2213,6 +2366,14 @@ class TestRemoteRelayHTTPService:
             assert error_event["payload"] == {
                 "message": "remote peer registration missing host_info_min.shell",
                 "code": "chat_handler_failed",
+            }
+            failed_event = [
+                event for event in stream_body["events"] if event["type"] == "chat_failed"
+            ][-1]
+            assert failed_event["payload"] == {
+                "message": "remote peer registration missing host_info_min.shell",
+                "code": "chat_handler_failed",
+                "recoverable": False,
             }
         finally:
             service.stop()

@@ -169,8 +169,11 @@ class RemoteChatRoutes:
                 try:
                     self.service.stream_chat_handler(peer_id, req.prompt, session)
                 except Exception as exc:
+                    payload = _stream_chat_handler_error_payload(exc)
+                    session.append_event("error", payload)
                     session.append_event(
-                        "error", _stream_chat_handler_error_payload(exc)
+                        "chat_failed",
+                        {**payload, "recoverable": False},
                     )
                 finally:
                     session.mark_done()
@@ -276,8 +279,11 @@ class RemoteChatRoutes:
                 try:
                     self.service.stream_chat_handler(peer_id, req.prompt, session)
                 except Exception as exc:
+                    payload = _stream_chat_handler_error_payload(exc)
+                    session.append_event("error", payload)
                     session.append_event(
-                        "error", _stream_chat_handler_error_payload(exc)
+                        "chat_failed",
+                        {**payload, "recoverable": False},
                     )
                 finally:
                     session.mark_done()
