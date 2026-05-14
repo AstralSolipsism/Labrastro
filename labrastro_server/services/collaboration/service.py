@@ -18,7 +18,7 @@ from labrastro_server.services.collaboration.in_memory_store import (
     InMemoryIssueAssignmentStore,
 )
 from labrastro_server.services.collaboration.store import IssueAssignmentStore
-from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 from labrastro_server.taskflow.domain.project_state import TaskRunStatus
 from labrastro_server.taskflow.domain.taskflow_state import (
     ReadinessGate,
@@ -249,7 +249,21 @@ class IssueAssignmentService:
                 )
             ],
         )
-        self.taskflow_service.confirm_goal(taskflow_id, confirmed_by="issue_assignment")
+        state = self.taskflow_service.compile_brief_draft(
+            taskflow_id,
+            actor="issue_assignment",
+        )
+        version = state.outputs.current_brief_version
+        state = self.taskflow_service.mark_brief_ready(
+            taskflow_id,
+            version=version,
+            actor="issue_assignment",
+        )
+        self.taskflow_service.confirm_brief(
+            taskflow_id,
+            version=state.outputs.current_brief_version,
+            actor="issue_assignment",
+        )
         plan = self.taskflow_service.compile_goal(taskflow_id)
         work_item_id = plan.work_item_candidates[0].work_item_id
         assignment.work_item_id = work_item_id
@@ -277,13 +291,21 @@ class IssueAssignmentService:
         if not assignment.work_item_id:
             raise ValueError("assignment has no work item")
         dispatch_source = "mention" if assignment.source == "mention" else "assignment"
+        dispatch_metadata = {
+            "issue_id": issue.id,
+            "assignment_id": assignment.id,
+            "dispatch_source": dispatch_source,
+        }
+        mention_id = assignment.metadata.get("mention_id")
+        if dispatch_source == "mention" and mention_id:
+            dispatch_metadata["mention_id"] = str(mention_id)
         taskflow_id = issue.taskflow_id or self._ensure_backing_goal(issue, peer_id=peer_id)
         dispatch_decision = self.taskflow_service.request_dispatch_decision(
             taskflow_id,
             work_item_ids=[assignment.work_item_id],
             actor=peer_id or dispatch_source,
             rationale=f"{dispatch_source} dispatch requested.",
-            metadata={"dispatch_source": dispatch_source, "assignment_id": assignment.id},
+            metadata=dispatch_metadata,
         )
         self.taskflow_service.confirm_dispatch_decision(
             taskflow_id,
@@ -295,11 +317,7 @@ class IssueAssignmentService:
             work_item_id=assignment.work_item_id,
             dispatch_decision_id=dispatch_decision.id,
             executor_hint=assignment.target_agent_id,
-            metadata={
-                "issue_id": issue.id,
-                "assignment_id": assignment.id,
-                "dispatch_source": dispatch_source,
-            },
+            metadata=dispatch_metadata,
         )
         assignment.task_run_id = run.id
         assignment.status = (

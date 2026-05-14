@@ -8,7 +8,7 @@ from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
 )
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.collaboration.service import IssueAssignmentService
-from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 
 def _runtime() -> AgentRunControlPlane:
@@ -183,6 +183,32 @@ def test_mention_resolves_alias_and_creates_assignment_but_not_agent_run() -> No
     assert assignment.target_agent_id == "docs"
     assert assignment.source == "mention"
     assert runtime.list_agent_runs() == []
+
+
+def test_mention_dispatch_preserves_mention_id_in_agent_run_metadata() -> None:
+    service, _taskflow, runtime = _service()
+    issue = service.create_issue(
+        title="Draft guide",
+        description="Draft the guide.",
+        peer_id="peer-a",
+    )
+    mention = service.create_mention(
+        raw_text="@writer please draft this guide",
+        peer_id="peer-a",
+        issue_id=issue.id,
+        prompt="Draft the guide.",
+    )
+    assert mention.assignment_id is not None
+
+    dispatched = service.dispatch_assignment(mention.assignment_id, peer_id="peer-a")
+
+    assert dispatched.status == AssignmentStatus.DISPATCHED
+    agent_runs = runtime.list_agent_runs()
+    assert len(agent_runs) == 1
+    task = runtime.get_agent_run(agent_runs[0]["id"])
+    assert task.metadata["dispatch_source"] == "mention"
+    assert task.metadata["assignment_id"] == mention.assignment_id
+    assert task.metadata["mention_id"] == mention.id
 
 
 def test_mention_conflict_or_unknown_agent_needs_assignment() -> None:

@@ -8,7 +8,7 @@ from labrastro_server.adapters.reuleauxcoder.taskflow_dispatcher import (
 )
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.collaboration.service import IssueAssignmentService
-from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 
 def test_mention_agent_tool_creates_record_without_dispatching_agent_run() -> None:

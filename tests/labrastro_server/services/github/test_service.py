@@ -20,7 +20,7 @@ from labrastro_server.services.github.client import GitHubAPIError
 from labrastro_server.services.github.in_memory_store import InMemoryGitHubStore
 from labrastro_server.services.github.models import GitHubPullRequestRecord
 from labrastro_server.services.github.service import PullRequestService, WebhookService
-from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 
 class FakeGitHubClient:

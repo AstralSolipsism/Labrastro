@@ -223,18 +223,6 @@ class RemoteCollaborationRoutes:
                 and parts[:2] == ["remote", "issues"]
                 and parts[3] == "assignments"
             ):
-                legacy_dispatch_fields = [
-                    key
-                    for key in ("required_dispatch_tags", "preferred_dispatch_tags")
-                    if key in payload
-                ]
-                if legacy_dispatch_fields:
-                    self._send_error(
-                        HTTPStatus.BAD_REQUEST,
-                        "legacy_dispatch_fields_removed",
-                        "select an Agent explicitly with target_agent_id",
-                    )
-                    return
                 assignment = (
                     self.service.issue_assignment_service.create_assignment(
                         parts[2],
