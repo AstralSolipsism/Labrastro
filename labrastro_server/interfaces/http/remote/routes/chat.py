@@ -56,7 +56,54 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 )
 from reuleauxcoder.interfaces.events import UIEventKind
 
+
+def _stream_chat_handler_error_payload(exc: Exception) -> dict[str, str]:
+    message = str(exc).strip()
+    if isinstance(exc, ValueError) and message.startswith("remote peer "):
+        return {"message": message, "code": "chat_handler_failed"}
+    return {"message": "chat_handler_failed", "code": "chat_handler_failed"}
+
+
 class RemoteChatRoutes:
+    def _has_chat_model_context(self, peer_id: str, req: ChatStartRequest) -> bool:
+        provider_id = str(req.provider_id or "").strip()
+        model_id = str(req.model_id or "").strip()
+        if provider_id and model_id:
+            return True
+        if provider_id or model_id:
+            return False
+        session_id = str(req.session_hint or "").strip()
+        if not session_id or self.service.session_handler is None:
+            return False
+        try:
+            payload = dict(
+                self.service.session_handler(
+                    "load",
+                    peer_id,
+                    {"session_id": session_id},
+                )
+            )
+        except Exception:
+            return False
+        if payload.get("ok") is False:
+            return False
+        runtime_state = payload.get("runtime_state")
+        if not isinstance(runtime_state, dict):
+            return False
+        active_provider = str(
+            runtime_state.get("active_model_provider")
+            or runtime_state.get("provider_id")
+            or runtime_state.get("provider")
+            or ""
+        ).strip()
+        active_model = str(
+            runtime_state.get("active_model")
+            or runtime_state.get("model_id")
+            or runtime_state.get("model")
+            or ""
+        ).strip()
+        return bool(active_provider and active_model)
+
     def _get_chat_control_session(self, peer_token: str, chat_id: str):
         control_peer_id = self.service.relay_server.token_manager.verify_peer_token(
             peer_token
@@ -121,8 +168,10 @@ class RemoteChatRoutes:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
                     self.service.stream_chat_handler(peer_id, req.prompt, session)
-                except Exception:
-                    session.append_event("error", {"message": "chat_handler_failed"})
+                except Exception as exc:
+                    session.append_event(
+                        "error", _stream_chat_handler_error_payload(exc)
+                    )
                 finally:
                     session.mark_done()
             response_text = ""
@@ -182,6 +231,23 @@ class RemoteChatRoutes:
             if req.workflow_mode is not None
             else None
         )
+        has_provider = bool(str(req.provider_id or "").strip())
+        has_model = bool(str(req.model_id or "").strip())
+        if has_provider != has_model:
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "provider_model_required",
+                "provider_id and model_id must be provided together",
+            )
+            return
+        if getattr(self.service, "require_explicit_chat_model", False):
+            if not self._has_chat_model_context(peer_id, req):
+                self._send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "model_selection_required",
+                    "chat.start requires provider_id and model_id for a new chat session",
+                )
+                return
         session = self.service._create_chat_session(
             peer_id,
             req.session_hint,
@@ -209,8 +275,10 @@ class RemoteChatRoutes:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
                     self.service.stream_chat_handler(peer_id, req.prompt, session)
-                except Exception:
-                    session.append_event("error", {"message": "chat_handler_failed"})
+                except Exception as exc:
+                    session.append_event(
+                        "error", _stream_chat_handler_error_payload(exc)
+                    )
                 finally:
                     session.mark_done()
 

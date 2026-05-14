@@ -34,18 +34,15 @@ class ChatRequest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatRequest":
-        taskflow_id = d.get("taskflow_id")
-        if taskflow_id is None:
-            taskflow_id = d.get("taskflow_goal_id")
         parameters = d.get("parameters")
         return cls(
             peer_token=d["peer_token"],
             prompt=d["prompt"],
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
-            taskflow_id=taskflow_id,
-            provider_id=d.get("provider_id") or d.get("providerId"),
-            model_id=d.get("model_id") or d.get("modelId"),
+            taskflow_id=d.get("taskflow_id"),
+            provider_id=d.get("provider_id"),
+            model_id=d.get("model_id"),
             parameters=parameters if isinstance(parameters, dict) else {},
         )
 
@@ -95,9 +92,6 @@ class ChatStartRequest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatStartRequest":
-        taskflow_id = d.get("taskflow_id")
-        if taskflow_id is None:
-            taskflow_id = d.get("taskflow_goal_id")
         parameters = d.get("parameters")
         return cls(
             peer_token=d["peer_token"],
@@ -105,9 +99,9 @@ class ChatStartRequest:
             session_hint=d.get("session_hint"),
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
-            taskflow_id=taskflow_id,
-            provider_id=d.get("provider_id") or d.get("providerId"),
-            model_id=d.get("model_id") or d.get("modelId"),
+            taskflow_id=d.get("taskflow_id"),
+            provider_id=d.get("provider_id"),
+            model_id=d.get("model_id"),
             parameters=parameters if isinstance(parameters, dict) else {},
         )
 

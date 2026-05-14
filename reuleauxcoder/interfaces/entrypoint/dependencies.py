@@ -241,6 +241,8 @@ def _default_create_remote_http_service(
         issue_assignment_service=issue_assignment_service,
         github_pr_service=github_pr_service,
         persistence_maintenance_service=persistence_maintenance_service,
+        require_explicit_chat_model=True,
+        require_peer_runtime_context=True,
     )
     sandbox_config = getattr(config, "sandbox_provider", None)
     if sandbox_config is not None and sandbox_config.type == "docker":

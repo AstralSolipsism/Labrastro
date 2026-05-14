@@ -48,7 +48,7 @@ from reuleauxcoder.interfaces.cli.registration import CLI_PROFILE
 from reuleauxcoder.interfaces.cli.render import CLIRenderer
 from reuleauxcoder.interfaces.entrypoint.dependencies import AppDependencies
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
-from labrastro_server.services.taskflow.service import (
+from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_SYSTEM_PROMPT,
     TASKFLOW_WORKFLOW_MODE,
 )

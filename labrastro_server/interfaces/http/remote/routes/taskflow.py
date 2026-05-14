@@ -2,14 +2,7 @@ from __future__ import annotations
 
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import unquote
-
-from labrastro_server.taskflow.domain.taskflow_state import (
-    Assumption,
-    ReadinessGate,
-    WorkItemCandidate,
-)
-
+from urllib.parse import parse_qs, unquote
 
 def _payload_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -50,6 +43,61 @@ class RemoteTaskflowRoutes:
             if (
                 len(parts) == 5
                 and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "workspace"
+            ):
+                state = self.service.taskflow_service.get_taskflow_state(parts[3])
+                _assert_taskflow_peer(state, peer_id)
+                workspace = self.service.taskflow_service.get_workspace_v1(
+                    parts[3],
+                    runtime_control_plane=self.service.runtime_control_plane,
+                )
+                self._send_json(HTTPStatus.OK, workspace)
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "project-memory"
+            ):
+                state = self.service.taskflow_service.get_taskflow_state(parts[3])
+                _assert_taskflow_peer(state, peer_id)
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.service.taskflow_service.get_project_memory_view(parts[3]),
+                )
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "review-cards-v1"
+            ):
+                state = self.service.taskflow_service.get_taskflow_state(parts[3])
+                _assert_taskflow_peer(state, peer_id)
+                cards = self.service.taskflow_service.render_review_cards_v1(parts[3])
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "review_cards": [card.to_dict() for card in cards]},
+                )
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "projector-preview"
+            ):
+                state = self.service.taskflow_service.get_taskflow_state(parts[3])
+                _assert_taskflow_peer(state, peer_id)
+                query = parse_qs(parsed.query or "")
+                target = (query.get("target") or ["openspec"])[0]
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.service.taskflow_service.get_projector_preview(
+                        parts[3],
+                        target=target,
+                    ),
+                )
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
                 and parts[4] == "complexity"
             ):
                 state = self.service.taskflow_service.get_taskflow_state(parts[3])
@@ -62,19 +110,6 @@ class RemoteTaskflowRoutes:
                             parts[3]
                         ),
                     },
-                )
-                return
-            if (
-                len(parts) == 5
-                and parts[:3] == ["remote", "taskflow", "taskflows"]
-                and parts[4] == "review-cards"
-            ):
-                state = self.service.taskflow_service.get_taskflow_state(parts[3])
-                _assert_taskflow_peer(state, peer_id)
-                cards = self.service.taskflow_service.render_review_cards(parts[3])
-                self._send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "review_cards": [card.to_dict() for card in cards]},
                 )
                 return
             if (
@@ -155,52 +190,6 @@ class RemoteTaskflowRoutes:
                 action = parts[4]
                 state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
                 _assert_taskflow_peer(state, peer_id)
-                if action == "clarify":
-                    state = self.service.taskflow_service.clarify_goal(
-                        taskflow_id,
-                        goal_statement=payload.get("goal_statement"),
-                        background_delta=payload.get("background_delta"),
-                        scope_in=_payload_list(payload.get("scope_in")),
-                        scope_out=_payload_list(payload.get("scope_out")),
-                        deferred_scope=_payload_list(payload.get("deferred_scope")),
-                        success_criteria=_payload_list(
-                            payload.get("success_criteria")
-                        ),
-                        assumptions=[
-                            Assumption.from_dict(_payload_dict(item))
-                            for item in _payload_list(payload.get("assumptions"))
-                        ],
-                        work_item_candidates=[
-                            WorkItemCandidate.from_dict(_payload_dict(item))
-                            for item in _payload_list(
-                                payload.get("work_item_candidates")
-                            )
-                        ],
-                        readiness_gates=[
-                            ReadinessGate.from_dict(_payload_dict(item))
-                            for item in _payload_list(payload.get("readiness_gates"))
-                        ],
-                        readiness_score=(
-                            int(payload["readiness_score"])
-                            if payload.get("readiness_score") is not None
-                            else None
-                        ),
-                    )
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "taskflow": state.to_dict()},
-                    )
-                    return
-                if action == "confirm":
-                    state = self.service.taskflow_service.confirm_goal(
-                        taskflow_id,
-                        confirmed_by=str(payload.get("confirmed_by") or "user"),
-                    )
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "taskflow": state.to_dict()},
-                    )
-                    return
                 if action == "compile":
                     plan = self.service.taskflow_service.compile_goal(taskflow_id)
                     self._send_json(
@@ -259,32 +248,6 @@ class RemoteTaskflowRoutes:
                     )
                     return
             if (
-                len(parts) == 7
-                and parts[:3] == ["remote", "taskflow", "taskflows"]
-                and parts[4] == "questions"
-                and parts[6] == "answer"
-            ):
-                taskflow_id = parts[3]
-                state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
-                _assert_taskflow_peer(state, peer_id)
-                state = self.service.taskflow_service.answer_question(
-                    taskflow_id,
-                    question_id=parts[5],
-                    answer=payload.get("answer") or "",
-                    actor=str(payload.get("actor") or "user"),
-                    rationale=str(payload.get("rationale") or ""),
-                    confidence=(
-                        float(payload["confidence"])
-                        if payload.get("confidence") is not None
-                        else None
-                    ),
-                )
-                self._send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "taskflow": state.to_dict()},
-                )
-                return
-            if (
                 len(parts) == 6
                 and parts[:3] == ["remote", "taskflow", "taskflows"]
                 and parts[4] == "complexity"
@@ -337,33 +300,6 @@ class RemoteTaskflowRoutes:
                     )
                     return
             if (
-                len(parts) == 7
-                and parts[:3] == ["remote", "taskflow", "taskflows"]
-                and parts[4] == "decisions"
-                and parts[6] == "answer"
-            ):
-                taskflow_id = parts[3]
-                state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
-                _assert_taskflow_peer(state, peer_id)
-                state = self.service.taskflow_service.answer_decision(
-                    taskflow_id,
-                    decision_id=parts[5],
-                    selected_option_id=(
-                        str(payload["selected_option_id"])
-                        if payload.get("selected_option_id") is not None
-                        else None
-                    ),
-                    answer=payload.get("answer"),
-                    rationale=str(payload.get("rationale") or ""),
-                    actor=str(payload.get("actor") or "user"),
-                    source="api",
-                )
-                self._send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "taskflow": state.to_dict()},
-                )
-                return
-            if (
                 len(parts) == 6
                 and parts[:3] == ["remote", "taskflow", "taskflows"]
                 and parts[4] == "brief"
@@ -404,19 +340,19 @@ class RemoteTaskflowRoutes:
             if (
                 len(parts) == 7
                 and parts[:3] == ["remote", "taskflow", "taskflows"]
-                and parts[4] == "review-cards"
-                and parts[6] == "answer"
+                and parts[4] == "review-cards-v1"
+                and parts[6] == "actions"
             ):
                 taskflow_id = parts[3]
                 state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
                 _assert_taskflow_peer(state, peer_id)
-                answer = self.service.taskflow_service.answer_review_card(
+                answer = self.service.taskflow_service.answer_review_card_v1(
                     taskflow_id,
                     card_id=parts[5],
                     action=str(payload.get("action") or ""),
                     value=payload.get("value"),
                     actor=str(payload.get("actor") or "user"),
-                    comment=str(payload.get("comment") or ""),
+                    comment=str(payload.get("comment") or payload.get("reason") or ""),
                 )
                 state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
                 self._send_json(
@@ -426,6 +362,70 @@ class RemoteTaskflowRoutes:
                         "answer": answer.to_dict(),
                         "taskflow": state.to_dict(),
                     },
+                )
+                return
+            if (
+                len(parts) == 7
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "project-memory"
+                and parts[5] == "patches"
+                and parts[6] == "preview"
+            ):
+                taskflow_id = parts[3]
+                state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
+                _assert_taskflow_peer(state, peer_id)
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.service.taskflow_service.preview_project_memory_patch(
+                        taskflow_id,
+                        actor=str(payload.get("actor") or "user"),
+                        reason=str(payload.get("reason") or ""),
+                        source=str(payload.get("source") or "api"),
+                        operations=_payload_list(payload.get("operations")),
+                    ),
+                )
+                return
+            if (
+                len(parts) == 8
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "project-memory"
+                and parts[5] == "patches"
+                and parts[7] == "apply"
+            ):
+                taskflow_id = parts[3]
+                state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
+                _assert_taskflow_peer(state, peer_id)
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.service.taskflow_service.apply_project_memory_patch(
+                        taskflow_id,
+                        proposal_id=parts[6],
+                        actor=str(payload.get("actor") or "user"),
+                        reason=str(payload.get("reason") or ""),
+                        source=str(payload.get("source") or "api"),
+                        operations=_payload_list(payload.get("operations")),
+                    ),
+                )
+                return
+            if (
+                len(parts) == 7
+                and parts[:3] == ["remote", "taskflow", "taskflows"]
+                and parts[4] == "compiler-decisions"
+                and parts[6] == "review"
+            ):
+                taskflow_id = parts[3]
+                state = self.service.taskflow_service.get_taskflow_state(taskflow_id)
+                _assert_taskflow_peer(state, peer_id)
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.service.taskflow_service.review_compiler_decision(
+                        taskflow_id,
+                        decision_id=parts[5],
+                        action=str(payload.get("action") or ""),
+                        actor=str(payload.get("actor") or "user"),
+                        reason=str(payload.get("reason") or ""),
+                        value=payload.get("value"),
+                    ),
                 )
                 return
             if (

@@ -129,7 +129,8 @@ class TestRemoteHTTPContract:
         }
 
         register = fixtures["peer.register"]
-        RegisterRequest.from_dict(register["request"])
+        register_request = RegisterRequest.from_dict(register["request"])
+        assert register_request.host_info_min["shell"] == "bash"
         RegisterResponse.from_dict(register["response"]["payload"])
         Heartbeat.from_dict(fixtures["peer.heartbeat"]["request"])
         SessionListRequest.from_dict(fixtures["sessions.list"]["request"])
@@ -266,18 +267,15 @@ class TestChatRequest:
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
 
-    def test_accepts_legacy_taskflow_goal_id_input(self) -> None:
-        restored = ChatRequest.from_dict(
-            {
-                "peer_token": "pt_1",
-                "prompt": "continue",
-                "taskflow_goal_id": "taskflow-legacy",
-            }
-        )
+    def test_serializes_canonical_taskflow_id_only(self) -> None:
+        restored = ChatRequest.from_dict({
+            "peer_token": "pt_1",
+            "prompt": "continue",
+            "taskflow_id": "taskflow-1",
+        })
 
-        assert restored.taskflow_id == "taskflow-legacy"
-        assert "taskflow_goal_id" not in restored.to_dict()
-        assert restored.to_dict()["taskflow_id"] == "taskflow-legacy"
+        assert restored.taskflow_id == "taskflow-1"
+        assert restored.to_dict()["taskflow_id"] == "taskflow-1"
 
 
 class TestChatStartRequest:
@@ -300,18 +298,15 @@ class TestChatStartRequest:
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
 
-    def test_accepts_legacy_taskflow_goal_id_input(self) -> None:
-        restored = ChatStartRequest.from_dict(
-            {
-                "peer_token": "pt_1",
-                "prompt": "continue",
-                "taskflow_goal_id": "taskflow-legacy",
-            }
-        )
+    def test_serializes_canonical_taskflow_id_only(self) -> None:
+        restored = ChatStartRequest.from_dict({
+            "peer_token": "pt_1",
+            "prompt": "continue",
+            "taskflow_id": "taskflow-1",
+        })
 
-        assert restored.taskflow_id == "taskflow-legacy"
-        assert "taskflow_goal_id" not in restored.to_dict()
-        assert restored.to_dict()["taskflow_id"] == "taskflow-legacy"
+        assert restored.taskflow_id == "taskflow-1"
+        assert restored.to_dict()["taskflow_id"] == "taskflow-1"
 
 
 class TestChatStatusProtocol:

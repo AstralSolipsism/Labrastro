@@ -140,9 +140,17 @@ class RemotePeerRoutes:
     def _handle_register(self) -> None:
         payload = self._read_json()
         try:
-            resp = self.service.relay_server._on_register(
-                RegisterRequest.from_dict(payload)
-            )
+            req = RegisterRequest.from_dict(payload)
+            missing = _missing_peer_runtime_context_fields(req)
+            if getattr(self.service, "require_peer_runtime_context", False) and missing:
+                self._send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_peer_runtime_context",
+                    "remote peer registration is missing required runtime context",
+                    {"missing": missing},
+                )
+                return
+            resp = self.service.relay_server._on_register(req)
         except RegisterRejectedError as exc:
             self._send_error(
                 HTTPStatus.FORBIDDEN,
@@ -275,4 +283,19 @@ class RemotePeerRoutes:
         )
         self._send_json(HTTPStatus.OK, {"ok": True})
 
+
+def _missing_peer_runtime_context_fields(req: RegisterRequest) -> list[str]:
+    missing: list[str] = []
+    host_info = req.host_info_min if isinstance(req.host_info_min, dict) else {}
+    for key in ("os", "shell"):
+        value = host_info.get(key)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(f"host_info_min.{key}")
+    if not isinstance(req.cwd, str) or not req.cwd.strip():
+        missing.append("cwd")
+    if not isinstance(req.workspace_root, str) or not req.workspace_root.strip():
+        missing.append("workspace_root")
+    if not isinstance(req.features, list):
+        missing.append("features")
+    return missing
 

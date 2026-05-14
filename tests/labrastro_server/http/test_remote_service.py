@@ -156,6 +156,29 @@ def _json_request(
         return resp.status, json.loads(body) if body else {}
 
 
+def _peer_register_payload(
+    relay: RelayServer,
+    *,
+    cwd: str = "/tmp/peer",
+    workspace_root: str | None = None,
+    host_info_min: dict | None = None,
+    features: list[str] | None = None,
+) -> dict:
+    return {
+        "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+        "cwd": cwd,
+        "workspace_root": workspace_root or cwd,
+        "features": features or ["shell"],
+        "host_info_min": host_info_min
+        or {
+            "os": "linux",
+            "arch": "amd64",
+            "shell": "bash",
+            "hostname": "test-peer",
+        },
+    }
+
+
 def _raw_request(
     method: str,
     url: str,
@@ -1907,6 +1930,134 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_register_rejects_missing_runtime_context_when_required(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            require_peer_runtime_context=True,
+        )
+        service.start()
+        try:
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/register",
+                    {
+                        "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                        "cwd": "/tmp/peer",
+                    },
+                )
+            assert excinfo.value.code == 400
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert body["error"] == "invalid_peer_runtime_context"
+            assert "host_info_min.shell" in body["details"]["missing"]
+            assert "workspace_root" in body["details"]["missing"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_start_requires_model_for_new_sessions_when_required(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+            require_explicit_chat_model=True,
+            require_peer_runtime_context=True,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/chat/start",
+                    {"peer_token": peer_token, "prompt": "hello"},
+                )
+            assert excinfo.value.code == 400
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert body["error"] == "model_selection_required"
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {
+                    "peer_token": peer_token,
+                    "prompt": "hello",
+                    "provider_id": "deepseek",
+                    "model_id": "V4FLASH",
+                },
+            )
+            assert start_body["chat_id"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_start_allows_existing_session_runtime_model_when_required(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+
+        def session_handler(action: str, _peer_id: str, payload: dict) -> dict:
+            if action == "load" and payload.get("session_id") == "session-1":
+                return {
+                    "ok": True,
+                    "runtime_state": {
+                        "active_model_provider": "deepseek",
+                        "active_model": "V4FLASH",
+                    },
+                }
+            return {"ok": False, "error": "session_not_found", "_status": 404}
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+            session_handler=session_handler,
+            require_explicit_chat_model=True,
+            require_peer_runtime_context=True,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {
+                    "peer_token": peer_token,
+                    "prompt": "continue",
+                    "session_hint": "session-1",
+                },
+            )
+            assert start_body["chat_id"]
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_chat_status_reports_running_done_and_error(self) -> None:
         relay = RelayServer()
         relay.start()
@@ -2011,6 +2162,58 @@ class TestRemoteRelayHTTPService:
             assert error_status["status"] == "error"
             assert error_status["done"] is True
             assert error_status["error"] == "intentional_failure"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_start_reports_peer_registration_setup_errors(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, _session) -> None:
+            raise ValueError("remote peer registration missing host_info_min.shell")
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hello"},
+            )
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": start_body["chat_id"],
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+
+            error_event = [
+                event for event in stream_body["events"] if event["type"] == "error"
+            ][-1]
+            assert error_event["payload"] == {
+                "message": "remote peer registration missing host_info_min.shell",
+                "code": "chat_handler_failed",
+            }
         finally:
             service.stop()
             relay.stop()
@@ -3182,6 +3385,19 @@ class TestRemoteRelayHTTPService:
                 },
             )
             assert create_body["ok"] is True
+            with pytest.raises(HTTPError) as old_cards:
+                _json_request(
+                    "GET",
+                    f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/review-cards?peer_token={peer_token}",
+                )
+            assert old_cards.value.code == 404
+            with pytest.raises(HTTPError) as old_question_answer:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/questions/question-1/answer",
+                    {"peer_token": peer_token, "answer": "unused"},
+                )
+            assert old_question_answer.value.code == 404
 
             _, discovery_body = _json_request(
                 "POST",
@@ -3226,11 +3442,10 @@ class TestRemoteRelayHTTPService:
 
             _, answer_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/decisions/decision-boundary/answer",
+                f"{service.base_url}/remote/taskflow/taskflows/taskflow-http/review-cards-v1/taskflow-http:decision:decision-boundary/actions",
                 {
                     "peer_token": peer_token,
-                    "selected_option_id": "brief",
-                    "answer": "brief",
+                    "action": "accept",
                 },
             )
             assert answer_body["taskflow"]["outputs"]["current_brief_version"] == 2

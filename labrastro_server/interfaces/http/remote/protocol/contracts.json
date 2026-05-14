@@ -86,7 +86,8 @@
         "features": ["shell", "read_file"],
         "host_info_min": {
           "os": "linux",
-          "arch": "amd64"
+          "arch": "amd64",
+          "shell": "bash"
         }
       },
       "response": {

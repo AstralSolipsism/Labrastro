@@ -87,7 +87,7 @@ from labrastro_server.services.github.service import (
     ReconcileService,
     WebhookService,
 )
-from labrastro_server.services.taskflow.service import TaskflowService
+from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 
 
 @dataclass
@@ -509,6 +509,8 @@ class RemoteRelayHTTPService:
         chat_idle_ttl_sec: float = 30 * 60.0,
         chat_gc_interval_sec: float = 30.0,
         chat_artifact_root: str | Path | None = None,
+        require_explicit_chat_model: bool = False,
+        require_peer_runtime_context: bool = False,
     ) -> None:
         self.relay_server = relay_server
         self.bind = bind
@@ -556,6 +558,8 @@ class RemoteRelayHTTPService:
             else None
         )
         self.persistence_maintenance_service = persistence_maintenance_service
+        self.require_explicit_chat_model = bool(require_explicit_chat_model)
+        self.require_peer_runtime_context = bool(require_peer_runtime_context)
         self.max_request_body_bytes = max(1, int(max_request_body_bytes or 1))
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
