@@ -217,23 +217,41 @@ class SessionStore:
             if not path.exists():
                 return False
             path.unlink()
+            self.delete_snapshot(session_id)
+            self.delete_trace_events(session_id)
             return True
 
     def load_snapshot(self, session_id: str) -> tuple[dict | None, str | None]:
         """Load the latest UI snapshot sidecar for a session."""
+        snapshot, error, _event_seq = self.load_snapshot_record(session_id)
+        return snapshot, error
+
+    def load_snapshot_record(
+        self, session_id: str
+    ) -> tuple[dict | None, str | None, int]:
+        """Load the latest UI snapshot sidecar plus its covered event seq."""
         path = self._get_snapshot_path(session_id)
         if not path.exists():
-            return None, None
+            return None, None, 0
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            return None, str(exc)
+            return None, str(exc), 0
         if not isinstance(data, dict):
-            return None, "snapshot_not_object"
-        return data, None
+            return None, "snapshot_not_object", 0
+        return data, None, self._snapshot_event_seq(data)
 
-    def save_snapshot(self, session_id: str, snapshot: dict) -> None:
+    def save_snapshot(
+        self, session_id: str, snapshot: dict, event_seq: int | None = None
+    ) -> None:
         """Save a UI snapshot sidecar for a session."""
+        if event_seq is None:
+            event_seq = self._snapshot_event_seq(snapshot) or self.latest_trace_event_seq(
+                session_id
+            )
+        snapshot = dict(snapshot)
+        if event_seq:
+            snapshot["eventSeq"] = int(event_seq)
         path = self._get_snapshot_path(session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -243,6 +261,87 @@ class SessionStore:
     def delete_snapshot(self, session_id: str) -> bool:
         """Delete a UI snapshot sidecar if it exists."""
         path = self._get_snapshot_path(session_id)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
+    def append_trace_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict | None = None,
+        *,
+        chat_id: str | None = None,
+        chat_seq: int | None = None,
+        source: str = "remote_chat",
+        replayable: bool = True,
+    ) -> int:
+        """Append a replayable session trace event to a sidecar JSONL ledger."""
+        with self._lock:
+            path = self._get_trace_events_path(session_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            seq = self.latest_trace_event_seq(session_id) + 1
+            event = {
+                "session_id": session_id,
+                "session_event_seq": seq,
+                "chat_id": chat_id,
+                "chat_seq": int(chat_seq) if chat_seq is not None else None,
+                "seq": int(chat_seq) if chat_seq is not None else seq,
+                "type": str(event_type),
+                "payload": payload if isinstance(payload, dict) else {},
+                "source": source,
+                "replayable": bool(replayable),
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+                handle.write("\n")
+            return seq
+
+    def list_trace_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        replayable_only: bool = True,
+    ) -> list[dict]:
+        """Return persisted session trace events after the given session seq."""
+        path = self._get_trace_events_path(session_id)
+        if not path.exists():
+            return []
+        events: list[dict] = []
+        max_count = max(1, int(limit)) if limit is not None else None
+        with self._lock:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                seq = int(event.get("session_event_seq") or event.get("seq") or 0)
+                if seq <= int(after_seq or 0):
+                    continue
+                if replayable_only and event.get("replayable") is False:
+                    continue
+                events.append(event)
+                if max_count is not None and len(events) >= max_count:
+                    break
+        return events
+
+    def latest_trace_event_seq(self, session_id: str) -> int:
+        events = self.list_trace_events(
+            session_id, after_seq=0, limit=None, replayable_only=False
+        )
+        if not events:
+            return 0
+        return max(int(event.get("session_event_seq") or event.get("seq") or 0) for event in events)
+
+    def delete_trace_events(self, session_id: str) -> bool:
+        path = self._get_trace_events_path(session_id)
         if not path.exists():
             return False
         path.unlink()
@@ -355,3 +454,19 @@ class SessionStore:
     def _get_snapshot_path(self, session_id: str) -> Path:
         path = self._get_session_path(session_id)
         return path.with_name(f"{path.stem}.ui.json")
+
+    def _get_trace_events_path(self, session_id: str) -> Path:
+        path = self._get_session_path(session_id)
+        return path.with_name(f"{path.stem}.events.jsonl")
+
+    @staticmethod
+    def _snapshot_event_seq(snapshot: dict) -> int:
+        for key in ("eventSeq", "event_seq", "snapshotEventSeq", "snapshot_event_seq"):
+            value = snapshot.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0

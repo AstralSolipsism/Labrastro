@@ -305,6 +305,7 @@ class PostgresSessionStore:
                 {"id": session_id},
             )
             self.delete_snapshot(session_id)
+            self.delete_trace_events(session_id)
             return int(result.rowcount or 0) > 0
 
     def list(
@@ -351,11 +352,17 @@ class PostgresSessionStore:
         return sessions[0] if sessions else None
 
     def load_snapshot(self, session_id: str) -> tuple[dict | None, str | None]:
+        snapshot, error, _event_seq = self.load_snapshot_record(session_id)
+        return snapshot, error
+
+    def load_snapshot_record(
+        self, session_id: str
+    ) -> tuple[dict | None, str | None, int]:
         with self.engine.begin() as conn:
             row = conn.execute(
                 text(
                     """
-                    SELECT snapshot, snapshot_blob, snapshot_encoding
+                    SELECT snapshot, snapshot_blob, snapshot_encoding, event_seq
                     FROM labrastro_session_snapshots
                     WHERE session_id=:session_id
                     ORDER BY version DESC
@@ -367,19 +374,28 @@ class PostgresSessionStore:
         if row is not None:
             snapshot, error = self._decode_snapshot_row(row)
             if error is not None:
-                return None, error
-            return snapshot, None
-        return None, None
+                return None, error, 0
+            return snapshot, None, int(row.get("event_seq") or 0)
+        return None, None, 0
 
-    def save_snapshot(self, session_id: str, snapshot: dict) -> None:
+    def save_snapshot(
+        self, session_id: str, snapshot: dict, event_seq: int | None = None
+    ) -> None:
+        if event_seq is None:
+            event_seq = self._snapshot_event_seq(snapshot)
         stats = snapshot.get("stats", {}) if isinstance(snapshot.get("stats"), dict) else {}
         trace_nodes = snapshot.get("traceNodes", [])
         trace_edges = snapshot.get("traceEdges", [])
         turns = snapshot.get("turns", [])
-        snapshot_json, snapshot_blob, snapshot_encoding, snapshot_bytes = (
-            self._encode_snapshot(snapshot)
-        )
         with self.engine.begin() as conn:
+            if not event_seq:
+                event_seq = self._latest_trace_event_seq(conn, session_id)
+            snapshot = dict(snapshot)
+            if event_seq:
+                snapshot["eventSeq"] = int(event_seq)
+            snapshot_json, snapshot_blob, snapshot_encoding, snapshot_bytes = (
+                self._encode_snapshot(snapshot)
+            )
             version = conn.execute(
                 text(
                     """
@@ -396,12 +412,12 @@ class PostgresSessionStore:
                     INSERT INTO labrastro_session_snapshots (
                         session_id, version, snapshot, stats, turn_count,
                         trace_node_count, trace_edge_count, snapshot_blob,
-                        snapshot_encoding, snapshot_bytes
+                        snapshot_encoding, snapshot_bytes, event_seq
                     ) VALUES (
                         :session_id, :version, CAST(:snapshot AS JSONB),
                         CAST(:stats AS JSONB), :turn_count,
                         :trace_node_count, :trace_edge_count, :snapshot_blob,
-                        :snapshot_encoding, :snapshot_bytes
+                        :snapshot_encoding, :snapshot_bytes, :event_seq
                     )
                     """
                 ),
@@ -420,6 +436,7 @@ class PostgresSessionStore:
                     "snapshot_blob": snapshot_blob,
                     "snapshot_encoding": snapshot_encoding,
                     "snapshot_bytes": snapshot_bytes,
+                    "event_seq": int(event_seq or 0),
                 },
             )
 
@@ -427,6 +444,137 @@ class PostgresSessionStore:
         with self.engine.begin() as conn:
             result = conn.execute(
                 text("DELETE FROM labrastro_session_snapshots WHERE session_id=:session_id"),
+                {"session_id": session_id},
+            )
+            return int(result.rowcount or 0) > 0
+
+    def append_trace_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict | None = None,
+        *,
+        chat_id: str | None = None,
+        chat_seq: int | None = None,
+        source: str = "remote_chat",
+        replayable: bool = True,
+    ) -> int:
+        payload_json, payload_blob, payload_encoding, payload_bytes = (
+            self._encode_event_payload(payload if isinstance(payload, dict) else {})
+        )
+        with self.engine.begin() as conn:
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:session_id))"),
+                {"session_id": session_id},
+            )
+            seq = conn.execute(
+                text(
+                    """
+                    SELECT COALESCE(max(seq), 0) + 1
+                    FROM labrastro_session_trace_events
+                    WHERE session_id=:session_id
+                    """
+                ),
+                {"session_id": session_id},
+            ).scalar_one()
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO labrastro_session_trace_events (
+                        session_id, seq, type, payload, chat_id, chat_seq,
+                        source, replayable, payload_blob, payload_encoding,
+                        payload_bytes
+                    ) VALUES (
+                        :session_id, :seq, :type, CAST(:payload AS JSONB),
+                        :chat_id, :chat_seq, :source, :replayable,
+                        :payload_blob, :payload_encoding, :payload_bytes
+                    )
+                    ON CONFLICT (session_id, seq) DO NOTHING
+                    """
+                ),
+                {
+                    "session_id": session_id,
+                    "seq": int(seq),
+                    "type": str(event_type),
+                    "payload": payload_json,
+                    "chat_id": chat_id,
+                    "chat_seq": int(chat_seq) if chat_seq is not None else None,
+                    "source": source,
+                    "replayable": bool(replayable),
+                    "payload_blob": payload_blob,
+                    "payload_encoding": payload_encoding,
+                    "payload_bytes": payload_bytes,
+                },
+            )
+            return int(seq)
+
+    def list_trace_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        replayable_only: bool = True,
+    ) -> list[dict]:
+        clauses = ["session_id=:session_id", "seq > :after_seq"]
+        params: dict[str, Any] = {
+            "session_id": session_id,
+            "after_seq": max(0, int(after_seq or 0)),
+        }
+        if replayable_only:
+            clauses.append("replayable IS TRUE")
+        limit_sql = ""
+        if limit is not None:
+            params["limit"] = max(1, int(limit))
+            limit_sql = " LIMIT :limit"
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT session_id, seq, type, payload, chat_id, chat_seq,
+                           source, replayable, payload_blob, payload_encoding,
+                           payload_bytes, created_at
+                    FROM labrastro_session_trace_events
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY seq ASC
+                    {limit_sql}
+                    """
+                ),
+                params,
+            ).mappings().all()
+        events: list[dict] = []
+        for row in rows:
+            payload, _error = self._decode_event_payload(row)
+            seq = int(row["seq"] or 0)
+            chat_seq = row.get("chat_seq")
+            events.append(
+                {
+                    "session_id": str(row["session_id"]),
+                    "session_event_seq": seq,
+                    "seq": int(chat_seq or seq),
+                    "chat_id": row.get("chat_id"),
+                    "chat_seq": int(chat_seq) if chat_seq is not None else None,
+                    "type": str(row["type"]),
+                    "payload": payload if isinstance(payload, dict) else {},
+                    "source": str(row.get("source") or "remote_chat"),
+                    "replayable": bool(row.get("replayable")),
+                    "created_at": row["created_at"].isoformat()
+                    if hasattr(row["created_at"], "isoformat")
+                    else str(row["created_at"]),
+                }
+            )
+        return events
+
+    def latest_trace_event_seq(self, session_id: str) -> int:
+        with self.engine.begin() as conn:
+            return self._latest_trace_event_seq(conn, session_id)
+
+    def delete_trace_events(self, session_id: str) -> bool:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "DELETE FROM labrastro_session_trace_events WHERE session_id=:session_id"
+                ),
                 {"session_id": session_id},
             )
             return int(result.rowcount or 0) > 0
@@ -456,6 +604,58 @@ class PostgresSessionStore:
         if isinstance(snapshot, dict):
             return dict(snapshot), None
         return None, "snapshot_not_object"
+
+    def _encode_event_payload(
+        self, payload: dict
+    ) -> tuple[str | None, bytes | None, str, int]:
+        raw = _json_bytes(payload)
+        if len(raw) >= self.snapshot_compress_threshold_bytes:
+            return None, gzip.compress(raw), "json+gzip", len(raw)
+        return raw.decode("utf-8"), None, "jsonb", len(raw)
+
+    @staticmethod
+    def _decode_event_payload(row: Any) -> tuple[dict | None, str | None]:
+        encoding = str(row.get("payload_encoding") or "jsonb")
+        if encoding == "json+gzip":
+            blob = row.get("payload_blob")
+            if blob is None:
+                return None, "payload_blob_missing"
+            try:
+                raw = gzip.decompress(bytes(blob))
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return None, "payload_blob_invalid"
+        else:
+            payload = row.get("payload")
+        if isinstance(payload, dict):
+            return dict(payload), None
+        return None, "payload_not_object"
+
+    @staticmethod
+    def _snapshot_event_seq(snapshot: dict) -> int:
+        for key in ("eventSeq", "event_seq", "snapshotEventSeq", "snapshot_event_seq"):
+            value = snapshot.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    @staticmethod
+    def _latest_trace_event_seq(conn: Any, session_id: str) -> int:
+        value = conn.execute(
+            text(
+                """
+                SELECT COALESCE(max(seq), 0)
+                FROM labrastro_session_trace_events
+                WHERE session_id=:session_id
+                """
+            ),
+            {"session_id": session_id},
+        ).scalar_one()
+        return int(value or 0)
 
     @staticmethod
     def get_exit_time(messages: list[dict]) -> str | None:

@@ -98,6 +98,62 @@ def test_postgres_session_store_compresses_large_snapshot() -> None:
         store.delete(session_id)
 
 
+def test_postgres_session_store_trace_events_roundtrip_and_compression() -> None:
+    engine = _engine()
+    store = PostgresSessionStore(engine, snapshot_compress_threshold_bytes=64)
+    session_id = store.save(
+        messages=[{"role": "user", "content": "trace-event"}],
+        model="m1",
+        fingerprint="pg-test",
+    )
+
+    try:
+        first = store.append_trace_event(
+            session_id,
+            "context_event",
+            {"phase": "before"},
+            chat_id="chat-1",
+            chat_seq=5,
+        )
+        second = store.append_trace_event(
+            session_id,
+            "tool_call_end",
+            {"tool_result": "x" * 512},
+            chat_id="chat-1",
+            chat_seq=6,
+        )
+
+        assert (first, second) == (1, 2)
+        assert store.latest_trace_event_seq(session_id) == 2
+        events = store.list_trace_events(session_id, after_seq=1)
+        assert events[0]["session_event_seq"] == 2
+        assert events[0]["chat_seq"] == 6
+        assert events[0]["payload"]["tool_result"] == "x" * 512
+
+        store.save_snapshot(session_id, {"turns": []}, event_seq=2)
+        snapshot, error, event_seq = store.load_snapshot_record(session_id)
+        assert error is None
+        assert snapshot is not None
+        assert event_seq == 2
+
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT payload, payload_blob, payload_encoding
+                    FROM labrastro_session_trace_events
+                    WHERE session_id=:session_id AND seq=2
+                    """
+                ),
+                {"session_id": session_id},
+            ).mappings().one()
+        assert row["payload"] is None
+        assert row["payload_blob"] is not None
+        assert row["payload_encoding"] == "json+gzip"
+    finally:
+        store.delete(session_id)
+
+
 def test_persistence_maintenance_trims_snapshot_versions_and_retention() -> None:
     engine = _engine()
     store = PostgresSessionStore(engine)

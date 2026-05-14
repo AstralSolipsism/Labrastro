@@ -222,13 +222,52 @@ def test_session_store_snapshot_roundtrip(tmp_path: Path) -> None:
     session_id = store.save(messages=[{"role": "user", "content": "hi"}], model="m1")
     snapshot = {"turns": [{"id": "t1"}], "traceNodes": [{"id": "n1"}]}
 
-    store.save_snapshot(session_id, snapshot)
-    loaded, error = store.load_snapshot(session_id)
+    store.save_snapshot(session_id, snapshot, event_seq=7)
+    loaded, error, event_seq = store.load_snapshot_record(session_id)
 
     assert error is None
-    assert loaded == snapshot
+    assert loaded == {**snapshot, "eventSeq": 7}
+    assert event_seq == 7
     assert store.delete_snapshot(session_id) is True
     assert store.load_snapshot(session_id) == (None, None)
+
+
+def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session_id = store.save(messages=[{"role": "user", "content": "hi"}], model="m1")
+
+    first = store.append_trace_event(
+        session_id,
+        "context_event",
+        {"phase": "before"},
+        chat_id="chat-1",
+        chat_seq=3,
+    )
+    second = store.append_trace_event(
+        session_id,
+        "chat_end",
+        {"response": "done"},
+        chat_id="chat-1",
+        chat_seq=4,
+    )
+
+    assert (first, second) == (1, 2)
+    assert store.latest_trace_event_seq(session_id) == 2
+    assert store.list_trace_events(session_id, after_seq=1) == [
+        {
+            "session_id": session_id,
+            "session_event_seq": 2,
+            "chat_id": "chat-1",
+            "chat_seq": 4,
+            "seq": 4,
+            "type": "chat_end",
+            "payload": {"response": "done"},
+            "source": "remote_chat",
+            "replayable": True,
+        }
+    ]
+    assert store.delete_trace_events(session_id) is True
+    assert store.list_trace_events(session_id) == []
 
 
 def test_session_store_concurrent_save_keeps_sessions_readable(tmp_path: Path) -> None:
