@@ -154,6 +154,37 @@ def test_parse_config_rejects_deprecated_llm_config_paths() -> None:
     assert "models.profiles.main.base_url was removed" in message
 
 
+def test_load_explicit_config_ignores_global_example(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    global_path = tmp_path / "global.yaml"
+    workspace_path = tmp_path / "workspace.yaml"
+    explicit_path = tmp_path / "host.yaml"
+    global_path.write_text("meta:\n  example: true\n", encoding="utf-8")
+    explicit_path.write_text(
+        """
+remote_exec:
+  enabled: true
+  host_mode: true
+auth:
+  token_secret: test-secret
+providers:
+  items: {}
+models:
+  profiles: {}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigLoader, "GLOBAL_CONFIG_PATH", global_path)
+    monkeypatch.setattr(ConfigLoader, "WORKSPACE_CONFIG_PATH", workspace_path)
+
+    config = ConfigLoader(explicit_path).load()
+
+    assert config.remote_exec.enabled is True
+    assert config.remote_exec.host_mode is True
+
+
 def test_parse_config_reads_memory_provider_settings() -> None:
     config = ConfigLoader()._parse_config(
         {

@@ -363,11 +363,16 @@ class ConfigLoader:
         global_data = self._load_yaml(self.GLOBAL_CONFIG_PATH)
 
         # Detect example config — user still needs to configure providers and model profiles.
+        # Explicit host configs are authoritative for containers and admin tools; an old
+        # global example in HOME must not block them.
         if global_data and self._is_example_config(global_data):
-            raise ExampleConfigError(
-                f"\n  The config at {self.GLOBAL_CONFIG_PATH} is still the example template.\n"
-                "  Please configure providers.items and models.profiles, then restart.\n"
-            )
+            if self.config_path:
+                global_data = {}
+            else:
+                raise ExampleConfigError(
+                    f"\n  The config at {self.GLOBAL_CONFIG_PATH} is still the example template.\n"
+                    "  Please configure providers.items and models.profiles, then restart.\n"
+                )
 
         if global_data:
             config_data = self._merge_dicts(config_data, global_data)
