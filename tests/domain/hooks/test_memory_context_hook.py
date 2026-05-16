@@ -12,6 +12,7 @@ from reuleauxcoder.domain.memory import (
     MemoryProvideRequest,
     MemoryScope,
 )
+from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 
 
 def _context(metadata: dict) -> BeforeLLMRequestContext:
@@ -58,6 +59,18 @@ class UnavailableProvider:
         raise MemoryBackendUnavailable("database unavailable")
 
 
+class EmptyProvider:
+    def provide(
+        self, scope: MemoryScope, request: MemoryProvideRequest
+    ) -> MemoryBundle:
+        return MemoryBundle(
+            scope=scope,
+            items=[],
+            token_estimate=0,
+            provenance={"scope_version": 3},
+        )
+
+
 def test_memory_context_hook_injects_after_existing_system_messages() -> None:
     provider = RecordingProvider()
     hook = MemoryContextHook(provider=provider)
@@ -82,6 +95,58 @@ def test_memory_context_hook_injects_after_existing_system_messages() -> None:
     assert result.metadata["memory"]["scope_version"] == 7
 
 
+def test_memory_context_hook_emits_memory_context_event_with_rendered_prompt() -> None:
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
+    hook = MemoryContextHook(provider=RecordingProvider())
+    context = _context(
+        {
+            "owner_agent_id": "agent-a",
+            "memory_namespace": "agent-a",
+            "project_id": "project-1",
+            "round_index": 2,
+        }
+    )
+    context.ui_bus = ui_bus
+
+    result = hook.run(context)
+
+    memory_events = [
+        event
+        for event in seen
+        if event.kind == UIEventKind.CONTEXT
+        and event.data.get("schema") == "memory_context.v1"
+    ]
+    assert len(memory_events) == 1
+    payload = memory_events[0].data
+    assert payload["context_kind"] == "memory_injection"
+    assert payload["status"] == "provided"
+    assert payload["round_index"] == 2
+    assert payload["provided_items"] == 1
+    assert payload["token_estimate"] == 12
+    assert payload["scope"]["owner_agent_id"] == "agent-a"
+    assert payload["scope_version"] == 7
+    assert payload["items"][0]["type"] == "project"
+    assert payload["items"][0]["content"] == "This agent prefers pytest for verification."
+    assert payload["rendered_context"] == result.messages[2]["content"]
+
+
+def test_memory_context_hook_does_not_emit_event_for_empty_memory() -> None:
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
+    hook = MemoryContextHook(provider=EmptyProvider())
+    context = _context({"owner_agent_id": "agent-a", "memory_namespace": "agent-a"})
+    context.ui_bus = ui_bus
+
+    result = hook.run(context)
+
+    assert len(result.messages) == 3
+    assert result.metadata["memory"]["status"] == "empty"
+    assert seen == []
+
+
 def test_memory_context_hook_fail_closed_without_owner_agent_id() -> None:
     hook = MemoryContextHook(provider=RecordingProvider())
 
@@ -91,13 +156,18 @@ def test_memory_context_hook_fail_closed_without_owner_agent_id() -> None:
 
 def test_memory_context_hook_skips_when_backend_is_unavailable() -> None:
     hook = MemoryContextHook(provider=UnavailableProvider())
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
     context = _context({"owner_agent_id": "agent-a", "memory_namespace": "agent-a"})
+    context.ui_bus = ui_bus
 
     result = hook.run(context)
 
     assert len(result.messages) == 3
     assert result.metadata["memory"]["status"] == "unavailable"
     assert "database unavailable" in result.metadata["memory"]["warning"]
+    assert seen == []
 
 
 def test_memory_hooks_are_builtin_core_hooks() -> None:

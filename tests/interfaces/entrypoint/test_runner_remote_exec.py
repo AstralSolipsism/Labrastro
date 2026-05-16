@@ -500,6 +500,22 @@ def test_remote_relay_maps_all_ui_event_kinds_to_structured_events() -> None:
         assert payload["detail"] == "value"
 
 
+def test_remote_relay_maps_memory_context_to_dedicated_event_type() -> None:
+    event = UIEvent.info(
+        "Injected private memory context.",
+        kind=UIEventKind.CONTEXT,
+        schema="memory_context.v1",
+        context_kind="memory_injection",
+        provided_items=1,
+    )
+
+    assert _structured_ui_event_type(event) == "memory_context"
+    payload = _structured_ui_event_payload(event)
+    assert payload["schema"] == "memory_context.v1"
+    assert payload["context_kind"] == "memory_injection"
+    assert payload["provided_items"] == 1
+
+
 def test_switch_session_model_updates_runtime_without_transcript_pollution() -> None:
     store = MemorySessionStore()
     config = Config(

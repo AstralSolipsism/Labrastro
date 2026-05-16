@@ -16,6 +16,7 @@ class LLMProtocol(Protocol):
         tools: Optional[list[dict]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         on_reasoning_token: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Send messages and receive a response.
 

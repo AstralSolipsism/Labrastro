@@ -24,6 +24,10 @@ class AgentLoop:
         self._shell = shell_name
         self.last_response_streamed = False
 
+    def _ui_bus(self) -> Any:
+        context = getattr(self.agent, "context", None)
+        return getattr(context, "_ui_bus", None)
+
     def _runtime_tail_message(self) -> dict:
         """Build ephemeral runtime context appended only at send time."""
         runtime_context = self._runtime_context()
@@ -250,6 +254,7 @@ class AgentLoop:
                 on_reasoning_token=_on_reasoning_token,
                 hook_registry=self.agent.hook_registry,
                 session_id=getattr(self.agent, "current_session_id", None),
+                ui_bus=self._ui_bus(),
                 metadata={
                     **memory_metadata_from_agent(self.agent),
                     "round_index": round_num,
@@ -376,6 +381,7 @@ class AgentLoop:
             on_reasoning_token=_on_summary_reasoning_token,
             hook_registry=self.agent.hook_registry,
             session_id=getattr(self.agent, "current_session_id", None),
+            ui_bus=self._ui_bus(),
             metadata={
                 **memory_metadata_from_agent(self.agent),
                 "round_index": self.agent.state.current_round,

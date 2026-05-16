@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
+
+if TYPE_CHECKING:
+    from reuleauxcoder.interfaces.events import UIEventBus
 
 
 class HookKind(str, Enum):
@@ -65,6 +68,7 @@ class BeforeLLMRequestContext(HookContext):
     messages: list[dict[str, Any]] = field(default_factory=list)
     tools: list[dict[str, Any]] = field(default_factory=list)
     model: str | None = None
+    ui_bus: "UIEventBus | None" = None
 
 
 @dataclass(slots=True)

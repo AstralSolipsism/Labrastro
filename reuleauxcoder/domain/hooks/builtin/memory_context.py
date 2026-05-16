@@ -50,6 +50,57 @@ def _render_bundle(bundle: MemoryBundle) -> str:
     return "\n".join(lines)
 
 
+def _memory_item_event_payload(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "type": item.type,
+        "abstract": item.abstract,
+        "content": item.content,
+        "confidence": item.confidence,
+        "version": item.version,
+        "updated_at": item.updated_at,
+    }
+
+
+def _memory_context_event_payload(
+    *,
+    bundle: MemoryBundle,
+    request: MemoryProvideRequest,
+    rendered_context: str,
+    context: BeforeLLMRequestContext,
+) -> dict[str, Any]:
+    return {
+        "schema": "memory_context.v1",
+        "context_kind": "memory_injection",
+        "status": "provided",
+        "round_index": context.metadata.get("round_index"),
+        "scope": bundle.scope.to_dict(),
+        "scope_version": bundle.provenance.get("scope_version", 0),
+        "query": request.query,
+        "provided_items": len(bundle.items),
+        "token_estimate": bundle.token_estimate,
+        "items": [_memory_item_event_payload(item) for item in bundle.items],
+        "rendered_context": rendered_context,
+    }
+
+
+def _emit_memory_context_event(
+    context: BeforeLLMRequestContext, payload: dict[str, Any]
+) -> None:
+    if context.ui_bus is None:
+        return
+    try:
+        from reuleauxcoder.interfaces.events import UIEventKind
+
+        context.ui_bus.info(
+            "Injected private memory context.",
+            kind=UIEventKind.CONTEXT,
+            **payload,
+        )
+    except Exception:
+        pass
+
+
 def _insert_after_system_messages(messages: list[dict[str, Any]], message: dict[str, Any]) -> None:
     index = 0
     while index < len(messages) and messages[index].get("role") == "system":
@@ -150,9 +201,10 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
                 "scope_version": bundle.provenance.get("scope_version", 0),
             }
             return context
+        rendered_context = _render_bundle(bundle)
         _insert_after_system_messages(
             context.messages,
-            {"role": "system", "content": _render_bundle(bundle)},
+            {"role": "system", "content": rendered_context},
         )
         context.metadata["memory"] = {
             "status": "provided",
@@ -160,7 +212,17 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
             "owner_agent_id": scope.owner_agent_id,
             "memory_namespace": scope.memory_namespace,
             "scope_version": bundle.provenance.get("scope_version", 0),
+            "token_estimate": bundle.token_estimate,
         }
+        _emit_memory_context_event(
+            context,
+            _memory_context_event_payload(
+                bundle=bundle,
+                request=request,
+                rendered_context=rendered_context,
+                context=context,
+            ),
+        )
         return context
 
 

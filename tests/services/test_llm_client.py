@@ -3,7 +3,8 @@
 import pytest
 
 from reuleauxcoder.domain.hooks.registry import HookRegistry
-from reuleauxcoder.domain.hooks.types import HookPoint
+from reuleauxcoder.domain.hooks.base import TransformHook
+from reuleauxcoder.domain.hooks.types import BeforeLLMRequestContext, HookPoint
 from reuleauxcoder.domain.hooks.builtin.project_context import ProjectContextHook
 from reuleauxcoder.domain.llm.models import (
     EMPTY_ASSISTANT_CONTENT_PLACEHOLDER,
@@ -597,6 +598,65 @@ def test_llm_debug_trace_persists_trace_and_emits_ui_event(
     assert payload["response"]["reasoning_chars"] == len("thinking")
     assert payload["response"]["usage"]["prompt_tokens"] == 12
     assert payload["response"]["usage"]["completion_tokens"] == 3
+
+
+def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
+
+    class CaptureUiBusHook(TransformHook[BeforeLLMRequestContext]):
+        def __init__(self) -> None:
+            super().__init__(name="capture_ui_bus")
+            self.ui_bus = None
+            self.metadata = {}
+
+        def run(self, context: BeforeLLMRequestContext) -> BeforeLLMRequestContext:
+            self.ui_bus = context.ui_bus
+            self.metadata = dict(context.metadata)
+            context.metadata["hook_seen"] = "yes"
+            return context
+
+    hook = CaptureUiBusHook()
+    registry = HookRegistry()
+    registry.register(HookPoint.BEFORE_LLM_REQUEST, hook)
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test-12345678",
+        base_url="https://example.com/v1",
+        debug_trace=True,
+    )
+
+    def _fake_call_with_retry(params):
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=1, completion_tokens=1)),
+            ]
+        )
+
+    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    response = llm.chat(
+        [{"role": "user", "content": "Hi"}],
+        hook_registry=registry,
+        session_id="session_test",
+        metadata={"request_id": "request-1"},
+        ui_bus=ui_bus,
+    )
+
+    assert response.content == "Hello"
+    assert hook.ui_bus is ui_bus
+    assert hook.metadata == {"request_id": "request-1"}
+    debug_events = [event for event in seen if event.level == UIEventLevel.DEBUG]
+    assert debug_events
+    trace_path = debug_events[-1].data.get("trace_path")
+    payload = json.loads(open(trace_path, encoding="utf-8").read())
+    assert payload["metadata"]["request_id"] == "request-1"
+    assert payload["metadata"]["hook_seen"] == "yes"
+    assert "ui_bus" not in payload["metadata"]
 
 
 def test_llm_chat_emits_reasoning_diagnostics_for_placeholder_and_missing_stream() -> None:

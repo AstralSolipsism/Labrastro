@@ -1903,6 +1903,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
 
 def _structured_ui_event_type(event) -> str:
+    data = getattr(event, "data", {}) or {}
+    if event.kind == UIEventKind.CONTEXT and (
+        data.get("context_kind") == "memory_injection"
+        or data.get("schema") == "memory_context.v1"
+    ):
+        return "memory_context"
     return {
         UIEventKind.VIEW: "view",
         UIEventKind.CONTEXT: "context_event",

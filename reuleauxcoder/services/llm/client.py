@@ -245,9 +245,12 @@ class LLM:
         )
         self._rebuild_provider()
 
-    def _emit_debug(self, message: str, **data: Any) -> None:
-        if self.ui_bus is not None:
-            self.ui_bus.debug(message, kind=UIEventKind.AGENT, **data)
+    def _emit_debug(
+        self, message: str, *, ui_bus: UIEventBus | None = None, **data: Any
+    ) -> None:
+        bus = ui_bus or self.ui_bus
+        if bus is not None:
+            bus.debug(message, kind=UIEventKind.AGENT, **data)
 
     def _prepare_provider(self):
         if self._provider is None:
@@ -268,8 +271,10 @@ class LLM:
         session_id: str | None = None,
         trace_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        ui_bus: UIEventBus | None = None,
     ) -> LLMResponse:
         """Send messages, stream back response, handle tool calls."""
+        active_ui_bus = ui_bus or self.ui_bus
         raw_messages = [dict(msg) for msg in messages]
         sanitized_messages = sanitize_messages_for_llm(
             messages,
@@ -293,6 +298,7 @@ class LLM:
                 self._emit_debug(
                     "[reasoning] sanitizer backfilled placeholder "
                     "reasoning_content for tool-call assistant messages",
+                    ui_bus=active_ui_bus,
                     placeholder=placeholder,
                     message_indices=backfilled_indices,
                     count=len(backfilled_indices),
@@ -326,6 +332,7 @@ class LLM:
                 session_id=session_id,
                 trace_id=trace_id,
                 metadata=dict(request.metadata),
+                ui_bus=active_ui_bus,
             )
 
             if hook_registry is not None:
@@ -372,6 +379,7 @@ class LLM:
                 self._emit_debug(
                     "[reasoning] thinking enabled but no reasoning_content "
                     "received in stream",
+                    ui_bus=active_ui_bus,
                     model=self.model,
                     has_tool_calls=bool(response.tool_calls),
                     content_chars=len(response.content or ""),
@@ -466,6 +474,7 @@ class LLM:
                 )
                 self._emit_debug(
                     f"LLM trace saved: {trace_path}",
+                    ui_bus=active_ui_bus,
                     trace_path=str(trace_path),
                     session_id=session_id,
                     trace_id=trace_id,
