@@ -7,6 +7,12 @@ def test_agent_event_chat_start_contains_user_input() -> None:
     assert event.data == {"user_input": "hello"}
 
 
+def test_agent_event_reasoning_token_contains_token() -> None:
+    event = AgentEvent.reasoning_token("thinking")
+    assert event.event_type is AgentEventType.REASONING_TOKEN
+    assert event.data == {"token": "thinking"}
+
+
 def test_agent_event_tool_call_start_contains_name_and_args() -> None:
     event = AgentEvent.tool_call_start("shell", {"command": "ls"})
     assert event.event_type is AgentEventType.TOOL_CALL_START

@@ -229,16 +229,25 @@ class AgentLoop:
             self.agent.state.current_round = round_num
 
             streamed_output = False
+            streamed_reasoning = False
 
             def _on_token(token: str) -> None:
                 nonlocal streamed_output
                 streamed_output = True
                 self.agent._emit_event(AgentEvent.stream_token(token))
 
+            def _on_reasoning_token(token: str) -> None:
+                nonlocal streamed_reasoning
+                if not token:
+                    return
+                streamed_reasoning = True
+                self.agent._emit_event(AgentEvent.reasoning_token(token))
+
             resp = self.agent.llm.chat(
                 messages=self._full_messages(),
                 tools=self._tool_schemas(),
                 on_token=_on_token,
+                on_reasoning_token=_on_reasoning_token,
                 hook_registry=self.agent.hook_registry,
                 session_id=getattr(self.agent, "current_session_id", None),
                 metadata={
@@ -251,6 +260,8 @@ class AgentLoop:
 
             self._record_response_usage(resp)
             self._emit_usage_update()
+            if resp.reasoning_content and not streamed_reasoning:
+                self.agent._emit_event(AgentEvent.reasoning_token(resp.reasoning_content))
 
             # No tool calls -> done
             if not resp.tool_calls:
@@ -344,16 +355,25 @@ class AgentLoop:
         )
         self.agent.state.messages.append({"role": "user", "content": summary_prompt})
         summary_streamed = False
+        summary_reasoning_streamed = False
 
         def _on_summary_token(token: str) -> None:
             nonlocal summary_streamed
             summary_streamed = True
             self.agent._emit_event(AgentEvent.stream_token(token))
 
+        def _on_summary_reasoning_token(token: str) -> None:
+            nonlocal summary_reasoning_streamed
+            if not token:
+                return
+            summary_reasoning_streamed = True
+            self.agent._emit_event(AgentEvent.reasoning_token(token))
+
         summary_resp = self.agent.llm.chat(
             messages=self._full_messages(),
             tools=None,
             on_token=_on_summary_token,
+            on_reasoning_token=_on_summary_reasoning_token,
             hook_registry=self.agent.hook_registry,
             session_id=getattr(self.agent, "current_session_id", None),
             metadata={
@@ -367,5 +387,7 @@ class AgentLoop:
         self.last_response_streamed = summary_streamed
         self._record_response_usage(summary_resp)
         self._emit_usage_update()
+        if summary_resp.reasoning_content and not summary_reasoning_streamed:
+            self.agent._emit_event(AgentEvent.reasoning_token(summary_resp.reasoning_content))
         self.agent.state.messages.append(summary_resp.message)
         return summary_resp.content or "(reached maximum tool-call rounds)"
