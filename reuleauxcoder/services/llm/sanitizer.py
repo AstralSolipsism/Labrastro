@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from reuleauxcoder.domain.llm.models import EMPTY_ASSISTANT_CONTENT_PLACEHOLDER
+
 DEFAULT_REASONING_REPLAY_PLACEHOLDER = "[PLACE_HOLDER]"
 
 
@@ -51,6 +53,9 @@ def _sanitize_messages_for_llm_core(
 
         raw_tool_calls = item.get("tool_calls") or []
         if not raw_tool_calls:
+            content = item.get("content")
+            if content is None or not str(content).strip():
+                item["content"] = EMPTY_ASSISTANT_CONTENT_PLACEHOLDER
             if effective_backfill and user_turn_had_tool_calls and "reasoning_content" not in item:
                 item["reasoning_content"] = reasoning_replay_placeholder
             elif not thinking_enabled and not (

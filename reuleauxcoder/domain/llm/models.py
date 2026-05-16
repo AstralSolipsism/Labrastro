@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 import json
 
 
+EMPTY_ASSISTANT_CONTENT_PLACEHOLDER = "[No assistant content returned.]"
+
+
 @dataclass
 class ToolCall:
     """Represents a tool call from the LLM."""
@@ -39,7 +42,10 @@ class LLMResponse:
     @property
     def message(self) -> dict:
         """Convert to OpenAI message format for appending to history."""
-        msg: dict = {"role": "assistant", "content": self.content or None}
+        content = self.content or None
+        if content is None and not self.tool_calls:
+            content = EMPTY_ASSISTANT_CONTENT_PLACEHOLDER
+        msg: dict = {"role": "assistant", "content": content}
         if self.reasoning_content is not None:
             msg["reasoning_content"] = self.reasoning_content
         if self.reasoning_signature is not None:

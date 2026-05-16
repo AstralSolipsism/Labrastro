@@ -31,8 +31,27 @@ def _make_messages_with_tokens(target_tokens: int) -> list[dict]:
 
 
 def _make_snippable_tool_messages(count: int = 11) -> list[dict]:
-    """Create enough tool messages so some are not protected by recent-tool keepalive."""
-    return [_make_long_tool_output() for _ in range(count)]
+    """Create assistant/tool rounds so older rounds can be snipped."""
+    messages: list[dict] = []
+    for index in range(count):
+        tool_call_id = f"tool_{index}"
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
+        tool_message = _make_long_tool_output()
+        tool_message["tool_call_id"] = tool_call_id
+        messages.append(tool_message)
+    return messages
 
 
 class TestWallHitStateMachine:
@@ -41,22 +60,35 @@ class TestWallHitStateMachine:
     def test_snip_tool_outputs_clears_stale_token_cache(self) -> None:
         manager = ContextManager()
         messages = _make_snippable_tool_messages(6)
-        cached_tokens = estimate_message_tokens(messages[0])
+        first_tool = messages[1]
+        cached_tokens = estimate_message_tokens(first_tool)
 
-        assert MESSAGE_TOKEN_KEY in messages[0]
+        assert MESSAGE_TOKEN_KEY in first_tool
 
         changed = manager._snip_tool_outputs(messages)
 
         assert changed is True
-        assert MESSAGE_TOKEN_KEY not in messages[0]
-        refreshed_tokens = estimate_message_tokens(messages[0])
+        assert MESSAGE_TOKEN_KEY not in first_tool
+        refreshed_tokens = estimate_message_tokens(first_tool)
         assert refreshed_tokens < cached_tokens
+
+    def test_snip_tool_outputs_protects_recent_agent_rounds(self) -> None:
+        manager = ContextManager(snip_keep_recent_tools=2)
+        messages = _make_snippable_tool_messages(4)
+
+        changed = manager._snip_tool_outputs(messages)
+
+        assert changed is True
+        assert "snipped" in messages[1]["content"]
+        assert "snipped" in messages[3]["content"]
+        assert "snipped" not in messages[5]["content"]
+        assert "snipped" not in messages[7]["content"]
 
     def test_snip_hit_count_increments_when_snip_doesnt_reduce_enough(self) -> None:
         """When snip runs but doesn't reduce below threshold, hit count should increment."""
         manager = ContextManager(max_tokens=1000)  # snip_at = 500
 
-        # 需要 >10 条 tool 消息，这样旧的 tool output 才不会被 protected。
+        # 需要多轮 agent/tool 消息，这样旧的 tool output 才不会被 protected。
         messages = _make_snippable_tool_messages(11)
         messages.extend(_make_messages_with_tokens(400))
 
@@ -93,11 +125,12 @@ class TestWallHitStateMachine:
         manager._snip_hit_count = 2
         manager._snip_exhausted = False
 
-        # 11 条 tool 消息里只有最老的一条是超长可压缩内容，其余都很短。
+        # 11 轮 agent/tool 消息里只有最老的一条工具输出是超长可压缩内容，其余都很短。
         # 这样 snip 一次后应该能直接回到健康区间。
         messages = _make_snippable_tool_messages(11)
-        for i in range(1, len(messages)):
-            messages[i]["content"] = "ok"
+        for index, message in enumerate(messages):
+            if message.get("role") == "tool" and index != 1:
+                message["content"] = "ok"
 
         manager.maybe_compress(messages, llm=None)
 
@@ -267,6 +300,10 @@ class TestWallHitStateMachine:
             ]
             assert context_events[0].data["applied_layers"] == [layer]
             assert context_events[1].data["applied_layers"] == [layer]
+            assert context_events[1].data["after_tokens"] == manager._last_compact_tokens
+            assert context_events[1].data["after_tokens"] == manager.get_context_tokens(
+                messages
+            )
 
     def test_strategy_description_uses_configured_recent_turn_count(self) -> None:
         manager = ContextManager(summarize_keep_recent_turns=7)

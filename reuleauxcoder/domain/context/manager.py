@@ -172,7 +172,7 @@ class ContextManager:
         self,
         max_tokens: int = 128_000,
         ui_bus: "UIEventBus | None" = None,
-        snip_keep_recent_tools: int = 5,
+        snip_keep_recent_tools: int = 2,
         snip_threshold_chars: int = 1500,
         snip_min_lines: int = 6,
         summarize_keep_recent_turns: int = 5,
@@ -369,7 +369,7 @@ class ContextManager:
         if strategy == "snip":
             changed = self._snip_tool_outputs(messages)
             if changed:
-                self._last_compact_tokens = estimate_tokens(messages, token_fudge_factor=self._token_fudge_factor)
+                self._last_compact_tokens = self.get_context_tokens(messages)
                 self._last_compact_strategy = "snip"
                 applied_layer = "snip_tool_outputs"
                 self._emit_compression_events(
@@ -385,7 +385,7 @@ class ContextManager:
                 messages, llm, keep_recent_user_turns=self._summarize_keep_recent_turns
             )
             if changed:
-                self._last_compact_tokens = estimate_tokens(messages, token_fudge_factor=self._token_fudge_factor)
+                self._last_compact_tokens = self.get_context_tokens(messages)
                 self._last_compact_strategy = "summarize"
                 applied_layer = "summarize_old"
                 self._emit_compression_events(
@@ -400,7 +400,7 @@ class ContextManager:
             if len(messages) <= 4:
                 return False
             self._hard_collapse(messages, llm)
-            self._last_compact_tokens = estimate_tokens(messages, token_fudge_factor=self._token_fudge_factor)
+            self._last_compact_tokens = self.get_context_tokens(messages)
             self._last_compact_strategy = "collapse"
             applied_layer = "hard_collapse"
             self._emit_compression_events(
@@ -414,10 +414,19 @@ class ContextManager:
         return False
 
     def _snip_tool_outputs(self, messages: list[dict]) -> bool:
-        """Layer 1: Truncate older tool results over threshold, keeping recent tool outputs intact."""
+        """Layer 1: Truncate older tool results, keeping recent agent rounds intact."""
         changed = False
         tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-        protected = set(tool_indices[-self._snip_keep_recent_tools :])
+        assistant_rounds = 0
+        cut_index = 0
+        for i in range(len(messages) - 1, -1, -1):
+            message = messages[i]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                assistant_rounds += 1
+                if assistant_rounds >= self._snip_keep_recent_tools:
+                    cut_index = i
+                    break
+        protected = {i for i in tool_indices if i >= cut_index}
 
         for i, m in enumerate(messages):
             if i in protected or m.get("role") != "tool":
@@ -551,7 +560,7 @@ class ContextManager:
         if not self._ui_bus:
             return
 
-        after_tokens = estimate_tokens(after_messages)
+        after_tokens = self.get_context_tokens(after_messages)
         after_message_count = len(after_messages)
         after_snapshot = self._snapshot_messages(after_messages)
         strategy = self._describe_strategy(applied_layers)

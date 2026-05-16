@@ -79,8 +79,8 @@ approval:
 
 # Optional context compression settings. Omit to use defaults.
 # context:
-#   # Number of recent tool calls to protect from snipping.
-#   snip_keep_recent_tools: 5
+#   # Number of recent agent rounds to protect from snipping.
+#   snip_keep_recent_tools: 2
 #   # Min content length (chars) to trigger tool output snip.
 #   snip_threshold_chars: 1500
 #   # Min line count to trigger tool output snip.

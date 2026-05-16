@@ -5,9 +5,39 @@ import pytest
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import HookPoint
 from reuleauxcoder.domain.hooks.builtin.project_context import ProjectContextHook
+from reuleauxcoder.domain.llm.models import (
+    EMPTY_ASSISTANT_CONTENT_PLACEHOLDER,
+    LLMResponse,
+    ToolCall,
+)
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventLevel
 from reuleauxcoder.services.llm.client import LLM, _merge_hook_request_overrides
 from reuleauxcoder.services.llm.sanitizer import sanitize_messages_for_llm
+
+
+def test_llm_response_message_uses_placeholder_for_reasoning_only_assistant() -> None:
+    response = LLMResponse(reasoning_content="thinking")
+
+    assert response.message["content"] == EMPTY_ASSISTANT_CONTENT_PLACEHOLDER
+    assert response.message["reasoning_content"] == "thinking"
+
+
+def test_llm_response_message_keeps_null_content_for_tool_call_assistant() -> None:
+    response = LLMResponse(
+        tool_calls=[ToolCall(id="tool_1", name="glob", arguments={"pattern": "*.py"})]
+    )
+
+    assert response.message["content"] is None
+    assert response.message["tool_calls"][0]["function"]["name"] == "glob"
+
+
+def test_sanitize_messages_repairs_empty_non_tool_assistant_content() -> None:
+    sanitized = sanitize_messages_for_llm(
+        [{"role": "assistant", "content": "", "reasoning_content": "thinking"}],
+        preserve_reasoning_content=True,
+    )
+
+    assert sanitized[0]["content"] == EMPTY_ASSISTANT_CONTENT_PLACEHOLDER
 
 
 def test_sanitize_messages_backfills_reasoning_content_for_assistant_tool_calls() -> (
