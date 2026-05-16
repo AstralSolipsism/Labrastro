@@ -19,8 +19,14 @@ FROM node:22-bookworm-slim AS node-runtime
 
 FROM python:3.12-slim
 
+ARG LABRASTRO_BUILD_REVISION=unknown
+
+LABEL org.opencontainers.image.title="labrastro-host" \
+    org.opencontainers.image.revision="${LABRASTRO_BUILD_REVISION}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LABRASTRO_BUILD_REVISION="${LABRASTRO_BUILD_REVISION}"
 
 WORKDIR /app
 
@@ -48,12 +54,15 @@ COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 COPY docker/config.host.yaml /app/docker/config.host.yaml.template
 COPY --from=peer-builder /out /app/artifacts/remote
 
+RUN python -c "from pathlib import Path; p = Path('/app/docker/entrypoint.sh'); data = p.read_bytes().replace(b'\r\n', b'\n').replace(b'\r', b'\n'); data = data[3:] if data.startswith(b'\xef\xbb\xbf') else data; p.write_bytes(data)" \
+    && chmod +x /app/docker/entrypoint.sh \
+    && printf '%s\n' "$LABRASTRO_BUILD_REVISION" > /app/BUILD_REVISION
+
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir --index-url https://pypi.org/simple . \
     && SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
     && mkdir -p "${SITE_PACKAGES}/artifacts" \
     && ln -sfn /app/artifacts/remote "${SITE_PACKAGES}/artifacts/remote" \
-    && chmod +x /app/docker/entrypoint.sh \
     && mkdir -p /app/.rcoder
 
 CMD ["/app/docker/entrypoint.sh"]

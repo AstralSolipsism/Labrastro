@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        LABRASTRO_BUILD_REVISION: ${LABRASTRO_BUILD_REVISION:-unknown}
     image: labrastro-host:test
     container_name: labrastro-host
     restart: unless-stopped

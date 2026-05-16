@@ -64,6 +64,7 @@ SOURCE_EXCLUDES = [
     "dist/**",
     "build/**",
     "node_modules/**",
+    ".deploy-revision",
 ]
 
 REQUIRED_TABLES = [
@@ -159,8 +160,32 @@ def should_exclude(rel: str) -> bool:
     return False
 
 
+def discover_source_revision(repo_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result and result.returncode == 0:
+        revision = result.stdout.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+            return revision.lower()
+    revision_file = repo_root / ".deploy-revision"
+    if revision_file.exists():
+        revision = revision_file.read_text(encoding="utf-8", errors="replace").strip()
+        if revision:
+            return revision
+    return "unknown"
+
+
 def create_source_archive(repo_root: Path, timestamp: str, out_dir: Path) -> Path:
     archive_path = out_dir / f"labrastro-src-{timestamp}.tgz"
+    revision = discover_source_revision(repo_root)
     with tarfile.open(archive_path, "w:gz") as tar:
         for path in sorted(repo_root.rglob("*")):
             rel = path.relative_to(repo_root).as_posix()
@@ -169,6 +194,12 @@ def create_source_archive(repo_root: Path, timestamp: str, out_dir: Path) -> Pat
             if path.is_dir():
                 continue
             tar.add(path, arcname=rel, recursive=False)
+        data = (revision + "\n").encode("utf-8")
+        info = tarfile.TarInfo(".deploy-revision")
+        info.size = len(data)
+        info.mode = 0o644
+        info.mtime = time.time()
+        tar.addfile(info, io.BytesIO(data))
     return archive_path
 
 
@@ -317,6 +348,7 @@ class ServerRunner:
         self.config_path: Path | None = None
         self.compose_path: Path | None = None
         self.compose_service = ""
+        self.source_revision = "unknown"
         self.host_url = "http://127.0.0.1:8765"
         self.original_agent_settings: dict[str, Any] = {}
         self.worker_proc: subprocess.Popen[str] | None = None
@@ -397,6 +429,7 @@ class ServerRunner:
         args: list[str],
         *,
         check: bool = True,
+        env: dict[str, str] | None = None,
         timeout: int | None = None,
     ) -> CommandResult:
         argv = ["docker", "compose", "-f", str(self.compose_path)]
@@ -404,7 +437,7 @@ class ServerRunner:
         if input_text:
             argv.extend(["-f", "-"])
         argv.extend(args)
-        return self.run_cmd(argv, check=check, timeout=timeout, input_text=input_text)
+        return self.run_cmd(argv, check=check, env=env, timeout=timeout, input_text=input_text)
 
     def http_json(
         self,
@@ -870,6 +903,13 @@ class ServerRunner:
         if src.exists():
             self.bash(f"mv {q(src)} {q(previous)}", timeout=120)
         self.bash(f"mv {q(stage)} {q(src)}", timeout=120)
+        revision_file = src / ".deploy-revision"
+        if revision_file.exists():
+            self.source_revision = (
+                revision_file.read_text(encoding="utf-8", errors="replace").strip()
+                or "unknown"
+            )
+        build_env = {"LABRASTRO_BUILD_REVISION": self.source_revision}
         base_dockerfile = src / "docker" / "Dockerfile"
         if base_dockerfile.exists():
             base_image = "labrastro-host:test"
@@ -885,6 +925,8 @@ class ServerRunner:
                 [
                     "docker",
                     "build",
+                    "--build-arg",
+                    f"LABRASTRO_BUILD_REVISION={self.source_revision}",
                     "-t",
                     base_image,
                     "-f",
@@ -893,9 +935,17 @@ class ServerRunner:
                 ],
                 timeout=1800,
             )
-            self.record_step("build_base_image", image=base_image)
-        self.run_compose(["build", self.compose_service], timeout=1800)
-        self.record_step("deploy_source", compose_service=self.compose_service)
+            self.record_step(
+                "build_base_image",
+                image=base_image,
+                revision=self.source_revision,
+            )
+        self.run_compose(["build", self.compose_service], env=build_env, timeout=1800)
+        self.record_step(
+            "deploy_source",
+            compose_service=self.compose_service,
+            revision=self.source_revision,
+        )
 
     def start_host(self) -> None:
         self.run_compose(["up", "-d", self.compose_service], timeout=300)

@@ -1,9 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
+import tarfile
 from types import SimpleNamespace
 
-from scripts.runtime_e2e_smoke import DEFAULT_SMOKE_DATABASE, REQUIRED_TABLES, ServerRunner
+from scripts.runtime_e2e_smoke import (
+    DEFAULT_SMOKE_DATABASE,
+    REQUIRED_TABLES,
+    ServerRunner,
+    create_source_archive,
+)
 
 
 def _args(tmp_path: Path, *, database_name: str | None = None) -> SimpleNamespace:
@@ -48,3 +54,26 @@ def test_required_tables_match_current_taskflow_snapshot_schema() -> None:
     assert "labrastro_taskflow_states" in REQUIRED_TABLES
     assert "labrastro_taskflow_events" in REQUIRED_TABLES
     assert "labrastro_taskflow_goals" not in REQUIRED_TABLES
+
+
+def test_source_archive_embeds_deploy_revision(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".deploy-revision").write_text("abc123\n", encoding="utf-8")
+    (repo / ".git").mkdir()
+    (repo / ".git" / "HEAD").write_text("ignored", encoding="utf-8")
+    (repo / "docker").mkdir()
+    (repo / "docker" / "entrypoint.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (repo / "README.md").write_text("demo\n", encoding="utf-8")
+
+    archive = create_source_archive(repo, "20260516T000000Z", tmp_path)
+
+    with tarfile.open(archive, "r:gz") as tar:
+        names = set(tar.getnames())
+        revision = tar.extractfile(".deploy-revision")
+        assert revision is not None
+        revision_text = revision.read().decode("utf-8")
+
+    assert ".deploy-revision" in names
+    assert ".git/HEAD" not in names
+    assert revision_text == "abc123\n"

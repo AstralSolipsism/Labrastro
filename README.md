@@ -132,9 +132,12 @@ LABRASTRO_SANDBOX_HOST_BASE_URL=http://labrastro-host:8765
 `LABRASTRO_SUPERADMIN_PASSWORD` 是后台登录明文密码。模型 Provider 与模型 Profile 可在前端 Admin 配置中维护，不需要作为 Docker 启动必填项。启动 Host：
 
 ```bash
+export LABRASTRO_BUILD_REVISION="$(git rev-parse HEAD 2>/dev/null || cat .deploy-revision 2>/dev/null || echo unknown)"
 docker compose up -d --build
 docker compose logs -f labrastro-host
 ```
+
+镜像会写入 `org.opencontainers.image.revision` label，并在容器内生成 `/app/BUILD_REVISION`。`docker/entrypoint.sh` 会在镜像构建阶段统一去除 CRLF/BOM 并设置可执行位，避免 Windows 打包或传输后导致容器入口脚本无法执行。
 
 Docker compose 不再提供内置 Postgres overlay，也不会自己拉起数据库容器。完整控制面验证必须通过 `.env` 中的 `LABRASTRO_DATABASE_URL` 显式指向已有 Postgres。
 
