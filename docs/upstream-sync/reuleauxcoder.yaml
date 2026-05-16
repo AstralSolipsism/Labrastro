@@ -1,0 +1,334 @@
+schema_version: 1
+upstream:
+  repo: RC-CHN/ReuleauxCoder
+  branch: main
+  fetched_ref: refs/remotes/upstream/main
+  last_reviewed_commit: "b570877f7634bcb70add41ac925282792a91e11d"
+  last_reviewed_short: "b570877"
+  reviewed_at: 2026-05-16
+local:
+  repo: AstralSolipsism/ReuleauxCoder
+  branch: main
+  head_commit: "45bcbcf6bc28b8d0f21f819b140bb6d643abab4d"
+  head_short: "45bcbcf"
+notes:
+  - Git ancestry and patch-id are not authoritative for this fork after local rewrites.
+  - Use entries.status plus local_commits as the maintained upstream-sync source of truth.
+  - Future upstream ports should add commit trailers: Upstream-Origin, Upstream-Status, Upstream-Local-Mode.
+status_legend:
+  merged: Upstream change was brought in by a merge or patch-equivalent commit.
+  ported: Upstream behavior was manually ported with local commit IDs listed.
+  superseded: Upstream behavior was absorbed and then replaced by a local architecture or product decision.
+  partial: Some behavior exists locally, but the upstream change is not fully represented.
+  pending: Not yet ported or intentionally evaluated.
+  deferred: Reviewed and intentionally deferred to a later design or port phase.
+  skipped: Reviewed and intentionally not needed.
+entries:
+  - upstream: "f998d0d4def1b7d7523741fa9eee5865477ae8de"
+    short: "f998d0d"
+    date: 2026-04-29
+    title: "refactor(approval): unify approval infrastructure with handler model"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "7a310472de67d419b6faeeba4bf9a6b974a0098a"
+    short: "7a31047"
+    date: 2026-04-29
+    title: "refactor(interfaces): add queued delivery to UIEventBus, remove AgentChannels"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "505e82a33f961ed7f01090859117cacbd7babb1f"
+    short: "505e82a"
+    date: 2026-04-29
+    title: "refactor(interfaces): move approval_preview from domain/ to interfaces/shared/"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "8d08548dabe191f676c058cf48ce6a954a9e04fc"
+    short: "8d08548"
+    date: 2026-04-29
+    title: "refactor(approval): add judge middleware and unify sub-agent provider"
+    status: merged
+    local_commits: ["e23231d", "def356c"]
+    notes: "Merged through v0.2.9 line; local equivalent commit also exists."
+  - upstream: "30f75c4d5f3270d3cb4d2110a10a807e58fa6fb1"
+    short: "30f75c4"
+    date: 2026-04-29
+    title: "fix(cli): stop double-truncating already-wrapped tool output in renderer"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "c6a459174b521f9f445452a1ec1dd760a1ceede8"
+    short: "c6a4591"
+    date: 2026-04-29
+    title: "fix(cli): use markdown-it block parser to prevent streaming code-fence splits"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "dc8cb520588e5d2de3d1dfce31044d5472d6e42e"
+    short: "dc8cb52"
+    date: 2026-04-29
+    title: "feat(cli): show total line count in non-truncated compact output"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "08f18d306b092d8ba55db33ce33984222bda6ee7"
+    short: "08f18d3"
+    date: 2026-04-29
+    title: "test(cli): adapt paragraph-flush test to markdown-it block commitment"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9."
+  - upstream: "a165392c7dbc8a63ba1cd5b4e8b6923a56ebd75c"
+    short: "a165392"
+    date: 2026-04-29
+    title: "chore: bump version to v0.2.9"
+    status: merged
+    local_commits: ["e23231d", "ceafc9c"]
+    notes: "Version-line merge marker only."
+  - upstream: "93b62836c5954c220ccba18c524afb0679983796"
+    short: "93b6283"
+    date: 2026-04-29
+    title: "doc: update AGENT.md"
+    status: merged
+    local_commits: ["e23231d"]
+    notes: "Covered by local merge of upstream v0.2.9; local AGENT.md has fork-specific additions."
+  - upstream: "4e5b29f8990e6da128f3d56b4a5e335e880172b1"
+    short: "4e5b29f"
+    date: 2026-05-05
+    title: "doc: update readme.md"
+    status: superseded
+    local_commits: ["dde129d", "e1379a1", "3b4e654"]
+    notes: "Upstream README text is replaced by local Labrastro/EZCode positioning docs."
+  - upstream: "9d1d924688ffd2d50fdae5dd833cc0a3a5605b68"
+    short: "9d1d924"
+    date: 2026-05-05
+    title: "refactor(agent-tool): unify task/tasks into single tasks array parameter"
+    status: superseded
+    local_commits: ["a9c210b", "2a6a507", "7232655"]
+    notes: "Initially ported as tasks-array agent tool, then replaced by delegate_agent over durable AgentRun."
+  - upstream: "629e35688867b160856a191c39e5e06e51dee225"
+    short: "629e356"
+    date: 2026-05-05
+    title: "fix(agent): defer sub-agent injection when pending tool calls exist"
+    status: superseded
+    local_commits: ["20f7ebb", "2a6a507"]
+    notes: "Buffered injection was ported, then old sub-agent injection was removed by AgentRun delegation."
+  - upstream: "8e9d9e6e76059e6866e11d0936b3ce3d30d10b68"
+    short: "8e9d9e6"
+    date: 2026-05-05
+    title: "feat(ci): add Windows runner to CI matrix and harden cross-platform shell execution"
+    status: ported
+    local_commits: ["cfdec34", "84b7dc2"]
+    notes: "Split into Windows CI matrix and stronger shell/platform implementation with tests."
+  - upstream: "cef3a6342514b8a2cb63d4e14e41fac2bc6e5adf"
+    short: "cef3a63"
+    date: 2026-05-05
+    title: "tests: fix Path.home() detection on Windows in tool_output test"
+    status: ported
+    local_commits: ["84b7dc2", "c0038e9"]
+    notes: "Current test patches Path.home directly and has Windows-safe normalization."
+  - upstream: "28aba93cbf2e1beb088d2159eb050e162cf04e45"
+    short: "28aba93"
+    date: 2026-05-05
+    title: "chore: bump version to v0.2.10"
+    status: skipped
+    local_commits: []
+    notes: "Fork version line has diverged; track upstream capability status instead of upstream package version."
+  - upstream: "5794cd850b6679c145786091079f6d8bb60247da"
+    short: "5794cd8"
+    date: 2026-05-13
+    title: "refactor(context): reduce snip protection window to 2 rounds"
+    status: ported
+    local_commits: ["45bcbcf"]
+    notes: "Default is now 2 and snip protection is based on recent assistant tool-call rounds."
+  - upstream: "950727b90c0d5ce8d4d41e1ecf8dd81122f01f5a"
+    short: "950727b"
+    date: 2026-05-13
+    title: "feat(context): add list_file tool"
+    status: ported
+    local_commits: ["ba3383c"]
+    notes: "Added Python builtin list_file, remote relay dispatch, Go peer support/features, approval allow-list, and tests."
+  - upstream: "a2b730089b3179ecf447588119652714e6428e0f"
+    short: "a2b7300"
+    date: 2026-05-13
+    title: "fix(llm): sync hook-modified messages to API request params"
+    status: ported
+    local_commits: ["afb1905"]
+    notes: "Local provider request path rebuilds request messages/tools after hook transforms."
+  - upstream: "88e457d55c969f4971b9a20ceffa8acb6a51a7fb"
+    short: "88e457d"
+    date: 2026-05-13
+    title: "feat(session): show both first and last message in session preview"
+    status: pending
+    local_commits: []
+    notes: "CLI/session-list UX improvement; deferred to a later session/frontend experience batch."
+  - upstream: "86238008b68162ef46d1b7a62863c61470e0e2fe"
+    short: "8623800"
+    date: 2026-05-13
+    title: "feat(list_file): escape markdown-sensitive chars in file names"
+    status: ported
+    local_commits: ["ba3383c"]
+    notes: "Included in list_file port; Markdown-sensitive filename characters are escaped in Python and Go outputs."
+  - upstream: "ac21249de460d0f134dc0febbe20d4f63dba8788"
+    short: "ac21249"
+    date: 2026-05-13
+    title: "fix(context): fix UI reporting stale token counts after snip"
+    status: ported
+    local_commits: ["45bcbcf"]
+    notes: "Snip clears per-message token cache; last_compact and UI after-token counts now use compressed real-time context totals."
+  - upstream: "613f8d37e51178364e2fac0efcac1896d46a23f0"
+    short: "613f8d3"
+    date: 2026-05-13
+    title: "chore: bump version to v0.2.11"
+    status: skipped
+    local_commits: []
+    notes: "Version-line marker only."
+  - upstream: "4db57d849f649d001fbb218576cc990baaf183a4"
+    short: "4db57d8"
+    date: 2026-05-14
+    title: "fix(llm): repair reasoning-only assistant messages"
+    status: ported
+    local_commits: ["45bcbcf"]
+    notes: "Reasoning-only non-tool assistant messages now receive a non-empty placeholder while tool-call assistant content can stay null."
+  - upstream: "6eb9e2fac3e0ab2e289eee58540cc724333ccc3a"
+    short: "6eb9e2f"
+    date: 2026-05-14
+    title: "docs(tools): recommend list_file over shell ls in tool description"
+    status: ported
+    local_commits: ["ba3383c"]
+    notes: "list_file tool description recommends using it first for project structure and path exploration."
+  - upstream: "560151994e595cc6761547d42787fd0b7a42b2cc"
+    short: "5601519"
+    date: 2026-05-15
+    title: "feat(lsp): add core data types, registry, and config"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; design must cover host/peer workspace location and remote-aware paths."
+  - upstream: "38553bef41dbbba5cd24de0935894a4d2e751689"
+    short: "38553be"
+    date: 2026-05-15
+    title: "feat(lsp): add LSP client, manager, and diagnostic hooks"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; diagnostic hooks need remote peer workspace and lifecycle design first."
+  - upstream: "df5943581e5c3f3b375cbc15eaedee3a49b810cd"
+    short: "df59435"
+    date: 2026-05-15
+    title: "feat(lsp): wire LSP infrastructure into AppRunner"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; runner wiring conflicts with Labrastro server and remote peer control paths."
+  - upstream: "6ca16288f38efa12bc864b8427674d1ddb12be27"
+    short: "6ca1628"
+    date: 2026-05-15
+    title: "feat(lsp): wire LSP infrastructure into AppRunner with visible startup feedback"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase with startup feedback design after host/peer placement is decided."
+  - upstream: "e8f12ae1609acf8fc834d22dceae493429591060"
+    short: "e8f12ae"
+    date: 2026-05-15
+    title: "fix(lsp): consolidate startup messages and reduce log noise"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; logging policy depends on final server/peer lifecycle ownership."
+  - upstream: "336021ca7749b5c31628f6cae2d11b9d11bbbaff"
+    short: "336021c"
+    date: 2026-05-15
+    title: "fix(lsp): start pyright language server correctly"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; language server launch location must be designed for remote peer workspaces."
+  - upstream: "f4474f9e91487be7c7358184a2032d2eec097e8a"
+    short: "f4474f9"
+    date: 2026-05-15
+    title: "test(lsp): add opt-in real server diagnostics smoke tests"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; smoke tests should target the chosen host/peer topology."
+  - upstream: "06604ee1053a0ebfd4a312eb2584f08e3e0e65c5"
+    short: "06604ee"
+    date: 2026-05-15
+    title: "fix(lsp): own subprocess lifecycle in worker loop"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; subprocess cleanup belongs with final lifecycle ownership."
+  - upstream: "e4f88fa3293e966d53426e65fded46178103d447"
+    short: "e4f88fa"
+    date: 2026-05-15
+    title: "feat(lsp): inject diagnostics immediately after file edits"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; diagnostic injection timing depends on remote edit and LSP visibility design."
+  - upstream: "9d065a9f98cffe057146021f56e33e341f399b89"
+    short: "9d065a9"
+    date: 2026-05-15
+    title: "style: format code"
+    status: skipped
+    local_commits: []
+    notes: "Formatting-only upstream commit; do not port as a standalone change."
+  - upstream: "a731858d1fe85f733a03eacdbac8a8117373085c"
+    short: "a731858"
+    date: 2026-05-15
+    title: "fix: Retrieve the exception so asyncio does not warn about"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; async cleanup is part of LSP lifecycle design."
+  - upstream: "d4f063d144c84d5c7c46fd8b45a9758300217104"
+    short: "d4f063d"
+    date: 2026-05-15
+    title: "refactor(lsp): remove dead main-thread spawn paths, harden shutdown"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; shutdown ownership must align with host/peer placement."
+  - upstream: "ee9b9b25b380f361beb756f35216fc9413f03a1f"
+    short: "ee9b9b2"
+    date: 2026-05-15
+    title: "fix(lsp): normalise workspace-relative paths to forward slashes"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; important input to Windows and remote path normalization design."
+  - upstream: "090aa00bdadaa4891b72064a9ad03dcbb98ce35b"
+    short: "090aa00"
+    date: 2026-05-15
+    title: "feat(lsp): add active LSP tools (goToDefinition, findReferences, documentSymbol)"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; high-value tools should be added after read-only permission and path design."
+  - upstream: "452868fce2bfc1bb680dad353fb228bbbf7b4097"
+    short: "452868f"
+    date: 2026-05-15
+    title: "docs: document LSP support and add default-allow rule for lsp tool"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; default-allow should wait until the lsp tool exists locally."
+  - upstream: "4cc7cbb87dfa3b8e095dfe0a922e5a44bf18e8da"
+    short: "4cc7cbb"
+    date: 2026-05-15
+    title: "doc: update AGENT.md"
+    status: pending
+    local_commits: []
+    notes: "Documentation update; review after deciding LSP/list_file port scope."
+  - upstream: "2025c9e8c4d2acaeb7388905605d40fd13c248e4"
+    short: "2025c9e"
+    date: 2026-05-15
+    title: "fix(test): Convert file:// URI to a path string (always forward slashes)"
+    status: deferred
+    local_commits: []
+    notes: "Deferred to next LSP phase; test helper belongs with remote-aware LSP path handling."
+  - upstream: "cd5ec1b6162d3080a0ed9918afa676cfd882b7f3"
+    short: "cd5ec1b"
+    date: 2026-05-15
+    title: "chore: bump version to v0.3.0"
+    status: skipped
+    local_commits: []
+    notes: "Version-line marker only."
+  - upstream: "b570877f7634bcb70add41ac925282792a91e11d"
+    short: "b570877"
+    date: 2026-05-15
+    title: "style: format code"
+    status: skipped
+    local_commits: []
+    notes: "Formatting-only upstream commit; do not port as a standalone change."
