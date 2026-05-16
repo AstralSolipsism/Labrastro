@@ -1394,6 +1394,9 @@ class Config:
     # Remote execution settings
     remote_exec: RemoteExecConfig = field(default_factory=RemoteExecConfig)
 
+    # Language Server Protocol settings
+    lsp: dict[str, Any] = field(default_factory=dict)
+
     # Remote host authentication settings
     auth: AuthConfig = field(default_factory=AuthConfig)
 

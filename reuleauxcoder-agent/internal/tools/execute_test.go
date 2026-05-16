@@ -404,6 +404,28 @@ func TestListFileFiltersDotfilesPatternAndSingleFile(t *testing.T) {
 	}
 }
 
+func TestExecuteLSPRejectsUnsupportedFileTypeBeforeStartingServer(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName: "lsp",
+		Args: map[string]any{
+			"operation": "documentSymbol",
+			"filePath":  "notes.txt",
+		},
+	}, dir, nil)
+
+	if result.OK || result.ErrorCode != "REMOTE_LSP_ERROR" {
+		t.Fatalf("result = %#v, want REMOTE_LSP_ERROR", result)
+	}
+	if !strings.Contains(result.ErrorMessage, "unsupported file type") {
+		t.Fatalf("error = %q, want unsupported file type", result.ErrorMessage)
+	}
+}
+
 func TestExecuteArchivesLongOutputUnderWorkspaceRoot(t *testing.T) {
 	cwd := t.TempDir()
 	workspaceRoot := t.TempDir()

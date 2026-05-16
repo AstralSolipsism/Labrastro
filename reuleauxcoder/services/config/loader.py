@@ -367,6 +367,7 @@ class ConfigLoader:
         context_config = data.get("context", {})
         memory_config = data.get("memory", {})
         remote_exec_config = data.get("remote_exec", {})
+        lsp_config = data.get("lsp", {})
         auth_config = data.get("auth", {})
         agent_registry_config = data.get("agent_registry", {})
         runtime_profiles_config = data.get("runtime_profiles", {})
@@ -585,6 +586,7 @@ class ConfigLoader:
                 ),
                 shell_timeout_sec=int(remote_exec_config.get("shell_timeout_sec", 120)),
             ),
+            lsp=lsp_config if isinstance(lsp_config, dict) else {},
             auth=AuthConfig.from_dict(
                 auth_config if isinstance(auth_config, dict) else {}
             ),

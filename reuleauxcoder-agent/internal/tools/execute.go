@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RC-CHN/ReuleauxCoder/reuleauxcoder-agent/internal/lsp"
 	"github.com/RC-CHN/ReuleauxCoder/reuleauxcoder-agent/internal/protocol"
 )
 
@@ -65,11 +66,24 @@ func ExecuteWithContext(
 		result = grepFiles(req.Args, cwd)
 	case "list_file":
 		result = listFile(req.Args, cwd)
+	case "lsp":
+		result = lspTool(req.Args, cwd)
 	default:
 		result = errorResult("REMOTE_TOOL_ERROR", fmt.Sprintf("unsupported tool %q", req.ToolName))
 	}
+	if result.OK && (req.ToolName == "write_file" || req.ToolName == "edit_file") {
+		result = appendLSPDiagnostics(result, req.Args, cwd)
+	}
 	result = prependWarning(result, staleWarning)
 	return finalizeToolResult(req, result, workspaceRoot)
+}
+
+func LSPAvailable() bool {
+	return lsp.Available()
+}
+
+func ShutdownLSP() {
+	lsp.ShutdownDefault()
 }
 
 func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPreviewResult {
@@ -521,6 +535,27 @@ func editFile(args map[string]any, cwd string, expectedState map[string]any) pro
 		result += "\n" + mutation.diff
 	}
 	return protocol.ExecToolResult{OK: true, Result: result}
+}
+
+func lspTool(args map[string]any, cwd string) protocol.ExecToolResult {
+	result, err := lsp.ExecuteOperation(args, cwd)
+	if err != nil {
+		return errorResult("REMOTE_LSP_ERROR", err.Error())
+	}
+	return protocol.ExecToolResult{OK: true, Result: result}
+}
+
+func appendLSPDiagnostics(result protocol.ExecToolResult, args map[string]any, cwd string) protocol.ExecToolResult {
+	filePath, _ := args["file_path"].(string)
+	if strings.TrimSpace(filePath) == "" {
+		return result
+	}
+	diagnostics := lsp.DiagnosticsAfterEdit(filePath, cwd)
+	if strings.TrimSpace(diagnostics) == "" {
+		return result
+	}
+	result.Result = strings.TrimRight(result.Result, "\n") + "\n\n" + diagnostics
+	return result
 }
 
 type fileState struct {

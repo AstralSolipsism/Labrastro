@@ -74,6 +74,8 @@ def discover_hook_specs() -> list[HookSpec]:
         MemoryContextHook,
         MemorySessionSaveHook,
         MemoryToolCaptureHook,
+        LspDiagnosticInjectorHook,
+        LspEditObserverHook,
         ToolOutputTruncationHook,
         ToolPolicyGuardHook,
         ProjectContextHook,

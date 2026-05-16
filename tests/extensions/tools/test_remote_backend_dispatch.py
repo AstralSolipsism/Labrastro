@@ -20,6 +20,7 @@ from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
 from reuleauxcoder.extensions.tools.builtin.glob import GlobTool
 from reuleauxcoder.extensions.tools.builtin.grep import GrepTool
 from reuleauxcoder.extensions.tools.builtin.list_file import ListFileTool
+from reuleauxcoder.extensions.tools.builtin.lsp import LspTool
 from reuleauxcoder.extensions.tools.builtin.read import ReadFileTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
 from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
@@ -138,6 +139,40 @@ class TestRemoteBackendDispatch:
 
             result = tool.execute(path="/tmp", pattern=123)
             assert "must be a string" in result.lower()
+        finally:
+            srv.stop()
+
+    def test_lsp_no_peer(self) -> None:
+        srv = RelayServer()
+        srv.start()
+        try:
+            backend = RemoteRelayToolBackend(relay_server=srv)
+            tool = LspTool(backend=backend)
+            result = tool.execute(operation="documentSymbol", filePath="main.py")
+            assert "no remote peer" in result.lower()
+        finally:
+            srv.stop()
+
+    def test_lsp_requires_peer_feature(self) -> None:
+        srv = RelayServer()
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import RegisterRequest
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                    features=["read_file"],
+                )
+            )
+            backend = RemoteRelayToolBackend(relay_server=srv)
+            backend.context.peer_id = resp.peer_id
+            tool = LspTool(backend=backend)
+
+            result = tool.execute(operation="documentSymbol", filePath="main.py")
+
+            assert "does not advertise lsp support" in result.lower()
         finally:
             srv.stop()
 

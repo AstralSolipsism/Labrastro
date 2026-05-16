@@ -118,6 +118,7 @@ BUILTIN_TOOL_NAMES = {
     "glob",
     "grep",
     "list_file",
+    "lsp",
     "agent",
 }
 

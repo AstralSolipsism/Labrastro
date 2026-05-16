@@ -38,3 +38,24 @@ func TestAttachToolCallIDToStreamChunk(t *testing.T) {
 		t.Fatalf("chunk meta = %#v, want tool_call_id", chunk.Meta)
 	}
 }
+
+func TestBaseFeaturesAdvertisesLSPOnlyWhenAvailable(t *testing.T) {
+	withLSP := baseFeatures(true)
+	withoutLSP := baseFeatures(false)
+
+	if !containsFeature(withLSP, "lsp") {
+		t.Fatalf("features = %#v, want lsp", withLSP)
+	}
+	if containsFeature(withoutLSP, "lsp") {
+		t.Fatalf("features = %#v, want no lsp", withoutLSP)
+	}
+}
+
+func containsFeature(features []string, target string) bool {
+	for _, feature := range features {
+		if feature == target {
+			return true
+		}
+	}
+	return false
+}

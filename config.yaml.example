@@ -46,7 +46,7 @@ modes:
   profiles:
     planner:
       description: "Planning-first mode; keep implementation changes minimal unless asked."
-      tools: ["read_file", "glob", "grep"]
+      tools: ["read_file", "list_file", "glob", "grep", "lsp"]
       prompt_append: "Focus on architecture, trade-offs, and actionable implementation plans."
 
 approval:
@@ -59,6 +59,8 @@ approval:
     - tool_name: "grep"
       action: "allow"
     - tool_name: "list_file"
+      action: "allow"
+    - tool_name: "lsp"
       action: "allow"
     - tool_name: "write_file"
       action: "require_approval"
@@ -112,6 +114,17 @@ approval:
 #   heartbeat_timeout_sec: 30
 #   default_tool_timeout_sec: 30
 #   shell_timeout_sec: 120
+#
+# lsp:
+#   enabled: true
+#   poll_timeout_ms: 5000
+#   max_diagnostics: 20
+#   include_warnings: false
+#   # servers:
+#   #   python:
+#   #     cmd: "npx"
+#   #     args: ["-y", "--package", "pyright", "pyright-langserver", "--stdio"]
+#   #     workspace_root: "."
 #
 # auth:
 #   enabled: true

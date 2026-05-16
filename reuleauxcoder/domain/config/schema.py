@@ -136,6 +136,20 @@ CONFIG_SCHEMA = {
         "default_tool_timeout_sec": "int (default: 30)",
         "shell_timeout_sec": "int (default: 120)",
     },
+    "lsp": {
+        "enabled": "bool (default: true)",
+        "poll_timeout_ms": "int (default: 5000)",
+        "max_diagnostics": "int (default: 20)",
+        "include_warnings": "bool (default: false)",
+        "servers": {
+            "language": {
+                "cmd": "string (optional, language-server executable override)",
+                "args": "list of strings (optional)",
+                "workspace_root": "string (optional)",
+                "init_opts": "dict (optional)",
+            }
+        },
+    },
     "auth": {
         "enabled": "bool (required for remote host mode)",
         "token_secret": "string (required when auth.enabled=true)",
@@ -279,7 +293,7 @@ BUILTIN_MODES = {
     },
     "planner": {
         "description": "Planning-first mode; focus on analysis and implementation plans.",
-        "tools": ["read_file", "glob", "grep"],
+        "tools": ["read_file", "list_file", "glob", "grep", "lsp"],
         "prompt_append": (
             "Focus on analysis, architecture, and step-by-step plans. Avoid file mutations "
             "unless explicitly requested."
@@ -287,7 +301,7 @@ BUILTIN_MODES = {
     },
     "debugger": {
         "description": "Debugging mode focused on diagnosis and verification.",
-        "tools": ["read_file", "glob", "grep", "shell"],
+        "tools": ["read_file", "list_file", "glob", "grep", "lsp", "shell"],
         "prompt_append": (
             "Focus on root-cause analysis, minimal repro steps, and targeted fixes with "
             "clear verification."
@@ -295,7 +309,7 @@ BUILTIN_MODES = {
     },
     "taskflow": {
         "description": "Background long-task planning and dispatch mode.",
-        "tools": ["read_file", "glob", "grep"],
+        "tools": ["read_file", "list_file", "glob", "grep", "lsp"],
         "prompt_append": (
             "Guide the user from a fuzzy goal into decisions, acceptance criteria, "
             "issue drafts, task drafts, dispatch, and completion review."
@@ -318,6 +332,7 @@ DEFAULTS = {
         {"tool_name": "glob", "action": "allow"},
         {"tool_name": "grep", "action": "allow"},
         {"tool_name": "list_file", "action": "allow"},
+        {"tool_name": "lsp", "action": "allow"},
         {"tool_name": "write_file", "action": "require_approval"},
         {"tool_name": "edit_file", "action": "require_approval"},
         {"tool_name": "shell", "action": "require_approval"},

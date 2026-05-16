@@ -11,6 +11,8 @@ from reuleauxcoder.domain.hooks.builtin.memory_context import (
     MemorySessionSaveHook,
     MemoryToolCaptureHook,
 )
+from reuleauxcoder.domain.hooks.builtin.lsp_edit_observer import LspEditObserverHook
+from reuleauxcoder.domain.hooks.builtin.lsp_injector import LspDiagnosticInjectorHook
 
 __all__ = [
     "ToolOutputTruncationHook",
@@ -20,4 +22,6 @@ __all__ = [
     "MemoryContextHook",
     "MemorySessionSaveHook",
     "MemoryToolCaptureHook",
+    "LspEditObserverHook",
+    "LspDiagnosticInjectorHook",
 ]

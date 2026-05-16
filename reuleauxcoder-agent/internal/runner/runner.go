@@ -78,7 +78,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		workspaceRoot = cwd
 	}
 
-	features := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "list_file", "tool_preview"}
+	features := baseFeatures(tools.LSPAvailable())
 	hostInfo := map[string]any{
 		"os":       runtimeOS(),
 		"arch":     runtimeArch(),
@@ -134,6 +134,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if r.mcp != nil {
 			r.mcp.Stop()
 		}
+		tools.ShutdownLSP()
 		disconnectCtx, cancelDisconnect := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelDisconnect()
 		_ = r.client.Disconnect(disconnectCtx, protocol.DisconnectRequest{
@@ -171,6 +172,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	return r.runPollLoop(childCtx, registerResp.PeerToken, cwd, workspaceRoot, pollInterval)
+}
+
+func baseFeatures(lspAvailable bool) []string {
+	features := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "list_file", "tool_preview"}
+	if lspAvailable {
+		features = append(features, "lsp")
+	}
+	return features
 }
 
 func writePeerInfoFile(path string, resp protocol.RegisterResponse) error {

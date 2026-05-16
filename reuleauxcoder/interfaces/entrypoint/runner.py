@@ -37,6 +37,8 @@ from reuleauxcoder.extensions.mcp.manager import MCPManager
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
 from labrastro_server.relay.server import RelayServer
+from reuleauxcoder.extensions.lsp.config import LspConfig
+from reuleauxcoder.extensions.lsp.manager import LspManager
 from reuleauxcoder.extensions.skills.service import SkillsService
 from reuleauxcoder.interfaces.entrypoint.dependencies import (
     AppContext,
@@ -67,6 +69,7 @@ class AppRunner:
         self._mcp_manager: MCPManager | None = None
         self._relay_server: RelayServer | None = None
         self._relay_http_service: RemoteRelayHTTPService | None = None
+        self._lsp_manager: LspManager | None = None
 
     def initialize(self) -> AppContext:
         """Initialize all application components and return context."""
@@ -156,6 +159,7 @@ class AppRunner:
         agent.context._ui_bus = ui_bus
 
         self._register_hooks(agent, config)
+        self._init_lsp(config, agent, ui_bus)
         self._wire_agent_tool_parent(agent)
         return config, ui_bus, llm, agent
 
@@ -171,6 +175,46 @@ class AppRunner:
         hooks = instantiate_hooks(specs, config)
         for hook_point, hook in hooks:
             agent.register_hook(hook_point, hook)
+
+    def _init_lsp(self, config: Config, agent: Agent, ui_bus: UIEventBus) -> None:
+        """Initialize host-side LSP for local execution."""
+        lsp_config = LspConfig.from_config(config)
+        if not lsp_config.enabled:
+            self._set_lsp_tool_manager(None)
+            return
+        if self._relay_server is not None:
+            self._set_lsp_tool_manager(None)
+            ui_bus.info(
+                "LSP: remote execution will use peer-side LSP when the peer supports it.",
+                kind=UIEventKind.SYSTEM,
+            )
+            return
+
+        manager = LspManager(lsp_config, workspace_cwd=Path.cwd())
+        report = manager.health_check()
+        if report.available == 0:
+            ui_bus.info(
+                "LSP: no language servers found on PATH. Install pyright, rust-analyzer, gopls, etc. for diagnostics.",
+                kind=UIEventKind.SYSTEM,
+            )
+        else:
+            ready = ", ".join(
+                status.language for status in report.statuses if status.available
+            )
+            ui_bus.info(
+                f"LSP: {report.available}/{report.total} language servers ready: {ready}",
+                kind=UIEventKind.SYSTEM,
+            )
+
+        manager.start_worker()
+        self._lsp_manager = manager
+        setattr(agent, "lsp_manager", manager)
+        for hooks in agent.hook_registry._hooks.values():
+            for hook in hooks:
+                setter = getattr(hook, "set_lsp_manager", None)
+                if callable(setter):
+                    setter(manager)
+        self._set_lsp_tool_manager(manager)
 
     @staticmethod
     def _wire_agent_tool_parent(agent: Agent) -> None:
@@ -278,6 +322,21 @@ class AppRunner:
             self._mcp_manager.disconnect_all()
             self._mcp_manager.stop()
             self._mcp_manager = None
+        if self._lsp_manager:
+            self._lsp_manager.shutdown_all()
+            self._lsp_manager = None
+            self._set_lsp_tool_manager(None)
+
+    @staticmethod
+    def _set_lsp_tool_manager(manager: LspManager | None) -> None:
+        try:
+            from reuleauxcoder.extensions.tools.builtin.lsp import (
+                set_lsp_manager as set_lsp_tool_manager,
+            )
+
+            set_lsp_tool_manager(manager)
+        except Exception:
+            pass
 
     @staticmethod
     def _run_lifecycle_hooks(

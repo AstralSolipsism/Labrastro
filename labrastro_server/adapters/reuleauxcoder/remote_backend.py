@@ -43,11 +43,22 @@ class RemoteRelayToolBackend(ToolBackend):
         If no peer is explicitly selected, picks the single online peer (MVP).
         """
         peer_id = self.context.peer_id
+        peer = None
         if peer_id is None:
             peer = self.relay_server.registry.pick_default_peer()
             if peer is None:
                 return "Error: no remote peer is currently connected"
             peer_id = peer.peer_id
+        elif tool_name == "lsp":
+            peer = self.relay_server.registry.get(peer_id)
+
+        if tool_name == "lsp":
+            if peer is None:
+                peer = self.relay_server.registry.get(peer_id)
+            if peer is None:
+                return f"Error: peer '{peer_id}' is not online"
+            if "lsp" not in peer.features:
+                return f"Error: peer '{peer_id}' does not advertise LSP support"
 
         timeout = None
         if tool_name == "shell":
