@@ -112,9 +112,9 @@ def model_binding_settings(
         api_key=params.get("api_key") or getattr(fallback, "api_key", ""),
         base_url=params.get("base_url") or getattr(fallback, "base_url", None),
         temperature=params.get("temperature", getattr(fallback, "temperature", 0.0)),
-        max_tokens=params.get("max_tokens", getattr(fallback, "max_tokens", 4096)),
+        max_tokens=params.get("max_tokens", getattr(fallback, "max_tokens", 0)),
         max_context_tokens=params.get(
-            "max_context_tokens", getattr(fallback, "max_context_tokens", 128000)
+            "max_context_tokens", getattr(fallback, "max_context_tokens", 0)
         ),
         preserve_reasoning_content=params.get(
             "preserve_reasoning_content",

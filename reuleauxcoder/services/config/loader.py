@@ -51,6 +51,17 @@ class ConfigEnvironmentError(Exception):
     """Raised when config references a missing environment variable."""
 
 
+class DeprecatedConfigError(Exception):
+    """Raised when a config uses removed legacy configuration paths."""
+
+    def __init__(self, errors: list[str]):
+        self.errors = list(errors)
+        message = "Deprecated configuration paths are no longer supported:\n" + "\n".join(
+            f"  - {error}" for error in self.errors
+        )
+        super().__init__(message)
+
+
 class ConfigValidationError(Exception):
     """Raised when loaded config is structurally complete but invalid."""
 
@@ -74,7 +85,7 @@ class ConfigLoader:
     GLOBAL_CONFIG_PATH = Path.home() / ".rcoder" / "config.yaml"
     WORKSPACE_CONFIG_PATH = Path.cwd() / ".rcoder" / "config.yaml"
 
-    # LLM params that support active_profile → app_config → DEFAULTS priority.
+    # LLM params are derived only from the active model profile/provider pair.
     _LLM_PARAM_FIELDS = [
         "model",
         "api_key",
@@ -125,19 +136,6 @@ class ConfigLoader:
                                 f"providers.items.{provider_id}.{field}",
                             )
 
-        models = expanded.get("models", {})
-        if isinstance(models, dict):
-            profiles = models.get("profiles", {})
-            if isinstance(profiles, dict):
-                for profile_id, profile_data in profiles.items():
-                    if not isinstance(profile_data, dict):
-                        continue
-                    for field in ("api_key", "base_url"):
-                        if field in profile_data:
-                            profile_data[field] = self._expand_env_value(
-                                profile_data[field],
-                                f"models.profiles.{profile_id}.{field}",
-                            )
         persistence = expanded.get("persistence", {})
         if isinstance(persistence, dict) and "database_url" in persistence:
             value = str(persistence.get("database_url") or "").strip()
@@ -189,11 +187,74 @@ class ConfigLoader:
                         )
         return expanded
 
+    _REMOVED_ROOT_LLM_FIELDS = {
+        "model",
+        "api_key",
+        "base_url",
+        "max_tokens",
+        "temperature",
+        "max_context_tokens",
+        "preserve_reasoning_content",
+        "backfill_reasoning_content_for_tool_calls",
+        "reasoning_effort",
+        "thinking_enabled",
+        "reasoning_replay_mode",
+        "reasoning_replay_placeholder",
+        "llm_debug_trace",
+        "llm_debug_raw_chunks",
+        "llm_debug_trace_authoritative",
+    }
+
+    def _reject_deprecated_config_paths(self, data: dict) -> None:
+        """Reject legacy model configuration paths instead of silently migrating."""
+        if not isinstance(data, dict):
+            return
+        errors: list[str] = []
+        if "app" in data:
+            errors.append(
+                "app was removed; configure LLM providers under providers.items and models under models.profiles"
+            )
+        for field in sorted(self._REMOVED_ROOT_LLM_FIELDS):
+            if field in data:
+                target = (
+                    "diagnostics.llm_trace"
+                    if field.startswith("llm_debug")
+                    else "providers.items / models.profiles"
+                )
+                errors.append(f"{field} was removed; use {target}")
+
+        models = data.get("models", {})
+        profiles = models.get("profiles", {}) if isinstance(models, dict) else {}
+        if isinstance(profiles, dict):
+            for profile_id, profile_data in profiles.items():
+                if not isinstance(profile_data, dict):
+                    continue
+                for field in ("api_key", "base_url"):
+                    if field in profile_data:
+                        errors.append(
+                            f"models.profiles.{profile_id}.{field} was removed; configure it under providers.items"
+                        )
+        if errors:
+            raise DeprecatedConfigError(errors)
+
     def _resolve_llm_params(
-        self, active_profile, app_config: dict, providers: ProvidersConfig | None = None
+        self, active_profile, providers: ProvidersConfig | None = None
     ) -> dict:
-        """Resolve LLM params with active_profile > app_config > default priority."""
-        params: dict = {}
+        """Resolve LLM params from the active profile and provider only."""
+        params: dict = {
+            "model": "",
+            "api_key": "",
+            "base_url": None,
+            "max_tokens": 0,
+            "temperature": 0.0,
+            "max_context_tokens": 0,
+            "preserve_reasoning_content": True,
+            "backfill_reasoning_content_for_tool_calls": False,
+            "reasoning_effort": None,
+            "thinking_enabled": None,
+            "reasoning_replay_mode": None,
+            "reasoning_replay_placeholder": None,
+        }
         provider_config = None
         if (
             active_profile is not None
@@ -205,18 +266,10 @@ class ConfigLoader:
             profile_val = (
                 getattr(active_profile, field, None) if active_profile is not None else None
             )
-            if field == "api_key" and profile_val == "":
-                profile_val = None
             if profile_val is not None:
                 params[field] = profile_val
             elif field in {"api_key", "base_url"} and provider_config is not None:
                 params[field] = getattr(provider_config, field)
-            elif field in app_config:
-                params[field] = app_config[field]
-            elif field in DEFAULTS:
-                params[field] = DEFAULTS[field]
-            else:
-                params[field] = None
         return params
 
     def _load_yaml(self, path: Path) -> dict:
@@ -309,11 +362,11 @@ class ConfigLoader:
         # Load global config
         global_data = self._load_yaml(self.GLOBAL_CONFIG_PATH)
 
-        # Detect example config — user still needs to fill in API key + model
+        # Detect example config — user still needs to configure providers and model profiles.
         if global_data and self._is_example_config(global_data):
             raise ExampleConfigError(
                 f"\n  The config at {self.GLOBAL_CONFIG_PATH} is still the example template.\n"
-                "  Please edit it with your API key and model settings, then restart.\n"
+                "  Please configure providers.items and models.profiles, then restart.\n"
             )
 
         if global_data:
@@ -330,18 +383,18 @@ class ConfigLoader:
             if explicit_data:
                 config_data = self._merge_dicts(config_data, explicit_data)
 
+        self._reject_deprecated_config_paths(config_data)
+
         # Require explicit model/runtime config for local CLI usage. Remote host mode
         # can bootstrap without a model so admins can configure providers via UI.
-        has_runtime_config = any(
-            key in config_data and config_data.get(key) for key in ("models", "app")
-        )
+        has_runtime_config = bool(config_data.get("models"))
         if not has_runtime_config and not self._is_remote_host_mode_config(config_data):
             self._generate_example_global_config()
             raise ExampleConfigError(
                 f"\n  Welcome to ReuleauxCoder! \U0001F389\n\n"
                 f"  No config.yaml found. I've created an example at:\n"
                 f"    {self.GLOBAL_CONFIG_PATH}\n\n"
-                "  Please edit it with your API key and model settings, then restart.\n"
+                "  Please configure providers.items and models.profiles, then restart.\n"
             )
 
         config_data = self._expand_env_refs(config_data)
@@ -353,7 +406,7 @@ class ConfigLoader:
 
     def _parse_config(self, data: dict) -> Config:
         """Parse YAML data into Config model."""
-        app_config = data.get("app", {})
+        self._reject_deprecated_config_paths(data)
         approval_config = data.get("approval", {})
         tool_output_config = data.get("tool_output", {})
         session_config = data.get("session", {})
@@ -490,7 +543,7 @@ class ConfigLoader:
                 str(package_id), package_data
             )
 
-        llm_params = self._resolve_llm_params(active_profile, app_config, providers)
+        llm_params = self._resolve_llm_params(active_profile, providers)
         agent_registry_data, runtime_profiles_data = ensure_default_environment_agent_registry(
             agent_registry_config if isinstance(agent_registry_config, dict) else {},
             runtime_profiles_config if isinstance(runtime_profiles_config, dict) else {},
@@ -507,11 +560,7 @@ class ConfigLoader:
             isinstance(diagnostics_config, dict)
             and isinstance(diagnostics_config.get("llm_trace"), dict)
         )
-        llm_trace_enabled = app_config.get("llm_debug_trace")
-        if diagnostics_has_llm_trace:
-            llm_trace_enabled = diagnostics.llm_trace.enabled
-        elif llm_trace_enabled is None:
-            llm_trace_enabled = diagnostics.llm_trace.enabled
+        llm_trace_enabled = diagnostics.llm_trace.enabled
 
         return Config(
             **llm_params,
@@ -658,17 +707,9 @@ class ConfigLoader:
         """Generate an example config at the global config path."""
         example = {
             "meta": {"example": True},
+            "providers": {"items": {}},
             "models": {
-                "profiles": {
-                    "default": {
-                        "model": "gpt-4o",
-                        "api_key": "your-api-key-here",
-                        "base_url": "https://api.openai.com/v1",
-                        "max_tokens": 4096,
-                        "temperature": 0.0,
-                        "max_context_tokens": 128000,
-                    }
-                }
+                "profiles": {}
             },
             "modes": {
                 "active": "coder",

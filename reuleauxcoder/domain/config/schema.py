@@ -8,12 +8,10 @@ CONFIG_SCHEMA = {
         "profiles": {
             "profile_name": {
                 "model": "string (required)",
-                "provider": "string (optional, references providers.items.<provider_id>)",
-                "api_key": "string (required)",
-                "base_url": "string (optional)",
-                "max_tokens": "int (default: 4096)",
+                "provider": "string (required, references providers.items.<provider_id>)",
+                "max_tokens": "int (required; use model capabilities or explicit user value)",
                 "temperature": "float (default: 0.0)",
-                "max_context_tokens": "int (default: 128000)",
+                "max_context_tokens": "int (required; use model capabilities or explicit user value)",
                 "preserve_reasoning_content": "bool (default: true, persist/round-trip provider reasoning_content)",
                 "backfill_reasoning_content_for_tool_calls": "bool (default: false, inject empty reasoning_content for assistant tool calls when missing)",
                 "thinking_enabled": "bool (optional, enable provider thinking/reasoning mode for this profile)",
@@ -326,10 +324,7 @@ DEFAULT_ACTIVE_MODE = "coder"
 
 # Default values for configuration
 DEFAULTS = {
-    "model": "gpt-4o",
-    "max_tokens": 4096,
     "temperature": 0.0,
-    "max_context_tokens": 128_000,
     "approval_default_mode": "require_approval",
     "approval_rules": [
         {"tool_name": "read_file", "action": "allow"},
@@ -351,7 +346,6 @@ DEFAULTS = {
     "session_auto_save": True,
     "session_dir": None,  # Will be computed at runtime
     "history_file": None,  # Will be computed at runtime
-    "llm_debug_trace": False,
     "snip_keep_recent_tools": 2,
     "snip_threshold_chars": 1500,
     "snip_min_lines": 6,

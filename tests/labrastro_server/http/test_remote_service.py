@@ -630,6 +630,76 @@ class TestRemoteRelayHTTPService:
 
         assert manager.model_capabilities_status()["model_capabilities"]["enabled"] is True
 
+    def test_admin_record_model_profile_rejects_profile_credentials(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        manager = RemoteAdminConfigManager(config_path)
+
+        result = manager.record_model_profile(
+            {
+                "profile_id": "deepseek-main",
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "api_key": "sk-old",
+                "base_url": "https://api.deepseek.com",
+                "max_tokens": 8192,
+                "max_context_tokens": 128000,
+                "capability_user_configured": True,
+            }
+        )
+
+        assert result.ok is False
+        assert result.status == 400
+        assert result.payload["error"] == "deprecated_model_profile_field"
+        assert result.payload["fields"] == ["api_key", "base_url"]
+
+    def test_admin_record_model_profile_requires_capability_or_explicit_limits(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "custom": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        manager = RemoteAdminConfigManager(config_path)
+
+        result = manager.record_model_profile(
+            {
+                "profile_id": "custom-main",
+                "provider": "custom",
+                "model": "custom-model",
+            }
+        )
+
+        assert result.ok is False
+        assert result.status == 400
+        assert result.payload["error"] == "model_capability_required"
+        assert result.payload["provider_id"] == "custom"
+        assert result.payload["model"] == "custom-model"
+
     def test_admin_record_model_profile_uses_deepseek_v4_capability_defaults(
         self, tmp_path: Path
     ) -> None:
@@ -1176,6 +1246,192 @@ class TestRemoteRelayHTTPService:
             assert stats["by_model"][0]["name"] == "deepseek-v4"
             assert stats["issues"][0]["path"] == "$.content"
             assert stats["repairs"][0]["action"] == "optional_null_omitted"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_server_settings_manage_runtime_policy_groups(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "persistence:\n"
+            "  backend: postgres\n"
+            "  database_url: postgresql://example\n"
+            "github:\n"
+            "  enabled: false\n"
+            "  webhook_secret: super-secret-value\n",
+            encoding="utf-8",
+        )
+        reloads: list[str] = []
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+            admin_config_reload_handler=lambda: reloads.append("reload"),
+        )
+        service.start()
+        try:
+            _, read_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/server-settings/read",
+                {},
+                headers=TEST_ADMIN_HEADERS,
+            )
+            settings = read_body["settings"]
+            assert settings["tool_output"]["max_chars"] == 12000
+            assert settings["context"]["snip_threshold_chars"] == 1500
+            assert settings["memory"]["backend"] == "sqlite"
+            assert settings["approval"]["default_mode"] == "require_approval"
+            assert "coder" in settings["modes"]["profiles"]
+            assert settings["skills"]["enabled"] is True
+            assert settings["prompt"]["system_append"] == ""
+            assert settings["persistence"]["backend"] == "postgres"
+            assert settings["github"]["webhook_secret_hint"] == "supe...alue"
+            assert "webhook_secret" not in settings["github"]
+
+            _, update_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/server-settings/update",
+                {
+                    "settings": {
+                        "tool_output": {
+                            "max_chars": 24000,
+                            "max_lines": 240,
+                            "store_full_output": False,
+                            "store_dir": ".rcoder/full-tools",
+                        },
+                        "context": {
+                            "snip_keep_recent_tools": 3,
+                            "snip_threshold_chars": 3000,
+                            "snip_min_lines": 8,
+                            "summarize_keep_recent_turns": 7,
+                            "token_fudge_factor": 1.3,
+                        },
+                        "memory": {
+                            "enabled": False,
+                            "capture_enabled": False,
+                            "backend": "memory",
+                            "store_path": ".rcoder/memory.sqlite3",
+                            "default_agent_id": "core",
+                            "default_namespace": "tests",
+                            "token_budget": 256,
+                        },
+                        "approval": {
+                            "default_mode": "warn",
+                            "rules": [{"tool_name": "shell", "action": "deny"}],
+                        },
+                        "modes": {
+                            "active": "review",
+                            "profiles": {
+                                "review": {
+                                    "description": "Review only",
+                                    "tools": ["read_file"],
+                                    "prompt_append": "Review carefully.",
+                                }
+                            },
+                        },
+                        "skills": {
+                            "enabled": True,
+                            "scan_project": False,
+                            "scan_user": True,
+                            "disabled": ["legacy-skill"],
+                        },
+                        "prompt": {"system_append": "Global note."},
+                        "persistence": {
+                            "runtime_enabled": False,
+                            "sessions_enabled": True,
+                            "retention_days": 14,
+                            "snapshot_max_versions_per_session": 5,
+                            "snapshot_compress_threshold_bytes": 1024,
+                            "maintenance_interval_sec": 120,
+                        },
+                        "sandbox_provider": {
+                            "type": "docker",
+                            "host_base_url": "http://sandbox:8765",
+                            "worker_image": "worker:test",
+                            "workspace_volume_root": "workspaces",
+                            "idle_ttl_seconds": 600,
+                        },
+                        "model_capabilities": {
+                            "enabled": False,
+                            "interval_sec": 3600,
+                        },
+                        "diagnostics": {
+                            "tool_argument_validation": {
+                                "enabled": True,
+                                "record_clean": True,
+                            }
+                        },
+                        "github": {
+                            "enabled": False,
+                            "app_id": "1",
+                            "installation_id": "2",
+                            "private_key_path": "/tmp/key.pem",
+                            "api_base_url": "https://api.github.com",
+                            "web_base_url": "https://github.com",
+                            "reconcile_interval_sec": 30,
+                        },
+                    }
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert update_body["ok"] is True
+            updated = update_body["settings"]
+            assert updated["tool_output"]["max_chars"] == 24000
+            assert updated["context"]["token_fudge_factor"] == 1.3
+            assert updated["memory"]["enabled"] is False
+            assert updated["approval"]["rules"][0]["action"] == "deny"
+            assert updated["modes"]["active"] == "review"
+            assert updated["modes"]["profiles"]["review"]["tools"] == ["read_file"]
+            assert updated["skills"]["disabled"] == ["legacy-skill"]
+            assert updated["prompt"]["system_append"] == "Global note."
+            assert updated["persistence"]["retention_days"] == 14
+            assert updated["sandbox_provider"]["worker_image"] == "worker:test"
+            assert updated["model_capabilities"]["enabled"] is False
+            assert updated["diagnostics"]["tool_argument_validation"]["record_clean"] is True
+            assert updated["github"]["webhook_secret_hint"] == "supe...alue"
+
+            raw = load_yaml_config(config_path)
+            assert raw["github"]["webhook_secret"] == "super-secret-value"
+            assert raw["persistence"]["backend"] == "postgres"
+            assert raw["persistence"]["database_url"] == "postgresql://example"
+            assert len(reloads) == 1
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_server_settings_reject_read_only_persistence_fields(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        config_path = tmp_path / "config.yaml"
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+            admin_config_reload_handler=lambda: None,
+        )
+        service.start()
+        try:
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/server-settings/update",
+                    {"settings": {"persistence": {"database_url": "postgres://x"}}},
+                    headers=TEST_ADMIN_HEADERS,
+                )
+                raise AssertionError("read-only persistence field should fail")
+            except HTTPError as exc:
+                assert exc.code == 400
+                body = json.loads(exc.read().decode("utf-8"))
+                assert body["error"] == "read_only_persistence_field"
+                assert body["details"]["fields"] == ["database_url"]
         finally:
             service.stop()
             relay.stop()

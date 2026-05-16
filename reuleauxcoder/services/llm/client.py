@@ -115,7 +115,7 @@ def _persist_debug_trace(
     return path
 
 
-def _legacy_provider_config(
+def _direct_provider_config(
     *,
     provider_id: str | None,
     api_key: str,
@@ -124,7 +124,7 @@ def _legacy_provider_config(
     max_retries: int = 3,
 ) -> ProviderConfig:
     return ProviderConfig(
-        id=provider_id or "legacy-openai-chat",
+        id=provider_id or ("direct-openai-chat" if api_key or base_url else "unconfigured"),
         type="openai_chat",
         compat=infer_provider_compat(base_url),
         api_key=api_key,
@@ -135,15 +135,15 @@ def _legacy_provider_config(
 
 
 class LLM:
-    """LLM facade that keeps the legacy public API stable."""
+    """LLM facade for the active provider/model binding."""
 
     def __init__(
         self,
-        model: str,
-        api_key: str,
+        model: str = "",
+        api_key: str = "",
         base_url: Optional[str] = None,
         temperature: float = 0.0,
-        max_tokens: int = 4096,
+        max_tokens: int = 0,
         preserve_reasoning_content: bool = True,
         backfill_reasoning_content_for_tool_calls: bool = False,
         reasoning_effort: str | None = None,
@@ -171,7 +171,7 @@ class LLM:
         self.debug_trace = debug_trace
         self.debug_raw_chunks = debug_raw_chunks
         self.ui_bus = ui_bus
-        self.provider_config = provider_config or _legacy_provider_config(
+        self.provider_config = provider_config or _direct_provider_config(
             provider_id=provider,
             api_key=api_key,
             base_url=base_url,
@@ -191,6 +191,13 @@ class LLM:
         self.api_key = self.provider_config.api_key
         self.base_url = self.provider_config.base_url
         self._provider_unavailable_reason = ""
+        if not self.model:
+            self._provider = None
+            self.client = None
+            self._provider_unavailable_reason = (
+                "No chat model is selected. Choose a provider and model before starting chat."
+            )
+            return
         if not self.api_key:
             self._provider = None
             self.client = None
@@ -243,7 +250,7 @@ class LLM:
             self.debug_trace = debug_trace
         if debug_raw_chunks is not None:
             self.debug_raw_chunks = debug_raw_chunks
-        self.provider_config = provider_config or _legacy_provider_config(
+        self.provider_config = provider_config or _direct_provider_config(
             provider_id=provider,
             api_key=api_key,
             base_url=base_url,

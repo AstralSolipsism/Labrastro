@@ -171,8 +171,9 @@ class OpenAIResponsesProvider:
             "model": request.model,
             "input": convert_messages_to_responses_input(request.messages),
             "stream": True,
-            "max_output_tokens": request.max_tokens,
         }
+        if request.max_tokens > 0:
+            params["max_output_tokens"] = request.max_tokens
         if self.config.extra.get("send_temperature"):
             params["temperature"] = request.temperature
         if request.tools:

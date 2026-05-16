@@ -5,6 +5,7 @@ import pytest
 
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError
+from reuleauxcoder.services.config.loader import DeprecatedConfigError
 from reuleauxcoder.services.config.loader import ExampleConfigError
 
 
@@ -24,10 +25,12 @@ def test_load_yaml_returns_empty_dict_for_invalid_yaml(tmp_path: Path) -> None:
 def test_merge_dicts_recursively_merges_nested_dicts() -> None:
     loader = ConfigLoader()
     merged = loader._merge_dicts(
-        {"app": {"model": "a", "temperature": 0.0}},
-        {"app": {"temperature": 0.5}},
+        {"diagnostics": {"llm_trace": {"enabled": False, "raw_chunks": False}}},
+        {"diagnostics": {"llm_trace": {"raw_chunks": True}}},
     )
-    assert merged == {"app": {"model": "a", "temperature": 0.5}}
+    assert merged == {
+        "diagnostics": {"llm_trace": {"enabled": False, "raw_chunks": True}}
+    }
 
 
 def test_merge_dicts_merges_profile_maps_by_name() -> None:
@@ -37,8 +40,18 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
             "models": {
                 "active_main": "main",
                 "profiles": {
-                    "main": {"model": "gpt-4o", "api_key": "k1"},
-                    "sub": {"model": "gpt-4o-mini", "api_key": "k2"},
+                    "main": {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "max_tokens": 32768,
+                        "max_context_tokens": 128000,
+                    },
+                    "sub": {
+                        "provider": "openai",
+                        "model": "gpt-4o-mini",
+                        "max_tokens": 16384,
+                        "max_context_tokens": 128000,
+                    },
                 },
             }
         },
@@ -47,7 +60,12 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
                 "active_main": "sub",
                 "profiles": {
                     "main": {"temperature": 0.2},
-                    "extra": {"model": "x", "api_key": "k3"},
+                    "extra": {
+                        "provider": "openai",
+                        "model": "x",
+                        "max_tokens": 8192,
+                        "max_context_tokens": 32000,
+                    },
                 },
             }
         },
@@ -55,8 +73,10 @@ def test_merge_dicts_merges_profile_maps_by_name() -> None:
 
     assert merged["models"]["active_main"] == "sub"
     assert merged["models"]["profiles"]["main"] == {
+        "provider": "openai",
         "model": "gpt-4o",
-        "api_key": "k1",
+        "max_tokens": 32768,
+        "max_context_tokens": 128000,
         "temperature": 0.2,
     }
     assert "sub" in merged["models"]["profiles"]
@@ -104,6 +124,34 @@ def test_parse_config_reads_llm_trace_diagnostics_settings() -> None:
     assert config.llm_debug_trace is True
     assert config.llm_debug_trace_authoritative is True
     assert config.llm_debug_raw_chunks is True
+
+
+def test_parse_config_rejects_deprecated_llm_config_paths() -> None:
+    with pytest.raises(DeprecatedConfigError) as exc:
+        ConfigLoader()._parse_config(
+            {
+                "app": {"model": "gpt-4o"},
+                "model": "gpt-4o",
+                "llm_debug_trace": True,
+                "models": {
+                    "profiles": {
+                        "main": {
+                            "provider": "openai",
+                            "model": "gpt-4o",
+                            "api_key": "sk-old",
+                            "base_url": "https://api.openai.com/v1",
+                        }
+                    }
+                },
+            }
+        )
+
+    message = str(exc.value)
+    assert "app was removed" in message
+    assert "model was removed" in message
+    assert "llm_debug_trace was removed; use diagnostics.llm_trace" in message
+    assert "models.profiles.main.api_key was removed" in message
+    assert "models.profiles.main.base_url was removed" in message
 
 
 def test_parse_config_reads_memory_provider_settings() -> None:
@@ -168,20 +216,36 @@ def test_parse_config_selects_active_profiles_and_modes() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
+            "providers": {
+                "items": {
+                    "main-provider": {
+                        "type": "openai_chat",
+                        "api_key": "main-key",
+                    },
+                    "sub-provider": {
+                        "type": "openai_chat",
+                        "api_key": "sub-key",
+                    },
+                }
+            },
             "models": {
                 "active_main": "main",
                 "active_sub": "sub",
                 "profiles": {
                     "main": {
+                        "provider": "main-provider",
                         "model": "gpt-main",
-                        "api_key": "main-key",
+                        "max_tokens": 8192,
+                        "max_context_tokens": 64000,
                         "temperature": 0.1,
                         "preserve_reasoning_content": True,
                         "backfill_reasoning_content_for_tool_calls": True,
                     },
                     "sub": {
+                        "provider": "sub-provider",
                         "model": "gpt-sub",
-                        "api_key": "sub-key",
+                        "max_tokens": 4096,
+                        "max_context_tokens": 32000,
                         "temperature": 0.2,
                     },
                 },
@@ -240,6 +304,8 @@ def test_parse_config_reads_provider_backed_profiles() -> None:
                     "main": {
                         "provider": "anthropic-main",
                         "model": "claude-sonnet",
+                        "max_tokens": 8192,
+                        "max_context_tokens": 200000,
                     }
                 },
             },
@@ -277,6 +343,8 @@ def test_parse_config_keeps_existing_agent_default_model() -> None:
                     "legacy-main": {
                         "provider": "deepseek",
                         "model": "V4FLASH",
+                        "max_tokens": 384000,
+                        "max_context_tokens": 1000000,
                     }
                 },
             },
@@ -302,7 +370,7 @@ def test_parse_config_keeps_existing_agent_default_model() -> None:
     assert coder_model.display_name == "V4 Pro"
 
 
-def test_expand_env_refs_expands_provider_and_profile_runtime_fields(
+def test_expand_env_refs_expands_provider_runtime_fields(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("LABRASTRO_PROVIDER_KEY", "sk-env")
@@ -315,14 +383,6 @@ def test_expand_env_refs_expands_provider_and_profile_runtime_fields(
                     "openai": {
                         "type": "openai_chat",
                         "api_key": "${LABRASTRO_PROVIDER_KEY}",
-                    }
-                }
-            },
-            "models": {
-                "profiles": {
-                    "main": {
-                        "model": "gpt",
-                        "api_key": "${LABRASTRO_PROVIDER_KEY}",
                         "base_url": "${LABRASTRO_BASE_URL}",
                     }
                 }
@@ -331,8 +391,7 @@ def test_expand_env_refs_expands_provider_and_profile_runtime_fields(
     )
 
     assert expanded["providers"]["items"]["openai"]["api_key"] == "sk-env"
-    assert expanded["models"]["profiles"]["main"]["api_key"] == "sk-env"
-    assert expanded["models"]["profiles"]["main"]["base_url"] == "https://env.example/v1"
+    assert expanded["providers"]["items"]["openai"]["base_url"] == "https://env.example/v1"
 
 
 def test_expand_env_refs_reports_missing_env_var() -> None:
@@ -359,10 +418,6 @@ def test_parse_config_reads_remote_exec_settings() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
-            "app": {"api_key": "key"},
-            "models": {
-                "profiles": {"main": {"model": "gpt-main", "api_key": "main-key"}}
-            },
             "modes": {"profiles": {"coder": {}}},
             "remote_exec": {
                 "enabled": True,
@@ -417,9 +472,6 @@ def test_parse_config_reads_peer_mcp_artifacts() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
-            "models": {
-                "profiles": {"main": {"model": "gpt-main", "api_key": "key"}}
-            },
             "mcp": {
                 "artifact_root": "/srv/rcoder/mcp-artifacts",
                 "servers": {
@@ -469,9 +521,6 @@ def test_parse_config_reads_command_mcp_manifest_fields() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
-            "models": {
-                "profiles": {"main": {"model": "gpt-main", "api_key": "key"}}
-            },
             "mcp": {
                 "servers": {
                     "gitnexus": {
@@ -515,9 +564,6 @@ def test_parse_config_reads_environment_cli_tools() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
-            "models": {
-                "profiles": {"main": {"model": "gpt-main", "api_key": "key"}}
-            },
             "modes": {"profiles": {"coder": {}}},
             "environment": {
                 "cli_tools": {
@@ -557,9 +603,6 @@ def test_parse_config_reads_environment_skills() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
-            "models": {
-                "profiles": {"main": {"model": "gpt-main", "api_key": "key"}}
-            },
             "modes": {"profiles": {"coder": {}}},
             "environment": {
                 "skills": {
@@ -599,10 +642,23 @@ def test_parse_config_falls_back_when_active_profile_missing() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
+            "providers": {
+                "items": {
+                    "openai": {
+                        "type": "openai_chat",
+                        "api_key": "key-1",
+                    }
+                }
+            },
             "models": {
                 "active_main": "missing",
                 "profiles": {
-                    "first": {"model": "gpt-first", "api_key": "key-1"},
+                    "first": {
+                        "provider": "openai",
+                        "model": "gpt-first",
+                        "max_tokens": 8192,
+                        "max_context_tokens": 128000,
+                    },
                 },
             },
             "modes": {"profiles": {"coder": {}}},
@@ -623,9 +679,12 @@ def test_merge_dicts_preserves_active_main_and_active_sub_across_layers() -> Non
         "models": {
             "active_main": "glm-5",
             "profiles": {
-                "glm-5": {"model": "glm-5", "api_key": "k"},
-                "ds-v4-pro": {"model": "deepseek-v4-pro", "api_key": "k"},
-                "ds-v4-flash": {"model": "deepseek-v4-flash", "api_key": "k"},
+                "glm-5": {"provider": "zhipu", "model": "glm-5"},
+                "ds-v4-pro": {"provider": "deepseek", "model": "deepseek-v4-pro"},
+                "ds-v4-flash": {
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                },
             },
         }
     }
@@ -736,10 +795,10 @@ def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
     assert example_path.exists()
     data = loader._load_yaml(example_path)
     assert data["meta"]["example"] is True
+    assert data["providers"]["items"] == {}
     assert "models" in data
     assert "profiles" in data["models"]
-    assert "default" in data["models"]["profiles"]
-    assert data["models"]["profiles"]["default"]["api_key"] == "your-api-key-here"
+    assert data["models"]["profiles"] == {}
     assert "modes" in data
     assert data["modes"]["active"] == "coder"
     runtime_profiles = data["runtime_profiles"]
@@ -766,11 +825,18 @@ def test_load_does_not_copy_global_environment_manifest_into_workspace(
     global_path.parent.mkdir(parents=True)
     global_path.write_text(
         """
+providers:
+  items:
+    openai:
+      type: openai_chat
+      api_key: key
 models:
   profiles:
     main:
+      provider: openai
       model: gpt-main
-      api_key: key
+      max_tokens: 8192
+      max_context_tokens: 128000
 environment:
   cli_tools:
     gitnexus:

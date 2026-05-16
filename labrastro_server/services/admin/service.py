@@ -12,23 +12,31 @@ from typing import Any, Callable
 from reuleauxcoder.app.runtime.agent_runtime import get_interactive_run_limiter
 from reuleauxcoder.domain.config.models import (
     AgentRegistryConfig,
+    ApprovalConfig,
+    ApprovalRuleConfig,
     CapabilityPackageConfig,
+    ContextConfig,
     DiagnosticsConfig,
     EnvironmentCLIToolConfig,
     EnvironmentSkillConfig,
     GitHubConfig,
+    MemoryConfig,
     MCPServerConfig,
+    ModeConfig,
     ModelProfileConfig,
+    PersistenceConfig,
+    PromptConfig,
     ProviderApiFeatures,
     ProviderConfig,
     RunLimitsConfig,
     RuntimeProfilesConfig,
     SandboxProviderConfig,
+    SkillsConfig,
     ensure_default_capability_packages,
     ensure_default_environment_agent_registry,
     infer_provider_compat,
 )
-from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULT_ACTIVE_MODE
+from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.llm.diagnostics import (
@@ -267,6 +275,141 @@ class RemoteAdminConfigManager:
             ),
         )
 
+    def _tool_output_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("tool_output", {})
+        raw = raw if isinstance(raw, dict) else {}
+        return {
+            "max_chars": int(raw.get("max_chars", DEFAULTS["tool_output_max_chars"]) or DEFAULTS["tool_output_max_chars"]),
+            "max_lines": int(raw.get("max_lines", DEFAULTS["tool_output_max_lines"]) or DEFAULTS["tool_output_max_lines"]),
+            "store_full_output": bool(raw.get("store_full_output", DEFAULTS["tool_output_store_full"])),
+            "store_dir": raw.get("store_dir", DEFAULTS["tool_output_store_dir"]),
+        }
+
+    def _context_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("context", {})
+        raw = raw if isinstance(raw, dict) else {}
+        config = ContextConfig(
+            snip_keep_recent_tools=int(raw.get("snip_keep_recent_tools", DEFAULTS["snip_keep_recent_tools"]) or 0),
+            snip_threshold_chars=int(raw.get("snip_threshold_chars", DEFAULTS["snip_threshold_chars"]) or 0),
+            snip_min_lines=int(raw.get("snip_min_lines", DEFAULTS["snip_min_lines"]) or 0),
+            summarize_keep_recent_turns=int(raw.get("summarize_keep_recent_turns", DEFAULTS["summarize_keep_recent_turns"]) or 0),
+            token_fudge_factor=float(raw.get("token_fudge_factor", DEFAULTS["token_fudge_factor"]) or 0),
+        )
+        return {
+            "snip_keep_recent_tools": config.snip_keep_recent_tools,
+            "snip_threshold_chars": config.snip_threshold_chars,
+            "snip_min_lines": config.snip_min_lines,
+            "summarize_keep_recent_turns": config.summarize_keep_recent_turns,
+            "token_fudge_factor": config.token_fudge_factor,
+        }
+
+    def _approval_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("approval", {})
+        raw = raw if isinstance(raw, dict) else {}
+        rules = []
+        raw_rules = raw.get("rules", DEFAULTS["approval_rules"])
+        if isinstance(raw_rules, list):
+            for item in raw_rules:
+                if not isinstance(item, dict):
+                    continue
+                rule = ApprovalRuleConfig(
+                    tool_name=item.get("tool_name"),
+                    tool_source=item.get("tool_source"),
+                    mcp_server=item.get("mcp_server"),
+                    effect_class=item.get("effect_class"),
+                    profile=item.get("profile"),
+                    action=item.get("action", "require_approval"),
+                )
+                rules.append(
+                    {
+                        "tool_name": rule.tool_name,
+                        "tool_source": rule.tool_source,
+                        "mcp_server": rule.mcp_server,
+                        "effect_class": rule.effect_class,
+                        "profile": rule.profile,
+                        "action": rule.action,
+                    }
+                )
+        approval = ApprovalConfig(
+            default_mode=str(raw.get("default_mode", DEFAULTS["approval_default_mode"]) or "require_approval"),
+            rules=[
+                ApprovalRuleConfig(
+                    tool_name=rule.get("tool_name"),
+                    tool_source=rule.get("tool_source"),
+                    mcp_server=rule.get("mcp_server"),
+                    effect_class=rule.get("effect_class"),
+                    profile=rule.get("profile"),
+                    action=rule.get("action", "require_approval"),
+                )
+                for rule in rules
+            ],
+        )
+        return {
+            "default_mode": approval.default_mode,
+            "rules": [
+                {
+                    "tool_name": rule.tool_name,
+                    "tool_source": rule.tool_source,
+                    "mcp_server": rule.mcp_server,
+                    "effect_class": rule.effect_class,
+                    "profile": rule.profile,
+                    "action": rule.action,
+                }
+                for rule in approval.rules
+            ],
+        }
+
+    def _skills_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("skills", {})
+        raw = raw if isinstance(raw, dict) else {}
+        config = SkillsConfig(
+            enabled=bool(raw.get("enabled", True)),
+            scan_project=bool(raw.get("scan_project", True)),
+            scan_user=bool(raw.get("scan_user", True)),
+            disabled=[
+                str(name)
+                for name in raw.get("disabled", [])
+                if str(name).strip()
+            ]
+            if isinstance(raw.get("disabled", []), list)
+            else [],
+        )
+        return {
+            "enabled": config.enabled,
+            "scan_project": config.scan_project,
+            "scan_user": config.scan_user,
+            "disabled": list(config.disabled),
+        }
+
+    def _prompt_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("prompt", {})
+        raw = raw if isinstance(raw, dict) else {}
+        config = PromptConfig(system_append=str(raw.get("system_append", "") or ""))
+        return {"system_append": config.system_append}
+
+    def _modes_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        listed = self.list_modes()
+        profiles = {
+            str(item["name"]): {
+                "description": str(item.get("description") or ""),
+                "tools": [str(tool) for tool in item.get("tools", [])]
+                if isinstance(item.get("tools", []), list)
+                else [],
+                "prompt_append": str(item.get("prompt_append") or ""),
+            }
+            for item in listed["modes"]
+            if isinstance(item, dict) and item.get("name")
+        }
+        return {"active": listed["active_mode"], "profiles": profiles}
+
+    def _memory_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("memory", {})
+        return MemoryConfig.from_dict(raw if isinstance(raw, dict) else {}).to_dict()
+
+    def _persistence_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("persistence", {})
+        return PersistenceConfig.from_dict(raw if isinstance(raw, dict) else {}).to_dict()
+
     def read_server_settings(self) -> dict[str, Any]:
         data = self._load_data()
         raw_capability_packages = data.get("capability_packages", {})
@@ -299,6 +442,14 @@ class RemoteAdminConfigManager:
                 "runtime_profiles": runtime_profiles.to_dict(),
                 "run_limits": run_limits.to_dict(),
                 "capability_packages": capability_packages,
+                "tool_output": self._tool_output_settings(data),
+                "context": self._context_settings(data),
+                "memory": self._memory_settings(data),
+                "approval": self._approval_settings(data),
+                "modes": self._modes_settings(data),
+                "skills": self._skills_settings(data),
+                "prompt": self._prompt_settings(data),
+                "persistence": self._persistence_settings(data),
                 "github": github.to_dict(mask_secret=True),
                 "sandbox_provider": sandbox_provider.to_dict(),
                 "model_capabilities": {
@@ -323,6 +474,14 @@ class RemoteAdminConfigManager:
         raw_runtime_profiles = payload.get("runtime_profiles")
         raw_run_limits = payload.get("run_limits")
         raw_capability_packages = payload.get("capability_packages")
+        raw_tool_output = payload.get("tool_output")
+        raw_context = payload.get("context")
+        raw_memory = payload.get("memory")
+        raw_approval = payload.get("approval")
+        raw_modes = payload.get("modes")
+        raw_skills = payload.get("skills")
+        raw_prompt = payload.get("prompt")
+        raw_persistence = payload.get("persistence")
         raw_github = payload.get("github")
         raw_sandbox = payload.get("sandbox_provider")
         raw_model_capabilities = payload.get("model_capabilities")
@@ -335,6 +494,22 @@ class RemoteAdminConfigManager:
             raw_run_limits = raw_settings.get("run_limits")
         if isinstance(raw_settings, dict) and raw_capability_packages is None:
             raw_capability_packages = raw_settings.get("capability_packages")
+        if isinstance(raw_settings, dict) and raw_tool_output is None:
+            raw_tool_output = raw_settings.get("tool_output")
+        if isinstance(raw_settings, dict) and raw_context is None:
+            raw_context = raw_settings.get("context")
+        if isinstance(raw_settings, dict) and raw_memory is None:
+            raw_memory = raw_settings.get("memory")
+        if isinstance(raw_settings, dict) and raw_approval is None:
+            raw_approval = raw_settings.get("approval")
+        if isinstance(raw_settings, dict) and raw_modes is None:
+            raw_modes = raw_settings.get("modes")
+        if isinstance(raw_settings, dict) and raw_skills is None:
+            raw_skills = raw_settings.get("skills")
+        if isinstance(raw_settings, dict) and raw_prompt is None:
+            raw_prompt = raw_settings.get("prompt")
+        if isinstance(raw_settings, dict) and raw_persistence is None:
+            raw_persistence = raw_settings.get("persistence")
         if isinstance(raw_settings, dict) and raw_github is None:
             raw_github = raw_settings.get("github")
         if isinstance(raw_settings, dict) and raw_sandbox is None:
@@ -348,6 +523,14 @@ class RemoteAdminConfigManager:
             and not isinstance(raw_runtime_profiles, dict)
             and not isinstance(raw_run_limits, dict)
             and not isinstance(raw_capability_packages, dict)
+            and not isinstance(raw_tool_output, dict)
+            and not isinstance(raw_context, dict)
+            and not isinstance(raw_memory, dict)
+            and not isinstance(raw_approval, dict)
+            and not isinstance(raw_modes, dict)
+            and not isinstance(raw_skills, dict)
+            and not isinstance(raw_prompt, dict)
+            and not isinstance(raw_persistence, dict)
             and not isinstance(raw_github, dict)
             and not isinstance(raw_sandbox, dict)
             and not isinstance(raw_model_capabilities, dict)
@@ -388,6 +571,394 @@ class RemoteAdminConfigManager:
                     package_id: package.to_dict()
                     for package_id, package in capability_packages.items()
                 }
+            if isinstance(raw_tool_output, dict):
+                previous_tool_output = (
+                    previous_data.get("tool_output", {})
+                    if isinstance(previous_data.get("tool_output"), dict)
+                    else {}
+                )
+                merged_tool_output = ConfigLoader()._merge_dicts(
+                    previous_tool_output,
+                    raw_tool_output,
+                )
+                try:
+                    tool_output = {
+                        "max_chars": int(
+                            merged_tool_output.get(
+                                "max_chars", DEFAULTS["tool_output_max_chars"]
+                            )
+                            or DEFAULTS["tool_output_max_chars"]
+                        ),
+                        "max_lines": int(
+                            merged_tool_output.get(
+                                "max_lines", DEFAULTS["tool_output_max_lines"]
+                            )
+                            or DEFAULTS["tool_output_max_lines"]
+                        ),
+                        "store_full_output": bool(
+                            merged_tool_output.get(
+                                "store_full_output",
+                                DEFAULTS["tool_output_store_full"],
+                            )
+                        ),
+                        "store_dir": merged_tool_output.get("store_dir"),
+                    }
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_tool_output", "message": str(exc)},
+                        400,
+                    )
+                if tool_output["max_chars"] < 1 or tool_output["max_lines"] < 1:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_tool_output",
+                            "message": "tool_output.max_chars and max_lines must be positive",
+                        },
+                        400,
+                    )
+                if tool_output["store_dir"] is not None:
+                    tool_output["store_dir"] = str(tool_output["store_dir"])
+                data["tool_output"] = tool_output
+            if isinstance(raw_context, dict):
+                previous_context = (
+                    previous_data.get("context", {})
+                    if isinstance(previous_data.get("context"), dict)
+                    else {}
+                )
+                merged_context = ConfigLoader()._merge_dicts(
+                    previous_context,
+                    raw_context,
+                )
+                try:
+                    context = {
+                        "snip_keep_recent_tools": int(
+                            merged_context.get(
+                                "snip_keep_recent_tools",
+                                DEFAULTS["snip_keep_recent_tools"],
+                            )
+                            or 0
+                        ),
+                        "snip_threshold_chars": int(
+                            merged_context.get(
+                                "snip_threshold_chars",
+                                DEFAULTS["snip_threshold_chars"],
+                            )
+                            or 0
+                        ),
+                        "snip_min_lines": int(
+                            merged_context.get(
+                                "snip_min_lines", DEFAULTS["snip_min_lines"]
+                            )
+                            or 0
+                        ),
+                        "summarize_keep_recent_turns": int(
+                            merged_context.get(
+                                "summarize_keep_recent_turns",
+                                DEFAULTS["summarize_keep_recent_turns"],
+                            )
+                            or 0
+                        ),
+                        "token_fudge_factor": float(
+                            merged_context.get(
+                                "token_fudge_factor",
+                                DEFAULTS["token_fudge_factor"],
+                            )
+                            or 0
+                        ),
+                    }
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_context", "message": str(exc)},
+                        400,
+                    )
+                if (
+                    context["snip_keep_recent_tools"] < 0
+                    or context["snip_threshold_chars"] < 1
+                    or context["snip_min_lines"] < 1
+                    or context["summarize_keep_recent_turns"] < 0
+                    or context["token_fudge_factor"] <= 0
+                ):
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_context",
+                            "message": "context values must be positive where applicable",
+                        },
+                        400,
+                    )
+                data["context"] = context
+            if isinstance(raw_memory, dict):
+                previous_memory = (
+                    previous_data.get("memory", {})
+                    if isinstance(previous_data.get("memory"), dict)
+                    else {}
+                )
+                merged_memory = ConfigLoader()._merge_dicts(
+                    previous_memory,
+                    raw_memory,
+                )
+                try:
+                    memory = MemoryConfig.from_dict(merged_memory)
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_memory", "message": str(exc)},
+                        400,
+                    )
+                if memory.backend not in {"sqlite", "postgres", "memory"}:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_memory",
+                            "message": "memory.backend must be one of sqlite, postgres, memory",
+                        },
+                        400,
+                    )
+                if memory.enabled and not memory.default_agent_id.strip():
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_memory",
+                            "message": "memory.default_agent_id is required when memory.enabled is true",
+                        },
+                        400,
+                    )
+                if memory.token_budget < 1:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_memory",
+                            "message": "memory.token_budget must be positive",
+                        },
+                        400,
+                    )
+                data["memory"] = memory.to_dict()
+            if isinstance(raw_approval, dict):
+                previous_approval = (
+                    previous_data.get("approval", {})
+                    if isinstance(previous_data.get("approval"), dict)
+                    else {}
+                )
+                merged_approval = ConfigLoader()._merge_dicts(
+                    previous_approval,
+                    raw_approval,
+                )
+                valid_actions = {"allow", "warn", "require_approval", "deny"}
+                default_mode = str(
+                    merged_approval.get(
+                        "default_mode", DEFAULTS["approval_default_mode"]
+                    )
+                    or "require_approval"
+                )
+                if default_mode not in valid_actions:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_approval",
+                            "message": "approval.default_mode must be one of allow, warn, require_approval, deny",
+                        },
+                        400,
+                    )
+                rules: list[dict[str, Any]] = []
+                raw_rules = merged_approval.get("rules", [])
+                if not isinstance(raw_rules, list):
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_approval",
+                            "message": "approval.rules must be a list",
+                        },
+                        400,
+                    )
+                for index, item in enumerate(raw_rules):
+                    if not isinstance(item, dict):
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_approval",
+                                "message": f"approval.rules[{index}] must be an object",
+                            },
+                            400,
+                        )
+                    action = str(item.get("action") or "require_approval")
+                    if action not in valid_actions:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_approval",
+                                "message": f"approval.rules[{index}].action must be one of allow, warn, require_approval, deny",
+                            },
+                            400,
+                        )
+                    rule: dict[str, Any] = {"action": action}
+                    for field in (
+                        "tool_name",
+                        "tool_source",
+                        "mcp_server",
+                        "effect_class",
+                        "profile",
+                    ):
+                        value = item.get(field)
+                        if value is not None and str(value).strip():
+                            rule[field] = str(value).strip()
+                    rules.append(rule)
+                data["approval"] = {"default_mode": default_mode, "rules": rules}
+            if isinstance(raw_modes, dict):
+                previous_modes = (
+                    previous_data.get("modes", {})
+                    if isinstance(previous_data.get("modes"), dict)
+                    else {}
+                )
+                merged_modes = dict(previous_modes)
+                for key, value in raw_modes.items():
+                    if key != "profiles":
+                        merged_modes[key] = value
+                if "profiles" in raw_modes:
+                    merged_modes["profiles"] = raw_modes.get("profiles")
+                profiles_raw = merged_modes.get("profiles", {})
+                if not isinstance(profiles_raw, dict) or not profiles_raw:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_modes",
+                            "message": "modes.profiles must be a non-empty object",
+                        },
+                        400,
+                    )
+                profiles: dict[str, Any] = {}
+                for mode_name, mode_data in profiles_raw.items():
+                    if not isinstance(mode_data, dict):
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_modes",
+                                "message": f"modes.profiles.{mode_name} must be an object",
+                            },
+                            400,
+                        )
+                    mode = ModeConfig.from_dict(str(mode_name), mode_data)
+                    profiles[str(mode_name)] = {
+                        "description": mode.description,
+                        "tools": list(mode.tools),
+                        "prompt_append": mode.prompt_append,
+                    }
+                active = str(merged_modes.get("active") or "").strip()
+                if not active:
+                    active = DEFAULT_ACTIVE_MODE if DEFAULT_ACTIVE_MODE in profiles else next(iter(profiles))
+                if active not in profiles:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_modes",
+                            "message": "modes.active must exist in modes.profiles",
+                        },
+                        400,
+                    )
+                data["modes"] = {"active": active, "profiles": profiles}
+            if isinstance(raw_skills, dict):
+                previous_skills = (
+                    previous_data.get("skills", {})
+                    if isinstance(previous_data.get("skills"), dict)
+                    else {}
+                )
+                merged_skills = ConfigLoader()._merge_dicts(
+                    previous_skills,
+                    raw_skills,
+                )
+                disabled_raw = merged_skills.get("disabled", [])
+                if disabled_raw is None:
+                    disabled_raw = []
+                if not isinstance(disabled_raw, list):
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_skills",
+                            "message": "skills.disabled must be a list",
+                        },
+                        400,
+                    )
+                data["skills"] = {
+                    "enabled": bool(merged_skills.get("enabled", True)),
+                    "scan_project": bool(merged_skills.get("scan_project", True)),
+                    "scan_user": bool(merged_skills.get("scan_user", True)),
+                    "disabled": [
+                        str(name).strip()
+                        for name in disabled_raw
+                        if str(name).strip()
+                    ],
+                }
+            if isinstance(raw_prompt, dict):
+                previous_prompt = (
+                    previous_data.get("prompt", {})
+                    if isinstance(previous_data.get("prompt"), dict)
+                    else {}
+                )
+                merged_prompt = ConfigLoader()._merge_dicts(
+                    previous_prompt,
+                    raw_prompt,
+                )
+                data["prompt"] = {
+                    "system_append": str(merged_prompt.get("system_append", "") or "")
+                }
+            if isinstance(raw_persistence, dict):
+                blocked = [
+                    field
+                    for field in ("backend", "database_url", "auto_migrate")
+                    if field in raw_persistence
+                ]
+                if blocked:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "read_only_persistence_field",
+                            "fields": blocked,
+                            "message": "persistence backend, database_url, and auto_migrate are deployment settings",
+                        },
+                        400,
+                    )
+                previous_persistence = (
+                    previous_data.get("persistence", {})
+                    if isinstance(previous_data.get("persistence"), dict)
+                    else {}
+                )
+                merged_persistence = ConfigLoader()._merge_dicts(
+                    previous_persistence,
+                    raw_persistence,
+                )
+                try:
+                    persistence = PersistenceConfig.from_dict(merged_persistence)
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_persistence", "message": str(exc)},
+                        400,
+                    )
+                if persistence.retention_days < 0:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_persistence",
+                            "message": "persistence.retention_days must be zero or positive",
+                        },
+                        400,
+                    )
+                if (
+                    persistence.snapshot_max_versions_per_session < 1
+                    or persistence.snapshot_compress_threshold_bytes < 1
+                    or persistence.maintenance_interval_sec < 1
+                ):
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_persistence",
+                            "message": "persistence snapshot and maintenance values must be positive",
+                        },
+                        400,
+                    )
+                data["persistence"] = persistence.to_dict()
             agent_settings_changed = any(
                 isinstance(value, dict)
                 for value in (raw_agent_registry, raw_runtime_profiles, raw_run_limits)
@@ -487,6 +1058,42 @@ class RemoteAdminConfigManager:
                         },
                         400,
                     )
+                if github.enabled:
+                    missing_fields = [
+                        field
+                        for field, value in (
+                            ("app_id", github.app_id),
+                            ("installation_id", github.installation_id),
+                            ("private_key_path", github.private_key_path),
+                            ("webhook_secret", github.webhook_secret),
+                        )
+                        if not value
+                    ]
+                    if missing_fields:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_github",
+                                "fields": missing_fields,
+                                "message": "github enabled requires app_id, installation_id, private_key_path, and webhook_secret",
+                            },
+                            400,
+                        )
+                    persistence_data = (
+                        data.get("persistence", {})
+                        if isinstance(data.get("persistence"), dict)
+                        else {}
+                    )
+                    persistence = PersistenceConfig.from_dict(persistence_data)
+                    if persistence.backend == "memory" or not persistence.database_url:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_github",
+                                "message": "github enabled requires Postgres persistence.database_url",
+                            },
+                            400,
+                        )
                 data["github"] = github.to_dict()
             if isinstance(raw_sandbox, dict):
                 previous_sandbox = (
@@ -1002,29 +1609,49 @@ class RemoteAdminConfigManager:
         profile_id = str(payload.get("profile_id") or payload.get("id") or "").strip()
         if not profile_id:
             return AdminConfigResult(False, {"error": "profile_id_required"}, 400)
-        if payload.get("api_key") and payload.get("api_key_env"):
-            return AdminConfigResult(False, {"error": "api_key_conflict"}, 400)
+        removed_fields = [
+            field
+            for field in ("api_key", "api_key_env", "base_url", "base_url_env")
+            if field in payload
+        ]
+        if removed_fields:
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "deprecated_model_profile_field",
+                    "fields": removed_fields,
+                    "message": "Model profiles no longer store credentials or endpoints. Configure them under providers.items.",
+                },
+                400,
+            )
 
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
             profiles = self._model_profiles(data)
             previous = profiles.get(profile_id, {}) if isinstance(profiles.get(profile_id), dict) else {}
-            api_key = _field_or_env(payload, "api_key", "api_key_env")
-            if api_key is None:
-                api_key = previous.get("api_key", "")
-            model_name = str(payload.get("model") or previous.get("model") or "gpt-4o")
-            provider_id = payload.get("provider", previous.get("provider"))
+            model_name = str(payload.get("model") or previous.get("model") or "").strip()
+            if not model_name:
+                return AdminConfigResult(False, {"error": "model_required"}, 400)
+            provider_id = str(payload.get("provider", previous.get("provider") or "") or "").strip()
+            if not provider_id:
+                return AdminConfigResult(False, {"error": "provider_required"}, 400)
             provider_config = None
-            provider_item = self._provider_items(data).get(str(provider_id or ""))
+            provider_item = self._provider_items(data).get(provider_id)
             if isinstance(provider_item, dict):
-                provider_config = ProviderConfig.from_dict(str(provider_id or ""), provider_item)
+                provider_config = ProviderConfig.from_dict(provider_id, provider_item)
+            else:
+                return AdminConfigResult(
+                    False,
+                    {"error": "provider_not_found", "provider_id": provider_id},
+                    404,
+                )
             catalog_capability = self.model_capability_catalog.lookup(
-                provider_config or str(provider_id or ""),
+                provider_config or provider_id,
                 model_name,
             )
             capability_defaults = ProviderManager.known_model_capabilities(
-                provider_config or str(provider_id or ""),
+                provider_config or provider_id,
                 model_name,
             )
             if catalog_capability is not None:
@@ -1034,12 +1661,14 @@ class RemoteAdminConfigManager:
                     capability_defaults["max_context_tokens"] = (
                         catalog_capability.max_context_tokens
                     )
+            explicit_max_tokens = payload.get("max_tokens") is not None
+            explicit_max_context_tokens = payload.get("max_context_tokens") is not None
             user_configured = bool(
                 payload.get("capability_user_configured")
                 if "capability_user_configured" in payload
                 else (
-                    "max_tokens" in payload
-                    or "max_context_tokens" in payload
+                    explicit_max_tokens
+                    or explicit_max_context_tokens
                     or previous.get("capability_user_configured", False)
                 )
             )
@@ -1052,7 +1681,7 @@ class RemoteAdminConfigManager:
                 if not user_configured and recommended_max_tokens
                 else (
                     payload.get("max_tokens")
-                    if payload.get("max_tokens") is not None
+                    if explicit_max_tokens
                     else previous.get("max_tokens")
                 )
             )
@@ -1061,20 +1690,36 @@ class RemoteAdminConfigManager:
                 if not user_configured and recommended_max_context_tokens
                 else (
                     payload.get("max_context_tokens")
-                    if payload.get("max_context_tokens") is not None
+                    if explicit_max_context_tokens
                     else previous.get("max_context_tokens")
                 )
             )
+            try:
+                max_tokens_int = int(max_tokens_value or 0)
+                max_context_tokens_int = int(max_context_tokens_value or 0)
+            except (TypeError, ValueError) as exc:
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_model_profile", "message": str(exc)},
+                    400,
+                )
+            if max_tokens_int < 1 or max_context_tokens_int < 1:
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "model_capability_required",
+                        "message": "max_tokens and max_context_tokens are required. Refresh model capabilities or enter explicit values.",
+                        "provider_id": provider_id,
+                        "model": model_name,
+                    },
+                    400,
+                )
             profile_data = {
                 "model": model_name,
-                "api_key": str(api_key or ""),
                 "provider": provider_id,
-                "base_url": payload.get("base_url", previous.get("base_url")),
-                "max_tokens": int(max_tokens_value or recommended_max_tokens or 4096),
+                "max_tokens": max_tokens_int,
                 "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else previous.get("temperature", 0.0)),
-                "max_context_tokens": int(
-                    max_context_tokens_value or recommended_max_context_tokens or 128000
-                ),
+                "max_context_tokens": max_context_tokens_int,
                 "preserve_reasoning_content": bool(payload.get("preserve_reasoning_content", previous.get("preserve_reasoning_content", True))),
                 "backfill_reasoning_content_for_tool_calls": bool(payload.get("backfill_reasoning_content_for_tool_calls", previous.get("backfill_reasoning_content_for_tool_calls", False))),
                 "reasoning_effort": payload.get("reasoning_effort", previous.get("reasoning_effort")),
@@ -1474,8 +2119,6 @@ class RemoteAdminConfigManager:
     ) -> dict[str, Any]:
         profile = ModelProfileConfig.from_dict(profile_id, item)
         view = profile.to_dict()
-        view.pop("api_key", None)
-        view["api_key_hint"] = _mask(str(item.get("api_key", "") or ""))
         view["id"] = profile_id
         if "capability_user_configured" in item:
             view["capability_user_configured"] = bool(

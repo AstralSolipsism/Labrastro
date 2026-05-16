@@ -321,8 +321,9 @@ class OpenAIChatProvider:
             "model": request.model,
             "messages": request.messages,
             "stream": True,
-            "max_tokens": request.max_tokens,
         }
+        if request.max_tokens > 0:
+            params["max_tokens"] = request.max_tokens
         if not should_omit_openai_chat_temperature(self.config):
             params["temperature"] = request.temperature
         apply_openai_chat_reasoning(self.config, request, params, diagnostics)

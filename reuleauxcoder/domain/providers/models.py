@@ -29,7 +29,7 @@ class ProviderRequest:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] = field(default_factory=list)
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = 0
     reasoning_effort: str | None = None
     thinking_enabled: bool | None = None
     tool_choice: str | dict[str, Any] | None = None

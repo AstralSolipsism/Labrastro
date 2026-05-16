@@ -372,7 +372,6 @@ def _build_runner_with_fake_agent(
         "fake-main": ModelProfileConfig(
             name="fake-main",
             model="fake-model",
-            api_key="key",
             provider="fake",
             max_tokens=2048,
             max_context_tokens=128000,
@@ -1382,7 +1381,6 @@ class TestRunnerRemoteExec:
                 "main-fast": ModelProfileConfig(
                     name="main-fast",
                     model="fast-model",
-                    api_key="key",
                     provider="deepseek",
                     max_tokens=1111,
                     max_context_tokens=2222,
@@ -1390,7 +1388,6 @@ class TestRunnerRemoteExec:
                 "main-deep": ModelProfileConfig(
                     name="main-deep",
                     model="deep-model",
-                    api_key="key",
                     provider="deepseek",
                     max_tokens=3333,
                     max_context_tokens=4444,

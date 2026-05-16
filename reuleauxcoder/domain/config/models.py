@@ -505,13 +505,11 @@ class ModelProfileConfig:
     """Named model/runtime profile used by ``/model`` switching."""
 
     name: str
-    model: str
-    api_key: str
+    model: str = ""
     provider: Optional[str] = None
-    base_url: Optional[str] = None
-    max_tokens: int = 4096
+    max_tokens: int = 0
     temperature: float = 0.0
-    max_context_tokens: int = 128_000
+    max_context_tokens: int = 0
     preserve_reasoning_content: bool = True
     backfill_reasoning_content_for_tool_calls: bool = False
     reasoning_effort: Optional[str] = None
@@ -523,9 +521,7 @@ class ModelProfileConfig:
         """Convert to dictionary format for serialization."""
         return {
             "model": self.model,
-            "api_key": self.api_key,
             "provider": self.provider,
-            "base_url": self.base_url,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "max_context_tokens": self.max_context_tokens,
@@ -540,15 +536,20 @@ class ModelProfileConfig:
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "ModelProfileConfig":
         """Create from dictionary format."""
+        removed_fields = [field for field in ("api_key", "base_url") if field in d]
+        if removed_fields:
+            raise ValueError(
+                "model profile fields "
+                + ", ".join(removed_fields)
+                + " were removed; configure credentials and endpoints under providers.items"
+            )
         return cls(
             name=name,
-            model=d.get("model", "gpt-4o"),
-            api_key=d.get("api_key", ""),
+            model=str(d.get("model", "") or ""),
             provider=str(d["provider"]) if d.get("provider") is not None else None,
-            base_url=d.get("base_url"),
-            max_tokens=d.get("max_tokens", 4096),
+            max_tokens=int(d.get("max_tokens", 0) or 0),
             temperature=d.get("temperature", 0.0),
-            max_context_tokens=d.get("max_context_tokens", 128_000),
+            max_context_tokens=int(d.get("max_context_tokens", 0) or 0),
             preserve_reasoning_content=d.get("preserve_reasoning_content", True),
             backfill_reasoning_content_for_tool_calls=d.get(
                 "backfill_reasoning_content_for_tool_calls", False
@@ -1372,12 +1373,12 @@ def _string_dict_list_config_value(value: Any) -> list[dict[str, str]]:
 class Config:
     """Main configuration model for ReuleauxCoder."""
 
-    model: str = "gpt-4o"
+    model: str = ""
     api_key: str = ""
     base_url: Optional[str] = None
-    max_tokens: int = 4096
+    max_tokens: int = 0
     temperature: float = 0.0
-    max_context_tokens: int = 128_000
+    max_context_tokens: int = 0
     preserve_reasoning_content: bool = True
     backfill_reasoning_content_for_tool_calls: bool = False
     reasoning_effort: Optional[str] = None
@@ -1461,14 +1462,10 @@ class Config:
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = []
-        is_remote_host_mode = self.remote_exec.enabled and self.remote_exec.host_mode
-        has_provider_backed_key = any(
-            provider.api_key for provider in self.providers.items.values()
-        )
-        if not is_remote_host_mode and not self.api_key and not has_provider_backed_key:
-            errors.append("api_key is required")
-        if self.max_tokens < 1:
+        if self.max_tokens < 0:
             errors.append("max_tokens must be positive")
+        if self.max_context_tokens < 0:
+            errors.append("max_context_tokens must be positive")
         if self.temperature < 0 or self.temperature > 2:
             errors.append("temperature must be between 0 and 2")
         if self.tool_output_max_chars < 1:
@@ -1626,13 +1623,14 @@ class Config:
         ):
             errors.append("active_sub_model_profile must exist in model_profiles")
         for name, profile in self.model_profiles.items():
-            if profile.provider:
-                if profile.provider not in self.providers.items:
-                    errors.append(
-                        f"model_profiles[{name}].provider must exist in providers.items"
-                    )
-            elif not profile.api_key:
-                errors.append(f"model_profiles[{name}].api_key is required")
+            if not profile.provider:
+                errors.append(f"model_profiles[{name}].provider is required")
+            elif profile.provider not in self.providers.items:
+                errors.append(
+                    f"model_profiles[{name}].provider must exist in providers.items"
+                )
+            if not profile.model:
+                errors.append(f"model_profiles[{name}].model is required")
             if profile.max_tokens < 1:
                 errors.append(f"model_profiles[{name}].max_tokens must be positive")
             if profile.max_context_tokens < 1:

@@ -531,7 +531,11 @@ def test_anthropic_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
     )
 
     response = provider.chat(
-        ProviderRequest(model="claude-demo", messages=[{"role": "user", "content": "hi"}])
+        ProviderRequest(
+            model="claude-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096,
+        )
     )
 
     assert response.tool_calls[0].argument_error == "missing tool arguments"
@@ -564,6 +568,7 @@ def test_anthropic_provider_emits_thinking_delta_callback() -> None:
         ProviderRequest(
             model="claude-demo",
             messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096,
             on_reasoning_token=reasoning_tokens.append,
         )
     )

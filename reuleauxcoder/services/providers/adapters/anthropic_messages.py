@@ -177,8 +177,10 @@ class AnthropicMessagesProvider:
             "model": request.model,
             "messages": messages,
             "stream": True,
-            "max_tokens": request.max_tokens,
         }
+        if request.max_tokens < 1:
+            raise RuntimeError("max_tokens is required for Anthropic messages providers")
+        params["max_tokens"] = request.max_tokens
         if system:
             params["system"] = system
         if request.tools:

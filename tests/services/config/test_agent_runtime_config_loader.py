@@ -8,13 +8,34 @@ from reuleauxcoder.domain.config.models import build_agent_run_snapshot
 from reuleauxcoder.services.config.loader import ConfigLoader
 
 
+def _model_config() -> dict:
+    return {
+        "providers": {
+            "items": {
+                "openai": {
+                    "type": "openai_chat",
+                    "api_key": "key",
+                }
+            }
+        },
+        "models": {
+            "active_main": "main",
+            "profiles": {
+                "main": {
+                    "provider": "openai",
+                    "model": "gpt",
+                    "max_tokens": 8192,
+                    "max_context_tokens": 128000,
+                }
+            },
+        },
+    }
+
+
 def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     config = ConfigLoader()._parse_config(
         {
-            "models": {
-                "active_main": "main",
-                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
-            },
+            **_model_config(),
             "run_limits": {
                 "max_running_agents": 8,
                 "max_shells_per_agent": 2,
@@ -84,10 +105,7 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
 def test_parse_config_injects_environment_configurator_by_default() -> None:
     config = ConfigLoader()._parse_config(
         {
-            "models": {
-                "active_main": "main",
-                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
-            },
+            **_model_config(),
             "runtime_profiles": {
                 "codex_remote": {
                     "executor": "codex",
@@ -162,10 +180,7 @@ def test_merge_dicts_merges_agent_registry_maps_by_id() -> None:
 def test_agent_run_snapshot_keeps_credential_refs_but_not_plaintext_secrets() -> None:
     config = ConfigLoader()._parse_config(
         {
-            "models": {
-                "active_main": "main",
-                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
-            },
+            **_model_config(),
             "runtime_profiles": {
                 "codex_remote": {
                     "executor": "codex",
@@ -199,10 +214,7 @@ def test_agent_run_snapshot_keeps_credential_refs_but_not_plaintext_secrets() ->
 def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> None:
     config = ConfigLoader()._parse_config(
         {
-            "models": {
-                "active_main": "main",
-                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
-            },
+            **_model_config(),
             "agent_registry": {
                 "agents": {
                     "reviewer": {
@@ -225,10 +237,7 @@ def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> 
 def test_parse_config_reads_persistence_settings() -> None:
     config = ConfigLoader()._parse_config(
         {
-            "models": {
-                "active_main": "main",
-                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
-            },
+            **_model_config(),
             "persistence": {
                 "backend": "postgres",
                 "database_url": "postgresql://user:pass@localhost/labrastro",
@@ -257,10 +266,7 @@ def test_missing_persistence_database_url_env_is_optional() -> None:
     loader = ConfigLoader()
     data = loader._expand_env_refs(
         {
-            "models": {
-                "active_main": "main",
-                "profiles": {"main": {"model": "gpt", "api_key": "key"}},
-            },
+            **_model_config(),
             "persistence": {
                 "backend": "auto",
                 "database_url": "${LABRASTRO_TEST_MISSING_DATABASE_URL}",

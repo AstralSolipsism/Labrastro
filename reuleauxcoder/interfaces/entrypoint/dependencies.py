@@ -62,11 +62,12 @@ def _default_load_tools(tool_backend: ToolBackend) -> list[Any]:
 
 
 def _default_create_agent(llm: LLM, tools: list[Any], config: Config) -> Agent:
+    context_tokens = int(getattr(config, "max_context_tokens", 0) or 0)
     return Agent(
         llm=llm,
         tools=tools,
         config=config,
-        max_context_tokens=config.max_context_tokens,
+        max_context_tokens=max(1, context_tokens),
         available_modes=getattr(config, "modes", {}) or {},
         active_mode=getattr(config, "active_mode", None),
     )

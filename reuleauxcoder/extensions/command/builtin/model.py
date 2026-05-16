@@ -254,8 +254,8 @@ def _handle_set_main_model(command, ctx) -> CommandResult:
     ctx.config.active_main_model_profile = profile_name
     ctx.config.model = profile.model
     provider = _profile_provider(ctx.config, profile)
-    ctx.config.api_key = profile.api_key or (provider.api_key if provider else "")
-    ctx.config.base_url = profile.base_url or (provider.base_url if provider else None)
+    ctx.config.api_key = provider.api_key if provider else ""
+    ctx.config.base_url = provider.base_url if provider else None
     ctx.config.temperature = profile.temperature
     ctx.config.max_tokens = profile.max_tokens
     ctx.config.max_context_tokens = profile.max_context_tokens
@@ -330,9 +330,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
     if active_main:
         lines.append(f"- main agent: `{active_main}`")
     else:
-        lines.append(f"- main agent: runtime `{runtime_model or config.model}`")
-        if config.base_url:
-            lines.append(f"  - base_url: `{config.base_url}`")
+        lines.append(f"- main agent: runtime `{runtime_model or config.model or 'unconfigured'}`")
 
     if active_sub:
         lines.append(f"- delegated run default: `{active_sub}`")
@@ -354,14 +352,11 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
 
     if not profiles:
         lines.append(
-            "> No model profiles configured. Add `models.profiles` in config.yaml."
+            "> No model profiles configured. Add providers and model profiles from the VS Code settings page."
         )
         lines.append("")
         lines.append("**Current runtime config**")
-        lines.append(f"- model: `{config.model}`")
-        lines.append(f"- max_tokens: {config.max_tokens}")
-        lines.append(f"- temperature: {config.temperature}")
-        lines.append(f"- max_context_tokens: {config.max_context_tokens}")
+        lines.append(f"- model: `{runtime_model or config.model or 'unconfigured'}`")
     else:
         lines.append("## Profiles")
         lines.append("")
@@ -373,10 +368,8 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
             if active_sub == name:
                 badges.append("SUB")
             badge_text = f" [{' | '.join(badges)}]" if badges else ""
-            api_key = getattr(p, "api_key", "")
             provider = _profile_provider(config, p)
-            if not api_key and provider is not None:
-                api_key = provider.api_key
+            api_key = provider.api_key if provider is not None else ""
             if api_key and len(api_key) >= 4:
                 api_hint = f"...{api_key[-4:]}"
             elif api_key:
@@ -396,7 +389,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
                 "provider_api_features": (
                     provider.api_features.to_dict() if provider else {}
                 ),
-                "base_url": p.base_url or (provider.base_url if provider else None),
+                "base_url": provider.base_url if provider else None,
                 "max_tokens": p.max_tokens,
                 "temperature": p.temperature,
                 "max_context_tokens": p.max_context_tokens,
@@ -417,7 +410,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
                 ]
                 if features:
                     lines.append(f"- api_features: `{', '.join(sorted(features))}`")
-            effective_base_url = p.base_url or (provider.base_url if provider else None)
+            effective_base_url = provider.base_url if provider else None
             if effective_base_url:
                 lines.append(f"- base_url: `{effective_base_url}`")
             lines.append(f"- max_tokens: {p.max_tokens}")

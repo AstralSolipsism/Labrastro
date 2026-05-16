@@ -141,10 +141,10 @@ def test_mcp_server_config_accepts_both_placement() -> None:
 def test_model_profile_config_from_dict_uses_defaults() -> None:
     profile = ModelProfileConfig.from_dict("main", {})
     assert profile.name == "main"
-    assert profile.model == "gpt-4o"
-    assert profile.api_key == ""
+    assert profile.model == ""
     assert profile.provider is None
-    assert profile.max_tokens == 4096
+    assert profile.max_tokens == 0
+    assert profile.max_context_tokens == 0
     assert profile.temperature == 0.0
     assert profile.preserve_reasoning_content is True
     assert profile.backfill_reasoning_content_for_tool_calls is False
@@ -153,11 +153,34 @@ def test_model_profile_config_from_dict_uses_defaults() -> None:
 def test_model_profile_config_reads_provider_reference() -> None:
     profile = ModelProfileConfig.from_dict(
         "main",
-        {"model": "claude", "provider": "anthropic-main", "max_tokens": 8192},
+        {
+            "model": "claude",
+            "provider": "anthropic-main",
+            "max_tokens": 8192,
+            "max_context_tokens": 200000,
+        },
     )
 
     assert profile.provider == "anthropic-main"
-    assert profile.api_key == ""
+    assert profile.max_context_tokens == 200000
+
+
+def test_model_profile_config_rejects_profile_credentials() -> None:
+    try:
+        ModelProfileConfig.from_dict(
+            "main",
+            {
+                "model": "claude",
+                "provider": "anthropic-main",
+                "api_key": "sk-old",
+                "base_url": "https://api.example.test/v1",
+            },
+        )
+    except ValueError as exc:
+        assert "api_key" in str(exc)
+        assert "base_url" in str(exc)
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("expected removed profile credentials to be rejected")
 
 
 def test_provider_config_roundtrip() -> None:
@@ -207,8 +230,8 @@ def test_mode_config_from_dict_normalizes_invalid_fields() -> None:
 
 def test_config_validate_collects_multiple_errors() -> None:
     config = Config(
-        api_key="",
-        max_tokens=0,
+        max_tokens=-1,
+        max_context_tokens=-1,
         temperature=3.0,
         tool_output_max_chars=0,
         tool_output_max_lines=0,
@@ -219,7 +242,6 @@ def test_config_validate_collects_multiple_errors() -> None:
             "bad": ModelProfileConfig(
                 name="bad",
                 model="gpt",
-                api_key="",
                 max_tokens=0,
                 temperature=5.0,
                 max_context_tokens=0,
@@ -234,15 +256,15 @@ def test_config_validate_collects_multiple_errors() -> None:
 
     errors = config.validate()
 
-    assert "api_key is required" in errors
     assert "max_tokens must be positive" in errors
+    assert "max_context_tokens must be positive" in errors
     assert "temperature must be between 0 and 2" in errors
     assert "tool_output_max_chars must be positive" in errors
     assert "tool_output_max_lines must be positive" in errors
     assert "active_main_model_profile must exist in model_profiles" in errors
     assert "active_sub_model_profile must exist in model_profiles" in errors
     assert "active_mode must exist in modes" in errors
-    assert "model_profiles[bad].api_key is required" in errors
+    assert "model_profiles[bad].provider is required" in errors
     assert "model_profiles[bad].max_tokens must be positive" in errors
     assert "model_profiles[bad].max_context_tokens must be positive" in errors
     assert "model_profiles[bad].temperature must be between 0 and 2" in errors
@@ -258,7 +280,6 @@ def test_config_validate_collects_multiple_errors() -> None:
 
 def test_config_validate_accepts_provider_backed_profile_without_profile_api_key() -> None:
     config = Config(
-        api_key="",
         providers=ProvidersConfig(
             items={
                 "anthropic-main": ProviderConfig(
@@ -272,8 +293,9 @@ def test_config_validate_accepts_provider_backed_profile_without_profile_api_key
             "main": ModelProfileConfig(
                 name="main",
                 model="claude",
-                api_key="",
                 provider="anthropic-main",
+                max_tokens=8192,
+                max_context_tokens=200000,
             )
         },
         active_main_model_profile="main",
@@ -284,14 +306,14 @@ def test_config_validate_accepts_provider_backed_profile_without_profile_api_key
 
 def test_config_validate_rejects_missing_profile_provider_reference() -> None:
     config = Config(
-        api_key="",
         providers=ProvidersConfig(),
         model_profiles={
             "main": ModelProfileConfig(
                 name="main",
                 model="claude",
-                api_key="",
                 provider="missing",
+                max_tokens=8192,
+                max_context_tokens=200000,
             )
         },
     )
@@ -303,7 +325,6 @@ def test_config_validate_rejects_missing_profile_provider_reference() -> None:
 
 def test_config_validate_accepts_agent_default_model_provider_reference() -> None:
     config = Config(
-        api_key="",
         providers=ProvidersConfig(
             items={
                 "deepseek": ProviderConfig(
@@ -328,7 +349,6 @@ def test_config_validate_accepts_agent_default_model_provider_reference() -> Non
 
 def test_config_validate_rejects_missing_agent_default_model_provider() -> None:
     config = Config(
-        api_key="",
         providers=ProvidersConfig(),
         agent_registry=AgentRegistryConfig(
             agents={
@@ -347,14 +367,13 @@ def test_config_validate_rejects_missing_agent_default_model_provider() -> None:
 
 def test_config_is_valid_for_minimal_valid_configuration() -> None:
     config = Config(
-        api_key="key",
         approval=ApprovalConfig(default_mode="allow"),
     )
     assert config.is_valid() is True
 
 
 def test_sandbox_provider_config_defaults_and_validation() -> None:
-    config = Config(api_key="key")
+    config = Config()
 
     assert config.sandbox_provider.type == "none"
     assert config.sandbox_provider.worker_image == "labrastro-host:test"
@@ -363,7 +382,6 @@ def test_sandbox_provider_config_defaults_and_validation() -> None:
 
 def test_config_validate_allows_remote_host_without_model_key() -> None:
     config = Config(
-        api_key="",
         remote_exec=RemoteExecConfig(enabled=True, host_mode=True),
         auth=AuthConfig(
             enabled=True,
@@ -380,12 +398,12 @@ def test_config_validate_allows_remote_host_without_model_key() -> None:
     assert "api_key is required" not in config.validate()
 
 
-def test_config_validate_still_requires_model_key_outside_remote_host() -> None:
-    config = Config(api_key="")
+def test_config_validate_allows_unconfigured_llm_outside_remote_host() -> None:
+    config = Config()
 
-    assert "api_key is required" in config.validate()
+    assert config.validate() == []
 
-    invalid = Config(api_key="key")
+    invalid = Config()
     invalid.sandbox_provider.type = "bad"
     invalid.sandbox_provider.idle_ttl_seconds = 0
 
@@ -395,12 +413,12 @@ def test_config_validate_still_requires_model_key_outside_remote_host() -> None:
 
 
 def test_config_supports_llm_debug_trace_flag() -> None:
-    config = Config(api_key="key", llm_debug_trace=True)
+    config = Config(llm_debug_trace=True)
     assert config.llm_debug_trace is True
 
 
 def test_remote_exec_config_defaults() -> None:
-    config = Config(api_key="key")
+    config = Config()
     assert isinstance(config.remote_exec, RemoteExecConfig)
     assert config.remote_exec.enabled is False
     assert config.remote_exec.host_mode is False

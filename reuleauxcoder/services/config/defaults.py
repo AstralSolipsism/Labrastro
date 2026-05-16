@@ -8,7 +8,6 @@ SESSION_DIR_DEFAULT = "~/.rcoder/sessions"
 HISTORY_FILE_DEFAULT = "~/.rcoder/history"
 
 # Agent defaults
-MAX_CONTEXT_TOKENS_DEFAULT = 128_000
 MAX_ROUNDS_DEFAULT = 50
 
 # Context compression defaults

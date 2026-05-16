@@ -94,6 +94,12 @@ class RemoteAdminRoutes:
                     return
             if path == "/remote/admin/status":
                 result = {"ok": True, **self.service.admin_manager.status()}
+                pr_service = getattr(self.service, "github_pr_service", None)
+                result["github"] = (
+                    pr_service.status()
+                    if pr_service is not None
+                    else {"enabled": False, "api": {"ok": False}}
+                )
                 self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/remote/admin/agent-runs/submit":
@@ -599,7 +605,22 @@ class RemoteAdminRoutes:
             settings = payload.get("settings")
             if isinstance(settings, dict):
                 targets.extend(str(key) for key in settings if str(key).strip())
-            for key in ("agent_registry", "runtime_profiles", "run_limits", "sandbox_provider"):
+            for key in (
+                "agent_registry",
+                "runtime_profiles",
+                "run_limits",
+                "capability_packages",
+                "tool_output",
+                "context",
+                "memory",
+                "approval",
+                "modes",
+                "skills",
+                "prompt",
+                "persistence",
+                "sandbox_provider",
+                "model_capabilities",
+            ):
                 if isinstance(payload.get(key), dict):
                     targets.append(key)
             if isinstance(payload.get("diagnostics"), dict):

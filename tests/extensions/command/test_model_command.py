@@ -4,6 +4,8 @@ from reuleauxcoder.domain.config.models import (
     ApprovalConfig,
     Config,
     ModelProfileConfig,
+    ProviderConfig,
+    ProvidersConfig,
 )
 from reuleauxcoder.extensions.command.builtin.model import (
     SetMainModelCommand,
@@ -28,6 +30,7 @@ class FakeLLM:
         self.temperature = 0.0
         self.max_tokens = 2048
         self.debug_trace = False
+        self.debug_raw_chunks = False
 
     def reconfigure(self, **kwargs) -> None:
         for key, value in kwargs.items():
@@ -38,8 +41,7 @@ def _build_ctx() -> SimpleNamespace:
     profile_a = ModelProfileConfig(
         name="alpha",
         model="model-alpha",
-        api_key="key-alpha",
-        base_url="https://alpha.example",
+        provider="alpha-provider",
         max_tokens=4000,
         temperature=0.1,
         max_context_tokens=100000,
@@ -47,8 +49,7 @@ def _build_ctx() -> SimpleNamespace:
     profile_b = ModelProfileConfig(
         name="beta",
         model="model-beta",
-        api_key="key-beta",
-        base_url="https://beta.example",
+        provider="beta-provider",
         max_tokens=8000,
         temperature=0.2,
         max_context_tokens=200000,
@@ -57,6 +58,22 @@ def _build_ctx() -> SimpleNamespace:
         model="base-model",
         api_key="base-key",
         approval=ApprovalConfig(),
+        providers=ProvidersConfig(
+            items={
+                "alpha-provider": ProviderConfig(
+                    id="alpha-provider",
+                    type="openai_chat",
+                    api_key="key-alpha",
+                    base_url="https://alpha.example",
+                ),
+                "beta-provider": ProviderConfig(
+                    id="beta-provider",
+                    type="openai_chat",
+                    api_key="key-beta",
+                    base_url="https://beta.example",
+                ),
+            }
+        ),
         model_profiles={"alpha": profile_a, "beta": profile_b},
         active_main_model_profile="alpha",
         active_sub_model_profile="alpha",
