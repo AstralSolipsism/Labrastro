@@ -19,6 +19,7 @@ from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
 from reuleauxcoder.extensions.tools.builtin.glob import GlobTool
 from reuleauxcoder.extensions.tools.builtin.grep import GrepTool
+from reuleauxcoder.extensions.tools.builtin.list_file import ListFileTool
 from reuleauxcoder.extensions.tools.builtin.read import ReadFileTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
 from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
@@ -116,6 +117,26 @@ class TestRemoteBackendDispatch:
             assert "non-empty string" in result.lower()
 
             result = tool.execute(pattern="foo", include=123)
+            assert "must be a string" in result.lower()
+        finally:
+            srv.stop()
+
+    def test_list_file_no_peer(self) -> None:
+        srv = RelayServer()
+        srv.start()
+        try:
+            backend = RemoteRelayToolBackend(relay_server=srv)
+            tool = ListFileTool(backend=backend)
+            result = tool.execute(path="/tmp")
+            assert "no remote peer" in result.lower()
+
+            result = tool.execute(path="")
+            assert "non-empty string" in result.lower()
+
+            result = tool.execute(path="/tmp", all="yes")
+            assert "boolean" in result.lower()
+
+            result = tool.execute(path="/tmp", pattern=123)
             assert "must be a string" in result.lower()
         finally:
             srv.stop()

@@ -317,6 +317,93 @@ func TestGlobSupportsGlobstarAndSortsByNewestMtime(t *testing.T) {
 	}
 }
 
+func TestListFileListsAndSanitizesNames(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tricky`name`.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".hidden"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName: "list_file",
+		Args: map[string]any{
+			"path": ".",
+		},
+	}, dir, nil)
+
+	if !result.OK {
+		t.Fatalf("list_file failed: %#v", result)
+	}
+	if !strings.Contains(result.Result, "src/") {
+		t.Fatalf("directory missing from list_file output: %q", result.Result)
+	}
+	if !strings.Contains(result.Result, "README.md") {
+		t.Fatalf("file missing from list_file output: %q", result.Result)
+	}
+	if !strings.Contains(result.Result, "tricky\\`name\\`.txt") {
+		t.Fatalf("markdown-sensitive name was not escaped: %q", result.Result)
+	}
+	if !strings.Contains(result.Result, ".hidden") {
+		t.Fatalf("default list_file output should include dotfiles: %q", result.Result)
+	}
+}
+
+func TestListFileFiltersDotfilesPatternAndSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".hidden"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	filtered := Execute(protocol.ExecToolRequest{
+		ToolName: "list_file",
+		Args: map[string]any{
+			"path":    ".",
+			"all":     false,
+			"long":    false,
+			"pattern": "*.go",
+		},
+	}, dir, nil)
+
+	if !filtered.OK {
+		t.Fatalf("list_file failed: %#v", filtered)
+	}
+	if strings.TrimSpace(filtered.Result) != "main.go" {
+		t.Fatalf("filtered list_file output = %q, want only main.go", filtered.Result)
+	}
+
+	single := Execute(protocol.ExecToolRequest{
+		ToolName: "list_file",
+		Args: map[string]any{
+			"path": "README.md",
+			"long": false,
+		},
+	}, dir, nil)
+
+	if !single.OK {
+		t.Fatalf("single file list_file failed: %#v", single)
+	}
+	if single.Result != "README.md" {
+		t.Fatalf("single file output = %q, want README.md", single.Result)
+	}
+}
+
 func TestExecuteArchivesLongOutputUnderWorkspaceRoot(t *testing.T) {
 	cwd := t.TempDir()
 	workspaceRoot := t.TempDir()

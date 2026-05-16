@@ -78,7 +78,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		workspaceRoot = cwd
 	}
 
-	features := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "tool_preview"}
+	features := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "list_file", "tool_preview"}
 	hostInfo := map[string]any{
 		"os":       runtimeOS(),
 		"arch":     runtimeArch(),

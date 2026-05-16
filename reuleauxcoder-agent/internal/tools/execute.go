@@ -63,6 +63,8 @@ func ExecuteWithContext(
 		result = globFiles(req.Args, cwd)
 	case "grep":
 		result = grepFiles(req.Args, cwd)
+	case "list_file":
+		result = listFile(req.Args, cwd)
 	default:
 		result = errorResult("REMOTE_TOOL_ERROR", fmt.Sprintf("unsupported tool %q", req.ToolName))
 	}
@@ -883,6 +885,195 @@ func grepFiles(args map[string]any, cwd string) protocol.ExecToolResult {
 		return protocol.ExecToolResult{OK: true, Result: "No matches found."}
 	}
 	return protocol.ExecToolResult{OK: true, Result: strings.Join(matches, "\n")}
+}
+
+func listFile(args map[string]any, cwd string) protocol.ExecToolResult {
+	pathValue, _ := args["path"].(string)
+	if pathValue == "" {
+		pathValue = "."
+	}
+	all := true
+	if v, ok := args["all"].(bool); ok {
+		all = v
+	}
+	long := true
+	if v, ok := args["long"].(bool); ok {
+		long = v
+	}
+	recursive := false
+	if v, ok := args["recursive"].(bool); ok {
+		recursive = v
+	}
+	pattern, _ := args["pattern"].(string)
+
+	base, err := resolvePath(cwd, pathValue)
+	if err != nil {
+		return errorResult("REMOTE_TOOL_ERROR", err.Error())
+	}
+	info, err := os.Stat(base)
+	if err != nil {
+		return errorResult("REMOTE_TOOL_ERROR", err.Error())
+	}
+	if !info.IsDir() {
+		name := sanitizeName(info.Name())
+		if long {
+			return protocol.ExecToolResult{
+				OK:     true,
+				Result: fmt.Sprintf("%s  %8d  %s  %s", modeString(info.Mode()), info.Size(), mtimeString(info.ModTime()), name),
+			}
+		}
+		return protocol.ExecToolResult{OK: true, Result: name}
+	}
+
+	lines, err := collectDirEntries(base, all, long, pattern, recursive)
+	if err != nil {
+		return errorResult("REMOTE_TOOL_ERROR", err.Error())
+	}
+	if len(lines) == 0 {
+		if pattern != "" {
+			return protocol.ExecToolResult{OK: true, Result: fmt.Sprintf("(no entries matching %q in %q)", pattern, base)}
+		}
+		return protocol.ExecToolResult{OK: true, Result: fmt.Sprintf("(empty directory: %q)", base)}
+	}
+	header := ""
+	if long {
+		header = fmt.Sprintf("%s:\n", base)
+	}
+	return protocol.ExecToolResult{OK: true, Result: header + strings.Join(lines, "\n")}
+}
+
+func collectDirEntries(
+	base string,
+	all bool,
+	long bool,
+	pattern string,
+	recursive bool,
+) ([]string, error) {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+
+	type dirEntry struct {
+		name  string
+		mode  os.FileMode
+		isDir bool
+		size  int64
+		mtime time.Time
+	}
+	list := make([]dirEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !all && strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		if pattern != "" {
+			matched, matchErr := filepath.Match(pattern, entry.Name())
+			if matchErr != nil || !matched {
+				continue
+			}
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			list = append(list, dirEntry{name: entry.Name(), isDir: entry.IsDir()})
+			continue
+		}
+		list = append(list, dirEntry{
+			name:  entry.Name(),
+			mode:  info.Mode(),
+			isDir: entry.IsDir(),
+			size:  info.Size(),
+			mtime: info.ModTime(),
+		})
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].isDir != list[j].isDir {
+			return list[i].isDir
+		}
+		return strings.ToLower(list[i].name) < strings.ToLower(list[j].name)
+	})
+
+	lines := make([]string, 0, len(list))
+	for _, entry := range list {
+		safeName := sanitizeName(entry.name)
+		if entry.isDir {
+			safeName += "/"
+		}
+		if long {
+			lines = append(lines, fmt.Sprintf("%s  %8d  %s  %s", modeString(entry.mode), entry.size, mtimeString(entry.mtime), safeName))
+		} else {
+			lines = append(lines, safeName)
+		}
+	}
+
+	if recursive {
+		for _, entry := range list {
+			if !entry.isDir {
+				continue
+			}
+			if !all && strings.HasPrefix(entry.name, ".") {
+				continue
+			}
+			subPath := filepath.Join(base, entry.name)
+			subLines, subErr := collectDirEntries(subPath, all, long, pattern, true)
+			if subErr == nil && len(subLines) > 0 {
+				lines = append(lines, "")
+				lines = append(lines, subLines...)
+			}
+		}
+	}
+
+	return lines, nil
+}
+
+func modeString(mode os.FileMode) string {
+	b := make([]byte, 10)
+	if mode.IsDir() {
+		b[0] = 'd'
+	} else {
+		b[0] = '-'
+	}
+	perm := mode.Perm()
+	b[1] = rwx(perm, 2)
+	b[2] = rwx(perm, 1)
+	b[3] = rwx(perm, 0)
+	b[4] = rwx(perm>>3, 2)
+	b[5] = rwx(perm>>3, 1)
+	b[6] = rwx(perm>>3, 0)
+	b[7] = rwx(perm>>6, 2)
+	b[8] = rwx(perm>>6, 1)
+	b[9] = rwx(perm>>6, 0)
+	return string(b)
+}
+
+func sanitizeName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch r {
+		case '`', '*', '_', '[', ']', '|', '<', '>':
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func rwx(perm os.FileMode, bit uint) byte {
+	if perm&(1<<(2-bit)) == 0 {
+		return '-'
+	}
+	switch bit {
+	case 2:
+		return 'r'
+	case 1:
+		return 'w'
+	default:
+		return 'x'
+	}
+}
+
+func mtimeString(t time.Time) string {
+	return t.Format("Jan _2 15:04")
 }
 
 func resolvePath(cwd, path string) (string, error) {

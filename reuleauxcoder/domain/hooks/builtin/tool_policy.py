@@ -117,6 +117,7 @@ BUILTIN_TOOL_NAMES = {
     "edit_file",
     "glob",
     "grep",
+    "list_file",
     "agent",
 }
 
