@@ -25,7 +25,8 @@ reuleauxcoder-agent/  # Go binary for remote peer execution
 │   ├── client/http.go                 # HTTP client for relay protocol
 │   ├── runner/runner.go               # Main loop (register/heartbeat/poll/execute)
 │   ├── protocol/types.go              # Protocol type definitions
-│   └── tools/execute.go               # Local tool execution (shell/read/write/edit/glob/grep)
+│   ├── lsp/lsp.go                     # Peer-side LSP client/manager
+│   └── tools/execute.go               # Local tool execution (shell/read/write/edit/glob/grep/list_file/lsp)
 ```
 
 ## Layer Responsibilities
@@ -50,7 +51,7 @@ Pure business logic with no external dependencies. Contains core abstractions an
   - `registry.py` — `HookRegistry`: global hook store keyed by `HookPoint`, sorted by priority.
   - `discovery.py` — `discover_hook_specs()` scans `builtin/` for `@register_hook`-decorated classes.
   - `base.py` — `Hook` abstract base, `HookSpec` frozen dataclass for lazy instantiation.
-  - `builtin/` — `ToolPolicyGuardHook`, `ToolOutputTruncationHook`, `ProjectContextHook`, `ProjectContextStartupNotifier`.
+  - `builtin/` — `ToolPolicyGuardHook`, `ToolOutputTruncationHook`, `ProjectContextHook`, `ProjectContextStartupNotifier`, `LspEditObserverHook`, `LspDiagnosticInjectorHook`.
 - **llm/**: LLM domain models
   - `models.py` — `LLMResponse` (content, tool_calls, usage, finish_reason), `ToolCall` (id, name, arguments), `TokenUsage`.
   - `messages.py` — `Message` types (system, user, assistant, tool), `ToolResult`.
@@ -131,6 +132,15 @@ Pluggable extension system.
   - `builtin/grep.py` — `GrepTool`: skips `.git`, `node_modules`, `__pycache__`, `.venv`, etc. via `_SKIP_DIRS`.
   - `builtin/glob.py` — `GlobTool`: recursive `**` support, skip-dirs filter.
   - `builtin/agent.py` — `AgentTool`: spawns sub-agents. `_parent_agent` ref for mode validation. Pre-flight: required `tasks: list[str]`, background requires `mode='explore'`, batch requires `mode='explore'` + `run_in_background=true`, `parallel_explore` caps (1-4).
+  - `builtin/list_file.py` — `ListFileTool`: read-only directory exploration; supports `path`, `all`, `long`, `recursive`, `pattern`, and escapes Markdown-sensitive file names.
+  - `builtin/lsp.py` — `LspTool`: read-only LSP navigation (`goToDefinition`, `findReferences`, `documentSymbol`). Local execution uses host `LspManager`; remote execution forwards to a peer that advertises `lsp`.
+- **lsp/**: Language Server Protocol integration
+  - `config.py` — `LspConfig` (`enabled`, `poll_timeout_ms`, `max_diagnostics`, `include_warnings`, `server_overrides`).
+  - `registry.py` — language detection by extension, default server commands, workspace-root marker resolution.
+  - `client.py` — stdio JSON-RPC client with lazy process startup, request/notify, diagnostic collection, shutdown fallback.
+  - `manager.py` — `LspManager`: lazy per-language/root client ownership, health check, diagnostics cache, active request dispatch, `shutdown_all()`.
+  - `diagnostics.py` — `Diagnostic`, `DiagnosticBlock`, and compact `<diagnostics file="...">` rendering.
+  - `tool_helpers.py` — validates active LSP operations and formats definitions, references, and document symbols.
 - **command/**: Slash commands with `@register_command_module` + `ActionRegistry`
   - Complete command list: `/help`, `/quit`/`/exit`, `/reset`, `/new`, `/compact [force <strategy>]`, `/tokens`, `/debug on/off`, `/save`, `/model <profile|use-main|use-sub|set-main|set-sub>`, `/mode <mode>`, `/skills [reload|enable|disable <n>]`, `/mcp [show|enable|disable <s>]`, `/approval [show|set ...|set-global ...]`, `/sessions [all]`, `/session <id|latest>`, `/jobs [get|wait <job_id>]`.
   - Commands grouped by module: `system.py` (help/quit/reset/compact/tokens/debug), `sessions.py` (save/new/sessions/session), `model.py` (model switch), `mode.py` (mode switch), `skills.py`, `mcp.py`, `approval.py`, `subagent_jobs.py`.
@@ -335,7 +345,8 @@ Blocks are sorted by `(zone, order, key)` for deterministic output.
 Application initialization and dependency injection.
 - Uses `AppDependencies` for customizable component construction
 - Auto-discovers hooks via `discover_hook_specs()` + `instantiate_hooks()`
-- Manages MCP servers, skills service, and session restore/save lifecycle
+- Manages MCP servers, skills service, host-side LSP, and session restore/save lifecycle
+- LSP lifecycle: local execution uses host `LspManager`; remote execution uses peer-advertised `lsp` capability and peer paths.
 - Computes the current session fingerprint from runtime/config
 - Auto-resume latest is fingerprint-scoped and resolves "latest" by most recently saved/updated session
 - Manual resume by explicit session id is allowed to cross fingerprints with warning
@@ -376,10 +387,11 @@ Standalone Go binary for remote peer execution:
 - `ApprovalReplyRequest` for remote approval decisions
 
 **Tools** (`internal/tools/execute.go`):
-- Supports: `shell`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
+- Supports: `shell`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_file`, `lsp`
 - Shell: subprocess with timeout, stdout/stderr streaming
 - File ops: path validation, content limits
 - Glob/grep: skip `.git`, `node_modules`, `__pycache__`, venv, etc.
+- `lsp`: read-only peer-side language-server queries; `write_file`/`edit_file` append diagnostics when available.
 
 ## Configuration (`config.yaml`)
 
@@ -391,7 +403,7 @@ Key sections:
   - Core: `model`, `api_key`, `base_url`, `max_tokens`, `temperature`, `max_context_tokens`.
   - Reasoning: `thinking_enabled`, `reasoning_effort` (`"high"`/`"medium"`/`"low"`), `reasoning_replay_mode` (`"tool_calls"`/`"none"`), `preserve_reasoning_content`, `backfill_reasoning_content_for_tool_calls`.
 - **`modes`**: `active` selects current mode. Each `profiles.<mode>` has `description`, `prompt_append`, `tools` (allow list; `"*"` for all), `allowed_subagent_modes`.
-- **`approval`**: `default_mode` (`"allow"`/`"warn"`/`"require_approval"`/`"deny"`). `rules`: list of `{tool_name, tool_source, action}`. Tool source matches support `"mcp"`, `"mcp:<server>"`, `"mcp:<server>:<tool>"`.
+- **`approval`**: `default_mode` (`"allow"`/`"warn"`/`"require_approval"`/`"deny"`). `rules`: list of `{tool_name, tool_source, action}`. Tool source matches support `"mcp"`, `"mcp:<server>"`, `"mcp:<server>:<tool>"`. Default read-only allow-list includes `read_file`, `glob`, `grep`, `list_file`, and `lsp`.
 - **`prompt`**: `system_append` for custom system prompt injection.
 - **`skills`**: `enabled` (bool), `disabled` (list of skill names to exclude), `dirs` (additional skill directories).
 - **`mcp.servers`**: `<name>` → `{command, args, env}`. MCP servers are stdio-based JSON-RPC subprocesses.
@@ -399,6 +411,7 @@ Key sections:
 - **`session`**: `auto_save` (default true), `dir` (default `.rcoder/sessions`).
 - **`tool_output`**: `max_chars` (default 12000), `max_lines` (120), `store_full_output` (true), `store_dir` (`.rcoder/tool-outputs`).
 - **`remote_exec`**: `enabled`, `host_mode`, `relay_bind`, `bootstrap_token_ttl_sec`, `peer_token_ttl_sec`, `heartbeat_interval_sec`, `heartbeat_timeout_sec`, `default_tool_timeout_sec`, `shell_timeout_sec`.
+- **`lsp`**: `enabled`, `poll_timeout_ms`, `max_diagnostics`, `include_warnings`, optional `servers.<language>` overrides (`cmd`, `args`, `workspace_root`, `init_opts`).
 - **`auth`**: `enabled`, `token_secret`, `access_token_ttl_sec`, `refresh_token_ttl_sec`, `password_hash_iterations`, `store_path`, `superadmins`.
 - **`cli`**: `history_file` (default `~/.rcoder/history`).
 
