@@ -173,6 +173,10 @@ CONFIG_SCHEMA = {
         "max_running_agents": "int (default: 4, global server-side Agent concurrency limit)",
         "max_shells_per_agent": "int (default: 1, per-Agent shell concurrency limit)",
     },
+    "model_capabilities": {
+        "enabled": "bool (default: true, periodically sync model capability catalog)",
+        "interval_sec": "int (default: 86400, background sync interval in seconds)",
+    },
     "runtime_profiles": {
         "profile_id": {
             "executor": "string (one of reuleauxcoder, fake, codex, claude, gemini)",

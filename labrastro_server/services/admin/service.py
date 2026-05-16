@@ -34,6 +34,12 @@ from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.llm.diagnostics import (
     summarize_tool_argument_validation_events,
 )
+from reuleauxcoder.services.providers.model_capabilities import (
+    ModelCapabilityCatalogService,
+    capability_recommendation,
+    capability_source_label,
+    utc_now_iso,
+)
 from reuleauxcoder.services.providers.manager import ProviderManager
 
 
@@ -54,17 +60,20 @@ class RemoteAdminConfigManager:
 
     def __init__(
         self,
-        config_path: Path | None = None,
+        config_path: Path | str | None = None,
         *,
         reload_handler: ConfigReloadHandler | None = None,
         provider_test_handler: ProviderTestHandler | None = None,
         provider_models_handler: ProviderModelsHandler | None = None,
     ) -> None:
-        self.config_path = config_path or ConfigLoader.GLOBAL_CONFIG_PATH
+        self.config_path = Path(config_path or ConfigLoader.GLOBAL_CONFIG_PATH)
         self.reload_handler = reload_handler
         self.provider_test_handler = provider_test_handler
         self.provider_models_handler = provider_models_handler
         self._lock = threading.Lock()
+        self.model_capability_catalog = ModelCapabilityCatalogService(
+            self.config_path.parent / "model-capabilities"
+        )
 
     def status(self) -> dict[str, Any]:
         modes = self.list_modes()
@@ -81,6 +90,7 @@ class RemoteAdminConfigManager:
             "modes": modes["modes"],
             "active_mode": modes["active_mode"],
             "server_settings": self.read_server_settings()["settings"],
+            "model_capabilities": self.model_capabilities_status()["model_capabilities"],
             "agent_runs": get_interactive_run_limiter().snapshot(),
         }
 
@@ -94,6 +104,111 @@ class RemoteAdminConfigManager:
         import hashlib
 
         return f'"sha256-{hashlib.sha256(payload).hexdigest()}"'
+
+    def model_capabilities_settings(
+        self, data: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        data = data if data is not None else self._load_data()
+        raw = data.get("model_capabilities", {})
+        raw = raw if isinstance(raw, dict) else {}
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "interval_sec": max(60, int(raw.get("interval_sec", 86400) or 86400)),
+        }
+
+    def model_capabilities_status(self) -> dict[str, Any]:
+        settings = self.model_capabilities_settings()
+        return {
+            "model_capabilities": self.model_capability_catalog.status(
+                enabled=bool(settings["enabled"]),
+                interval_sec=int(settings["interval_sec"]),
+            )
+        }
+
+    def list_model_capabilities(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "model_capabilities": {
+                **self.model_capabilities_status()["model_capabilities"],
+                "models": self.model_capability_catalog.list_capabilities(
+                    provider=str(payload.get("provider") or payload.get("provider_id") or ""),
+                    model=str(payload.get("model") or payload.get("model_id") or ""),
+                ),
+            }
+        }
+
+    def refresh_model_capabilities(self) -> AdminConfigResult:
+        result = self.model_capability_catalog.refresh()
+        status = 200 if result.get("ok") is True else 502
+        return AdminConfigResult(bool(result.get("ok")), result, status)
+
+    def apply_model_capability_recommendation(
+        self, payload: dict[str, Any]
+    ) -> AdminConfigResult:
+        raw_ids = payload.get("profile_ids")
+        profile_ids = (
+            [str(item).strip() for item in raw_ids if str(item).strip()]
+            if isinstance(raw_ids, list)
+            else [str(payload.get("profile_id") or payload.get("id") or "").strip()]
+        )
+        profile_ids = [item for item in dict.fromkeys(profile_ids) if item]
+        if not profile_ids:
+            return AdminConfigResult(False, {"error": "profile_id_required"}, 400)
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            profiles = self._model_profiles(data)
+            updated: list[dict[str, Any]] = []
+            errors: list[dict[str, str]] = []
+            for profile_id in profile_ids:
+                item = profiles.get(profile_id)
+                if not isinstance(item, dict):
+                    errors.append({"profile_id": profile_id, "error": "profile_not_found"})
+                    continue
+                provider = self._provider_config_for_profile(data, item)
+                capability = self.model_capability_catalog.lookup(
+                    provider or str(item.get("provider") or ""),
+                    str(item.get("model") or profile_id),
+                )
+                if capability is None:
+                    errors.append({"profile_id": profile_id, "error": "capability_not_found"})
+                    continue
+                if capability.max_output_tokens:
+                    item["max_tokens"] = capability.max_output_tokens
+                if capability.max_context_tokens:
+                    item["max_context_tokens"] = capability.max_context_tokens
+                applied_at = utc_now_iso()
+                source = (
+                    capability_source_label(capability)
+                    if capability is not None
+                    else "catalog"
+                )
+                profile = ModelProfileConfig.from_dict(profile_id, item)
+                profiles[profile_id] = {
+                    **profile.to_dict(),
+                    "capability_user_configured": False,
+                    "capability_applied_at": applied_at,
+                    "capability_source": source,
+                }
+                updated.append(self._profile_view(profile_id, profiles[profile_id], data=data))
+            if not updated:
+                return AdminConfigResult(
+                    False,
+                    {"error": "capability_apply_failed", "errors": errors},
+                    404,
+                )
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "updated_profiles": updated,
+                    "errors": errors,
+                    **self.list_model_profiles(),
+                },
+            )
 
     def list_modes(self) -> dict[str, Any]:
         data = self._load_data()
@@ -173,6 +288,7 @@ class RemoteAdminConfigManager:
         sandbox_provider = SandboxProviderConfig.from_dict(
             raw_sandbox if isinstance(raw_sandbox, dict) else {}
         )
+        model_capabilities = self.model_capabilities_settings(data)
         raw_diagnostics = data.get("diagnostics", {})
         diagnostics = DiagnosticsConfig.from_dict(
             raw_diagnostics if isinstance(raw_diagnostics, dict) else {}
@@ -185,6 +301,13 @@ class RemoteAdminConfigManager:
                 "capability_packages": capability_packages,
                 "github": github.to_dict(mask_secret=True),
                 "sandbox_provider": sandbox_provider.to_dict(),
+                "model_capabilities": {
+                    **model_capabilities,
+                    "status": self.model_capability_catalog.status(
+                        enabled=bool(model_capabilities["enabled"]),
+                        interval_sec=int(model_capabilities["interval_sec"]),
+                    ),
+                },
                 "diagnostics": diagnostics.to_dict(),
             },
             "agent_runs": get_interactive_run_limiter().snapshot(),
@@ -202,6 +325,7 @@ class RemoteAdminConfigManager:
         raw_capability_packages = payload.get("capability_packages")
         raw_github = payload.get("github")
         raw_sandbox = payload.get("sandbox_provider")
+        raw_model_capabilities = payload.get("model_capabilities")
         raw_diagnostics = payload.get("diagnostics")
         if isinstance(raw_settings, dict) and raw_agent_registry is None:
             raw_agent_registry = raw_settings.get("agent_registry")
@@ -215,6 +339,8 @@ class RemoteAdminConfigManager:
             raw_github = raw_settings.get("github")
         if isinstance(raw_settings, dict) and raw_sandbox is None:
             raw_sandbox = raw_settings.get("sandbox_provider")
+        if isinstance(raw_settings, dict) and raw_model_capabilities is None:
+            raw_model_capabilities = raw_settings.get("model_capabilities")
         if isinstance(raw_settings, dict) and raw_diagnostics is None:
             raw_diagnostics = raw_settings.get("diagnostics")
         if (
@@ -224,6 +350,7 @@ class RemoteAdminConfigManager:
             and not isinstance(raw_capability_packages, dict)
             and not isinstance(raw_github, dict)
             and not isinstance(raw_sandbox, dict)
+            and not isinstance(raw_model_capabilities, dict)
             and not isinstance(raw_diagnostics, dict)
         ):
             return AdminConfigResult(False, {"error": "server_settings_required"}, 400)
@@ -407,6 +534,37 @@ class RemoteAdminConfigManager:
                         400,
                     )
                 data["sandbox_provider"] = sandbox_provider.to_dict()
+            if isinstance(raw_model_capabilities, dict):
+                previous_model_capabilities = (
+                    previous_data.get("model_capabilities", {})
+                    if isinstance(previous_data.get("model_capabilities"), dict)
+                    else {}
+                )
+                merged_model_capabilities = ConfigLoader()._merge_dicts(
+                    previous_model_capabilities,
+                    raw_model_capabilities,
+                )
+                try:
+                    model_capabilities = {
+                        "enabled": bool(merged_model_capabilities.get("enabled", True)),
+                        "interval_sec": max(
+                            60,
+                            int(
+                                merged_model_capabilities.get("interval_sec", 86400)
+                                or 86400
+                            ),
+                        ),
+                    }
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_model_capabilities",
+                            "message": str(exc),
+                        },
+                        400,
+                    )
+                data["model_capabilities"] = model_capabilities
             if isinstance(raw_diagnostics, dict):
                 previous_diagnostics = (
                     previous_data.get("diagnostics", {})
@@ -422,6 +580,13 @@ class RemoteAdminConfigManager:
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
+            if isinstance(raw_model_capabilities, dict):
+                settings = self.model_capabilities_settings()
+                self.model_capability_catalog.stop_periodic()
+                self.model_capability_catalog.start_periodic(
+                    enabled=bool(settings["enabled"]),
+                    interval_sec=int(settings["interval_sec"]),
+                )
             if agent_settings_changed:
                 get_interactive_run_limiter().configure(
                     max_running_agents=run_limits.max_running_agents,
@@ -797,6 +962,13 @@ class RemoteAdminConfigManager:
             )
         models = result.get("models") if isinstance(result, dict) else None
         if isinstance(models, list):
+            result["models"] = [
+                self.model_capability_catalog.enrich_model(provider, item)
+                if isinstance(item, dict)
+                else item
+                for item in models
+            ]
+            models = result["models"]
             with self._lock:
                 previous_data = self._load_data()
                 data = deepcopy(previous_data)
@@ -809,7 +981,9 @@ class RemoteAdminConfigManager:
         return AdminConfigResult(True, result)
 
     def list_model_profiles(self) -> dict[str, Any]:
-        models = self._models_data()
+        data = self._load_data()
+        models = data.get("models", {})
+        models = models if isinstance(models, dict) else {}
         raw_profiles = models.get("profiles", {})
         profiles = []
         if isinstance(raw_profiles, dict):
@@ -817,12 +991,7 @@ class RemoteAdminConfigManager:
                 item = raw_profiles.get(profile_id)
                 if not isinstance(item, dict):
                     continue
-                profile = ModelProfileConfig.from_dict(str(profile_id), item)
-                profile_dict = profile.to_dict()
-                profile_dict.pop("api_key", None)
-                profile_dict["api_key_hint"] = _mask(str(item.get("api_key", "") or ""))
-                profile_dict["id"] = profile.name
-                profiles.append(profile_dict)
+                profiles.append(self._profile_view(str(profile_id), item, data=data))
         return {
             "model_profiles": profiles,
             "active_main": models.get("active_main"),
@@ -844,14 +1013,68 @@ class RemoteAdminConfigManager:
             api_key = _field_or_env(payload, "api_key", "api_key_env")
             if api_key is None:
                 api_key = previous.get("api_key", "")
+            model_name = str(payload.get("model") or previous.get("model") or "gpt-4o")
+            provider_id = payload.get("provider", previous.get("provider"))
+            provider_config = None
+            provider_item = self._provider_items(data).get(str(provider_id or ""))
+            if isinstance(provider_item, dict):
+                provider_config = ProviderConfig.from_dict(str(provider_id or ""), provider_item)
+            catalog_capability = self.model_capability_catalog.lookup(
+                provider_config or str(provider_id or ""),
+                model_name,
+            )
+            capability_defaults = ProviderManager.known_model_capabilities(
+                provider_config or str(provider_id or ""),
+                model_name,
+            )
+            if catalog_capability is not None:
+                if catalog_capability.max_output_tokens:
+                    capability_defaults["max_tokens"] = catalog_capability.max_output_tokens
+                if catalog_capability.max_context_tokens:
+                    capability_defaults["max_context_tokens"] = (
+                        catalog_capability.max_context_tokens
+                    )
+            user_configured = bool(
+                payload.get("capability_user_configured")
+                if "capability_user_configured" in payload
+                else (
+                    "max_tokens" in payload
+                    or "max_context_tokens" in payload
+                    or previous.get("capability_user_configured", False)
+                )
+            )
+            recommended_max_tokens = capability_defaults.get("max_tokens")
+            recommended_max_context_tokens = capability_defaults.get(
+                "max_context_tokens"
+            )
+            max_tokens_value = (
+                recommended_max_tokens
+                if not user_configured and recommended_max_tokens
+                else (
+                    payload.get("max_tokens")
+                    if payload.get("max_tokens") is not None
+                    else previous.get("max_tokens")
+                )
+            )
+            max_context_tokens_value = (
+                recommended_max_context_tokens
+                if not user_configured and recommended_max_context_tokens
+                else (
+                    payload.get("max_context_tokens")
+                    if payload.get("max_context_tokens") is not None
+                    else previous.get("max_context_tokens")
+                )
+            )
             profile_data = {
-                "model": str(payload.get("model") or previous.get("model") or "gpt-4o"),
+                "model": model_name,
                 "api_key": str(api_key or ""),
-                "provider": payload.get("provider", previous.get("provider")),
+                "provider": provider_id,
                 "base_url": payload.get("base_url", previous.get("base_url")),
-                "max_tokens": int(payload.get("max_tokens") or previous.get("max_tokens") or 4096),
+                "max_tokens": int(max_tokens_value or recommended_max_tokens or 4096),
                 "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else previous.get("temperature", 0.0)),
-                "max_context_tokens": int(payload.get("max_context_tokens") or previous.get("max_context_tokens") or 128000),
+                "max_context_tokens": int(
+                    max_context_tokens_value or recommended_max_context_tokens or 128000
+                ),
                 "preserve_reasoning_content": bool(payload.get("preserve_reasoning_content", previous.get("preserve_reasoning_content", True))),
                 "backfill_reasoning_content_for_tool_calls": bool(payload.get("backfill_reasoning_content_for_tool_calls", previous.get("backfill_reasoning_content_for_tool_calls", False))),
                 "reasoning_effort": payload.get("reasoning_effort", previous.get("reasoning_effort")),
@@ -860,7 +1083,15 @@ class RemoteAdminConfigManager:
                 "reasoning_replay_placeholder": payload.get("reasoning_replay_placeholder", previous.get("reasoning_replay_placeholder")),
             }
             profile = ModelProfileConfig.from_dict(profile_id, profile_data)
-            profiles[profile_id] = profile.to_dict()
+            profiles[profile_id] = {
+                **profile.to_dict(),
+                "capability_user_configured": user_configured,
+                "capability_source": (
+                    capability_source_label(catalog_capability)
+                    if catalog_capability
+                    else previous.get("capability_source")
+                ),
+            }
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
@@ -868,7 +1099,9 @@ class RemoteAdminConfigManager:
                 True,
                 {
                     "ok": True,
-                    "model_profile": self._profile_view(profile_id, profiles[profile_id]),
+                    "model_profile": self._profile_view(
+                        profile_id, profiles[profile_id], data=data
+                    ),
                     "created": not previous,
                 },
             )
@@ -948,6 +1181,17 @@ class RemoteAdminConfigManager:
         data = self._load_data()
         expanded = ConfigLoader()._expand_env_refs(data)
         raw = (((expanded.get("providers") or {}).get("items")) or {}).get(provider_id)
+        if not isinstance(raw, dict):
+            return None
+        return ProviderConfig.from_dict(provider_id, raw)
+
+    def _provider_config_for_profile(
+        self, data: dict[str, Any], profile: dict[str, Any]
+    ) -> ProviderConfig | None:
+        provider_id = str(profile.get("provider") or "").strip()
+        if not provider_id:
+            return None
+        raw = (((data.get("providers") or {}).get("items")) or {}).get(provider_id)
         if not isinstance(raw, dict):
             return None
         return ProviderConfig.from_dict(provider_id, raw)
@@ -1221,12 +1465,40 @@ class RemoteAdminConfigManager:
         view["models"] = _normalize_provider_models(item.get("models", []))
         return view
 
-    def _profile_view(self, profile_id: str, item: dict[str, Any]) -> dict[str, Any]:
+    def _profile_view(
+        self,
+        profile_id: str,
+        item: dict[str, Any],
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         profile = ModelProfileConfig.from_dict(profile_id, item)
         view = profile.to_dict()
         view.pop("api_key", None)
         view["api_key_hint"] = _mask(str(item.get("api_key", "") or ""))
         view["id"] = profile_id
+        if "capability_user_configured" in item:
+            view["capability_user_configured"] = bool(
+                item.get("capability_user_configured")
+            )
+        if item.get("capability_source"):
+            view["capability_source"] = item.get("capability_source")
+        if item.get("capability_applied_at"):
+            view["capability_applied_at"] = item.get("capability_applied_at")
+        capability = None
+        if data is not None:
+            capability = self.model_capability_catalog.lookup(
+                self._provider_config_for_profile(data, item)
+                or str(item.get("provider") or ""),
+                profile.model,
+            )
+        recommendation = capability_recommendation(
+            capability,
+            current_max_tokens=profile.max_tokens,
+            current_max_context_tokens=profile.max_context_tokens,
+        )
+        if recommendation is not None:
+            view["capability_recommendation"] = recommendation
         return view
 
 

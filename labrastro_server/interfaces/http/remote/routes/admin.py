@@ -385,6 +385,34 @@ class RemoteAdminRoutes:
                     },
                 )
                 return
+            if path == "/remote/admin/model-capabilities/status":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, **self.service.admin_manager.model_capabilities_status()},
+                )
+                return
+            if path == "/remote/admin/model-capabilities/list":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        **self.service.admin_manager.list_model_capabilities(payload),
+                    },
+                )
+                return
+            if path == "/remote/admin/model-capabilities/refresh":
+                result = self.service.admin_manager.refresh_model_capabilities()
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/model-capabilities/apply":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.apply_model_capability_recommendation(payload),
+                )
+                self._send_json(result.status, result.payload)
+                return
             if path == "/remote/admin/providers/list":
                 result = {"ok": True, **self.service.admin_manager.list_providers()}
                 self._send_json(HTTPStatus.OK, result)

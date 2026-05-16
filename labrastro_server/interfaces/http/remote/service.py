@@ -661,6 +661,7 @@ class RemoteRelayHTTPService:
         self._start_persistence_maintenance()
         self._start_agent_run_recovery()
         self._start_github_reconcile()
+        self._start_model_capability_sync()
         if self.ui_bus is not None:
             self.ui_bus.info(
                 f"Remote relay HTTP service listening on {self.base_url}",
@@ -668,6 +669,7 @@ class RemoteRelayHTTPService:
             )
 
     def stop(self) -> None:
+        self._stop_model_capability_sync()
         self._stop_github_reconcile()
         self._stop_agent_run_recovery()
         self._stop_persistence_maintenance()
@@ -766,6 +768,16 @@ class RemoteRelayHTTPService:
         if self._github_reconcile_thread is not None:
             self._github_reconcile_thread.join(timeout=3)
             self._github_reconcile_thread = None
+
+    def _start_model_capability_sync(self) -> None:
+        settings = self.admin_manager.model_capabilities_settings()
+        self.admin_manager.model_capability_catalog.start_periodic(
+            enabled=bool(settings["enabled"]),
+            interval_sec=int(settings["interval_sec"]),
+        )
+
+    def _stop_model_capability_sync(self) -> None:
+        self.admin_manager.model_capability_catalog.stop_periodic()
 
     def issue_bootstrap_token(
         self, ttl_sec: int = 300, claims: dict[str, Any] | None = None

@@ -622,6 +622,171 @@ class TestRemoteRelayHTTPService:
             "debugger",
         }
 
+    def test_admin_manager_accepts_string_config_path(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(config_path, {"providers": {"items": {}}})
+
+        manager = RemoteAdminConfigManager(str(config_path))
+
+        assert manager.model_capabilities_status()["model_capabilities"]["enabled"] is True
+
+    def test_admin_record_model_profile_uses_deepseek_v4_capability_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "compat": "deepseek",
+                            "api_key": "sk-test",
+                            "base_url": "https://api.deepseek.com",
+                        }
+                    }
+                }
+            },
+        )
+        manager = RemoteAdminConfigManager(
+            config_path,
+            reload_handler=lambda: None,
+        )
+
+        result = manager.record_model_profile(
+            {
+                "profile_id": "deepseek-v4-pro-main",
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "max_tokens": 4096,
+                "max_context_tokens": 128000,
+                "capability_user_configured": False,
+            }
+        )
+
+        assert result.ok is True
+        profile = result.payload["model_profile"]
+        assert profile["max_tokens"] == 384000
+        assert profile["max_context_tokens"] == 1000000
+        assert profile["capability_user_configured"] is False
+
+    def test_admin_model_capabilities_list_and_apply_profile_recommendation(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "compat": "deepseek",
+                            "api_key": "sk-test",
+                            "base_url": "https://api.deepseek.com",
+                        }
+                    }
+                },
+                "models": {
+                    "profiles": {
+                        "deepseek-v4-pro-main": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                            "max_tokens": 4096,
+                            "max_context_tokens": 128000,
+                        }
+                    }
+                },
+            },
+        )
+        manager = RemoteAdminConfigManager(
+            config_path,
+            reload_handler=lambda: None,
+        )
+
+        listed = manager.list_model_capabilities(
+            {"provider": "deepseek", "model": "deepseek-v4-pro"}
+        )
+        apply_result = manager.apply_model_capability_recommendation(
+            {"profile_id": "deepseek-v4-pro-main"}
+        )
+
+        assert listed["model_capabilities"]["models"][0]["max_output_tokens"] == 384000
+        assert apply_result.ok is True
+        profile = apply_result.payload["model_profiles"][0]
+        assert profile["max_tokens"] == 384000
+        assert profile["max_context_tokens"] == 1000000
+        assert "capability_recommendation" not in profile
+
+    def test_admin_model_capabilities_http_endpoints(self, tmp_path: Path) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "compat": "deepseek",
+                            "api_key": "sk-test",
+                            "base_url": "https://api.deepseek.com",
+                        }
+                    }
+                },
+                "models": {
+                    "profiles": {
+                        "deepseek-v4-pro-main": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                            "max_tokens": 4096,
+                            "max_context_tokens": 128000,
+                        }
+                    }
+                },
+            },
+        )
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+            admin_config_reload_handler=lambda: None,
+        )
+        service.start()
+        try:
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/model-capabilities/status",
+                {},
+                TEST_ADMIN_HEADERS,
+            )
+            assert status == 200
+            assert body["model_capabilities"]["enabled"] is True
+
+            status, listed = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/model-capabilities/list",
+                {"provider": "deepseek", "model": "deepseek-v4-pro"},
+                TEST_ADMIN_HEADERS,
+            )
+            assert status == 200
+            assert listed["model_capabilities"]["models"][0]["max_output_tokens"] == 384000
+
+            status, applied = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/model-capabilities/apply",
+                {"profile_id": "deepseek-v4-pro-main"},
+                TEST_ADMIN_HEADERS,
+            )
+            assert status == 200
+            assert applied["model_profiles"][0]["max_tokens"] == 384000
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_admin_toolchain_endpoints_manage_manifest(
         self, tmp_path: Path
     ) -> None:
