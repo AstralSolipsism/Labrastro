@@ -129,8 +129,23 @@ class Session:
         }
 
     def get_preview(self) -> str:
-        """Get preview text from first user message."""
-        for m in self.messages:
-            if m.get("role") == "user" and m.get("content"):
-                return m["content"][:80]
+        """Build a preview from the first user message and latest visible state."""
+        first_user = ""
+        last_content = ""
+        for message in self.messages:
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            text = content.replace("\n", " ").strip()
+            if not text:
+                continue
+            role = message.get("role")
+            if role == "user" and not first_user:
+                first_user = text
+            if role in ("user", "assistant"):
+                last_content = text
+        if first_user and last_content:
+            return f"{first_user[:60]} ... {last_content[:60]}"
+        if first_user:
+            return first_user[:80]
         return ""
