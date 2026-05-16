@@ -1756,6 +1756,14 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         {"format": "markdown", "content": content},
                     )
                 return
+            if event.event_type == AgentEventType.REASONING_TOKEN:
+                content = event.data.get("token", "")
+                if content:
+                    remote_session.append_event(
+                        "reasoning_delta",
+                        {"format": "markdown", "content": content},
+                    )
+                return
             if event.event_type == AgentEventType.USAGE_UPDATE:
                 remote_session.append_event("usage_update", event.data)
                 return

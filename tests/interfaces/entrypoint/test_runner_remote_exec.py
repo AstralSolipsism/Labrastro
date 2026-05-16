@@ -1572,6 +1572,7 @@ class TestRunnerRemoteExec:
                 handler(event)
 
         def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            emit(agent, AgentEvent.reasoning_token("Need file"))
             emit(agent, AgentEvent.stream_token("Before tool"))
             emit(
                 agent,
@@ -1615,12 +1616,18 @@ class TestRunnerRemoteExec:
                 for event in events
                 if event["type"] == "assistant_delta"
             )
+            reasoning_text = "".join(
+                event["payload"].get("content", "")
+                for event in events
+                if event["type"] == "reasoning_delta"
+            )
             terminal_text = "\n".join(
                 event["payload"].get("content", "")
                 for event in events
                 if event["type"] == "output"
             )
 
+            assert reasoning_text == "Need file"
             assert assistant_text == "Before tool"
             assert "TOOL CALL" not in terminal_text
             assert "read_file(" not in terminal_text
