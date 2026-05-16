@@ -235,13 +235,49 @@ def test_chat_provider_parses_reasoning_delta_field() -> None:
         ),
     ]
     provider.call_with_retry = lambda _params: iter(events)
+    reasoning_tokens: list[str] = []
 
     response = provider.chat(
-        ProviderRequest(model="qwen-demo", messages=[{"role": "user", "content": "hi"}])
+        ProviderRequest(
+            model="qwen-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            on_reasoning_token=reasoning_tokens.append,
+        )
     )
 
     assert response.reasoning_content == "think"
     assert response.content == "done"
+    assert reasoning_tokens == ["think"]
+
+
+def test_responses_provider_emits_reasoning_delta_callback() -> None:
+    provider = OpenAIResponsesProvider(
+        ProviderConfig(id="responses", type="openai_responses", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(type="response.reasoning_text.delta", delta="plan"),
+        SimpleNamespace(type="response.output_text.delta", delta="done"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(id="resp_1", usage=None),
+        ),
+    ]
+    provider.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_params: iter(events))
+    )
+    reasoning_tokens: list[str] = []
+
+    response = provider.chat(
+        ProviderRequest(
+            model="gpt-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            on_reasoning_token=reasoning_tokens.append,
+        )
+    )
+
+    assert response.reasoning_content == "plan"
+    assert response.content == "done"
+    assert reasoning_tokens == ["plan"]
 
 
 def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
@@ -455,6 +491,40 @@ def test_anthropic_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
     assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "write_file"
 
 
+def test_anthropic_provider_emits_thinking_delta_callback() -> None:
+    provider = AnthropicMessagesProvider(
+        ProviderConfig(id="anthropic", type="anthropic_messages", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="thinking_delta", thinking="inspect"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="text_delta", text="done"),
+        ),
+    ]
+    provider.client = SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **_params: iter(events))
+    )
+    reasoning_tokens: list[str] = []
+
+    response = provider.chat(
+        ProviderRequest(
+            model="claude-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            on_reasoning_token=reasoning_tokens.append,
+        )
+    )
+
+    assert response.reasoning_content == "inspect"
+    assert response.content == "done"
+    assert reasoning_tokens == ["inspect"]
+
+
 def test_chat_provider_parses_deepseek_cache_usage_fields() -> None:
     provider = OpenAIChatProvider(
         ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
@@ -516,14 +586,20 @@ def test_chat_provider_preserves_reasoning_details_signature() -> None:
         )
     ]
     provider.call_with_retry = lambda _params: iter(events)
+    reasoning_tokens: list[str] = []
 
     response = provider.chat(
-        ProviderRequest(model="qwen-demo", messages=[{"role": "user", "content": "hi"}])
+        ProviderRequest(
+            model="qwen-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            on_reasoning_token=reasoning_tokens.append,
+        )
     )
 
     assert response.reasoning_content == "think"
     assert response.reasoning_signature == "sig-1"
     assert response.reasoning_details[0]["signature"] == "sig-1"
+    assert reasoning_tokens == ["think"]
 
 
 def test_chat_provider_downgrades_deepseek_forced_tool_choice_during_thinking() -> None:

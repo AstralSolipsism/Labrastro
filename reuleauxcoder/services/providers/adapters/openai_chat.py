@@ -272,8 +272,12 @@ class OpenAIChatProvider:
                         request.on_token(delta.content)
                 if getattr(delta, "reasoning_content", None):
                     reasoning_parts.append(delta.reasoning_content)
+                    if request.on_reasoning_token is not None:
+                        request.on_reasoning_token(delta.reasoning_content)
                 if getattr(delta, "reasoning", None):
                     reasoning_parts.append(delta.reasoning)
+                    if request.on_reasoning_token is not None:
+                        request.on_reasoning_token(delta.reasoning)
                 reasoning_details = getattr(delta, "reasoning_details", None) or []
                 for detail in reasoning_details:
                     detail_dict = _reasoning_detail_to_dict(detail)
@@ -281,7 +285,10 @@ class OpenAIChatProvider:
                         reasoning_details_out.append(detail_dict)
                     text = detail_dict.get("text")
                     if text:
-                        reasoning_parts.append(str(text))
+                        reasoning_text = str(text)
+                        reasoning_parts.append(reasoning_text)
+                        if request.on_reasoning_token is not None:
+                            request.on_reasoning_token(reasoning_text)
                     signature = detail_dict.get("signature")
                     if signature and reasoning_signature is None:
                         reasoning_signature = str(signature)

@@ -34,6 +34,7 @@ class ProviderRequest:
     thinking_enabled: bool | None = None
     tool_choice: str | dict[str, Any] | None = None
     on_token: Callable[[str], None] | None = None
+    on_reasoning_token: Callable[[str], None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     request_params: dict[str, Any] | None = None
 

@@ -263,6 +263,7 @@ class LLM:
         messages: list[dict],
         tools: Optional[list[dict]] = None,
         on_token: Optional[Callable[[str], None]] = None,
+        on_reasoning_token: Optional[Callable[[str], None]] = None,
         hook_registry: HookRegistry | None = None,
         session_id: str | None = None,
         trace_id: str | None = None,
@@ -306,6 +307,7 @@ class LLM:
             reasoning_effort=self.reasoning_effort,
             thinking_enabled=self.thinking_enabled,
             on_token=on_token,
+            on_reasoning_token=on_reasoning_token,
             metadata=dict(metadata or {}),
         )
         params: dict[str, Any] = {}

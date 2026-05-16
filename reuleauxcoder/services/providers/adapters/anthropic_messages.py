@@ -310,6 +310,8 @@ class AnthropicMessagesProvider:
                     thinking = str(getattr(delta, "thinking", "") or "")
                     if thinking:
                         reasoning_parts.append(thinking)
+                        if request.on_reasoning_token is not None:
+                            request.on_reasoning_token(thinking)
                 elif delta_type == "signature_delta":
                     reasoning_signature = str(getattr(delta, "signature", "") or "")
                 elif delta_type == "input_json_delta":

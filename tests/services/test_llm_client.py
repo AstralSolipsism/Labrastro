@@ -566,13 +566,16 @@ def test_llm_debug_trace_persists_trace_and_emits_ui_event(
         )
 
     llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    reasoning_tokens: list[str] = []
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
+        on_reasoning_token=reasoning_tokens.append,
         session_id="session_test",
         trace_id="trace_1",
     )
 
     assert response.content == "Hello"
+    assert reasoning_tokens == ["thinking"]
     debug_events = [event for event in seen if event.level == UIEventLevel.DEBUG]
     assert debug_events
     trace_path = debug_events[-1].data.get("trace_path")

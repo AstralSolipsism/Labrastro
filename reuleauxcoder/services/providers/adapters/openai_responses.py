@@ -281,6 +281,8 @@ class OpenAIResponsesProvider:
                 delta = str(getattr(event, "delta", "") or "")
                 if delta:
                     reasoning_parts.append(delta)
+                    if request.on_reasoning_token is not None:
+                        request.on_reasoning_token(delta)
                 continue
             if event_type == "response.output_item.added":
                 item = getattr(event, "item", None)
