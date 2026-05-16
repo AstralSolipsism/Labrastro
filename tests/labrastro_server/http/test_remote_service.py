@@ -963,6 +963,10 @@ class TestRemoteRelayHTTPService:
             )
             diagnostics = read_body["settings"]["diagnostics"]["tool_argument_validation"]
             assert diagnostics == {"enabled": True, "record_clean": False}
+            assert read_body["settings"]["diagnostics"]["llm_trace"] == {
+                "enabled": False,
+                "raw_chunks": False,
+            }
 
             _, update_body = _json_request(
                 "POST",
@@ -970,7 +974,8 @@ class TestRemoteRelayHTTPService:
                 {
                     "settings": {
                         "diagnostics": {
-                            "tool_argument_validation": {"enabled": False}
+                            "tool_argument_validation": {"enabled": False},
+                            "llm_trace": {"enabled": True, "raw_chunks": True},
                         }
                     }
                 },
@@ -983,9 +988,17 @@ class TestRemoteRelayHTTPService:
                 ]
                 is False
             )
+            assert update_body["settings"]["diagnostics"]["llm_trace"] == {
+                "enabled": True,
+                "raw_chunks": True,
+            }
             assert load_yaml_config(config_path)["diagnostics"][
                 "tool_argument_validation"
             ] == {"enabled": False, "record_clean": False}
+            assert load_yaml_config(config_path)["diagnostics"]["llm_trace"] == {
+                "enabled": True,
+                "raw_chunks": True,
+            }
 
             _, stats_body = _json_request(
                 "POST",

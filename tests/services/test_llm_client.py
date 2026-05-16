@@ -594,10 +594,51 @@ def test_llm_debug_trace_persists_trace_and_emits_ui_event(
     assert payload["stream"]["reasoning_chunks"] == 1
     assert payload["stream"]["events"][0]["type"] == "content"
     assert payload["stream"]["events"][0]["text"] == "Hello"
+    assert payload["stream"]["raw_chunk_count"] == 0
+    assert payload["stream"]["raw_chunks"] == []
     assert payload["response"]["reasoning_received"] is True
     assert payload["response"]["reasoning_chars"] == len("thinking")
     assert payload["response"]["usage"]["prompt_tokens"] == 12
     assert payload["response"]["usage"]["completion_tokens"] == 3
+
+
+def test_llm_debug_trace_can_record_raw_stream_chunks(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
+
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test-12345678",
+        base_url="https://example.com/v1",
+        debug_trace=True,
+        debug_raw_chunks=True,
+        ui_bus=ui_bus,
+    )
+
+    def _fake_call_with_retry(params):
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=12, completion_tokens=3)),
+            ]
+        )
+
+    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    response = llm.chat(
+        [{"role": "user", "content": "Hi"}],
+        session_id="session_test",
+        trace_id="trace_raw",
+    )
+
+    assert response.content == "Hello"
+    debug_events = [event for event in seen if event.level == UIEventLevel.DEBUG]
+    trace_path = debug_events[-1].data.get("trace_path")
+    payload = json.loads(open(trace_path, encoding="utf-8").read())
+    assert payload["stream"]["raw_chunk_count"] == 2
+    assert payload["stream"]["raw_chunks"][0]["_chunk_index"] == 0
+    assert payload["stream"]["raw_chunks"][0]["choices"][0]["delta"]["content"] == "Hello"
 
 
 def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(

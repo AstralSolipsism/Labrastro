@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import time
+import base64
+import contextvars
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APITimeoutError,
@@ -32,6 +35,124 @@ from reuleauxcoder.services.providers.tool_arguments import (
 
 
 MAX_DEBUG_STREAM_EVENTS = 200
+_DEBUG_HTTP_CHUNK_SINK: contextvars.ContextVar[list[dict[str, Any]] | None] = (
+    contextvars.ContextVar("openai_chat_debug_http_chunk_sink", default=None)
+)
+
+
+def _safe_response_headers(headers: httpx.Headers) -> dict[str, str]:
+    allowed = {
+        "content-type",
+        "date",
+        "server",
+        "x-request-id",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "cf-ray",
+    }
+    return {key: value for key, value in headers.items() if key.lower() in allowed}
+
+
+class _DebugByteStream(httpx.SyncByteStream):
+    def __init__(
+        self,
+        stream: httpx.SyncByteStream,
+        sink: list[dict[str, Any]],
+    ) -> None:
+        self._stream = stream
+        self._sink = sink
+
+    def __iter__(self):
+        for chunk in self._stream:
+            self._sink.append(
+                {
+                    "type": "response_body_chunk",
+                    "index": len(self._sink),
+                    "byte_length": len(chunk),
+                    "text": chunk.decode("utf-8", errors="replace"),
+                    "base64": base64.b64encode(chunk).decode("ascii"),
+                }
+            )
+            yield chunk
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+class _DebugHTTPTransport(httpx.HTTPTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        response = super().handle_request(request)
+        sink = _DEBUG_HTTP_CHUNK_SINK.get()
+        if sink is None:
+            return response
+        sink.append(
+            {
+                "type": "response_start",
+                "method": request.method,
+                "url_path": request.url.path,
+                "status_code": response.status_code,
+                "headers": _safe_response_headers(response.headers),
+            }
+        )
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            stream=_DebugByteStream(response.stream, sink),
+            extensions=response.extensions,
+            request=response.request,
+        )
+
+
+def _debug_value_to_json(value: Any, *, depth: int = 0) -> Any:
+    if depth > 10:
+        return repr(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _debug_value_to_json(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_debug_value_to_json(item, depth=depth + 1) for item in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return _debug_value_to_json(
+                value.model_dump(mode="json"),
+                depth=depth + 1,
+            )
+        except TypeError:
+            try:
+                return _debug_value_to_json(value.model_dump(), depth=depth + 1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    for method_name in ("to_dict_recursive", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _debug_value_to_json(method(), depth=depth + 1)
+            except Exception:
+                pass
+    if hasattr(value, "__dict__"):
+        return {
+            key: _debug_value_to_json(item, depth=depth + 1)
+            for key, item in vars(value).items()
+            if not key.startswith("_") and not callable(item)
+        }
+    return repr(value)
+
+
+def _chunk_to_debug_dict(chunk: Any, chunk_index: int) -> dict[str, Any]:
+    value = _debug_value_to_json(chunk)
+    if isinstance(value, dict):
+        result = dict(value)
+    else:
+        result = {"value": value}
+    result["_chunk_index"] = chunk_index
+    return result
 
 
 def _reasoning_detail_to_dict(detail: Any) -> dict[str, Any]:
@@ -187,6 +308,10 @@ class OpenAIChatProvider:
         }
         if config.headers:
             client_kwargs["default_headers"] = config.headers
+        client_kwargs["http_client"] = httpx.Client(
+            transport=_DebugHTTPTransport(),
+            timeout=config.timeout_sec,
+        )
         self.client = OpenAI(**client_kwargs)
         self.call_with_retry = self._call_with_retry
 
@@ -223,7 +348,15 @@ class OpenAIChatProvider:
             if isinstance(item, ProviderDiagnostic)
         ]
         debug_stream_events: list[dict[str, Any]] = []
+        debug_raw_stream_chunks: list[dict[str, Any]] = []
+        debug_http_chunks: list[dict[str, Any]] = []
+        capture_debug_chunks = bool(request.metadata.get("llm_debug_raw_chunks"))
         debug_stream_options_enabled = False
+        debug_http_token = (
+            _DEBUG_HTTP_CHUNK_SINK.set(debug_http_chunks)
+            if capture_debug_chunks
+            else None
+        )
         try:
             try:
                 params["stream_options"] = {"include_usage": True}
@@ -246,7 +379,11 @@ class OpenAIChatProvider:
             reasoning_signature: str | None = None
             reasoning_details_out: list[dict[str, Any]] = []
 
-            for chunk in stream:
+            for chunk_index, chunk in enumerate(stream):
+                if capture_debug_chunks:
+                    debug_raw_stream_chunks.append(
+                        _chunk_to_debug_dict(chunk, chunk_index)
+                    )
                 if len(debug_stream_events) < MAX_DEBUG_STREAM_EVENTS:
                     debug_stream_events.extend(_extract_stream_event(chunk))
                     if len(debug_stream_events) > MAX_DEBUG_STREAM_EVENTS:
@@ -341,11 +478,15 @@ class OpenAIChatProvider:
                 provider_extra={
                     "request_params": dict(params),
                     "debug_stream_events": debug_stream_events,
+                    "debug_raw_stream_chunks": debug_raw_stream_chunks,
+                    "debug_http_chunks": debug_http_chunks,
                     "stream_options_enabled": debug_stream_options_enabled,
                     "tool_argument_diagnostics": tool_argument_diagnostics,
                 },
             )
         finally:
+            if debug_http_token is not None:
+                _DEBUG_HTTP_CHUNK_SINK.reset(debug_http_token)
             request.metadata.pop("provider_diagnostics", None)
 
     def test(self, *, model: str, prompt: str = "ping") -> ProviderResponse:

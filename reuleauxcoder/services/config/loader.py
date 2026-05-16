@@ -500,6 +500,18 @@ class ConfigLoader:
         run_limits = RunLimitsConfig.from_dict(
             run_limits_config if isinstance(run_limits_config, dict) else {}
         )
+        diagnostics = DiagnosticsConfig.from_dict(
+            diagnostics_config if isinstance(diagnostics_config, dict) else {}
+        )
+        diagnostics_has_llm_trace = (
+            isinstance(diagnostics_config, dict)
+            and isinstance(diagnostics_config.get("llm_trace"), dict)
+        )
+        llm_trace_enabled = app_config.get("llm_debug_trace")
+        if diagnostics_has_llm_trace:
+            llm_trace_enabled = diagnostics.llm_trace.enabled
+        elif llm_trace_enabled is None:
+            llm_trace_enabled = diagnostics.llm_trace.enabled
 
         return Config(
             **llm_params,
@@ -597,9 +609,7 @@ class ConfigLoader:
             persistence=PersistenceConfig.from_dict(
                 persistence_config if isinstance(persistence_config, dict) else {}
             ),
-            diagnostics=DiagnosticsConfig.from_dict(
-                diagnostics_config if isinstance(diagnostics_config, dict) else {}
-            ),
+            diagnostics=diagnostics,
             sandbox_provider=SandboxProviderConfig.from_dict(
                 sandbox_provider_config
                 if isinstance(sandbox_provider_config, dict)
@@ -614,9 +624,9 @@ class ConfigLoader:
             ),
             session_dir=session_config.get("dir"),
             history_file=cli_config.get("history_file"),
-            llm_debug_trace=bool(
-                app_config.get("llm_debug_trace", DEFAULTS["llm_debug_trace"])
-            ),
+            llm_debug_trace=bool(llm_trace_enabled),
+            llm_debug_trace_authoritative=diagnostics_has_llm_trace,
+            llm_debug_raw_chunks=bool(diagnostics.llm_trace.raw_chunks),
         )
 
     def _is_workspace_bootstrapped(self, workspace_data: dict) -> bool:

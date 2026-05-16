@@ -49,6 +49,7 @@ def _default_create_llm(config: Config) -> LLM:
     return build_llm_from_settings(
         config,
         debug_trace=getattr(config, "llm_debug_trace", False),
+        debug_raw_chunks=getattr(config, "llm_debug_raw_chunks", False),
     )
 
 

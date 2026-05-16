@@ -970,25 +970,58 @@ class ToolArgumentValidationDiagnosticsConfig:
 
 
 @dataclass
+class LLMTraceDiagnosticsConfig:
+    """LLM trace settings."""
+
+    enabled: bool = False
+    raw_chunks: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "LLMTraceDiagnosticsConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            raw_chunks=bool(data.get("raw_chunks", False)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "raw_chunks": self.raw_chunks,
+        }
+
+
+@dataclass
 class DiagnosticsConfig:
     """Diagnostics and telemetry settings."""
 
     tool_argument_validation: ToolArgumentValidationDiagnosticsConfig = field(
         default_factory=ToolArgumentValidationDiagnosticsConfig
     )
+    llm_trace: LLMTraceDiagnosticsConfig = field(
+        default_factory=LLMTraceDiagnosticsConfig
+    )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "DiagnosticsConfig":
-        raw = data.get("tool_argument_validation", {}) if isinstance(data, dict) else {}
+        raw_tool_arguments = (
+            data.get("tool_argument_validation", {}) if isinstance(data, dict) else {}
+        )
+        raw_llm_trace = data.get("llm_trace", {}) if isinstance(data, dict) else {}
         return cls(
             tool_argument_validation=ToolArgumentValidationDiagnosticsConfig.from_dict(
-                raw if isinstance(raw, dict) else {}
-            )
+                raw_tool_arguments if isinstance(raw_tool_arguments, dict) else {}
+            ),
+            llm_trace=LLMTraceDiagnosticsConfig.from_dict(
+                raw_llm_trace if isinstance(raw_llm_trace, dict) else {}
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tool_argument_validation": self.tool_argument_validation.to_dict(),
+            "llm_trace": self.llm_trace.to_dict(),
         }
 
 
@@ -1375,6 +1408,8 @@ class Config:
     # CLI settings
     history_file: Optional[str] = None
     llm_debug_trace: bool = False
+    llm_debug_trace_authoritative: bool = False
+    llm_debug_raw_chunks: bool = False
 
     # Approval settings
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)

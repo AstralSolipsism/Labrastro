@@ -151,6 +151,7 @@ class LLM:
         reasoning_replay_mode: str | None = None,
         reasoning_replay_placeholder: str = DEFAULT_REASONING_REPLAY_PLACEHOLDER,
         debug_trace: bool = False,
+        debug_raw_chunks: bool = False,
         ui_bus: UIEventBus | None = None,
         provider: str | None = None,
         provider_config: ProviderConfig | None = None,
@@ -168,6 +169,7 @@ class LLM:
         self.reasoning_replay_mode = reasoning_replay_mode
         self.reasoning_replay_placeholder = reasoning_replay_placeholder
         self.debug_trace = debug_trace
+        self.debug_raw_chunks = debug_raw_chunks
         self.ui_bus = ui_bus
         self.provider_config = provider_config or _legacy_provider_config(
             provider_id=provider,
@@ -215,6 +217,7 @@ class LLM:
         reasoning_replay_mode: str | None = None,
         reasoning_replay_placeholder: str | None = None,
         debug_trace: bool | None = None,
+        debug_raw_chunks: bool | None = None,
         provider: str | None = None,
         provider_config: ProviderConfig | None = None,
     ) -> None:
@@ -238,6 +241,8 @@ class LLM:
             self.reasoning_replay_placeholder = reasoning_replay_placeholder
         if debug_trace is not None:
             self.debug_trace = debug_trace
+        if debug_raw_chunks is not None:
+            self.debug_raw_chunks = debug_raw_chunks
         self.provider_config = provider_config or _legacy_provider_config(
             provider_id=provider,
             api_key=api_key,
@@ -367,6 +372,10 @@ class LLM:
             before_context.metadata = dict(request.metadata)
             final_messages = list(request.messages)
             final_metadata = dict(before_context.metadata)
+            if self.debug_trace:
+                request.metadata["llm_debug_trace"] = True
+                if self.debug_raw_chunks:
+                    request.metadata["llm_debug_raw_chunks"] = True
             provider_response = provider.chat(request)
             response = provider_response.to_llm_response()
             params = dict(response.provider_extra.get("request_params") or params)
@@ -389,6 +398,13 @@ class LLM:
                 debug_events = list(
                     (response.provider_extra or {}).get("debug_stream_events") or []
                 )[:MAX_DEBUG_STREAM_EVENTS]
+                debug_raw_chunks = list(
+                    (response.provider_extra or {}).get("debug_raw_stream_chunks")
+                    or []
+                )
+                debug_http_chunks = list(
+                    (response.provider_extra or {}).get("debug_http_chunks") or []
+                )
                 reasoning_received = bool(response.reasoning_content)
                 reasoning_stream_chunks = sum(
                     1
@@ -438,6 +454,10 @@ class LLM:
                         "event_count": len(debug_events),
                         "reasoning_chunks": reasoning_stream_chunks,
                         "events": debug_events,
+                        "raw_chunk_count": len(debug_raw_chunks),
+                        "raw_chunks": debug_raw_chunks,
+                        "http_chunk_count": len(debug_http_chunks),
+                        "http_chunks": debug_http_chunks,
                     },
                     "response": {
                         "content": _trim_text(response.content or "", 1000),

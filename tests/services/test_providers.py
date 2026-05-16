@@ -335,7 +335,11 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
     provider.call_with_retry = lambda _params: iter(events)
 
     response = provider.chat(
-        ProviderRequest(model="deepseek-demo", messages=[{"role": "user", "content": "hi"}])
+        ProviderRequest(
+            model="deepseek-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            metadata={"llm_debug_raw_chunks": True},
+        )
     )
 
     assert response.tool_calls[0].name == "write_file"
@@ -345,6 +349,14 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
     }
     assert response.tool_calls[0].argument_error is None
     assert response.provider_extra["tool_argument_diagnostics"] == []
+    assert len(response.provider_extra["debug_raw_stream_chunks"]) == 2
+    assert response.provider_extra["debug_raw_stream_chunks"][0]["_chunk_index"] == 0
+    assert (
+        response.provider_extra["debug_raw_stream_chunks"][0]["choices"][0]["delta"][
+            "tool_calls"
+        ][0]["function"]["arguments"]
+        == '{"file_path":"demo.md",'
+    )
 
 
 def test_chat_provider_marks_empty_tool_arguments_as_diagnostic() -> None:

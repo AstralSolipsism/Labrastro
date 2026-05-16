@@ -86,6 +86,26 @@ def test_parse_config_reads_tool_argument_diagnostics_settings() -> None:
     assert settings.record_clean is True
 
 
+def test_parse_config_reads_llm_trace_diagnostics_settings() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "diagnostics": {
+                "llm_trace": {
+                    "enabled": True,
+                    "raw_chunks": True,
+                }
+            }
+        }
+    )
+
+    settings = config.diagnostics.llm_trace
+    assert settings.enabled is True
+    assert settings.raw_chunks is True
+    assert config.llm_debug_trace is True
+    assert config.llm_debug_trace_authoritative is True
+    assert config.llm_debug_raw_chunks is True
+
+
 def test_parse_config_reads_memory_provider_settings() -> None:
     config = ConfigLoader()._parse_config(
         {
