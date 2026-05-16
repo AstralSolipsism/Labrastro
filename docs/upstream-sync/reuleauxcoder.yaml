@@ -9,8 +9,8 @@ upstream:
 local:
   repo: AstralSolipsism/ReuleauxCoder
   branch: main
-  head_commit: "45bcbcf6bc28b8d0f21f819b140bb6d643abab4d"
-  head_short: "45bcbcf"
+  head_commit: "fbabc6b2d86658d857c39a63786533b08d5327e6"
+  head_short: "fbabc6b"
 notes:
   - Git ancestry and patch-id are not authoritative for this fork after local rewrites.
   - Use entries.status plus local_commits as the maintained upstream-sync source of truth.
@@ -161,9 +161,9 @@ entries:
     short: "88e457d"
     date: 2026-05-13
     title: "feat(session): show both first and last message in session preview"
-    status: pending
-    local_commits: []
-    notes: "CLI/session-list UX improvement; deferred to a later session/frontend experience batch."
+    status: ported
+    local_commits: ["4ea4cf3"]
+    notes: "Session preview now combines first user content with the latest user/assistant visible state; covered by tests/domain/test_session_models.py."
   - upstream: "86238008b68162ef46d1b7a62863c61470e0e2fe"
     short: "8623800"
     date: 2026-05-13
@@ -203,65 +203,65 @@ entries:
     short: "5601519"
     date: 2026-05-15
     title: "feat(lsp): add core data types, registry, and config"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; design must cover host/peer workspace location and remote-aware paths."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Added LSP config, diagnostics, language registry, and tests with peer-aware local adaptations."
   - upstream: "38553bef41dbbba5cd24de0935894a4d2e751689"
     short: "38553be"
     date: 2026-05-15
     title: "feat(lsp): add LSP client, manager, and diagnostic hooks"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; diagnostic hooks need remote peer workspace and lifecycle design first."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Added stdio JSON-RPC LSP client, lazy manager, cached diagnostic injection, and post-edit diagnostic hook."
   - upstream: "df5943581e5c3f3b375cbc15eaedee3a49b810cd"
     short: "df59435"
     date: 2026-05-15
     title: "feat(lsp): wire LSP infrastructure into AppRunner"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; runner wiring conflicts with Labrastro server and remote peer control paths."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "AppRunner initializes host-side LSP for local execution and skips host LSP when remote relay execution is active."
   - upstream: "6ca16288f38efa12bc864b8427674d1ddb12be27"
     short: "6ca1628"
     date: 2026-05-15
     title: "feat(lsp): wire LSP infrastructure into AppRunner with visible startup feedback"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase with startup feedback design after host/peer placement is decided."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Startup emits concise LSP availability feedback; remote mode reports peer-side LSP ownership."
   - upstream: "e8f12ae1609acf8fc834d22dceae493429591060"
     short: "e8f12ae"
     date: 2026-05-15
     title: "fix(lsp): consolidate startup messages and reduce log noise"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; logging policy depends on final server/peer lifecycle ownership."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Consolidated startup output into one ready/unavailable message and fail-open behavior."
   - upstream: "336021ca7749b5c31628f6cae2d11b9d11bbbaff"
     short: "336021c"
     date: 2026-05-15
     title: "fix(lsp): start pyright language server correctly"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; language server launch location must be designed for remote peer workspaces."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Default Python server command uses npx with pyright package and pyright-langserver --stdio on host and peer."
   - upstream: "f4474f9e91487be7c7358184a2032d2eec097e8a"
     short: "f4474f9"
     date: 2026-05-15
     title: "test(lsp): add opt-in real server diagnostics smoke tests"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; smoke tests should target the chosen host/peer topology."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Added opt-in real server smoke test gated by RCODER_LSP_REAL_SERVER_SMOKE plus unit coverage."
   - upstream: "06604ee1053a0ebfd4a312eb2584f08e3e0e65c5"
     short: "06604ee"
     date: 2026-05-15
     title: "fix(lsp): own subprocess lifecycle in worker loop"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; subprocess cleanup belongs with final lifecycle ownership."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Host LspManager and peer manager own client subprocess shutdown; peer runner calls tools.ShutdownLSP on exit."
   - upstream: "e4f88fa3293e966d53426e65fded46178103d447"
     short: "e4f88fa"
     date: 2026-05-15
     title: "feat(lsp): inject diagnostics immediately after file edits"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; diagnostic injection timing depends on remote edit and LSP visibility design."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Local edit/write results append host diagnostics; remote peer edit/write results append peer diagnostics when available."
   - upstream: "9d065a9f98cffe057146021f56e33e341f399b89"
     short: "9d065a9"
     date: 2026-05-15
@@ -273,51 +273,51 @@ entries:
     short: "a731858"
     date: 2026-05-15
     title: "fix: Retrieve the exception so asyncio does not warn about"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; async cleanup is part of LSP lifecycle design."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Local implementation avoids asyncio worker futures; subprocess/request cleanup is handled synchronously."
   - upstream: "d4f063d144c84d5c7c46fd8b45a9758300217104"
     short: "d4f063d"
     date: 2026-05-15
     title: "refactor(lsp): remove dead main-thread spawn paths, harden shutdown"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; shutdown ownership must align with host/peer placement."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Lazy client creation has one ownership path; AppRunner and peer runner both clear LSP state on shutdown."
   - upstream: "ee9b9b25b380f361beb756f35216fc9413f03a1f"
     short: "ee9b9b2"
     date: 2026-05-15
     title: "fix(lsp): normalise workspace-relative paths to forward slashes"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; important input to Windows and remote path normalization design."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Host and peer display workspace-relative paths with forward slashes; URI conversion has Windows handling."
   - upstream: "090aa00bdadaa4891b72064a9ad03dcbb98ce35b"
     short: "090aa00"
     date: 2026-05-15
     title: "feat(lsp): add active LSP tools (goToDefinition, findReferences, documentSymbol)"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; high-value tools should be added after read-only permission and path design."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Added read-only lsp builtin tool for goToDefinition, findReferences, and documentSymbol with remote peer forwarding."
   - upstream: "452868fce2bfc1bb680dad353fb228bbbf7b4097"
     short: "452868f"
     date: 2026-05-15
     title: "docs: document LSP support and add default-allow rule for lsp tool"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; default-allow should wait until the lsp tool exists locally."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Added lsp to read-only approval allow-list, config schema/example, and local docs."
   - upstream: "4cc7cbb87dfa3b8e095dfe0a922e5a44bf18e8da"
     short: "4cc7cbb"
     date: 2026-05-15
     title: "doc: update AGENT.md"
-    status: pending
-    local_commits: []
-    notes: "Documentation update; review after deciding LSP/list_file port scope."
+    status: ported
+    local_commits: ["fbabc6b"]
+    notes: "AGENT.md updated for local list_file/LSP, including peer-first remote LSP behavior."
   - upstream: "2025c9e8c4d2acaeb7388905605d40fd13c248e4"
     short: "2025c9e"
     date: 2026-05-15
     title: "fix(test): Convert file:// URI to a path string (always forward slashes)"
-    status: deferred
-    local_commits: []
-    notes: "Deferred to next LSP phase; test helper belongs with remote-aware LSP path handling."
+    status: ported
+    local_commits: ["1b1986c"]
+    notes: "Covered by host and peer URI/path formatting tests with forward-slash display paths."
   - upstream: "cd5ec1b6162d3080a0ed9918afa676cfd882b7f3"
     short: "cd5ec1b"
     date: 2026-05-15

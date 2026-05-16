@@ -10,7 +10,7 @@ or patch-id cannot represent a local rewrite.
 - Upstream branch: `main`
 - Last reviewed upstream commit: `b570877f7634bcb70add41ac925282792a91e11d`
 - Local branch: `main`
-- Local head after current absorption batch: `45bcbcf6bc28b8d0f21f819b140bb6d643abab4d`
+- Local head after current absorption batch: `fbabc6b2d86658d857c39a63786533b08d5327e6`
 - Review date: 2026-05-16
 
 ## Status Rules
@@ -65,11 +65,11 @@ Coverage: Python builtin tool, remote relay dispatch, Go peer execution/features
 - `4db57d8`: reasoning-only assistant messages now receive a non-empty placeholder in `45bcbcf`.
 - `5794cd8`: snip protection now keeps recent assistant tool-call rounds, default 2, in `45bcbcf`.
 - `ac21249`: after-snip token reporting now uses compressed real-time totals in `45bcbcf`.
-- `88e457d`: session preview UX remains pending for a later session/frontend batch.
+- `88e457d`: session preview now combines the first user message with the latest visible user/assistant state in `4ea4cf3`.
 
 Coverage: `LLMResponse.message`, LLM sanitizer, context manager, config defaults, and targeted tests.
 
-### LSP capability group
+### Ported LSP capability group
 
 Upstream commits:
 
@@ -81,9 +81,9 @@ Upstream commits:
 - `090aa00` active `lsp` tool
 - `452868f`, `4cc7cbb`, `2025c9e` docs/tests
 
-Current status: deferred. Upstream LSP assumes the host process can see the edited workspace, while
-EZCode often executes through remote peers and Labrastro server control paths. The port should decide whether LSP runs
-on host, peer, or both.
+Current status: ported through `1b1986c` and `fbabc6b` with a peer-first remote strategy. Local execution uses host
+LSP. Remote execution forwards the `lsp` tool only to peers that advertise `lsp`, and peer-side write/edit diagnostics
+use the peer workspace path.
 
 ## Operational Rule
 
