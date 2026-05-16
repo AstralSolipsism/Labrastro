@@ -26,6 +26,19 @@ class ProviderManager:
         "openai_responses": OpenAIResponsesProvider,
     }
 
+    _known_model_capabilities: dict[str, dict[str, Any]] = {
+        "deepseek-v4-flash": {
+            "max_context_tokens": 1_000_000,
+            "max_tokens": 384_000,
+            "capability_source": "DeepSeek API Docs / Models & Pricing",
+        },
+        "deepseek-v4-pro": {
+            "max_context_tokens": 1_000_000,
+            "max_tokens": 384_000,
+            "capability_source": "DeepSeek API Docs / Models & Pricing",
+        },
+    }
+
     def create(self, config: ProviderConfig, *, allow_disabled: bool = False) -> LLMProvider:
         if not config.enabled and not allow_disabled:
             raise RuntimeError(f"Provider '{config.id}' is disabled")
@@ -65,6 +78,7 @@ class ProviderManager:
                     "id": str(model_id),
                     "owned_by": _model_value(item, "owned_by"),
                     "created": _model_value(item, "created"),
+                    **self.known_model_capabilities(config, str(model_id)),
                 }
             )
         models.sort(key=lambda model: model["id"])
@@ -78,6 +92,22 @@ class ProviderManager:
     @classmethod
     def supported_types(cls) -> list[str]:
         return sorted(cls._registry)
+
+    @classmethod
+    def known_model_capabilities(
+        cls, config: ProviderConfig | str | None, model_id: str
+    ) -> dict[str, Any]:
+        if isinstance(config, ProviderConfig):
+            is_deepseek = (
+                config.compat == "deepseek"
+                or config.id.lower() == "deepseek"
+                or "api.deepseek.com" in str(config.base_url or "").lower()
+            )
+        else:
+            is_deepseek = str(config or "").strip().lower() == "deepseek"
+        if not is_deepseek:
+            return {}
+        return dict(cls._known_model_capabilities.get(str(model_id).strip().lower(), {}))
 
 
 def _model_value(item: Any, key: str) -> Any:

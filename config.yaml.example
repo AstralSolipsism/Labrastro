@@ -32,9 +32,9 @@ models:
       model: "deepseek-v4-pro"
       api_key: "your-deepseek-api-key-here"
       base_url: "https://api.deepseek.com"
-      max_tokens: 8192
+      max_tokens: 384000
       temperature: 0.0
-      max_context_tokens: 128000
+      max_context_tokens: 1000000
       preserve_reasoning_content: true
       backfill_reasoning_content_for_tool_calls: false
       thinking_enabled: true

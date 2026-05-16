@@ -23,6 +23,42 @@ from reuleauxcoder.extensions.provider.manifest import (
 from reuleauxcoder.services.providers.manager import ProviderManager
 
 
+def test_provider_manager_enriches_deepseek_v4_model_capabilities(monkeypatch) -> None:
+    class FakeModels:
+        def list(self):
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        id="deepseek-v4-pro",
+                        owned_by="deepseek",
+                        created=1,
+                    )
+                ]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.models = FakeModels()
+
+    monkeypatch.setattr("reuleauxcoder.services.providers.manager.OpenAI", FakeOpenAI)
+
+    result = ProviderManager().list_models(
+        ProviderConfig(
+            id="deepseek",
+            type="openai_chat",
+            compat="deepseek",
+            api_key="sk-test",
+            base_url="https://api.deepseek.com",
+        )
+    )
+
+    model = result["models"][0]
+    assert model["id"] == "deepseek-v4-pro"
+    assert model["max_tokens"] == 384000
+    assert model["max_context_tokens"] == 1000000
+    assert model["capability_source"] == "DeepSeek API Docs / Models & Pricing"
+
+
 def test_anthropic_message_conversion_maps_tools_and_thinking() -> None:
     system, messages = convert_messages_to_anthropic(
         [
