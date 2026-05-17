@@ -74,14 +74,12 @@ def test_record_cli_tool_requires_command_and_check(tmp_path: Path) -> None:
         )
 
 
-def test_run_env_record_cli_writes_default_global_manifest(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_run_env_record_cli_writes_explicit_manifest(tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.yaml"
-    monkeypatch.setattr(ConfigLoader, "GLOBAL_CONFIG_PATH", config_path)
 
     exit_code = run_env_record_cli(
         SimpleNamespace(
+            config=str(config_path),
             tool_name="gitnexus",
             tool_command="gitnexus",
             tag=["repo_index"],
@@ -99,3 +97,55 @@ def test_run_env_record_cli_writes_default_global_manifest(
     assert tool["command"] == "gitnexus"
     assert tool["version"] == "1.2.3"
     assert "Created CLI environment entry 'gitnexus'" in capsys.readouterr().out
+
+
+def test_run_env_record_cli_uses_rcoder_config_path(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config_path = tmp_path / "host.yaml"
+    monkeypatch.setenv("RCODER_CONFIG_PATH", str(config_path))
+
+    exit_code = run_env_record_cli(
+        SimpleNamespace(
+            config=None,
+            tool_name="beads",
+            tool_command="beads",
+            tag=[],
+            check="beads --version",
+            install=None,
+            version=None,
+            source=None,
+            description=None,
+        )
+    )
+
+    data = load_yaml_config(config_path)
+    assert exit_code == 0
+    assert data["environment"]["cli_tools"]["beads"]["command"] == "beads"
+    assert str(config_path) in capsys.readouterr().out
+
+
+def test_run_env_record_cli_requires_authoritative_config(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    global_path = tmp_path / "global.yaml"
+    monkeypatch.delenv("RCODER_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(ConfigLoader, "GLOBAL_CONFIG_PATH", global_path)
+
+    exit_code = run_env_record_cli(
+        SimpleNamespace(
+            config=None,
+            tool_name="gitnexus",
+            tool_command="gitnexus",
+            tag=[],
+            check="gitnexus --version",
+            install=None,
+            version=None,
+            source=None,
+            description=None,
+        )
+    )
+
+    assert exit_code == 1
+    assert not global_path.exists()
+    assert "requires --config or RCODER_CONFIG_PATH" in capsys.readouterr().out

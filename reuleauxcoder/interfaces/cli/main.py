@@ -8,9 +8,9 @@ This module handles CLI-specific concerns:
 
 import sys
 import time
-from pathlib import Path
 
 from reuleauxcoder.domain.approval import SharedApprovalProvider
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.interfaces.cli.approval_handler import make_cli_handler
 from reuleauxcoder.interfaces.cli.args import parse_args
 from reuleauxcoder.interfaces.cli.registration import create_cli_registration
@@ -80,9 +80,17 @@ def main():
     ) == "install-node":
         sys.exit(run_mcp_install_node_cli(args))
 
+    try:
+        config_path = resolve_cli_config_path(
+            args, require=bool(args.server), purpose="server mode"
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     # Build options from CLI args
     options = AppOptions(
-        config_path=Path(args.config) if args.config else None,
+        config_path=config_path,
         model=args.model,
         resume_session_id=args.resume,
         auto_resume_latest=True,

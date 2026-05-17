@@ -1,4 +1,4 @@
-"""Configuration loader - loads config.yaml with global + workspace merge."""
+"""Configuration loader for host-authoritative and local bootstrap configs."""
 
 import os
 from pathlib import Path
@@ -76,10 +76,9 @@ class ConfigValidationError(Exception):
 class ConfigLoader:
     """Loads configuration from config.yaml.
 
-    Configuration priority (later overrides earlier):
-    1. Global config: ~/.rcoder/config.yaml
-    2. Workspace config: ./.rcoder/config.yaml
-    3. Explicit path: --config argument
+    Two loading modes are intentionally separate:
+    1. Explicit config: only the given file plus builtin defaults.
+    2. Layered user config: global + workspace, only for no --config bootstrap.
     """
 
     GLOBAL_CONFIG_PATH = Path.home() / ".rcoder" / "config.yaml"
@@ -102,7 +101,7 @@ class ConfigLoader:
     ]
 
     def __init__(self, config_path: Optional[Path] = None):
-        self.config_path = config_path
+        self.config_path = Path(config_path) if config_path is not None else None
 
     _ENV_REF_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
@@ -349,30 +348,53 @@ class ConfigLoader:
 
         return result
 
-    def load(self) -> Config:
-        """Load configuration with global + workspace merge."""
-        # Start with builtin mode defaults
-        config_data = {
+    def _base_config_data(self) -> dict:
+        return {
             "modes": {
                 "active": DEFAULT_ACTIVE_MODE,
                 "profiles": dict(BUILTIN_MODES),
             }
         }
 
+    def load(self) -> Config:
+        """Load configuration using explicit-only or local layered semantics."""
+        if self.config_path is not None:
+            return self.load_explicit_config(self.config_path)
+        return self.load_layered_user_config()
+
+    def load_explicit_config(self, path: Path) -> Config:
+        """Load a host/admin config without reading HOME or workspace configs."""
+        config_data = self._base_config_data()
+
+        explicit_data = self._load_yaml(path)
+        if explicit_data:
+            config_data = self._merge_dicts(config_data, explicit_data)
+
+        self._reject_deprecated_config_paths(config_data)
+
+        has_runtime_config = bool(config_data.get("models"))
+        if not has_runtime_config and not self._is_remote_host_mode_config(config_data):
+            raise ExampleConfigError(
+                f"\n  The explicit config at {path} is missing model/runtime configuration.\n"
+                "  Configure providers.items and models.profiles, or enable remote_exec.host_mode.\n"
+            )
+
+        config_data = self._expand_env_refs(config_data)
+        return self._parse_config(config_data)
+
+    def load_layered_user_config(self) -> Config:
+        """Load global + workspace config for local bootstrap/dev usage."""
+        config_data = self._base_config_data()
+
         # Load global config
         global_data = self._load_yaml(self.GLOBAL_CONFIG_PATH)
 
         # Detect example config — user still needs to configure providers and model profiles.
-        # Explicit host configs are authoritative for containers and admin tools; an old
-        # global example in HOME must not block them.
         if global_data and self._is_example_config(global_data):
-            if self.config_path:
-                global_data = {}
-            else:
-                raise ExampleConfigError(
-                    f"\n  The config at {self.GLOBAL_CONFIG_PATH} is still the example template.\n"
-                    "  Please configure providers.items and models.profiles, then restart.\n"
-                )
+            raise ExampleConfigError(
+                f"\n  The config at {self.GLOBAL_CONFIG_PATH} is still the example template.\n"
+                "  Please configure providers.items and models.profiles, then restart.\n"
+            )
 
         if global_data:
             config_data = self._merge_dicts(config_data, global_data)
@@ -381,12 +403,6 @@ class ConfigLoader:
         workspace_data = self._load_yaml(self.WORKSPACE_CONFIG_PATH)
         if workspace_data:
             config_data = self._merge_dicts(config_data, workspace_data)
-
-        # Load explicit config path (overrides everything)
-        if self.config_path:
-            explicit_data = self._load_yaml(self.config_path)
-            if explicit_data:
-                config_data = self._merge_dicts(config_data, explicit_data)
 
         self._reject_deprecated_config_paths(config_data)
 
@@ -895,6 +911,6 @@ class ConfigLoader:
 
     @classmethod
     def from_path(cls, path: Optional[Path] = None) -> Config:
-        """Convenience method to load config from a path."""
+        """Load an explicit config path, or layered user config when path is absent."""
         loader = cls(path)
         return loader.load()

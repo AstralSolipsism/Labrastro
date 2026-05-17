@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from reuleauxcoder.domain.config.models import EnvironmentCLIToolConfig
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 
@@ -64,17 +65,22 @@ class EnvironmentManifestManager:
 
 
 def run_env_record_cli(args) -> int:
-    tool = EnvironmentCLIToolConfig(
-        name=str(args.tool_name),
-        command=str(args.tool_command),
-        tags=[str(item) for item in args.tag],
-        check=str(args.check),
-        install=str(args.install or ""),
-        version=str(args.version) if args.version else None,
-        source=str(args.source or ""),
-        description=str(args.description or ""),
-    )
-    result = EnvironmentManifestManager().record_cli_tool(tool)
+    try:
+        tool = EnvironmentCLIToolConfig(
+            name=str(args.tool_name),
+            command=str(args.tool_command),
+            tags=[str(item) for item in args.tag],
+            check=str(args.check),
+            install=str(args.install or ""),
+            version=str(args.version) if args.version else None,
+            source=str(args.source or ""),
+            description=str(args.description or ""),
+        )
+        config_path = resolve_cli_config_path(args, require=True, purpose="env record")
+        result = EnvironmentManifestManager(config_path).record_cli_tool(tool)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     verb = "Created" if result.created else "Updated"
     print(f"{verb} CLI environment entry '{result.name}' in {result.path}")
     return 0

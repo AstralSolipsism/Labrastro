@@ -183,6 +183,90 @@ models:
 
     assert config.remote_exec.enabled is True
     assert config.remote_exec.host_mode is True
+    assert not workspace_path.exists()
+
+
+def test_load_explicit_config_ignores_global_and_workspace_values(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    global_path = tmp_path / "global.yaml"
+    workspace_path = tmp_path / "workspace" / ".rcoder" / "config.yaml"
+    explicit_path = tmp_path / "host.yaml"
+    global_path.write_text(
+        """
+providers:
+  items:
+    global-provider:
+      type: openai_chat
+      api_key: global-key
+models:
+  profiles:
+    global-main:
+      provider: global-provider
+      model: global-model
+      max_tokens: 4096
+      max_context_tokens: 128000
+""".strip(),
+        encoding="utf-8",
+    )
+    workspace_path.parent.mkdir(parents=True)
+    workspace_path.write_text(
+        """
+providers:
+  items:
+    workspace-provider:
+      type: openai_chat
+      api_key: workspace-key
+models:
+  profiles:
+    workspace-main:
+      provider: workspace-provider
+      model: workspace-model
+      max_tokens: 8192
+      max_context_tokens: 256000
+modes:
+  active: workspace-only
+  profiles:
+    workspace-only:
+      name: workspace-only
+      description: Workspace-only mode
+""".strip(),
+        encoding="utf-8",
+    )
+    explicit_path.write_text(
+        """
+remote_exec:
+  enabled: true
+  host_mode: true
+auth:
+  token_secret: test-secret
+providers:
+  items:
+    host-provider:
+      type: openai_chat
+      api_key: host-key
+models:
+  profiles:
+    main:
+      provider: host-provider
+      model: host-model
+      max_tokens: 123
+      max_context_tokens: 456
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigLoader, "GLOBAL_CONFIG_PATH", global_path)
+    monkeypatch.setattr(ConfigLoader, "WORKSPACE_CONFIG_PATH", workspace_path)
+
+    config = ConfigLoader(explicit_path).load()
+
+    assert set(config.providers.items) == {"host-provider"}
+    assert set(config.model_profiles) == {"main"}
+    assert config.model_profiles["main"].model == "host-model"
+    assert config.model_profiles["main"].max_tokens == 123
+    assert config.active_mode == "coder"
+    assert "workspace-only" not in config.modes
 
 
 def test_parse_config_reads_memory_provider_settings() -> None:

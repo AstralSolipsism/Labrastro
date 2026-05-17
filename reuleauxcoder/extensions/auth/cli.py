@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import getpass
-from pathlib import Path
 
 from labrastro_server.services.auth.crypto import hash_password
 from labrastro_server.services.auth.service import validate_auth_config
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.services.config.loader import (
     ConfigEnvironmentError,
     ExampleConfigError,
@@ -29,9 +29,11 @@ def run_auth_cli(args) -> int:
     if getattr(args, "auth_command", None) == "verify-config":
         try:
             config = ConfigLoader.from_path(
-                Path(args.config) if getattr(args, "config", None) else None
+                resolve_cli_config_path(
+                    args, require=True, purpose="auth verify-config"
+                )
             )
-        except (ConfigEnvironmentError, ExampleConfigError) as exc:
+        except (ConfigEnvironmentError, ExampleConfigError, ValueError) as exc:
             print(f"ERROR: {exc}")
             return 1
         errors = config.validate()

@@ -1,7 +1,12 @@
 ﻿from pathlib import Path
 
+from types import SimpleNamespace
+
 from reuleauxcoder.domain.config.models import MCPServerConfig
-from reuleauxcoder.extensions.mcp.manifest import MCPManifestManager
+from reuleauxcoder.extensions.mcp.manifest import (
+    MCPManifestManager,
+    run_mcp_record_cli,
+)
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 
 
@@ -72,3 +77,30 @@ def test_record_mcp_server_preserves_existing_artifacts(tmp_path: Path) -> None:
     assert result.created is False
     assert server["distribution"] == "command"
     assert "linux-amd64" in server["artifacts"]
+
+
+def test_run_mcp_record_cli_requires_authoritative_config(
+    capsys, monkeypatch
+) -> None:
+    monkeypatch.delenv("RCODER_CONFIG_PATH", raising=False)
+
+    result = run_mcp_record_cli(
+        SimpleNamespace(
+            config=None,
+            server_name="gitnexus",
+            mcp_tool_command="gitnexus",
+            mcp_arg=["mcp"],
+            env=[],
+            placement="peer",
+            distribution="command",
+            version=None,
+            requirement=[],
+            check=None,
+            install=None,
+            source=None,
+            description=None,
+        )
+    )
+
+    assert result == 1
+    assert "requires --config or RCODER_CONFIG_PATH" in capsys.readouterr().out

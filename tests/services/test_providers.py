@@ -1004,6 +1004,33 @@ def test_provider_record_cli_writes_compat(tmp_path, capsys, monkeypatch) -> Non
     assert provider.compat == "kimi"
 
 
+def test_provider_record_cli_requires_authoritative_config(
+    capsys, monkeypatch
+) -> None:
+    monkeypatch.delenv("RCODER_CONFIG_PATH", raising=False)
+
+    result = run_provider_record_cli(
+        SimpleNamespace(
+            config=None,
+            provider_id="kimi",
+            provider_type="openai_chat",
+            compat="kimi",
+            api_key="sk-test",
+            api_key_env=None,
+            base_url="https://api.moonshot.ai/v1",
+            base_url_env=None,
+            header=[],
+            timeout_sec=120,
+            max_retries=3,
+            api_feature=[],
+            extra=[],
+        )
+    )
+
+    assert result == 1
+    assert "requires --config or RCODER_CONFIG_PATH" in capsys.readouterr().out
+
+
 def test_provider_list_cli_displays_compat(tmp_path, capsys) -> None:
     path = tmp_path / "config.yaml"
     ProviderManifestManager(path).record_provider(

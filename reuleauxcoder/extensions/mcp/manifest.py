@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from reuleauxcoder.domain.config.models import MCPServerConfig
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 
@@ -81,9 +82,8 @@ def run_mcp_record_cli(args) -> int:
             source=str(args.source or ""),
             description=str(args.description or ""),
         )
-        result = MCPManifestManager(
-            Path(args.config) if args.config else None
-        ).record_server(server)
+        config_path = resolve_cli_config_path(args, require=True, purpose="mcp record")
+        result = MCPManifestManager(config_path).record_server(server)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1

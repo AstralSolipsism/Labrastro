@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
 
 from labrastro_server.infrastructure.persistence.db import create_postgres_engine
@@ -13,11 +12,14 @@ from labrastro_server.infrastructure.persistence.migration import (
 from labrastro_server.infrastructure.persistence.maintenance import (
     PersistenceMaintenanceService,
 )
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.services.config.loader import ConfigLoader
 
 
 def _load_database_url(args) -> str:
-    config = ConfigLoader.from_path(Path(args.config) if args.config else None)
+    config = ConfigLoader.from_path(
+        resolve_cli_config_path(args, require=True, purpose="db")
+    )
     database_url = config.persistence.database_url
     if not database_url:
         print("persistence.database_url is required", file=sys.stderr)
@@ -26,7 +28,11 @@ def _load_database_url(args) -> str:
 
 
 def run_db_cli(args) -> int:
-    database_url = _load_database_url(args)
+    try:
+        database_url = _load_database_url(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if args.db_command == "migrate":
         run_migrations(database_url)
         print("database migrated")
@@ -40,7 +46,13 @@ def run_db_cli(args) -> int:
         if days <= 0:
             print("retention_days must be positive for cleanup", file=sys.stderr)
             return 1
-        config = ConfigLoader.from_path(Path(args.config) if args.config else None)
+        try:
+            config = ConfigLoader.from_path(
+                resolve_cli_config_path(args, require=True, purpose="db cleanup")
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         maintenance = PersistenceMaintenanceService(
             engine,
             retention_days=days,

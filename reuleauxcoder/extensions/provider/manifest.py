@@ -11,6 +11,7 @@ from reuleauxcoder.domain.config.models import (
     ProviderConfig,
     infer_provider_compat,
 )
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError, ConfigLoader
 from reuleauxcoder.services.providers.manager import ProviderManager
@@ -97,9 +98,10 @@ def run_provider_record_cli(args) -> int:
             ),
             extra=_parse_extra_entries(list(args.extra or [])),
         )
-        result = ProviderManifestManager(
-            Path(args.config) if args.config else None
-        ).record_provider(provider)
+        config_path = resolve_cli_config_path(
+            args, require=True, purpose="provider record"
+        )
+        result = ProviderManifestManager(config_path).record_provider(provider)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
@@ -111,9 +113,9 @@ def run_provider_record_cli(args) -> int:
 def run_provider_list_cli(args) -> int:
     try:
         providers = ProviderManifestManager(
-            Path(args.config) if args.config else None
+            resolve_cli_config_path(args, require=False, purpose="provider list")
         ).list_providers()
-    except ConfigEnvironmentError as exc:
+    except (ConfigEnvironmentError, ValueError) as exc:
         print(f"Error: {exc}")
         return 1
     if not providers:
@@ -136,7 +138,7 @@ def run_provider_list_cli(args) -> int:
 def run_provider_test_cli(args) -> int:
     try:
         provider = ProviderManifestManager(
-            Path(args.config) if args.config else None
+            resolve_cli_config_path(args, require=False, purpose="provider test")
         ).raw_provider(str(args.provider_id))
         if provider is None:
             print(f"Error: provider '{args.provider_id}' is not configured")

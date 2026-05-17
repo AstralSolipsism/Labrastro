@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 
@@ -604,8 +605,15 @@ class MCPArtifactManager:
 
 
 def run_mcp_artifact_cli(args: argparse.Namespace) -> int:
-    manager = MCPArtifactManager(Path(args.config) if args.config else None)
     try:
+        write_command = args.artifact_command in {"import", "build-node"}
+        manager = MCPArtifactManager(
+            resolve_cli_config_path(
+                args,
+                require=write_command,
+                purpose=f"mcp artifact {args.artifact_command or ''}".strip(),
+            )
+        )
         if args.artifact_command == "import":
             record = manager.import_artifact(
                 args.server_name, args.version, args.platform, Path(args.archive)
@@ -631,7 +639,7 @@ def run_mcp_artifact_cli(args: argparse.Namespace) -> int:
                 _print_record("verified" if record.verified else "failed", record)
                 failed = failed or not bool(record.verified)
             return 1 if failed else 0
-    except MCPArtifactError as exc:
+    except (MCPArtifactError, ValueError) as exc:
         print(f"Error: {exc}")
         return 1
     print("Error: missing artifact command")
@@ -639,8 +647,10 @@ def run_mcp_artifact_cli(args: argparse.Namespace) -> int:
 
 
 def run_mcp_install_node_cli(args: argparse.Namespace) -> int:
-    manager = MCPArtifactManager(Path(args.config) if args.config else None)
     try:
+        manager = MCPArtifactManager(
+            resolve_cli_config_path(args, require=True, purpose="mcp install-node")
+        )
         result = manager.install_node(
             args.server_name,
             args.package,
@@ -650,7 +660,7 @@ def run_mcp_install_node_cli(args: argparse.Namespace) -> int:
             args=list(args.node_arg or []),
             env=_parse_env_entries(list(args.env or [])),
         )
-    except MCPArtifactError as exc:
+    except (MCPArtifactError, ValueError) as exc:
         print(f"Error: {exc}")
         return 1
     print(
