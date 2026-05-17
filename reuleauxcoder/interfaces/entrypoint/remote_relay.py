@@ -1398,6 +1398,21 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 relay_server.cancel_pending_requests(peer_id, reason),
             )
         )
+        if hasattr(remote_session, "set_follow_up_callback"):
+            remote_session.set_follow_up_callback(
+                lambda ticket: peer_agent.queue_follow_up(
+                    str(ticket.get("followup_id") or ""),
+                    str(ticket.get("text") or ""),
+                )
+            )
+        if hasattr(remote_session, "set_follow_up_cancel_callback"):
+            remote_session.set_follow_up_cancel_callback(peer_agent.cancel_follow_up)
+        if hasattr(peer_agent, "set_follow_up_consumed_handler"):
+            peer_agent.set_follow_up_consumed_handler(
+                lambda item: remote_session.mark_follow_up_consumed(
+                    getattr(item, "followup_id", "")
+                )
+            )
         if getattr(remote_session, "cancel_requested", False):
             peer_agent.request_stop()
 
@@ -1894,6 +1909,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if peer_context_manager is not None:
                 peer_context_manager._ui_bus = previous_context_bus
             peer_agent.approval_provider = previous_approval
+            if hasattr(peer_agent, "set_follow_up_consumed_handler"):
+                peer_agent.set_follow_up_consumed_handler(None)
+            if hasattr(remote_session, "set_follow_up_callback"):
+                remote_session.set_follow_up_callback(None)
+            if hasattr(remote_session, "set_follow_up_cancel_callback"):
+                remote_session.set_follow_up_cancel_callback(None)
             try:
                 peer_agent._event_handlers.remove(_on_agent_event)
             except ValueError:

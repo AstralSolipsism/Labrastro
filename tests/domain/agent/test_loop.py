@@ -118,6 +118,21 @@ def test_agent_loop_remote_peer_runtime_context_requires_peer_registration() -> 
         raise AssertionError("remote_peer context without registration must fail")
 
 
+def test_agent_loop_injects_consumed_follow_up_before_next_llm_call() -> None:
+    agent = _AgentStub()
+    agent.consume_follow_ups = lambda: [
+        SimpleNamespace(followup_id="follow-1", text="prefer the shorter path")
+    ]
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    loop._inject_pending_follow_ups()
+    messages = loop._full_messages()
+
+    assert messages[-2]["role"] == "user"
+    assert "<conversation_guidance>" in messages[-2]["content"]
+    assert "prefer the shorter path" in messages[-2]["content"]
+
+
 def test_system_prompt_includes_taskflow_only_when_workflow_is_active() -> None:
     normal = system_prompt([_Tool("read_file", "Read file")])
     taskflow = system_prompt(
