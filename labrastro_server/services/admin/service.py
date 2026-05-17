@@ -1609,18 +1609,31 @@ class RemoteAdminConfigManager:
         profile_id = str(payload.get("profile_id") or payload.get("id") or "").strip()
         if not profile_id:
             return AdminConfigResult(False, {"error": "profile_id_required"}, 400)
-        removed_fields = [
-            field
-            for field in ("api_key", "api_key_env", "base_url", "base_url_env")
-            if field in payload
-        ]
-        if removed_fields:
+        allowed_fields = {
+            "backfill_reasoning_content_for_tool_calls",
+            "capability_user_configured",
+            "id",
+            "max_context_tokens",
+            "max_tokens",
+            "model",
+            "preserve_reasoning_content",
+            "profile_id",
+            "provider",
+            "reasoning_effort",
+            "reasoning_replay_mode",
+            "reasoning_replay_placeholder",
+            "temperature",
+            "thinking_enabled",
+        }
+        unknown_fields = sorted(str(field) for field in payload if field not in allowed_fields)
+        if unknown_fields:
             return AdminConfigResult(
                 False,
                 {
-                    "error": "deprecated_model_profile_field",
-                    "fields": removed_fields,
-                    "message": "Model profiles no longer store credentials or endpoints. Configure them under providers.items.",
+                    "error": "unknown_model_profile_field",
+                    "fields": unknown_fields,
+                    "message": "Unknown model profile field: "
+                    + ", ".join(unknown_fields),
                 },
                 400,
             )

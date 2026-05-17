@@ -55,8 +55,6 @@ def _build_ctx() -> SimpleNamespace:
         max_context_tokens=200000,
     )
     config = Config(
-        model="base-model",
-        api_key="base-key",
         approval=ApprovalConfig(),
         providers=ProvidersConfig(
             items={
@@ -77,7 +75,6 @@ def _build_ctx() -> SimpleNamespace:
         model_profiles={"alpha": profile_a, "beta": profile_b},
         active_main_model_profile="alpha",
         active_sub_model_profile="alpha",
-        max_context_tokens=64000,
     )
     llm = FakeLLM()
     agent = SimpleNamespace(
@@ -134,7 +131,7 @@ def test_set_main_model_updates_global_and_runtime(monkeypatch) -> None:
 
     assert saved["profile_name"] == "beta"
     assert ctx.config.active_main_model_profile == "beta"
-    assert ctx.config.model == "model-beta"
+    assert not hasattr(ctx.config, "model")
     assert ctx.agent.active_main_model_profile == "beta"
     assert result.payload["active_main_profile"] == "beta"
 

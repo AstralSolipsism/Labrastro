@@ -17,17 +17,15 @@ from reuleauxcoder.infrastructure.persistence.session_store import (
     DEFAULT_SESSION_FINGERPRINT,
 )
 from reuleauxcoder.services.llm.factory import (
+    llm_raw_chunks_enabled,
+    llm_trace_enabled,
     model_binding_settings,
     reconfigure_llm_from_settings,
 )
 
 
 def _apply_llm_diagnostic_runtime(config: Config, agent: Agent) -> None:
-    setattr(
-        agent.llm,
-        "debug_raw_chunks",
-        bool(getattr(config, "llm_debug_raw_chunks", False)),
-    )
+    setattr(agent.llm, "debug_raw_chunks", llm_raw_chunks_enabled(config))
 
 
 def get_session_fingerprint(config: Config, agent: Agent) -> str:
@@ -108,13 +106,13 @@ def _apply_model_binding(
         model=model,
         parameters=parameters,
         fallback=config,
+        providers=getattr(config, "providers", None),
     )
     reconfigure_llm_from_settings(
         agent.llm,
         settings,
-        debug_trace=getattr(agent.llm, "debug_trace", getattr(config, "llm_debug_trace", False)),
-        debug_raw_chunks=getattr(config, "llm_debug_raw_chunks", False),
-        providers=getattr(config, "providers", None),
+        debug_trace=getattr(agent.llm, "debug_trace", llm_trace_enabled(config)),
+        debug_raw_chunks=llm_raw_chunks_enabled(config),
     )
     max_context = getattr(settings, "max_context_tokens", None)
     if max_context:
@@ -169,7 +167,7 @@ def build_session_runtime_state(config: Config, agent: Agent) -> SessionRuntimeS
     """Capture session-scoped runtime overrides from the live host runtime."""
     session_rules = getattr(agent, "session_approval_rules", None) or []
     return SessionRuntimeState(
-        model=getattr(agent.llm, "model", None) or getattr(config, "model", None),
+        model=getattr(agent.llm, "model", None) or None,
         active_mode=getattr(agent, "active_mode", None),
         llm_debug_trace=getattr(agent.llm, "debug_trace", None),
         active_model_provider=getattr(agent, "active_model_provider", None),
@@ -200,7 +198,7 @@ def restore_config_runtime_defaults(config: Config, agent: Agent) -> None:
     setattr(agent, "active_model", None)
     setattr(agent, "active_model_display_name", None)
     setattr(agent, "active_model_parameters", {})
-    agent.llm.debug_trace = getattr(config, "llm_debug_trace", False)
+    agent.llm.debug_trace = llm_trace_enabled(config)
     _apply_llm_diagnostic_runtime(config, agent)
     if apply_agent_default_model(config, agent):
         pass
@@ -212,13 +210,13 @@ def restore_config_runtime_defaults(config: Config, agent: Agent) -> None:
             reconfigure_llm_from_settings(
                 agent.llm,
                 profile,
-                debug_trace=getattr(config, "llm_debug_trace", False),
-                debug_raw_chunks=getattr(config, "llm_debug_raw_chunks", False),
+                debug_trace=llm_trace_enabled(config),
+                debug_raw_chunks=llm_raw_chunks_enabled(config),
                 providers=getattr(config, "providers", None),
             )
             agent.context.reconfigure(profile.max_context_tokens)
         else:
-            agent.llm.debug_trace = getattr(config, "llm_debug_trace", False)
+            agent.llm.debug_trace = llm_trace_enabled(config)
             _apply_llm_diagnostic_runtime(config, agent)
         setattr(agent, "active_main_model_profile", main_profile_name)
     main_profile_name = getattr(config, "active_main_model_profile", None)
@@ -254,8 +252,8 @@ def apply_session_runtime_state(session: Session, config: Config, agent: Agent) 
             apply_agent_default_model(config, agent)
 
     loaded_debug = runtime.llm_debug_trace
-    if getattr(config, "llm_debug_trace_authoritative", False):
-        agent.llm.debug_trace = getattr(config, "llm_debug_trace", False)
+    if getattr(config, "llm_trace_authoritative", False):
+        agent.llm.debug_trace = llm_trace_enabled(config)
     elif loaded_debug is not None:
         agent.llm.debug_trace = loaded_debug
     _apply_llm_diagnostic_runtime(config, agent)
@@ -295,7 +293,7 @@ def apply_session_runtime_state(session: Session, config: Config, agent: Agent) 
             agent.llm,
             profile,
             debug_trace=agent.llm.debug_trace,
-            debug_raw_chunks=getattr(config, "llm_debug_raw_chunks", False),
+            debug_raw_chunks=llm_raw_chunks_enabled(config),
             providers=getattr(config, "providers", None),
         )
         agent.context.reconfigure(profile.max_context_tokens)

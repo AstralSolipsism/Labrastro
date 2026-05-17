@@ -1,4 +1,10 @@
-from reuleauxcoder.domain.config.models import Config, ContextConfig
+from reuleauxcoder.domain.config.models import (
+    Config,
+    ContextConfig,
+    ModelProfileConfig,
+    ProviderConfig,
+    ProvidersConfig,
+)
 from reuleauxcoder.interfaces.entrypoint.dependencies import _default_create_agent
 
 
@@ -9,8 +15,19 @@ class FakeLLM:
 
 def test_default_create_agent_passes_context_config_to_context_manager() -> None:
     config = Config(
-        api_key="key",
-        max_context_tokens=12345,
+        providers=ProvidersConfig(
+            items={"openai": ProviderConfig(id="openai", api_key="key")}
+        ),
+        model_profiles={
+            "main": ModelProfileConfig(
+                name="main",
+                provider="openai",
+                model="gpt-4.1",
+                max_tokens=8192,
+                max_context_tokens=12345,
+            )
+        },
+        active_main_model_profile="main",
         context=ContextConfig(
             snip_keep_recent_tools=2,
             snip_threshold_chars=321,

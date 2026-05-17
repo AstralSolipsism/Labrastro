@@ -9,6 +9,7 @@ from labrastro_server.services.auth.service import validate_auth_config
 from reuleauxcoder.extensions.config_target import resolve_cli_config_path
 from reuleauxcoder.services.config.loader import (
     ConfigEnvironmentError,
+    ConfigSchemaError,
     ExampleConfigError,
     ConfigLoader,
 )
@@ -33,7 +34,7 @@ def run_auth_cli(args) -> int:
                     args, require=True, purpose="auth verify-config"
                 )
             )
-        except (ConfigEnvironmentError, ExampleConfigError, ValueError) as exc:
+        except (ConfigEnvironmentError, ConfigSchemaError, ExampleConfigError, ValueError) as exc:
             print(f"ERROR: {exc}")
             return 1
         errors = config.validate()

@@ -18,7 +18,7 @@ def test_parse_debug_on_off() -> None:
 def test_handle_debug_toggles_runtime_flag() -> None:
     ui_bus = UIEventBus()
     llm = SimpleNamespace(debug_trace=False)
-    config = SimpleNamespace(llm_debug_trace=False)
+    config = SimpleNamespace()
     ctx = SimpleNamespace(
         config=config,
         agent=SimpleNamespace(llm=llm),
@@ -26,12 +26,10 @@ def test_handle_debug_toggles_runtime_flag() -> None:
     )
 
     result = _handle_debug(SimpleNamespace(enabled=True), ctx)
-    assert ctx.config.llm_debug_trace is False
     assert ctx.agent.llm.debug_trace is True
     assert result.payload == {"llm_debug_trace": True}
 
     result = _handle_debug(SimpleNamespace(enabled=False), ctx)
-    assert ctx.config.llm_debug_trace is False
     assert ctx.agent.llm.debug_trace is False
     assert result.payload == {"llm_debug_trace": False}
 

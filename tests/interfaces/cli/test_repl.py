@@ -21,7 +21,7 @@ def _agent_with_messages() -> SimpleNamespace:
 
 
 def test_auto_save_session_saves_and_updates_current_id(tmp_path) -> None:
-    config = Config(api_key="key", session_dir=str(tmp_path))
+    config = Config(session_dir=str(tmp_path))
     agent = _agent_with_messages()
     ui_bus = UIEventBus()
 
@@ -37,7 +37,7 @@ def test_auto_save_session_saves_and_updates_current_id(tmp_path) -> None:
 
 
 def test_auto_save_session_noops_when_disabled(tmp_path) -> None:
-    config = Config(api_key="key", session_dir=str(tmp_path))
+    config = Config(session_dir=str(tmp_path))
     config.session_auto_save = False
     agent = _agent_with_messages()
 

@@ -48,6 +48,7 @@ from reuleauxcoder.interfaces.cli.registration import CLI_PROFILE
 from reuleauxcoder.interfaces.cli.render import CLIRenderer
 from reuleauxcoder.interfaces.entrypoint.dependencies import AppDependencies
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
+from reuleauxcoder.services.llm.factory import llm_trace_enabled, resolve_model_runtime
 from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_SYSTEM_PROMPT,
     TASKFLOW_WORKFLOW_MODE,
@@ -502,9 +503,9 @@ def switch_session_model(
         SessionRuntimeState.from_dict(loaded.runtime_state.to_dict())
         if loaded is not None
         else SessionRuntimeState(
-            model=getattr(config, "model", None),
+            model=resolve_model_runtime(config).model or None,
             active_mode=getattr(config, "active_mode", None),
-            llm_debug_trace=getattr(config, "llm_debug_trace", None),
+            llm_debug_trace=llm_trace_enabled(config),
             active_main_model_profile=getattr(
                 config, "active_main_model_profile", None
             ),
@@ -526,7 +527,7 @@ def switch_session_model(
     if runtime_state.active_mode is None:
         runtime_state.active_mode = getattr(config, "active_mode", None)
     if runtime_state.llm_debug_trace is None:
-        runtime_state.llm_debug_trace = getattr(config, "llm_debug_trace", None)
+        runtime_state.llm_debug_trace = llm_trace_enabled(config)
 
     save_runtime_state = getattr(session_store, "save_runtime_state", None)
     messages = list(loaded.messages) if loaded is not None else []
@@ -537,7 +538,7 @@ def switch_session_model(
     if callable(save_runtime_state):
         save_runtime_state(
             session_id,
-            runtime_state.model or getattr(config, "model", ""),
+            runtime_state.model or resolve_model_runtime(config).model,
             runtime_state,
             messages=messages,
             total_prompt_tokens=total_prompt_tokens,
@@ -548,7 +549,7 @@ def switch_session_model(
     else:
         session_store.save(
             messages,
-            runtime_state.model or getattr(config, "model", ""),
+            runtime_state.model or resolve_model_runtime(config).model,
             session_id,
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
@@ -821,7 +822,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return
         save_runtime_state(
             session_id,
-            getattr(getattr(peer_agent, "llm", None), "model", current_config.model),
+            getattr(getattr(peer_agent, "llm", None), "model", "")
+            or resolve_model_runtime(current_config).model,
             build_session_runtime_state(current_config, peer_agent),
             messages=[],
             active_mode=getattr(peer_agent, "active_mode", None),
@@ -1219,7 +1221,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return
         sid = session_store.save(
             peer_agent.messages,
-            getattr(peer_agent.llm, "model", current_config.model),
+            getattr(peer_agent.llm, "model", "")
+            or resolve_model_runtime(current_config).model,
             getattr(peer_agent, "current_session_id", None),
             total_prompt_tokens=peer_agent.state.total_prompt_tokens,
             total_completion_tokens=peer_agent.state.total_completion_tokens,

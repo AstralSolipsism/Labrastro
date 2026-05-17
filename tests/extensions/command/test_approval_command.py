@@ -18,7 +18,7 @@ from reuleauxcoder.interfaces.events import UIEventBus, UIEventLevel
 
 
 def _build_ctx() -> SimpleNamespace:
-    config = Config(api_key="key", approval=ApprovalConfig())
+    config = Config(approval=ApprovalConfig())
     hook_registry = HookRegistry()
     hook_registry.register(
         HookPoint.BEFORE_TOOL_EXECUTE,

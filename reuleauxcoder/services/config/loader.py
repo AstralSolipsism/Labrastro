@@ -51,12 +51,12 @@ class ConfigEnvironmentError(Exception):
     """Raised when config references a missing environment variable."""
 
 
-class DeprecatedConfigError(Exception):
-    """Raised when a config uses removed legacy configuration paths."""
+class ConfigSchemaError(Exception):
+    """Raised when config contains fields outside the current schema."""
 
     def __init__(self, errors: list[str]):
         self.errors = list(errors)
-        message = "Deprecated configuration paths are no longer supported:\n" + "\n".join(
+        message = "Invalid configuration schema:\n" + "\n".join(
             f"  - {error}" for error in self.errors
         )
         super().__init__(message)
@@ -84,21 +84,65 @@ class ConfigLoader:
     GLOBAL_CONFIG_PATH = Path.home() / ".rcoder" / "config.yaml"
     WORKSPACE_CONFIG_PATH = Path.cwd() / ".rcoder" / "config.yaml"
 
-    # LLM params are derived only from the active model profile/provider pair.
-    _LLM_PARAM_FIELDS = [
-        "model",
+    _ROOT_FIELDS = {
+        "agent_registry",
+        "approval",
+        "auth",
+        "capability_packages",
+        "cli",
+        "context",
+        "diagnostics",
+        "environment",
+        "github",
+        "lsp",
+        "mcp",
+        "memory",
+        "meta",
+        "model_capabilities",
+        "models",
+        "modes",
+        "persistence",
+        "prompt",
+        "providers",
+        "remote_exec",
+        "run_limits",
+        "runtime_profiles",
+        "sandbox_provider",
+        "session",
+        "skills",
+        "tool_output",
+    }
+    _PROVIDERS_FIELDS = {"items"}
+    _PROVIDER_ITEM_FIELDS = {
+        "api_features",
         "api_key",
         "base_url",
-        "max_tokens",
-        "temperature",
-        "max_context_tokens",
-        "preserve_reasoning_content",
+        "compat",
+        "enabled",
+        "extra",
+        "headers",
+        "max_retries",
+        "models",
+        "timeout_sec",
+        "type",
+    }
+    _MODELS_FIELDS = {"active_main", "active_sub", "profiles"}
+    _MODEL_PROFILE_FIELDS = {
         "backfill_reasoning_content_for_tool_calls",
+        "max_context_tokens",
+        "max_tokens",
+        "model",
+        "preserve_reasoning_content",
+        "provider",
         "reasoning_effort",
-        "thinking_enabled",
         "reasoning_replay_mode",
         "reasoning_replay_placeholder",
-    ]
+        "temperature",
+        "thinking_enabled",
+    }
+    _DIAGNOSTICS_FIELDS = {"llm_trace", "tool_argument_validation"}
+    _LLM_TRACE_FIELDS = {"enabled", "raw_chunks"}
+    _TOOL_ARGUMENT_VALIDATION_FIELDS = {"enabled", "record_clean"}
 
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = Path(config_path) if config_path is not None else None
@@ -186,90 +230,92 @@ class ConfigLoader:
                         )
         return expanded
 
-    _REMOVED_ROOT_LLM_FIELDS = {
-        "model",
-        "api_key",
-        "base_url",
-        "max_tokens",
-        "temperature",
-        "max_context_tokens",
-        "preserve_reasoning_content",
-        "backfill_reasoning_content_for_tool_calls",
-        "reasoning_effort",
-        "thinking_enabled",
-        "reasoning_replay_mode",
-        "reasoning_replay_placeholder",
-        "llm_debug_trace",
-        "llm_debug_raw_chunks",
-        "llm_debug_trace_authoritative",
-    }
+    @staticmethod
+    def _collect_unknown_fields(
+        data: dict,
+        *,
+        allowed: set[str],
+        path: str,
+        errors: list[str],
+    ) -> None:
+        prefix = f"{path}." if path else ""
+        for key in sorted(data):
+            if str(key) not in allowed:
+                errors.append(f"Unknown config field: {prefix}{key}")
 
-    def _reject_deprecated_config_paths(self, data: dict) -> None:
-        """Reject legacy model configuration paths instead of silently migrating."""
+    def _reject_unknown_config_fields(self, data: dict) -> None:
+        """Reject fields outside the current config schema."""
         if not isinstance(data, dict):
             return
         errors: list[str] = []
-        if "app" in data:
-            errors.append(
-                "app was removed; configure LLM providers under providers.items and models under models.profiles"
-            )
-        for field in sorted(self._REMOVED_ROOT_LLM_FIELDS):
-            if field in data:
-                target = (
-                    "diagnostics.llm_trace"
-                    if field.startswith("llm_debug")
-                    else "providers.items / models.profiles"
-                )
-                errors.append(f"{field} was removed; use {target}")
+        self._collect_unknown_fields(
+            data, allowed=self._ROOT_FIELDS, path="", errors=errors
+        )
 
-        models = data.get("models", {})
-        profiles = models.get("profiles", {}) if isinstance(models, dict) else {}
-        if isinstance(profiles, dict):
-            for profile_id, profile_data in profiles.items():
-                if not isinstance(profile_data, dict):
-                    continue
-                for field in ("api_key", "base_url"):
-                    if field in profile_data:
-                        errors.append(
-                            f"models.profiles.{profile_id}.{field} was removed; configure it under providers.items"
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            self._collect_unknown_fields(
+                providers,
+                allowed=self._PROVIDERS_FIELDS,
+                path="providers",
+                errors=errors,
+            )
+            items = providers.get("items", {})
+            if isinstance(items, dict):
+                for provider_id, provider_data in items.items():
+                    if isinstance(provider_data, dict):
+                        self._collect_unknown_fields(
+                            provider_data,
+                            allowed=self._PROVIDER_ITEM_FIELDS,
+                            path=f"providers.items.{provider_id}",
+                            errors=errors,
                         )
-        if errors:
-            raise DeprecatedConfigError(errors)
 
-    def _resolve_llm_params(
-        self, active_profile, providers: ProvidersConfig | None = None
-    ) -> dict:
-        """Resolve LLM params from the active profile and provider only."""
-        params: dict = {
-            "model": "",
-            "api_key": "",
-            "base_url": None,
-            "max_tokens": 0,
-            "temperature": 0.0,
-            "max_context_tokens": 0,
-            "preserve_reasoning_content": True,
-            "backfill_reasoning_content_for_tool_calls": False,
-            "reasoning_effort": None,
-            "thinking_enabled": None,
-            "reasoning_replay_mode": None,
-            "reasoning_replay_placeholder": None,
-        }
-        provider_config = None
-        if (
-            active_profile is not None
-            and getattr(active_profile, "provider", None)
-            and providers is not None
-        ):
-            provider_config = providers.items.get(active_profile.provider)
-        for field in self._LLM_PARAM_FIELDS:
-            profile_val = (
-                getattr(active_profile, field, None) if active_profile is not None else None
+        models = data.get("models")
+        if isinstance(models, dict):
+            self._collect_unknown_fields(
+                models,
+                allowed=self._MODELS_FIELDS,
+                path="models",
+                errors=errors,
             )
-            if profile_val is not None:
-                params[field] = profile_val
-            elif field in {"api_key", "base_url"} and provider_config is not None:
-                params[field] = getattr(provider_config, field)
-        return params
+            profiles = models.get("profiles", {})
+            if isinstance(profiles, dict):
+                for profile_id, profile_data in profiles.items():
+                    if isinstance(profile_data, dict):
+                        self._collect_unknown_fields(
+                            profile_data,
+                            allowed=self._MODEL_PROFILE_FIELDS,
+                            path=f"models.profiles.{profile_id}",
+                            errors=errors,
+                        )
+
+        diagnostics = data.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            self._collect_unknown_fields(
+                diagnostics,
+                allowed=self._DIAGNOSTICS_FIELDS,
+                path="diagnostics",
+                errors=errors,
+            )
+            llm_trace = diagnostics.get("llm_trace")
+            if isinstance(llm_trace, dict):
+                self._collect_unknown_fields(
+                    llm_trace,
+                    allowed=self._LLM_TRACE_FIELDS,
+                    path="diagnostics.llm_trace",
+                    errors=errors,
+                )
+            tool_validation = diagnostics.get("tool_argument_validation")
+            if isinstance(tool_validation, dict):
+                self._collect_unknown_fields(
+                    tool_validation,
+                    allowed=self._TOOL_ARGUMENT_VALIDATION_FIELDS,
+                    path="diagnostics.tool_argument_validation",
+                    errors=errors,
+                )
+        if errors:
+            raise ConfigSchemaError(errors)
 
     def _load_yaml(self, path: Path) -> dict:
         """Load YAML file, return empty dict if not exists or invalid."""
@@ -370,7 +416,7 @@ class ConfigLoader:
         if explicit_data:
             config_data = self._merge_dicts(config_data, explicit_data)
 
-        self._reject_deprecated_config_paths(config_data)
+        self._reject_unknown_config_fields(config_data)
 
         has_runtime_config = bool(config_data.get("models"))
         if not has_runtime_config and not self._is_remote_host_mode_config(config_data):
@@ -404,7 +450,7 @@ class ConfigLoader:
         if workspace_data:
             config_data = self._merge_dicts(config_data, workspace_data)
 
-        self._reject_deprecated_config_paths(config_data)
+        self._reject_unknown_config_fields(config_data)
 
         # Require explicit model/runtime config for local CLI usage. Remote host mode
         # can bootstrap without a model so admins can configure providers via UI.
@@ -427,7 +473,7 @@ class ConfigLoader:
 
     def _parse_config(self, data: dict) -> Config:
         """Parse YAML data into Config model."""
-        self._reject_deprecated_config_paths(data)
+        self._reject_unknown_config_fields(data)
         approval_config = data.get("approval", {})
         tool_output_config = data.get("tool_output", {})
         session_config = data.get("session", {})
@@ -497,12 +543,6 @@ class ConfigLoader:
         ):
             active_sub_model_profile = active_main_model_profile
 
-        active_profile = (
-            model_profiles.get(active_main_model_profile)
-            if isinstance(active_main_model_profile, str)
-            else None
-        )
-
         # Parse modes (builtin modes already merged during load())
         modes: dict[str, ModeConfig] = {}
         mode_profiles_data = modes_config.get("profiles", {})
@@ -564,7 +604,6 @@ class ConfigLoader:
                 str(package_id), package_data
             )
 
-        llm_params = self._resolve_llm_params(active_profile, providers)
         agent_registry_data, runtime_profiles_data = ensure_default_environment_agent_registry(
             agent_registry_config if isinstance(agent_registry_config, dict) else {},
             runtime_profiles_config if isinstance(runtime_profiles_config, dict) else {},
@@ -581,10 +620,8 @@ class ConfigLoader:
             isinstance(diagnostics_config, dict)
             and isinstance(diagnostics_config.get("llm_trace"), dict)
         )
-        llm_trace_enabled = diagnostics.llm_trace.enabled
 
         return Config(
-            **llm_params,
             mcp_servers=mcp_servers,
             mcp_artifact_root=str(
                 mcp_config.get("artifact_root", ".rcoder/mcp-artifacts")
@@ -694,9 +731,7 @@ class ConfigLoader:
             ),
             session_dir=session_config.get("dir"),
             history_file=cli_config.get("history_file"),
-            llm_debug_trace=bool(llm_trace_enabled),
-            llm_debug_trace_authoritative=diagnostics_has_llm_trace,
-            llm_debug_raw_chunks=bool(diagnostics.llm_trace.raw_chunks),
+            llm_trace_authoritative=diagnostics_has_llm_trace,
         )
 
     def _is_workspace_bootstrapped(self, workspace_data: dict) -> bool:

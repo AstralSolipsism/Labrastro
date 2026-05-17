@@ -51,12 +51,14 @@ from reuleauxcoder.interfaces.entrypoint.runner import (
     AppOptions,
     AppRunner,
 )
+from reuleauxcoder.services.config.loader import ConfigValidationError
 from reuleauxcoder.interfaces.entrypoint.remote_relay import (
     _structured_ui_event_payload,
     _structured_ui_event_type,
     switch_session_model,
 )
 from reuleauxcoder.interfaces.events import UIEvent, UIEventKind
+from reuleauxcoder.services.llm.factory import resolve_model_runtime
 
 
 def _free_port() -> int:
@@ -387,7 +389,6 @@ def _build_runner_with_fake_agent(
         return service
 
     config = Config(
-        api_key="key",
         remote_exec=RemoteExecConfig(
             enabled=True, host_mode=True, relay_bind=relay_bind
         ),
@@ -410,7 +411,7 @@ def _build_runner_with_fake_agent(
         options=AppOptions(),
         dependencies=AppDependencies(
             load_config=lambda _: config,
-            create_llm=lambda cfg: FakeLLM(cfg.model),
+            create_llm=lambda cfg: FakeLLM(resolve_model_runtime(cfg).model),
             load_tools=load_tools or (lambda _backend: []),
             create_agent=lambda llm, _tools, _config: FakeAgent(
                 llm, tools=_tools, chat_behavior=chat_behavior
@@ -518,7 +519,6 @@ def test_remote_relay_maps_memory_context_to_dedicated_event_type() -> None:
 def test_switch_session_model_updates_runtime_without_transcript_pollution() -> None:
     store = MemorySessionStore()
     config = Config(
-        model="old-model",
         active_mode="coder",
         providers=ProvidersConfig(
             items={
@@ -598,10 +598,81 @@ def test_switch_session_model_rejects_unknown_or_disabled_provider() -> None:
     assert disabled["error"] == "provider_disabled"
 
 
+def test_runner_model_option_selects_configured_profile() -> None:
+    config = Config(
+        providers=ProvidersConfig(
+            items={"fake": ProviderConfig(id="fake", api_key="key")}
+        ),
+        model_profiles={
+            "alpha": ModelProfileConfig(
+                name="alpha",
+                provider="fake",
+                model="alpha-model",
+                max_tokens=2048,
+                max_context_tokens=64000,
+            ),
+            "beta": ModelProfileConfig(
+                name="beta",
+                provider="fake",
+                model="beta-model",
+                max_tokens=4096,
+                max_context_tokens=128000,
+            ),
+        },
+        active_main_model_profile="alpha",
+        remote_exec=RemoteExecConfig(enabled=False),
+    )
+    runner = AppRunner(
+        options=AppOptions(model="beta"),
+        dependencies=AppDependencies(
+            load_config=lambda _: config,
+            create_llm=lambda cfg: FakeLLM(resolve_model_runtime(cfg).model),
+            load_tools=lambda _backend: [],
+            create_agent=lambda llm, tools, _config: FakeAgent(llm, tools=tools),
+        ),
+    )
+
+    ctx = runner.initialize()
+
+    assert ctx.config.active_main_model_profile == "beta"
+    assert ctx.agent.llm.model == "beta-model"
+    runner.cleanup(ctx.agent)
+
+
+def test_runner_model_option_rejects_unknown_profile() -> None:
+    config = Config(
+        providers=ProvidersConfig(
+            items={"fake": ProviderConfig(id="fake", api_key="key")}
+        ),
+        model_profiles={
+            "alpha": ModelProfileConfig(
+                name="alpha",
+                provider="fake",
+                model="alpha-model",
+                max_tokens=2048,
+                max_context_tokens=64000,
+            )
+        },
+        active_main_model_profile="alpha",
+        remote_exec=RemoteExecConfig(enabled=False),
+    )
+    runner = AppRunner(
+        options=AppOptions(model="missing"),
+        dependencies=AppDependencies(load_config=lambda _: config),
+    )
+
+    try:
+        runner.initialize()
+    except ConfigValidationError as exc:
+        assert "model profile 'missing' does not exist" in str(exc)
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("expected missing model profile to fail")
+
+
 class TestRunnerRemoteExec:
     def test_local_mode_no_relay(self, tmp_path: Path) -> None:
         """When remote_exec is disabled, runner starts normally with local backend."""
-        config = Config(api_key="key", remote_exec=RemoteExecConfig(enabled=False))
+        config = Config(remote_exec=RemoteExecConfig(enabled=False))
         runner = AppRunner(
             options=AppOptions(),
             dependencies=AppDependencies(
@@ -617,7 +688,6 @@ class TestRunnerRemoteExec:
     def test_local_mode_smoke_startup_uses_local_backends(self, tmp_path: Path) -> None:
         """Smoke test: normal local startup should not initialize remote services."""
         config = Config(
-            api_key="key",
             remote_exec=RemoteExecConfig(enabled=False, host_mode=False),
         )
         runner = AppRunner(
@@ -641,7 +711,6 @@ class TestRunnerRemoteExec:
 
     def test_remote_enabled_host_mode_starts_relay(self, tmp_path: Path) -> None:
         config = Config(
-            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -669,7 +738,6 @@ class TestRunnerRemoteExec:
         self, tmp_path: Path
     ) -> None:
         config = Config(
-            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -697,7 +765,6 @@ class TestRunnerRemoteExec:
             raise RuntimeError("boom")
 
         config = Config(
-            api_key="key",
             remote_exec=RemoteExecConfig(enabled=True, host_mode=True),
             auth=_test_auth_config(tmp_path),
         )
@@ -716,7 +783,6 @@ class TestRunnerRemoteExec:
 
     def test_cleanup_runs_relay_cleanup(self, tmp_path: Path) -> None:
         config = Config(
-            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -739,7 +805,6 @@ class TestRunnerRemoteExec:
 
     def test_runner_preserves_context_config_on_agent(self, tmp_path: Path) -> None:
         config = Config(
-            api_key="key",
             context=ContextConfig(
                 snip_keep_recent_tools=9,
                 snip_threshold_chars=3210,
@@ -759,7 +824,7 @@ class TestRunnerRemoteExec:
             getattr(ctx.agent, "config", None) is None
             or getattr(ctx.agent, "config", None) == config
         )
-        assert ctx.agent.max_context_tokens == config.max_context_tokens
+        assert ctx.agent.max_context_tokens == 1
         runner.cleanup(ctx.agent)
 
     def test_attach_mcp_starts_server_and_both_placements(self, monkeypatch) -> None:
@@ -789,7 +854,6 @@ class TestRunnerRemoteExec:
     def test_server_mode_smoke_auth_bootstrap_token(self, tmp_path: Path) -> None:
         relay_bind = "127.0.0.1:18765"
         config = Config(
-            api_key="key",
             remote_exec=RemoteExecConfig(
                 enabled=True,
                 host_mode=True,
@@ -831,7 +895,6 @@ class TestRunnerRemoteExec:
         save_yaml_config(
             config_path,
             {
-                "api_key": "key",
                 "remote_exec": {
                     "enabled": True,
                     "host_mode": True,
@@ -850,7 +913,6 @@ class TestRunnerRemoteExec:
             data = load_yaml_config(path or config_path)
             remote_exec = data.get("remote_exec", {})
             config = Config(
-                api_key="key",
                 remote_exec=RemoteExecConfig(
                     enabled=bool(remote_exec.get("enabled", True)),
                     host_mode=bool(remote_exec.get("host_mode", True)),
@@ -874,7 +936,7 @@ class TestRunnerRemoteExec:
             options=AppOptions(config_path=config_path, server_mode=True),
             dependencies=AppDependencies(
                 load_config=load_test_config,
-                create_llm=lambda cfg: FakeLLM(cfg.model),
+                create_llm=lambda cfg: FakeLLM(resolve_model_runtime(cfg).model),
                 load_tools=lambda _backend: [],
                 create_agent=lambda llm, tools, _config: FakeAgent(llm, tools=tools),
             ),

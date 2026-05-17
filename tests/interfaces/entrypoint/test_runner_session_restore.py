@@ -62,7 +62,6 @@ class FakeAgent:
 
 def _build_config(tmp_path: Path) -> Config:
     return Config(
-        api_key="key",
         approval=ApprovalConfig(default_mode="require_approval"),
         session_dir=str(tmp_path),
         modes={
@@ -70,7 +69,6 @@ def _build_config(tmp_path: Path) -> Config:
             "debugger": ModeConfig(name="debugger", description="Debug mode"),
         },
         active_mode="coder",
-        llm_debug_trace=False,
     )
 
 

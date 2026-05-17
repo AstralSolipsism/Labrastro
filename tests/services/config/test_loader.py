@@ -5,8 +5,9 @@ import pytest
 
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError
-from reuleauxcoder.services.config.loader import DeprecatedConfigError
+from reuleauxcoder.services.config.loader import ConfigSchemaError
 from reuleauxcoder.services.config.loader import ExampleConfigError
+from reuleauxcoder.services.llm.factory import resolve_model_runtime
 
 
 def test_load_yaml_returns_empty_dict_for_missing_file(tmp_path: Path) -> None:
@@ -121,13 +122,11 @@ def test_parse_config_reads_llm_trace_diagnostics_settings() -> None:
     settings = config.diagnostics.llm_trace
     assert settings.enabled is True
     assert settings.raw_chunks is True
-    assert config.llm_debug_trace is True
-    assert config.llm_debug_trace_authoritative is True
-    assert config.llm_debug_raw_chunks is True
+    assert config.llm_trace_authoritative is True
 
 
-def test_parse_config_rejects_deprecated_llm_config_paths() -> None:
-    with pytest.raises(DeprecatedConfigError) as exc:
+def test_parse_config_rejects_unknown_llm_config_shape() -> None:
+    with pytest.raises(ConfigSchemaError) as exc:
         ConfigLoader()._parse_config(
             {
                 "app": {"model": "gpt-4o"},
@@ -147,11 +146,11 @@ def test_parse_config_rejects_deprecated_llm_config_paths() -> None:
         )
 
     message = str(exc.value)
-    assert "app was removed" in message
-    assert "model was removed" in message
-    assert "llm_debug_trace was removed; use diagnostics.llm_trace" in message
-    assert "models.profiles.main.api_key was removed" in message
-    assert "models.profiles.main.base_url was removed" in message
+    assert "Unknown config field: app" in message
+    assert "Unknown config field: model" in message
+    assert "Unknown config field: llm_debug_trace" in message
+    assert "Unknown config field: models.profiles.main.api_key" in message
+    assert "Unknown config field: models.profiles.main.base_url" in message
 
 
 def test_load_explicit_config_ignores_global_example(
@@ -383,8 +382,9 @@ def test_parse_config_selects_active_profiles_and_modes() -> None:
         }
     )
 
-    assert config.model == "gpt-main"
-    assert config.api_key == "main-key"
+    runtime = resolve_model_runtime(config)
+    assert runtime.model == "gpt-main"
+    assert runtime.api_key == "main-key"
     assert config.active_main_model_profile == "main"
     assert config.active_sub_model_profile == "sub"
     assert config.active_mode == "coder"
@@ -394,8 +394,8 @@ def test_parse_config_selects_active_profiles_and_modes() -> None:
     assert config.skills.scan_project is False
     assert config.skills.disabled == ["demo"]
     assert config.prompt.system_append == "Always answer in Chinese."
-    assert config.preserve_reasoning_content is True
-    assert config.backfill_reasoning_content_for_tool_calls is True
+    assert runtime.preserve_reasoning_content is True
+    assert runtime.backfill_reasoning_content_for_tool_calls is True
 
 
 def test_parse_config_reads_provider_backed_profiles() -> None:
@@ -432,8 +432,9 @@ def test_parse_config_reads_provider_backed_profiles() -> None:
     assert config.providers.items["anthropic-main"].compat == "deepseek"
     assert config.model_profiles["main"].provider == "anthropic-main"
     assert "coder" not in config.agent_registry.agents
-    assert config.api_key == "sk-ant"
-    assert config.base_url == "https://api.anthropic.com"
+    runtime = resolve_model_runtime(config)
+    assert runtime.api_key == "sk-ant"
+    assert runtime.base_url == "https://api.anthropic.com"
 
 
 def test_parse_config_keeps_existing_agent_default_model() -> None:
@@ -782,7 +783,7 @@ def test_parse_config_falls_back_when_active_profile_missing() -> None:
 
     assert config.active_main_model_profile == "first"
     assert config.active_sub_model_profile == "first"
-    assert config.model == "gpt-first"
+    assert resolve_model_runtime(config).model == "gpt-first"
 
 
 def test_merge_dicts_preserves_active_main_and_active_sub_across_layers() -> None:

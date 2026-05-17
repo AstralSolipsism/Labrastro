@@ -38,7 +38,7 @@ def _auto_save_session(
 
     sid = create_configured_session_store(config, sessions_dir).save(
         agent.messages,
-        getattr(agent.llm, "model", config.model),
+        getattr(agent.llm, "model", ""),
         current_session_id,
         is_exit=is_exit,
         total_prompt_tokens=agent.state.total_prompt_tokens,
@@ -68,7 +68,11 @@ def run_repl(
     skills_service=None,
 ) -> None:
     ensure_user_dirs()
-    show_banner(config.model, config.base_url, __version__)
+    show_banner(
+        getattr(agent.llm, "model", ""),
+        getattr(agent.llm, "base_url", None),
+        __version__,
+    )
 
     hist_path = (
         str(Path(config.history_file).expanduser())
@@ -167,7 +171,7 @@ def run_repl(
             if diagnostic_path and current_session_id:
                 create_configured_session_store(config, sessions_dir).append_system_message(
                     current_session_id,
-                    config.model,
+                    getattr(agent.llm, "model", ""),
                     f"[LLM_ERROR_DIAGNOSTIC] path={diagnostic_path} error={type(e).__name__}: {e}",
                     active_mode=getattr(agent, "active_mode", None),
                 )

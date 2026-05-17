@@ -34,6 +34,7 @@ from reuleauxcoder.extensions.provider.manifest import (
 )
 from reuleauxcoder.services.config.loader import (
     ConfigEnvironmentError,
+    ConfigSchemaError,
     ConfigValidationError,
     ExampleConfigError,
 )
@@ -101,7 +102,12 @@ def main():
     try:
         runner = AppRunner(options)
         ctx = runner.initialize()
-    except (ConfigEnvironmentError, ConfigValidationError, ExampleConfigError) as e:
+    except (
+        ConfigEnvironmentError,
+        ConfigSchemaError,
+        ConfigValidationError,
+        ExampleConfigError,
+    ) as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
@@ -135,9 +141,11 @@ def main():
     bridge = AgentEventBridge(ctx.ui_bus)
     ctx.agent.add_event_handler(bridge.on_agent_event)
 
-    # Check for API key
-    if not ctx.config.api_key:
-        ctx.ui_bus.error("No API key found in config.yaml.")
+    if not getattr(ctx.agent.llm, "model", "") or not getattr(ctx.agent.llm, "api_key", ""):
+        ctx.ui_bus.error(
+            "No model provider/profile is configured. "
+            "Configure providers.items and models.profiles."
+        )
         renderer.close()
         sys.exit(1)
 

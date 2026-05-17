@@ -3,7 +3,7 @@ from reuleauxcoder.extensions.lsp.config import LspConfig
 
 
 def test_lsp_config_defaults_when_section_missing() -> None:
-    config = Config(api_key="key")
+    config = Config()
 
     lsp = LspConfig.from_config(config)
 

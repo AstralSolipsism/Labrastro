@@ -38,7 +38,12 @@ from labrastro_server.services.agent_runtime.control_plane import AgentRunContro
 from labrastro_server.services.auth.service import AuthService, validate_auth_config
 from labrastro_server.services.sandbox import DockerSandboxProvider, SandboxProfile
 from reuleauxcoder.services.llm.client import LLM
-from reuleauxcoder.services.llm.factory import build_llm_from_settings
+from reuleauxcoder.services.llm.factory import (
+    build_llm_from_settings,
+    llm_raw_chunks_enabled,
+    llm_trace_enabled,
+    resolve_model_runtime,
+)
 
 
 def _default_load_config(path: Path | None) -> Config:
@@ -47,9 +52,9 @@ def _default_load_config(path: Path | None) -> Config:
 
 def _default_create_llm(config: Config) -> LLM:
     return build_llm_from_settings(
-        config,
-        debug_trace=getattr(config, "llm_debug_trace", False),
-        debug_raw_chunks=getattr(config, "llm_debug_raw_chunks", False),
+        resolve_model_runtime(config),
+        debug_trace=llm_trace_enabled(config),
+        debug_raw_chunks=llm_raw_chunks_enabled(config),
     )
 
 
@@ -62,7 +67,7 @@ def _default_load_tools(tool_backend: ToolBackend) -> list[Any]:
 
 
 def _default_create_agent(llm: LLM, tools: list[Any], config: Config) -> Agent:
-    context_tokens = int(getattr(config, "max_context_tokens", 0) or 0)
+    context_tokens = int(resolve_model_runtime(config).max_context_tokens or 0)
     return Agent(
         llm=llm,
         tools=tools,

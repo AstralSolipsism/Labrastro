@@ -136,7 +136,12 @@ class AppRunner:
     ) -> tuple[Config, UIEventBus, LLM, Agent]:
         """Build config + ui bus + llm + agent, with runtime hooks initialized."""
         if self.options.model:
-            config.model = self.options.model
+            profiles = getattr(config, "model_profiles", {}) or {}
+            if self.options.model not in profiles:
+                raise ConfigValidationError(
+                    [f"model profile '{self.options.model}' does not exist"]
+                )
+            config.active_main_model_profile = self.options.model
 
         llm = self.dependencies.create_llm(config)
         llm.ui_bus = ui_bus

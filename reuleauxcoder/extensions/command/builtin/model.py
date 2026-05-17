@@ -24,7 +24,10 @@ from reuleauxcoder.infrastructure.persistence.workspace_config_store import (
 from reuleauxcoder.interfaces.cli.views.common import render_markdown_panel
 from reuleauxcoder.interfaces.events import UIEventKind
 from reuleauxcoder.interfaces.view_registration import register_view
-from reuleauxcoder.services.llm.factory import reconfigure_llm_from_settings
+from reuleauxcoder.services.llm.factory import (
+    llm_trace_enabled,
+    reconfigure_llm_from_settings,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +182,7 @@ def _resolve_profile(ctx, profile_name: str):
 
 def _apply_main_profile_to_runtime(ctx, profile_name: str, profile) -> None:
     debug_trace = getattr(
-        ctx.agent.llm, "debug_trace", getattr(ctx.config, "llm_debug_trace", False)
+        ctx.agent.llm, "debug_trace", llm_trace_enabled(ctx.config)
     )
     reconfigure_llm_from_settings(
         ctx.agent.llm,
@@ -252,13 +255,6 @@ def _handle_set_main_model(command, ctx) -> CommandResult:
         return CommandResult(action="continue")
 
     ctx.config.active_main_model_profile = profile_name
-    ctx.config.model = profile.model
-    provider = _profile_provider(ctx.config, profile)
-    ctx.config.api_key = provider.api_key if provider else ""
-    ctx.config.base_url = provider.base_url if provider else None
-    ctx.config.temperature = profile.temperature
-    ctx.config.max_tokens = profile.max_tokens
-    ctx.config.max_context_tokens = profile.max_context_tokens
     path = WorkspaceConfigStore().save_active_main_model_profile(profile_name)
 
     _apply_main_profile_to_runtime(ctx, profile_name, profile)
@@ -330,7 +326,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
     if active_main:
         lines.append(f"- main agent: `{active_main}`")
     else:
-        lines.append(f"- main agent: runtime `{runtime_model or config.model or 'unconfigured'}`")
+        lines.append(f"- main agent: runtime `{runtime_model or 'unconfigured'}`")
 
     if active_sub:
         lines.append(f"- delegated run default: `{active_sub}`")
@@ -356,7 +352,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
         )
         lines.append("")
         lines.append("**Current runtime config**")
-        lines.append(f"- model: `{runtime_model or config.model or 'unconfigured'}`")
+        lines.append(f"- model: `{runtime_model or 'unconfigured'}`")
     else:
         lines.append("## Profiles")
         lines.append("")
@@ -423,7 +419,7 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
         "active_profile": active_main,
         "active_main_profile": active_main,
         "active_sub_profile": active_sub,
-        "current_model": runtime_model or config.model,
+        "current_model": runtime_model,
         "markdown": "\n".join(lines),
         "profiles": profile_items,
     }

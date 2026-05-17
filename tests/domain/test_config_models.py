@@ -165,22 +165,21 @@ def test_model_profile_config_reads_provider_reference() -> None:
     assert profile.max_context_tokens == 200000
 
 
-def test_model_profile_config_rejects_profile_credentials() -> None:
-    try:
-        ModelProfileConfig.from_dict(
-            "main",
-            {
-                "model": "claude",
-                "provider": "anthropic-main",
-                "api_key": "sk-old",
-                "base_url": "https://api.example.test/v1",
-            },
-        )
-    except ValueError as exc:
-        assert "api_key" in str(exc)
-        assert "base_url" in str(exc)
-    else:  # pragma: no cover - assertion clarity
-        raise AssertionError("expected removed profile credentials to be rejected")
+def test_model_profile_config_only_materializes_current_fields() -> None:
+    profile = ModelProfileConfig.from_dict(
+        "main",
+        {
+            "model": "claude",
+            "provider": "anthropic-main",
+            "api_key": "sk-old",
+            "base_url": "https://api.example.test/v1",
+        },
+    )
+
+    assert profile.model == "claude"
+    assert profile.provider == "anthropic-main"
+    assert not hasattr(profile, "api_key")
+    assert not hasattr(profile, "base_url")
 
 
 def test_provider_config_roundtrip() -> None:
@@ -230,9 +229,6 @@ def test_mode_config_from_dict_normalizes_invalid_fields() -> None:
 
 def test_config_validate_collects_multiple_errors() -> None:
     config = Config(
-        max_tokens=-1,
-        max_context_tokens=-1,
-        temperature=3.0,
         tool_output_max_chars=0,
         tool_output_max_lines=0,
         active_main_model_profile="missing-main",
@@ -256,18 +252,15 @@ def test_config_validate_collects_multiple_errors() -> None:
 
     errors = config.validate()
 
-    assert "max_tokens must be positive" in errors
-    assert "max_context_tokens must be positive" in errors
-    assert "temperature must be between 0 and 2" in errors
     assert "tool_output_max_chars must be positive" in errors
     assert "tool_output_max_lines must be positive" in errors
     assert "active_main_model_profile must exist in model_profiles" in errors
     assert "active_sub_model_profile must exist in model_profiles" in errors
     assert "active_mode must exist in modes" in errors
-    assert "model_profiles[bad].provider is required" in errors
-    assert "model_profiles[bad].max_tokens must be positive" in errors
-    assert "model_profiles[bad].max_context_tokens must be positive" in errors
-    assert "model_profiles[bad].temperature must be between 0 and 2" in errors
+    assert "models.profiles.bad.provider is required" in errors
+    assert "models.profiles.bad.max_tokens must be positive" in errors
+    assert "models.profiles.bad.max_context_tokens must be positive" in errors
+    assert "models.profiles.bad.temperature must be between 0 and 2" in errors
     assert (
         "approval.default_mode must be one of allow, warn, require_approval, deny"
         in errors
@@ -320,7 +313,7 @@ def test_config_validate_rejects_missing_profile_provider_reference() -> None:
 
     errors = config.validate()
 
-    assert "model_profiles[main].provider must exist in providers.items" in errors
+    assert "models.profiles.main.provider references unknown provider" in errors
 
 
 def test_config_validate_accepts_agent_default_model_provider_reference() -> None:
@@ -412,9 +405,17 @@ def test_config_validate_allows_unconfigured_llm_outside_remote_host() -> None:
     assert "sandbox_provider.idle_ttl_seconds must be positive" in errors
 
 
-def test_config_supports_llm_debug_trace_flag() -> None:
-    config = Config(llm_debug_trace=True)
-    assert config.llm_debug_trace is True
+def test_config_has_no_flat_llm_runtime_fields() -> None:
+    config = Config()
+    for field in (
+        "model",
+        "api_key",
+        "base_url",
+        "max_tokens",
+        "max_context_tokens",
+        "temperature",
+    ):
+        assert not hasattr(config, field)
 
 
 def test_remote_exec_config_defaults() -> None:

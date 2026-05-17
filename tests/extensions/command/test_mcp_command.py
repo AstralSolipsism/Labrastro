@@ -18,7 +18,7 @@ class FakeTool:
 
 
 def _build_ctx(backend: str) -> SimpleNamespace:
-    config = Config(api_key="key", approval=ApprovalConfig())
+    config = Config(approval=ApprovalConfig())
     agent = SimpleNamespace(tools=[FakeTool(backend)])
     ui_bus = UIEventBus()
     return SimpleNamespace(config=config, agent=agent, ui_bus=ui_bus)

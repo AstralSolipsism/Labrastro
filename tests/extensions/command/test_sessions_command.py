@@ -66,7 +66,7 @@ class FakeAgent:
 
 
 def _build_ctx(tmp_path: Path, *, fingerprint: str = "local") -> SimpleNamespace:
-    config = Config(api_key="key", approval=ApprovalConfig(), session_dir=str(tmp_path))
+    config = Config(approval=ApprovalConfig(), session_dir=str(tmp_path))
     agent = FakeAgent()
     setattr(agent, "session_fingerprint", fingerprint)
     ui_bus = UIEventBus()

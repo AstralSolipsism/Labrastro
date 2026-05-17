@@ -245,10 +245,6 @@ class ProviderConfig:
 
     @classmethod
     def from_dict(cls, provider_id: str, d: dict[str, Any]) -> "ProviderConfig":
-        if "capabilities" in d:
-            raise ValueError(
-                "provider config field capabilities was removed; use api_features"
-            )
         raw_type = str(d.get("type", "openai_chat")).strip().lower()
         provider_type: ProviderType
         if raw_type in {"anthropic_messages", "openai_responses"}:
@@ -536,13 +532,6 @@ class ModelProfileConfig:
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "ModelProfileConfig":
         """Create from dictionary format."""
-        removed_fields = [field for field in ("api_key", "base_url") if field in d]
-        if removed_fields:
-            raise ValueError(
-                "model profile fields "
-                + ", ".join(removed_fields)
-                + " were removed; configure credentials and endpoints under providers.items"
-            )
         return cls(
             name=name,
             model=str(d.get("model", "") or ""),
@@ -1373,18 +1362,6 @@ def _string_dict_list_config_value(value: Any) -> list[dict[str, str]]:
 class Config:
     """Main configuration model for ReuleauxCoder."""
 
-    model: str = ""
-    api_key: str = ""
-    base_url: Optional[str] = None
-    max_tokens: int = 0
-    temperature: float = 0.0
-    max_context_tokens: int = 0
-    preserve_reasoning_content: bool = True
-    backfill_reasoning_content_for_tool_calls: bool = False
-    reasoning_effort: Optional[str] = None
-    thinking_enabled: Optional[bool] = None
-    reasoning_replay_mode: Optional[str] = None
-    reasoning_replay_placeholder: Optional[str] = None
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     mcp_artifact_root: str = ".rcoder/mcp-artifacts"
     model_profiles: dict[str, ModelProfileConfig] = field(default_factory=dict)
@@ -1408,9 +1385,7 @@ class Config:
 
     # CLI settings
     history_file: Optional[str] = None
-    llm_debug_trace: bool = False
-    llm_debug_trace_authoritative: bool = False
-    llm_debug_raw_chunks: bool = False
+    llm_trace_authoritative: bool = False
 
     # Approval settings
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
@@ -1462,12 +1437,20 @@ class Config:
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = []
-        if self.max_tokens < 0:
-            errors.append("max_tokens must be positive")
-        if self.max_context_tokens < 0:
-            errors.append("max_context_tokens must be positive")
-        if self.temperature < 0 or self.temperature > 2:
-            errors.append("temperature must be between 0 and 2")
+        for name, profile in self.model_profiles.items():
+            prefix = f"models.profiles.{name}"
+            if not profile.provider:
+                errors.append(f"{prefix}.provider is required")
+            elif profile.provider not in self.providers.items:
+                errors.append(f"{prefix}.provider references unknown provider")
+            if not profile.model:
+                errors.append(f"{prefix}.model is required")
+            if profile.max_tokens < 1:
+                errors.append(f"{prefix}.max_tokens must be positive")
+            if profile.max_context_tokens < 1:
+                errors.append(f"{prefix}.max_context_tokens must be positive")
+            if profile.temperature < 0 or profile.temperature > 2:
+                errors.append(f"{prefix}.temperature must be between 0 and 2")
         if self.tool_output_max_chars < 1:
             errors.append("tool_output_max_chars must be positive")
         if self.tool_output_max_lines < 1:

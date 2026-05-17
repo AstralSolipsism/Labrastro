@@ -664,7 +664,7 @@ class TestRemoteRelayHTTPService:
 
         assert result.ok is False
         assert result.status == 400
-        assert result.payload["error"] == "deprecated_model_profile_field"
+        assert result.payload["error"] == "unknown_model_profile_field"
         assert result.payload["fields"] == ["api_key", "base_url"]
 
     def test_admin_record_model_profile_requires_capability_or_explicit_limits(

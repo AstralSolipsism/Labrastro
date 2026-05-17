@@ -251,7 +251,7 @@ def _handle_save_session(command, ctx) -> CommandResult:
     fingerprint = get_session_fingerprint(ctx.config, ctx.agent)
     session_id = store.save(
         ctx.agent.messages,
-        getattr(ctx.agent.llm, "model", ctx.config.model),
+        getattr(ctx.agent.llm, "model", ""),
         command.current_session_id,
         total_prompt_tokens=ctx.agent.state.total_prompt_tokens,
         total_completion_tokens=ctx.agent.state.total_completion_tokens,
@@ -286,7 +286,7 @@ def _handle_new_session(command, ctx) -> CommandResult:
     if getattr(ctx.config, "session_auto_save", True) and ctx.agent.messages:
         sid = store.save(
             ctx.agent.messages,
-            getattr(ctx.agent.llm, "model", ctx.config.model),
+            getattr(ctx.agent.llm, "model", ""),
             previous_session_id,
             total_prompt_tokens=ctx.agent.state.total_prompt_tokens,
             total_completion_tokens=ctx.agent.state.total_completion_tokens,

@@ -156,7 +156,7 @@ def _handle_exit(command, ctx) -> CommandResult:
     if getattr(ctx.config, "session_auto_save", True) and ctx.agent.messages:
         sid = create_configured_session_store(ctx.config, ctx.sessions_dir).save(
             ctx.agent.messages,
-            getattr(ctx.agent.llm, "model", ctx.config.model),
+            getattr(ctx.agent.llm, "model", ""),
             command.current_session_id,
             is_exit=True,
             total_prompt_tokens=ctx.agent.state.total_prompt_tokens,
