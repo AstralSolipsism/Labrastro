@@ -376,6 +376,9 @@ class RemoteChatRoutes:
         if control is None:
             return
         _control_peer_id, session = control
+        if session.done or not session.running:
+            self._send_error(HTTPStatus.CONFLICT, "chat_not_running")
+            return
         try:
             ticket = session.submit_follow_up(
                 req.text,
@@ -406,6 +409,9 @@ class RemoteChatRoutes:
         if control is None:
             return
         _control_peer_id, session = control
+        if not req.followup_id:
+            self._send_error(HTTPStatus.BAD_REQUEST, "missing_followup_id")
+            return
         ok = session.cancel_follow_up(req.followup_id, req.reason)
         if not ok:
             self._send_error(HTTPStatus.NOT_FOUND, "follow_up_not_found")
