@@ -7,6 +7,10 @@ from reuleauxcoder.domain.session.models import SessionRuntimeState
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 
 
+def _record_turn(store: SessionStore, session_id: str, text: str) -> None:
+    store.append_trace_event(session_id, "chat_start", {"prompt": text})
+
+
 def test_session_store_save_and_load_roundtrip(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     messages = [{"role": "user", "content": "hello world"}]
@@ -106,11 +110,13 @@ def test_session_store_list_filters_by_fingerprint(tmp_path: Path) -> None:
     local_id = store.save(
         messages=[{"role": "user", "content": "first"}], model="m1", fingerprint="local"
     )
+    _record_turn(store, local_id, "first")
     remote_id = store.save(
         messages=[{"role": "user", "content": "second"}],
         model="m2",
         fingerprint="remote:abc",
     )
+    _record_turn(store, remote_id, "second")
     (tmp_path / "broken.json").write_text("{not-json}", encoding="utf-8")
 
     local_sessions = store.list(limit=10, fingerprint="local")
@@ -135,7 +141,7 @@ def test_session_store_does_not_persist_empty_sessions(tmp_path: Path) -> None:
     assert store.get_latest(fingerprint="local") is None
 
 
-def test_session_store_list_skips_legacy_empty_sessions(tmp_path: Path) -> None:
+def test_session_store_list_skips_documentless_sessions(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     legacy_id = "session_legacy_empty"
     (tmp_path / f"{legacy_id}.json").write_text(
@@ -158,6 +164,7 @@ def test_session_store_list_skips_legacy_empty_sessions(tmp_path: Path) -> None:
         model="m1",
         fingerprint="local",
     )
+    _record_turn(store, content_id, "hello")
 
     listed = store.list(limit=10, fingerprint="local")
 
@@ -175,11 +182,13 @@ def test_session_store_get_latest_prefers_recently_updated_session(
     first_id = store.save(
         messages=[{"role": "user", "content": "first"}], model="m1", fingerprint="local"
     )
+    _record_turn(store, first_id, "first")
     second_id = store.save(
         messages=[{"role": "user", "content": "second"}],
         model="m2",
         fingerprint="local",
     )
+    _record_turn(store, second_id, "second")
 
     # Update the older session after the newer one was created.
     store.save(
@@ -188,6 +197,7 @@ def test_session_store_get_latest_prefers_recently_updated_session(
         session_id=first_id,
         fingerprint="local",
     )
+    _record_turn(store, first_id, "first-updated")
 
     latest = store.get_latest(fingerprint="local")
     assert latest is not None
@@ -217,19 +227,17 @@ def test_session_store_delete_removes_session_file(tmp_path: Path) -> None:
     assert store.delete(session_id) is False
 
 
-def test_session_store_snapshot_roundtrip(tmp_path: Path) -> None:
+def test_session_store_document_roundtrip(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     session_id = store.save(messages=[{"role": "user", "content": "hi"}], model="m1")
-    snapshot = {"turns": [{"id": "t1"}], "traceNodes": [{"id": "n1"}]}
+    document = {"turns": [{"id": "t1"}], "traceNodes": [{"id": "n1"}], "last_event_seq": 7}
 
-    store.save_snapshot(session_id, snapshot, event_seq=7)
-    loaded, error, event_seq = store.load_snapshot_record(session_id)
+    store.save_document(session_id, document)
+    loaded = store.load_document(session_id)
 
-    assert error is None
-    assert loaded == {**snapshot, "eventSeq": 7}
-    assert event_seq == 7
-    assert store.delete_snapshot(session_id) is True
-    assert store.load_snapshot(session_id) == (None, None)
+    assert loaded == document
+    assert store.delete_document(session_id) is True
+    assert store.load_document(session_id) is None
 
 
 def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
@@ -275,6 +283,7 @@ def test_session_store_concurrent_save_keeps_sessions_readable(tmp_path: Path) -
     session_id = store.save(
         messages=[{"role": "user", "content": "seed"}], model="m1", fingerprint="local"
     )
+    _record_turn(store, session_id, "seed")
 
     def update_existing(index: int) -> None:
         store.save(
@@ -283,13 +292,15 @@ def test_session_store_concurrent_save_keeps_sessions_readable(tmp_path: Path) -
             session_id=session_id,
             fingerprint="local",
         )
+        _record_turn(store, session_id, f"existing-{index}")
 
     def create_new(index: int) -> None:
-        store.save(
+        new_id = store.save(
             messages=[{"role": "user", "content": f"new-{index}"}],
             model="m2",
             fingerprint="remote:abc",
         )
+        _record_turn(store, new_id, f"new-{index}")
 
     threads = [
         threading.Thread(target=update_existing, args=(i,)) for i in range(4)

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 
@@ -33,7 +33,7 @@ def _engine():
     return create_postgres_engine(database_url)
 
 
-def test_postgres_session_store_save_load_snapshot_delete() -> None:
+def test_postgres_session_store_save_load_document_delete() -> None:
     store = _store()
     session_id = store.save(
         messages=[{"role": "user", "content": "postgres-session"}],
@@ -45,62 +45,29 @@ def test_postgres_session_store_save_load_snapshot_delete() -> None:
     assert loaded is not None
     assert loaded.messages[0]["content"] == "postgres-session"
 
-    store.save_snapshot(
+    store.save_document(
         session_id,
-        {"turns": [{"id": "t1"}], "traceNodes": [{"id": "n1"}], "traceEdges": []},
+        {
+            "session": {"id": session_id, "title": "Document"},
+            "stats": {"taskText": "Document"},
+            "turns": [{"id": "t1"}],
+            "last_event_seq": 7,
+        },
     )
-    snapshot, error = store.load_snapshot(session_id)
-    assert error is None
-    assert snapshot is not None
-    assert snapshot["turns"][0]["id"] == "t1"
+    document = store.load_document(session_id)
+    assert document is not None
+    assert document["turns"][0]["id"] == "t1"
 
     listed = store.list(limit=10, fingerprint="pg-test")
     assert any(item.id == session_id for item in listed)
     assert store.delete(session_id) is True
     assert store.load(session_id) is None
+    assert store.load_document(session_id) is None
 
 
-def test_postgres_session_store_compresses_large_snapshot() -> None:
+def test_postgres_session_store_trace_events_reduce_to_document_and_compress_payload() -> None:
     engine = _engine()
-    store = PostgresSessionStore(engine, snapshot_compress_threshold_bytes=64)
-    session_id = store.save(
-        messages=[{"role": "user", "content": "compressed-snapshot"}],
-        model="m1",
-        fingerprint="pg-test",
-    )
-    snapshot = {"turns": [{"id": "t1", "content": "x" * 512}]}
-
-    try:
-        store.save_snapshot(session_id, snapshot)
-
-        loaded, error = store.load_snapshot(session_id)
-        assert error is None
-        assert loaded == snapshot
-
-        with engine.begin() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    SELECT snapshot, snapshot_blob, snapshot_encoding, snapshot_bytes
-                    FROM labrastro_session_snapshots
-                    WHERE session_id=:session_id
-                    ORDER BY version DESC
-                    LIMIT 1
-                    """
-                ),
-                {"session_id": session_id},
-            ).mappings().one()
-        assert row["snapshot"] is None
-        assert row["snapshot_blob"] is not None
-        assert row["snapshot_encoding"] == "json+gzip"
-        assert row["snapshot_bytes"] > 64
-    finally:
-        store.delete(session_id)
-
-
-def test_postgres_session_store_trace_events_roundtrip_and_compression() -> None:
-    engine = _engine()
-    store = PostgresSessionStore(engine, snapshot_compress_threshold_bytes=64)
+    store = PostgresSessionStore(engine, payload_compress_threshold_bytes=64)
     session_id = store.save(
         messages=[{"role": "user", "content": "trace-event"}],
         model="m1",
@@ -110,31 +77,37 @@ def test_postgres_session_store_trace_events_roundtrip_and_compression() -> None
     try:
         first = store.append_trace_event(
             session_id,
-            "context_event",
-            {"phase": "before"},
+            "chat_start",
+            {"prompt": "hello"},
             chat_id="chat-1",
-            chat_seq=5,
+            chat_seq=1,
         )
         second = store.append_trace_event(
             session_id,
             "tool_call_end",
-            {"tool_result": "x" * 512},
+            {
+                "tool_name": "write_file",
+                "tool_call_id": "tool-1",
+                "tool_result": "x" * 512,
+            },
             chat_id="chat-1",
-            chat_seq=6,
+            chat_seq=2,
         )
 
         assert (first, second) == (1, 2)
         assert store.latest_trace_event_seq(session_id) == 2
         events = store.list_trace_events(session_id, after_seq=1)
         assert events[0]["session_event_seq"] == 2
-        assert events[0]["chat_seq"] == 6
+        assert events[0]["chat_seq"] == 2
         assert events[0]["payload"]["tool_result"] == "x" * 512
 
-        store.save_snapshot(session_id, {"turns": []}, event_seq=2)
-        snapshot, error, event_seq = store.load_snapshot_record(session_id)
-        assert error is None
-        assert snapshot is not None
-        assert event_seq == 2
+        document = store.load_document(session_id)
+        assert document is not None
+        assert document["last_event_seq"] == 2
+        assert document["turns"][0]["userMessage"]["text"] == "hello"
+        tool_parts = document["turns"][0]["assistantMessages"][0]["parts"]
+        assert tool_parts[0]["type"] == "tool"
+        assert tool_parts[0]["toolOutput"] == "x" * 512
 
         with engine.begin() as conn:
             row = conn.execute(
@@ -154,7 +127,7 @@ def test_postgres_session_store_trace_events_roundtrip_and_compression() -> None
         store.delete(session_id)
 
 
-def test_persistence_maintenance_trims_snapshot_versions_and_retention() -> None:
+def test_persistence_maintenance_does_not_touch_session_documents() -> None:
     engine = _engine()
     store = PostgresSessionStore(engine)
     session_id = store.save(
@@ -164,64 +137,17 @@ def test_persistence_maintenance_trims_snapshot_versions_and_retention() -> None
     )
 
     try:
-        for idx in range(5):
-            store.save_snapshot(session_id, {"turns": [{"id": f"t{idx}"}]})
-
-        maintenance = PersistenceMaintenanceService(
+        store.save_document(
+            session_id,
+            {"turns": [{"id": "t1"}], "last_event_seq": 1},
+        )
+        result = PersistenceMaintenanceService(
             engine,
             retention_days=0,
-            snapshot_max_versions_per_session=2,
             interval_sec=3600,
-        )
-        result = maintenance.run_once()
-        assert result.snapshot_versions_deleted >= 3
+        ).run_once()
 
-        with engine.begin() as conn:
-            versions = conn.execute(
-                text(
-                    """
-                    SELECT version
-                    FROM labrastro_session_snapshots
-                    WHERE session_id=:session_id
-                    ORDER BY version
-                    """
-                ),
-                {"session_id": session_id},
-            ).scalars().all()
-            conn.execute(
-                text(
-                    """
-                    UPDATE labrastro_session_snapshots
-                    SET created_at = now() - interval '10 day'
-                    WHERE session_id=:session_id
-                    """
-                ),
-                {"session_id": session_id},
-            )
-        assert versions == [4, 5]
-
-        retention = PersistenceMaintenanceService(
-            engine,
-            retention_days=1,
-            snapshot_max_versions_per_session=20,
-            interval_sec=3600,
-        )
-        result = retention.run_once()
-        assert result.snapshot_retention_deleted == 1
-
-        with engine.begin() as conn:
-            remaining = conn.execute(
-                text(
-                    """
-                    SELECT version
-                    FROM labrastro_session_snapshots
-                    WHERE session_id=:session_id
-                    ORDER BY version
-                    """
-                ),
-                {"session_id": session_id},
-            ).scalars().all()
-        assert remaining == [5]
+        assert result.agent_run_events_deleted == 0
+        assert store.load_document(session_id) is not None
     finally:
         store.delete(session_id)
-

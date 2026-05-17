@@ -163,8 +163,8 @@ def create_session_store(config: Config, sessions_dir: Path | None) -> Any:
         return SessionStore(sessions_dir)
     return PostgresSessionStore(
         engine,
-        snapshot_compress_threshold_bytes=(
-            config.persistence.snapshot_compress_threshold_bytes
+        payload_compress_threshold_bytes=(
+            config.persistence.event_payload_compress_threshold_bytes
         ),
     )
 
@@ -178,9 +178,6 @@ def create_persistence_maintenance_service(
     return PersistenceMaintenanceService(
         engine,
         retention_days=config.persistence.retention_days,
-        snapshot_max_versions_per_session=(
-            config.persistence.snapshot_max_versions_per_session
-        ),
         interval_sec=config.persistence.maintenance_interval_sec,
     )
 

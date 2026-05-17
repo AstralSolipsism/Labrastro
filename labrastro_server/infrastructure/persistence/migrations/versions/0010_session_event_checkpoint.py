@@ -11,12 +11,6 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        ALTER TABLE labrastro_session_snapshots
-            ADD COLUMN IF NOT EXISTS event_seq BIGINT NOT NULL DEFAULT 0
-        """
-    )
-    op.execute(
-        """
         ALTER TABLE labrastro_session_trace_events
             ALTER COLUMN payload DROP NOT NULL
         """
@@ -140,11 +134,5 @@ def downgrade() -> None:
         """
         ALTER TABLE labrastro_session_trace_events
             DROP COLUMN IF EXISTS chat_id
-        """
-    )
-    op.execute(
-        """
-        ALTER TABLE labrastro_session_snapshots
-            DROP COLUMN IF EXISTS event_seq
         """
     )

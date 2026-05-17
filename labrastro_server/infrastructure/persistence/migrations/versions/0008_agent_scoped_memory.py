@@ -5,7 +5,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0008_agent_scoped_memory"
-down_revision = "0007_snapshot_retention_and_compression"
+down_revision = "0007_agent_run_event_retention_index"
 branch_labels = None
 depends_on = None
 

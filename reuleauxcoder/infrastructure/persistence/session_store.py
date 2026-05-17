@@ -17,6 +17,12 @@ from reuleauxcoder.domain.session.models import (
     SessionMetadata,
     SessionRuntimeState,
 )
+from reuleauxcoder.domain.session.document import (
+    apply_session_event,
+    empty_session_document,
+    session_metadata_from_document,
+    update_session_document_metadata,
+)
 from reuleauxcoder.infrastructure.fs.paths import get_sessions_dir
 
 DEFAULT_SESSION_FINGERPRINT = "local"
@@ -103,6 +109,7 @@ class SessionStore:
                 json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._save_document_metadata(session)
             return session_id
 
     def save_runtime_state(
@@ -143,6 +150,7 @@ class SessionStore:
                 json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._save_document_metadata(session)
             return session_id
 
     def append_system_message(
@@ -217,50 +225,31 @@ class SessionStore:
             if not path.exists():
                 return False
             path.unlink()
-            self.delete_snapshot(session_id)
+            self.delete_document(session_id)
             self.delete_trace_events(session_id)
             return True
 
-    def load_snapshot(self, session_id: str) -> tuple[dict | None, str | None]:
-        """Load the latest UI snapshot sidecar for a session."""
-        snapshot, error, _event_seq = self.load_snapshot_record(session_id)
-        return snapshot, error
-
-    def load_snapshot_record(
-        self, session_id: str
-    ) -> tuple[dict | None, str | None, int]:
-        """Load the latest UI snapshot sidecar plus its covered event seq."""
-        path = self._get_snapshot_path(session_id)
+    def load_document(self, session_id: str) -> dict | None:
+        path = self._get_document_path(session_id)
         if not path.exists():
-            return None, None, 0
+            return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return None, str(exc), 0
-        if not isinstance(data, dict):
-            return None, "snapshot_not_object", 0
-        return data, None, self._snapshot_event_seq(data)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
 
-    def save_snapshot(
-        self, session_id: str, snapshot: dict, event_seq: int | None = None
-    ) -> None:
-        """Save a UI snapshot sidecar for a session."""
-        if event_seq is None:
-            event_seq = self._snapshot_event_seq(snapshot) or self.latest_trace_event_seq(
-                session_id
-            )
-        snapshot = dict(snapshot)
-        if event_seq:
-            snapshot["eventSeq"] = int(event_seq)
-        path = self._get_snapshot_path(session_id)
+    def save_document(self, session_id: str, document: dict) -> None:
+        if not isinstance(document, dict):
+            document = empty_session_document(session_id)
+        path = self._get_document_path(session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def delete_snapshot(self, session_id: str) -> bool:
-        """Delete a UI snapshot sidecar if it exists."""
-        path = self._get_snapshot_path(session_id)
+    def delete_document(self, session_id: str) -> bool:
+        path = self._get_document_path(session_id)
         if not path.exists():
             return False
         path.unlink()
@@ -296,6 +285,17 @@ class SessionStore:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
                 handle.write("\n")
+            document = self.load_document(session_id) or empty_session_document(session_id)
+            document = apply_session_event(
+                document,
+                session_id=session_id,
+                event_type=str(event_type),
+                payload=payload if isinstance(payload, dict) else {},
+                session_event_seq=seq,
+                chat_id=chat_id,
+                chat_seq=chat_seq,
+            )
+            self.save_document(session_id, document)
             return seq
 
     def list_trace_events(
@@ -367,15 +367,28 @@ class SessionStore:
                     session = Session.from_dict(data)
                     if fingerprint is not None and session.fingerprint != fingerprint:
                         continue
-                    if not self.has_history_content(session.messages):
+                    document = self.load_document(session.id or file_path.stem)
+                    if not isinstance(document, dict):
+                        continue
+                    if not isinstance(document.get("turns"), list) or not document.get("turns"):
                         continue
 
+                    metadata_payload = session_metadata_from_document(
+                        document,
+                        {
+                            "id": session.id or file_path.stem,
+                            "model": session.model,
+                            "saved_at": session.saved_at,
+                            "preview": session.get_preview(),
+                            "fingerprint": session.fingerprint,
+                        },
+                    )
                     metadata = SessionMetadata(
-                        id=session.id or file_path.stem,
-                        model=session.model,
-                        saved_at=session.saved_at,
-                        preview=session.get_preview(),
-                        fingerprint=session.fingerprint,
+                        id=str(metadata_payload["id"]),
+                        model=str(metadata_payload["model"]),
+                        saved_at=str(metadata_payload["saved_at"]),
+                        preview=str(metadata_payload["preview"]),
+                        fingerprint=str(metadata_payload["fingerprint"]),
                     )
 
                     stat = file_path.stat()
@@ -455,9 +468,25 @@ class SessionStore:
         path = self._get_session_path(session_id)
         return path.with_name(f"{path.stem}.ui.json")
 
+    def _get_document_path(self, session_id: str) -> Path:
+        path = self._get_session_path(session_id)
+        return path.with_name(f"{path.stem}.document.json")
+
     def _get_trace_events_path(self, session_id: str) -> Path:
         path = self._get_session_path(session_id)
         return path.with_name(f"{path.stem}.events.jsonl")
+
+    def _save_document_metadata(self, session: Session) -> None:
+        document = update_session_document_metadata(
+            self.load_document(session.id),
+            session_id=session.id,
+            model=session.model,
+            saved_at=session.saved_at,
+            preview=session.get_preview(),
+            fingerprint=session.fingerprint,
+            runtime_state=session.runtime_state.to_dict(),
+        )
+        self.save_document(session.id, document)
 
     @staticmethod
     def _snapshot_event_seq(snapshot: dict) -> int:

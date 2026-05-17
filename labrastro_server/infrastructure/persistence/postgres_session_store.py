@@ -1,4 +1,4 @@
-"""Postgres-backed conversation session and UI snapshot store."""
+"""Postgres-backed conversation session and document store."""
 
 from __future__ import annotations
 
@@ -14,6 +14,12 @@ from reuleauxcoder.domain.session.models import (
     Session,
     SessionMetadata,
     SessionRuntimeState,
+)
+from reuleauxcoder.domain.session.document import (
+    apply_session_event,
+    empty_session_document,
+    session_metadata_from_document,
+    update_session_document_metadata,
 )
 from reuleauxcoder.infrastructure.persistence.session_store import (
     DEFAULT_SESSION_FINGERPRINT,
@@ -66,12 +72,12 @@ class PostgresSessionStore:
         self,
         engine: Any,
         *,
-        snapshot_compress_threshold_bytes: int = 262144,
+        payload_compress_threshold_bytes: int = 262144,
     ) -> None:
         _require_sqlalchemy()
         self.engine = engine
-        self.snapshot_compress_threshold_bytes = max(
-            1, int(snapshot_compress_threshold_bytes or 1)
+        self.payload_compress_threshold_bytes = max(
+            1, int(payload_compress_threshold_bytes or 1)
         )
 
     @staticmethod
@@ -165,6 +171,7 @@ class PostgresSessionStore:
                     "total_completion_tokens": session.total_completion_tokens,
                 },
             )
+            self._upsert_document_metadata(conn, session)
         return session_id
 
     def save_runtime_state(
@@ -241,6 +248,7 @@ class PostgresSessionStore:
                     "has_history_content": has_history,
                 },
             )
+            self._upsert_document_metadata(conn, session)
         return session_id
 
     def append_system_message(
@@ -304,7 +312,7 @@ class PostgresSessionStore:
                 ),
                 {"id": session_id},
             )
-            self.delete_snapshot(session_id)
+            self._delete_document(conn, session_id)
             self.delete_trace_events(session_id)
             return int(result.rowcount or 0) > 0
 
@@ -315,35 +323,51 @@ class PostgresSessionStore:
         fingerprint: str | None = DEFAULT_SESSION_FINGERPRINT,
     ) -> list[SessionMetadata]:
         params: dict[str, Any] = {"limit": max(1, min(100, int(limit or 20)))}
-        clauses = ["deleted_at IS NULL", "has_history_content = TRUE"]
+        clauses = ["sessions.deleted_at IS NULL"]
         if fingerprint is not None:
-            clauses.append("fingerprint=:fingerprint")
+            clauses.append("sessions.fingerprint=:fingerprint")
             params["fingerprint"] = fingerprint
         with self.engine.begin() as conn:
             rows = conn.execute(
                 text(
                     f"""
-                    SELECT id, model, saved_at, preview, fingerprint
-                    FROM labrastro_sessions
+                    SELECT sessions.id, sessions.model, sessions.saved_at,
+                           sessions.preview, sessions.fingerprint,
+                           documents.document
+                    FROM labrastro_sessions sessions
+                    JOIN labrastro_session_documents documents
+                      ON documents.session_id = sessions.id
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY saved_at DESC, updated_at DESC
+                      AND jsonb_array_length(COALESCE(documents.document->'turns', '[]'::jsonb)) > 0
+                    ORDER BY documents.updated_at DESC, sessions.saved_at DESC
                     LIMIT :limit
                     """
                 ),
                 params,
             ).mappings().all()
-        return [
-            SessionMetadata(
-                id=str(row["id"]),
-                model=str(row["model"]),
-                saved_at=row["saved_at"].isoformat()
+        sessions: list[SessionMetadata] = []
+        for row in rows:
+            fallback = {
+                "id": str(row["id"]),
+                "model": str(row["model"]),
+                "saved_at": row["saved_at"].isoformat()
                 if hasattr(row["saved_at"], "isoformat")
                 else str(row["saved_at"]),
-                preview=str(row["preview"] or ""),
-                fingerprint=str(row["fingerprint"] or DEFAULT_SESSION_FINGERPRINT),
+                "preview": str(row["preview"] or ""),
+                "fingerprint": str(row["fingerprint"] or DEFAULT_SESSION_FINGERPRINT),
+            }
+            document = row.get("document") if isinstance(row.get("document"), dict) else {}
+            metadata = session_metadata_from_document(document, fallback)
+            sessions.append(
+                SessionMetadata(
+                    id=str(metadata["id"]),
+                    model=str(metadata["model"]),
+                    saved_at=str(metadata["saved_at"]),
+                    preview=str(metadata["preview"]),
+                    fingerprint=str(metadata["fingerprint"] or DEFAULT_SESSION_FINGERPRINT),
+                )
             )
-            for row in rows
-        ]
+        return sessions
 
     def get_latest(
         self, *, fingerprint: str | None = DEFAULT_SESSION_FINGERPRINT
@@ -351,102 +375,29 @@ class PostgresSessionStore:
         sessions = self.list(limit=1, fingerprint=fingerprint)
         return sessions[0] if sessions else None
 
-    def load_snapshot(self, session_id: str) -> tuple[dict | None, str | None]:
-        snapshot, error, _event_seq = self.load_snapshot_record(session_id)
-        return snapshot, error
-
-    def load_snapshot_record(
-        self, session_id: str
-    ) -> tuple[dict | None, str | None, int]:
+    def load_document(self, session_id: str) -> dict | None:
         with self.engine.begin() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    SELECT snapshot, snapshot_blob, snapshot_encoding, event_seq
-                    FROM labrastro_session_snapshots
-                    WHERE session_id=:session_id
-                    ORDER BY version DESC
-                    LIMIT 1
-                    """
-                ),
-                {"session_id": session_id},
-            ).mappings().first()
-        if row is not None:
-            snapshot, error = self._decode_snapshot_row(row)
-            if error is not None:
-                return None, error, 0
-            return snapshot, None, int(row.get("event_seq") or 0)
-        return None, None, 0
+            return self._load_document(conn, session_id)
 
-    def save_snapshot(
-        self, session_id: str, snapshot: dict, event_seq: int | None = None
-    ) -> None:
-        if event_seq is None:
-            event_seq = self._snapshot_event_seq(snapshot)
-        stats = snapshot.get("stats", {}) if isinstance(snapshot.get("stats"), dict) else {}
-        trace_nodes = snapshot.get("traceNodes", [])
-        trace_edges = snapshot.get("traceEdges", [])
-        turns = snapshot.get("turns", [])
+    def save_document(self, session_id: str, document: dict) -> None:
+        if not isinstance(document, dict):
+            document = empty_session_document(session_id)
         with self.engine.begin() as conn:
-            if not event_seq:
-                event_seq = self._latest_trace_event_seq(conn, session_id)
-            snapshot = dict(snapshot)
-            if event_seq:
-                snapshot["eventSeq"] = int(event_seq)
-            snapshot_json, snapshot_blob, snapshot_encoding, snapshot_bytes = (
-                self._encode_snapshot(snapshot)
-            )
-            version = conn.execute(
-                text(
-                    """
-                    SELECT COALESCE(max(version), 0) + 1
-                    FROM labrastro_session_snapshots
-                    WHERE session_id=:session_id
-                    """
-                ),
-                {"session_id": session_id},
-            ).scalar_one()
             conn.execute(
-                text(
-                    """
-                    INSERT INTO labrastro_session_snapshots (
-                        session_id, version, snapshot, stats, turn_count,
-                        trace_node_count, trace_edge_count, snapshot_blob,
-                        snapshot_encoding, snapshot_bytes, event_seq
-                    ) VALUES (
-                        :session_id, :version, CAST(:snapshot AS JSONB),
-                        CAST(:stats AS JSONB), :turn_count,
-                        :trace_node_count, :trace_edge_count, :snapshot_blob,
-                        :snapshot_encoding, :snapshot_bytes, :event_seq
-                    )
-                    """
-                ),
-                {
-                    "session_id": session_id,
-                    "version": int(version),
-                    "snapshot": snapshot_json,
-                    "stats": _json(stats),
-                    "turn_count": len(turns) if isinstance(turns, list) else 0,
-                    "trace_node_count": len(trace_nodes)
-                    if isinstance(trace_nodes, list)
-                    else 0,
-                    "trace_edge_count": len(trace_edges)
-                    if isinstance(trace_edges, list)
-                    else 0,
-                    "snapshot_blob": snapshot_blob,
-                    "snapshot_encoding": snapshot_encoding,
-                    "snapshot_bytes": snapshot_bytes,
-                    "event_seq": int(event_seq or 0),
-                },
-            )
-
-    def delete_snapshot(self, session_id: str) -> bool:
-        with self.engine.begin() as conn:
-            result = conn.execute(
-                text("DELETE FROM labrastro_session_snapshots WHERE session_id=:session_id"),
+                text("SELECT pg_advisory_xact_lock(hashtext(:session_id))"),
                 {"session_id": session_id},
             )
-            return int(result.rowcount or 0) > 0
+            self._upsert_document(
+                conn,
+                session_id,
+                document,
+                int(document.get("revision") or 0),
+                int(document.get("last_event_seq") or 0),
+            )
+
+    def delete_document(self, session_id: str) -> bool:
+        with self.engine.begin() as conn:
+            return self._delete_document(conn, session_id)
 
     def append_trace_event(
         self,
@@ -505,6 +456,54 @@ class PostgresSessionStore:
                     "payload_encoding": payload_encoding,
                     "payload_bytes": payload_bytes,
                 },
+            )
+            document = self._load_document(conn, session_id)
+            if document is None:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT model, saved_at, preview, fingerprint, runtime_state
+                        FROM labrastro_sessions
+                        WHERE id=:session_id
+                        """
+                    ),
+                    {"session_id": session_id},
+                ).mappings().first()
+                if row is not None:
+                    saved_at = (
+                        row["saved_at"].isoformat()
+                        if hasattr(row["saved_at"], "isoformat")
+                        else str(row["saved_at"])
+                    )
+                    document = empty_session_document(
+                        session_id,
+                        metadata={
+                            "model": str(row["model"] or ""),
+                            "saved_at": saved_at,
+                            "preview": str(row["preview"] or ""),
+                            "fingerprint": str(row["fingerprint"] or DEFAULT_SESSION_FINGERPRINT),
+                        },
+                        runtime_state=row.get("runtime_state")
+                        if isinstance(row.get("runtime_state"), dict)
+                        else {},
+                    )
+                else:
+                    document = empty_session_document(session_id)
+            document = apply_session_event(
+                document,
+                session_id=session_id,
+                event_type=str(event_type),
+                payload=payload if isinstance(payload, dict) else {},
+                session_event_seq=int(seq),
+                chat_id=chat_id,
+                chat_seq=chat_seq,
+            )
+            self._upsert_document(
+                conn,
+                session_id,
+                document,
+                int(document.get("revision") or 0),
+                int(document.get("last_event_seq") or 0),
             )
             return int(seq)
 
@@ -579,37 +578,11 @@ class PostgresSessionStore:
             )
             return int(result.rowcount or 0) > 0
 
-    def _encode_snapshot(
-        self, snapshot: dict
-    ) -> tuple[str | None, bytes | None, str, int]:
-        payload = _json_bytes(snapshot)
-        if len(payload) >= self.snapshot_compress_threshold_bytes:
-            return None, gzip.compress(payload), "json+gzip", len(payload)
-        return payload.decode("utf-8"), None, "jsonb", len(payload)
-
-    @staticmethod
-    def _decode_snapshot_row(row: Any) -> tuple[dict | None, str | None]:
-        encoding = str(row.get("snapshot_encoding") or "jsonb")
-        if encoding == "json+gzip":
-            blob = row.get("snapshot_blob")
-            if blob is None:
-                return None, "snapshot_blob_missing"
-            try:
-                raw = gzip.decompress(bytes(blob))
-                snapshot = json.loads(raw.decode("utf-8"))
-            except Exception:
-                return None, "snapshot_blob_invalid"
-        else:
-            snapshot = row.get("snapshot")
-        if isinstance(snapshot, dict):
-            return dict(snapshot), None
-        return None, "snapshot_not_object"
-
     def _encode_event_payload(
         self, payload: dict
     ) -> tuple[str | None, bytes | None, str, int]:
         raw = _json_bytes(payload)
-        if len(raw) >= self.snapshot_compress_threshold_bytes:
+        if len(raw) >= self.payload_compress_threshold_bytes:
             return None, gzip.compress(raw), "json+gzip", len(raw)
         return raw.decode("utf-8"), None, "jsonb", len(raw)
 
@@ -632,18 +605,6 @@ class PostgresSessionStore:
         return None, "payload_not_object"
 
     @staticmethod
-    def _snapshot_event_seq(snapshot: dict) -> int:
-        for key in ("eventSeq", "event_seq", "snapshotEventSeq", "snapshot_event_seq"):
-            value = snapshot.get(key)
-            if value is None:
-                continue
-            try:
-                return max(0, int(value))
-            except (TypeError, ValueError):
-                continue
-        return 0
-
-    @staticmethod
     def _latest_trace_event_seq(conn: Any, session_id: str) -> int:
         value = conn.execute(
             text(
@@ -656,6 +617,81 @@ class PostgresSessionStore:
             {"session_id": session_id},
         ).scalar_one()
         return int(value or 0)
+
+    def _load_document(self, conn: Any, session_id: str) -> dict | None:
+        row = conn.execute(
+            text(
+                """
+                SELECT document
+                FROM labrastro_session_documents
+                WHERE session_id=:session_id
+                """
+            ),
+            {"session_id": session_id},
+        ).mappings().first()
+        if row is None:
+            return None
+        document = row.get("document")
+        return dict(document) if isinstance(document, dict) else None
+
+    def _upsert_document_metadata(self, conn: Any, session: Session) -> None:
+        existing = self._load_document(conn, session.id)
+        document = update_session_document_metadata(
+            existing,
+            session_id=session.id,
+            model=session.model,
+            saved_at=session.saved_at,
+            preview=session.get_preview(),
+            fingerprint=session.fingerprint,
+            runtime_state=session.runtime_state.to_dict(),
+        )
+        self._upsert_document(
+            conn,
+            session.id,
+            document,
+            int(document.get("revision") or 0),
+            int(document.get("last_event_seq") or 0),
+        )
+
+    def _upsert_document(
+        self,
+        conn: Any,
+        session_id: str,
+        document: dict,
+        revision: int,
+        last_event_seq: int,
+    ) -> None:
+        conn.execute(
+            text(
+                """
+                INSERT INTO labrastro_session_documents (
+                    session_id, document, revision, last_event_seq, updated_at
+                ) VALUES (
+                    :session_id, CAST(:document AS JSONB), :revision,
+                    :last_event_seq, now()
+                )
+                ON CONFLICT (session_id) DO UPDATE SET
+                    document=EXCLUDED.document,
+                    revision=EXCLUDED.revision,
+                    last_event_seq=EXCLUDED.last_event_seq,
+                    updated_at=now()
+                """
+            ),
+            {
+                "session_id": session_id,
+                "document": _json(document),
+                "revision": int(revision or 0),
+                "last_event_seq": int(last_event_seq or 0),
+            },
+        )
+
+    @staticmethod
+    def _delete_document(conn: Any, session_id: str) -> bool:
+        result = conn.execute(
+            text("DELETE FROM labrastro_session_documents WHERE session_id=:session_id"),
+            {"session_id": session_id},
+        )
+        return int(result.rowcount or 0) > 0
 
     @staticmethod
     def get_exit_time(messages: list[dict]) -> str | None:

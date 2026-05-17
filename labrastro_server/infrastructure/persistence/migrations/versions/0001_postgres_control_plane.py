@@ -169,21 +169,6 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE IF NOT EXISTS labrastro_session_snapshots (
-            session_id TEXT NOT NULL REFERENCES labrastro_sessions(id) ON DELETE CASCADE,
-            version BIGINT NOT NULL,
-            snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-            stats JSONB NOT NULL DEFAULT '{}'::jsonb,
-            turn_count INT NOT NULL DEFAULT 0,
-            trace_node_count INT NOT NULL DEFAULT 0,
-            trace_edge_count INT NOT NULL DEFAULT 0,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (session_id, version)
-        )
-        """
-    )
-    op.execute(
-        """
         CREATE TABLE IF NOT EXISTS labrastro_session_trace_events (
             id BIGSERIAL PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES labrastro_sessions(id) ON DELETE CASCADE,
@@ -231,7 +216,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS labrastro_session_trace_events")
-    op.execute("DROP TABLE IF EXISTS labrastro_session_snapshots")
     op.execute("DROP TABLE IF EXISTS labrastro_sessions")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_locks")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_cancel_requests")
