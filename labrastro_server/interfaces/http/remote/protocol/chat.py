@@ -294,6 +294,84 @@ class ChatCancelResponse:
         return cls(ok=bool(d.get("ok", False)), error=d.get("error"))
 
 @dataclass
+class ChatFollowUpRequest:
+    peer_token: str
+    chat_id: str
+    text: str
+    followup_id: str | None = None
+    client_request_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "peer_token": self.peer_token,
+            "chat_id": self.chat_id,
+            "text": self.text,
+        }
+        if self.followup_id is not None:
+            payload["followup_id"] = self.followup_id
+        if self.client_request_id is not None:
+            payload["client_request_id"] = self.client_request_id
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatFollowUpRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            chat_id=d["chat_id"],
+            text=d["text"],
+            followup_id=d.get("followup_id") or d.get("followupId"),
+            client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
+        )
+
+@dataclass
+class ChatFollowUpCancelRequest:
+    peer_token: str
+    chat_id: str
+    followup_id: str
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "peer_token": self.peer_token,
+            "chat_id": self.chat_id,
+            "followup_id": self.followup_id,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatFollowUpCancelRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            chat_id=d["chat_id"],
+            followup_id=d.get("followup_id") or d.get("followupId"),
+            reason=d.get("reason"),
+        )
+
+@dataclass
+class ChatFollowUpResponse:
+    ok: bool
+    followup_id: str | None = None
+    state: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"ok": self.ok, "error": self.error}
+        if self.followup_id is not None:
+            payload["followup_id"] = self.followup_id
+        if self.state is not None:
+            payload["state"] = self.state
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatFollowUpResponse":
+        return cls(
+            ok=bool(d.get("ok", False)),
+            followup_id=d.get("followup_id") if isinstance(d.get("followup_id"), str) else None,
+            state=d.get("state") if isinstance(d.get("state"), str) else None,
+            error=d.get("error"),
+        )
+
+@dataclass
 class ApprovalReplyRequest:
     peer_token: str
     chat_id: str
@@ -348,6 +426,9 @@ __all__ = [
     "ChatStatusResponse",
     "ChatCancelRequest",
     "ChatCancelResponse",
+    "ChatFollowUpRequest",
+    "ChatFollowUpCancelRequest",
+    "ChatFollowUpResponse",
     "ApprovalReplyRequest",
     "ApprovalReplyResponse",
 ]

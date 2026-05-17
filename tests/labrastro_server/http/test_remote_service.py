@@ -3025,6 +3025,238 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_chat_follow_up_can_be_consumed_at_safe_boundary(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        handler_ready = threading.Event()
+        consumed = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            session.set_follow_up_callback(
+                lambda ticket: (
+                    session.mark_follow_up_consumed(ticket["followup_id"]),
+                    consumed.set(),
+                )
+            )
+            handler_ready.set()
+            consumed.wait(timeout=2)
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "guide me"},
+            )
+            chat_id = start_body["chat_id"]
+            assert handler_ready.wait(2)
+
+            _, follow_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/follow-up",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "followup_id": "follow-1",
+                    "client_request_id": "pending-1",
+                    "text": "prefer the shorter path",
+                },
+            )
+            assert follow_body["ok"] is True
+            assert follow_body["followup_id"] == "follow-1"
+            assert follow_body["state"] in {"pending", "consumed"}
+            assert consumed.wait(2)
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+            event_types = [event["type"] for event in stream_body["events"]]
+            assert "chat_follow_up_accepted" in event_types
+            assert "chat_follow_up_consumed" in event_types
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_follow_up_unconsumed_when_run_finishes_without_boundary(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        handler_ready = threading.Event()
+        release = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            handler_ready.set()
+            release.wait(timeout=2)
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "pure stream"},
+            )
+            chat_id = start_body["chat_id"]
+            assert handler_ready.wait(2)
+
+            _, follow_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/follow-up",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "followup_id": "follow-1",
+                    "text": "late guidance",
+                },
+            )
+            assert follow_body["ok"] is True
+            release.set()
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+            events = stream_body["events"]
+            unconsumed = [
+                event
+                for event in events
+                if event["type"] == "chat_follow_up_unconsumed"
+            ]
+            assert unconsumed
+            assert unconsumed[-1]["payload"]["followup_id"] == "follow-1"
+        finally:
+            release.set()
+            service.stop()
+            relay.stop()
+
+    def test_chat_follow_up_cancel_marks_ticket_cancelled(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        handler_ready = threading.Event()
+        release = threading.Event()
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            handler_ready.set()
+            release.wait(timeout=2)
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "cancel follow up"},
+            )
+            chat_id = start_body["chat_id"]
+            assert handler_ready.wait(2)
+
+            _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/follow-up",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "followup_id": "follow-1",
+                    "text": "temporary guidance",
+                },
+            )
+            _, cancel_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/follow-up/cancel",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "followup_id": "follow-1",
+                    "reason": "user_changed_to_queue",
+                },
+            )
+            assert cancel_body["ok"] is True
+            assert cancel_body["state"] == "cancelled"
+            release.set()
+
+            _, stream_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+            cancelled = [
+                event
+                for event in stream_body["events"]
+                if event["type"] == "chat_follow_up_cancelled"
+            ]
+            assert cancelled
+            assert cancelled[-1]["payload"]["reason"] == "user_changed_to_queue"
+        finally:
+            release.set()
+            service.stop()
+            relay.stop()
+
     def test_chat_stream_reports_lost_events_when_buffer_pruned(
         self, tmp_path: Path
     ) -> None:

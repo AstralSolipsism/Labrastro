@@ -20,6 +20,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyResponse,
     ChatCancelRequest,
     ChatCancelResponse,
+    ChatFollowUpCancelRequest,
+    ChatFollowUpRequest,
+    ChatFollowUpResponse,
     ChatRequest,
     ChatResponse,
     ChatStartRequest,
@@ -359,6 +362,61 @@ class RemoteChatRoutes:
             session.mark_done()
         self._send_json(
             HTTPStatus.OK, ChatCancelResponse(ok=True).to_dict()
+        )
+
+    def _handle_chat_follow_up(self) -> None:
+        payload = self._read_json()
+        try:
+            req = ChatFollowUpRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_follow_up_request")
+            return
+
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
+            return
+        _control_peer_id, session = control
+        try:
+            ticket = session.submit_follow_up(
+                req.text,
+                followup_id=req.followup_id,
+                client_request_id=req.client_request_id,
+            )
+        except ValueError:
+            self._send_error(HTTPStatus.BAD_REQUEST, "empty_follow_up")
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            ChatFollowUpResponse(
+                ok=True,
+                followup_id=str(ticket.get("followup_id") or ""),
+                state=str(ticket.get("state") or "pending"),
+            ).to_dict(),
+        )
+
+    def _handle_chat_follow_up_cancel(self) -> None:
+        payload = self._read_json()
+        try:
+            req = ChatFollowUpCancelRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_follow_up_cancel_request")
+            return
+
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
+            return
+        _control_peer_id, session = control
+        ok = session.cancel_follow_up(req.followup_id, req.reason)
+        if not ok:
+            self._send_error(HTTPStatus.NOT_FOUND, "follow_up_not_found")
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            ChatFollowUpResponse(
+                ok=True,
+                followup_id=req.followup_id,
+                state="cancelled",
+            ).to_dict(),
         )
 
     def _handle_approval_reply(self) -> None:

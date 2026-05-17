@@ -270,12 +270,15 @@ class _RemoteChatSession:
     running: bool = False
     seq_next: int = 1
     approval_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
+    follow_up_tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     cond: threading.Condition = field(default_factory=threading.Condition)
     cancel_requested: bool = False
     cancel_reason: str | None = None
     cancel_callback: Callable[[str], None] | None = None
+    follow_up_callback: Callable[[dict[str, Any]], None] | None = None
+    follow_up_cancel_callback: Callable[[str], None] | None = None
     artifact_root: Path = field(
         default_factory=lambda: Path(tempfile.gettempdir()) / "labrastro-chat-events"
     )
@@ -391,6 +394,7 @@ class _RemoteChatSession:
             self.last_activity_at = time.time()
 
     def mark_done(self) -> None:
+        unconsumed: list[dict[str, Any]] = []
         with self.cond:
             self.running = False
             self.done = True
@@ -404,7 +408,17 @@ class _RemoteChatSession:
                 waiter["done"] = True
                 waiter["decision"] = "deny_once"
                 waiter["reason"] = "chat_closed"
+            for ticket in self.follow_up_tickets.values():
+                if ticket.get("state") in {"consumed", "cancelled", "unconsumed"}:
+                    continue
+                ticket["state"] = "unconsumed"
+                unconsumed.append(dict(ticket))
             self.cond.notify_all()
+        for ticket in unconsumed:
+            self.append_event(
+                "chat_follow_up_unconsumed",
+                self._follow_up_event_payload(ticket),
+            )
 
     def is_stale(self, now: float, *, closed_ttl_sec: float, idle_ttl_sec: float) -> bool:
         if self.done and self.finished_at is not None:
@@ -471,6 +485,100 @@ class _RemoteChatSession:
         if callback is not None:
             callback(reason)
         return first_request
+
+    def submit_follow_up(
+        self,
+        text: str,
+        *,
+        followup_id: str | None = None,
+        client_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        message_text = text.strip()
+        if not message_text:
+            raise ValueError("empty_follow_up")
+        callback: Callable[[dict[str, Any]], None] | None = None
+        with self.cond:
+            ticket_id = followup_id or str(uuid.uuid4())
+            existing = self.follow_up_tickets.get(ticket_id)
+            if existing is not None:
+                return dict(existing)
+            ticket = {
+                "followup_id": ticket_id,
+                "text": message_text,
+                "state": "pending",
+                "client_request_id": client_request_id,
+                "created_at": time.time(),
+            }
+            self.follow_up_tickets[ticket_id] = ticket
+            callback = self.follow_up_callback
+            self.cond.notify_all()
+        self.append_event(
+            "chat_follow_up_accepted",
+            self._follow_up_event_payload(ticket),
+        )
+        if callback is not None:
+            callback(dict(ticket))
+        return dict(ticket)
+
+    def set_follow_up_callback(
+        self, callback: Callable[[dict[str, Any]], None] | None
+    ) -> None:
+        with self.cond:
+            self.follow_up_callback = callback
+            pending = [
+                dict(ticket)
+                for ticket in self.follow_up_tickets.values()
+                if ticket.get("state") == "pending"
+            ]
+        if callback is not None:
+            for ticket in pending:
+                callback(ticket)
+
+    def set_follow_up_cancel_callback(
+        self, callback: Callable[[str], None] | None
+    ) -> None:
+        with self.cond:
+            self.follow_up_cancel_callback = callback
+
+    def cancel_follow_up(self, followup_id: str, reason: str | None = None) -> bool:
+        callback: Callable[[str], None] | None = None
+        with self.cond:
+            ticket = self.follow_up_tickets.get(followup_id)
+            if ticket is None:
+                return False
+            if ticket.get("state") in {"consumed", "cancelled"}:
+                return True
+            ticket["state"] = "cancelled"
+            ticket["reason"] = reason or "cancelled"
+            callback = self.follow_up_cancel_callback
+            payload = self._follow_up_event_payload(ticket)
+            self.cond.notify_all()
+        if callback is not None:
+            callback(followup_id)
+        self.append_event("chat_follow_up_cancelled", payload)
+        return True
+
+    def mark_follow_up_consumed(self, followup_id: str) -> bool:
+        with self.cond:
+            ticket = self.follow_up_tickets.get(followup_id)
+            if ticket is None or ticket.get("state") in {"consumed", "cancelled", "unconsumed"}:
+                return False
+            ticket["state"] = "consumed"
+            ticket["consumed_at"] = time.time()
+            payload = self._follow_up_event_payload(ticket)
+            self.cond.notify_all()
+        self.append_event("chat_follow_up_consumed", payload)
+        return True
+
+    @staticmethod
+    def _follow_up_event_payload(ticket: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "followup_id": ticket.get("followup_id"),
+            "client_request_id": ticket.get("client_request_id"),
+            "state": ticket.get("state"),
+            "text": ticket.get("text"),
+            **({"reason": ticket.get("reason")} if ticket.get("reason") else {}),
+        }
 
     def register_approval(self, approval_id: str) -> None:
         with self.cond:
@@ -1011,6 +1119,12 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/chat/cancel":
                     self._handle_chat_cancel()
+                    return
+                if parsed.path == "/remote/chat/follow-up":
+                    self._handle_chat_follow_up()
+                    return
+                if parsed.path == "/remote/chat/follow-up/cancel":
+                    self._handle_chat_follow_up_cancel()
                     return
                 if parsed.path == "/remote/approval/reply":
                     self._handle_approval_reply()

@@ -55,6 +55,8 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("chat.stream", "POST", "/remote/chat/stream", "ChatStreamRequest", "ChatStreamResponse", "peer_token"),
     RemoteEndpoint("chat.status", "POST", "/remote/chat/status", "ChatStatusRequest", "ChatStatusResponse", "peer_token"),
     RemoteEndpoint("chat.cancel", "POST", "/remote/chat/cancel", "ChatCancelRequest", "ChatCancelResponse", "peer_token"),
+    RemoteEndpoint("chat.follow_up", "POST", "/remote/chat/follow-up", "ChatFollowUpRequest", "ChatFollowUpResponse", "peer_token"),
+    RemoteEndpoint("chat.follow_up_cancel", "POST", "/remote/chat/follow-up/cancel", "ChatFollowUpCancelRequest", "ChatFollowUpResponse", "peer_token"),
     RemoteEndpoint("chat.approval_reply", "POST", "/remote/approval/reply", "ApprovalReplyRequest", "ApprovalReplyResponse", "peer_token"),
     RemoteEndpoint("agent_runs.events", "GET", "/remote/agent-runs/{agent_run_id}/events", "AgentRunEventsQuery", "AgentRunEventsResponse", "peer_token"),
     RemoteEndpoint("agent_runs.claim", "POST", "/remote/agent-runs/claim", "AgentRunClaimRequest", "AgentRunClaimResponse", "peer_token"),
