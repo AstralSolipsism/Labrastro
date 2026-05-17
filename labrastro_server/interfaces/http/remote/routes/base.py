@@ -43,7 +43,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionLoadRequest,
     SessionModelSwitchRequest,
     SessionNewRequest,
-    SessionSnapshotRequest,
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import inspect
@@ -91,260 +90,6 @@ def _stable_digest(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256-{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _snapshot_digest(snapshot: dict[str, Any], event_seq: int | None = None) -> str:
-    normalized = dict(snapshot)
-    normalized.pop("updatedAt", None)
-    normalized.pop("updated_at", None)
-    if event_seq is not None:
-        for key in ("eventSeq", "event_seq", "snapshotEventSeq", "snapshot_event_seq"):
-            normalized.pop(key, None)
-        if event_seq:
-            normalized["eventSeq"] = int(event_seq)
-    return _stable_digest(normalized)
-
-
-def _message_field(message: Any, field: str) -> Any:
-    if isinstance(message, dict):
-        return message.get(field)
-    return getattr(message, field, None)
-
-
-def _message_content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(part for part in parts if part)
-    return ""
-
-
-def _assistant_contents_by_turn(messages: list[Any]) -> list[list[str]]:
-    groups: list[list[str]] = []
-    current_turn_index = -1
-    for message in messages:
-        role = _message_field(message, "role")
-        if role == "user":
-            groups.append([])
-            current_turn_index = len(groups) - 1
-            continue
-        if role != "assistant":
-            continue
-        content = _message_content_text(_message_field(message, "content"))
-        if not content:
-            continue
-        if current_turn_index < 0:
-            groups.append([])
-            current_turn_index = 0
-        groups[current_turn_index].append(content)
-    return groups
-
-
-def _patch_snapshot_turn_final_text(
-    turn: dict[str, Any], authoritative_final: str, turn_index: int
-) -> None:
-    assistant_messages = turn.get("assistantMessages")
-    if not isinstance(assistant_messages, list):
-        assistant_messages = []
-        turn["assistantMessages"] = assistant_messages
-    if not assistant_messages:
-        assistant_messages.append(
-            {
-                "id": f"assistant-final-{turn_index}",
-                "role": "assistant",
-                "parts": [],
-            }
-        )
-    message = assistant_messages[-1]
-    if not isinstance(message, dict):
-        message = {"role": "assistant", "parts": []}
-        assistant_messages[-1] = message
-    parts = message.get("parts")
-    if not isinstance(parts, list):
-        parts = []
-        message["parts"] = parts
-    text_part_index = -1
-    for index in range(len(parts) - 1, -1, -1):
-        part = parts[index]
-        if isinstance(part, dict) and part.get("type") == "text":
-            text_part_index = index
-            break
-    current_final = ""
-    if text_part_index >= 0 and isinstance(parts[text_part_index], dict):
-        text = parts[text_part_index].get("text")
-        current_final = text if isinstance(text, str) else ""
-    elif isinstance(message.get("text"), str):
-        current_final = str(message.get("text"))
-    if len(authoritative_final) <= len(current_final):
-        return
-    if text_part_index >= 0 and isinstance(parts[text_part_index], dict):
-        parts[text_part_index] = {
-            **parts[text_part_index],
-            "type": "text",
-            "text": authoritative_final,
-            "textFormat": parts[text_part_index].get("textFormat") or "markdown",
-        }
-    else:
-        parts.append(
-            {
-                "id": f"assistant-final-part-{turn_index}",
-                "type": "text",
-                "text": authoritative_final,
-                "textFormat": "markdown",
-            }
-        )
-    message["text"] = authoritative_final
-
-
-def _tool_call_function(call: Any) -> dict[str, Any]:
-    if isinstance(call, dict):
-        function = call.get("function")
-        return function if isinstance(function, dict) else {}
-    function = getattr(call, "function", None)
-    return function if isinstance(function, dict) else {}
-
-
-def _build_turns_from_session_messages(messages: list[Any]) -> list[dict[str, Any]]:
-    turns: list[dict[str, Any]] = []
-    pending_turn: dict[str, Any] | None = None
-    display_index = 0
-
-    def ensure_turn() -> dict[str, Any]:
-        nonlocal pending_turn, display_index
-        if pending_turn is None:
-            pending_turn = {
-                "userMessage": {
-                    "id": f"history-user-{display_index}",
-                    "role": "user",
-                    "text": "",
-                    "parts": [],
-                    "timestamp": 0,
-                },
-                "assistantMessages": [],
-            }
-            turns.append(pending_turn)
-        return pending_turn
-
-    for raw in messages:
-        role = _message_field(raw, "role")
-        content = _message_content_text(_message_field(raw, "content"))
-        if role == "system":
-            continue
-        if role == "user":
-            pending_turn = {
-                "userMessage": {
-                    "id": f"history-user-{display_index}",
-                    "role": "user",
-                    "text": content,
-                    "parts": [],
-                    "timestamp": 0,
-                },
-                "assistantMessages": [],
-            }
-            turns.append(pending_turn)
-            display_index += 1
-            continue
-        if role == "assistant":
-            turn = ensure_turn()
-            parts: list[dict[str, Any]] = []
-            if content:
-                parts.append(
-                    {
-                        "id": f"history-assistant-part-{display_index}",
-                        "type": "text",
-                        "text": content,
-                        "textFormat": "markdown",
-                    }
-                )
-            tool_calls = _message_field(raw, "tool_calls")
-            if isinstance(tool_calls, list):
-                for call_index, call in enumerate(tool_calls):
-                    function = _tool_call_function(call)
-                    tool_name = function.get("name") or _message_field(call, "name") or "tool"
-                    tool_call_id = (
-                        _message_field(call, "id")
-                        or _message_field(call, "tool_call_id")
-                        or f"history-tool-call-{display_index}-{call_index}"
-                    )
-                    parts.append(
-                        {
-                            "id": f"history-tool-start-{display_index}-{call_index}",
-                            "type": "tool",
-                            "tool": str(tool_name),
-                            "toolCallId": str(tool_call_id),
-                            "status": "running",
-                        }
-                    )
-            turn.setdefault("assistantMessages", []).append(
-                {
-                    "id": f"history-assistant-{display_index}",
-                    "role": "assistant",
-                    "text": content,
-                    "parts": parts,
-                    "timestamp": 0,
-                }
-            )
-            display_index += 1
-            continue
-        if role == "tool":
-            turn = ensure_turn()
-            tool_call_id = _message_field(raw, "tool_call_id") or f"history-tool-{display_index}"
-            turn.setdefault("assistantMessages", []).append(
-                {
-                    "id": f"history-tool-result-{display_index}",
-                    "role": "assistant",
-                    "text": "",
-                    "parts": [
-                        {
-                            "id": f"history-tool-result-part-{display_index}",
-                            "type": "tool",
-                            "tool": str(_message_field(raw, "name") or "tool"),
-                            "toolCallId": str(tool_call_id),
-                            "status": "returned",
-                            "toolOutput": content,
-                            "toolOutputFormat": "plain",
-                        }
-                    ],
-                    "timestamp": 0,
-                }
-            )
-            display_index += 1
-
-    return turns
-
-
-def _merge_snapshot_with_session_messages(
-    snapshot: dict[str, Any], messages: list[Any]
-) -> dict[str, Any]:
-    turns = snapshot.get("turns")
-    fallback_turns = _build_turns_from_session_messages(messages)
-    if not isinstance(turns, list):
-        next_snapshot = copy.deepcopy(snapshot)
-        next_snapshot["turns"] = fallback_turns
-        return next_snapshot
-    assistant_groups = _assistant_contents_by_turn(messages)
-    next_snapshot = copy.deepcopy(snapshot)
-    next_turns = next_snapshot.get("turns")
-    if not isinstance(next_turns, list):
-        return snapshot
-    if assistant_groups:
-        for turn_index, turn in enumerate(next_turns):
-            if turn_index >= len(assistant_groups) or not isinstance(turn, dict):
-                continue
-            final_content = assistant_groups[turn_index][-1] if assistant_groups[turn_index] else ""
-            if final_content:
-                _patch_snapshot_turn_final_text(turn, final_content, turn_index)
-    if len(next_turns) < len(fallback_turns):
-        next_turns.extend(copy.deepcopy(fallback_turns[len(next_turns):]))
-    return next_snapshot
 
 
 def init_remote_relay(runner, config: Config, ui_bus: UIEventBus) -> None:
@@ -444,9 +189,6 @@ def switch_session_model(
     session_store: Any,
     fingerprint: str,
     payload: dict[str, Any],
-    *,
-    snapshot_loader: Callable[[str], tuple[dict[str, Any] | None, str | None]]
-    | None = None,
 ) -> dict[str, Any]:
     if config is None:
         return {"ok": False, "error": "config_unavailable", "_status": 503}
@@ -559,10 +301,6 @@ def switch_session_model(
         )
 
     saved = session_store.load(session_id)
-    snapshot: dict[str, Any] | None = None
-    snapshot_error: str | None = None
-    if snapshot_loader is not None:
-        snapshot, snapshot_error = snapshot_loader(session_id)
     return {
         "ok": True,
         "session_id": session_id,
@@ -583,9 +321,6 @@ def switch_session_model(
             "preview": "",
             "fingerprint": fingerprint,
         },
-        "messages": list(saved.messages) if saved is not None else [],
-        "snapshot": snapshot,
-        "snapshot_error": snapshot_error,
     }
 
 
@@ -731,52 +466,20 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             "fingerprint": session.fingerprint,
         }
 
-    def _load_session_snapshot_record(
-        session_id: str,
-    ) -> tuple[dict[str, Any] | None, str | None, int]:
-        loader = getattr(session_store, "load_snapshot_record", None)
-        if callable(loader):
-            return loader(session_id)
-        snapshot, error = session_store.load_snapshot(session_id)
-        return snapshot, error, 0
-
-    def _load_session_snapshot(session_id: str) -> tuple[dict[str, Any] | None, str | None]:
-        snapshot, error, _event_seq = _load_session_snapshot_record(session_id)
-        return snapshot, error
-
-    def _latest_session_trace_event_seq(session_id: str) -> int:
-        latest = getattr(session_store, "latest_trace_event_seq", None)
-        if not callable(latest):
-            return 0
+    def _load_session_document(session_id: str) -> dict[str, Any] | None:
+        loader = getattr(session_store, "load_document", None)
+        if not callable(loader):
+            return None
         try:
-            return int(latest(session_id) or 0)
+            document = loader(session_id)
         except Exception:
-            return 0
+            return None
+        return document if isinstance(document, dict) else None
 
-    def _list_session_trace_events(session_id: str, after_seq: int) -> list[dict[str, Any]]:
-        list_events = getattr(session_store, "list_trace_events", None)
-        if not callable(list_events):
-            return []
-        try:
-            events = list_events(
-                session_id,
-                after_seq=max(0, int(after_seq or 0)),
-                replayable_only=True,
-            )
-        except Exception:
-            return []
-        return [dict(event) for event in events if isinstance(event, dict)]
-
-    def _session_event_recovery_payload(
-        session_id: str, snapshot_event_seq: int
-    ) -> dict[str, Any]:
-        latest_event_seq = _latest_session_trace_event_seq(session_id)
-        after_seq = max(0, int(snapshot_event_seq or 0))
-        return {
-            "snapshot_event_seq": after_seq,
-            "latest_event_seq": latest_event_seq,
-            "events_after_snapshot": _list_session_trace_events(session_id, after_seq),
-        }
+    def _save_session_document(session_id: str, document: dict[str, Any]) -> None:
+        saver = getattr(session_store, "save_document", None)
+        if callable(saver):
+            saver(session_id, document)
 
     def _append_session_trace_event(
         session_id: str,
@@ -799,14 +502,6 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             source=source,
             replayable=replayable,
         )
-
-    def _save_session_snapshot(
-        session_id: str, snapshot: dict[str, Any], event_seq: int | None = None
-    ) -> None:
-        try:
-            session_store.save_snapshot(session_id, snapshot, event_seq=event_seq)
-        except TypeError:
-            session_store.save_snapshot(session_id, snapshot)
 
     def _persist_session_placeholder(peer_agent: Agent, peer_id: str) -> None:
         current_config = _current_config()
@@ -872,18 +567,14 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "current_fingerprint": fingerprint,
                     "_status": 403,
                 }
-            snapshot, snapshot_error, snapshot_event_seq = _load_session_snapshot_record(
-                session_id
-            )
+            document = _load_session_document(session_id)
             return {
                 "ok": True,
                 "fingerprint": fingerprint,
                 "metadata": _session_metadata_payload(loaded),
-                "messages": list(loaded.messages),
+                "document": document,
                 "runtime_state": loaded.runtime_state.to_dict(),
-                "snapshot": snapshot,
-                "snapshot_error": snapshot_error,
-                **_session_event_recovery_payload(session_id, snapshot_event_seq),
+                "last_event_seq": int((document or {}).get("last_event_seq") or 0),
             }
 
         if action == "new":
@@ -911,22 +602,33 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 runtime_state.active_model_display_name = agent_model.display_name
                 runtime_state.active_model_parameters = dict(agent_model.parameters)
                 runtime_state.model = agent_model.model
+            save_runtime_state = getattr(session_store, "save_runtime_state", None)
+            if callable(save_runtime_state):
+                save_runtime_state(
+                    session_id,
+                    runtime_state.model or "",
+                    runtime_state,
+                    messages=[],
+                    active_mode=runtime_state.active_mode,
+                    fingerprint=fingerprint,
+                )
+            loaded = session_store.load(session_id)
+            document = _load_session_document(session_id)
             return {
                 "ok": True,
                 "fingerprint": fingerprint,
-                "metadata": {
+                "metadata": _session_metadata_payload(loaded)
+                if loaded is not None
+                else {
                     "id": session_id,
-                    "model": getattr(current_config, "model", ""),
+                    "model": runtime_state.model or "",
                     "saved_at": "",
                     "preview": "",
                     "fingerprint": fingerprint,
                 },
-                "messages": [],
                 "runtime_state": runtime_state.to_dict(),
-                "snapshot": None,
-                "snapshot_event_seq": 0,
-                "latest_event_seq": 0,
-                "events_after_snapshot": [],
+                "document": document,
+                "last_event_seq": int((document or {}).get("last_event_seq") or 0),
             }
 
         if action == "model":
@@ -935,14 +637,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 session_store,
                 fingerprint,
                 payload,
-                snapshot_loader=_load_session_snapshot,
             )
             session_id = str(result.get("session_id") or payload.get("session_id") or "")
             if result.get("ok") and session_id:
-                _snapshot, _snapshot_error, snapshot_event_seq = _load_session_snapshot_record(
-                    session_id
-                )
-                result.update(_session_event_recovery_payload(session_id, snapshot_event_seq))
+                document = _load_session_document(session_id)
+                result["document"] = document
+                result["last_event_seq"] = int((document or {}).get("last_event_seq") or 0)
             return result
 
         if action == "delete":
@@ -961,7 +661,6 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "_status": 403,
                 }
             deleted = session_store.delete(session_id)
-            session_store.delete_snapshot(session_id)
             delete_events = getattr(session_store, "delete_trace_events", None)
             if callable(delete_events):
                 delete_events(session_id)
@@ -1034,14 +733,35 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 fingerprint=fingerprint,
             )
 
-            snapshot_payload = payload.get("snapshot")
-            if isinstance(snapshot_payload, dict) and snapshot_payload:
-                _save_session_snapshot(session_id, snapshot_payload)
-
             saved = session_store.load(session_id)
-            snapshot, snapshot_error, snapshot_event_seq = _load_session_snapshot_record(
-                session_id
-            )
+            source_document = _load_session_document(source_session_id)
+            if isinstance(source_document, dict):
+                document = json.loads(json.dumps(source_document))
+                document["revision"] = 0
+                document["last_event_seq"] = 0
+                metadata = document.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                    document["metadata"] = metadata
+                metadata["id"] = session_id
+                metadata["fingerprint"] = fingerprint
+                session_payload = document.get("session")
+                if not isinstance(session_payload, dict):
+                    session_payload = {}
+                    document["session"] = session_payload
+                session_payload.update(
+                    {
+                        "id": session_id,
+                        "kind": "fork",
+                        "parentSessionId": source_session_id,
+                        "sourceSessionId": source_session_id,
+                    }
+                )
+                turns = document.get("turns")
+                if isinstance(turns, list) and keep_through_message_index >= 0:
+                    document["turns"] = turns[: keep_through_message_index + 1]
+                _save_session_document(session_id, document)
+            document = _load_session_document(session_id)
             return {
                 "ok": True,
                 "session_id": session_id,
@@ -1057,56 +777,9 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "preview": "",
                     "fingerprint": fingerprint,
                 },
-                "messages": list(saved.messages) if saved is not None else cloned_messages,
                 "runtime_state": runtime_state.to_dict(),
-                "snapshot": snapshot,
-                "snapshot_error": snapshot_error,
-                **_session_event_recovery_payload(session_id, snapshot_event_seq),
-            }
-
-        if action == "snapshot":
-            session_id = str(payload.get("session_id") or "")
-            snapshot = payload.get("snapshot")
-            if not session_id:
-                return {"ok": False, "error": "missing_session_id", "_status": 400}
-            if not isinstance(snapshot, dict):
-                return {"ok": False, "error": "invalid_snapshot", "_status": 400}
-            loaded = session_store.load(session_id)
-            if loaded is None:
-                return {"ok": False, "error": "session_not_found", "_status": 404}
-            if loaded.fingerprint != fingerprint:
-                return {
-                    "ok": False,
-                    "error": "session_fingerprint_mismatch",
-                    "_status": 403,
-                }
-            snapshot_event_seq = int(
-                snapshot.get("eventSeq")
-                or snapshot.get("event_seq")
-                or _latest_session_trace_event_seq(session_id)
-                or 0
-            )
-            snapshot = _merge_snapshot_with_session_messages(snapshot, loaded.messages)
-            digest = _snapshot_digest(snapshot, snapshot_event_seq)
-            latest_snapshot, _snapshot_error = _load_session_snapshot(session_id)
-            if (
-                isinstance(latest_snapshot, dict)
-                and _snapshot_digest(latest_snapshot, snapshot_event_seq) == digest
-            ):
-                return {
-                    "ok": True,
-                    "session_id": session_id,
-                    "snapshot_digest": digest,
-                    "snapshot_event_seq": snapshot_event_seq,
-                    "unchanged": True,
-                }
-            _save_session_snapshot(session_id, snapshot, snapshot_event_seq)
-            return {
-                "ok": True,
-                "session_id": session_id,
-                "snapshot_digest": digest,
-                "snapshot_event_seq": snapshot_event_seq,
-                "unchanged": False,
+                "document": document,
+                "last_event_seq": int((document or {}).get("last_event_seq") or 0),
             }
 
         return {"ok": False, "error": "unknown_session_action", "_status": 404}
@@ -1275,7 +948,6 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 "model_id": model_id,
                 "parameters": dict(parameters),
             },
-            snapshot_loader=_load_session_snapshot,
         )
         if not result.get("ok"):
             remote_session.append_event(
@@ -1903,6 +1575,13 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 "code": "REMOTE_CHAT_ERROR",
                 "recoverable": False,
             }
+            diagnostic_path = getattr(exc, "llm_diagnostic_path", None)
+            if diagnostic_path:
+                failure_payload["diagnostic_path"] = str(diagnostic_path)
+            failure_payload["error_type"] = type(exc).__name__
+            provider_phase = getattr(exc, "provider_error_phase", None)
+            if provider_phase:
+                failure_payload["provider_error_phase"] = str(provider_phase)
             remote_session.append_event("error", failure_payload)
             remote_session.append_event("chat_failed", failure_payload)
         finally:

@@ -1,4 +1,4 @@
-"""HTTP transport adapter for the remote relay host."""
+﻿"""HTTP transport adapter for the remote relay host."""
 
 from __future__ import annotations
 
@@ -29,6 +29,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyResponse,
     ChatCancelRequest,
     ChatCancelResponse,
+    ChatFollowUpCancelRequest,
+    ChatFollowUpRequest,
+    ChatFollowUpResponse,
     ChatRequest,
     ChatResponse,
     ChatStartRequest,
@@ -58,7 +61,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionLoadRequest,
     SessionModelSwitchRequest,
     SessionNewRequest,
-    SessionSnapshotRequest,
     ToolPreviewResult,
 )
 from labrastro_server.relay.server import RelayServer
@@ -102,7 +104,7 @@ SessionTraceEventSink = Callable[
 
 
 def _is_replayable_chat_event(event_type: str) -> bool:
-    return event_type not in {"assistant_delta", "usage_update", "run_stats"}
+    return bool(event_type)
 
 
 class _ChatEventBuffer:
@@ -262,6 +264,7 @@ class _RemoteChatSession:
     taskflow_id: str | None = None
     provider_id: str | None = None
     model_id: str | None = None
+    client_request_id: str | None = None
     model_parameters: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
     status: str = "created"
@@ -372,6 +375,8 @@ class _RemoteChatSession:
             return
         if session_event_seq is not None:
             event["session_event_seq"] = int(session_event_seq)
+            event["last_event_seq"] = int(session_event_seq)
+            event["document_revision"] = int(session_event_seq)
 
     def wait_events(
         self, cursor: int, timeout_sec: float
@@ -921,6 +926,7 @@ class RemoteRelayHTTPService:
         taskflow_id: str | None = None,
         provider_id: str | None = None,
         model_id: str | None = None,
+        client_request_id: str | None = None,
         model_parameters: dict[str, Any] | None = None,
     ) -> _RemoteChatSession:
         self._gc_chat_sessions()
@@ -933,6 +939,7 @@ class RemoteRelayHTTPService:
             taskflow_id=taskflow_id,
             provider_id=provider_id,
             model_id=model_id,
+            client_request_id=client_request_id,
             model_parameters=dict(model_parameters or {}),
             artifact_root=self._chat_artifact_root,
             max_events=self._chat_max_events,
@@ -943,6 +950,27 @@ class RemoteRelayHTTPService:
         with self._chat_sessions_lock:
             self._chat_sessions[session.chat_id] = session
         return session
+
+    def _get_chat_session_by_request(
+        self,
+        peer_id: str,
+        session_hint: str | None,
+        client_request_id: str | None,
+    ) -> _RemoteChatSession | None:
+        request_id = str(client_request_id or "").strip()
+        if not request_id:
+            return None
+        self._gc_chat_sessions()
+        with self._chat_sessions_lock:
+            for session in self._chat_sessions.values():
+                if session.peer_id != peer_id:
+                    continue
+                if session.client_request_id != request_id:
+                    continue
+                if (session.session_hint or "") != (session_hint or ""):
+                    continue
+                return session
+        return None
 
     def set_session_trace_event_sink(
         self, sink: SessionTraceEventSink | None

@@ -52,7 +52,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionListRequest,
     SessionLoadRequest,
     SessionNewRequest,
-    SessionSnapshotRequest,
     ToolPreviewRequest,
     ToolPreviewResult,
     RelayEnvelope,
@@ -224,13 +223,14 @@ def test_remote_chat_session_flushes_pending_replayable_events_when_session_id_a
 
     assert [event["type"] for event in persisted] == [
         "chat_start",
+        "assistant_delta",
         "remote_peer_ready",
         "chat_end",
     ]
-    assert [event["session_id"] for event in persisted] == ["session-1"] * 3
+    assert [event["session_id"] for event in persisted] == ["session-1"] * 4
     event_by_type = {event["type"]: event for event in session.events}
-    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 2
-    assert event_by_type["chat_end"]["session_event_seq"] == 3
+    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 3
+    assert event_by_type["chat_end"]["session_event_seq"] == 4
 
 
 def _raw_request(
@@ -1345,8 +1345,7 @@ class TestRemoteRelayHTTPService:
                             "runtime_enabled": False,
                             "sessions_enabled": True,
                             "retention_days": 14,
-                            "snapshot_max_versions_per_session": 5,
-                            "snapshot_compress_threshold_bytes": 1024,
+                            "event_payload_compress_threshold_bytes": 1024,
                             "maintenance_interval_sec": 120,
                         },
                         "sandbox_provider": {
@@ -2517,6 +2516,62 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_chat_start_is_idempotent_for_client_request_id(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        release = threading.Event()
+        starts: list[str] = []
+
+        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+            starts.append(session.chat_id)
+            release.wait(timeout=2)
+            session.append_event("chat_end", {"response": "ok"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            payload = {
+                "peer_token": peer_token,
+                "prompt": "same request",
+                "session_hint": "session-1",
+                "client_request_id": "req-1",
+            }
+
+            _, first = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                payload,
+            )
+            _, second = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                payload,
+            )
+
+            assert second["chat_id"] == first["chat_id"]
+            deadline = time.time() + 1
+            while len(starts) < 1 and time.time() < deadline:
+                time.sleep(0.01)
+            assert len(starts) == 1
+        finally:
+            release.set()
+            service.stop()
+            relay.stop()
+
     def test_register_rejects_missing_runtime_context_when_required(self) -> None:
         relay = RelayServer()
         relay.start()
@@ -3612,12 +3667,14 @@ class TestRemoteRelayHTTPService:
                 "prompt": "hello",
                 "session_hint": "session-1",
                 "mode": "planner",
+                "client_request_id": "req-1",
             }
         ).to_dict() == {
             "peer_token": "peer-token",
             "prompt": "hello",
             "session_hint": "session-1",
             "mode": "planner",
+            "client_request_id": "req-1",
         }
         assert ChatStartRequest.from_dict(
             {
@@ -3656,26 +3713,11 @@ class TestRemoteRelayHTTPService:
                 "peer_token": "peer-token",
                 "source_session_id": "session-1",
                 "keep_through_message_index": 3,
-                "snapshot": {"version": 1},
             }
         ).to_dict() == {
             "peer_token": "peer-token",
             "source_session_id": "session-1",
             "keep_through_message_index": 3,
-            "snapshot": {"version": 1},
-        }
-        assert SessionSnapshotRequest.from_dict(
-            {
-                "peer_token": "peer-token",
-                "session_id": "session-1",
-                "snapshot": {"version": 1},
-                "snapshot_digest": "digest-1",
-            }
-        ).to_dict() == {
-            "peer_token": "peer-token",
-            "session_id": "session-1",
-            "snapshot": {"version": 1},
-            "snapshot_digest": "digest-1",
         }
 
     def test_sessions_routes_verify_peer_token_and_dispatch(self) -> None:

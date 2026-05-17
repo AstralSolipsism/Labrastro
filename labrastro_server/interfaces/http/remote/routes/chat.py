@@ -48,7 +48,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionLoadRequest,
     SessionModelSwitchRequest,
     SessionNewRequest,
-    SessionSnapshotRequest,
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
@@ -254,6 +253,20 @@ class RemoteChatRoutes:
                     "chat.start requires provider_id and model_id for a new chat session",
                 )
                 return
+        existing = self.service._get_chat_session_by_request(
+            peer_id,
+            req.session_hint,
+            req.client_request_id,
+        )
+        if existing is not None:
+            self._send_json(
+                HTTPStatus.OK,
+                ChatStartResponse(
+                    chat_id=existing.chat_id,
+                    session_id=existing.session_id,
+                ).to_dict(),
+            )
+            return
         session = self.service._create_chat_session(
             peer_id,
             req.session_hint,
@@ -262,6 +275,7 @@ class RemoteChatRoutes:
             taskflow_id=req.taskflow_id,
             provider_id=req.provider_id,
             model_id=req.model_id,
+            client_request_id=req.client_request_id,
             model_parameters=req.parameters,
         )
         session.append_event(
@@ -293,7 +307,11 @@ class RemoteChatRoutes:
 
         threading.Thread(target=_run_chat, daemon=True).start()
         self._send_json(
-            HTTPStatus.OK, ChatStartResponse(chat_id=session.chat_id).to_dict()
+            HTTPStatus.OK,
+            ChatStartResponse(
+                chat_id=session.chat_id,
+                session_id=session.session_id,
+            ).to_dict(),
         )
 
     def _handle_chat_stream(self) -> None:

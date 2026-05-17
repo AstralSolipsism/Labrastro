@@ -946,15 +946,14 @@ class RemoteAdminConfigManager:
                         400,
                     )
                 if (
-                    persistence.snapshot_max_versions_per_session < 1
-                    or persistence.snapshot_compress_threshold_bytes < 1
+                    persistence.event_payload_compress_threshold_bytes < 1
                     or persistence.maintenance_interval_sec < 1
                 ):
                     return AdminConfigResult(
                         False,
                         {
                             "error": "invalid_persistence",
-                            "message": "persistence snapshot and maintenance values must be positive",
+                            "message": "persistence event payload and maintenance values must be positive",
                         },
                         400,
                     )

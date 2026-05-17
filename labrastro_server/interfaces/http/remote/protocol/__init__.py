@@ -57,7 +57,6 @@ from labrastro_server.interfaces.http.remote.protocol.sessions import (
     SessionLoadRequest,
     SessionModelSwitchRequest,
     SessionNewRequest,
-    SessionSnapshotRequest,
 )
 from labrastro_server.interfaces.http.remote.protocol.tools import (
     CleanupRequest,
@@ -119,7 +118,6 @@ __all__ = [
     "SessionLoadRequest",
     "SessionModelSwitchRequest",
     "SessionNewRequest",
-    "SessionSnapshotRequest",
     "ToolPreviewRequest",
     "ToolPreviewResult",
     "ToolStreamChunk",

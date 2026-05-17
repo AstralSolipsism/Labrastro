@@ -63,6 +63,7 @@ class ChatStartRequest:
     peer_token: str
     prompt: str
     session_hint: str | None = None
+    client_request_id: str | None = None
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
@@ -76,6 +77,8 @@ class ChatStartRequest:
             "prompt": self.prompt,
             "session_hint": self.session_hint,
         }
+        if self.client_request_id is not None:
+            payload["client_request_id"] = self.client_request_id
         if self.mode is not None:
             payload["mode"] = self.mode
         if self.workflow_mode is not None:
@@ -97,6 +100,7 @@ class ChatStartRequest:
             peer_token=d["peer_token"],
             prompt=d["prompt"],
             session_hint=d.get("session_hint"),
+            client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
             taskflow_id=d.get("taskflow_id"),
@@ -108,14 +112,22 @@ class ChatStartRequest:
 @dataclass
 class ChatStartResponse:
     chat_id: str
+    session_id: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"chat_id": self.chat_id, "error": self.error}
+        payload: dict[str, Any] = {"chat_id": self.chat_id, "error": self.error}
+        if self.session_id is not None:
+            payload["session_id"] = self.session_id
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatStartResponse":
-        return cls(chat_id=d.get("chat_id", ""), error=d.get("error"))
+        return cls(
+            chat_id=d.get("chat_id", ""),
+            session_id=d.get("session_id") if isinstance(d.get("session_id"), str) else None,
+            error=d.get("error"),
+        )
 
 @dataclass
 class ChatStreamRequest:

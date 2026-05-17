@@ -74,7 +74,7 @@ REQUIRED_TABLES = [
     "labrastro_agent_run_sessions",
     "labrastro_agent_run_artifacts",
     "labrastro_sessions",
-    "labrastro_session_snapshots",
+    "labrastro_session_documents",
     "labrastro_taskflow_projects",
     "labrastro_taskflow_states",
     "labrastro_taskflow_events",
@@ -2100,9 +2100,9 @@ class ServerRunner:
                 model="smoke-model",
                 fingerprint="agent-run-smoke:{self.timestamp}",
             )
-            store.save_snapshot(sid, {{"turns": [{{"id": "turn-1"}}], "traceNodes": [{{"id": "node-1"}}], "traceEdges": []}})
-            snapshot, error = store.load_snapshot(sid)
-            print(json.dumps({{"session_id": sid, "snapshot_ok": snapshot is not None, "error": error}}))
+            store.save_document(sid, {{"turns": [{{"id": "turn-1"}}], "traceNodes": [{{"id": "node-1"}}], "traceEdges": []}})
+            document = store.load_document(sid)
+            print(json.dumps({{"session_id": sid, "document_ok": document is not None}}))
             """
         )
         encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
@@ -2118,25 +2118,25 @@ class ServerRunner:
             timeout=60,
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
-        if not data.get("session_id") or data.get("snapshot_ok") is not True:
+        if not data.get("session_id") or data.get("document_ok") is not True:
             raise RuntimeError(f"session persistence smoke failed: {data}")
         self.restart_host()
         session_count = self.psql(
             "SELECT count(*) FROM labrastro_sessions WHERE fingerprint='agent-run-smoke:" + self.timestamp + "'",
             database=self.db_name,
         ).stdout.strip()
-        snapshot_count = self.psql(
-            "SELECT count(*) FROM labrastro_session_snapshots WHERE session_id='" + data["session_id"] + "'",
+        document_count = self.psql(
+            "SELECT count(*) FROM labrastro_session_documents WHERE session_id='" + data["session_id"] + "'",
             database=self.db_name,
         ).stdout.strip()
-        if session_count == "0" or snapshot_count == "0":
+        if session_count == "0" or document_count == "0":
             raise RuntimeError(
-                f"session/snapshot rows missing: sessions={session_count} snapshots={snapshot_count}"
+                f"session/document rows missing: sessions={session_count} documents={document_count}"
             )
         self.report["checks"]["session_persistence"] = {
             "session_id": data["session_id"],
             "sessions": session_count,
-            "snapshots": snapshot_count,
+            "documents": document_count,
         }
         self.record_step("session_persistence", session_id=data["session_id"])
 

@@ -32,6 +32,10 @@ from reuleauxcoder.domain.config.models import (
     RuntimeProfilesConfig,
 )
 from reuleauxcoder.domain.session.models import Session, SessionRuntimeState
+from reuleauxcoder.domain.session.document import (
+    apply_session_event,
+    update_session_document_metadata,
+)
 
 TEST_AUTH_PASSWORD = "admin-password"
 from reuleauxcoder.domain.approval import ApprovalRequest
@@ -132,7 +136,7 @@ class FakeLLM:
 class MemorySessionStore:
     def __init__(self) -> None:
         self.sessions: dict[str, Session] = {}
-        self.snapshots: dict[str, dict] = {}
+        self.documents: dict[str, dict] = {}
         self._next_id = 0
 
     def generate_session_id(self) -> str:
@@ -158,7 +162,7 @@ class MemorySessionStore:
         effective_runtime = runtime_state or SessionRuntimeState(
             model=model, active_mode=active_mode
         )
-        self.sessions[session_id] = Session(
+        session = Session(
             id=session_id,
             model=effective_runtime.model or model,
             saved_at="memory",
@@ -168,6 +172,16 @@ class MemorySessionStore:
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
             runtime_state=effective_runtime,
+        )
+        self.sessions[session_id] = session
+        self.documents[session_id] = update_session_document_metadata(
+            self.documents.get(session_id),
+            session_id=session_id,
+            model=session.model,
+            saved_at=session.saved_at,
+            preview=session.get_preview(),
+            fingerprint=session.fingerprint,
+            runtime_state=effective_runtime.to_dict(),
         )
         return session_id
 
@@ -203,7 +217,8 @@ class MemorySessionStore:
         items = [
             session
             for session in items
-            if SessionStore.has_history_content(session.messages)
+            if self.documents.get(session.id, {}).get("turns")
+            or SessionStore.has_history_content(session.messages)
         ]
         return items[:limit]
 
@@ -211,20 +226,12 @@ class MemorySessionStore:
         items = self.list(limit=1, fingerprint=fingerprint)
         return items[0] if items else None
 
-    def load_snapshot(self, _session_id: str) -> tuple[dict | None, str | None]:
-        snapshot = self.snapshots.get(_session_id)
-        return (dict(snapshot), None) if snapshot is not None else (None, None)
+    def load_document(self, session_id: str) -> dict | None:
+        document = self.documents.get(session_id)
+        return json.loads(json.dumps(document)) if document is not None else None
 
-    def save_snapshot(
-        self, session_id: str, snapshot: dict, event_seq: int | None = None
-    ) -> None:
-        if event_seq is not None:
-            snapshot = {**snapshot, "eventSeq": event_seq}
-        self.snapshots[session_id] = dict(snapshot)
-
-    def load_snapshot_record(self, session_id: str) -> tuple[dict | None, str | None, int]:
-        snapshot, error = self.load_snapshot(session_id)
-        return snapshot, error, int((snapshot or {}).get("eventSeq") or 0)
+    def save_document(self, session_id: str, document: dict) -> None:
+        self.documents[session_id] = json.loads(json.dumps(document))
 
     def append_trace_event(
         self,
@@ -256,6 +263,15 @@ class MemorySessionStore:
                 "replayable": replayable,
             }
         )
+        self.documents[session_id] = apply_session_event(
+            self.documents.get(session_id),
+            session_id=session_id,
+            event_type=event_type,
+            payload=payload or {},
+            session_event_seq=seq,
+            chat_id=chat_id,
+            chat_seq=chat_seq,
+        )
         return seq
 
     def list_trace_events(
@@ -282,11 +298,8 @@ class MemorySessionStore:
     def delete_trace_events(self, session_id: str) -> bool:
         return getattr(self, "trace_events", {}).pop(session_id, None) is not None
 
-    def delete_snapshot(self, _session_id: str) -> None:
-        self.snapshots.pop(_session_id, None)
-        return None
-
     def delete(self, session_id: str) -> bool:
+        self.documents.pop(session_id, None)
         return self.sessions.pop(session_id, None) is not None
 
 
@@ -554,9 +567,6 @@ def test_switch_session_model_updates_runtime_without_transcript_pollution() -> 
     assert result["active_model"]["model_id"] == "V4PRO"
     assert result["runtime_state"]["active_model_provider"] == "deepseek"
     assert result["runtime_state"]["active_model"] == "V4PRO"
-    assert len(result["messages"]) == 1
-    assert result["messages"][0]["role"] == "user"
-    assert result["messages"][0]["content"] == "hello"
     saved = store.load("session-model")
     assert saved is not None
     assert len(saved.messages) == 1
@@ -1027,7 +1037,61 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
-    def test_runner_stream_chat_accepts_snapshot_after_ready_before_end(
+    def test_runner_stream_chat_includes_llm_diagnostic_fields_on_failure(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        port = _free_port()
+
+        def chat_behavior(_agent: FakeAgent, _prompt: str) -> str:
+            error = RuntimeError("Connection error.")
+            setattr(
+                error,
+                "llm_diagnostic_path",
+                "/app/.rcoder/diagnostics/llm_error_session.json",
+            )
+            setattr(error, "provider_error_phase", "request_start")
+            raise error
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}", chat_behavior=chat_behavior
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hello"},
+            )
+
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+            failed_events = [
+                event for event in events if event["type"] == "chat_failed"
+            ]
+
+            assert failed_events
+            payload = failed_events[0]["payload"]
+            assert payload["message"] == "Connection error."
+            assert payload["code"] == "REMOTE_CHAT_ERROR"
+            assert payload["error_type"] == "RuntimeError"
+            assert payload["provider_error_phase"] == "request_start"
+            assert payload["diagnostic_path"].endswith("llm_error_session.json")
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_stream_chat_exposes_running_document_after_ready(
         self, tmp_path: Path
     ) -> None:
         workspace = tmp_path / "workspace"
@@ -1085,23 +1149,18 @@ class TestRunnerRemoteExec:
             assert ready is not None
             session_id = ready["payload"]["session_id"]
 
-            _, snapshot_body = _json_request(
-                "POST",
-                f"{runner._relay_http_service.base_url}/remote/sessions/snapshot",
-                {
-                    "peer_token": peer_token,
-                    "session_id": session_id,
-                    "snapshot": {"version": 1, "sessionId": session_id},
-                },
-            )
-            assert snapshot_body["ok"] is True
-
             _, listed = _json_request(
                 "POST",
                 f"{runner._relay_http_service.base_url}/remote/sessions/list",
                 {"peer_token": peer_token},
             )
-            assert not any(item["id"] == session_id for item in listed["sessions"])
+            assert any(item["id"] == session_id for item in listed["sessions"])
+            _, running_doc = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/load",
+                {"peer_token": peer_token, "session_id": session_id},
+            )
+            assert running_doc["document"]["turns"][0]["userMessage"]["text"] == "hello"
 
             release.set()
             _collect_stream_events(
@@ -1318,15 +1377,12 @@ class TestRunnerRemoteExec:
             )
             assert not any(item["id"] == session_id for item in listed["sessions"])
 
-            try:
-                _json_request(
-                    "POST",
-                    f"{runner._relay_http_service.base_url}/remote/sessions/load",
-                    {"peer_token": peer_token, "session_id": session_id},
-                )
-                raise AssertionError("expected empty session placeholder to be absent")
-            except HTTPError as exc:
-                assert exc.code == 404
+            _, empty_loaded = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/load",
+                {"peer_token": peer_token, "session_id": session_id},
+            )
+            assert empty_loaded["document"]["turns"] == []
 
             _, start_body = _json_request(
                 "POST",
@@ -1360,45 +1416,14 @@ class TestRunnerRemoteExec:
             assert unchanged_list["list_etag"] == listed["list_etag"]
             assert "sessions" not in unchanged_list
 
-            snapshot = {
-                "version": 1,
-                "sessionId": session_id,
-                "turns": [{"userMessage": {"text": "hello"}, "assistantMessages": []}],
-            }
-            _, saved = _json_request(
-                "POST",
-                f"{runner._relay_http_service.base_url}/remote/sessions/snapshot",
-                {
-                    "peer_token": peer_token,
-                    "session_id": session_id,
-                    "snapshot": snapshot,
-                },
-            )
-            assert saved["ok"] is True
-            assert saved["snapshot_digest"]
-            _, saved_again = _json_request(
-                "POST",
-                f"{runner._relay_http_service.base_url}/remote/sessions/snapshot",
-                {
-                    "peer_token": peer_token,
-                    "session_id": session_id,
-                    "snapshot": snapshot,
-                    "snapshot_digest": saved["snapshot_digest"],
-                },
-            )
-            assert saved_again["ok"] is True
-            assert saved_again["unchanged"] is True
-            assert saved_again["snapshot_digest"] == saved["snapshot_digest"]
-
             _, loaded = _json_request(
                 "POST",
                 f"{runner._relay_http_service.base_url}/remote/sessions/load",
                 {"peer_token": peer_token, "session_id": session_id},
             )
             assert loaded["metadata"]["id"] == session_id
-            assert loaded["snapshot"]["turns"][0]["userMessage"]["text"] == "hello"
-            assert loaded["latest_event_seq"] >= loaded["snapshot_event_seq"]
-            assert isinstance(loaded["events_after_snapshot"], list)
+            assert loaded["document"]["turns"][0]["userMessage"]["text"] == "hello"
+            assert loaded["last_event_seq"] >= 1
 
             _, deleted = _json_request(
                 "POST",
@@ -1580,20 +1605,8 @@ class TestRunnerRemoteExec:
                 f"{runner._relay_http_service.base_url}/remote/sessions/load",
                 {"peer_token": peer_token, "session_id": source_session_id},
             )
-            assert len(loaded["messages"]) >= 2
+            assert loaded["document"]["turns"][0]["userMessage"]["text"] == "hello"
 
-            snapshot = {
-                "version": 1,
-                "sessionId": "placeholder",
-                "session": {
-                    "id": "placeholder",
-                    "kind": "fork",
-                    "parentSessionId": source_session_id,
-                    "sourceSessionId": source_session_id,
-                    "summary": "Fork summary",
-                },
-                "turns": [],
-            }
             _, forked = _json_request(
                 "POST",
                 f"{runner._relay_http_service.base_url}/remote/sessions/fork",
@@ -1601,12 +1614,11 @@ class TestRunnerRemoteExec:
                     "peer_token": peer_token,
                     "source_session_id": source_session_id,
                     "keep_through_message_index": 0,
-                    "snapshot": snapshot,
                 },
             )
             forked_session_id = forked["metadata"]["id"]
-            assert forked["messages"] == loaded["messages"][:1]
-            assert forked["snapshot"]["session"]["parentSessionId"] == source_session_id
+            assert forked["document"]["session"]["parentSessionId"] == source_session_id
+            assert forked["document"]["turns"][0]["userMessage"]["text"] == "hello"
 
             _, fork_start = _json_request(
                 "POST",

@@ -43,7 +43,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionLoadRequest,
     SessionModelSwitchRequest,
     SessionNewRequest,
-    SessionSnapshotRequest,
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
@@ -78,10 +77,6 @@ class RemoteSessionRoutes:
                 session_payload = req.to_dict()
             elif action == "fork":
                 req = SessionForkRequest.from_dict(payload)
-                peer_token = req.peer_token
-                session_payload = req.to_dict()
-            elif action == "snapshot":
-                req = SessionSnapshotRequest.from_dict(payload)
                 peer_token = req.peer_token
                 session_payload = req.to_dict()
             elif action == "model":
