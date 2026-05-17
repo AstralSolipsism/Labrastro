@@ -8,8 +8,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional
 
-from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
-
 from reuleauxcoder.domain.config.models import ProviderConfig, infer_provider_compat
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import (
@@ -29,7 +27,6 @@ from reuleauxcoder.services.llm.sanitizer import (
     DEFAULT_REASONING_REPLAY_PLACEHOLDER,
     sanitize_messages_for_llm,
 )
-from reuleauxcoder.services.providers.adapters.openai_chat import OpenAIChatProvider
 from reuleauxcoder.services.providers.manager import ProviderManager
 
 
@@ -269,8 +266,6 @@ class LLM:
             self._rebuild_provider()
         if self._provider is None:
             raise RuntimeError(self._provider_unavailable_reason)
-        if isinstance(self._provider, OpenAIChatProvider):
-            self._provider.call_with_retry = self._call_with_retry
         return self._provider
 
     def chat(
@@ -331,6 +326,7 @@ class LLM:
         params: dict[str, Any] = {}
         final_messages = list(sanitized_messages)
         final_metadata = dict(request.metadata)
+        request_started_at = time.monotonic()
 
         try:
             params = provider.build_request_params(request)
@@ -525,6 +521,9 @@ class LLM:
 
             return after_context.response or response
         except Exception as e:
+            error_params = getattr(e, "provider_request_params", None)
+            if isinstance(error_params, dict):
+                params = dict(error_params)
             diagnostic_path = persist_llm_error_diagnostic(
                 model=self.model,
                 base_url=self.base_url,
@@ -534,19 +533,11 @@ class LLM:
                 sanitized_messages=final_messages,
                 error=e,
                 metadata=final_metadata,
+                provider_id=self.provider_id,
+                provider_type=self.provider_type,
+                timeout_sec=getattr(self.provider_config, "timeout_sec", None),
+                max_retries=getattr(self.provider_config, "max_retries", None),
+                duration_ms=int((time.monotonic() - request_started_at) * 1000),
             )
             setattr(e, "llm_diagnostic_path", str(diagnostic_path))
             raise
-
-    def _call_with_retry(self, params: dict, max_retries: int | None = None):
-        """Retry OpenAI-compatible Chat Completions transient errors."""
-        retries = self.provider_config.max_retries if max_retries is None else max_retries
-        if self.client is None:
-            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        for attempt in range(retries + 1):
-            try:
-                return self.client.chat.completions.create(**params)
-            except (RateLimitError, APITimeoutError, APIConnectionError):
-                if attempt >= retries:
-                    raise
-                time.sleep(2**attempt)

@@ -234,7 +234,9 @@ CONFIG_SCHEMA = {
         "auto_migrate": "bool (default: true)",
         "runtime_enabled": "bool (default: true)",
         "sessions_enabled": "bool (default: true)",
-        "retention_days": "int (default: 0, zero keeps runtime events and snapshots forever)",
+        "retention_days": "int (default: 0, zero keeps runtime events forever)",
+        "event_payload_compress_threshold_bytes": "int (default: 262144, compress large event payloads)",
+        "maintenance_interval_sec": "int (default: 3600)",
     },
     "environment": {
         "cli_tools": {

@@ -373,6 +373,15 @@ class _FakeChunk:
         ]
 
 
+def _set_fake_call_with_retry(llm: LLM, func):
+    assert llm._provider is not None
+
+    def _wrapped(params, **_kwargs):
+        return func(params)
+
+    llm._provider.call_with_retry = _wrapped
+
+
 def test_llm_chat_applies_project_context_hook_to_provider_request(
     tmp_path, monkeypatch
 ) -> None:
@@ -396,7 +405,7 @@ def test_llm_chat_applies_project_context_hook_to_provider_request(
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
 
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
@@ -484,7 +493,7 @@ def test_llm_chat_sends_explicit_thinking_enabled_state() -> None:
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat([{"role": "user", "content": "Hi"}])
 
     assert response.content == "Hello"
@@ -509,7 +518,7 @@ def test_llm_chat_sends_explicit_thinking_disabled_state() -> None:
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat([{"role": "user", "content": "Hi"}])
 
     assert response.content == "Hello"
@@ -534,7 +543,7 @@ def test_llm_chat_omits_thinking_state_when_unset() -> None:
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat([{"role": "user", "content": "Hi"}])
 
     assert response.content == "Hello"
@@ -566,7 +575,7 @@ def test_llm_debug_trace_persists_trace_and_emits_ui_event(
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     reasoning_tokens: list[str] = []
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
@@ -625,7 +634,7 @@ def test_llm_debug_trace_can_record_raw_stream_chunks(tmp_path, monkeypatch) -> 
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
         session_id="session_test",
@@ -639,6 +648,37 @@ def test_llm_debug_trace_can_record_raw_stream_chunks(tmp_path, monkeypatch) -> 
     assert payload["stream"]["raw_chunk_count"] == 2
     assert payload["stream"]["raw_chunks"][0]["_chunk_index"] == 0
     assert payload["stream"]["raw_chunks"][0]["choices"][0]["delta"]["content"] == "Hello"
+
+
+def test_llm_chat_persists_provider_error_diagnostic_path(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test-12345678",
+        base_url="https://example.com/v1",
+    )
+
+    def _fake_call_with_retry(params):
+        error = RuntimeError("Connection error.")
+        setattr(error, "provider_error_phase", "request_start")
+        setattr(error, "provider_retry_attempts", [{"attempt": 1, "action": "raise"}])
+        setattr(error, "provider_request_params", dict(params))
+        raise error
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        llm.chat([{"role": "user", "content": "Hi"}], session_id="session_test")
+
+    diagnostic_path = getattr(exc_info.value, "llm_diagnostic_path", "")
+    assert diagnostic_path
+    payload = json.loads(open(diagnostic_path, encoding="utf-8").read())
+    assert payload["provider"]["id"] == "direct-openai-chat"
+    assert payload["provider_error"]["phase"] == "request_start"
+    assert payload["provider_error"]["retry_attempts"] == [
+        {"attempt": 1, "action": "raise"}
+    ]
+    assert payload["request"]["stream"] is True
 
 
 def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(
@@ -679,7 +719,7 @@ def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
         hook_registry=registry,
@@ -721,7 +761,7 @@ def test_llm_chat_emits_reasoning_diagnostics_for_placeholder_and_missing_stream
             ]
         )
 
-    llm._call_with_retry = _fake_call_with_retry  # type: ignore[method-assign]
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat(
         [
             {

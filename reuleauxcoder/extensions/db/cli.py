@@ -56,18 +56,13 @@ def run_db_cli(args) -> int:
         maintenance = PersistenceMaintenanceService(
             engine,
             retention_days=days,
-            snapshot_max_versions_per_session=(
-                config.persistence.snapshot_max_versions_per_session
-            ),
             interval_sec=config.persistence.maintenance_interval_sec,
         )
         result = maintenance.run_once()
         print(f"cleanup_complete retention_days={days}")
         print(
             "deleted "
-            f"snapshot_versions={result.snapshot_versions_deleted} "
-            f"snapshots={result.snapshot_retention_deleted} "
-            f"runtime_events={result.runtime_events_deleted}"
+            f"agent_run_events={result.agent_run_events_deleted}"
         )
         return 0
     print("unknown db command", file=sys.stderr)

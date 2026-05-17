@@ -1,6 +1,8 @@
 ﻿from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import APIConnectionError, BadRequestError
 
 from reuleauxcoder.domain.config.models import ProviderConfig
 from reuleauxcoder.domain.providers.models import ProviderRequest
@@ -9,7 +11,11 @@ from reuleauxcoder.services.providers.adapters.anthropic_messages import (
     convert_chat_tools_to_anthropic_tools,
     convert_messages_to_anthropic,
 )
-from reuleauxcoder.services.providers.adapters.openai_chat import OpenAIChatProvider
+from reuleauxcoder.services.providers.adapters.openai_chat import (
+    OpenAIChatProvider,
+    _DEBUG_HTTP_CHUNK_SINK,
+    _DebugHTTPTransport,
+)
 from reuleauxcoder.services.providers.adapters.openai_responses import (
     OpenAIResponsesProvider,
     convert_chat_tools_to_responses_tools,
@@ -57,6 +63,179 @@ def test_provider_manager_enriches_deepseek_v4_model_capabilities(monkeypatch) -
     assert model["max_tokens"] == 384000
     assert model["max_context_tokens"] == 1000000
     assert model["capability_source"] == "DeepSeek API Docs / Models & Pricing"
+
+
+def test_chat_provider_uses_configured_openai_client(monkeypatch) -> None:
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "reuleauxcoder.services.providers.adapters.openai_chat.OpenAI",
+        FakeOpenAI,
+    )
+
+    provider = OpenAIChatProvider(
+        ProviderConfig(
+            id="chat",
+            type="openai_chat",
+            api_key="sk-test",
+            base_url="https://api.example.test/v1",
+            headers={"X-Test": "yes"},
+            timeout_sec=9,
+            max_retries=2,
+        )
+    )
+
+    assert provider.config.timeout_sec == 9
+    assert provider.config.max_retries == 2
+    assert captured["api_key"] == "sk-test"
+    assert captured["base_url"] == "https://api.example.test/v1"
+    assert captured["timeout"] == 9
+    assert captured["default_headers"] == {"X-Test": "yes"}
+    assert isinstance(captured["http_client"], httpx.Client)
+
+
+def test_debug_http_transport_uses_incoming_request_when_wrapping_response(
+    monkeypatch,
+) -> None:
+    transport = _DebugHTTPTransport()
+    request = httpx.Request("POST", "https://api.example.test/v1/chat/completions")
+
+    def fake_handle_request(self, incoming_request):
+        assert incoming_request is request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=httpx.ByteStream(b"data: ok\n\n"),
+        )
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", fake_handle_request)
+    sink: list[dict] = []
+    token = _DEBUG_HTTP_CHUNK_SINK.set(sink)
+    try:
+        response = transport.handle_request(request)
+        assert response.request is request
+        assert b"".join(response.iter_bytes()) == b"data: ok\n\n"
+    finally:
+        _DEBUG_HTTP_CHUNK_SINK.reset(token)
+        transport.close()
+
+    assert [item["type"] for item in sink] == [
+        "request_start",
+        "response_start",
+        "response_body_chunk",
+    ]
+
+
+def test_chat_provider_retries_connection_errors_without_stream_options_downgrade() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(
+            id="chat",
+            type="openai_chat",
+            api_key="sk-test",
+            max_retries=1,
+        )
+    )
+    calls = []
+    request = httpx.Request("POST", "https://api.example.test/v1/chat/completions")
+
+    def create(**params):
+        calls.append(dict(params))
+        raise APIConnectionError(request=request)
+
+    provider.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(APIConnectionError) as exc_info:
+        provider.chat(
+            ProviderRequest(model="demo", messages=[{"role": "user", "content": "hi"}])
+        )
+
+    assert len(calls) == 2
+    assert all("stream_options" in call for call in calls)
+    attempts = getattr(exc_info.value, "provider_retry_attempts")
+    assert [item["action"] for item in attempts] == ["retry", "raise"]
+    assert not any(item.get("action") == "retry_without_stream_options" for item in attempts)
+    assert getattr(exc_info.value, "provider_error_phase") == "request_start"
+
+
+def test_chat_provider_retries_unsupported_stream_options_once() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
+    )
+    calls = []
+
+    def create(**params):
+        calls.append(dict(params))
+        if len(calls) == 1:
+            request = httpx.Request(
+                "POST", "https://api.example.test/v1/chat/completions"
+            )
+            response = httpx.Response(400, request=request)
+            raise BadRequestError(
+                "Unrecognized request argument supplied: stream_options",
+                response=response,
+                body=None,
+            )
+        return iter(
+            [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                content="ok",
+                                reasoning=None,
+                                reasoning_content=None,
+                                reasoning_details=None,
+                                tool_calls=None,
+                            )
+                        )
+                    ],
+                    usage=None,
+                )
+            ]
+        )
+
+    provider.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    response = provider.chat(
+        ProviderRequest(model="demo", messages=[{"role": "user", "content": "hi"}])
+    )
+
+    assert response.content == "ok"
+    assert "stream_options" in calls[0]
+    assert "stream_options" not in calls[1]
+    assert response.provider_extra["stream_options_enabled"] is False
+    assert response.provider_extra["retry_attempts"][0]["action"] == (
+        "retry_without_stream_options"
+    )
+
+
+def test_chat_provider_marks_stream_iteration_errors() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
+    )
+
+    class BrokenStream:
+        def __iter__(self):
+            raise RuntimeError("stream broke")
+
+    provider.call_with_retry = lambda _params, **_kwargs: BrokenStream()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        provider.chat(
+            ProviderRequest(model="demo", messages=[{"role": "user", "content": "hi"}])
+        )
+
+    assert str(exc_info.value) == "stream broke"
+    assert getattr(exc_info.value, "provider_error_phase") == "stream_iterate"
+    assert getattr(exc_info.value, "provider_request_params")["model"] == "demo"
 
 
 def test_anthropic_message_conversion_maps_tools_and_thinking() -> None:
@@ -270,7 +449,7 @@ def test_chat_provider_parses_reasoning_delta_field() -> None:
             usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2),
         ),
     ]
-    provider.call_with_retry = lambda _params: iter(events)
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
     reasoning_tokens: list[str] = []
 
     response = provider.chat(
@@ -368,7 +547,7 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
             usage=None,
         ),
     ]
-    provider.call_with_retry = lambda _params: iter(events)
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
 
     response = provider.chat(
         ProviderRequest(
@@ -424,7 +603,7 @@ def test_chat_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
             usage=None,
         )
     ]
-    provider.call_with_retry = lambda _params: iter(events)
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
 
     response = provider.chat(
         ProviderRequest(model="deepseek-demo", messages=[{"role": "user", "content": "hi"}])
@@ -465,7 +644,7 @@ def test_chat_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
             usage=None,
         )
     ]
-    provider.call_with_retry = lambda _params: iter(events)
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
 
     response = provider.chat(
         ProviderRequest(model="deepseek-demo", messages=[{"role": "user", "content": "hi"}])
@@ -593,7 +772,7 @@ def test_chat_provider_parses_deepseek_cache_usage_fields() -> None:
             ),
         )
     ]
-    provider.call_with_retry = lambda _params: iter(events)
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
 
     response = provider.chat(
         ProviderRequest(
@@ -638,7 +817,7 @@ def test_chat_provider_preserves_reasoning_details_signature() -> None:
             usage=None,
         )
     ]
-    provider.call_with_retry = lambda _params: iter(events)
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
     reasoning_tokens: list[str] = []
 
     response = provider.chat(

@@ -54,6 +54,73 @@ def _safe_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() in allowed}
 
 
+def _safe_request_headers(headers: httpx.Headers) -> dict[str, str]:
+    allowed = {
+        "accept",
+        "content-type",
+        "user-agent",
+    }
+    return {key: value for key, value in headers.items() if key.lower() in allowed}
+
+
+def _exception_summary(exc: Exception) -> dict[str, Any]:
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+    }
+
+
+def _safe_setattr(obj: Any, name: str, value: Any) -> None:
+    try:
+        setattr(obj, name, value)
+    except Exception:
+        pass
+
+
+def _attach_provider_exception_diagnostics(
+    exc: Exception,
+    *,
+    config: ProviderConfig,
+    params: dict[str, Any],
+    phase: str,
+    attempts: list[dict[str, Any]],
+    stream_options_enabled: bool,
+    debug_http_chunks: list[dict[str, Any]],
+) -> None:
+    effective_attempts = list(attempts)
+    if not effective_attempts:
+        existing_attempts = getattr(exc, "provider_retry_attempts", None)
+        if isinstance(existing_attempts, list):
+            effective_attempts = list(existing_attempts)
+    _safe_setattr(exc, "provider_id", config.id)
+    _safe_setattr(exc, "provider_type", config.type)
+    _safe_setattr(exc, "provider_base_url", config.base_url)
+    _safe_setattr(exc, "provider_timeout_sec", config.timeout_sec)
+    _safe_setattr(exc, "provider_max_retries", config.max_retries)
+    _safe_setattr(exc, "provider_error_phase", phase)
+    _safe_setattr(exc, "provider_retry_attempts", effective_attempts)
+    _safe_setattr(exc, "provider_request_params", dict(params))
+    _safe_setattr(exc, "provider_stream_options_enabled", stream_options_enabled)
+    if debug_http_chunks:
+        _safe_setattr(exc, "provider_debug_http_chunks", list(debug_http_chunks))
+
+
+def _stream_options_unsupported(exc: BadRequestError) -> bool:
+    message = str(exc).lower()
+    if "stream_options" not in message and "include_usage" not in message:
+        return False
+    unsupported_markers = (
+        "unsupported",
+        "not support",
+        "unrecognized",
+        "unknown",
+        "extra inputs",
+        "invalid",
+        "not permitted",
+    )
+    return any(marker in message for marker in unsupported_markers)
+
+
 class _DebugByteStream(httpx.SyncByteStream):
     def __init__(
         self,
@@ -82,8 +149,29 @@ class _DebugByteStream(httpx.SyncByteStream):
 
 class _DebugHTTPTransport(httpx.HTTPTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        response = super().handle_request(request)
         sink = _DEBUG_HTTP_CHUNK_SINK.get()
+        if sink is not None:
+            sink.append(
+                {
+                    "type": "request_start",
+                    "method": request.method,
+                    "url_path": request.url.path,
+                    "headers": _safe_request_headers(request.headers),
+                }
+            )
+        try:
+            response = super().handle_request(request)
+        except Exception as exc:
+            if sink is not None:
+                sink.append(
+                    {
+                        "type": "request_error",
+                        "method": request.method,
+                        "url_path": request.url.path,
+                        "error": _exception_summary(exc),
+                    }
+                )
+            raise
         if sink is None:
             return response
         sink.append(
@@ -100,7 +188,7 @@ class _DebugHTTPTransport(httpx.HTTPTransport):
             headers=response.headers,
             stream=_DebugByteStream(response.stream, sink),
             extensions=response.extensions,
-            request=response.request,
+            request=request,
         )
 
 
@@ -351,6 +439,7 @@ class OpenAIChatProvider:
         debug_stream_events: list[dict[str, Any]] = []
         debug_raw_stream_chunks: list[dict[str, Any]] = []
         debug_http_chunks: list[dict[str, Any]] = []
+        retry_attempts: list[dict[str, Any]] = []
         capture_debug_chunks = bool(request.metadata.get("llm_debug_raw_chunks"))
         debug_stream_options_enabled = False
         debug_http_token = (
@@ -361,11 +450,40 @@ class OpenAIChatProvider:
         try:
             try:
                 params["stream_options"] = {"include_usage": True}
-                stream = self.call_with_retry(params)
+                stream = self.call_with_retry(
+                    params,
+                    attempts=retry_attempts,
+                    phase="request_start",
+                )
                 debug_stream_options_enabled = True
-            except Exception:
+            except BadRequestError as exc:
+                if not _stream_options_unsupported(exc):
+                    _attach_provider_exception_diagnostics(
+                        exc,
+                        config=self.config,
+                        params=params,
+                        phase="request_start",
+                        attempts=retry_attempts,
+                        stream_options_enabled=False,
+                        debug_http_chunks=debug_http_chunks,
+                    )
+                    raise
+                retry_attempts.append(
+                    {
+                        "attempt": len(retry_attempts) + 1,
+                        "phase": "request_start",
+                        "stream_options": True,
+                        "error": _exception_summary(exc),
+                        "action": "retry_without_stream_options",
+                    }
+                )
                 params.pop("stream_options", None)
-                stream = self.call_with_retry(params)
+                stream = self.call_with_retry(
+                    params,
+                    attempts=retry_attempts,
+                    phase="request_start",
+                )
+                debug_stream_options_enabled = False
 
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -380,68 +498,80 @@ class OpenAIChatProvider:
             reasoning_signature: str | None = None
             reasoning_details_out: list[dict[str, Any]] = []
 
-            for chunk_index, chunk in enumerate(stream):
-                if capture_debug_chunks:
-                    debug_raw_stream_chunks.append(
-                        _chunk_to_debug_dict(chunk, chunk_index)
-                    )
-                if len(debug_stream_events) < MAX_DEBUG_STREAM_EVENTS:
-                    debug_stream_events.extend(_extract_stream_event(chunk))
-                    if len(debug_stream_events) > MAX_DEBUG_STREAM_EVENTS:
-                        debug_stream_events = debug_stream_events[
-                            :MAX_DEBUG_STREAM_EVENTS
-                        ]
-                usage = getattr(chunk, "usage", None)
-                if usage:
-                    prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
-                    completion_tok = getattr(usage, "completion_tokens", 0) or 0
-                    cache_read_tokens, cache_write_tokens, usage_extra = (
-                        _extract_cache_usage(usage)
-                    )
-                    cost_usd = _usage_float(usage, "cost_usd")
-                choices = getattr(chunk, "choices", None) or []
-                if not choices:
-                    continue
-                delta = choices[0].delta
-                if getattr(delta, "content", None):
-                    content_parts.append(delta.content)
-                    tokens.append(delta.content)
-                    if request.on_token is not None:
-                        request.on_token(delta.content)
-                if getattr(delta, "reasoning_content", None):
-                    reasoning_parts.append(delta.reasoning_content)
-                    if request.on_reasoning_token is not None:
-                        request.on_reasoning_token(delta.reasoning_content)
-                if getattr(delta, "reasoning", None):
-                    reasoning_parts.append(delta.reasoning)
-                    if request.on_reasoning_token is not None:
-                        request.on_reasoning_token(delta.reasoning)
-                reasoning_details = getattr(delta, "reasoning_details", None) or []
-                for detail in reasoning_details:
-                    detail_dict = _reasoning_detail_to_dict(detail)
-                    if detail_dict:
-                        reasoning_details_out.append(detail_dict)
-                    text = detail_dict.get("text")
-                    if text:
-                        reasoning_text = str(text)
-                        reasoning_parts.append(reasoning_text)
+            try:
+                for chunk_index, chunk in enumerate(stream):
+                    if capture_debug_chunks:
+                        debug_raw_stream_chunks.append(
+                            _chunk_to_debug_dict(chunk, chunk_index)
+                        )
+                    if len(debug_stream_events) < MAX_DEBUG_STREAM_EVENTS:
+                        debug_stream_events.extend(_extract_stream_event(chunk))
+                        if len(debug_stream_events) > MAX_DEBUG_STREAM_EVENTS:
+                            debug_stream_events = debug_stream_events[
+                                :MAX_DEBUG_STREAM_EVENTS
+                            ]
+                    usage = getattr(chunk, "usage", None)
+                    if usage:
+                        prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
+                        completion_tok = getattr(usage, "completion_tokens", 0) or 0
+                        cache_read_tokens, cache_write_tokens, usage_extra = (
+                            _extract_cache_usage(usage)
+                        )
+                        cost_usd = _usage_float(usage, "cost_usd")
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = choices[0].delta
+                    if getattr(delta, "content", None):
+                        content_parts.append(delta.content)
+                        tokens.append(delta.content)
+                        if request.on_token is not None:
+                            request.on_token(delta.content)
+                    if getattr(delta, "reasoning_content", None):
+                        reasoning_parts.append(delta.reasoning_content)
                         if request.on_reasoning_token is not None:
-                            request.on_reasoning_token(reasoning_text)
-                    signature = detail_dict.get("signature")
-                    if signature and reasoning_signature is None:
-                        reasoning_signature = str(signature)
-                if getattr(delta, "tool_calls", None):
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tc_map:
-                            tc_map[idx] = {"id": "", "name": "", "args": ""}
-                        if tc_delta.id:
-                            tc_map[idx]["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tc_map[idx]["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tc_map[idx]["args"] += tc_delta.function.arguments
+                            request.on_reasoning_token(delta.reasoning_content)
+                    if getattr(delta, "reasoning", None):
+                        reasoning_parts.append(delta.reasoning)
+                        if request.on_reasoning_token is not None:
+                            request.on_reasoning_token(delta.reasoning)
+                    reasoning_details = getattr(delta, "reasoning_details", None) or []
+                    for detail in reasoning_details:
+                        detail_dict = _reasoning_detail_to_dict(detail)
+                        if detail_dict:
+                            reasoning_details_out.append(detail_dict)
+                        text = detail_dict.get("text")
+                        if text:
+                            reasoning_text = str(text)
+                            reasoning_parts.append(reasoning_text)
+                            if request.on_reasoning_token is not None:
+                                request.on_reasoning_token(reasoning_text)
+                        signature = detail_dict.get("signature")
+                        if signature and reasoning_signature is None:
+                            reasoning_signature = str(signature)
+                    if getattr(delta, "tool_calls", None):
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tc_map:
+                                tc_map[idx] = {"id": "", "name": "", "args": ""}
+                            if tc_delta.id:
+                                tc_map[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tc_map[idx]["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tc_map[idx]["args"] += tc_delta.function.arguments
+            except Exception as exc:
+                _attach_provider_exception_diagnostics(
+                    exc,
+                    config=self.config,
+                    params=params,
+                    phase="stream_iterate",
+                    attempts=retry_attempts,
+                    stream_options_enabled=debug_stream_options_enabled,
+                    debug_http_chunks=debug_http_chunks,
+                )
+                raise
 
             parsed: list[ToolCall] = []
             tool_argument_diagnostics: list[dict[str, Any]] = []
@@ -482,9 +612,21 @@ class OpenAIChatProvider:
                     "debug_raw_stream_chunks": debug_raw_stream_chunks,
                     "debug_http_chunks": debug_http_chunks,
                     "stream_options_enabled": debug_stream_options_enabled,
+                    "retry_attempts": retry_attempts,
                     "tool_argument_diagnostics": tool_argument_diagnostics,
                 },
             )
+        except Exception as exc:
+            _attach_provider_exception_diagnostics(
+                exc,
+                config=self.config,
+                params=params,
+                phase=getattr(exc, "provider_error_phase", None) or "request_start",
+                attempts=retry_attempts,
+                stream_options_enabled=debug_stream_options_enabled,
+                debug_http_chunks=debug_http_chunks,
+            )
+            raise
         finally:
             if debug_http_token is not None:
                 _DEBUG_HTTP_CHUNK_SINK.reset(debug_http_token)
@@ -499,7 +641,13 @@ class OpenAIChatProvider:
             )
         )
 
-    def _call_with_retry(self, params: dict):
+    def _call_with_retry(
+        self,
+        params: dict,
+        *,
+        attempts: list[dict[str, Any]] | None = None,
+        phase: str = "request_start",
+    ):
         max_retries = self.config.max_retries
         retried_without_temperature = False
         attempt = 0
@@ -513,12 +661,45 @@ class OpenAIChatProvider:
                     and "temperature" in message
                     and "temperature" in params
                 ):
+                    if attempts is not None:
+                        attempts.append(
+                            {
+                                "attempt": len(attempts) + 1,
+                                "phase": phase,
+                                "stream_options": bool(params.get("stream_options")),
+                                "error": _exception_summary(exc),
+                                "action": "retry_without_temperature",
+                            }
+                        )
                     params.pop("temperature", None)
                     retried_without_temperature = True
                     continue
                 raise
-            except (RateLimitError, APITimeoutError, APIConnectionError):
+            except (RateLimitError, APITimeoutError, APIConnectionError) as exc:
+                record: dict[str, Any] = {
+                    "attempt": len(attempts or []) + 1,
+                    "phase": phase,
+                    "stream_options": bool(params.get("stream_options")),
+                    "error": _exception_summary(exc),
+                }
                 if attempt >= max_retries:
+                    record["action"] = "raise"
+                    if attempts is not None:
+                        attempts.append(record)
+                    _attach_provider_exception_diagnostics(
+                        exc,
+                        config=self.config,
+                        params=params,
+                        phase=phase,
+                        attempts=attempts or [record],
+                        stream_options_enabled=bool(params.get("stream_options")),
+                        debug_http_chunks=[],
+                    )
                     raise
-                time.sleep(2**attempt)
+                delay = 2**attempt
+                record["action"] = "retry"
+                record["sleep_sec"] = delay
+                if attempts is not None:
+                    attempts.append(record)
+                time.sleep(delay)
                 attempt += 1

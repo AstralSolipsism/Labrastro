@@ -1,5 +1,7 @@
 ﻿from pathlib import Path
 
+import json
+
 from reuleauxcoder.services.llm.diagnostics import (
     aggregate_tool_argument_validation_events,
     persist_llm_error_diagnostic,
@@ -49,6 +51,77 @@ def test_persist_llm_error_diagnostic_writes_json(tmp_path: Path, monkeypatch) -
     assert '"session_id": "session_test"' in content
     assert '"tool_names": [' in content
     assert '"round_index": 2' in content
+
+
+def test_persist_llm_error_diagnostic_records_cause_chain_and_provider_details(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    try:
+        try:
+            raise OSError("socket closed")
+        except OSError as cause:
+            raise RuntimeError("Connection error.") from cause
+    except RuntimeError as error:
+        setattr(error, "provider_error_phase", "request_start")
+        setattr(
+            error,
+            "provider_retry_attempts",
+            [
+                {
+                    "attempt": 1,
+                    "phase": "request_start",
+                    "error": {
+                        "type": "APIConnectionError",
+                        "message": "Connection error.",
+                    },
+                    "headers": {"Authorization": "Bearer secret-token"},
+                    "action": "raise",
+                }
+            ],
+        )
+        path = persist_llm_error_diagnostic(
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com",
+            session_id="session_test",
+            request_params={
+                "stream": True,
+                "max_tokens": 384000,
+                "stream_options": {"include_usage": True},
+                "api_key": "sk-secret",
+                "tools": [{"type": "function", "function": {"name": "write_file"}}],
+            },
+            raw_messages=[{"role": "user", "content": "hello"}],
+            sanitized_messages=[{"role": "user", "content": "hello"}],
+            error=error,
+            metadata={"Authorization": "Bearer secret-token"},
+            provider_id="deepseek",
+            provider_type="openai_chat",
+            timeout_sec=120,
+            max_retries=3,
+            duration_ms=42,
+        )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["provider"] == {
+        "id": "deepseek",
+        "type": "openai_chat",
+        "base_url": "https://api.deepseek.com",
+        "timeout_sec": 120,
+        "max_retries": 3,
+    }
+    assert payload["duration_ms"] == 42
+    assert payload["provider_error"]["phase"] == "request_start"
+    assert payload["error"]["cause_chain"][0]["type"] == "RuntimeError"
+    assert payload["error"]["cause_chain"][1]["type"] == "OSError"
+    assert "RuntimeError: Connection error." in payload["error"]["traceback"]
+    assert payload["request"]["tool_names"] == ["write_file"]
+    assert payload["metadata"]["Authorization"] == "[REDACTED]"
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "sk-secret" not in serialized
+    assert "secret-token" not in serialized
 
 
 def test_tool_argument_validation_telemetry_aggregates_by_model_tool_and_issue(

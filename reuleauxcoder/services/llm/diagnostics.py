@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,18 @@ MAX_SNAPSHOT_MESSAGES = 10
 MAX_CONTENT_CHARS = 500
 MAX_TOOL_RESULT_CHARS = 500
 MAX_ERROR_BODY_CHARS = 4000
+MAX_TRACEBACK_CHARS = 12000
 TOOL_ARGUMENT_TELEMETRY_FILE = "tool_argument_validation.jsonl"
+SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "token",
+    "password",
+    "secret",
+    "peer_token",
+    "bootstrap-token",
+)
 
 
 def snapshot_messages(
@@ -49,6 +61,114 @@ def snapshot_messages(
     return snapshot
 
 
+def _is_sensitive_key(key: Any) -> bool:
+    lower = str(key).lower()
+    return any(part in lower for part in SENSITIVE_KEY_PARTS)
+
+
+def _redact(value: Any, *, depth: int = 0) -> Any:
+    if depth > 8:
+        return repr(value)
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]" if _is_sensitive_key(key) else _redact(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact(item, depth=depth + 1) for item in value[:200]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    for method_name in ("model_dump", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _redact(method(), depth=depth + 1)
+            except Exception:
+                pass
+    return repr(value)
+
+
+def _exception_payload(exc: BaseException, *, relation: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "relation": relation,
+        "type": type(exc).__name__,
+        "module": type(exc).__module__,
+        "message": str(exc),
+    }
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        payload["status_code"] = status_code
+    code = getattr(exc, "code", None)
+    if code is not None:
+        payload["code"] = code
+    body = getattr(exc, "body", None)
+    if body is not None:
+        body_text = (
+            body if isinstance(body, str) else json.dumps(_redact(body), ensure_ascii=False)
+        )
+        payload["body"] = body_text[:MAX_ERROR_BODY_CHARS]
+    return payload
+
+
+def _cause_chain(error: Exception) -> list[dict[str, Any]]:
+    chain: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    relation = "self"
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(_exception_payload(current, relation=relation))
+        if current.__cause__ is not None:
+            current = current.__cause__
+            relation = "__cause__"
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current = current.__context__
+            relation = "__context__"
+        else:
+            current = None
+    return chain
+
+
+def _traceback_text(error: Exception) -> str:
+    text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    return text[:MAX_TRACEBACK_CHARS]
+
+
+def _request_summary(request_params: dict[str, Any]) -> dict[str, Any]:
+    tool_schemas = request_params.get("tools") or []
+    tool_names: list[str] = []
+    for tool in tool_schemas:
+        function_def = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function_def, dict):
+            name = function_def.get("name")
+            if isinstance(name, str) and name:
+                tool_names.append(name)
+    return {
+        "stream": request_params.get("stream"),
+        "temperature": request_params.get("temperature"),
+        "max_tokens": request_params.get("max_tokens"),
+        "max_output_tokens": request_params.get("max_output_tokens"),
+        "stream_options": _redact(request_params.get("stream_options")),
+        "tool_count": len(tool_schemas),
+        "tool_names": tool_names,
+        "param_keys": sorted(str(key) for key in request_params.keys()),
+    }
+
+
+def _provider_error_diagnostics(error: Exception) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    for attr, key in (
+        ("provider_error_phase", "phase"),
+        ("provider_stream_options_enabled", "stream_options_enabled"),
+        ("provider_retry_attempts", "retry_attempts"),
+        ("provider_debug_http_chunks", "http_chunks"),
+    ):
+        value = getattr(error, attr, None)
+        if value is not None:
+            diagnostics[key] = _redact(value)
+    return diagnostics
+
+
 def persist_llm_error_diagnostic(
     *,
     model: str,
@@ -59,6 +179,11 @@ def persist_llm_error_diagnostic(
     sanitized_messages: list[dict],
     error: Exception,
     metadata: dict[str, Any] | None = None,
+    provider_id: str | None = None,
+    provider_type: str | None = None,
+    timeout_sec: int | None = None,
+    max_retries: int | None = None,
+    duration_ms: int | None = None,
 ) -> Path:
     """Persist an LLM error diagnostic JSON dump and return the path."""
     diagnostics_dir = get_diagnostics_dir()
@@ -66,46 +191,50 @@ def persist_llm_error_diagnostic(
     session_slug = session_id or "no_session"
     file_path = diagnostics_dir / f"llm_error_{timestamp}_{session_slug}.json"
 
-    body = getattr(error, "body", None)
     error_payload = {
         "type": type(error).__name__,
         "message": str(error),
+        "cause_chain": _cause_chain(error),
+        "traceback": _traceback_text(error),
     }
+    body = getattr(error, "body", None)
     if body is not None:
         body_text = (
-            body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+            body if isinstance(body, str) else json.dumps(_redact(body), ensure_ascii=False)
         )
         error_payload["body"] = body_text[:MAX_ERROR_BODY_CHARS]
 
-    tool_schemas = request_params.get("tools") or []
-    tool_names: list[str] = []
-    for tool in tool_schemas:
-        function_def = tool.get("function") if isinstance(tool, dict) else None
-        if isinstance(function_def, dict):
-            name = function_def.get("name")
-            if isinstance(name, str) and name:
-                tool_names.append(name)
+    resolved_provider_id = provider_id or getattr(error, "provider_id", None)
+    resolved_provider_type = provider_type or getattr(error, "provider_type", None)
+    resolved_base_url = base_url or getattr(error, "provider_base_url", None)
+    resolved_timeout = timeout_sec or getattr(error, "provider_timeout_sec", None)
+    resolved_retries = max_retries
+    if resolved_retries is None:
+        resolved_retries = getattr(error, "provider_max_retries", None)
 
     payload = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "session_id": session_id,
         "model": model,
-        "base_url": base_url,
-        "error": error_payload,
-        "request": {
-            "stream": request_params.get("stream"),
-            "temperature": request_params.get("temperature"),
-            "max_tokens": request_params.get("max_tokens"),
-            "tool_count": len(tool_schemas),
-            "tool_names": tool_names,
+        "base_url": resolved_base_url,
+        "provider": {
+            "id": resolved_provider_id,
+            "type": resolved_provider_type,
+            "base_url": resolved_base_url,
+            "timeout_sec": resolved_timeout,
+            "max_retries": resolved_retries,
         },
+        "duration_ms": duration_ms,
+        "error": error_payload,
+        "request": _request_summary(request_params),
+        "provider_error": _provider_error_diagnostics(error),
         "messages": {
             "raw_count": len(raw_messages),
             "sanitized_count": len(sanitized_messages),
             "raw_tail": snapshot_messages(raw_messages),
             "sanitized_tail": snapshot_messages(sanitized_messages),
         },
-        "metadata": dict(metadata or {}),
+        "metadata": _redact(dict(metadata or {})),
     }
 
     file_path.write_text(
