@@ -266,6 +266,7 @@ class _RemoteChatSession:
     model_id: str | None = None
     client_request_id: str | None = None
     model_parameters: dict[str, Any] = field(default_factory=dict)
+    initial_prompt: str | None = None
     session_id: str | None = None
     status: str = "created"
     last_error: str | None = None
@@ -274,6 +275,7 @@ class _RemoteChatSession:
     seq_next: int = 1
     approval_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
     follow_up_tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    recovery_ticket: dict[str, Any] | None = None
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     cond: threading.Condition = field(default_factory=threading.Condition)
@@ -334,6 +336,10 @@ class _RemoteChatSession:
                 self.status = "cancelled"
                 reason = (payload or {}).get("reason") if isinstance(payload, dict) else None
                 self.last_error = str(reason) if reason is not None else "chat_cancelled"
+            elif event_type == "chat_interrupted":
+                self.status = "interrupted"
+                message = (payload or {}).get("message") if isinstance(payload, dict) else None
+                self.last_error = str(message) if message is not None else "provider stream interrupted"
             self.last_activity_at = time.time()
             self.cond.notify_all()
             return seq
@@ -403,7 +409,7 @@ class _RemoteChatSession:
         with self.cond:
             self.running = False
             self.done = True
-            if self.status not in {"error", "cancelled"}:
+            if self.status not in {"error", "cancelled", "interrupted"}:
                 self.status = "done"
             self.finished_at = time.time()
             self.last_activity_at = self.finished_at
@@ -458,6 +464,7 @@ class _RemoteChatSession:
                 "last_activity_at": self.last_activity_at,
                 "finished_at": self.finished_at,
                 "error": self.last_error,
+                "recovery": dict(self.recovery_ticket) if self.recovery_ticket else None,
             }
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
@@ -584,6 +591,55 @@ class _RemoteChatSession:
             "text": ticket.get("text"),
             **({"reason": ticket.get("reason")} if ticket.get("reason") else {}),
         }
+
+    def register_recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.cond:
+            ticket = {
+                "recovery_id": str(uuid.uuid4()),
+                "state": "pending",
+                "created_at": time.time(),
+                "actions": list(payload.get("recovery_actions") or ["continue", "retry"]),
+                "payload": dict(payload),
+            }
+            self.recovery_ticket = ticket
+            self.cond.notify_all()
+            return dict(ticket)
+
+    def consume_recovery(self, action: str) -> tuple[str, dict[str, Any]]:
+        normalized = action if action in {"continue", "retry"} else "continue"
+        with self.cond:
+            ticket = self.recovery_ticket
+            if ticket is None or ticket.get("state") != "pending":
+                raise ValueError("recovery_not_available")
+            actions = ticket.get("actions")
+            if isinstance(actions, list) and normalized not in actions:
+                raise ValueError("recovery_action_unavailable")
+            ticket["state"] = "consumed"
+            ticket["action"] = normalized
+            ticket["consumed_at"] = time.time()
+            prompt = self._recovery_prompt(normalized, dict(ticket.get("payload") or {}))
+            self.done = False
+            self.running = True
+            self.status = "running"
+            self.finished_at = None
+            self.last_error = None
+            self.cond.notify_all()
+            return prompt, dict(ticket)
+
+    def _recovery_prompt(self, action: str, payload: dict[str, Any]) -> str:
+        if action == "retry" and self.initial_prompt:
+            return self.initial_prompt
+        response = str(payload.get("response") or "").strip()
+        if len(response) > 4000:
+            response = response[-4000:]
+        return (
+            "<stream_recovery>\n"
+            "The previous chat response was interrupted by the provider stream.\n"
+            "Continue from the last visible assistant output without repeating completed text.\n"
+            "Last visible assistant output:\n"
+            f"{response}\n"
+            "</stream_recovery>"
+        )
 
     def register_approval(self, approval_id: str) -> None:
         with self.cond:
@@ -928,6 +984,7 @@ class RemoteRelayHTTPService:
         model_id: str | None = None,
         client_request_id: str | None = None,
         model_parameters: dict[str, Any] | None = None,
+        initial_prompt: str | None = None,
     ) -> _RemoteChatSession:
         self._gc_chat_sessions()
         session = _RemoteChatSession(
@@ -941,6 +998,7 @@ class RemoteRelayHTTPService:
             model_id=model_id,
             client_request_id=client_request_id,
             model_parameters=dict(model_parameters or {}),
+            initial_prompt=initial_prompt,
             artifact_root=self._chat_artifact_root,
             max_events=self._chat_max_events,
             max_payload_bytes=self._chat_max_payload_bytes,
@@ -1144,6 +1202,9 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/chat/status":
                     self._handle_chat_status()
+                    return
+                if parsed.path == "/remote/chat/recover":
+                    self._handle_chat_recover()
                     return
                 if parsed.path == "/remote/chat/cancel":
                     self._handle_chat_cancel()

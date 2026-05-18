@@ -23,6 +23,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatFollowUpCancelRequest,
     ChatFollowUpRequest,
     ChatFollowUpResponse,
+    ChatRecoverRequest,
+    ChatRecoverResponse,
     ChatRequest,
     ChatResponse,
     ChatStartRequest,
@@ -154,6 +156,7 @@ class RemoteChatRoutes:
                 provider_id=req.provider_id,
                 model_id=req.model_id,
                 model_parameters=req.parameters,
+                initial_prompt=req.prompt,
             )
             session.append_event(
                 "chat_start",
@@ -277,6 +280,7 @@ class RemoteChatRoutes:
             model_id=req.model_id,
             client_request_id=req.client_request_id,
             model_parameters=req.parameters,
+            initial_prompt=req.prompt,
         )
         session.append_event(
             "chat_start",
@@ -412,6 +416,64 @@ class RemoteChatRoutes:
                 ok=True,
                 followup_id=str(ticket.get("followup_id") or ""),
                 state=str(ticket.get("state") or "pending"),
+            ).to_dict(),
+        )
+
+    def _handle_chat_recover(self) -> None:
+        payload = self._read_json()
+        try:
+            req = ChatRecoverRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_recover_request")
+            return
+
+        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        if control is None:
+            return
+        peer_id, session = control
+        if self.service.stream_chat_handler is None:
+            self._send_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "chat_stream_unavailable",
+            )
+            return
+        if session.running:
+            self._send_error(HTTPStatus.CONFLICT, "chat_already_running")
+            return
+        try:
+            prompt, ticket = session.consume_recovery(req.action)
+        except ValueError as exc:
+            self._send_error(HTTPStatus.CONFLICT, str(exc) or "recovery_not_available")
+            return
+        session.append_event(
+            "chat_recovery_start",
+            {
+                "recovery_id": ticket.get("recovery_id"),
+                "action": ticket.get("action"),
+            },
+        )
+
+        def _run_recovery() -> None:
+            with self.service._get_peer_chat_lock(peer_id):
+                try:
+                    self.service.stream_chat_handler(peer_id, prompt, session)
+                except Exception as exc:
+                    payload = _stream_chat_handler_error_payload(exc)
+                    session.append_event("error", payload)
+                    session.append_event(
+                        "chat_failed",
+                        {**payload, "recoverable": False},
+                    )
+                finally:
+                    session.mark_done()
+
+        threading.Thread(target=_run_recovery, daemon=True).start()
+        self._send_json(
+            HTTPStatus.OK,
+            ChatRecoverResponse(
+                ok=True,
+                chat_id=session.chat_id,
+                state=str(ticket.get("state") or "consumed"),
             ).to_dict(),
         )
 

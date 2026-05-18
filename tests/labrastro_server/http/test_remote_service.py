@@ -2868,6 +2868,96 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_chat_recover_consumes_recovery_ticket_and_restarts_stream(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        prompts: list[str] = []
+
+        def stream_chat_handler(_peer_id: str, prompt: str, session) -> None:
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                payload = {
+                    "message": "provider stream interrupted",
+                    "response": "partial answer",
+                    "recoverable": True,
+                    "recovery_actions": ["continue", "retry"],
+                }
+                session.register_recovery(payload)
+                session.append_event("chat_interrupted", payload)
+                return
+            session.append_event("assistant_delta", {"content": " resumed"})
+            session.append_event("chat_end", {"response": "partial answer resumed"})
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            stream_chat_handler=stream_chat_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "initial"},
+            )
+            chat_id = start_body["chat_id"]
+            _, first_stream = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            )
+            assert any(event["type"] == "chat_interrupted" for event in first_stream["events"])
+
+            _, recover_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/recover",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "action": "continue",
+                },
+            )
+            assert recover_body == {
+                "ok": True,
+                "chat_id": chat_id,
+                "error": None,
+                "state": "consumed",
+            }
+
+            _, second_stream = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/stream",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "cursor": first_stream["next_cursor"],
+                    "timeout_sec": 1,
+                },
+            )
+            assert prompts[0] == "initial"
+            assert "<stream_recovery>" in prompts[1]
+            assert any(event["type"] == "chat_recovery_start" for event in second_stream["events"])
+            assert any(event["type"] == "chat_end" for event in second_stream["events"])
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_chat_stream_cursor_resume_reads_events_created_between_polls(self) -> None:
         relay = RelayServer()
         relay.start()

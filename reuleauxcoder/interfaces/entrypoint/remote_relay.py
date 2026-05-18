@@ -1185,6 +1185,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         )
         renderer = CLIRenderer(console_override=ansi_console)
         assistant_content_emitted = {"value": False}
+        chat_interrupted_emitted = {"value": False}
         active_tool_calls_by_name: dict[str, list[str]] = {}
         context_event_bus = UIEventBus()
 
@@ -1469,6 +1470,20 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         {"format": "markdown", "content": response},
                     )
                 return
+            if event.event_type == AgentEventType.PROVIDER_STREAM_INTERRUPTED:
+                remote_session.append_event("provider_stream_interrupted", event.data)
+                return
+            if event.event_type == AgentEventType.PROVIDER_STREAM_RECOVERING:
+                remote_session.append_event("provider_stream_recovering", event.data)
+                return
+            if event.event_type == AgentEventType.PROVIDER_STREAM_RECOVERED:
+                remote_session.append_event("provider_stream_recovered", event.data)
+                return
+            if event.event_type == AgentEventType.CHAT_INTERRUPTED:
+                chat_interrupted_emitted["value"] = True
+                remote_session.register_recovery(dict(event.data))
+                remote_session.append_event("chat_interrupted", event.data)
+                return
             if event.event_type == AgentEventType.TOOL_CALL_START:
                 if event.tool_name and event.tool_call_id:
                     active_tool_calls_by_name.setdefault(event.tool_name, []).append(
@@ -1550,13 +1565,14 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "chat_cancelled",
                     {"reason": getattr(remote_session, "cancel_reason", None)},
                 )
-            remote_session.append_event(
-                "chat_end",
-                {
-                    "response": result,
-                    "response_rendered": assistant_content_emitted["value"],
-                },
-            )
+            if not chat_interrupted_emitted["value"]:
+                remote_session.append_event(
+                    "chat_end",
+                    {
+                        "response": result,
+                        "response_rendered": assistant_content_emitted["value"],
+                    },
+                )
         except RemoteToolProtocolError as exc:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)

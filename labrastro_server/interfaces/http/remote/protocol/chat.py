@@ -220,6 +220,7 @@ class ChatStatusResponse:
     last_activity_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
+    recovery: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -243,6 +244,7 @@ class ChatStatusResponse:
             "last_activity_at": self.last_activity_at,
             "finished_at": self.finished_at,
             "error": self.error,
+            "recovery": dict(self.recovery) if isinstance(self.recovery, dict) else None,
         }
 
     @classmethod
@@ -270,6 +272,7 @@ class ChatStatusResponse:
             else None,
             finished_at=float(d["finished_at"]) if d.get("finished_at") is not None else None,
             error=d.get("error") if isinstance(d.get("error"), str) else None,
+            recovery=d.get("recovery") if isinstance(d.get("recovery"), dict) else None,
         )
 
 @dataclass
@@ -384,6 +387,53 @@ class ChatFollowUpResponse:
         )
 
 @dataclass
+class ChatRecoverRequest:
+    peer_token: str
+    chat_id: str
+    action: str = "continue"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "peer_token": self.peer_token,
+            "chat_id": self.chat_id,
+            "action": self.action,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatRecoverRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            chat_id=d["chat_id"],
+            action=str(d.get("action") or "continue"),
+        )
+
+@dataclass
+class ChatRecoverResponse:
+    ok: bool
+    chat_id: str
+    state: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ok": self.ok,
+            "chat_id": self.chat_id,
+            "error": self.error,
+        }
+        if self.state is not None:
+            payload["state"] = self.state
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatRecoverResponse":
+        return cls(
+            ok=bool(d.get("ok", False)),
+            chat_id=str(d.get("chat_id") or ""),
+            state=d.get("state") if isinstance(d.get("state"), str) else None,
+            error=d.get("error"),
+        )
+
+@dataclass
 class ApprovalReplyRequest:
     peer_token: str
     chat_id: str
@@ -441,6 +491,8 @@ __all__ = [
     "ChatFollowUpRequest",
     "ChatFollowUpCancelRequest",
     "ChatFollowUpResponse",
+    "ChatRecoverRequest",
+    "ChatRecoverResponse",
     "ApprovalReplyRequest",
     "ApprovalReplyResponse",
 ]
