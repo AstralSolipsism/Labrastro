@@ -38,6 +38,9 @@ class LLMResponse:
     tokens: list[str] = field(
         default_factory=list
     )  # Streamed tokens for event emission
+    stream_status: str = "completed"
+    interruption: dict | None = None
+    recovery: dict | None = None
 
     @property
     def message(self) -> dict:
@@ -64,6 +67,12 @@ class LLMResponse:
                 }
                 for tc in self.tool_calls
             ]
+        if self.stream_status != "completed":
+            msg["stream_status"] = self.stream_status
+        if self.interruption:
+            msg["interruption"] = dict(self.interruption)
+        if self.recovery:
+            msg["recovery"] = dict(self.recovery)
         return msg
 
     @property

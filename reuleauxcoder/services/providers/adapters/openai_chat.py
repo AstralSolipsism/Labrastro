@@ -29,6 +29,10 @@ from reuleauxcoder.services.providers.compat import (
     apply_openai_chat_tool_choice,
     should_omit_openai_chat_temperature,
 )
+from reuleauxcoder.services.providers.stream_supervisor import (
+    ProviderStreamInterruptedError,
+    StreamSupervisor,
+)
 from reuleauxcoder.services.providers.tool_arguments import (
     parse_provider_tool_arguments,
 )
@@ -498,124 +502,147 @@ class OpenAIChatProvider:
             reasoning_signature: str | None = None
             reasoning_details_out: list[dict[str, Any]] = []
 
-            try:
-                for chunk_index, chunk in enumerate(stream):
-                    if capture_debug_chunks:
-                        debug_raw_stream_chunks.append(
-                            _chunk_to_debug_dict(chunk, chunk_index)
+            def _build_response(
+                *,
+                stream_status: str = "completed",
+                interruption: dict[str, Any] | None = None,
+                recovery: dict[str, Any] | None = None,
+            ) -> ProviderResponse:
+                parsed: list[ToolCall] = []
+                tool_argument_diagnostics: list[dict[str, Any]] = []
+                response_diagnostics = list(diagnostics)
+                if stream_status == "completed":
+                    for idx in sorted(tc_map):
+                        raw = tc_map[idx]
+                        tool_call_id = raw.get("id") or f"tool_call_{idx}"
+                        raw_args = raw.get("args", "")
+                        tool_name = str(raw.get("name") or "")
+                        tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
+                            index=idx,
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            raw_arguments=str(raw_args),
                         )
-                    if len(debug_stream_events) < MAX_DEBUG_STREAM_EVENTS:
-                        debug_stream_events.extend(_extract_stream_event(chunk))
-                        if len(debug_stream_events) > MAX_DEBUG_STREAM_EVENTS:
-                            debug_stream_events = debug_stream_events[
-                                :MAX_DEBUG_STREAM_EVENTS
-                            ]
-                    usage = getattr(chunk, "usage", None)
-                    if usage:
-                        prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
-                        completion_tok = getattr(usage, "completion_tokens", 0) or 0
-                        cache_read_tokens, cache_write_tokens, usage_extra = (
-                            _extract_cache_usage(usage)
-                        )
-                        cost_usd = _usage_float(usage, "cost_usd")
-                    choices = getattr(chunk, "choices", None) or []
-                    if not choices:
-                        continue
-                    delta = choices[0].delta
-                    if getattr(delta, "content", None):
-                        content_parts.append(delta.content)
-                        tokens.append(delta.content)
-                        if request.on_token is not None:
-                            request.on_token(delta.content)
-                    if getattr(delta, "reasoning_content", None):
-                        reasoning_parts.append(delta.reasoning_content)
-                        if request.on_reasoning_token is not None:
-                            request.on_reasoning_token(delta.reasoning_content)
-                    if getattr(delta, "reasoning", None):
-                        reasoning_parts.append(delta.reasoning)
-                        if request.on_reasoning_token is not None:
-                            request.on_reasoning_token(delta.reasoning)
-                    reasoning_details = getattr(delta, "reasoning_details", None) or []
-                    for detail in reasoning_details:
-                        detail_dict = _reasoning_detail_to_dict(detail)
-                        if detail_dict:
-                            reasoning_details_out.append(detail_dict)
-                        text = detail_dict.get("text")
-                        if text:
-                            reasoning_text = str(text)
-                            reasoning_parts.append(reasoning_text)
-                            if request.on_reasoning_token is not None:
-                                request.on_reasoning_token(reasoning_text)
-                        signature = detail_dict.get("signature")
-                        if signature and reasoning_signature is None:
-                            reasoning_signature = str(signature)
-                    if getattr(delta, "tool_calls", None):
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in tc_map:
-                                tc_map[idx] = {"id": "", "name": "", "args": ""}
-                            if tc_delta.id:
-                                tc_map[idx]["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    tc_map[idx]["name"] = tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    tc_map[idx]["args"] += tc_delta.function.arguments
-            except Exception as exc:
-                _attach_provider_exception_diagnostics(
-                    exc,
-                    config=self.config,
-                    params=params,
-                    phase="stream_iterate",
-                    attempts=retry_attempts,
-                    stream_options_enabled=debug_stream_options_enabled,
-                    debug_http_chunks=debug_http_chunks,
+                        if diagnostic:
+                            tool_argument_diagnostics.append(diagnostic)
+                        if provider_diagnostic:
+                            response_diagnostics.append(provider_diagnostic)
+                        parsed.append(tool_call)
+                return ProviderResponse(
+                    content="".join(content_parts),
+                    reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
+                    reasoning_signature=reasoning_signature,
+                    reasoning_details=reasoning_details_out,
+                    tool_calls=parsed,
+                    prompt_tokens=prompt_tok,
+                    completion_tokens=completion_tok,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    cost_usd=cost_usd,
+                    usage_extra=usage_extra,
+                    tokens=tokens,
+                    diagnostics=response_diagnostics,
+                    stream_status=stream_status,
+                    interruption=interruption,
+                    recovery=recovery,
+                    provider_extra={
+                        "request_params": dict(params),
+                        "debug_stream_events": debug_stream_events,
+                        "debug_raw_stream_chunks": debug_raw_stream_chunks,
+                        "debug_http_chunks": debug_http_chunks,
+                        "stream_options_enabled": debug_stream_options_enabled,
+                        "retry_attempts": retry_attempts,
+                        "tool_argument_diagnostics": tool_argument_diagnostics,
+                        "stream_partial": {"has_tool_delta": bool(tc_map)},
+                    },
                 )
-                raise
 
-            parsed: list[ToolCall] = []
-            tool_argument_diagnostics: list[dict[str, Any]] = []
-            for idx in sorted(tc_map):
-                raw = tc_map[idx]
-                tool_call_id = raw.get("id") or f"tool_call_{idx}"
-                raw_args = raw.get("args", "")
-                tool_name = str(raw.get("name") or "")
-                tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
-                    index=idx,
-                    tool_call_id=tool_call_id,
-                    tool_name=tool_name,
-                    raw_arguments=str(raw_args),
-                )
-                if diagnostic:
-                    tool_argument_diagnostics.append(diagnostic)
-                if provider_diagnostic:
-                    diagnostics.append(provider_diagnostic)
-                parsed.append(tool_call)
+            def _decode_chunk(chunk_index: int, chunk: Any) -> None:
+                nonlocal prompt_tok
+                nonlocal completion_tok
+                nonlocal cache_read_tokens
+                nonlocal cache_write_tokens
+                nonlocal cost_usd
+                nonlocal usage_extra
+                nonlocal reasoning_signature
+                nonlocal debug_stream_events
+                if capture_debug_chunks:
+                    debug_raw_stream_chunks.append(
+                        _chunk_to_debug_dict(chunk, chunk_index)
+                    )
+                if len(debug_stream_events) < MAX_DEBUG_STREAM_EVENTS:
+                    debug_stream_events.extend(_extract_stream_event(chunk))
+                    if len(debug_stream_events) > MAX_DEBUG_STREAM_EVENTS:
+                        debug_stream_events = debug_stream_events[
+                            :MAX_DEBUG_STREAM_EVENTS
+                        ]
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
+                    completion_tok = getattr(usage, "completion_tokens", 0) or 0
+                    cache_read_tokens, cache_write_tokens, usage_extra = (
+                        _extract_cache_usage(usage)
+                    )
+                    cost_usd = _usage_float(usage, "cost_usd")
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    return
+                delta = choices[0].delta
+                if getattr(delta, "content", None):
+                    content_parts.append(delta.content)
+                    tokens.append(delta.content)
+                    if request.on_token is not None:
+                        request.on_token(delta.content)
+                if getattr(delta, "reasoning_content", None):
+                    reasoning_parts.append(delta.reasoning_content)
+                    if request.on_reasoning_token is not None:
+                        request.on_reasoning_token(delta.reasoning_content)
+                if getattr(delta, "reasoning", None):
+                    reasoning_parts.append(delta.reasoning)
+                    if request.on_reasoning_token is not None:
+                        request.on_reasoning_token(delta.reasoning)
+                reasoning_details = getattr(delta, "reasoning_details", None) or []
+                for detail in reasoning_details:
+                    detail_dict = _reasoning_detail_to_dict(detail)
+                    if detail_dict:
+                        reasoning_details_out.append(detail_dict)
+                    text = detail_dict.get("text")
+                    if text:
+                        reasoning_text = str(text)
+                        reasoning_parts.append(reasoning_text)
+                        if request.on_reasoning_token is not None:
+                            request.on_reasoning_token(reasoning_text)
+                    signature = detail_dict.get("signature")
+                    if signature and reasoning_signature is None:
+                        reasoning_signature = str(signature)
+                if getattr(delta, "tool_calls", None):
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tc_map:
+                            tc_map[idx] = {"id": "", "name": "", "args": ""}
+                        if tc_delta.id:
+                            tc_map[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tc_map[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tc_map[idx]["args"] += tc_delta.function.arguments
 
-            return ProviderResponse(
-                content="".join(content_parts),
-                reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
-                reasoning_signature=reasoning_signature,
-                reasoning_details=reasoning_details_out,
-                tool_calls=parsed,
-                prompt_tokens=prompt_tok,
-                completion_tokens=completion_tok,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                cost_usd=cost_usd,
-                usage_extra=usage_extra,
-                tokens=tokens,
-                diagnostics=diagnostics,
-                provider_extra={
-                    "request_params": dict(params),
-                    "debug_stream_events": debug_stream_events,
-                    "debug_raw_stream_chunks": debug_raw_stream_chunks,
-                    "debug_http_chunks": debug_http_chunks,
-                    "stream_options_enabled": debug_stream_options_enabled,
-                    "retry_attempts": retry_attempts,
-                    "tool_argument_diagnostics": tool_argument_diagnostics,
-                },
-            )
+            StreamSupervisor(
+                provider_id=self.config.id,
+                provider_type=self.config.type,
+                params=params,
+                attempts=retry_attempts,
+                stream_options_enabled=debug_stream_options_enabled,
+                debug_http_chunks=debug_http_chunks,
+                partial_response_factory=lambda: _build_response(
+                    stream_status="interrupted"
+                ),
+            ).consume(stream, _decode_chunk)
+
+            return _build_response()
+        except ProviderStreamInterruptedError:
+            raise
         except Exception as exc:
             _attach_provider_exception_diagnostics(
                 exc,

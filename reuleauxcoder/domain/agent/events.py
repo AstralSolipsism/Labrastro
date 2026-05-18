@@ -16,6 +16,10 @@ class AgentEventType(Enum):
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
+    PROVIDER_STREAM_INTERRUPTED = "provider_stream_interrupted"
+    PROVIDER_STREAM_RECOVERING = "provider_stream_recovering"
+    PROVIDER_STREAM_RECOVERED = "provider_stream_recovered"
+    CHAT_INTERRUPTED = "chat_interrupted"
     DELEGATED_RUN_COMPLETED = "delegated_run_completed"
     # User-visible context compression lifecycle events are currently emitted via
     # UIEventKind.CONTEXT so CLI, remote relay, and webview can share one UI path.
@@ -211,6 +215,34 @@ class AgentEvent:
         return cls(
             event_type=AgentEventType.ERROR,
             error_message=message,
+        )
+
+    @classmethod
+    def provider_stream_interrupted(cls, payload: dict[str, Any]) -> "AgentEvent":
+        """Create an event for a recoverable provider stream interruption."""
+        return cls(
+            event_type=AgentEventType.PROVIDER_STREAM_INTERRUPTED,
+            data=payload,
+            error_message=str(payload.get("message") or ""),
+        )
+
+    @classmethod
+    def provider_stream_recovering(cls, payload: dict[str, Any]) -> "AgentEvent":
+        """Create an event for an active provider stream recovery attempt."""
+        return cls(event_type=AgentEventType.PROVIDER_STREAM_RECOVERING, data=payload)
+
+    @classmethod
+    def provider_stream_recovered(cls, payload: dict[str, Any]) -> "AgentEvent":
+        """Create an event for a completed provider stream recovery."""
+        return cls(event_type=AgentEventType.PROVIDER_STREAM_RECOVERED, data=payload)
+
+    @classmethod
+    def chat_interrupted(cls, response: str, payload: dict[str, Any]) -> "AgentEvent":
+        """Create a terminal recoverable chat interruption event."""
+        return cls(
+            event_type=AgentEventType.CHAT_INTERRUPTED,
+            data={**payload, "response": response},
+            error_message=str(payload.get("message") or ""),
         )
 
     @classmethod

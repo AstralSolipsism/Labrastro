@@ -14,6 +14,7 @@ from reuleauxcoder.domain.providers.models import (
     ProviderResponse,
 )
 from reuleauxcoder.services.providers.compat import apply_openai_responses_qwen
+from reuleauxcoder.services.providers.stream_supervisor import StreamSupervisor
 from reuleauxcoder.services.providers.tool_arguments import (
     parse_provider_tool_arguments,
 )
@@ -260,13 +261,67 @@ class OpenAIResponsesProvider:
         usage_extra: dict[str, Any] = {}
         provider_response_id: str | None = None
 
-        for event in stream:
+        def _build_response(
+            *,
+            stream_status: str = "completed",
+            interruption: dict[str, Any] | None = None,
+            recovery: dict[str, Any] | None = None,
+        ) -> ProviderResponse:
+            parsed: list[ToolCall] = []
+            tool_argument_diagnostics: list[dict[str, Any]] = []
+            response_diagnostics = list(diagnostics)
+            if stream_status == "completed":
+                for index, raw in enumerate(tool_calls.values()):
+                    tool_call_id = raw.get("id") or f"tool_call_{len(parsed)}"
+                    tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
+                        index=index,
+                        tool_call_id=tool_call_id,
+                        tool_name=raw.get("name") or "",
+                        raw_arguments=raw.get("args") or "",
+                    )
+                    if diagnostic:
+                        tool_argument_diagnostics.append(diagnostic)
+                    if provider_diagnostic:
+                        response_diagnostics.append(provider_diagnostic)
+                    parsed.append(tool_call)
+            return ProviderResponse(
+                content="".join(content_parts),
+                reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
+                tool_calls=parsed,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                cost_usd=cost_usd,
+                usage_extra=usage_extra,
+                tokens=tokens,
+                provider_response_id=provider_response_id,
+                diagnostics=response_diagnostics,
+                stream_status=stream_status,
+                interruption=interruption,
+                recovery=recovery,
+                provider_extra={
+                    "request_params": dict(params),
+                    "debug_stream_events": debug_events,
+                    "tool_argument_diagnostics": tool_argument_diagnostics,
+                    "stream_partial": {"has_tool_delta": bool(tool_calls)},
+                },
+            )
+
+        def _decode_event(_event_index: int, event: Any) -> None:
+            nonlocal prompt_tokens
+            nonlocal completion_tokens
+            nonlocal cache_read_tokens
+            nonlocal cache_write_tokens
+            nonlocal cost_usd
+            nonlocal usage_extra
+            nonlocal provider_response_id
             event_type = getattr(event, "type", "")
             debug_events.append({"type": event_type})
             if event_type == "response.created":
                 response = getattr(event, "response", None)
                 provider_response_id = getattr(response, "id", None)
-                continue
+                return
             if event_type == "response.output_text.delta":
                 delta = str(getattr(event, "delta", "") or "")
                 if delta:
@@ -274,7 +329,7 @@ class OpenAIResponsesProvider:
                     tokens.append(delta)
                     if request.on_token is not None:
                         request.on_token(delta)
-                continue
+                return
             if event_type in {
                 "response.reasoning_text.delta",
                 "response.reasoning_summary_text.delta",
@@ -284,7 +339,7 @@ class OpenAIResponsesProvider:
                     reasoning_parts.append(delta)
                     if request.on_reasoning_token is not None:
                         request.on_reasoning_token(delta)
-                continue
+                return
             if event_type == "response.output_item.added":
                 item = getattr(event, "item", None)
                 if getattr(item, "type", None) == "function_call":
@@ -294,7 +349,7 @@ class OpenAIResponsesProvider:
                         "name": str(getattr(item, "name", "") or ""),
                         "args": str(getattr(item, "arguments", "") or ""),
                     }
-                continue
+                return
             if event_type == "response.function_call_arguments.delta":
                 item_id = str(getattr(event, "item_id", "") or getattr(event, "call_id", ""))
                 if item_id:
@@ -306,7 +361,7 @@ class OpenAIResponsesProvider:
                             "args": "",
                         },
                     )["args"] += str(getattr(event, "delta", "") or "")
-                continue
+                return
             if event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 if getattr(item, "type", None) == "function_call":
@@ -324,7 +379,7 @@ class OpenAIResponsesProvider:
                     raw["args"] = str(
                         getattr(item, "arguments", raw["args"]) or raw["args"]
                     )
-                continue
+                return
             if event_type == "response.completed":
                 response = getattr(event, "response", None)
                 provider_response_id = getattr(response, "id", provider_response_id)
@@ -340,45 +395,21 @@ class OpenAIResponsesProvider:
                         _extract_cache_usage(usage)
                     )
                     cost_usd = _usage_float(usage, "cost_usd")
-                continue
+                return
             if event_type == "error":
                 error = getattr(event, "error", None)
                 raise RuntimeError(str(getattr(error, "message", error)))
 
-        parsed: list[ToolCall] = []
-        tool_argument_diagnostics: list[dict[str, Any]] = []
-        for index, raw in enumerate(tool_calls.values()):
-            tool_call_id = raw.get("id") or f"tool_call_{len(parsed)}"
-            tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
-                index=index,
-                tool_call_id=tool_call_id,
-                tool_name=raw.get("name") or "",
-                raw_arguments=raw.get("args") or "",
-            )
-            if diagnostic:
-                tool_argument_diagnostics.append(diagnostic)
-            if provider_diagnostic:
-                diagnostics.append(provider_diagnostic)
-            parsed.append(tool_call)
-        return ProviderResponse(
-            content="".join(content_parts),
-            reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
-            tool_calls=parsed,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-            cost_usd=cost_usd,
-            usage_extra=usage_extra,
-            tokens=tokens,
-            provider_response_id=provider_response_id,
-            diagnostics=diagnostics,
-            provider_extra={
-                "request_params": dict(params),
-                "debug_stream_events": debug_events,
-                "tool_argument_diagnostics": tool_argument_diagnostics,
-            },
-        )
+        StreamSupervisor(
+            provider_id=self.config.id,
+            provider_type=self.config.type,
+            params=params,
+            partial_response_factory=lambda: _build_response(
+                stream_status="interrupted"
+            ),
+        ).consume(stream, _decode_event)
+
+        return _build_response()
 
     def test(self, *, model: str, prompt: str = "ping") -> ProviderResponse:
         return self.chat(

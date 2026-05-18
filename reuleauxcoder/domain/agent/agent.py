@@ -329,9 +329,16 @@ class Agent:
             self._emit_usage_event("error")
             raise
 
+        interrupted = bool(getattr(self._loop, "last_run_interrupted", False))
         self._emit_usage_event(
-            "cancelled" if self.stop_requested() else "done"
+            "interrupted"
+            if interrupted
+            else "cancelled" if self.stop_requested() else "done"
         )
+        if interrupted:
+            payload = getattr(self._loop, "last_interruption_payload", None) or {}
+            self._emit_event(AgentEvent.chat_interrupted(result, payload))
+            return result
         self._emit_event(
             AgentEvent.chat_end(
                 result,

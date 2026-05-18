@@ -211,6 +211,43 @@ class ProviderApiFeatures:
 
 
 @dataclass
+class StreamRecoveryConfig:
+    """Provider stream recovery policy."""
+
+    enabled: bool = True
+    max_continue_attempts: int = 1
+    retry_empty_once: bool = True
+    retry_tool_delta_once: bool = True
+    fallback_models: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "max_continue_attempts": self.max_continue_attempts,
+            "retry_empty_once": self.retry_empty_once,
+            "retry_tool_delta_once": self.retry_tool_delta_once,
+            "fallback_models": [dict(item) for item in self.fallback_models],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "StreamRecoveryConfig":
+        if not isinstance(d, dict):
+            return cls()
+        fallbacks = d.get("fallback_models")
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            max_continue_attempts=max(0, int(d.get("max_continue_attempts", 1) or 0)),
+            retry_empty_once=bool(d.get("retry_empty_once", True)),
+            retry_tool_delta_once=bool(d.get("retry_tool_delta_once", True)),
+            fallback_models=[
+                dict(item) for item in fallbacks if isinstance(item, dict)
+            ]
+            if isinstance(fallbacks, list)
+            else [],
+        )
+
+
+@dataclass
 class ProviderConfig:
     """Server-side LLM provider configuration."""
 
@@ -226,6 +263,7 @@ class ProviderConfig:
     api_features: ProviderApiFeatures = field(
         default_factory=lambda: ProviderApiFeatures.defaults_for("openai_chat")
     )
+    stream_recovery: StreamRecoveryConfig = field(default_factory=StreamRecoveryConfig)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -239,6 +277,7 @@ class ProviderConfig:
             "timeout_sec": self.timeout_sec,
             "max_retries": self.max_retries,
             "api_features": self.api_features.to_dict(),
+            "stream_recovery": self.stream_recovery.to_dict(),
             "extra": dict(self.extra),
         }
         return data
@@ -276,6 +315,7 @@ class ProviderConfig:
             api_features=ProviderApiFeatures.from_dict(
                 d.get("api_features"), provider_type=provider_type
             ),
+            stream_recovery=StreamRecoveryConfig.from_dict(d.get("stream_recovery")),
             extra=dict(raw_extra) if isinstance(raw_extra, dict) else {},
         )
 
@@ -1636,6 +1676,10 @@ class Config:
             if provider.max_retries < 0:
                 errors.append(
                     f"providers.items[{provider_id}].max_retries must be non-negative"
+                )
+            if provider.stream_recovery.max_continue_attempts < 0:
+                errors.append(
+                    f"providers.items[{provider_id}].stream_recovery.max_continue_attempts must be non-negative"
                 )
 
         if self.active_mode and self.active_mode not in self.modes:

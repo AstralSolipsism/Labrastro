@@ -681,6 +681,46 @@ def test_llm_chat_persists_provider_error_diagnostic_path(tmp_path, monkeypatch)
     assert payload["request"]["stream"] is True
 
 
+def test_llm_chat_continues_after_partial_stream_interruption(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    llm = LLM(model="demo-model", api_key="sk-test-12345678")
+    calls: list[dict] = []
+    tokens: list[str] = []
+
+    class BrokenAfterContent:
+        def __iter__(self):
+            yield _FakeChunk(content="Hello ")
+            raise RuntimeError("incomplete chunked read")
+
+    def _fake_call_with_retry(params):
+        calls.append(dict(params))
+        if len(calls) == 1:
+            return BrokenAfterContent()
+        return iter(
+            [
+                _FakeChunk(content="world"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=2, completion_tokens=1)),
+            ]
+        )
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+
+    response = llm.chat(
+        [{"role": "user", "content": "Hi"}],
+        on_token=tokens.append,
+        session_id="session_recovery",
+    )
+
+    assert response.content == "Hello world"
+    assert response.stream_status == "completed"
+    assert response.interruption["classification"] == "text_interrupted"
+    assert response.recovery["attempted"] is True
+    assert tokens == ["Hello ", "world"]
+    assert calls[1]["messages"][-1]["content"].startswith("<stream_recovery>")
+
+
 def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(
     tmp_path, monkeypatch
 ) -> None:

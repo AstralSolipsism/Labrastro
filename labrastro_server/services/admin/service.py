@@ -32,6 +32,7 @@ from reuleauxcoder.domain.config.models import (
     RuntimeProfilesConfig,
     SandboxProviderConfig,
     SkillsConfig,
+    StreamRecoveryConfig,
     ensure_default_capability_packages,
     ensure_default_environment_agent_registry,
     infer_provider_compat,
@@ -1409,6 +1410,9 @@ class RemoteAdminConfigManager:
                 "api_features": ProviderApiFeatures.from_dict(
                     _dict_field(payload, "api_features", previous),
                     provider_type=provider_type,
+                ).to_dict(),
+                "stream_recovery": StreamRecoveryConfig.from_dict(
+                    _dict_field(payload, "stream_recovery", previous)
                 ).to_dict(),
                 "extra": _dict_field(payload, "extra", previous),
             }

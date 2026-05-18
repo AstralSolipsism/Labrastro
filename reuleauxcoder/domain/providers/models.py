@@ -58,6 +58,9 @@ class ProviderResponse:
     provider_response_id: str | None = None
     provider_extra: dict[str, Any] = field(default_factory=dict)
     diagnostics: list[ProviderDiagnostic] = field(default_factory=list)
+    stream_status: str = "completed"
+    interruption: dict[str, Any] | None = None
+    recovery: dict[str, Any] | None = None
 
     def to_llm_response(self) -> LLMResponse:
         extra = dict(self.provider_extra)
@@ -78,4 +81,7 @@ class ProviderResponse:
             provider_response_id=self.provider_response_id,
             provider_extra=extra,
             tokens=list(self.tokens),
+            stream_status=self.stream_status,
+            interruption=dict(self.interruption) if self.interruption else None,
+            recovery=dict(self.recovery) if self.recovery else None,
         )

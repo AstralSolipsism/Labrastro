@@ -16,6 +16,7 @@ from reuleauxcoder.services.providers.compat import (
     apply_anthropic_reasoning_effort,
     deepseek_anthropic_budget_is_provider_managed,
 )
+from reuleauxcoder.services.providers.stream_supervisor import StreamSupervisor
 from reuleauxcoder.services.providers.tool_arguments import (
     parse_provider_tool_arguments,
 )
@@ -284,7 +285,61 @@ class AnthropicMessagesProvider:
         usage_extra: dict[str, Any] = {}
         reasoning_signature: str | None = None
 
-        for event in stream:
+        def _build_response(
+            *,
+            stream_status: str = "completed",
+            interruption: dict[str, Any] | None = None,
+            recovery: dict[str, Any] | None = None,
+        ) -> ProviderResponse:
+            parsed: list[ToolCall] = []
+            tool_argument_diagnostics: list[dict[str, Any]] = []
+            response_diagnostics = list(diagnostics)
+            if stream_status == "completed":
+                for index, raw in enumerate(tool_blocks.values()):
+                    tool_call_id = raw.get("id") or f"tool_call_{len(parsed)}"
+                    tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
+                        index=index,
+                        tool_call_id=tool_call_id,
+                        tool_name=raw.get("name") or "",
+                        raw_arguments=raw.get("args") or "",
+                    )
+                    if diagnostic:
+                        tool_argument_diagnostics.append(diagnostic)
+                    if provider_diagnostic:
+                        response_diagnostics.append(provider_diagnostic)
+                    parsed.append(tool_call)
+            return ProviderResponse(
+                content="".join(content_parts),
+                reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
+                reasoning_signature=reasoning_signature,
+                tool_calls=parsed,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                cost_usd=cost_usd,
+                usage_extra=usage_extra,
+                tokens=tokens,
+                diagnostics=response_diagnostics,
+                stream_status=stream_status,
+                interruption=interruption,
+                recovery=recovery,
+                provider_extra={
+                    "request_params": dict(params),
+                    "debug_stream_events": debug_events,
+                    "tool_argument_diagnostics": tool_argument_diagnostics,
+                    "stream_partial": {"has_tool_delta": bool(tool_blocks)},
+                },
+            )
+
+        def _decode_event(_event_index: int, event: Any) -> None:
+            nonlocal prompt_tokens
+            nonlocal completion_tokens
+            nonlocal cache_read_tokens
+            nonlocal cache_write_tokens
+            nonlocal cost_usd
+            nonlocal usage_extra
+            nonlocal reasoning_signature
             event_type = str(getattr(event, "type", "") or "")
             debug_events.append({"type": event_type})
             if event_type == "content_block_start":
@@ -296,7 +351,7 @@ class AnthropicMessagesProvider:
                         "name": str(getattr(block, "name", "") or ""),
                         "args": "",
                     }
-                continue
+                return
             if event_type == "content_block_delta":
                 index = int(getattr(event, "index", 0) or 0)
                 delta = getattr(event, "delta", None)
@@ -321,7 +376,7 @@ class AnthropicMessagesProvider:
                         index,
                         {"id": f"tool_call_{index}", "name": "", "args": ""},
                     )["args"] += str(getattr(delta, "partial_json", "") or "")
-                continue
+                return
             if event_type == "message_delta":
                 usage = getattr(event, "usage", None)
                 if usage is not None:
@@ -334,7 +389,7 @@ class AnthropicMessagesProvider:
                     )
                     cost_usd = _usage_float(usage, "cost_usd")
                     usage_extra = {"usage": _usage_dict(usage)}
-                continue
+                return
             if event_type == "message_start":
                 message = getattr(event, "message", None)
                 usage = getattr(message, "usage", None)
@@ -348,42 +403,18 @@ class AnthropicMessagesProvider:
                     )
                     cost_usd = _usage_float(usage, "cost_usd")
                     usage_extra = {"usage": _usage_dict(usage)}
-                continue
+                return
 
-        parsed: list[ToolCall] = []
-        tool_argument_diagnostics: list[dict[str, Any]] = []
-        for index, raw in enumerate(tool_blocks.values()):
-            tool_call_id = raw.get("id") or f"tool_call_{len(parsed)}"
-            tool_call, diagnostic, provider_diagnostic = parse_provider_tool_arguments(
-                index=index,
-                tool_call_id=tool_call_id,
-                tool_name=raw.get("name") or "",
-                raw_arguments=raw.get("args") or "",
-            )
-            if diagnostic:
-                tool_argument_diagnostics.append(diagnostic)
-            if provider_diagnostic:
-                diagnostics.append(provider_diagnostic)
-            parsed.append(tool_call)
-        return ProviderResponse(
-            content="".join(content_parts),
-            reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
-            reasoning_signature=reasoning_signature,
-            tool_calls=parsed,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-            cost_usd=cost_usd,
-            usage_extra=usage_extra,
-            tokens=tokens,
-            diagnostics=diagnostics,
-            provider_extra={
-                "request_params": dict(params),
-                "debug_stream_events": debug_events,
-                "tool_argument_diagnostics": tool_argument_diagnostics,
-            },
-        )
+        StreamSupervisor(
+            provider_id=self.config.id,
+            provider_type=self.config.type,
+            params=params,
+            partial_response_factory=lambda: _build_response(
+                stream_status="interrupted"
+            ),
+        ).consume(stream, _decode_event)
+
+        return _build_response()
 
     def test(self, *, model: str, prompt: str = "ping") -> ProviderResponse:
         return self.chat(

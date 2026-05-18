@@ -27,6 +27,7 @@ from reuleauxcoder.extensions.provider.manifest import (
     run_provider_record_cli,
 )
 from reuleauxcoder.services.providers.manager import ProviderManager
+from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 
 
 def test_provider_manager_enriches_deepseek_v4_model_capabilities(monkeypatch) -> None:
@@ -228,14 +229,15 @@ def test_chat_provider_marks_stream_iteration_errors() -> None:
 
     provider.call_with_retry = lambda _params, **_kwargs: BrokenStream()
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(ProviderStreamInterruptedError) as exc_info:
         provider.chat(
             ProviderRequest(model="demo", messages=[{"role": "user", "content": "hi"}])
         )
 
     assert str(exc_info.value) == "stream broke"
-    assert getattr(exc_info.value, "provider_error_phase") == "stream_iterate"
-    assert getattr(exc_info.value, "provider_request_params")["model"] == "demo"
+    assert exc_info.value.partial_response.stream_status == "interrupted"
+    assert exc_info.value.interruption["phase"] == "stream_iterate"
+    assert exc_info.value.interruption["classification"] == "empty_interrupted"
 
 
 def test_anthropic_message_conversion_maps_tools_and_thinking() -> None:

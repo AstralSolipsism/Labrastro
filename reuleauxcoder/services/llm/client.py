@@ -16,7 +16,11 @@ from reuleauxcoder.domain.hooks.types import (
     HookPoint,
 )
 from reuleauxcoder.domain.llm.models import LLMResponse
-from reuleauxcoder.domain.providers.models import ProviderDiagnostic, ProviderRequest
+from reuleauxcoder.domain.providers.models import (
+    ProviderDiagnostic,
+    ProviderRequest,
+    ProviderResponse,
+)
 from reuleauxcoder.infrastructure.fs.paths import get_diagnostics_dir
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from reuleauxcoder.services.llm.diagnostics import (
@@ -28,10 +32,15 @@ from reuleauxcoder.services.llm.sanitizer import (
     sanitize_messages_for_llm,
 )
 from reuleauxcoder.services.providers.manager import ProviderManager
+from reuleauxcoder.services.providers.stream_supervisor import (
+    ProviderStreamInterruptedError,
+    StreamRecoveryPolicy,
+)
 
 
 MAX_DEBUG_CONTENT_CHARS = 400
 MAX_DEBUG_STREAM_EVENTS = 200
+STREAM_RECOVERY_VISIBLE_LIMIT = 4000
 
 _PROVIDER_PAYLOAD_KEYS_BY_TYPE: dict[str, set[str]] = {
     "openai_chat": {"messages", "tools"},
@@ -268,6 +277,309 @@ class LLM:
             raise RuntimeError(self._provider_unavailable_reason)
         return self._provider
 
+    def _persist_stream_interruption_diagnostic(
+        self,
+        *,
+        interrupted: ProviderStreamInterruptedError,
+        params: dict[str, Any],
+        raw_messages: list[dict],
+        final_messages: list[dict],
+        final_metadata: dict[str, Any],
+        session_id: str | None,
+        started_at: float,
+    ) -> ProviderResponse:
+        partial = interrupted.partial_response
+        diagnostic_path = persist_llm_error_diagnostic(
+            model=self.model,
+            base_url=self.base_url,
+            session_id=session_id,
+            request_params=params,
+            raw_messages=raw_messages,
+            sanitized_messages=final_messages,
+            error=interrupted.original_error,
+            metadata=final_metadata,
+            provider_id=self.provider_id,
+            provider_type=self.provider_type,
+            timeout_sec=getattr(self.provider_config, "timeout_sec", None),
+            max_retries=getattr(self.provider_config, "max_retries", None),
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        interruption = dict(partial.interruption or interrupted.interruption)
+        interruption["diagnostic_path"] = str(diagnostic_path)
+        partial.interruption = interruption
+        partial.provider_extra = {
+            **dict(partial.provider_extra or {}),
+            "llm_diagnostic_path": str(diagnostic_path),
+        }
+        return partial
+
+    def _recover_interrupted_response(
+        self,
+        *,
+        provider: Any,
+        request: ProviderRequest,
+        partial: ProviderResponse,
+        policy: StreamRecoveryPolicy,
+    ) -> ProviderResponse:
+        interruption = dict(partial.interruption or {})
+        action = str(interruption.get("retry_action") or "retry")
+        partial_kind = str(interruption.get("partial_kind") or "empty")
+        if not policy.enabled:
+            partial.recovery = {
+                "attempted": False,
+                "action": action,
+                "attempt": 0,
+                "max_attempts": 0,
+                "reason": "disabled",
+            }
+            return partial
+        if action == "continue" and policy.max_continue_attempts < 1:
+            partial.recovery = {
+                "attempted": False,
+                "action": action,
+                "attempt": 0,
+                "max_attempts": 0,
+                "reason": "continue_disabled",
+            }
+            return partial
+        if action == "retry":
+            if partial_kind == "empty" and not policy.retry_empty_once:
+                return self._mark_recovery_skipped(partial, action, "empty_retry_disabled")
+            if partial_kind == "tool_call_delta" and not policy.retry_tool_delta_once:
+                return self._mark_recovery_skipped(partial, action, "tool_delta_retry_disabled")
+
+        attempts = self._recovery_attempts(policy, action)
+        last_error: str | None = None
+        for attempt_index, attempt in enumerate(attempts, start=1):
+            recovery_request = self._build_recovery_request(
+                request,
+                partial=partial,
+                action=action,
+                model=str(attempt.get("model") or request.model),
+            )
+            try:
+                attempt_provider = provider
+                fallback_provider_id = attempt.get("provider_id")
+                if attempt.get("provider_config") is not None:
+                    attempt_provider = self._provider_manager.create(
+                        attempt["provider_config"],
+                        allow_disabled=True,
+                    )
+                recovered = attempt_provider.chat(recovery_request)
+            except ProviderStreamInterruptedError as exc:
+                last_error = str(exc.original_error)
+                continue
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+            recovery = {
+                "attempted": True,
+                "action": action,
+                "attempt": attempt_index,
+                "max_attempts": len(attempts),
+                **(
+                    {"fallback_provider": fallback_provider_id}
+                    if fallback_provider_id
+                    else {}
+                ),
+                **(
+                    {"fallback_model": attempt.get("model")}
+                    if attempt.get("model") and attempt.get("model") != request.model
+                    else {}
+                ),
+            }
+            return self._merge_recovered_response(
+                partial,
+                recovered,
+                action=action,
+                recovery=recovery,
+            )
+
+        partial.recovery = {
+            "attempted": True,
+            "action": action,
+            "attempt": len(attempts),
+            "max_attempts": len(attempts),
+            "failed": True,
+            **({"error": last_error} if last_error else {}),
+        }
+        return partial
+
+    def _mark_recovery_skipped(
+        self, partial: ProviderResponse, action: str, reason: str
+    ) -> ProviderResponse:
+        partial.recovery = {
+            "attempted": False,
+            "action": action,
+            "attempt": 0,
+            "max_attempts": 0,
+            "reason": reason,
+        }
+        return partial
+
+    def _recovery_attempts(
+        self, policy: StreamRecoveryPolicy, action: str
+    ) -> list[dict[str, Any]]:
+        attempts: list[dict[str, Any]] = [{"model": self.model}]
+        if action == "continue":
+            attempts = attempts[: policy.max_continue_attempts]
+        for raw in policy.fallback_models:
+            provider_config = self._fallback_provider_config(raw)
+            attempts.append(
+                {
+                    "provider_id": raw.get("provider_id") or raw.get("provider"),
+                    "model": raw.get("model") or self.model,
+                    "provider_config": provider_config,
+                }
+            )
+        return attempts
+
+    def _fallback_provider_config(self, raw: dict[str, Any]) -> ProviderConfig | None:
+        provider_data = raw.get("provider_config")
+        if not isinstance(provider_data, dict):
+            provider_data = {
+                key: value
+                for key, value in raw.items()
+                if key
+                in {
+                    "type",
+                    "compat",
+                    "enabled",
+                    "api_key",
+                    "base_url",
+                    "headers",
+                    "timeout_sec",
+                    "max_retries",
+                    "api_features",
+                    "extra",
+                }
+            }
+        if not provider_data:
+            return None
+        provider_id = str(raw.get("provider_id") or raw.get("provider") or "stream-fallback")
+        return ProviderConfig.from_dict(provider_id, provider_data)
+
+    def _build_recovery_request(
+        self,
+        request: ProviderRequest,
+        *,
+        partial: ProviderResponse,
+        action: str,
+        model: str,
+    ) -> ProviderRequest:
+        messages = list(request.messages)
+        if action == "continue":
+            messages.append(partial.to_llm_response().message)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._continuation_prompt(partial),
+                }
+            )
+        recovery_metadata = dict(request.metadata)
+        recovery_metadata["stream_recovery"] = {
+            "action": action,
+            "partial_kind": (partial.interruption or {}).get("partial_kind"),
+        }
+        return ProviderRequest(
+            model=model,
+            messages=messages,
+            tools=list(request.tools),
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            reasoning_effort=request.reasoning_effort,
+            thinking_enabled=request.thinking_enabled,
+            tool_choice=request.tool_choice,
+            on_token=request.on_token,
+            on_reasoning_token=request.on_reasoning_token,
+            metadata=recovery_metadata,
+        )
+
+    def _continuation_prompt(self, partial: ProviderResponse) -> str:
+        visible = (partial.content or "").strip()
+        if len(visible) > STREAM_RECOVERY_VISIBLE_LIMIT:
+            visible = visible[-STREAM_RECOVERY_VISIBLE_LIMIT:]
+        return (
+            "<stream_recovery>\n"
+            "The previous provider stream was interrupted after partial assistant output.\n"
+            "Continue from the exact point after the already delivered assistant text. "
+            "Do not repeat completed text and do not mention the stream failure unless it affects the answer.\n"
+            "Already delivered assistant text:\n"
+            f"{visible}\n"
+            "</stream_recovery>"
+        )
+
+    def _merge_recovered_response(
+        self,
+        partial: ProviderResponse,
+        recovered: ProviderResponse,
+        *,
+        action: str,
+        recovery: dict[str, Any],
+    ) -> ProviderResponse:
+        if action == "continue":
+            content = f"{partial.content or ''}{recovered.content or ''}"
+            reasoning = "".join(
+                item
+                for item in [
+                    partial.reasoning_content or "",
+                    recovered.reasoning_content or "",
+                ]
+                if item
+            ) or None
+            tokens = [*partial.tokens, *recovered.tokens]
+        else:
+            content = recovered.content
+            reasoning = recovered.reasoning_content
+            tokens = list(recovered.tokens)
+        provider_extra = {
+            **dict(recovered.provider_extra or {}),
+            "stream_interruption": dict(partial.interruption or {}),
+            "stream_recovery": dict(recovery),
+        }
+        return ProviderResponse(
+            content=content,
+            reasoning_content=reasoning,
+            reasoning_signature=recovered.reasoning_signature or partial.reasoning_signature,
+            reasoning_details=[
+                *list(partial.reasoning_details),
+                *list(recovered.reasoning_details),
+            ],
+            tool_calls=list(recovered.tool_calls),
+            prompt_tokens=partial.prompt_tokens + recovered.prompt_tokens,
+            completion_tokens=partial.completion_tokens + recovered.completion_tokens,
+            cache_read_tokens=self._sum_nullable(
+                partial.cache_read_tokens, recovered.cache_read_tokens
+            ),
+            cache_write_tokens=self._sum_nullable(
+                partial.cache_write_tokens, recovered.cache_write_tokens
+            ),
+            cost_usd=self._sum_nullable_float(partial.cost_usd, recovered.cost_usd),
+            usage_extra={
+                "partial": dict(partial.usage_extra),
+                "recovered": dict(recovered.usage_extra),
+            },
+            tokens=tokens,
+            provider_response_id=recovered.provider_response_id or partial.provider_response_id,
+            provider_extra=provider_extra,
+            diagnostics=[*list(partial.diagnostics), *list(recovered.diagnostics)],
+            stream_status="completed",
+            interruption=dict(partial.interruption or {}),
+            recovery=recovery,
+        )
+
+    @staticmethod
+    def _sum_nullable(a: int | None, b: int | None) -> int | None:
+        if a is None and b is None:
+            return None
+        return (a or 0) + (b or 0)
+
+    @staticmethod
+    def _sum_nullable_float(a: float | None, b: float | None) -> float | None:
+        if a is None and b is None:
+            return None
+        return (a or 0.0) + (b or 0.0)
+
     def chat(
         self,
         messages: list[dict],
@@ -379,7 +691,24 @@ class LLM:
                 request.metadata["llm_debug_trace"] = True
                 if self.debug_raw_chunks:
                     request.metadata["llm_debug_raw_chunks"] = True
-            provider_response = provider.chat(request)
+            try:
+                provider_response = provider.chat(request)
+            except ProviderStreamInterruptedError as interrupted:
+                provider_response = self._persist_stream_interruption_diagnostic(
+                    interrupted=interrupted,
+                    params=params,
+                    raw_messages=raw_messages,
+                    final_messages=final_messages,
+                    final_metadata=final_metadata,
+                    session_id=session_id,
+                    started_at=request_started_at,
+                )
+                provider_response = self._recover_interrupted_response(
+                    provider=provider,
+                    request=request,
+                    partial=provider_response,
+                    policy=StreamRecoveryPolicy.from_config(self.provider_config),
+                )
             response = provider_response.to_llm_response()
             params = dict(response.provider_extra.get("request_params") or params)
 
@@ -454,6 +783,9 @@ class LLM:
                         "sanitized_tail": snapshot_messages(final_messages),
                     },
                     "stream": {
+                        "status": response.stream_status,
+                        "interruption": response.interruption,
+                        "recovery": response.recovery,
                         "event_count": len(debug_events),
                         "reasoning_chunks": reasoning_stream_chunks,
                         "events": debug_events,

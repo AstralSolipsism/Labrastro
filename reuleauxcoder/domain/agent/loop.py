@@ -23,6 +23,8 @@ class AgentLoop:
         self._prompt_fn = prompt_fn
         self._shell = shell_name
         self.last_response_streamed = False
+        self.last_run_interrupted = False
+        self.last_interruption_payload: dict[str, Any] | None = None
 
     def _ui_bus(self) -> Any:
         context = getattr(self.agent, "context", None)
@@ -236,8 +238,38 @@ class AgentLoop:
             )
         )
 
+    @staticmethod
+    def _stream_interruption_payload(response: "LLMResponse") -> dict[str, Any]:
+        interruption = dict(response.interruption or {})
+        recovery = dict(response.recovery or {})
+        return {
+            "stream_status": response.stream_status,
+            "recoverable": bool(interruption.get("recoverable", True)),
+            "phase": interruption.get("phase"),
+            "classification": interruption.get("classification"),
+            "partial_kind": interruption.get("partial_kind"),
+            "retry_action": interruption.get("retry_action"),
+            "message": interruption.get("message") or "provider stream interrupted",
+            "diagnostic_path": interruption.get("diagnostic_path"),
+            "recovery": recovery,
+            "recovery_actions": ["continue", "retry"],
+        }
+
+    def _emit_stream_recovery_events(self, response: "LLMResponse") -> None:
+        if not response.interruption:
+            return
+        payload = self._stream_interruption_payload(response)
+        self.agent._emit_event(AgentEvent.provider_stream_interrupted(payload))
+        recovery = payload.get("recovery")
+        if isinstance(recovery, dict) and recovery.get("attempted"):
+            self.agent._emit_event(AgentEvent.provider_stream_recovering(payload))
+            if response.stream_status == "completed" and not recovery.get("failed"):
+                self.agent._emit_event(AgentEvent.provider_stream_recovered(payload))
+
     def run(self) -> str:
         """Run the conversation loop."""
+        self.last_run_interrupted = False
+        self.last_interruption_payload = None
         # Compress if needed
         self.agent.context.maybe_compress(
             self.agent.state.messages,
@@ -285,8 +317,16 @@ class AgentLoop:
 
             self._record_response_usage(resp)
             self._emit_usage_update()
+            self._emit_stream_recovery_events(resp)
             if resp.reasoning_content and not streamed_reasoning:
                 self.agent._emit_event(AgentEvent.reasoning_token(resp.reasoning_content))
+
+            if resp.stream_status == "interrupted":
+                self.last_response_streamed = streamed_output
+                self.last_run_interrupted = True
+                self.last_interruption_payload = self._stream_interruption_payload(resp)
+                self.agent.state.messages.append(resp.message)
+                return resp.content
 
             # No tool calls -> done
             if not resp.tool_calls:
@@ -414,7 +454,13 @@ class AgentLoop:
         self.last_response_streamed = summary_streamed
         self._record_response_usage(summary_resp)
         self._emit_usage_update()
+        self._emit_stream_recovery_events(summary_resp)
         if summary_resp.reasoning_content and not summary_reasoning_streamed:
             self.agent._emit_event(AgentEvent.reasoning_token(summary_resp.reasoning_content))
+        if summary_resp.stream_status == "interrupted":
+            self.last_run_interrupted = True
+            self.last_interruption_payload = self._stream_interruption_payload(summary_resp)
+            self.agent.state.messages.append(summary_resp.message)
+            return summary_resp.content
         self.agent.state.messages.append(summary_resp.message)
         return summary_resp.content or "(reached maximum tool-call rounds)"
