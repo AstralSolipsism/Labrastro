@@ -156,6 +156,7 @@ class RemoteChatRoutes:
                 provider_id=req.provider_id,
                 model_id=req.model_id,
                 model_parameters=req.parameters,
+                locale=req.locale,
                 initial_prompt=req.prompt,
             )
             session.append_event(
@@ -167,6 +168,7 @@ class RemoteChatRoutes:
                     "taskflow_id": req.taskflow_id,
                     "provider_id": req.provider_id,
                     "model_id": req.model_id,
+                    "locale": req.locale,
                 },
             )
             session.mark_running()
@@ -280,6 +282,7 @@ class RemoteChatRoutes:
             model_id=req.model_id,
             client_request_id=req.client_request_id,
             model_parameters=req.parameters,
+            locale=req.locale,
             initial_prompt=req.prompt,
         )
         session.append_event(
@@ -291,6 +294,7 @@ class RemoteChatRoutes:
                 "taskflow_id": req.taskflow_id,
                 "provider_id": req.provider_id,
                 "model_id": req.model_id,
+                "locale": req.locale,
             },
         )
         session.mark_running()

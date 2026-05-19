@@ -266,6 +266,7 @@ class _RemoteChatSession:
     model_id: str | None = None
     client_request_id: str | None = None
     model_parameters: dict[str, Any] = field(default_factory=dict)
+    locale: str | None = None
     initial_prompt: str | None = None
     session_id: str | None = None
     status: str = "created"
@@ -984,6 +985,7 @@ class RemoteRelayHTTPService:
         model_id: str | None = None,
         client_request_id: str | None = None,
         model_parameters: dict[str, Any] | None = None,
+        locale: str | None = None,
         initial_prompt: str | None = None,
     ) -> _RemoteChatSession:
         self._gc_chat_sessions()
@@ -998,6 +1000,7 @@ class RemoteRelayHTTPService:
             model_id=model_id,
             client_request_id=client_request_id,
             model_parameters=dict(model_parameters or {}),
+            locale=locale,
             initial_prompt=initial_prompt,
             artifact_root=self._chat_artifact_root,
             max_events=self._chat_max_events,

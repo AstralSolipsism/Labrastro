@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 import inspect
@@ -34,7 +35,11 @@ from reuleauxcoder.domain.approval import (
     ApprovalRequest,
     PendingApproval,
 )
-from reuleauxcoder.domain.config.models import Config, build_agent_run_snapshot
+from reuleauxcoder.domain.config.models import (
+    Config,
+    PromptConfig,
+    build_agent_run_snapshot,
+)
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
@@ -182,6 +187,38 @@ def active_model_payload(
         "display_name": display_name or model_id,
         **dict(parameters or {}),
     }
+
+
+def _chat_locale_prompt_append(locale: str | None) -> str:
+    value = str(locale or "").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("zh"):
+        return (
+            "Language: Use Simplified Chinese for user-visible assistant replies. "
+            "Keep code, commands, paths, API names, and quoted errors unchanged."
+        )
+    return (
+        "Language: Use English for user-visible assistant replies. "
+        "Keep code, commands, paths, API names, and quoted errors unchanged."
+    )
+
+
+def _runtime_config_with_chat_locale(
+    config: Config | None,
+    locale: str | None,
+) -> Config | None:
+    append = _chat_locale_prompt_append(locale)
+    if config is None or not append:
+        return config
+
+    current_prompt = getattr(config, "prompt", None) or PromptConfig()
+    current_append = str(getattr(current_prompt, "system_append", "") or "")
+    merged_append = f"{current_append.rstrip()}\n\n{append}" if current_append.strip() else append
+    return replace(
+        config,
+        prompt=replace(current_prompt, system_append=merged_append),
+    )
 
 
 def switch_session_model(
@@ -1550,6 +1587,13 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             peer_context_manager._ui_bus = context_event_bus
         peer_agent.add_event_handler(_on_agent_event)
         peer_agent.approval_provider = _RemoteApprovalProvider()
+        previous_runtime_config = getattr(peer_agent, "runtime_config", None)
+        localized_runtime_config = _runtime_config_with_chat_locale(
+            previous_runtime_config,
+            getattr(remote_session, "locale", None),
+        )
+        if localized_runtime_config is not previous_runtime_config:
+            setattr(peer_agent, "runtime_config", localized_runtime_config)
         try:
             result = _agent_chat(
                 peer_agent,
@@ -1601,6 +1645,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             remote_session.append_event("error", failure_payload)
             remote_session.append_event("chat_failed", failure_payload)
         finally:
+            if localized_runtime_config is not previous_runtime_config:
+                setattr(peer_agent, "runtime_config", previous_runtime_config)
             if peer_context_manager is not None:
                 peer_context_manager._ui_bus = previous_context_bus
             peer_agent.approval_provider = previous_approval

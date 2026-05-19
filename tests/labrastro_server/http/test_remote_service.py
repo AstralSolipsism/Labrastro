@@ -2469,6 +2469,7 @@ class TestRemoteRelayHTTPService:
 
         def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
             seen["mode"] = session.mode
+            seen["locale"] = session.locale
             session.append_event("chat_end", {"response": "ok"})
 
         service = RemoteRelayHTTPService(
@@ -2495,6 +2496,7 @@ class TestRemoteRelayHTTPService:
                     "peer_token": peer_token,
                     "prompt": "use planner mode",
                     "mode": "planner",
+                    "locale": "zh-CN",
                 },
             )
             chat_id = start_body["chat_id"]
@@ -2512,6 +2514,7 @@ class TestRemoteRelayHTTPService:
 
             assert stream_body["done"] is True
             assert seen["mode"] == "planner"
+            assert seen["locale"] == "zh-CN"
         finally:
             service.stop()
             relay.stop()
@@ -3758,6 +3761,7 @@ class TestRemoteRelayHTTPService:
                 "session_hint": "session-1",
                 "mode": "planner",
                 "client_request_id": "req-1",
+                "locale": "zh-CN",
             }
         ).to_dict() == {
             "peer_token": "peer-token",
@@ -3765,6 +3769,7 @@ class TestRemoteRelayHTTPService:
             "session_hint": "session-1",
             "mode": "planner",
             "client_request_id": "req-1",
+            "locale": "zh-CN",
         }
         assert ChatStartRequest.from_dict(
             {

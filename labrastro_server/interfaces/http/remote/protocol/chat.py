@@ -70,6 +70,7 @@ class ChatStartRequest:
     provider_id: str | None = None
     model_id: str | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
+    locale: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -91,6 +92,8 @@ class ChatStartRequest:
             payload["model_id"] = self.model_id
         if self.parameters:
             payload["parameters"] = dict(self.parameters)
+        if self.locale is not None:
+            payload["locale"] = self.locale
         return payload
 
     @classmethod
@@ -107,6 +110,7 @@ class ChatStartRequest:
             provider_id=d.get("provider_id"),
             model_id=d.get("model_id"),
             parameters=parameters if isinstance(parameters, dict) else {},
+            locale=d.get("locale"),
         )
 
 @dataclass

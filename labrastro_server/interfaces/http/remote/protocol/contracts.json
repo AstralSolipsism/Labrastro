@@ -157,7 +157,8 @@
         "peer_token": "pt_contract",
         "prompt": "hello",
         "session_hint": "session_contract",
-        "mode": "chat"
+        "mode": "chat",
+        "locale": "zh-CN"
       },
       "response": {
         "chat_id": "chat_contract",

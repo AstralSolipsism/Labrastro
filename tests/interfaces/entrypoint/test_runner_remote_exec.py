@@ -25,6 +25,7 @@ from reuleauxcoder.domain.config.models import (
     MCPServerConfig,
     ModelProfileConfig,
     ModeConfig,
+    PromptConfig,
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
@@ -57,6 +58,8 @@ from reuleauxcoder.interfaces.entrypoint.runner import (
 )
 from reuleauxcoder.services.config.loader import ConfigValidationError
 from reuleauxcoder.interfaces.entrypoint.remote_relay import (
+    _chat_locale_prompt_append,
+    _runtime_config_with_chat_locale,
     _structured_ui_event_payload,
     _structured_ui_event_type,
     switch_session_model,
@@ -69,6 +72,37 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def test_chat_locale_prompt_append_maps_supported_locales() -> None:
+    assert _chat_locale_prompt_append("zh-CN") == (
+        "Language: Use Simplified Chinese for user-visible assistant replies. "
+        "Keep code, commands, paths, API names, and quoted errors unchanged."
+    )
+    assert _chat_locale_prompt_append("zh-Hans").startswith(
+        "Language: Use Simplified Chinese"
+    )
+    assert _chat_locale_prompt_append("en") == (
+        "Language: Use English for user-visible assistant replies. "
+        "Keep code, commands, paths, API names, and quoted errors unchanged."
+    )
+    assert _chat_locale_prompt_append("ja").startswith("Language: Use English")
+    assert _chat_locale_prompt_append(None) == ""
+
+
+def test_runtime_config_with_chat_locale_merges_prompt_without_mutating_source() -> None:
+    config = Config(prompt=PromptConfig(system_append="Use repo conventions."))
+
+    localized = _runtime_config_with_chat_locale(config, "zh-CN")
+
+    assert localized is not config
+    assert localized is not None
+    assert config.prompt.system_append == "Use repo conventions."
+    assert localized.prompt.system_append == (
+        "Use repo conventions.\n\n"
+        "Language: Use Simplified Chinese for user-visible assistant replies. "
+        "Keep code, commands, paths, API names, and quoted errors unchanged."
+    )
 
 
 def _json_request(

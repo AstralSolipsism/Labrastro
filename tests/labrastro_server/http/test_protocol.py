@@ -287,6 +287,7 @@ class TestChatStartRequest:
             mode="taskflow",
             workflow_mode="taskflow",
             taskflow_id="taskflow-1",
+            locale="zh-CN",
         )
 
         restored = ChatStartRequest.from_dict(req.to_dict())
@@ -297,6 +298,7 @@ class TestChatStartRequest:
         assert restored.mode == "taskflow"
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
+        assert restored.locale == "zh-CN"
 
     def test_serializes_canonical_taskflow_id_only(self) -> None:
         restored = ChatStartRequest.from_dict({
