@@ -158,6 +158,42 @@ func TestPreviewWriteFileDoesNotWriteAndExecuteDetectsStaleFile(t *testing.T) {
 	}
 }
 
+func TestExecuteWriteFileIgnoresPreviewMTimeWhenContentMatches(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(target, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := protocol.ToolPreviewRequest{
+		ToolName: "write_file",
+		Args: map[string]any{
+			"file_path": "notes.txt",
+			"content":   "new\n",
+		},
+	}
+	preview := Preview(req, dir)
+	if !preview.OK {
+		t.Fatalf("preview failed: %s", preview.ErrorMessage)
+	}
+	older := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(target, older, older); err != nil {
+		t.Fatal(err)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName:      "write_file",
+		Args:          req.Args,
+		ExpectedState: expectedStateFromPreview(preview),
+	}, dir, nil)
+	if !result.OK {
+		t.Fatalf("execute failed: %#v", result)
+	}
+	if got := readFileForTest(t, target); got != "new\n" {
+		t.Fatalf("execute content = %q", got)
+	}
+}
+
 func TestPreviewAndExecuteEditFileShareValidationAndState(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "main.txt")
@@ -197,6 +233,74 @@ func TestPreviewAndExecuteEditFileShareValidationAndState(t *testing.T) {
 	}
 	if got := readFileForTest(t, target); got != "omega beta\n" {
 		t.Fatalf("execute content = %q", got)
+	}
+}
+
+func TestEditFileMatchesOldStringAcrossLineEndings(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "main.txt")
+	if err := os.WriteFile(target, []byte("alpha\r\nbeta\r\ngamma\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := protocol.ToolPreviewRequest{
+		ToolName: "edit_file",
+		Args: map[string]any{
+			"file_path":  "main.txt",
+			"old_string": "alpha\nbeta",
+			"new_string": "one\ntwo",
+		},
+	}
+	preview := Preview(req, dir)
+	if !preview.OK {
+		t.Fatalf("preview failed: %s", preview.ErrorMessage)
+	}
+	if got := readFileForTest(t, target); got != "alpha\r\nbeta\r\ngamma\r\n" {
+		t.Fatalf("preview edited file, got %q", got)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName:      "edit_file",
+		Args:          req.Args,
+		ExpectedState: expectedStateFromPreview(preview),
+	}, dir, nil)
+	if !result.OK {
+		t.Fatalf("execute failed: %#v", result)
+	}
+	if got := readFileForTest(t, target); got != "one\r\ntwo\r\ngamma\r\n" {
+		t.Fatalf("execute content = %q", got)
+	}
+}
+
+func TestEditFileLineEndingFallbackPreservesSafeMatchCounts(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "main.txt")
+	if err := os.WriteFile(target, []byte("alpha\r\nbeta\r\nalpha\r\nbeta\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicate := Preview(protocol.ToolPreviewRequest{
+		ToolName: "edit_file",
+		Args: map[string]any{
+			"file_path":  "main.txt",
+			"old_string": "alpha\nbeta",
+			"new_string": "one\ntwo",
+		},
+	}, dir)
+	if duplicate.OK || !strings.Contains(duplicate.ErrorMessage, "appears 2 times") {
+		t.Fatalf("preview = %#v, want duplicate old_string error", duplicate)
+	}
+
+	missing := Preview(protocol.ToolPreviewRequest{
+		ToolName: "edit_file",
+		Args: map[string]any{
+			"file_path":  "main.txt",
+			"old_string": "missing\nbeta",
+			"new_string": "one\ntwo",
+		},
+	}, dir)
+	if missing.OK || !strings.Contains(missing.ErrorMessage, "old_string not found") {
+		t.Fatalf("preview = %#v, want missing old_string error", missing)
 	}
 }
 
@@ -492,21 +596,13 @@ func archivedPathFromResult(t *testing.T, result string) string {
 	return ""
 }
 
-func expectedStateFromPreview(preview protocol.ToolPreviewResult) map[string]any {
-	state := map[string]any{
-		"resolved_path": preview.ResolvedPath,
-		"old_sha256":    preview.OldSHA256,
+func expectedStateFromPreview(preview protocol.ToolPreviewResult) *protocol.ToolMutationPreviewState {
+	return &protocol.ToolMutationPreviewState{
+		ResolvedPath: preview.ResolvedPath,
+		OldSHA256:    preview.OldSHA256,
+		OldExists:    preview.OldExists,
+		OldSize:      preview.OldSize,
 	}
-	if preview.OldExists != nil {
-		state["old_exists"] = *preview.OldExists
-	}
-	if preview.OldSize != nil {
-		state["old_size"] = *preview.OldSize
-	}
-	if preview.OldMTimeNS != nil {
-		state["old_mtime_ns"] = *preview.OldMTimeNS
-	}
-	return state
 }
 
 func readFileForTest(t *testing.T, path string) string {

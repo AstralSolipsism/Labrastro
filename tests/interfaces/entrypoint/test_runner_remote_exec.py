@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 
 _URLOPEN = request.build_opener(request.ProxyHandler({})).open
 
-from reuleauxcoder.domain.agent.events import AgentEvent
+from reuleauxcoder.domain.agent.events import AgentEvent, ToolFailureKind
 from reuleauxcoder.domain.config.models import (
     AgentRegistryConfig,
     AuthConfig,
@@ -1953,6 +1953,94 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
+    def test_runner_remote_write_preview_failure_is_tool_denial(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        def fake_preview(self, peer_id, request, timeout_sec=None):
+            return ToolPreviewResult(
+                ok=False,
+                error_code="REMOTE_TOOL_ERROR",
+                error_message="old_string not found in demo.txt",
+            )
+
+        monkeypatch.setattr(RelayServer, "send_preview_request", fake_preview)
+        decisions: list[tuple[bool, str | None, dict]] = []
+
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            decision = agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="write_file",
+                    tool_args={"file_path": "demo.txt", "content": "host\n"},
+                    tool_source="builtin",
+                    reason="confirm write",
+                    metadata={"tool_call_id": "call-write-preview-failed"},
+                )
+            )
+            decisions.append((decision.approved, decision.reason, decision.meta))
+            return decision.reason or "missing preview failure"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=["tool_preview"],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "write"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+
+            assert decisions == [
+                (
+                    False,
+                    "Error [REMOTE_TOOL_ERROR]: old_string not found in demo.txt",
+                    {
+                        "failure_kind": ToolFailureKind.TOOL_RESULT_ERROR.value,
+                        "code": "REMOTE_TOOL_ERROR",
+                        "message": "old_string not found in demo.txt",
+                        "tool_diagnostics": [
+                            {
+                                "stage": "preview",
+                                "kind": "tool_result_error",
+                                "severity": "error",
+                                "code": "REMOTE_TOOL_ERROR",
+                                "message": "old_string not found in demo.txt",
+                                "repairable": True,
+                                "tool_name": "write_file",
+                                "tool_call_id": "call-write-preview-failed",
+                            }
+                        ],
+                    },
+                )
+            ]
+            assert not any(event["type"] == "approval_request" for event in events)
+            assert not any(
+                event["type"] == "tool_call_protocol_error" for event in events
+            )
+            assert not any(event["type"] == "chat_failed" for event in events)
+            assert any(
+                event["type"] == "chat_end"
+                and event["payload"].get("response")
+                == "Error [REMOTE_TOOL_ERROR]: old_string not found in demo.txt"
+                for event in events
+            )
+        finally:
+            runner.cleanup(ctx.agent)
+
     def test_runner_remote_write_approval_requires_peer_preview_capability(
         self, tmp_path: Path
     ) -> None:
@@ -2002,6 +2090,9 @@ class TestRunnerRemoteExec:
             assert payload["tool_name"] == "write_file"
             assert payload["tool_call_id"] == "call-write-1"
             assert payload["code"] == "REMOTE_PREVIEW_REQUIRED"
+            assert payload["failure_kind"] == ToolFailureKind.TOOL_PROTOCOL_ERROR.value
+            assert payload["tool_diagnostics"][0]["stage"] == "protocol"
+            assert payload["tool_diagnostics"][0]["kind"] == "tool_protocol_error"
             assert any(event["type"] == "error" for event in events)
             failed_events = [
                 event for event in events if event["type"] == "chat_failed"
@@ -2062,10 +2153,16 @@ class TestRunnerRemoteExec:
                 event for event in events if event["type"] == "tool_call_protocol_error"
             ]
             assert protocol_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
+            assert (
+                protocol_events[0]["payload"]["failure_kind"]
+                == ToolFailureKind.TOOL_PROTOCOL_ERROR.value
+            )
+            assert protocol_events[0]["payload"]["tool_diagnostics"][0]["stage"] == "protocol"
             failed_events = [
                 event for event in events if event["type"] == "chat_failed"
             ]
             assert failed_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
+            assert failed_events[0]["payload"]["tool_diagnostics"][0]["stage"] == "chat"
         finally:
             runner.cleanup(ctx.agent)
 

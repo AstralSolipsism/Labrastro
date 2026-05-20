@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from reuleauxcoder.domain.agent.tool_diagnostics import diagnostic_to_dict
 from reuleauxcoder.infrastructure.fs.paths import get_diagnostics_dir
 
 
@@ -16,7 +17,7 @@ MAX_CONTENT_CHARS = 500
 MAX_TOOL_RESULT_CHARS = 500
 MAX_ERROR_BODY_CHARS = 4000
 MAX_TRACEBACK_CHARS = 12000
-TOOL_ARGUMENT_TELEMETRY_FILE = "tool_argument_validation.jsonl"
+TOOL_DIAGNOSTICS_FILE = "tool_diagnostics.jsonl"
 SENSITIVE_KEY_PARTS = (
     "api_key",
     "apikey",
@@ -243,159 +244,154 @@ def persist_llm_error_diagnostic(
     return file_path
 
 
-def persist_tool_argument_validation_event(
+def persist_tool_diagnostic_event(
     *,
-    validation: Any,
+    diagnostics: list[Any],
     metadata: dict[str, Any] | None = None,
+    validation: Any | None = None,
 ) -> Path:
-    """Append a tool-argument validation telemetry event as JSONL."""
+    """Append a normalized tool diagnostic event as JSONL."""
     diagnostics_dir = get_diagnostics_dir()
-    file_path = diagnostics_dir / TOOL_ARGUMENT_TELEMETRY_FILE
-    validation_payload = (
-        validation.to_dict() if hasattr(validation, "to_dict") else dict(validation)
-    )
-    payload = {
+    file_path = diagnostics_dir / TOOL_DIAGNOSTICS_FILE
+    payload: dict[str, Any] = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "metadata": dict(metadata or {}),
-        "validation": validation_payload,
+        "metadata": _redact(dict(metadata or {})),
+        "diagnostics": [diagnostic_to_dict(item) for item in diagnostics],
     }
+    if validation is not None:
+        payload["validation"] = (
+            validation.to_dict() if hasattr(validation, "to_dict") else dict(validation)
+        )
     with file_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
     return file_path
 
 
-def aggregate_tool_argument_validation_events(
+def aggregate_tool_diagnostic_events(
     path: Path | None = None,
 ) -> dict[str, int]:
-    """Aggregate validation events by model/tool/problem/action/final status."""
-    source = path or (get_diagnostics_dir() / TOOL_ARGUMENT_TELEMETRY_FILE)
+    """Aggregate tool diagnostics by model/tool/stage/kind/action/final status."""
+    source = path or (get_diagnostics_dir() / TOOL_DIAGNOSTICS_FILE)
     counts: dict[str, int] = {}
     if not source.exists():
         return counts
-    for line in source.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        metadata = event.get("metadata") if isinstance(event, dict) else {}
-        validation = event.get("validation") if isinstance(event, dict) else {}
-        if not isinstance(metadata, dict) or not isinstance(validation, dict):
-            continue
+    for event in _iter_tool_diagnostic_events(source):
+        metadata = event["metadata"]
+        validation = event.get("validation") if isinstance(event.get("validation"), dict) else {}
         model = str(metadata.get("model") or "unknown")
         tool = str(metadata.get("tool") or validation.get("tool_name") or "unknown")
-        final_valid = str(bool(validation.get("final_valid"))).lower()
-        _inc(counts, f"model={model}|tool={tool}|final_valid={final_valid}")
-        for issue in validation.get("initial_issues") or []:
-            if isinstance(issue, dict):
+        if validation:
+            final_valid = str(bool(validation.get("final_valid"))).lower()
+            _inc(counts, f"model={model}|tool={tool}|final_valid={final_valid}")
+        for diagnostic in event["diagnostics"]:
+            stage = str(diagnostic.get("stage") or "unknown")
+            kind = str(diagnostic.get("kind") or "unknown")
+            code = str(diagnostic.get("code") or "unknown")
+            action = str(diagnostic.get("action") or diagnostic.get("code") or "unknown")
+            path_value = str(diagnostic.get("path") or "$")
+            _inc(counts, f"diagnostic|model={model}|tool={tool}|stage={stage}|kind={kind}|code={code}")
+            if kind == "repair_applied":
                 _inc(
                     counts,
-                    "issue|"
-                    f"model={model}|tool={tool}|code={issue.get('code')}|path={issue.get('path')}",
+                    f"repair|model={model}|tool={tool}|stage={stage}|action={action}|path={path_value}",
                 )
-        for repair in validation.get("repairs") or []:
-            if isinstance(repair, dict):
+            else:
                 _inc(
                     counts,
-                    "repair|"
-                    f"model={model}|tool={tool}|action={repair.get('action')}|path={repair.get('path')}",
+                    f"issue|model={model}|tool={tool}|stage={stage}|kind={kind}|code={code}|path={path_value}",
                 )
     return counts
 
 
-def summarize_tool_argument_validation_events(
+def summarize_tool_diagnostic_events(
     path: Path | None = None,
     *,
     recent_limit: int = 20,
 ) -> dict[str, Any]:
-    """Return UI-friendly tool-argument validation telemetry statistics."""
-    source = path or (get_diagnostics_dir() / TOOL_ARGUMENT_TELEMETRY_FILE)
+    """Return UI-friendly tool lifecycle diagnostic statistics."""
+    source = path or (get_diagnostics_dir() / TOOL_DIAGNOSTICS_FILE)
     if not source.exists():
-        return _empty_tool_argument_validation_summary(source)
+        return _empty_tool_diagnostic_summary(source)
 
     by_model: dict[str, dict[str, Any]] = {}
     by_tool: dict[str, dict[str, Any]] = {}
-    issues: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    repairs: dict[tuple[str, str, str], dict[str, Any]] = {}
+    by_stage: dict[str, dict[str, Any]] = {}
+    by_kind: dict[str, dict[str, Any]] = {}
+    issues: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    repairs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     recent: list[dict[str, Any]] = []
     event_count = 0
-    invalid_count = 0
+    diagnostic_count = 0
+    error_count = 0
+    warning_count = 0
     repaired_count = 0
 
-    for line in source.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        metadata = event.get("metadata")
-        validation = event.get("validation")
-        if not isinstance(metadata, dict) or not isinstance(validation, dict):
-            continue
+    for event in _iter_tool_diagnostic_events(source):
         event_count += 1
+        metadata = event["metadata"]
+        validation = event.get("validation") if isinstance(event.get("validation"), dict) else {}
         model = str(metadata.get("model") or "unknown")
         tool = str(metadata.get("tool") or validation.get("tool_name") or "unknown")
         provider = str(metadata.get("provider_id") or "")
         compat = str(metadata.get("compat") or "")
-        final_valid = bool(validation.get("final_valid"))
-        repair_items = [item for item in validation.get("repairs") or [] if isinstance(item, dict)]
-        issue_items = [
-            item
-            for item in [
-                *(validation.get("initial_issues") or []),
-                *(validation.get("final_issues") or []),
-            ]
-            if isinstance(item, dict)
-        ]
-        if not final_valid:
-            invalid_count += 1
-        if repair_items:
+        diagnostics = event["diagnostics"]
+        has_repair = any(item.get("kind") == "repair_applied" for item in diagnostics)
+        has_error = any(str(item.get("severity") or "") == "error" for item in diagnostics)
+        if has_repair:
             repaired_count += 1
-        _bump_bucket(by_model, model, final_valid=final_valid, repaired=bool(repair_items))
-        _bump_bucket(by_tool, tool, final_valid=final_valid, repaired=bool(repair_items))
+        diagnostic_count += len(diagnostics)
+        for diagnostic in diagnostics:
+            severity = str(diagnostic.get("severity") or "")
+            if severity == "error":
+                error_count += 1
+            elif severity == "warning":
+                warning_count += 1
+        _bump_bucket(by_model, model, has_error=has_error, repaired=has_repair)
+        _bump_bucket(by_tool, tool, has_error=has_error, repaired=has_repair)
         by_model[model]["provider_id"] = provider
         by_model[model]["compat"] = compat
-        for issue in issue_items:
-            key = (
-                model,
-                tool,
-                str(issue.get("code") or "unknown"),
-                str(issue.get("path") or "$"),
-            )
+
+        for diagnostic in diagnostics:
+            stage = str(diagnostic.get("stage") or "unknown")
+            kind = str(diagnostic.get("kind") or "unknown")
+            code = str(diagnostic.get("code") or "unknown")
+            action = str(diagnostic.get("action") or code)
+            path_value = str(diagnostic.get("path") or "$")
+            _bump_bucket(by_stage, stage, has_error=str(diagnostic.get("severity") or "") == "error", repaired=kind == "repair_applied")
+            _bump_bucket(by_kind, kind, has_error=str(diagnostic.get("severity") or "") == "error", repaired=kind == "repair_applied")
+            if kind == "repair_applied":
+                key = (model, tool, stage, action)
+                item = repairs.setdefault(
+                    key,
+                    {
+                        "model": model,
+                        "tool": tool,
+                        "stage": stage,
+                        "action": action,
+                        "path": path_value,
+                        "count": 0,
+                    },
+                )
+                item["count"] += 1
+                continue
+            key = (model, tool, stage, kind, code, path_value)
             item = issues.setdefault(
                 key,
                 {
                     "model": model,
                     "tool": tool,
-                    "code": key[2],
-                    "path": key[3],
-                    "expected": str(issue.get("expected") or ""),
-                    "actual": str(issue.get("actual") or ""),
+                    "stage": stage,
+                    "kind": kind,
+                    "code": code,
+                    "path": path_value,
+                    "expected": str(diagnostic.get("expected") or ""),
+                    "actual": str(diagnostic.get("actual") or ""),
+                    "repairable": bool(diagnostic.get("repairable", False)),
                     "count": 0,
                 },
             )
             item["count"] += 1
-        for repair in repair_items:
-            key = (
-                model,
-                tool,
-                str(repair.get("action") or "unknown"),
-            )
-            item = repairs.setdefault(
-                key,
-                {
-                    "model": model,
-                    "tool": tool,
-                    "action": key[2],
-                    "path": str(repair.get("path") or "$"),
-                    "count": 0,
-                },
-            )
-            item["count"] += 1
+
         recent.append(
             {
                 "timestamp": event.get("timestamp"),
@@ -403,9 +399,13 @@ def summarize_tool_argument_validation_events(
                 "tool": tool,
                 "provider_id": provider,
                 "compat": compat,
-                "final_valid": final_valid,
-                "issue_count": len(issue_items),
-                "repair_count": len(repair_items),
+                "diagnostic_count": len(diagnostics),
+                "stages": sorted(
+                    {str(item.get("stage") or "unknown") for item in diagnostics}
+                ),
+                "kinds": sorted(
+                    {str(item.get("kind") or "unknown") for item in diagnostics}
+                ),
             }
         )
         recent = recent[-recent_limit:]
@@ -415,24 +415,30 @@ def summarize_tool_argument_validation_events(
         "exists": True,
         "totals": {
             "events": event_count,
-            "invalid": invalid_count,
+            "diagnostics": diagnostic_count,
+            "errors": error_count,
+            "warnings": warning_count,
             "repaired": repaired_count,
         },
         "by_model": _sorted_counts(by_model),
         "by_tool": _sorted_counts(by_tool),
+        "by_stage": _sorted_counts(by_stage),
+        "by_kind": _sorted_counts(by_kind),
         "issues": sorted(issues.values(), key=lambda item: (-int(item["count"]), item["model"], item["tool"]))[:50],
         "repairs": sorted(repairs.values(), key=lambda item: (-int(item["count"]), item["model"], item["tool"]))[:50],
         "recent": list(reversed(recent)),
     }
 
 
-def _empty_tool_argument_validation_summary(source: Path) -> dict[str, Any]:
+def _empty_tool_diagnostic_summary(source: Path) -> dict[str, Any]:
     return {
         "path": str(source),
         "exists": False,
-        "totals": {"events": 0, "invalid": 0, "repaired": 0},
+        "totals": {"events": 0, "diagnostics": 0, "errors": 0, "warnings": 0, "repaired": 0},
         "by_model": [],
         "by_tool": [],
+        "by_stage": [],
+        "by_kind": [],
         "issues": [],
         "repairs": [],
         "recent": [],
@@ -443,16 +449,16 @@ def _bump_bucket(
     buckets: dict[str, dict[str, Any]],
     key: str,
     *,
-    final_valid: bool,
+    has_error: bool,
     repaired: bool,
 ) -> None:
     bucket = buckets.setdefault(
         key,
-        {"name": key, "events": 0, "invalid": 0, "repaired": 0},
+        {"name": key, "events": 0, "errors": 0, "repaired": 0},
     )
     bucket["events"] += 1
-    if not final_valid:
-        bucket["invalid"] += 1
+    if has_error:
+        bucket["errors"] += 1
     if repaired:
         bucket["repaired"] += 1
 
@@ -466,3 +472,24 @@ def _sorted_counts(buckets: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _inc(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
+
+
+def _iter_tool_diagnostic_events(source: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("metadata")
+        diagnostics = event.get("diagnostics")
+        if not isinstance(metadata, dict) or not isinstance(diagnostics, list):
+            continue
+        event["metadata"] = metadata
+        event["diagnostics"] = [dict(item) for item in diagnostics if isinstance(item, dict)]
+        events.append(event)
+    return events

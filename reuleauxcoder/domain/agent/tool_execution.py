@@ -4,16 +4,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 import concurrent.futures
 from contextlib import nullcontext
+import re
 
 if TYPE_CHECKING:
     from reuleauxcoder.domain.agent.agent import Agent
     from reuleauxcoder.domain.llm.models import ToolCall
 
-from reuleauxcoder.domain.agent.events import AgentEvent
+from reuleauxcoder.domain.agent.events import AgentEvent, ToolFailureKind
 from reuleauxcoder.domain.agent.tool_arguments import (
     format_tool_argument_retry_message,
     policy_for_provider,
     validate_and_repair_tool_arguments,
+)
+from reuleauxcoder.domain.agent.tool_diagnostics import (
+    ToolDiagnostic,
+    ToolDiagnosticKind,
+    ToolDiagnosticStage,
+    diagnostic_to_dict,
+    diagnostics_from_argument_validation,
+    tool_diagnostic_from_failure,
 )
 from reuleauxcoder.app.runtime.agent_runtime import (
     AgentRunCancelled,
@@ -27,7 +36,7 @@ from reuleauxcoder.domain.hooks.types import (
 )
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from reuleauxcoder.extensions.tools.registry import get_tool
-from reuleauxcoder.services.llm.diagnostics import persist_tool_argument_validation_event
+from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
 
 
 class ToolExecutor:
@@ -63,13 +72,41 @@ class ToolExecutor:
         return f"Error: bad arguments for {tool_name}: {detail}"
 
     @staticmethod
-    def _validation_meta(validation: object | None) -> dict | None:
+    def _diagnostics_meta(diagnostics: list[ToolDiagnostic | dict] | None) -> dict | None:
+        if not diagnostics:
+            return None
+        return {"tool_diagnostics": [diagnostic_to_dict(item) for item in diagnostics]}
+
+    @classmethod
+    def _validation_meta(
+        cls,
+        validation: object | None,
+        *,
+        tool_call_id: str | None = None,
+    ) -> dict | None:
         if validation is None:
             return None
-        to_dict = getattr(validation, "to_dict", None)
-        if not callable(to_dict):
-            return None
-        return {"tool_argument_validation": to_dict()}
+        return cls._diagnostics_meta(
+            diagnostics_from_argument_validation(
+                validation,
+                tool_call_id=tool_call_id,
+            )
+        )
+
+    @staticmethod
+    def _merge_meta(*items: dict | None) -> dict | None:
+        merged: dict = {}
+        for item in items:
+            if item:
+                diagnostics = item.get("tool_diagnostics")
+                if isinstance(diagnostics, list):
+                    merged.setdefault("tool_diagnostics", [])
+                    merged["tool_diagnostics"].extend(diagnostics)
+                for key, value in item.items():
+                    if key == "tool_diagnostics":
+                        continue
+                    merged[key] = value
+        return merged or None
 
     def _tool_argument_context(self, tc: "ToolCall", tool: object | None) -> dict:
         llm = getattr(self.agent, "llm", None)
@@ -87,39 +124,71 @@ class ToolExecutor:
             "model": getattr(llm, "model", None),
         }
 
-    def _persist_validation(self, validation: object, context: dict) -> None:
+    def _persist_tool_diagnostics(
+        self,
+        diagnostics_payload: list[ToolDiagnostic | dict],
+        context: dict,
+        *,
+        validation: object | None = None,
+    ) -> None:
         diagnostics = getattr(getattr(self.agent, "config", None), "diagnostics", None)
-        tool_argument_validation = getattr(
-            diagnostics, "tool_argument_validation", None
-        )
-        if getattr(tool_argument_validation, "enabled", True) is False:
+        tool_diagnostics = getattr(diagnostics, "tool_diagnostics", None)
+        if getattr(tool_diagnostics, "enabled", True) is False:
             return
-        has_diagnostics = getattr(validation, "has_diagnostics", None)
-        if has_diagnostics is False and not getattr(
-            tool_argument_validation, "record_clean", False
-        ):
+        if not diagnostics_payload and not getattr(tool_diagnostics, "record_clean", False):
             return
-        if isinstance(validation, dict):
-            final_valid = bool(validation.get("final_valid"))
-            has_payload = bool(
-                validation.get("initial_issues")
-                or validation.get("final_issues")
-                or validation.get("repairs")
-                or validation.get("provider_diagnostics")
-            )
-            if (
-                final_valid
-                and not has_payload
-                and not getattr(tool_argument_validation, "record_clean", False)
-            ):
-                return
         try:
-            persist_tool_argument_validation_event(
-                validation=validation,
+            persist_tool_diagnostic_event(
+                diagnostics=diagnostics_payload,
                 metadata=context,
+                validation=validation,
             )
         except Exception:
             pass
+
+    def _validation_diagnostics(
+        self,
+        validation: object,
+        *,
+        tool_call_id: str | None,
+    ) -> list[ToolDiagnostic]:
+        return diagnostics_from_argument_validation(validation, tool_call_id=tool_call_id)
+
+    def _record_lifecycle_diagnostics(
+        self,
+        diagnostics_payload: list[ToolDiagnostic | dict],
+        context: dict,
+    ) -> None:
+        self._persist_tool_diagnostics(diagnostics_payload, context)
+
+    @staticmethod
+    def _tool_result_error_diagnostic(
+        result: object,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> ToolDiagnostic | None:
+        if not isinstance(result, str):
+            return None
+        text = result.strip()
+        if not text.startswith("Error"):
+            return None
+        match = re.match(r"^Error\s+\[([A-Z0-9_:-]+)\]:\s*(.*)$", text)
+        if match:
+            code = match.group(1)
+            message = match.group(2) or text
+        else:
+            code = "tool_result_error"
+            message = text
+        return tool_diagnostic_from_failure(
+            stage=ToolDiagnosticStage.EXECUTION,
+            kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+            code=code,
+            message=message,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            repairable=True,
+        )
 
     def execute(self, tc: "ToolCall") -> str:
         """Execute a single tool call."""
@@ -150,7 +219,22 @@ class ToolExecutor:
         denied = next((d for d in guard_decisions if not d.allowed), None)
         if denied is not None:
             message = denied.reason or f"Tool '{tc.name}' blocked by guard hook"
-            self._emit_tool_end(tc, message, tool=tool)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                code="guard_denied",
+                message=message,
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+            )
+            context = self._tool_argument_context(tc, tool)
+            self._record_lifecycle_diagnostics([diagnostic], context)
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                meta=self._diagnostics_meta([diagnostic]),
+            )
             return message
 
         argument_error = getattr(tc, "argument_error", None)
@@ -178,22 +262,22 @@ class ToolExecutor:
                     getattr(tc, "argument_diagnostics", None) or []
                 ),
             }
-            self._persist_validation(parse_validation, self._tool_argument_context(tc, tool))
+            context = self._tool_argument_context(tc, tool)
+            parse_diagnostics = self._validation_diagnostics(
+                parse_validation,
+                tool_call_id=tc.id,
+            )
+            self._persist_tool_diagnostics(
+                parse_diagnostics,
+                context,
+                validation=parse_validation,
+            )
             message = self._bad_arguments_message(tc.name, str(argument_error))
             self._emit_tool_end(
                 tc,
                 message,
                 tool=tool,
-                meta={
-                    "tool_argument_validation": {
-                        "tool_name": tc.name,
-                        "final_valid": False,
-                        "provider_argument_error": str(argument_error),
-                        "provider_diagnostics": list(
-                            getattr(tc, "argument_diagnostics", None) or []
-                        ),
-                    }
-                },
+                meta=self._diagnostics_meta(parse_diagnostics),
             )
             return message
 
@@ -207,8 +291,16 @@ class ToolExecutor:
                 model=validation_context.get("model"),
             ),
         )
-        self._persist_validation(validation, validation_context)
-        validation_meta = self._validation_meta(validation)
+        validation_diagnostics = self._validation_diagnostics(
+            validation,
+            tool_call_id=tc.id,
+        )
+        self._persist_tool_diagnostics(
+            validation_diagnostics,
+            validation_context,
+            validation=validation,
+        )
+        validation_meta = self._diagnostics_meta(validation_diagnostics)
         if not validation.final_valid:
             message = self._bad_arguments_message(
                 tc.name,
@@ -224,10 +316,40 @@ class ToolExecutor:
             )
         except TypeError as e:
             message = self._bad_arguments_message(tc.name, str(e))
-            self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="preflight_type_error",
+                message=str(e),
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+                repairable=True,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
             return message
         if preflight_error:
-            self._emit_tool_end(tc, preflight_error, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="preflight_failed",
+                message=str(preflight_error),
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+                repairable=True,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                preflight_error,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
             return preflight_error
 
         if not self.agent.is_tool_allowed_in_mode(tc.name):
@@ -245,7 +367,23 @@ class ToolExecutor:
                 message = (
                     f"Tool '{tc.name}' is not available in current mode '{mode_name}'"
                 )
-            self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="tool_unavailable_in_mode",
+                message=message,
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+                repairable=True,
+                metadata={"mode": mode_name, "suggested_modes": suggested_modes},
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
             return message
 
         approval_required = next(
@@ -258,7 +396,21 @@ class ToolExecutor:
                     approval_required.reason
                     or f"Tool '{tc.name}' requires approval, but no approval provider is configured"
                 )
-                self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+                diagnostic = tool_diagnostic_from_failure(
+                    stage=ToolDiagnosticStage.APPROVAL,
+                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                    code="approval_provider_missing",
+                    message=message,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                )
+                self._record_lifecycle_diagnostics([diagnostic], validation_context)
+                self._emit_tool_end(
+                    tc,
+                    message,
+                    tool=tool,
+                    meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+                )
                 return message
             try:
                 decision = provider.request_approval(
@@ -274,14 +426,60 @@ class ToolExecutor:
                 )
             except (KeyboardInterrupt, EOFError):
                 message = f"Tool '{tc.name}' approval interrupted by user"
-                self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+                diagnostic = tool_diagnostic_from_failure(
+                    stage=ToolDiagnosticStage.APPROVAL,
+                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                    code="approval_interrupted",
+                    message=message,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                )
+                self._record_lifecycle_diagnostics([diagnostic], validation_context)
+                self._emit_tool_end(
+                    tc,
+                    message,
+                    tool=tool,
+                    meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+                )
                 return message
 
             if not decision.approved:
                 message = (
                     decision.reason or f"Tool '{tc.name}' denied by approval provider"
                 )
-                self._emit_tool_end(tc, message, tool=tool, meta=validation_meta)
+                decision_diagnostics = [
+                    diagnostic_to_dict(item)
+                    for item in decision.meta.get("tool_diagnostics", [])
+                    if isinstance(item, (ToolDiagnostic, dict))
+                ]
+                if not decision_diagnostics:
+                    decision_diagnostics = [
+                        tool_diagnostic_from_failure(
+                            stage=ToolDiagnosticStage.APPROVAL,
+                            kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                            code="approval_denied",
+                            message=message,
+                            tool_name=tc.name,
+                            tool_call_id=tc.id,
+                        ).to_dict()
+                    ]
+                self._record_lifecycle_diagnostics(
+                    decision_diagnostics,
+                    validation_context,
+                )
+                failure_meta = {
+                    "failure_kind": decision.meta.get(
+                        "failure_kind", ToolFailureKind.APPROVAL_DENIED.value
+                    ),
+                    **decision.meta,
+                    "tool_diagnostics": decision_diagnostics,
+                }
+                self._emit_tool_end(
+                    tc,
+                    message,
+                    tool=tool,
+                    meta=self._merge_meta(validation_meta, failure_meta),
+                )
                 return message
 
         before_context = self.agent.hook_registry.run_transforms(
@@ -301,9 +499,25 @@ class ToolExecutor:
 
         if tool is None:
             message = f"Error: unknown tool '{tool_call.name}'"
-            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="unknown_tool",
+                message=message,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+            )
+            context = self._tool_argument_context(tool_call, tool)
+            self._record_lifecycle_diagnostics([diagnostic], context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
             return message
 
+        execution_context = self._tool_argument_context(tool_call, tool)
         backend = getattr(tool, "backend", None)
         context = getattr(backend, "context", None)
         backend_id = getattr(backend, "backend_id", None)
@@ -362,21 +576,85 @@ class ToolExecutor:
             self.agent.hook_registry.run_observers(
                 HookPoint.AFTER_TOOL_EXECUTE, after_context
             )
+            result_diagnostic = self._tool_result_error_diagnostic(
+                after_context.result,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+            )
+            result_meta = self._diagnostics_meta([result_diagnostic]) if result_diagnostic else None
+            if result_diagnostic is not None:
+                self._record_lifecycle_diagnostics(
+                    [result_diagnostic],
+                    execution_context,
+                )
             self._emit_tool_end(
-                tool_call, after_context.result, tool=tool, meta=validation_meta
+                tool_call,
+                after_context.result,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, result_meta),
             )
             return after_context.result
         except TypeError as e:
             message = f"Error: bad arguments for {tool_call.name}: {e}"
-            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.EXECUTION,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="execution_type_error",
+                message=str(e),
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                repairable=True,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], execution_context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
             return message
         except AgentRunCancelled:
             message = f"Tool '{tool_call.name}' cancelled while waiting for runtime slot"
-            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.EXECUTION,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="tool_cancelled",
+                message=message,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], execution_context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
             return message
         except Exception as e:
             message = f"Error executing {tool_call.name}: {e}"
-            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.EXECUTION,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code=type(e).__name__,
+                message=str(e),
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                repairable=True,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], execution_context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                meta=self._merge_meta(
+                    validation_meta,
+                    {
+                        "failure_kind": ToolFailureKind.TOOL_RESULT_ERROR.value,
+                        **(self._diagnostics_meta([diagnostic]) or {}),
+                    },
+                ),
+            )
             return message
         finally:
             if context is not None:

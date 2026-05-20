@@ -366,17 +366,19 @@
       }
     },
     {
-      "name": "admin.diagnostics.tool_arguments.stats",
+      "name": "admin.diagnostics.tool_diagnostics.stats",
       "method": "POST",
-      "path": "/remote/admin/diagnostics/tool-arguments/stats",
+      "path": "/remote/admin/diagnostics/tool-diagnostics/stats",
       "auth": "bearer",
       "request": {},
       "response": {
         "ok": true,
-        "tool_argument_validation": {
+        "tool_diagnostics": {
           "totals": {
             "events": 0,
-            "invalid": 0,
+            "diagnostics": 0,
+            "errors": 0,
+            "warnings": 0,
             "repaired": 0
           },
           "by_model": []

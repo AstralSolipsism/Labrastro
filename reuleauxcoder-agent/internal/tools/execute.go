@@ -502,7 +502,7 @@ func readFile(args map[string]any, cwd string) protocol.ExecToolResult {
 	return protocol.ExecToolResult{OK: true, Result: result}
 }
 
-func writeFile(args map[string]any, cwd string, expectedState map[string]any) protocol.ExecToolResult {
+func writeFile(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
 	mutation, err := buildFileMutation("write_file", args, cwd)
 	if err != nil {
 		return errorResult("REMOTE_TOOL_ERROR", err.Error())
@@ -519,7 +519,7 @@ func writeFile(args map[string]any, cwd string, expectedState map[string]any) pr
 	return protocol.ExecToolResult{OK: true, Result: fmt.Sprintf("Wrote %d lines to %s", mutation.lineCount, mutation.filePath)}
 }
 
-func editFile(args map[string]any, cwd string, expectedState map[string]any) protocol.ExecToolResult {
+func editFile(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
 	mutation, err := buildFileMutation("edit_file", args, cwd)
 	if err != nil {
 		return errorResult("REMOTE_TOOL_ERROR", err.Error())
@@ -620,14 +620,14 @@ func buildFileMutation(toolName string, args map[string]any, cwd string) (*fileM
 		if oldString == newString {
 			return nil, fmt.Errorf("old_string and new_string must differ")
 		}
-		count := strings.Count(oldContent, oldString)
+		var count int
+		newContent, count = buildEditedContent(oldContent, oldString, newString)
 		if count == 0 {
 			return nil, fmt.Errorf("old_string not found in %s", filePath)
 		}
 		if count > 1 {
 			return nil, fmt.Errorf("old_string appears %d times in %s", count, filePath)
 		}
-		newContent = strings.Replace(oldContent, oldString, newString, 1)
 	default:
 		return nil, fmt.Errorf("unsupported tool %q", toolName)
 	}
@@ -668,26 +668,114 @@ func readFileSnapshot(path string) (string, fileState, error) {
 	}, nil
 }
 
-func validateExpectedState(expected map[string]any, current fileState, resolvedPath string) string {
-	if len(expected) == 0 {
+func validateExpectedState(expected *protocol.ToolMutationPreviewState, current fileState, resolvedPath string) string {
+	if expected == nil {
 		return ""
 	}
-	if expectedPath, _ := expected["resolved_path"].(string); expectedPath != "" && filepath.Clean(expectedPath) != filepath.Clean(resolvedPath) {
-		return fmt.Sprintf("approved preview targeted %s, current execution targets %s", expectedPath, resolvedPath)
+	if expected.ResolvedPath != "" && filepath.Clean(expected.ResolvedPath) != filepath.Clean(resolvedPath) {
+		return fmt.Sprintf("approved preview targeted %s, current execution targets %s", expected.ResolvedPath, resolvedPath)
 	}
-	if expectedExists, ok := asBool(expected["old_exists"]); ok && expectedExists != current.exists {
+	if expected.OldExists != nil && *expected.OldExists != current.exists {
 		return "file changed since approval preview was generated"
 	}
-	if expectedSHA, _ := expected["old_sha256"].(string); current.exists && expectedSHA != "" && expectedSHA != current.sha256 {
+	if current.exists && expected.OldSHA256 != "" && expected.OldSHA256 != current.sha256 {
 		return "file content changed since approval preview was generated"
 	}
-	if expectedSize, ok := asInt64(expected["old_size"]); ok && current.exists && expectedSize != current.size {
+	if expected.OldSize != nil && current.exists && *expected.OldSize != current.size {
 		return "file size changed since approval preview was generated"
 	}
-	if expectedMTime, ok := asInt64(expected["old_mtime_ns"]); ok && current.exists && expectedMTime != current.mtimeNS {
-		return "file timestamp changed since approval preview was generated"
-	}
 	return ""
+}
+
+func buildEditedContent(oldContent, oldString, newString string) (string, int) {
+	count := strings.Count(oldContent, oldString)
+	if count == 1 {
+		return strings.Replace(oldContent, oldString, newString, 1), 1
+	}
+	if count != 0 {
+		return "", count
+	}
+	return buildEditedContentByNormalizedLineEndings(oldContent, oldString, newString)
+}
+
+func buildEditedContentByNormalizedLineEndings(oldContent, oldString, newString string) (string, int) {
+	normalizedContent, starts, ends := normalizeLineEndingsWithMap(oldContent)
+	normalizedOld := normalizeLineEndings(oldString)
+	count := strings.Count(normalizedContent, normalizedOld)
+	if count != 1 {
+		return "", count
+	}
+	start := strings.Index(normalizedContent, normalizedOld)
+	if start < 0 || len(normalizedOld) == 0 {
+		return "", count
+	}
+	end := start + len(normalizedOld) - 1
+	if start >= len(starts) || end >= len(ends) {
+		return "", 0
+	}
+	originalStart := starts[start]
+	originalEnd := ends[end]
+	matched := oldContent[originalStart:originalEnd]
+	replacement := convertLineEndings(newString, dominantLineEnding(matched))
+	return oldContent[:originalStart] + replacement + oldContent[originalEnd:], 1
+}
+
+func normalizeLineEndings(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	return strings.ReplaceAll(value, "\r", "\n")
+}
+
+func normalizeLineEndingsWithMap(value string) (string, []int, []int) {
+	var b strings.Builder
+	b.Grow(len(value))
+	starts := make([]int, 0, len(value))
+	ends := make([]int, 0, len(value))
+	for i := 0; i < len(value); {
+		if value[i] == '\r' {
+			if i+1 < len(value) && value[i+1] == '\n' {
+				b.WriteByte('\n')
+				starts = append(starts, i)
+				ends = append(ends, i+2)
+				i += 2
+				continue
+			}
+			b.WriteByte('\n')
+			starts = append(starts, i)
+			ends = append(ends, i+1)
+			i++
+			continue
+		}
+		b.WriteByte(value[i])
+		starts = append(starts, i)
+		ends = append(ends, i+1)
+		i++
+	}
+	return b.String(), starts, ends
+}
+
+func dominantLineEnding(value string) string {
+	crlf := strings.Count(value, "\r\n")
+	withoutCRLF := strings.ReplaceAll(value, "\r\n", "")
+	lf := strings.Count(withoutCRLF, "\n")
+	cr := strings.Count(withoutCRLF, "\r")
+	if crlf > 0 && crlf >= lf && crlf >= cr {
+		return "\r\n"
+	}
+	if lf > 0 && lf >= cr {
+		return "\n"
+	}
+	if cr > 0 {
+		return "\r"
+	}
+	return "\n"
+}
+
+func convertLineEndings(value, newline string) string {
+	normalized := normalizeLineEndings(value)
+	if newline == "\n" {
+		return normalized
+	}
+	return strings.ReplaceAll(normalized, "\n", newline)
 }
 
 func unifiedWholeFileDiff(oldContent, newContent, filename string) string {
@@ -1149,26 +1237,6 @@ func asInt(v any) (int, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func asInt64(v any) (int64, bool) {
-	switch n := v.(type) {
-	case int:
-		return int64(n), true
-	case int32:
-		return int64(n), true
-	case int64:
-		return n, true
-	case float64:
-		return int64(n), true
-	default:
-		return 0, false
-	}
-}
-
-func asBool(v any) (bool, bool) {
-	b, ok := v.(bool)
-	return b, ok
 }
 
 func dedupe(items []string) []string {

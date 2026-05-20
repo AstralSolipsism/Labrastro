@@ -28,7 +28,18 @@ from reuleauxcoder.domain.memory.runtime import (
     bind_main_chat_memory_scope_to_agent,
     bind_memory_scope_to_agent,
 )
-from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
+from reuleauxcoder.domain.agent.events import (
+    AgentEvent,
+    AgentEventType,
+    ToolFailureKind,
+)
+from reuleauxcoder.domain.agent.tool_diagnostics import (
+    ToolDiagnostic,
+    ToolDiagnosticKind,
+    ToolDiagnosticStage,
+    diagnostic_to_dict,
+    tool_diagnostic_from_failure,
+)
 from reuleauxcoder.domain.approval import (
     ApprovalDecision,
     ApprovalProvider,
@@ -43,7 +54,11 @@ from reuleauxcoder.domain.config.models import (
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
-from labrastro_server.interfaces.http.remote.protocol import ChatResponse, ToolPreviewResult
+from labrastro_server.interfaces.http.remote.protocol import (
+    ChatResponse,
+    ToolMutationPreviewState,
+    ToolPreviewResult,
+)
 from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.extensions.skills.service import SkillsService
 from reuleauxcoder.extensions.tools.backend import ExecutionContext
@@ -53,6 +68,7 @@ from reuleauxcoder.interfaces.cli.render import CLIRenderer
 from reuleauxcoder.interfaces.entrypoint.dependencies import AppDependencies
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from reuleauxcoder.services.llm.factory import llm_trace_enabled, resolve_model_runtime
+from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
 from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_SYSTEM_PROMPT,
     TASKFLOW_WORKFLOW_MODE,
@@ -79,11 +95,21 @@ class RemoteToolProtocolError(RuntimeError):
         self.message = message
 
     def payload(self) -> dict[str, Any]:
+        diagnostic = tool_diagnostic_from_failure(
+            stage=ToolDiagnosticStage.PROTOCOL,
+            kind=ToolDiagnosticKind.TOOL_PROTOCOL_ERROR,
+            code=self.code,
+            message=self.message,
+            tool_name=self.tool_name,
+            tool_call_id=self.tool_call_id,
+        )
         return {
             "tool_name": self.tool_name,
             "tool_call_id": self.tool_call_id,
             "code": self.code,
             "message": self.message,
+            "failure_kind": ToolFailureKind.TOOL_PROTOCOL_ERROR.value,
+            "tool_diagnostics": [diagnostic.to_dict()],
         }
 
 
@@ -1241,6 +1267,51 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
         context_event_bus.subscribe(_append_context_event, replay_history=False)
 
+        def _remote_diagnostic_context(
+            *,
+            tool_name: str | None = None,
+            tool_call_id: str | None = None,
+        ) -> dict[str, Any]:
+            llm = getattr(peer_agent, "llm", None)
+            provider_config = getattr(llm, "provider_config", None)
+            return {
+                "session_id": getattr(peer_agent, "current_session_id", None),
+                "chat_id": getattr(remote_session, "chat_id", None),
+                "peer_id": peer_id,
+                "round_index": getattr(peer_agent.state, "current_round", None),
+                "tool": tool_name,
+                "tool_call_id": tool_call_id,
+                "provider_id": getattr(llm, "provider_id", None),
+                "provider_type": getattr(llm, "provider_type", None),
+                "compat": getattr(provider_config, "compat", None),
+                "model": getattr(llm, "model", None),
+            }
+
+        def _record_remote_diagnostics(
+            diagnostics_payload: list[ToolDiagnostic | dict[str, Any]],
+            *,
+            tool_name: str | None = None,
+            tool_call_id: str | None = None,
+        ) -> None:
+            diagnostics_config = getattr(
+                getattr(peer_agent, "config", None),
+                "diagnostics",
+                None,
+            )
+            tool_diagnostics = getattr(diagnostics_config, "tool_diagnostics", None)
+            if getattr(tool_diagnostics, "enabled", True) is False:
+                return
+            try:
+                persist_tool_diagnostic_event(
+                    diagnostics=diagnostics_payload,
+                    metadata=_remote_diagnostic_context(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                    ),
+                )
+            except Exception:
+                pass
+
         def _flush_output() -> None:
             rendered = ansi_console.export_text(clear=True, styles=True)
             if rendered.strip():
@@ -1310,19 +1381,47 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 )
             return f"### {title}\n\n{content}"
 
-        def _preview_state(preview: ToolPreviewResult) -> dict[str, Any]:
-            state: dict[str, Any] = {}
-            if preview.resolved_path is not None:
-                state["resolved_path"] = preview.resolved_path
-            if preview.old_sha256 is not None:
-                state["old_sha256"] = preview.old_sha256
-            if preview.old_exists is not None:
-                state["old_exists"] = preview.old_exists
-            if preview.old_size is not None:
-                state["old_size"] = preview.old_size
-            if preview.old_mtime_ns is not None:
-                state["old_mtime_ns"] = preview.old_mtime_ns
-            return state
+        def _preview_state(
+            preview: ToolPreviewResult,
+        ) -> ToolMutationPreviewState | None:
+            return ToolMutationPreviewState.from_preview(preview)
+
+        def _preview_failure_reason(preview: ToolPreviewResult) -> str:
+            code = str(preview.error_code or "REMOTE_PREVIEW_FAILED")
+            message = str(
+                preview.error_message
+                or preview.error_code
+                or "remote peer could not build a tool preview"
+            )
+            return f"Error [{code}]: {message}" if code else f"Error: {message}"
+
+        def _preview_failure_meta(
+            preview: ToolPreviewResult,
+            *,
+            tool_name: str,
+            tool_call_id: str | None,
+        ) -> dict[str, Any]:
+            code = str(preview.error_code or "REMOTE_PREVIEW_FAILED")
+            message = str(
+                preview.error_message
+                or preview.error_code
+                or "remote peer could not build a tool preview"
+            )
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREVIEW,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code=code,
+                message=message,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                repairable=True,
+            )
+            return {
+                "failure_kind": ToolFailureKind.TOOL_RESULT_ERROR.value,
+                "code": code,
+                "message": message,
+                "tool_diagnostics": [diagnostic.to_dict()],
+            }
 
         def _build_remote_preview(
             request: ApprovalRequest,
@@ -1353,16 +1452,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
 
             preview = backend.preview_tool(request.tool_name, dict(request.tool_args))
             if not preview.ok:
-                raise RemoteToolProtocolError(
-                    tool_name=request.tool_name,
-                    tool_call_id=tool_call_id,
-                    code="REMOTE_PREVIEW_FAILED",
-                    message=(
-                        preview.error_message
-                        or preview.error_code
-                        or "remote peer could not build a tool preview"
-                    ),
-                )
+                return [], preview, _preview_failure_reason(preview)
             if preview.sections:
                 return preview.sections, preview, None
             if preview.diff.strip():
@@ -1396,6 +1486,19 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             code: str,
             message: str,
         ) -> None:
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PROTOCOL,
+                kind=ToolDiagnosticKind.TOOL_PROTOCOL_ERROR,
+                code=code,
+                message=message,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
+            _record_remote_diagnostics(
+                [diagnostic],
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
             remote_session.append_event(
                 "tool_call_protocol_error",
                 {
@@ -1403,6 +1506,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "tool_call_id": tool_call_id,
                     "code": code,
                     "message": message,
+                    "failure_kind": ToolFailureKind.TOOL_PROTOCOL_ERROR.value,
+                    "tool_diagnostics": [diagnostic.to_dict()],
                 },
             )
 
@@ -1434,6 +1539,21 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         message=exc.message,
                     )
                     raise
+                if preview is not None and not preview.ok:
+                    preview_meta = _preview_failure_meta(
+                        preview,
+                        tool_name=request.tool_name,
+                        tool_call_id=tool_call_id or None,
+                    )
+                    _record_remote_diagnostics(
+                        preview_meta.get("tool_diagnostics", []),
+                        tool_name=request.tool_name,
+                        tool_call_id=tool_call_id or None,
+                    )
+                    return ApprovalDecision.deny_once(
+                        preview_error,
+                        meta=preview_meta,
+                    )
                 remote_session.register_approval(approval_id)
                 payload = {
                     "approval_id": approval_id,
@@ -1477,7 +1597,22 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                             _preview_state(preview),
                         )
                     return ApprovalDecision.allow_once(reason)
-                return ApprovalDecision.deny_once(reason)
+                denial_diagnostic = tool_diagnostic_from_failure(
+                    stage=ToolDiagnosticStage.APPROVAL,
+                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                    code="approval_denied",
+                    message=reason
+                    or f"Tool '{request.tool_name}' denied by approval provider",
+                    tool_name=request.tool_name,
+                    tool_call_id=tool_call_id or None,
+                )
+                return ApprovalDecision.deny_once(
+                    reason,
+                    meta={
+                        "failure_kind": ToolFailureKind.APPROVAL_DENIED.value,
+                        "tool_diagnostics": [denial_diagnostic.to_dict()],
+                    },
+                )
 
         def _on_remote_stream(
             tool_name: str, chunk: Any, tool_call_id: str | None = None
@@ -1653,10 +1788,25 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
             _append_final_stream_content()
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.CHAT,
+                kind=ToolDiagnosticKind.CHAT_TERMINAL_ERROR,
+                code=exc.code,
+                message=exc.message,
+                tool_name=exc.tool_name,
+                tool_call_id=exc.tool_call_id,
+            )
+            _record_remote_diagnostics(
+                [diagnostic],
+                tool_name=exc.tool_name,
+                tool_call_id=exc.tool_call_id,
+            )
             failure_payload = {
                 "message": exc.message,
                 "code": exc.code,
                 "recoverable": False,
+                "failure_kind": ToolFailureKind.CHAT_TERMINAL_ERROR.value,
+                "tool_diagnostics": [diagnostic.to_dict()],
             }
             remote_session.append_event("error", failure_payload)
             remote_session.append_event("chat_failed", failure_payload)
@@ -1664,10 +1814,19 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
             _append_final_stream_content()
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.CHAT,
+                kind=ToolDiagnosticKind.CHAT_TERMINAL_ERROR,
+                code="REMOTE_CHAT_ERROR",
+                message=str(exc),
+            )
+            _record_remote_diagnostics([diagnostic])
             failure_payload = {
                 "message": str(exc),
                 "code": "REMOTE_CHAT_ERROR",
                 "recoverable": False,
+                "failure_kind": ToolFailureKind.CHAT_TERMINAL_ERROR.value,
+                "tool_diagnostics": [diagnostic.to_dict()],
             }
             diagnostic_path = getattr(exc, "llm_diagnostic_path", None)
             if diagnostic_path:

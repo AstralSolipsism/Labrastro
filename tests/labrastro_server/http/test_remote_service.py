@@ -28,6 +28,9 @@ from labrastro_server.interfaces.http.remote.service import (
     RemoteRelayHTTPService as _RemoteRelayHTTPService,
     _RemoteChatSession,
 )
+from labrastro_server.interfaces.http.remote.routes.chat import (
+    _stream_chat_handler_error_payload,
+)
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
 from reuleauxcoder.domain.config.models import (
@@ -71,6 +74,17 @@ from reuleauxcoder.interfaces.events import UIEventBus
 
 
 TEST_ADMIN_TOKEN = "test-admin-token"
+
+
+def test_stream_chat_handler_error_payload_preserves_remote_protocol_code() -> None:
+    class RemoteProtocolLikeError(Exception):
+        code = "REMOTE_PREVIEW_EMPTY"
+        message = "remote peer preview did not include diff or sections"
+
+    assert _stream_chat_handler_error_payload(RemoteProtocolLikeError("wrapped")) == {
+        "message": "remote peer preview did not include diff or sections",
+        "code": "REMOTE_PREVIEW_EMPTY",
+    }
 
 
 def _agent_run_settings_from_config(data: dict) -> tuple[RunLimitsConfig, dict]:
@@ -1162,13 +1176,13 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_admin_diagnostics_settings_and_tool_argument_stats(
+    def test_admin_diagnostics_settings_and_tool_diagnostic_stats(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
         diagnostics_dir = tmp_path / ".rcoder" / "diagnostics"
         diagnostics_dir.mkdir(parents=True)
-        (diagnostics_dir / "tool_argument_validation.jsonl").write_text(
+        (diagnostics_dir / "tool_diagnostics.jsonl").write_text(
             json.dumps(
                 {
                     "timestamp": "2026-05-14 20:00:00",
@@ -1178,6 +1192,29 @@ class TestRemoteRelayHTTPService:
                         "model": "deepseek-v4",
                         "tool": "write_file",
                     },
+                    "diagnostics": [
+                        {
+                            "stage": "argument_validation",
+                            "kind": "schema_issue",
+                            "severity": "error",
+                            "code": "missing_required",
+                            "path": "$.content",
+                            "expected": "string",
+                            "actual": "missing",
+                            "message": "$.content: expected string, got missing",
+                            "repairable": False,
+                        },
+                        {
+                            "stage": "argument_validation",
+                            "kind": "repair_applied",
+                            "severity": "warning",
+                            "code": "optional_null_omitted",
+                            "action": "optional_null_omitted",
+                            "path": "$.encoding",
+                            "message": "optional_null_omitted",
+                            "repairable": True,
+                        },
+                    ],
                     "validation": {
                         "tool_name": "write_file",
                         "final_valid": False,
@@ -1220,7 +1257,7 @@ class TestRemoteRelayHTTPService:
                 {},
                 headers=TEST_ADMIN_HEADERS,
             )
-            diagnostics = read_body["settings"]["diagnostics"]["tool_argument_validation"]
+            diagnostics = read_body["settings"]["diagnostics"]["tool_diagnostics"]
             assert diagnostics == {"enabled": True, "record_clean": False}
             assert read_body["settings"]["diagnostics"]["llm_trace"] == {
                 "enabled": False,
@@ -1233,7 +1270,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "settings": {
                         "diagnostics": {
-                            "tool_argument_validation": {"enabled": False},
+                            "tool_diagnostics": {"enabled": False},
                             "llm_trace": {"enabled": True, "raw_chunks": True},
                         }
                     }
@@ -1242,7 +1279,7 @@ class TestRemoteRelayHTTPService:
             )
             assert update_body["ok"] is True
             assert (
-                update_body["settings"]["diagnostics"]["tool_argument_validation"][
+                update_body["settings"]["diagnostics"]["tool_diagnostics"][
                     "enabled"
                 ]
                 is False
@@ -1252,7 +1289,7 @@ class TestRemoteRelayHTTPService:
                 "raw_chunks": True,
             }
             assert load_yaml_config(config_path)["diagnostics"][
-                "tool_argument_validation"
+                "tool_diagnostics"
             ] == {"enabled": False, "record_clean": False}
             assert load_yaml_config(config_path)["diagnostics"]["llm_trace"] == {
                 "enabled": True,
@@ -1261,13 +1298,20 @@ class TestRemoteRelayHTTPService:
 
             _, stats_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/diagnostics/tool-arguments/stats",
+                f"{service.base_url}/remote/admin/diagnostics/tool-diagnostics/stats",
                 {},
                 headers=TEST_ADMIN_HEADERS,
             )
-            stats = stats_body["tool_argument_validation"]
-            assert stats["totals"] == {"events": 1, "invalid": 1, "repaired": 1}
+            stats = stats_body["tool_diagnostics"]
+            assert stats["totals"] == {
+                "events": 1,
+                "diagnostics": 2,
+                "errors": 1,
+                "warnings": 1,
+                "repaired": 1,
+            }
             assert stats["by_model"][0]["name"] == "deepseek-v4"
+            assert stats["by_stage"][0]["name"] == "argument_validation"
             assert stats["issues"][0]["path"] == "$.content"
             assert stats["repairs"][0]["action"] == "optional_null_omitted"
         finally:
@@ -1384,7 +1428,7 @@ class TestRemoteRelayHTTPService:
                             "interval_sec": 3600,
                         },
                         "diagnostics": {
-                            "tool_argument_validation": {
+                            "tool_diagnostics": {
                                 "enabled": True,
                                 "record_clean": True,
                             }
@@ -1415,7 +1459,7 @@ class TestRemoteRelayHTTPService:
             assert updated["persistence"]["retention_days"] == 14
             assert updated["sandbox_provider"]["worker_image"] == "worker:test"
             assert updated["model_capabilities"]["enabled"] is False
-            assert updated["diagnostics"]["tool_argument_validation"]["record_clean"] is True
+            assert updated["diagnostics"]["tool_diagnostics"]["record_clean"] is True
             assert updated["github"]["webhook_secret_hint"] == "supe...alue"
 
             raw = load_yaml_config(config_path)

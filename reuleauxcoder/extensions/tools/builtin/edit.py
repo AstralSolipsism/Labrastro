@@ -7,6 +7,11 @@ from pathlib import Path
 
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
+from reuleauxcoder.extensions.tools.file_editing import (
+    build_edited_content,
+    read_text_preserve_newlines,
+    write_text_preserve_newlines,
+)
 from reuleauxcoder.extensions.tools.registry import register_tool
 
 
@@ -90,9 +95,14 @@ class EditFileTool(Tool):
     def _execute_local(self, file_path: str, old_string: str, new_string: str) -> str:
         try:
             p = Path(file_path).expanduser().resolve()
-            content = p.read_text()
-            new_content = content.replace(old_string, new_string, 1)
-            p.write_text(new_content)
+            content = read_text_preserve_newlines(p)
+            new_content, occurrences = build_edited_content(
+                content, old_string, new_string
+            )
+            validation_error = _format_old_string_error(file_path, occurrences)
+            if validation_error:
+                return validation_error
+            write_text_preserve_newlines(p, new_content)
 
             diff = _unified_diff(content, new_content, str(p))
             return f"Edited {file_path}\n{diff}"
@@ -114,8 +124,12 @@ def _validate_edit_request(
     if not p.exists():
         return f"Error: {file_path} not found"
 
-    content = p.read_text()
-    occurrences = content.count(old_string)
+    content = read_text_preserve_newlines(p)
+    _, occurrences = build_edited_content(content, old_string, new_string)
+    return _format_old_string_error(file_path, occurrences)
+
+
+def _format_old_string_error(file_path: str, occurrences: int) -> str | None:
     if occurrences == 0:
         return (
             f"Error: old_string not found in {file_path}. "

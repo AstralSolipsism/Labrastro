@@ -1,4 +1,8 @@
-﻿from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
+from reuleauxcoder.domain.agent.events import (
+    AgentEvent,
+    AgentEventType,
+    ToolFailureKind,
+)
 
 
 def test_agent_event_chat_start_contains_user_input() -> None:
@@ -47,6 +51,19 @@ def test_agent_event_tool_call_protocol_error_contains_payload() -> None:
         "tool_call_id": "call-1",
         "code": "REMOTE_PREVIEW_REQUIRED",
         "message": "remote peer must provide a tool preview",
+        "failure_kind": ToolFailureKind.TOOL_PROTOCOL_ERROR.value,
+        "tool_diagnostics": [
+            {
+                "stage": "protocol",
+                "kind": "tool_protocol_error",
+                "severity": "error",
+                "code": "REMOTE_PREVIEW_REQUIRED",
+                "message": "remote peer must provide a tool preview",
+                "repairable": False,
+                "tool_name": "write_file",
+                "tool_call_id": "call-1",
+            }
+        ],
     }
 
 

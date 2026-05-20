@@ -429,7 +429,14 @@ def _apply_tool_or_output_event(
             "toolCallId": _tool_call_id(payload),
             "toolOutput": f"[{code}] {message}" if code else message,
             "toolOutputFormat": "plain",
-            "toolResultMeta": {"code": code, "message": message},
+            "toolResultMeta": {
+                "code": code,
+                "message": message,
+                "failure_kind": _string(payload, "failure_kind"),
+                "tool_diagnostics": payload.get("tool_diagnostics")
+                if isinstance(payload.get("tool_diagnostics"), list)
+                else [],
+            },
         }, meta)
     elif event_type == "tool_call_end":
         _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {

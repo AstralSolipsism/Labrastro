@@ -12,6 +12,7 @@ from labrastro_server.relay.errors import (
 )
 from labrastro_server.interfaces.http.remote.protocol import (
     ExecToolRequest,
+    ToolMutationPreviewState,
     ToolPreviewRequest,
     ToolPreviewResult,
     ToolStreamChunk,
@@ -35,7 +36,7 @@ class RemoteRelayToolBackend(ToolBackend):
         super().__init__(context or ExecutionContext(execution_target="remote_peer"))
         self.relay_server = relay_server
         self.ui_bus = ui_bus
-        self._approved_preview_states: dict[str, dict[str, Any]] = {}
+        self._approved_preview_states: dict[str, ToolMutationPreviewState] = {}
 
     def exec_tool(self, tool_name: str, args: dict[str, Any]) -> str:
         """Execute a tool on the remote peer and return the text result.
@@ -74,7 +75,7 @@ class RemoteRelayToolBackend(ToolBackend):
             timeout_sec=timeout,
             tool_call_id=tool_call_id,
             expected_state=self._approved_preview_states.pop(
-                self._request_key(tool_name, args), {}
+                self._request_key(tool_name, args), None
             ),
         )
 
@@ -132,9 +133,12 @@ class RemoteRelayToolBackend(ToolBackend):
             )
 
     def remember_approved_preview(
-        self, tool_name: str, args: dict[str, Any], state: dict[str, Any]
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        state: ToolMutationPreviewState | None,
     ) -> None:
-        if state:
+        if state is not None and not state.is_empty():
             self._approved_preview_states[self._request_key(tool_name, args)] = state
 
     def _build_stream_handler(self, tool_name: str, tool_call_id: str | None = None):

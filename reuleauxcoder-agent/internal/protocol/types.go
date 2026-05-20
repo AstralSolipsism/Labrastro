@@ -232,12 +232,12 @@ type EnvironmentManifestResponse struct {
 }
 
 type ExecToolRequest struct {
-	ToolName      string         `json:"tool_name"`
-	Args          map[string]any `json:"args"`
-	CWD           *string        `json:"cwd"`
-	TimeoutSec    int            `json:"timeout_sec"`
-	ExpectedState map[string]any `json:"expected_state,omitempty"`
-	ToolCallID    string         `json:"tool_call_id,omitempty"`
+	ToolName      string                    `json:"tool_name"`
+	Args          map[string]any            `json:"args"`
+	CWD           *string                   `json:"cwd"`
+	TimeoutSec    int                       `json:"timeout_sec"`
+	ExpectedState *ToolMutationPreviewState `json:"expected_state,omitempty"`
+	ToolCallID    string                    `json:"tool_call_id,omitempty"`
 }
 
 type ExecToolResult struct {
@@ -246,6 +246,13 @@ type ExecToolResult struct {
 	ErrorCode    string         `json:"error_code,omitempty"`
 	ErrorMessage string         `json:"error_message,omitempty"`
 	Meta         map[string]any `json:"meta,omitempty"`
+}
+
+type ToolMutationPreviewState struct {
+	ResolvedPath string `json:"resolved_path,omitempty"`
+	OldSHA256    string `json:"old_sha256,omitempty"`
+	OldExists    *bool  `json:"old_exists,omitempty"`
+	OldSize      *int64 `json:"old_size,omitempty"`
 }
 
 type ToolPreviewRequest struct {

@@ -75,7 +75,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("admin.environment.run", "POST", "/remote/admin/environment/run", "EnvironmentRunRequest", "AgentRunResponse", "bearer"),
     RemoteEndpoint("admin.server_settings.read", "POST", "/remote/admin/server-settings/read", "Empty", "ServerSettings", "bearer"),
     RemoteEndpoint("admin.server_settings.update", "POST", "/remote/admin/server-settings/update", "ServerSettingsUpdateRequest", "ServerSettings", "bearer"),
-    RemoteEndpoint("admin.diagnostics.tool_arguments.stats", "POST", "/remote/admin/diagnostics/tool-arguments/stats", "Empty", "ToolArgumentValidationStats", "bearer"),
+    RemoteEndpoint("admin.diagnostics.tool_diagnostics.stats", "POST", "/remote/admin/diagnostics/tool-diagnostics/stats", "Empty", "ToolDiagnosticsStats", "bearer"),
     RemoteEndpoint("admin.model_capabilities.status", "POST", "/remote/admin/model-capabilities/status", "Empty", "ModelCapabilityStatus", "bearer"),
     RemoteEndpoint("admin.model_capabilities.list", "POST", "/remote/admin/model-capabilities/list", "ModelCapabilityListRequest", "ModelCapabilityList", "bearer"),
     RemoteEndpoint("admin.model_capabilities.refresh", "POST", "/remote/admin/model-capabilities/refresh", "Empty", "ModelCapabilityRefreshResult", "bearer"),

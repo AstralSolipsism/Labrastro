@@ -28,18 +28,23 @@ class ApprovalDecision:
 
     mode: ApprovalDecisionMode
     reason: str | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
 
     @property
     def approved(self) -> bool:
         return self.mode == "allow_once"
 
     @classmethod
-    def allow_once(cls, reason: str | None = None) -> "ApprovalDecision":
-        return cls(mode="allow_once", reason=reason)
+    def allow_once(
+        cls, reason: str | None = None, *, meta: dict[str, Any] | None = None
+    ) -> "ApprovalDecision":
+        return cls(mode="allow_once", reason=reason, meta=meta or {})
 
     @classmethod
-    def deny_once(cls, reason: str | None = None) -> "ApprovalDecision":
-        return cls(mode="deny_once", reason=reason)
+    def deny_once(
+        cls, reason: str | None = None, *, meta: dict[str, Any] | None = None
+    ) -> "ApprovalDecision":
+        return cls(mode="deny_once", reason=reason, meta=meta or {})
 
 
 # ── PendingApproval: unified bridge between tool request and UI resolution ──

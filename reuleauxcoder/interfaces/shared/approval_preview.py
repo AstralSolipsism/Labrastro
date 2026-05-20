@@ -10,6 +10,10 @@ import difflib
 from pathlib import Path
 
 from reuleauxcoder.domain.approval import ApprovalRequest
+from reuleauxcoder.extensions.tools.file_editing import (
+    build_edited_content,
+    read_text_preserve_newlines,
+)
 
 
 def build_preview_diff(request: ApprovalRequest) -> str | None:
@@ -37,16 +41,17 @@ def build_preview_diff(request: ApprovalRequest) -> str | None:
             return None
 
         try:
-            content = Path(file_path).expanduser().resolve().read_text()
+            content = read_text_preserve_newlines(Path(file_path).expanduser().resolve())
         except Exception:
             return None
 
-        if content.count(old_string) != 1:
+        new_content, count = build_edited_content(content, old_string, new_string)
+        if count != 1:
             return None
 
         return _unified_diff(
             content,
-            content.replace(old_string, new_string, 1),
+            new_content,
             file_path,
         )
 
@@ -57,7 +62,7 @@ def build_preview_diff(request: ApprovalRequest) -> str | None:
 
         path = Path(file_path).expanduser().resolve()
         try:
-            old_content = path.read_text() if path.exists() else ""
+            old_content = read_text_preserve_newlines(path) if path.exists() else ""
         except Exception:
             old_content = ""
 

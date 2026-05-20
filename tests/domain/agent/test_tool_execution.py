@@ -204,7 +204,7 @@ def test_tool_executor_does_not_persist_clean_validation(tmp_path, monkeypatch) 
     )
 
     assert result == "ok"
-    assert not (tmp_path / ".rcoder" / "diagnostics" / "tool_argument_validation.jsonl").exists()
+    assert not (tmp_path / ".rcoder" / "diagnostics" / "tool_diagnostics.jsonl").exists()
 
 
 def test_tool_executor_respects_disabled_tool_argument_telemetry(tmp_path, monkeypatch) -> None:
@@ -219,7 +219,7 @@ def test_tool_executor_respects_disabled_tool_argument_telemetry(tmp_path, monke
     )
     agent.config = SimpleNamespace(
         diagnostics=SimpleNamespace(
-            tool_argument_validation=SimpleNamespace(
+            tool_diagnostics=SimpleNamespace(
                 enabled=False,
                 record_clean=False,
             )
@@ -232,7 +232,7 @@ def test_tool_executor_respects_disabled_tool_argument_telemetry(tmp_path, monke
     )
 
     assert result.startswith("Error: bad arguments for mcp_batch")
-    assert not (tmp_path / ".rcoder" / "diagnostics" / "tool_argument_validation.jsonl").exists()
+    assert not (tmp_path / ".rcoder" / "diagnostics" / "tool_diagnostics.jsonl").exists()
 
 
 def test_tool_executor_keeps_unrepairable_placeholder_as_tool_error(tmp_path, monkeypatch) -> None:

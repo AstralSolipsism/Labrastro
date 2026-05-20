@@ -970,16 +970,14 @@ class PersistenceConfig:
 
 
 @dataclass
-class ToolArgumentValidationDiagnosticsConfig:
-    """Tool argument validation telemetry settings."""
+class ToolDiagnosticsConfig:
+    """Tool lifecycle diagnostic telemetry settings."""
 
     enabled: bool = True
     record_clean: bool = False
 
     @classmethod
-    def from_dict(
-        cls, data: dict[str, Any] | None
-    ) -> "ToolArgumentValidationDiagnosticsConfig":
+    def from_dict(cls, data: dict[str, Any] | None) -> "ToolDiagnosticsConfig":
         if not isinstance(data, dict):
             return cls()
         return cls(
@@ -1021,8 +1019,8 @@ class LLMTraceDiagnosticsConfig:
 class DiagnosticsConfig:
     """Diagnostics and telemetry settings."""
 
-    tool_argument_validation: ToolArgumentValidationDiagnosticsConfig = field(
-        default_factory=ToolArgumentValidationDiagnosticsConfig
+    tool_diagnostics: ToolDiagnosticsConfig = field(
+        default_factory=ToolDiagnosticsConfig
     )
     llm_trace: LLMTraceDiagnosticsConfig = field(
         default_factory=LLMTraceDiagnosticsConfig
@@ -1030,13 +1028,11 @@ class DiagnosticsConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "DiagnosticsConfig":
-        raw_tool_arguments = (
-            data.get("tool_argument_validation", {}) if isinstance(data, dict) else {}
-        )
+        raw_tool_diagnostics = data.get("tool_diagnostics", {}) if isinstance(data, dict) else {}
         raw_llm_trace = data.get("llm_trace", {}) if isinstance(data, dict) else {}
         return cls(
-            tool_argument_validation=ToolArgumentValidationDiagnosticsConfig.from_dict(
-                raw_tool_arguments if isinstance(raw_tool_arguments, dict) else {}
+            tool_diagnostics=ToolDiagnosticsConfig.from_dict(
+                raw_tool_diagnostics if isinstance(raw_tool_diagnostics, dict) else {}
             ),
             llm_trace=LLMTraceDiagnosticsConfig.from_dict(
                 raw_llm_trace if isinstance(raw_llm_trace, dict) else {}
@@ -1045,7 +1041,7 @@ class DiagnosticsConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "tool_argument_validation": self.tool_argument_validation.to_dict(),
+            "tool_diagnostics": self.tool_diagnostics.to_dict(),
             "llm_trace": self.llm_trace.to_dict(),
         }
 

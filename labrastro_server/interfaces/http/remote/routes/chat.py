@@ -63,6 +63,13 @@ from reuleauxcoder.interfaces.events import UIEventKind
 
 def _stream_chat_handler_error_payload(exc: Exception) -> dict[str, str]:
     message = str(exc).strip()
+    code = getattr(exc, "code", None)
+    protocol_message = getattr(exc, "message", None)
+    if isinstance(code, str) and code.startswith("REMOTE_"):
+        return {
+            "message": str(protocol_message or message or code),
+            "code": code,
+        }
     if isinstance(exc, ValueError) and message.startswith("remote peer "):
         return {"message": message, "code": "chat_handler_failed"}
     return {"message": "chat_handler_failed", "code": "chat_handler_failed"}

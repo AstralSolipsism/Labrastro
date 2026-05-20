@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 from enum import Enum
 
+from reuleauxcoder.domain.agent.tool_diagnostics import (
+    ToolDiagnosticKind,
+    ToolDiagnosticStage,
+    tool_diagnostic_from_failure,
+)
+
 
 class AgentEventType(Enum):
     """Types of agent events."""
@@ -28,6 +34,13 @@ class AgentEventType(Enum):
     USAGE_UPDATE = "usage_update"
     RUNTIME_STATUS = "runtime_status"
     ERROR = "error"
+
+
+class ToolFailureKind(str, Enum):
+    TOOL_RESULT_ERROR = "tool_result_error"
+    APPROVAL_DENIED = "approval_denied"
+    TOOL_PROTOCOL_ERROR = "tool_protocol_error"
+    CHAT_TERMINAL_ERROR = "chat_terminal_error"
 
 
 @dataclass
@@ -118,11 +131,21 @@ class AgentEvent:
         message: str,
     ) -> "AgentEvent":
         """Create a protocol error event for a tool call that did not return."""
+        diagnostic = tool_diagnostic_from_failure(
+            stage=ToolDiagnosticStage.PROTOCOL,
+            kind=ToolDiagnosticKind.TOOL_PROTOCOL_ERROR,
+            code=code,
+            message=message,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+        )
         payload = {
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
             "code": code,
             "message": message,
+            "failure_kind": ToolFailureKind.TOOL_PROTOCOL_ERROR.value,
+            "tool_diagnostics": [diagnostic.to_dict()],
         }
         return cls(
             event_type=AgentEventType.TOOL_CALL_PROTOCOL_ERROR,

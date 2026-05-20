@@ -167,8 +167,8 @@ approval:
 #   interval_sec: 86400
 #
 # diagnostics:
-#   tool_argument_validation:
-#     enabled: true        # Record malformed/repaired tool argument calls.
+#   tool_diagnostics:
+#     enabled: true        # Record malformed/repaired/erroring tool lifecycle calls.
 #     record_clean: false  # Keep false; clean calls should not be persisted.
 #   llm_trace:
 #     enabled: false       # Record request/stream summaries for diagnosis.

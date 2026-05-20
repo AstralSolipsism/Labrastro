@@ -140,9 +140,9 @@ class ConfigLoader:
         "temperature",
         "thinking_enabled",
     }
-    _DIAGNOSTICS_FIELDS = {"llm_trace", "tool_argument_validation"}
+    _DIAGNOSTICS_FIELDS = {"llm_trace", "tool_diagnostics"}
     _LLM_TRACE_FIELDS = {"enabled", "raw_chunks"}
-    _TOOL_ARGUMENT_VALIDATION_FIELDS = {"enabled", "record_clean"}
+    _TOOL_DIAGNOSTICS_FIELDS = {"enabled", "record_clean"}
 
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = Path(config_path) if config_path is not None else None
@@ -306,12 +306,12 @@ class ConfigLoader:
                     path="diagnostics.llm_trace",
                     errors=errors,
                 )
-            tool_validation = diagnostics.get("tool_argument_validation")
-            if isinstance(tool_validation, dict):
+            tool_diagnostics = diagnostics.get("tool_diagnostics")
+            if isinstance(tool_diagnostics, dict):
                 self._collect_unknown_fields(
-                    tool_validation,
-                    allowed=self._TOOL_ARGUMENT_VALIDATION_FIELDS,
-                    path="diagnostics.tool_argument_validation",
+                    tool_diagnostics,
+                    allowed=self._TOOL_DIAGNOSTICS_FIELDS,
+                    path="diagnostics.tool_diagnostics",
                     errors=errors,
                 )
         if errors:

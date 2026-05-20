@@ -381,12 +381,12 @@ class RemoteAdminRoutes:
                 )
                 self._send_json(result.status, result.payload)
                 return
-            if path == "/remote/admin/diagnostics/tool-arguments/stats":
+            if path == "/remote/admin/diagnostics/tool-diagnostics/stats":
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "tool_argument_validation": self.service.admin_manager.tool_argument_validation_stats(),
+                        "tool_diagnostics": self.service.admin_manager.tool_diagnostic_stats(),
                     },
                 )
                 return
@@ -717,7 +717,7 @@ class RemoteAdminRoutes:
             "/remote/admin/agent-runs/list",
             "/remote/admin/agent-runs/load",
             "/remote/admin/server-settings/read",
-            "/remote/admin/diagnostics/tool-arguments/stats",
+            "/remote/admin/diagnostics/tool-diagnostics/stats",
             "/remote/admin/providers/list",
             "/remote/admin/providers/models",
             "/remote/admin/models/list",

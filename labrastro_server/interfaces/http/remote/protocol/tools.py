@@ -5,13 +5,74 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+
+@dataclass(frozen=True)
+class ToolMutationPreviewState:
+    resolved_path: str | None = None
+    old_sha256: str | None = None
+    old_exists: bool | None = None
+    old_size: int | None = None
+
+    def is_empty(self) -> bool:
+        return not any(
+            value is not None
+            for value in (
+                self.resolved_path,
+                self.old_sha256,
+                self.old_exists,
+                self.old_size,
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.resolved_path is not None:
+            payload["resolved_path"] = self.resolved_path
+        if self.old_sha256 is not None:
+            payload["old_sha256"] = self.old_sha256
+        if self.old_exists is not None:
+            payload["old_exists"] = self.old_exists
+        if self.old_size is not None:
+            payload["old_size"] = self.old_size
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "ToolMutationPreviewState | None":
+        if not isinstance(d, dict) or not d:
+            return None
+        state = cls(
+            resolved_path=(
+                str(d["resolved_path"]) if d.get("resolved_path") is not None else None
+            ),
+            old_sha256=str(d["old_sha256"]) if d.get("old_sha256") is not None else None,
+            old_exists=(
+                bool(d["old_exists"]) if d.get("old_exists") is not None else None
+            ),
+            old_size=int(d["old_size"]) if d.get("old_size") is not None else None,
+        )
+        return None if state.is_empty() else state
+
+    @classmethod
+    def from_preview(
+        cls, preview: "ToolPreviewResult"
+    ) -> "ToolMutationPreviewState | None":
+        return cls.from_dict(
+            {
+                "resolved_path": preview.resolved_path,
+                "old_sha256": preview.old_sha256,
+                "old_exists": preview.old_exists,
+                "old_size": preview.old_size,
+            }
+        )
+
+
 @dataclass
 class ExecToolRequest:
     tool_name: str
     args: dict[str, Any] = field(default_factory=dict)
     cwd: str | None = None
     timeout_sec: int = 30
-    expected_state: dict[str, Any] = field(default_factory=dict)
+    expected_state: ToolMutationPreviewState | None = None
     tool_call_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -20,7 +81,9 @@ class ExecToolRequest:
             "args": self.args,
             "cwd": self.cwd,
             "timeout_sec": self.timeout_sec,
-            "expected_state": self.expected_state,
+            "expected_state": (
+                self.expected_state.to_dict() if self.expected_state is not None else {}
+            ),
             "tool_call_id": self.tool_call_id,
         }
 
@@ -32,12 +95,9 @@ class ExecToolRequest:
             cwd=d.get("cwd"),
             timeout_sec=d.get("timeout_sec", 30),
             tool_call_id=d.get("tool_call_id"),
-            expected_state=(
-                dict(d.get("expected_state", {}))
-                if isinstance(d.get("expected_state", {}), dict)
-                else {}
-            ),
+            expected_state=ToolMutationPreviewState.from_dict(d.get("expected_state")),
         )
+
 
 @dataclass
 class ExecToolResult:
@@ -221,6 +281,7 @@ class CleanupResult:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "ToolMutationPreviewState",
     "ExecToolRequest",
     "ExecToolResult",
     "ToolPreviewRequest",

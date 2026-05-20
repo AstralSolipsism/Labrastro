@@ -3,13 +3,16 @@
 import json
 
 from reuleauxcoder.services.llm.diagnostics import (
-    aggregate_tool_argument_validation_events,
+    aggregate_tool_diagnostic_events,
     persist_llm_error_diagnostic,
-    persist_tool_argument_validation_event,
+    persist_tool_diagnostic_event,
     snapshot_messages,
-    summarize_tool_argument_validation_events,
+    summarize_tool_diagnostic_events,
 )
 from reuleauxcoder.domain.agent.tool_arguments import validate_and_repair_tool_arguments
+from reuleauxcoder.domain.agent.tool_diagnostics import (
+    diagnostics_from_argument_validation,
+)
 
 
 def test_snapshot_messages_keeps_last_10_and_truncates_content() -> None:
@@ -124,7 +127,7 @@ def test_persist_llm_error_diagnostic_records_cause_chain_and_provider_details(
     assert "secret-token" not in serialized
 
 
-def test_tool_argument_validation_telemetry_aggregates_by_model_tool_and_issue(
+def test_tool_diagnostic_telemetry_aggregates_by_model_tool_stage_and_issue(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -138,7 +141,11 @@ def test_tool_argument_validation_telemetry_aggregates_by_model_tool_and_issue(
         },
     )
 
-    path = persist_tool_argument_validation_event(
+    path = persist_tool_diagnostic_event(
+        diagnostics=diagnostics_from_argument_validation(
+            validation,
+            tool_call_id="call_write_1",
+        ),
         validation=validation,
         metadata={
             "model": "deepseek-v4-pro",
@@ -147,17 +154,24 @@ def test_tool_argument_validation_telemetry_aggregates_by_model_tool_and_issue(
         },
     )
 
-    counts = aggregate_tool_argument_validation_events(path)
+    counts = aggregate_tool_diagnostic_events(path)
 
     assert counts["model=deepseek-v4-pro|tool=write_file|final_valid=false"] == 1
     assert (
         counts[
-            "issue|model=deepseek-v4-pro|tool=write_file|code=missing_required|path=$.content"
+            "issue|model=deepseek-v4-pro|tool=write_file|stage=argument_validation|kind=schema_issue|code=missing_required|path=$.content"
         ]
         == 1
     )
 
-    summary = summarize_tool_argument_validation_events(path)
-    assert summary["totals"] == {"events": 1, "invalid": 1, "repaired": 0}
+    summary = summarize_tool_diagnostic_events(path)
+    assert summary["totals"] == {
+        "events": 1,
+        "diagnostics": 1,
+        "errors": 1,
+        "warnings": 0,
+        "repaired": 0,
+    }
     assert summary["by_model"][0]["name"] == "deepseek-v4-pro"
+    assert summary["by_stage"][0]["name"] == "argument_validation"
     assert summary["issues"][0]["code"] == "missing_required"

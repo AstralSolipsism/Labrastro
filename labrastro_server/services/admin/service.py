@@ -40,9 +40,7 @@ from reuleauxcoder.domain.config.models import (
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
-from reuleauxcoder.services.llm.diagnostics import (
-    summarize_tool_argument_validation_events,
-)
+from reuleauxcoder.services.llm.diagnostics import summarize_tool_diagnostic_events
 from reuleauxcoder.services.providers.model_capabilities import (
     ModelCapabilityCatalogService,
     capability_recommendation,
@@ -466,8 +464,8 @@ class RemoteAdminConfigManager:
             "config_etag": self.config_etag(data),
         }
 
-    def tool_argument_validation_stats(self) -> dict[str, Any]:
-        return summarize_tool_argument_validation_events()
+    def tool_diagnostic_stats(self) -> dict[str, Any]:
+        return summarize_tool_diagnostic_events()
 
     def update_server_settings(self, payload: dict[str, Any]) -> AdminConfigResult:
         raw_settings = payload.get("settings")

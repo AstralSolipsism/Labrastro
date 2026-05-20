@@ -44,6 +44,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     REMOTE_ENDPOINTS,
     SessionModelSwitchRequest,
     SessionListRequest,
+    ToolMutationPreviewState,
     ToolPreviewRequest,
     ToolPreviewResult,
     ToolStreamChunk,
@@ -531,7 +532,7 @@ class TestExecToolRequest:
             args={"command": "ls"},
             cwd="/tmp",
             timeout_sec=60,
-            expected_state={"old_sha256": "abc"},
+            expected_state=ToolMutationPreviewState(old_sha256="abc"),
         )
         d = req.to_dict()
         restored = ExecToolRequest.from_dict(d)
@@ -539,14 +540,35 @@ class TestExecToolRequest:
         assert restored.args == {"command": "ls"}
         assert restored.cwd == "/tmp"
         assert restored.timeout_sec == 60
-        assert restored.expected_state == {"old_sha256": "abc"}
+        assert restored.expected_state == ToolMutationPreviewState(old_sha256="abc")
 
     def test_defaults(self) -> None:
         req = ExecToolRequest(tool_name="read_file")
         assert req.args == {}
         assert req.cwd is None
         assert req.timeout_sec == 30
-        assert req.expected_state == {}
+        assert req.expected_state is None
+
+    def test_expected_state_ignores_preview_mtime(self) -> None:
+        state = ToolMutationPreviewState.from_preview(
+            ToolPreviewResult(
+                ok=True,
+                resolved_path="/repo/a.txt",
+                old_sha256="abc",
+                old_exists=True,
+                old_size=10,
+                old_mtime_ns=123,
+            )
+        )
+
+        assert state == ToolMutationPreviewState(
+            resolved_path="/repo/a.txt",
+            old_sha256="abc",
+            old_exists=True,
+            old_size=10,
+        )
+        assert state is not None
+        assert "old_mtime_ns" not in state.to_dict()
 
 
 class TestExecToolResult:
