@@ -102,9 +102,24 @@ SessionTraceEventSink = Callable[
     [str, str, dict[str, Any], str | None, int | None, str, bool], int | None
 ]
 
+_LIVE_ONLY_CHAT_EVENTS = frozenset(
+    {"assistant_delta", "reasoning_delta", "tool_call_stream"}
+)
+_LIVE_EVENT_FLUSH_INTERVAL_SEC = 0.04
+_LIVE_EVENT_MAX_CONTENT_CHARS = 1024
+
 
 def _is_replayable_chat_event(event_type: str) -> bool:
-    return bool(event_type)
+    return bool(event_type) and event_type not in _LIVE_ONLY_CHAT_EVENTS
+
+
+@dataclass
+class _PendingLiveChatEvent:
+    key: str
+    event_type: str
+    payload: dict[str, Any]
+    content: str
+    due_at: float
 
 
 class _ChatEventBuffer:
@@ -295,6 +310,8 @@ class _RemoteChatSession:
     last_activity_at: float = field(default_factory=time.time)
     _event_buffer: _ChatEventBuffer = field(init=False, repr=False)
     _pending_trace_events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+    _pending_live_events: list[_PendingLiveChatEvent] = field(default_factory=list, init=False, repr=False)
+    _last_live_flush_at: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.session_id is None:
@@ -309,41 +326,144 @@ class _RemoteChatSession:
 
     @property
     def events(self) -> list[dict[str, Any]]:
-        return self._event_buffer.snapshot()
+        with self.cond:
+            self._flush_live_events_locked(time.time(), force=True)
+            return self._event_buffer.snapshot()
 
     def append_event(
         self, event_type: str, payload: dict[str, Any] | None = None
     ) -> int:
         with self.cond:
-            seq = self.seq_next
-            self.seq_next += 1
-            event = {
-                "chat_id": self.chat_id,
-                "seq": seq,
-                "type": event_type,
-                "payload": payload or {},
-            }
-            if isinstance(payload, dict):
-                session_id = payload.get("session_id")
-                if isinstance(session_id, str) and session_id:
-                    self.session_id = session_id
-            self._persist_or_queue_trace_event(event)
-            self._event_buffer.append(event)
-            if event_type == "error":
-                self.status = "error"
-                message = (payload or {}).get("message") if isinstance(payload, dict) else None
-                self.last_error = str(message) if message is not None else "error"
-            elif event_type == "chat_cancelled":
-                self.status = "cancelled"
-                reason = (payload or {}).get("reason") if isinstance(payload, dict) else None
-                self.last_error = str(reason) if reason is not None else "chat_cancelled"
-            elif event_type == "chat_interrupted":
-                self.status = "interrupted"
-                message = (payload or {}).get("message") if isinstance(payload, dict) else None
-                self.last_error = str(message) if message is not None else "provider stream interrupted"
-            self.last_activity_at = time.time()
+            normalized_payload = payload if isinstance(payload, dict) else {}
+            now = time.time()
+            if event_type in _LIVE_ONLY_CHAT_EVENTS:
+                return self._append_live_event_locked(event_type, normalized_payload, now)
+            self._flush_live_events_locked(now, force=True)
+            seq = self._append_event_locked(event_type, normalized_payload)
+            self._update_status_for_event_locked(event_type, normalized_payload)
+            self.last_activity_at = now
             self.cond.notify_all()
             return seq
+
+    def _append_event_locked(self, event_type: str, payload: dict[str, Any]) -> int:
+        seq = self.seq_next
+        self.seq_next += 1
+        event = {
+            "chat_id": self.chat_id,
+            "seq": seq,
+            "type": event_type,
+            "payload": payload,
+        }
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self.session_id = session_id
+        self._persist_or_queue_trace_event(event)
+        self._event_buffer.append(event)
+        return seq
+
+    def _append_live_event_locked(
+        self, event_type: str, payload: dict[str, Any], now: float
+    ) -> int:
+        content = str(payload.get("content") or "")
+        if not content:
+            return self._event_buffer.latest_seq
+        self._flush_live_events_locked(now)
+        key = self._live_event_key(event_type, payload)
+        last_flush_at = self._last_live_flush_at.get(key, 0.0)
+        if now - last_flush_at >= _LIVE_EVENT_FLUSH_INTERVAL_SEC:
+            seq = self._append_event_locked(event_type, dict(payload))
+            self._last_live_flush_at[key] = now
+            self.last_activity_at = now
+            self.cond.notify_all()
+            return seq
+
+        pending = self._pending_live_event(key)
+        if pending is None:
+            pending = _PendingLiveChatEvent(
+                key=key,
+                event_type=event_type,
+                payload={**payload, "content": content},
+                content=content,
+                due_at=last_flush_at + _LIVE_EVENT_FLUSH_INTERVAL_SEC,
+            )
+            self._pending_live_events.append(pending)
+        else:
+            pending.content = f"{pending.content}{content}"
+            pending.payload.update({k: v for k, v in payload.items() if k != "content"})
+            pending.payload["content"] = pending.content
+        if len(pending.content) >= _LIVE_EVENT_MAX_CONTENT_CHARS:
+            self._flush_live_events_locked(now, force=True, keys={key})
+        self.last_activity_at = now
+        return self._event_buffer.latest_seq
+
+    def _pending_live_event(self, key: str) -> _PendingLiveChatEvent | None:
+        for event in self._pending_live_events:
+            if event.key == key:
+                return event
+        return None
+
+    def _flush_live_events_locked(
+        self,
+        now: float,
+        *,
+        force: bool = False,
+        keys: set[str] | None = None,
+    ) -> bool:
+        if not self._pending_live_events:
+            return False
+        remaining: list[_PendingLiveChatEvent] = []
+        flushed = False
+        for pending in self._pending_live_events:
+            selected = keys is None or pending.key in keys
+            due = now >= pending.due_at
+            too_large = len(pending.content) >= _LIVE_EVENT_MAX_CONTENT_CHARS
+            if selected and (force or due or too_large):
+                self._append_event_locked(pending.event_type, dict(pending.payload))
+                self._last_live_flush_at[pending.key] = now
+                flushed = True
+            else:
+                remaining.append(pending)
+        self._pending_live_events = remaining
+        if flushed:
+            self.last_activity_at = now
+            self.cond.notify_all()
+        return flushed
+
+    def _next_live_flush_delay_locked(self, now: float) -> float | None:
+        if not self._pending_live_events:
+            return None
+        due_at = min(event.due_at for event in self._pending_live_events)
+        return max(0.0, due_at - now)
+
+    @staticmethod
+    def _live_event_key(event_type: str, payload: dict[str, Any]) -> str:
+        if event_type != "tool_call_stream":
+            return event_type
+        return ":".join(
+            [
+                event_type,
+                str(payload.get("tool_call_id") or ""),
+                str(payload.get("tool_name") or ""),
+                str(payload.get("stream") or ""),
+                str(payload.get("format") or ""),
+            ]
+        )
+
+    def _update_status_for_event_locked(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        if event_type == "error":
+            self.status = "error"
+            message = payload.get("message")
+            self.last_error = str(message) if message is not None else "error"
+        elif event_type == "chat_cancelled":
+            self.status = "cancelled"
+            reason = payload.get("reason")
+            self.last_error = str(reason) if reason is not None else "chat_cancelled"
+        elif event_type == "chat_interrupted":
+            self.status = "interrupted"
+            message = payload.get("message")
+            self.last_error = str(message) if message is not None else "provider stream interrupted"
 
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
         if not _is_replayable_chat_event(str(event.get("type") or "")):
@@ -391,10 +511,15 @@ class _RemoteChatSession:
         deadline = time.time() + max(timeout_sec, 0.0)
         with self.cond:
             while cursor >= self._event_buffer.latest_seq and not self.done:
+                now = time.time()
+                if self._flush_live_events_locked(now):
+                    break
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
-                self.cond.wait(timeout=remaining)
+                live_delay = self._next_live_flush_delay_locked(time.time())
+                wait_timeout = remaining if live_delay is None else min(remaining, live_delay)
+                self.cond.wait(timeout=max(wait_timeout, 0.001))
             out, next_cursor = self._event_buffer.events_after(cursor)
             self.last_activity_at = time.time()
             return out, self.done, next_cursor
@@ -408,6 +533,7 @@ class _RemoteChatSession:
     def mark_done(self) -> None:
         unconsumed: list[dict[str, Any]] = []
         with self.cond:
+            self._flush_live_events_locked(time.time(), force=True)
             self.running = False
             self.done = True
             if self.status not in {"error", "cancelled", "interrupted"}:

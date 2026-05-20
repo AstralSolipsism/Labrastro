@@ -1742,6 +1742,16 @@ class TestRunnerRemoteExec:
                 for event in events
                 if event["type"] == "reasoning_delta"
             )
+            final_reasoning_text = "".join(
+                event["payload"].get("content", "")
+                for event in events
+                if event["type"] == "reasoning_message"
+            )
+            final_assistant_text = "".join(
+                event["payload"].get("content", "")
+                for event in events
+                if event["type"] == "assistant_message"
+            )
             terminal_text = "\n".join(
                 event["payload"].get("content", "")
                 for event in events
@@ -1750,6 +1760,8 @@ class TestRunnerRemoteExec:
 
             assert reasoning_text == "Need file"
             assert assistant_text == "Before tool"
+            assert final_reasoning_text == "Need file"
+            assert final_assistant_text == "done"
             assert "TOOL CALL" not in terminal_text
             assert "read_file(" not in terminal_text
             assert "file body" not in terminal_text

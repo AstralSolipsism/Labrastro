@@ -1114,7 +1114,9 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     str(ticket.get("text") or ""),
                 )
             )
-        if hasattr(remote_session, "set_follow_up_cancel_callback"):
+        if hasattr(remote_session, "set_follow_up_cancel_callback") and hasattr(
+            peer_agent, "cancel_follow_up"
+        ):
             remote_session.set_follow_up_cancel_callback(peer_agent.cancel_follow_up)
         if hasattr(peer_agent, "set_follow_up_consumed_handler"):
             peer_agent.set_follow_up_consumed_handler(
@@ -1222,8 +1224,11 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         )
         renderer = CLIRenderer(console_override=ansi_console)
         assistant_content_emitted = {"value": False}
+        reasoning_content_emitted = {"value": False}
         chat_interrupted_emitted = {"value": False}
         active_tool_calls_by_name: dict[str, list[str]] = {}
+        assistant_stream_parts: list[str] = []
+        reasoning_stream_parts: list[str] = []
         context_event_bus = UIEventBus()
 
         def _append_context_event(event) -> None:
@@ -1242,6 +1247,34 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 remote_session.append_event(
                     "output", {"format": "terminal", "content": rendered}
                 )
+
+        def _append_final_reasoning() -> None:
+            if reasoning_content_emitted["value"]:
+                return
+            content = "".join(reasoning_stream_parts)
+            if not content:
+                return
+            remote_session.append_event(
+                "reasoning_message",
+                {"format": "markdown", "content": content},
+            )
+            reasoning_content_emitted["value"] = True
+
+        def _append_final_assistant(response: str | None = None) -> None:
+            if assistant_content_emitted["value"]:
+                return
+            content = response if response else "".join(assistant_stream_parts)
+            if not content:
+                return
+            remote_session.append_event(
+                "assistant_message",
+                {"format": "markdown", "content": content},
+            )
+            assistant_content_emitted["value"] = True
+
+        def _append_final_stream_content(response: str | None = None) -> None:
+            _append_final_reasoning()
+            _append_final_assistant(response)
 
         def _remote_backend() -> RemoteRelayToolBackend | None:
             for tool in getattr(peer_agent, "tools", []):
@@ -1478,7 +1511,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.STREAM_TOKEN:
                 content = event.data.get("token", "")
                 if content:
-                    assistant_content_emitted["value"] = True
+                    assistant_stream_parts.append(str(content))
                     remote_session.append_event(
                         "assistant_delta",
                         {"format": "markdown", "content": content},
@@ -1487,6 +1520,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.REASONING_TOKEN:
                 content = event.data.get("token", "")
                 if content:
+                    reasoning_stream_parts.append(str(content))
                     remote_session.append_event(
                         "reasoning_delta",
                         {"format": "markdown", "content": content},
@@ -1501,11 +1535,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.CHAT_END:
                 response = event.data.get("response", "")
                 if event.data.get("render_response", True) and response:
-                    assistant_content_emitted["value"] = True
-                    remote_session.append_event(
-                        "assistant_message",
-                        {"format": "markdown", "content": response},
-                    )
+                    _append_final_stream_content(str(response))
                 return
             if event.event_type == AgentEventType.PROVIDER_STREAM_INTERRUPTED:
                 remote_session.append_event("provider_stream_interrupted", event.data)
@@ -1519,6 +1549,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.CHAT_INTERRUPTED:
                 chat_interrupted_emitted["value"] = True
                 remote_session.register_recovery(dict(event.data))
+                _append_final_stream_content()
                 remote_session.append_event("chat_interrupted", event.data)
                 return
             if event.event_type == AgentEventType.TOOL_CALL_START:
@@ -1604,6 +1635,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             )
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
+            _append_final_stream_content(str(result) if result else None)
             if getattr(remote_session, "cancel_requested", False):
                 remote_session.append_event(
                     "chat_cancelled",
@@ -1620,6 +1652,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         except RemoteToolProtocolError as exc:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
+            _append_final_stream_content()
             failure_payload = {
                 "message": exc.message,
                 "code": exc.code,
@@ -1630,6 +1663,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         except Exception as exc:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
+            _append_final_stream_content()
             failure_payload = {
                 "message": str(exc),
                 "code": "REMOTE_CHAT_ERROR",

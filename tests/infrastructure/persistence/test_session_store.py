@@ -278,6 +278,23 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
     assert store.list_trace_events(session_id) == []
 
 
+def test_live_trace_events_do_not_mutate_session_document(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session_id = store.save(messages=[{"role": "user", "content": "hi"}], model="m1")
+    store.append_trace_event(session_id, "chat_start", {"prompt": "hi"}, chat_id="chat-1", chat_seq=1)
+    before = store.load_document(session_id)
+
+    store.append_trace_event(
+        session_id,
+        "assistant_delta",
+        {"content": "live"},
+        chat_id="chat-1",
+        chat_seq=2,
+    )
+
+    assert store.load_document(session_id) == before
+
+
 def test_session_store_concurrent_save_keeps_sessions_readable(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     session_id = store.save(

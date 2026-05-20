@@ -215,22 +215,46 @@ def test_remote_chat_session_flushes_pending_replayable_events_when_session_id_a
     )
 
     session.append_event("chat_start", {"prompt": "hi"})
-    session.append_event("assistant_delta", {"content": "ignored"})
+    session.append_event("assistant_delta", {"content": "live-only"})
+    session.append_event("tool_call_stream", {"tool_call_id": "tool-1", "content": "live"})
     assert persisted == []
 
     session.append_event("remote_peer_ready", {"session_id": "session-1"})
+    session.append_event("assistant_message", {"content": "stored"})
     session.append_event("chat_end", {"response": "done"})
 
     assert [event["type"] for event in persisted] == [
         "chat_start",
-        "assistant_delta",
         "remote_peer_ready",
+        "assistant_message",
         "chat_end",
     ]
     assert [event["session_id"] for event in persisted] == ["session-1"] * 4
     event_by_type = {event["type"]: event for event in session.events}
-    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 3
+    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 2
+    assert event_by_type["assistant_message"]["session_event_seq"] == 3
     assert event_by_type["chat_end"]["session_event_seq"] == 4
+
+
+def test_remote_chat_session_coalesces_fast_live_events(tmp_path: Path) -> None:
+    session = _RemoteChatSession(
+        chat_id="chat-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    session.append_event("assistant_delta", {"content": "A"})
+    events, _done, cursor = session.wait_events(0, 0)
+    assert [event["payload"]["content"] for event in events] == ["A"]
+
+    session.append_event("assistant_delta", {"content": "B"})
+    session.append_event("assistant_delta", {"content": "C"})
+    events, _done, cursor = session.wait_events(cursor, 0)
+    assert events == []
+
+    events, _done, _cursor = session.wait_events(cursor, 0.2)
+    assert [event["type"] for event in events] == ["assistant_delta"]
+    assert events[0]["payload"]["content"] == "BC"
 
 
 def _raw_request(

@@ -6,6 +6,10 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+_LIVE_ONLY_SESSION_EVENTS = frozenset(
+    {"assistant_delta", "reasoning_delta", "tool_call_stream"}
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -79,6 +83,8 @@ def apply_session_event(
     _ensure_document_shape(doc, session_id)
     payload = dict(payload or {})
     event_type = str(event_type or "")
+    if event_type in _LIVE_ONLY_SESSION_EVENTS:
+        return doc
     event_seq = max(0, int(session_event_seq or 0))
     timestamp = created_at or utc_now()
     meta = {
@@ -117,19 +123,11 @@ def apply_session_event(
         })
     elif event_type in {"usage_update", "run_stats"}:
         _apply_usage(doc, payload)
-    elif event_type in {"reasoning_delta", "reasoning_message"}:
+    elif event_type == "reasoning_message":
         _upsert_reasoning_part(
             doc,
             str(payload.get("content") or ""),
             "plain" if str(payload.get("format") or "") == "plain" else "markdown",
-            meta,
-        )
-    elif event_type == "assistant_delta":
-        _append_text_part(
-            doc,
-            str(payload.get("content") or ""),
-            "assistant-stream",
-            "markdown",
             meta,
         )
     elif event_type == "assistant_message":
@@ -142,7 +140,7 @@ def apply_session_event(
         )
     elif event_type == "chat_end":
         _apply_chat_end(doc, payload, meta)
-    elif event_type in {"output", "tool_call_start", "tool_call_stream", "tool_call_end",
+    elif event_type in {"output", "tool_call_start", "tool_call_end",
                         "tool_call_protocol_error", "approval_request", "approval_resolved"}:
         _apply_tool_or_output_event(doc, event_type, payload, meta)
     elif event_type == "runtime_status":
@@ -422,18 +420,6 @@ def _apply_tool_or_output_event(
             "toolSource": _string(payload, "tool_source"),
             "toolStartedAt": payload.get("started_at"),
             "toolInput": payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {},
-        }, meta)
-    elif event_type == "tool_call_stream":
-        tool_call_id = _tool_call_id(payload)
-        current = _find_tool_part(doc, tool_call_id)
-        output = f"{current.get('toolOutput', '') if current else ''}{payload.get('content') or ''}"
-        _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
-            "status": "running",
-            "toolCallId": tool_call_id,
-            "toolSource": _string(payload, "tool_source"),
-            "toolStream": _string(payload, "stream") or "stdout",
-            "toolOutput": output,
-            "toolOutputFormat": "plain",
         }, meta)
     elif event_type == "tool_call_protocol_error":
         code = _string(payload, "code")
