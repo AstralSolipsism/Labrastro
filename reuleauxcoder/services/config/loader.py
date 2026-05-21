@@ -826,11 +826,6 @@ class ConfigLoader:
                 "environment": {
                     "name": "Environment Tools",
                     "description": "Read and configure the local workspace environment manifest.",
-                    "permissions": [
-                        "environment.check",
-                        "environment.configure",
-                        "environment.manifest.read",
-                    ],
                 }
             },
             "sandbox_provider": {

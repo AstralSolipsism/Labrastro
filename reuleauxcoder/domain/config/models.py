@@ -52,11 +52,6 @@ DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
 DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE: dict[str, Any] = {
     "name": "Environment Tools",
     "description": "Read and configure the local workspace environment manifest.",
-    "permissions": [
-        "environment.check",
-        "environment.configure",
-        "environment.manifest.read",
-    ],
     "source": "builtin",
 }
 

@@ -226,12 +226,11 @@ approval:
 #       max_concurrent_tasks: 2
 
 # Dispatch profiles describe what an Agent is good at. Capability packages are
-# reusable ability grants selected by `capability_refs`.
+# reusable CLI, MCP, and Skill component bundles selected by `capability_refs`.
 # capability_packages:
 #   environment:
 #     name: "Environment Tools"
 #     description: "Read and configure the local workspace environment manifest."
-#     permissions: ["environment.check", "environment.configure", "environment.manifest.read"]
 #     source: "builtin"
 #   github-review:
 #     name: "GitHub Review"
@@ -239,7 +238,6 @@ approval:
 #     mcp_servers: ["github"]
 #     skills: ["code-review"]
 #     cli_tools: ["gitnexus"]
-#     permissions: ["repo.read", "issue.comment"]
 #     source: "local"
 #
 # Optional execution-room provider for on-demand AgentRun worker sessions.

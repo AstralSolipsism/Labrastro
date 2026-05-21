@@ -223,7 +223,6 @@ CONFIG_SCHEMA = {
             "mcp_servers": ["server-name", "..."],
             "skills": ["skill-name", "..."],
             "cli_tools": ["tool-name", "..."],
-            "permissions": ["permission-name", "..."],
             "source": "string (optional, e.g. builtin/local/market)",
             "market": "dict (optional, package-market metadata)",
         }

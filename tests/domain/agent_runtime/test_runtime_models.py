@@ -142,7 +142,9 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert resolved["mcp_servers"] == ["github"]
     assert resolved["skills"] == ["code-review"]
     assert resolved["cli_tools"] == ["gitnexus"]
-    assert resolved["permissions"] == ["repo.read", "runtime.dispatch"]
+    assert "permissions" not in resolved
+    assert "permissions" not in resolved["packages"][0]
+    assert "permissions" not in resolved["packages"][1]
 
 
 def test_task_and_artifact_status_are_independent() -> None:

@@ -98,6 +98,7 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     assert config.agent_registry.agents["code_reviewer"].capability_refs == [
         "github-review",
     ]
+    assert "permissions" not in config.capability_packages["github-review"].to_dict()
     assert "environment_local" in config.runtime_profiles.profiles
     assert "environment_configurator" in config.agent_registry.agents
 
@@ -128,6 +129,7 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     assert "environment manifest" in agent.dispatch.profile
     assert agent.capability_refs == ["environment"]
     assert "environment" in config.capability_packages
+    assert "permissions" not in config.capability_packages["environment"].to_dict()
 
 
 def test_merge_dicts_merges_agent_registry_maps_by_id() -> None:

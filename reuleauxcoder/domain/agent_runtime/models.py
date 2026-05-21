@@ -157,7 +157,6 @@ class CapabilityPackageConfig:
     mcp_servers: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     cli_tools: list[str] = field(default_factory=list)
-    permissions: list[str] = field(default_factory=list)
     source: str = ""
     market: dict[str, Any] = field(default_factory=dict)
 
@@ -175,7 +174,6 @@ class CapabilityPackageConfig:
             mcp_servers=_string_list(data.get("mcp_servers", [])),
             skills=_string_list(data.get("skills", [])),
             cli_tools=_string_list(data.get("cli_tools", [])),
-            permissions=_string_list(data.get("permissions", [])),
             source=str(data.get("source", "") or ""),
             market=_dict_value(data.get("market", {})),
         )
@@ -192,8 +190,6 @@ class CapabilityPackageConfig:
             result["skills"] = list(self.skills)
         if self.cli_tools:
             result["cli_tools"] = list(self.cli_tools)
-        if self.permissions:
-            result["permissions"] = list(self.permissions)
         if self.source:
             result["source"] = self.source
         if self.market:
@@ -211,7 +207,6 @@ def resolve_capability_refs(
     mcp_servers: list[str] = []
     skills: list[str] = []
     cli_tools: list[str] = []
-    permissions: list[str] = []
     for package_id in capability_refs:
         package = packages.get(package_id)
         if package is None:
@@ -222,13 +217,11 @@ def resolve_capability_refs(
         mcp_servers.extend(package.mcp_servers)
         skills.extend(package.skills)
         cli_tools.extend(package.cli_tools)
-        permissions.extend(package.permissions)
     return {
         "packages": resolved_packages,
         "mcp_servers": _dedupe_strings(mcp_servers),
         "skills": _dedupe_strings(skills),
         "cli_tools": _dedupe_strings(cli_tools),
-        "permissions": _dedupe_strings(permissions),
     }
 
 
