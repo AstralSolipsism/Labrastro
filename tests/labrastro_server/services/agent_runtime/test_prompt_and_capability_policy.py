@@ -29,7 +29,7 @@ def test_prompt_renderer_targets_executor_native_instruction_files() -> None:
             "packages": [{"id": "github-review", "name": "GitHub Review"}],
             "mcp_servers": ["github"],
             "skills": ["code-review"],
-            "permissions": ["repo.read"],
+            "cli_tools": ["gitnexus"],
         },
     )
 
@@ -46,6 +46,8 @@ def test_prompt_renderer_targets_executor_native_instruction_files() -> None:
     assert "Dispatch Profile" in gemini.files["GEMINI.md"]
     assert "审查后端运行时变更" in gemini.files["GEMINI.md"]
     assert "GitHub Review" in gemini.files["GEMINI.md"]
+    assert "gitnexus" in gemini.files["GEMINI.md"]
+    assert "Permissions" not in gemini.files["GEMINI.md"]
 
 
 def test_prompt_renderer_does_not_render_raw_secret_values() -> None:

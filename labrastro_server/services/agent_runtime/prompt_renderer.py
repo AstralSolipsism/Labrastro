@@ -128,7 +128,6 @@ class ExecutorPromptRenderer:
             ("mcp_servers", "MCP servers"),
             ("skills", "Skills"),
             ("cli_tools", "CLI tools"),
-            ("permissions", "Permissions"),
         )
         for key, title in sections:
             values = resolved.get(key)
