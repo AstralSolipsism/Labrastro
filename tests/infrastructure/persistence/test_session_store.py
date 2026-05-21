@@ -175,6 +175,42 @@ def test_session_store_list_skips_documentless_sessions(tmp_path: Path) -> None:
     assert store.load(legacy_id) is not None
 
 
+def test_session_store_list_keeps_initial_chat_start_preview_for_multi_turn_session(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    session_id = store.save(
+        messages=[{"role": "user", "content": "分析项目会话历史问题"}],
+        model="m1",
+        fingerprint="local",
+    )
+    _record_turn(store, session_id, "分析项目会话历史问题")
+
+    store.save(
+        messages=[
+            {"role": "user", "content": "分析项目会话历史问题"},
+            {"role": "assistant", "content": "初步结论"},
+            {"role": "user", "content": "请继续"},
+        ],
+        model="m1",
+        session_id=session_id,
+        fingerprint="local",
+    )
+    _record_turn(store, session_id, "请继续")
+
+    listed = store.list(limit=10, fingerprint="local")
+    assert [item.id for item in listed] == [session_id]
+    assert listed[0].preview == "分析项目会话历史问题"
+
+    document = store.load_document(session_id)
+    assert document is not None
+    assert [turn["userMessage"]["text"] for turn in document["turns"]] == [
+        "分析项目会话历史问题",
+        "请继续",
+    ]
+    assert document["stats"]["taskText"] == "请继续"
+
+
 def test_session_store_get_latest_prefers_recently_updated_session(
     tmp_path: Path,
 ) -> None:

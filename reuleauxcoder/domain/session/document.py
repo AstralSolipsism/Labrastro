@@ -9,6 +9,7 @@ from typing import Any
 _LIVE_ONLY_SESSION_EVENTS = frozenset(
     {"assistant_delta", "reasoning_delta", "tool_call_stream"}
 )
+_DEFAULT_SESSION_TITLES = frozenset({"", "新会话"})
 
 
 def utc_now() -> str:
@@ -334,9 +335,10 @@ def _apply_chat_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: s
         "assistantMessages": [],
     }
     turns = _list(doc, "turns")
+    should_initialize_title = _should_initialize_chat_title(doc, len(turns))
     turns.append(turn)
     session = _dict(doc, "session")
-    if prompt:
+    if prompt and should_initialize_title:
         session["title"] = prompt[:80]
         session["summary"] = prompt
         _dict(doc, "metadata")["preview"] = prompt
@@ -347,6 +349,13 @@ def _apply_chat_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: s
         "runStatus": "running",
     })
     _patch_run_state(doc, status="running", error=None)
+
+
+def _should_initialize_chat_title(doc: dict[str, Any], turns_before: int) -> bool:
+    if turns_before <= 0:
+        return True
+    title = str(_dict(doc, "session").get("title") or "").strip()
+    return title in _DEFAULT_SESSION_TITLES
 
 
 def _apply_chat_end(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
