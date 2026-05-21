@@ -166,9 +166,9 @@
       }
     },
     {
-      "name": "chat.stream",
+      "name": "chat.events",
       "method": "POST",
-      "path": "/remote/chat/stream",
+      "path": "/remote/chat/events",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
@@ -226,9 +226,9 @@
       }
     },
     {
-      "name": "chat.stream_lost_events",
+      "name": "chat.events_lost_events",
       "method": "POST",
-      "path": "/remote/chat/stream",
+      "path": "/remote/chat/events",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",

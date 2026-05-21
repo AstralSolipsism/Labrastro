@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gzip
 import json
@@ -23,8 +23,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatResponse,
     ChatStartRequest,
     ChatStartResponse,
-    ChatStreamRequest,
-    ChatStreamResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,

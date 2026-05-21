@@ -15,8 +15,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatStartResponse,
     ChatStatusRequest,
     ChatStatusResponse,
-    ChatStreamRequest,
-    ChatStreamResponse,
+    ChatEventsRequest,
+    ChatEventsBatch,
     DisconnectNotice,
     EnvironmentCLIToolManifest,
     EnvironmentMCPServerManifest,
@@ -138,8 +138,8 @@ class TestRemoteHTTPContract:
         SessionModelSwitchRequest.from_dict(fixtures["sessions.model"]["request"])
         ChatStartRequest.from_dict(fixtures["chat.start"]["request"])
         ChatStartResponse.from_dict(fixtures["chat.start"]["response"])
-        ChatStreamRequest.from_dict(fixtures["chat.stream"]["request"])
-        ChatStreamResponse.from_dict(fixtures["chat.stream"]["response"])
+        ChatEventsRequest.from_dict(fixtures["chat.events"]["request"])
+        ChatEventsBatch.from_dict(fixtures["chat.events"]["response"])
         ChatStatusRequest.from_dict(fixtures["chat.status"]["request"])
         ChatStatusResponse.from_dict(fixtures["chat.status"]["response"])
         EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
@@ -148,11 +148,14 @@ class TestRemoteHTTPContract:
     def test_registry_matches_actual_peer_token_control_plane_routes(self) -> None:
         registry = {endpoint["name"]: endpoint for endpoint in endpoint_registry()}
 
+        assert "chat.stream" not in registry
         assert registry["mcp.artifact"]["auth"] == "peer_token"
         assert (
             registry["artifacts.get"]["path"]
             == "/remote/artifacts/{os}/{arch}/{artifact_name}"
         )
+        assert registry["chat.events"]["path"] == "/remote/chat/events"
+        assert registry["chat.events"]["response_shape"] == "ChatEventsBatch"
         assert registry["peer.disconnect"]["request_model"] == "PeerDisconnectRequest"
         for name in (
             "taskflow.get",

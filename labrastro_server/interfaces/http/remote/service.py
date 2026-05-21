@@ -1,4 +1,4 @@
-﻿"""HTTP transport adapter for the remote relay host."""
+"""HTTP transport adapter for the remote relay host."""
 
 from __future__ import annotations
 
@@ -36,8 +36,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatResponse,
     ChatStartRequest,
     ChatStartResponse,
-    ChatStreamRequest,
-    ChatStreamResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentCLIToolManifest,
@@ -826,7 +824,7 @@ class RemoteRelayHTTPService:
         ui_bus: UIEventBus | None = None,
         artifact_provider: callable | None = None,
         chat_handler: Callable[[str, str], ChatResponse] | None = None,
-        stream_chat_handler: Callable[[str, str, _RemoteChatSession], None]
+        chat_events_handler: Callable[[str, str, _RemoteChatSession], None]
         | None = None,
         session_handler: Callable[[str, str, dict[str, Any]], dict[str, Any]]
         | None = None,
@@ -862,7 +860,7 @@ class RemoteRelayHTTPService:
         self.ui_bus = ui_bus
         self.artifact_provider = artifact_provider
         self.chat_handler = chat_handler
-        self.stream_chat_handler = stream_chat_handler
+        self.chat_events_handler = chat_events_handler
         self.session_handler = session_handler
         self.session_trace_event_sink: SessionTraceEventSink | None = None
         self.session_history_status_provider = session_history_status_provider
@@ -1087,11 +1085,11 @@ class RemoteRelayHTTPService:
     ) -> None:
         self.chat_handler = handler
 
-    def set_stream_chat_handler(
+    def set_chat_events_handler(
         self,
         handler: Callable[[str, str, _RemoteChatSession], None] | None,
     ) -> None:
-        self.stream_chat_handler = handler
+        self.chat_events_handler = handler
 
     def set_session_handler(
         self,
@@ -1326,8 +1324,8 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/chat/start":
                     self._handle_chat_start()
                     return
-                if parsed.path == "/remote/chat/stream":
-                    self._handle_chat_stream()
+                if parsed.path == "/remote/chat/events":
+                    self._handle_chat_events()
                     return
                 if parsed.path == "/remote/chat/status":
                     self._handle_chat_status()

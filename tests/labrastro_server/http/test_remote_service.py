@@ -1,4 +1,4 @@
-﻿"""Tests for the HTTP transport adapter around the remote relay host."""
+"""Tests for the HTTP transport adapter around the remote relay host."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from labrastro_server.interfaces.http.remote.service import (
     _RemoteChatSession,
 )
 from labrastro_server.interfaces.http.remote.routes.chat import (
-    _stream_chat_handler_error_payload,
+    _chat_events_handler_error_payload,
 )
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
@@ -76,12 +76,12 @@ from reuleauxcoder.interfaces.events import UIEventBus
 TEST_ADMIN_TOKEN = "test-admin-token"
 
 
-def test_stream_chat_handler_error_payload_preserves_remote_protocol_code() -> None:
+def test_chat_events_handler_error_payload_preserves_remote_protocol_code() -> None:
     class RemoteProtocolLikeError(Exception):
         code = "REMOTE_PREVIEW_EMPTY"
         message = "remote peer preview did not include diff or sections"
 
-    assert _stream_chat_handler_error_payload(RemoteProtocolLikeError("wrapped")) == {
+    assert _chat_events_handler_error_payload(RemoteProtocolLikeError("wrapped")) == {
         "message": "remote peer preview did not include diff or sections",
         "code": "REMOTE_PREVIEW_EMPTY",
     }
@@ -168,6 +168,132 @@ def _json_request(
     with _URLOPEN(req, timeout=5) as resp:
         body = resp.read().decode("utf-8")
         return resp.status, json.loads(body) if body else {}
+
+
+def _sse_request(
+    method: str,
+    url: str,
+    payload: dict | None = None,
+) -> tuple[int, str, str, list[dict]]:
+    data = None
+    headers: dict[str, str] = {"Accept": "text/event-stream"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = request.Request(url, data=data, headers=headers, method=method)
+    with _URLOPEN(req, timeout=5) as resp:
+        body = resp.read().decode("utf-8")
+        content_type = resp.headers.get("Content-Type", "")
+        return resp.status, content_type, body, _parse_sse_frames(body)
+
+
+def _sse_first_frame_request(
+    method: str,
+    url: str,
+    payload: dict | None = None,
+) -> tuple[int, str, dict]:
+    data = None
+    headers: dict[str, str] = {"Accept": "text/event-stream"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = request.Request(url, data=data, headers=headers, method=method)
+    with _URLOPEN(req, timeout=5) as resp:
+        lines: list[str] = []
+        while True:
+            line = resp.readline().decode("utf-8")
+            if line in {"", "\n", "\r\n"}:
+                break
+            lines.append(line)
+        frames = _parse_sse_frames("".join(lines) + "\n")
+        assert frames
+        return resp.status, resp.headers.get("Content-Type", ""), frames[0]
+
+
+def _chat_events_body(
+    base_url: str,
+    peer_token: str,
+    chat_id: str,
+    *,
+    cursor: int = 0,
+    timeout_sec: float = 1,
+) -> dict:
+    status, content_type, _raw_body, frames = _sse_request(
+        "POST",
+        f"{base_url}/remote/chat/events",
+        {
+            "peer_token": peer_token,
+            "chat_id": chat_id,
+            "cursor": cursor,
+            "timeout_sec": timeout_sec,
+        },
+    )
+    assert status == 200
+    assert content_type.startswith("text/event-stream")
+    return _merge_chat_event_frames(frames)
+
+
+def _chat_events_first_body(
+    base_url: str,
+    peer_token: str,
+    chat_id: str,
+    *,
+    cursor: int = 0,
+    timeout_sec: float = 1,
+) -> dict:
+    status, content_type, frame = _sse_first_frame_request(
+        "POST",
+        f"{base_url}/remote/chat/events",
+        {
+            "peer_token": peer_token,
+            "chat_id": chat_id,
+            "cursor": cursor,
+            "timeout_sec": timeout_sec,
+        },
+    )
+    assert status == 200
+    assert content_type.startswith("text/event-stream")
+    return frame["data"]
+
+
+def _merge_chat_event_frames(frames: list[dict]) -> dict:
+    merged = {"events": [], "done": False, "next_cursor": 0, "error": None}
+    for frame in frames:
+        if frame["event"] != "chat":
+            continue
+        data = frame["data"]
+        merged["events"].extend(data.get("events", []))
+        merged["done"] = bool(data.get("done", False))
+        merged["next_cursor"] = data.get("next_cursor", merged["next_cursor"])
+        merged["error"] = data.get("error")
+    return merged
+
+
+def _parse_sse_frames(body: str) -> list[dict]:
+    frames: list[dict] = []
+    for raw_frame in body.replace("\r\n", "\n").split("\n\n"):
+        event_name = "message"
+        data_lines: list[str] = []
+        for line in raw_frame.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            field, separator, value = line.partition(":")
+            if not separator:
+                continue
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "event":
+                event_name = value
+            elif field == "data":
+                data_lines.append(value)
+        if data_lines:
+            frames.append(
+                {
+                    "event": event_name,
+                    "data": json.loads("\n".join(data_lines)),
+                }
+            )
+    return frames
 
 
 def _peer_register_payload(
@@ -2352,13 +2478,13 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_chat_endpoint_routes_taskflow_to_stream_chat_handler(self) -> None:
+    def test_chat_endpoint_routes_taskflow_to_chat_events_handler(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
         seen: dict[str, str | None] = {}
 
-        def stream_chat_handler(peer_id: str, prompt: str, session) -> None:
+        def chat_events_handler(peer_id: str, prompt: str, session) -> None:
             seen["peer_id"] = peer_id
             seen["prompt"] = prompt
             seen["mode"] = session.mode
@@ -2369,7 +2495,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2473,14 +2599,14 @@ class TestRemoteRelayHTTPService:
         relay.start()
         port = _free_port()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             # Wait long enough so test can force disconnect first.
             session.wait_approval("hold", timeout_sec=2)
 
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2511,16 +2637,7 @@ class TestRemoteRelayHTTPService:
             )
             assert status == 200
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id)
             assert stream_body["done"] is True
             event_types = [event["type"] for event in stream_body["events"]]
             assert "chat_start" in event_types
@@ -2535,7 +2652,7 @@ class TestRemoteRelayHTTPService:
         port = _free_port()
         seen: dict[str, str | None] = {}
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             seen["mode"] = session.mode
             seen["locale"] = session.locale
             session.append_event("chat_end", {"response": "ok"})
@@ -2543,7 +2660,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2569,16 +2686,7 @@ class TestRemoteRelayHTTPService:
             )
             chat_id = start_body["chat_id"]
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id)
 
             assert stream_body["done"] is True
             assert seen["mode"] == "planner"
@@ -2594,7 +2702,7 @@ class TestRemoteRelayHTTPService:
         release = threading.Event()
         starts: list[str] = []
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             starts.append(session.chat_id)
             release.wait(timeout=2)
             session.append_event("chat_end", {"response": "ok"})
@@ -2602,7 +2710,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2677,13 +2785,13 @@ class TestRemoteRelayHTTPService:
         relay.start()
         port = _free_port()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             session.append_event("chat_end", {"response": "ok"})
 
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
             require_explicit_chat_model=True,
             require_peer_runtime_context=True,
         )
@@ -2737,13 +2845,13 @@ class TestRemoteRelayHTTPService:
                 }
             return {"ok": False, "error": "session_not_found", "_status": 404}
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             session.append_event("chat_end", {"response": "ok"})
 
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
             session_handler=session_handler,
             require_explicit_chat_model=True,
             require_peer_runtime_context=True,
@@ -2778,7 +2886,7 @@ class TestRemoteRelayHTTPService:
         running_started = threading.Event()
         release_running = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, prompt: str, session) -> None:
             if prompt == "boom":
                 session.append_event("error", {"message": "intentional_failure"})
                 return
@@ -2789,7 +2897,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2824,16 +2932,7 @@ class TestRemoteRelayHTTPService:
             assert running_status["latest_seq"] >= 1
 
             release_running.set()
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 2,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id, timeout_sec=2)
             assert stream_body["done"] is True
 
             _, done_status = _json_request(
@@ -2851,15 +2950,11 @@ class TestRemoteRelayHTTPService:
                 f"{service.base_url}/remote/chat/start",
                 {"peer_token": peer_token, "prompt": "boom"},
             )
-            _, error_stream = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": error_start["chat_id"],
-                    "cursor": 0,
-                    "timeout_sec": 2,
-                },
+            error_stream = _chat_events_body(
+                service.base_url,
+                peer_token,
+                error_start["chat_id"],
+                timeout_sec=2,
             )
             assert error_stream["done"] is True
 
@@ -2884,13 +2979,13 @@ class TestRemoteRelayHTTPService:
         relay.start()
         port = _free_port()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, _session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, _session) -> None:
             raise ValueError("remote peer registration missing host_info_min.shell")
 
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2909,15 +3004,10 @@ class TestRemoteRelayHTTPService:
                 f"{service.base_url}/remote/chat/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": start_body["chat_id"],
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            stream_body = _chat_events_body(
+                service.base_url,
+                peer_token,
+                start_body["chat_id"],
             )
 
             error_event = [
@@ -2945,7 +3035,7 @@ class TestRemoteRelayHTTPService:
         port = _free_port()
         prompts: list[str] = []
 
-        def stream_chat_handler(_peer_id: str, prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, prompt: str, session) -> None:
             prompts.append(prompt)
             if len(prompts) == 1:
                 payload = {
@@ -2963,7 +3053,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -2983,15 +3073,10 @@ class TestRemoteRelayHTTPService:
                 {"peer_token": peer_token, "prompt": "initial"},
             )
             chat_id = start_body["chat_id"]
-            _, first_stream = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            first_stream = _chat_events_first_body(
+                service.base_url,
+                peer_token,
+                chat_id,
             )
             assert any(event["type"] == "chat_interrupted" for event in first_stream["events"])
 
@@ -3011,15 +3096,11 @@ class TestRemoteRelayHTTPService:
                 "state": "consumed",
             }
 
-            _, second_stream = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": first_stream["next_cursor"],
-                    "timeout_sec": 1,
-                },
+            second_stream = _chat_events_body(
+                service.base_url,
+                peer_token,
+                chat_id,
+                cursor=first_stream["next_cursor"],
             )
             assert prompts[0] == "initial"
             assert "<stream_recovery>" in prompts[1]
@@ -3029,7 +3110,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_chat_stream_cursor_resume_reads_events_created_between_polls(self) -> None:
+    def test_chat_events_cursor_resume_reads_events_created_between_connections(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
@@ -3037,7 +3118,7 @@ class TestRemoteRelayHTTPService:
         release_second_delta = threading.Event()
         finished = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
                 session.append_event("delta", {"text": "first"})
                 first_delta_sent.set()
@@ -3050,7 +3131,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3072,28 +3153,187 @@ class TestRemoteRelayHTTPService:
             chat_id = start_body["chat_id"]
             assert first_delta_sent.wait(2)
 
-            _, first_poll = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 0,
-                },
+            first_batch = _chat_events_first_body(
+                service.base_url,
+                peer_token,
+                chat_id,
+                timeout_sec=0,
             )
-            assert first_poll["done"] is False
-            assert [event["type"] for event in first_poll["events"]] == [
+            assert first_batch["done"] is False
+            assert [event["type"] for event in first_batch["events"]] == [
                 "chat_start",
                 "delta",
             ]
-            first_cursor = first_poll["next_cursor"]
+            first_cursor = first_batch["next_cursor"]
 
             release_second_delta.set()
             assert finished.wait(2)
-            _, resumed_poll = _json_request(
+            resumed_batch = _chat_events_body(
+                service.base_url,
+                peer_token,
+                chat_id,
+                cursor=first_cursor,
+            )
+
+            assert resumed_batch["done"] is True
+            assert [event["type"] for event in resumed_batch["events"]] == [
+                "delta",
+                "chat_end",
+            ]
+            assert resumed_batch["events"][0]["payload"]["text"] == "second"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_events_sse_streams_chat_response_frames(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        first_delta_sent = threading.Event()
+        release_second_delta = threading.Event()
+        finished = threading.Event()
+
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                session.append_event("delta", {"text": "first"})
+                first_delta_sent.set()
+                release_second_delta.wait(timeout=2)
+                session.append_event("delta", {"text": "second"})
+                session.append_event("chat_end", {"response": "done"})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            chat_events_handler=chat_events_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/chat/stream",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "sse"},
+            )
+            chat_id = start_body["chat_id"]
+            assert first_delta_sent.wait(2)
+
+            result: dict[str, object] = {}
+
+            def read_stream() -> None:
+                status, content_type, raw_body, frames = _sse_request(
+                    "POST",
+                    f"{service.base_url}/remote/chat/events",
+                    {
+                        "peer_token": peer_token,
+                        "chat_id": chat_id,
+                        "cursor": 0,
+                        "timeout_sec": 0.05,
+                    },
+                )
+                result.update(
+                    {
+                        "status": status,
+                        "content_type": content_type,
+                        "raw_body": raw_body,
+                        "frames": frames,
+                    }
+                )
+
+            reader = threading.Thread(target=read_stream)
+            reader.start()
+            time.sleep(0.2)
+            release_second_delta.set()
+            reader.join(timeout=5)
+
+            assert finished.wait(2)
+            assert not reader.is_alive()
+            assert result["status"] == 200
+            assert str(result["content_type"]).startswith("text/event-stream")
+            assert ": ping" in str(result["raw_body"])
+            frames = result["frames"]
+            assert isinstance(frames, list)
+            assert [frame["event"] for frame in frames] == ["chat", "chat"]
+            assert [event["type"] for event in frames[0]["data"]["events"]] == [
+                "chat_start",
+                "delta",
+            ]
+            assert frames[0]["data"]["done"] is False
+            assert [event["type"] for event in frames[1]["data"]["events"]] == [
+                "delta",
+                "chat_end",
+            ]
+            assert frames[1]["data"]["done"] is True
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_events_sse_resumes_from_cursor(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        first_delta_sent = threading.Event()
+        release_second_delta = threading.Event()
+        finished = threading.Event()
+
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            try:
+                session.append_event("delta", {"text": "first"})
+                first_delta_sent.set()
+                release_second_delta.wait(timeout=2)
+                session.append_event("delta", {"text": "second"})
+                session.append_event("chat_end", {"response": "done"})
+            finally:
+                finished.set()
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            chat_events_handler=chat_events_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "resume-sse"},
+            )
+            chat_id = start_body["chat_id"]
+            assert first_delta_sent.wait(2)
+
+            first_batch = _chat_events_first_body(
+                service.base_url,
+                peer_token,
+                chat_id,
+                timeout_sec=0,
+            )
+            first_cursor = first_batch["next_cursor"]
+
+            release_second_delta.set()
+            assert finished.wait(2)
+            status, content_type, _raw_body, frames = _sse_request(
+                "POST",
+                f"{service.base_url}/remote/chat/events",
                 {
                     "peer_token": peer_token,
                     "chat_id": chat_id,
@@ -3102,23 +3342,26 @@ class TestRemoteRelayHTTPService:
                 },
             )
 
-            assert resumed_poll["done"] is True
-            assert [event["type"] for event in resumed_poll["events"]] == [
+            assert status == 200
+            assert content_type.startswith("text/event-stream")
+            assert len(frames) == 1
+            assert [event["type"] for event in frames[0]["data"]["events"]] == [
                 "delta",
                 "chat_end",
             ]
-            assert resumed_poll["events"][0]["payload"]["text"] == "second"
+            assert frames[0]["data"]["events"][0]["payload"]["text"] == "second"
+            assert frames[0]["data"]["done"] is True
         finally:
             service.stop()
             relay.stop()
 
-    def test_chat_stream_accepts_replacement_peer_token_for_existing_chat(self) -> None:
+    def test_chat_events_accepts_replacement_peer_token_for_existing_chat(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
         finished = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
                 session.append_event("delta", {"text": "after-reconnect"})
                 session.append_event("chat_end", {"response": "done"})
@@ -3128,7 +3371,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3158,15 +3401,10 @@ class TestRemoteRelayHTTPService:
             )
             assert finished.wait(2)
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": replacement_token,
-                    "chat_id": start_body["chat_id"],
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            stream_body = _chat_events_body(
+                service.base_url,
+                replacement_token,
+                start_body["chat_id"],
             )
 
             assert stream_body["done"] is True
@@ -3185,13 +3423,13 @@ class TestRemoteRelayHTTPService:
         relay.start()
         port = _free_port()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             session.wait_approval("hold", timeout_sec=2)
 
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3223,16 +3461,7 @@ class TestRemoteRelayHTTPService:
             )
             assert cancel_body["ok"] is True
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id)
             assert stream_body["done"] is True
             event_types = [event["type"] for event in stream_body["events"]]
             assert "chat_cancel_requested" in event_types
@@ -3248,7 +3477,7 @@ class TestRemoteRelayHTTPService:
         handler_ready = threading.Event()
         consumed = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             session.set_follow_up_callback(
                 lambda ticket: (
                     session.mark_follow_up_consumed(ticket["followup_id"]),
@@ -3262,7 +3491,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3300,16 +3529,7 @@ class TestRemoteRelayHTTPService:
             assert follow_body["state"] in {"pending", "consumed"}
             assert consumed.wait(2)
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id)
             event_types = [event["type"] for event in stream_body["events"]]
             assert "chat_follow_up_accepted" in event_types
             assert "chat_follow_up_consumed" in event_types
@@ -3324,7 +3544,7 @@ class TestRemoteRelayHTTPService:
         handler_ready = threading.Event()
         release = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             handler_ready.set()
             release.wait(timeout=2)
             session.append_event("chat_end", {"response": "ok"})
@@ -3332,7 +3552,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3367,16 +3587,7 @@ class TestRemoteRelayHTTPService:
             assert follow_body["ok"] is True
             release.set()
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id)
             events = stream_body["events"]
             unconsumed = [
                 event
@@ -3397,7 +3608,7 @@ class TestRemoteRelayHTTPService:
         handler_ready = threading.Event()
         release = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             handler_ready.set()
             release.wait(timeout=2)
             session.append_event("chat_end", {"response": "ok"})
@@ -3405,7 +3616,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3451,16 +3662,7 @@ class TestRemoteRelayHTTPService:
             assert cancel_body["state"] == "cancelled"
             release.set()
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
-            )
+            stream_body = _chat_events_body(service.base_url, peer_token, chat_id)
             cancelled = [
                 event
                 for event in stream_body["events"]
@@ -3473,7 +3675,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_chat_stream_reports_lost_events_when_buffer_pruned(
+    def test_chat_events_reports_lost_events_when_buffer_pruned(
         self, tmp_path: Path
     ) -> None:
         relay = RelayServer()
@@ -3481,7 +3683,7 @@ class TestRemoteRelayHTTPService:
         port = _free_port()
         finished = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
                 for idx in range(6):
                     session.append_event("delta", {"idx": idx})
@@ -3492,7 +3694,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
             chat_max_events=3,
             chat_artifact_root=tmp_path / "chat-events",
         )
@@ -3515,15 +3717,10 @@ class TestRemoteRelayHTTPService:
             )
             assert finished.wait(2)
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": start_body["chat_id"],
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            stream_body = _chat_events_body(
+                service.base_url,
+                peer_token,
+                start_body["chat_id"],
             )
 
             events = stream_body["events"]
@@ -3542,7 +3739,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_chat_stream_spills_oversized_payload_to_gzip_artifact(
+    def test_chat_events_spills_oversized_payload_to_gzip_artifact(
         self, tmp_path: Path
     ) -> None:
         relay = RelayServer()
@@ -3551,7 +3748,7 @@ class TestRemoteRelayHTTPService:
         finished = threading.Event()
         large_text = "x" * 512
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
                 session.append_event("delta", {"text": large_text})
                 session.append_event("chat_end", {"response": "done"})
@@ -3561,7 +3758,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
             chat_max_payload_bytes=128,
             chat_artifact_root=tmp_path / "chat-events",
         )
@@ -3584,15 +3781,10 @@ class TestRemoteRelayHTTPService:
             )
             assert finished.wait(2)
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": start_body["chat_id"],
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            stream_body = _chat_events_body(
+                service.base_url,
+                peer_token,
+                start_body["chat_id"],
             )
 
             delta_event = next(
@@ -3617,7 +3809,7 @@ class TestRemoteRelayHTTPService:
         port = _free_port()
         finished = threading.Event()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
                 session.append_event("delta", {"text": "x" * 512})
             finally:
@@ -3626,7 +3818,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
             chat_max_payload_bytes=128,
             chat_artifact_root=tmp_path / "chat-events",
         )
@@ -3650,15 +3842,10 @@ class TestRemoteRelayHTTPService:
             chat_id = start_body["chat_id"]
             assert finished.wait(2)
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            stream_body = _chat_events_first_body(
+                service.base_url,
+                peer_token,
+                chat_id,
             )
             delta_event = next(
                 event for event in stream_body["events"] if event["type"] == "delta"
@@ -3683,7 +3870,7 @@ class TestRemoteRelayHTTPService:
         relay.start()
         port = _free_port()
 
-        def stream_chat_handler(_peer_id: str, _prompt: str, session) -> None:
+        def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             approval_id = "approval-1"
             session.register_approval(approval_id)
             session.append_event(
@@ -3704,7 +3891,7 @@ class TestRemoteRelayHTTPService:
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            stream_chat_handler=stream_chat_handler,
+            chat_events_handler=chat_events_handler,
         )
         service.start()
         try:
@@ -3725,15 +3912,10 @@ class TestRemoteRelayHTTPService:
             )
             chat_id = start_body["chat_id"]
 
-            _, stream_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": 0,
-                    "timeout_sec": 1,
-                },
+            stream_body = _chat_events_first_body(
+                service.base_url,
+                peer_token,
+                chat_id,
             )
             approval_events = [
                 event
@@ -3757,15 +3939,11 @@ class TestRemoteRelayHTTPService:
             assert status == 200
             assert reply_body["ok"] is True
 
-            _, resolved_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/chat/stream",
-                {
-                    "peer_token": peer_token,
-                    "chat_id": chat_id,
-                    "cursor": stream_body["next_cursor"],
-                    "timeout_sec": 1,
-                },
+            resolved_body = _chat_events_body(
+                service.base_url,
+                peer_token,
+                chat_id,
+                cursor=stream_body["next_cursor"],
             )
             resolved_events = [
                 event
@@ -4058,7 +4236,7 @@ class TestRemoteRelayHTTPService:
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
             session_handler=session_handler,
-            stream_chat_handler=stream_handler,
+            chat_events_handler=stream_handler,
         )
         service.start()
         try:
@@ -4072,7 +4250,7 @@ class TestRemoteRelayHTTPService:
             assert body["features"]["sessions"] is True
             assert body["features"]["session_auto_save"] is True
             assert body["features"]["session_history_writable"] is True
-            assert body["features"]["chat_stream"] is True
+            assert body["features"]["chat_events"] is True
             assert body["features"]["taskflow"] is True
             assert body["features"]["issue_assignment"] is True
             assert body["features"]["fresh_session_without_session_hint"] is True
@@ -4098,7 +4276,7 @@ class TestRemoteRelayHTTPService:
             assert body["features"]["sessions"] is False
             assert body["features"]["session_auto_save"] is True
             assert body["features"]["session_history_writable"] is False
-            assert body["features"]["chat_stream"] is False
+            assert body["features"]["chat_events"] is False
             assert body["features"]["fresh_session_without_session_hint"] is False
             assert body["features"]["peer_token_heartbeat_refresh"] is True
             assert body["features"]["agent_runs"]["executor_features"] == {}

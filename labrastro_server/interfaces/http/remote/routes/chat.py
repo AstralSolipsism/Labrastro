@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gzip
 import json
@@ -31,8 +31,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatStartResponse,
     ChatStatusRequest,
     ChatStatusResponse,
-    ChatStreamRequest,
-    ChatStreamResponse,
+    ChatEventsRequest,
+    ChatEventsBatch,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -61,7 +61,7 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 from reuleauxcoder.interfaces.events import UIEventKind
 
 
-def _stream_chat_handler_error_payload(exc: Exception) -> dict[str, str]:
+def _chat_events_handler_error_payload(exc: Exception) -> dict[str, str]:
     message = str(exc).strip()
     code = getattr(exc, "code", None)
     protocol_message = getattr(exc, "message", None)
@@ -73,6 +73,12 @@ def _stream_chat_handler_error_payload(exc: Exception) -> dict[str, str]:
     if isinstance(exc, ValueError) and message.startswith("remote peer "):
         return {"message": message, "code": "chat_handler_failed"}
     return {"message": "chat_handler_failed", "code": "chat_handler_failed"}
+
+
+def _sse_wait_timeout(timeout_sec: float) -> float:
+    if timeout_sec <= 0:
+        return 15.0
+    return min(max(timeout_sec, 0.05), 30.0)
 
 
 class RemoteChatRoutes:
@@ -149,10 +155,10 @@ class RemoteChatRoutes:
             else None
         )
         if workflow_mode == "taskflow":
-            if self.service.stream_chat_handler is None:
+            if self.service.chat_events_handler is None:
                 self._send_error(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    "chat_stream_unavailable",
+                    "chat_events_unavailable",
                 )
                 return
             session = self.service._create_chat_session(
@@ -181,9 +187,9 @@ class RemoteChatRoutes:
             session.mark_running()
             with self.service._get_peer_chat_lock(peer_id):
                 try:
-                    self.service.stream_chat_handler(peer_id, req.prompt, session)
+                    self.service.chat_events_handler(peer_id, req.prompt, session)
                 except Exception as exc:
-                    payload = _stream_chat_handler_error_payload(exc)
+                    payload = _chat_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
                         "chat_failed",
@@ -236,10 +242,10 @@ class RemoteChatRoutes:
         if peer_id is None:
             self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
-        if self.service.stream_chat_handler is None:
+        if self.service.chat_events_handler is None:
             self._send_error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "chat_stream_unavailable",
+                "chat_events_unavailable",
             )
             return
 
@@ -309,9 +315,9 @@ class RemoteChatRoutes:
         def _run_chat() -> None:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
-                    self.service.stream_chat_handler(peer_id, req.prompt, session)
+                    self.service.chat_events_handler(peer_id, req.prompt, session)
                 except Exception as exc:
-                    payload = _stream_chat_handler_error_payload(exc)
+                    payload = _chat_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
                         "chat_failed",
@@ -329,12 +335,12 @@ class RemoteChatRoutes:
             ).to_dict(),
         )
 
-    def _handle_chat_stream(self) -> None:
+    def _handle_chat_events(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatStreamRequest.from_dict(payload)
+            req = ChatEventsRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_stream_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_events_request")
             return
 
         control = self._get_chat_control_session(req.peer_token, req.chat_id)
@@ -342,15 +348,48 @@ class RemoteChatRoutes:
             return
         _control_peer_id, session = control
 
-        events, done, next_cursor = session.wait_events(
-            req.cursor, req.timeout_sec
-        )
-        self._send_json(
-            HTTPStatus.OK,
-            ChatStreamResponse(
-                events=events, done=done, next_cursor=next_cursor
-            ).to_dict(),
-        )
+        self._send_sse_headers()
+        cursor = int(req.cursor)
+        wait_timeout = _sse_wait_timeout(req.timeout_sec)
+        while True:
+            try:
+                events, done, next_cursor = session.wait_events(
+                    cursor, wait_timeout
+                )
+                if events or done:
+                    self._write_sse_event(
+                        "chat",
+                        ChatEventsBatch(
+                            events=events, done=done, next_cursor=next_cursor
+                        ).to_dict(),
+                    )
+                    cursor = next_cursor
+                    if done:
+                        self.close_connection = True
+                        break
+                    continue
+                self._write_sse_comment("ping")
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+                break
+
+    def _send_sse_headers(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Request-ID", self._request_id())
+        self.end_headers()
+
+    def _write_sse_event(self, event: str, data: dict[str, Any]) -> None:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        self.wfile.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _write_sse_comment(self, comment: str) -> None:
+        self.wfile.write(f": {comment}\n\n".encode("utf-8"))
+        self.wfile.flush()
 
     def _handle_chat_status(self) -> None:
         payload = self._read_json()
@@ -442,10 +481,10 @@ class RemoteChatRoutes:
         if control is None:
             return
         peer_id, session = control
-        if self.service.stream_chat_handler is None:
+        if self.service.chat_events_handler is None:
             self._send_error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "chat_stream_unavailable",
+                "chat_events_unavailable",
             )
             return
         if session.running:
@@ -467,9 +506,9 @@ class RemoteChatRoutes:
         def _run_recovery() -> None:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
-                    self.service.stream_chat_handler(peer_id, prompt, session)
+                    self.service.chat_events_handler(peer_id, prompt, session)
                 except Exception as exc:
-                    payload = _stream_chat_handler_error_payload(exc)
+                    payload = _chat_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
                         "chat_failed",
@@ -533,5 +572,3 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.NOT_FOUND, "approval_not_found")
             return
         self._send_json(HTTPStatus.OK, ApprovalReplyResponse(ok=True).to_dict())
-
-

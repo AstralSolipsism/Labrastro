@@ -122,6 +122,91 @@ def _json_request(
         return resp.status, json.loads(body) if body else {}
 
 
+def _chat_events_request(base_url: str, peer_token: str, chat_id: str) -> list[dict]:
+    status, _cursor, events, _done = _chat_events_until(
+        base_url,
+        peer_token,
+        chat_id,
+        lambda _event: False,
+        until_done=True,
+    )
+    assert status == 200
+    return events
+
+
+def _chat_events_until(
+    base_url: str,
+    peer_token: str,
+    chat_id: str,
+    predicate,
+    *,
+    until_done: bool = False,
+    timeout_sec: float = 3.0,
+) -> tuple[int, int, list[dict], bool]:
+    payload = {
+        "peer_token": peer_token,
+        "chat_id": chat_id,
+        "cursor": 0,
+        "timeout_sec": 0.5,
+    }
+    req = request.Request(
+        f"{base_url}/remote/chat/events",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
+        method="POST",
+    )
+    deadline = time.time() + timeout_sec
+    events: list[dict] = []
+    cursor = 0
+    done = False
+    with _URLOPEN(req, timeout=5) as resp:
+        while time.time() < deadline:
+            frame = _read_sse_frame(resp)
+            if frame is None:
+                break
+            data = frame.get("data", {})
+            batch_events = data.get("events", [])
+            events.extend(batch_events)
+            cursor = int(data.get("next_cursor", cursor))
+            done = bool(data.get("done", False))
+            if any(predicate(event) for event in batch_events):
+                return resp.status, cursor, events, done
+            if done and until_done:
+                return resp.status, cursor, events, done
+            if done:
+                break
+    return 200, cursor, events, done
+
+
+def _read_sse_frame(resp) -> dict | None:
+    lines: list[str] = []
+    while True:
+        line = resp.readline().decode("utf-8")
+        if line == "":
+            return None
+        if line in {"\n", "\r\n"}:
+            break
+        lines.append(line)
+    event = "message"
+    data_lines: list[str] = []
+    for raw_line in lines:
+        line = raw_line.rstrip("\r\n")
+        if not line or line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if not separator:
+            continue
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event = value
+        elif field == "data":
+            data_lines.append(value)
+    if not data_lines:
+        return {"event": event, "data": {}}
+    return {"event": event, "data": json.loads("\n".join(data_lines))}
+
+
 def _test_auth_config(store_dir: Path | None = None) -> AuthConfig:
     if store_dir is None:
         store_dir = Path(tempfile.mkdtemp(prefix="labrastro-auth-"))
@@ -504,24 +589,16 @@ def _register_peer(
 def _collect_stream_events(
     base_url: str, peer_token: str, chat_id: str, timeout_sec: float = 3.0
 ) -> list[dict]:
-    deadline = time.time() + timeout_sec
-    cursor = 0
-    events: list[dict] = []
-    while time.time() < deadline:
-        _, stream_body = _json_request(
-            "POST",
-            f"{base_url}/remote/chat/stream",
-            {
-                "peer_token": peer_token,
-                "chat_id": chat_id,
-                "cursor": cursor,
-                "timeout_sec": 0.5,
-            },
-        )
-        events.extend(stream_body["events"])
-        cursor = stream_body["next_cursor"]
-        if stream_body["done"]:
-            return events
+    status, _cursor, events, done = _chat_events_until(
+        base_url,
+        peer_token,
+        chat_id,
+        lambda _event: False,
+        until_done=True,
+        timeout_sec=timeout_sec,
+    )
+    if status == 200 and done:
+        return events
     raise AssertionError("timed out waiting for stream events")
 
 
@@ -1157,29 +1234,20 @@ class TestRunnerRemoteExec:
                 f"{runner._relay_http_service.base_url}/remote/chat/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
-            cursor = 0
-            ready = None
-            deadline = time.time() + 3
-            while time.time() < deadline and ready is None:
-                _, stream_body = _json_request(
-                    "POST",
-                    f"{runner._relay_http_service.base_url}/remote/chat/stream",
-                    {
-                        "peer_token": peer_token,
-                        "chat_id": start_body["chat_id"],
-                        "cursor": cursor,
-                        "timeout_sec": 0.5,
-                    },
-                )
-                cursor = stream_body["next_cursor"]
-                ready = next(
-                    (
-                        event
-                        for event in stream_body["events"]
-                        if event["type"] == "remote_peer_ready"
-                    ),
-                    None,
-                )
+            _, _cursor, events, _done = _chat_events_until(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+                lambda event: event["type"] == "remote_peer_ready",
+            )
+            ready = next(
+                (
+                    event
+                    for event in events
+                    if event["type"] == "remote_peer_ready"
+                ),
+                None,
+            )
             assert ready is not None
             session_id = ready["payload"]["session_id"]
 
@@ -1902,26 +1970,17 @@ class TestRunnerRemoteExec:
                 f"{runner._relay_http_service.base_url}/remote/chat/start",
                 {"peer_token": peer_token, "prompt": "write"},
             )
-            cursor = 0
-            approval_events: list[dict] = []
-            deadline = time.time() + 3
-            while time.time() < deadline and not approval_events:
-                _, stream_body = _json_request(
-                    "POST",
-                    f"{runner._relay_http_service.base_url}/remote/chat/stream",
-                    {
-                        "peer_token": peer_token,
-                        "chat_id": start_body["chat_id"],
-                        "cursor": cursor,
-                        "timeout_sec": 0.5,
-                    },
-                )
-                cursor = stream_body["next_cursor"]
-                approval_events = [
-                    event
-                    for event in stream_body["events"]
-                    if event["type"] == "approval_request"
-                ]
+            _, _cursor, events, _done = _chat_events_until(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+                lambda event: event["type"] == "approval_request",
+            )
+            approval_events = [
+                event
+                for event in events
+                if event["type"] == "approval_request"
+            ]
             assert approval_events
             payload = approval_events[0]["payload"]
             assert preview_calls[0]["peer_id"] == peer_id
@@ -2198,25 +2257,20 @@ class TestRunnerRemoteExec:
                 f"{runner._relay_http_service.base_url}/remote/chat/start",
                 {"peer_token": peer_token, "prompt": "shell"},
             )
-            cursor = 0
-            approval_payload: dict | None = None
-            deadline = time.time() + 3
-            while time.time() < deadline and approval_payload is None:
-                _, stream_body = _json_request(
-                    "POST",
-                    f"{runner._relay_http_service.base_url}/remote/chat/stream",
-                    {
-                        "peer_token": peer_token,
-                        "chat_id": start_body["chat_id"],
-                        "cursor": cursor,
-                        "timeout_sec": 0.5,
-                    },
-                )
-                cursor = stream_body["next_cursor"]
-                for event in stream_body["events"]:
-                    if event["type"] == "approval_request":
-                        approval_payload = event["payload"]
-                        break
+            _, _cursor, events, _done = _chat_events_until(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+                lambda event: event["type"] == "approval_request",
+            )
+            approval_payload = next(
+                (
+                    event["payload"]
+                    for event in events
+                    if event["type"] == "approval_request"
+                ),
+                None,
+            )
             assert approval_payload is not None
             assert approval_payload["tool_name"] == "shell"
             assert approval_payload["preview_unavailable"] is True
@@ -2320,25 +2374,20 @@ class TestRunnerRemoteExec:
                 {"peer_token": peer_token, "prompt": "run shell"},
             )
 
-            cursor = 0
-            approval_payload: dict | None = None
-            deadline = time.time() + 3
-            while time.time() < deadline and approval_payload is None:
-                _, stream_body = _json_request(
-                    "POST",
-                    f"{runner._relay_http_service.base_url}/remote/chat/stream",
-                    {
-                        "peer_token": peer_token,
-                        "chat_id": start_body["chat_id"],
-                        "cursor": cursor,
-                        "timeout_sec": 0.5,
-                    },
-                )
-                cursor = stream_body["next_cursor"]
-                for event in stream_body["events"]:
-                    if event["type"] == "approval_request":
-                        approval_payload = event["payload"]
-                        break
+            _, _cursor, events, _done = _chat_events_until(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+                lambda event: event["type"] == "approval_request",
+            )
+            approval_payload = next(
+                (
+                    event["payload"]
+                    for event in events
+                    if event["type"] == "approval_request"
+                ),
+                None,
+            )
             assert approval_payload is not None
 
             _, cancelled = _json_request(

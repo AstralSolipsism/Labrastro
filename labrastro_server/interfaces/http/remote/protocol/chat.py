@@ -134,7 +134,7 @@ class ChatStartResponse:
         )
 
 @dataclass
-class ChatStreamRequest:
+class ChatEventsRequest:
     peer_token: str
     chat_id: str
     cursor: int = 0
@@ -149,7 +149,7 @@ class ChatStreamRequest:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatStreamRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "ChatEventsRequest":
         return cls(
             peer_token=d["peer_token"],
             chat_id=d["chat_id"],
@@ -158,7 +158,7 @@ class ChatStreamRequest:
         )
 
 @dataclass
-class ChatStreamResponse:
+class ChatEventsBatch:
     events: list[dict[str, Any]] = field(default_factory=list)
     done: bool = False
     next_cursor: int = 0
@@ -173,7 +173,7 @@ class ChatStreamResponse:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatStreamResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "ChatEventsBatch":
         return cls(
             events=list(d.get("events", [])),
             done=bool(d.get("done", False)),
@@ -486,8 +486,8 @@ __all__ = [
     "ChatResponse",
     "ChatStartRequest",
     "ChatStartResponse",
-    "ChatStreamRequest",
-    "ChatStreamResponse",
+    "ChatEventsRequest",
+    "ChatEventsBatch",
     "ChatStatusRequest",
     "ChatStatusResponse",
     "ChatCancelRequest",

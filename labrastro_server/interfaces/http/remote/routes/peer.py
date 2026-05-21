@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gzip
 import json
@@ -23,8 +23,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatResponse,
     ChatStartRequest,
     ChatStartResponse,
-    ChatStreamRequest,
-    ChatStreamResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -68,11 +66,11 @@ class RemotePeerRoutes:
                     "session_history_writable": session_history_status[
                         "session_history_writable"
                     ],
-                    "chat_stream": self.service.stream_chat_handler is not None,
+                    "chat_events": self.service.chat_events_handler is not None,
                     "taskflow": self.service.taskflow_service is not None,
                     "issue_assignment": self.service.issue_assignment_service
                     is not None,
-                    "fresh_session_without_session_hint": self.service.stream_chat_handler
+                    "fresh_session_without_session_hint": self.service.chat_events_handler
                     is not None,
                     "peer_token_heartbeat_refresh": True,
             "agent_runs": agent_run_features,
@@ -297,4 +295,3 @@ def _missing_peer_runtime_context_fields(req: RegisterRequest) -> list[str]:
     if not isinstance(req.features, list):
         missing.append("features")
     return missing
-

@@ -1,4 +1,4 @@
-"""Remote execution relay protocol message models."""
+﻿"""Remote execution relay protocol message models."""
 
 from labrastro_server.interfaces.http.remote.protocol.base import (
     Heartbeat,
@@ -27,8 +27,8 @@ from labrastro_server.interfaces.http.remote.protocol.chat import (
     ChatStartResponse,
     ChatStatusRequest,
     ChatStatusResponse,
-    ChatStreamRequest,
-    ChatStreamResponse,
+    ChatEventsRequest,
+    ChatEventsBatch,
 )
 from labrastro_server.interfaces.http.remote.protocol.environment import (
     EnvironmentCLIToolManifest,
@@ -87,8 +87,8 @@ __all__ = [
     "ChatStartResponse",
     "ChatStatusRequest",
     "ChatStatusResponse",
-    "ChatStreamRequest",
-    "ChatStreamResponse",
+    "ChatEventsRequest",
+    "ChatEventsBatch",
     "CleanupRequest",
     "CleanupResult",
     "DisconnectNotice",

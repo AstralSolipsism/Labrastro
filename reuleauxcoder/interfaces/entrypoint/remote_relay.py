@@ -1,4 +1,4 @@
-﻿"""Remote relay bootstrap and peer chat binding helpers."""
+"""Remote relay bootstrap and peer chat binding helpers."""
 
 from __future__ import annotations
 
@@ -1857,7 +1857,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             renderer.close()
 
     runner._relay_http_service.set_chat_handler(_chat)
-    runner._relay_http_service.set_stream_chat_handler(_stream_chat)
+    runner._relay_http_service.set_chat_events_handler(_stream_chat)
 
 
 def _structured_ui_event_type(event) -> str:
