@@ -76,14 +76,18 @@ def _free_port() -> int:
 
 def test_chat_locale_prompt_append_maps_supported_locales() -> None:
     assert _chat_locale_prompt_append("zh-CN") == (
-        "Language: Use Simplified Chinese for user-visible assistant replies. "
+        "Language: Use Simplified Chinese for all user-visible generated content, "
+        "including assistant replies, progress narration, and publicly displayed "
+        "reasoning/thinking summaries. "
         "Keep code, commands, paths, API names, and quoted errors unchanged."
     )
     assert _chat_locale_prompt_append("zh-Hans").startswith(
         "Language: Use Simplified Chinese"
     )
     assert _chat_locale_prompt_append("en") == (
-        "Language: Use English for user-visible assistant replies. "
+        "Language: Use English for all user-visible generated content, "
+        "including assistant replies, progress narration, and publicly displayed "
+        "reasoning/thinking summaries. "
         "Keep code, commands, paths, API names, and quoted errors unchanged."
     )
     assert _chat_locale_prompt_append("ja").startswith("Language: Use English")
@@ -100,7 +104,9 @@ def test_runtime_config_with_chat_locale_merges_prompt_without_mutating_source()
     assert config.prompt.system_append == "Use repo conventions."
     assert localized.prompt.system_append == (
         "Use repo conventions.\n\n"
-        "Language: Use Simplified Chinese for user-visible assistant replies. "
+        "Language: Use Simplified Chinese for all user-visible generated content, "
+        "including assistant replies, progress narration, and publicly displayed "
+        "reasoning/thinking summaries. "
         "Keep code, commands, paths, API names, and quoted errors unchanged."
     )
 
@@ -1145,6 +1151,51 @@ class TestRunnerRemoteExec:
                 and "REMOTE PEER READY" in event["payload"].get("content", "")
                 for event in events
             )
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_stream_chat_applies_locale_to_runtime_prompt(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        port = _free_port()
+        captured: dict[str, str] = {}
+
+        def chat_behavior(agent: FakeAgent, prompt: str) -> str:
+            prompt_config = getattr(getattr(agent, "runtime_config", None), "prompt", None)
+            captured["system_append"] = str(
+                getattr(prompt_config, "system_append", "") or ""
+            )
+            return f"done:{prompt}"
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                {"peer_token": peer_token, "prompt": "hello", "locale": "zh-CN"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["chat_id"],
+            )
+
+            assert any(event["type"] == "chat_end" for event in events)
+            assert "Use Simplified Chinese" in captured["system_append"]
+            assert "publicly displayed reasoning/thinking summaries" in captured["system_append"]
         finally:
             runner.cleanup(ctx.agent)
 

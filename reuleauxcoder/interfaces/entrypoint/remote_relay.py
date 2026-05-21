@@ -221,11 +221,15 @@ def _chat_locale_prompt_append(locale: str | None) -> str:
         return ""
     if value.startswith("zh"):
         return (
-            "Language: Use Simplified Chinese for user-visible assistant replies. "
+            "Language: Use Simplified Chinese for all user-visible generated content, "
+            "including assistant replies, progress narration, and publicly displayed "
+            "reasoning/thinking summaries. "
             "Keep code, commands, paths, API names, and quoted errors unchanged."
         )
     return (
-        "Language: Use English for user-visible assistant replies. "
+        "Language: Use English for all user-visible generated content, "
+        "including assistant replies, progress narration, and publicly displayed "
+        "reasoning/thinking summaries. "
         "Keep code, commands, paths, API names, and quoted errors unchanged."
     )
 
