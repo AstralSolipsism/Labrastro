@@ -91,7 +91,7 @@ type ChatStartResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-type ChatStreamRequest struct {
+type ChatEventsRequest struct {
 	PeerToken  string  `json:"peer_token"`
 	ChatID     string  `json:"chat_id"`
 	Cursor     int     `json:"cursor"`
@@ -105,7 +105,7 @@ type ChatEvent struct {
 	Payload map[string]any `json:"payload,omitempty"`
 }
 
-type ChatStreamResponse struct {
+type ChatEventsBatch struct {
 	Events     []ChatEvent `json:"events,omitempty"`
 	Done       bool        `json:"done"`
 	NextCursor int         `json:"next_cursor"`

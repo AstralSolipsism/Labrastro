@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -71,12 +72,54 @@ func (c *HTTPClient) ChatStart(ctx context.Context, req protocol.ChatStartReques
 	return resp, nil
 }
 
-func (c *HTTPClient) ChatStream(ctx context.Context, req protocol.ChatStreamRequest) (protocol.ChatStreamResponse, error) {
-	var resp protocol.ChatStreamResponse
-	if err := c.postJSON(ctx, "/remote/chat/stream", req, &resp); err != nil {
-		return protocol.ChatStreamResponse{}, err
+func (c *HTTPClient) ChatEvents(ctx context.Context, reqBody protocol.ChatEventsRequest, onBatch func(protocol.ChatEventsBatch) error) error {
+	buf, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
 	}
-	return resp, nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/remote/chat/events", bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	streamClient := *c.http
+	streamClient.Timeout = 0
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	for {
+		eventName, data, err := readSSEFrame(reader)
+		if err != nil {
+			if err == io.EOF {
+				return fmt.Errorf("chat events stream closed before done")
+			}
+			return err
+		}
+		if eventName != "chat" || strings.TrimSpace(data) == "" {
+			continue
+		}
+		var batch protocol.ChatEventsBatch
+		if err := json.Unmarshal([]byte(data), &batch); err != nil {
+			return err
+		}
+		if onBatch != nil {
+			if err := onBatch(batch); err != nil {
+				return err
+			}
+		}
+		if batch.Done {
+			return nil
+		}
+	}
 }
 
 func (c *HTTPClient) ApprovalReply(ctx context.Context, req protocol.ApprovalReplyRequest) (protocol.ApprovalReplyResponse, error) {
@@ -166,6 +209,35 @@ func (c *HTTPClient) CompleteAgentRun(ctx context.Context, req protocol.AgentRun
 		return protocol.AgentRunCompleteResponse{}, err
 	}
 	return resp, nil
+}
+
+func readSSEFrame(reader *bufio.Reader) (string, string, error) {
+	eventName := "message"
+	var dataLines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return eventName, strings.Join(dataLines, "\n"), nil
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		value = strings.TrimPrefix(value, " ")
+		switch field {
+		case "event":
+			eventName = value
+		case "data":
+			dataLines = append(dataLines, value)
+		}
+	}
 }
 
 func (c *HTTPClient) postJSON(ctx context.Context, path string, reqBody any, out any) error {

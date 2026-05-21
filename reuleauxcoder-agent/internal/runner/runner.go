@@ -805,32 +805,26 @@ func (r *Runner) runRemoteChat(ctx context.Context, peerToken, prompt string) er
 		return fmt.Errorf("chat start failed: empty chat id")
 	}
 
-	cursor := 0
-	for {
-		streamCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
-		streamResp, err := r.client.ChatStream(streamCtx, protocol.ChatStreamRequest{
+	return r.client.ChatEvents(
+		ctx,
+		protocol.ChatEventsRequest{
 			PeerToken:  peerToken,
 			ChatID:     startResp.ChatID,
-			Cursor:     cursor,
+			Cursor:     0,
 			TimeoutSec: 30,
-		})
-		cancel()
-		if err != nil {
-			return fmt.Errorf("chat stream failed: %w", err)
-		}
-		if strings.TrimSpace(streamResp.Error) != "" {
-			return fmt.Errorf("chat stream failed: %s", streamResp.Error)
-		}
-		for _, event := range streamResp.Events {
-			if err := r.handleChatEvent(ctx, peerToken, startResp.ChatID, event); err != nil {
-				return err
+		},
+		func(batch protocol.ChatEventsBatch) error {
+			if strings.TrimSpace(batch.Error) != "" {
+				return fmt.Errorf("chat events failed: %s", batch.Error)
 			}
-		}
-		cursor = streamResp.NextCursor
-		if streamResp.Done {
+			for _, event := range batch.Events {
+				if err := r.handleChatEvent(ctx, peerToken, startResp.ChatID, event); err != nil {
+					return err
+				}
+			}
 			return nil
-		}
-	}
+		},
+	)
 }
 
 func (r *Runner) handleChatEvent(ctx context.Context, peerToken, chatID string, event protocol.ChatEvent) error {
