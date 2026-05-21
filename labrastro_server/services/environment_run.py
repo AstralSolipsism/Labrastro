@@ -20,10 +20,7 @@ from reuleauxcoder.domain.config.models import DEFAULT_ENVIRONMENT_AGENT_ID
 
 
 ENVIRONMENT_WORKFLOW = "environment_config"
-ENVIRONMENT_MODE_PERMISSIONS = {
-    "check": {"environment.check", "environment.manifest.read"},
-    "configure": {"environment.configure", "environment.manifest.read"},
-}
+ENVIRONMENT_MODES = {"check", "configure"}
 
 
 class EnvironmentRunError(Exception):
@@ -66,7 +63,7 @@ class EnvironmentRunService:
         agent_id: str | None = None,
     ) -> EnvironmentRunResult:
         normalized_mode = str(mode or "").strip().lower()
-        if normalized_mode not in ENVIRONMENT_MODE_PERMISSIONS:
+        if normalized_mode not in ENVIRONMENT_MODES:
             raise EnvironmentRunError(
                 "invalid_environment_mode",
                 "mode must be check or configure",
@@ -131,12 +128,17 @@ class EnvironmentRunService:
         )
 
     def _select_agent(self, *, mode: str, preferred_agent_id: str | None) -> str:
-        required_permissions = ENVIRONMENT_MODE_PERMISSIONS[mode]
+        del mode
+        selected_id = str(preferred_agent_id or DEFAULT_ENVIRONMENT_AGENT_ID).strip()
+        if selected_id != DEFAULT_ENVIRONMENT_AGENT_ID:
+            raise EnvironmentRunError(
+                "environment_agent_not_allowed",
+                "environment runs must use the built-in environment_configurator agent",
+            )
         snapshot = self.runtime_control_plane.runtime_snapshot
         agents = snapshot.get("agents", {})
         if not isinstance(agents, dict):
             agents = {}
-        selected_id = str(preferred_agent_id or DEFAULT_ENVIRONMENT_AGENT_ID).strip()
         agent = agents.get(selected_id)
         if not isinstance(agent, dict):
             raise EnvironmentRunError(
@@ -144,24 +146,7 @@ class EnvironmentRunService:
                 f"environment agent not found: {selected_id}",
                 status=HTTPStatus.NOT_FOUND,
             )
-        permissions = _resolved_permissions(agent)
-        if not required_permissions <= permissions:
-            missing = sorted(required_permissions - permissions)
-            raise EnvironmentRunError(
-                "environment_agent_permission_mismatch",
-                f"agent {selected_id} lacks environment permissions: {', '.join(missing)}",
-            )
         return selected_id
-
-
-def _resolved_permissions(agent: dict[str, Any]) -> set[str]:
-    resolved = agent.get("resolved_capabilities", {})
-    if not isinstance(resolved, dict):
-        return set()
-    permissions = resolved.get("permissions", [])
-    if not isinstance(permissions, list):
-        return set()
-    return {str(item) for item in permissions if str(item).strip()}
 
 
 def _manifest_entries(manifest: EnvironmentManifestResponse) -> list[dict[str, Any]]:
@@ -287,7 +272,7 @@ def _render_environment_prompt(
 
 
 __all__ = [
-    "ENVIRONMENT_AGENT_CAPABILITIES",
+    "ENVIRONMENT_MODES",
     "ENVIRONMENT_WORKFLOW",
     "EnvironmentRunError",
     "EnvironmentRunResult",

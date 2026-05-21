@@ -29,13 +29,7 @@ def _control(*, agents: dict | None = None) -> AgentRunControlPlane:
                 "environment_configurator": {
                     "runtime_profile": "environment_local",
                     "capability_refs": ["environment"],
-                    "resolved_capabilities": {
-                        "permissions": [
-                            "environment.check",
-                            "environment.configure",
-                            "environment.manifest.read",
-                        ]
-                    },
+                    "resolved_capabilities": {},
                 }
             },
         }
@@ -116,13 +110,11 @@ def test_environment_run_rejects_missing_agent_candidate() -> None:
     assert raised.value.error == "environment_agent_not_found"
 
 
-def test_environment_run_rejects_missing_permission_for_selected_agent() -> None:
+def test_environment_run_rejects_non_builtin_selected_agent() -> None:
     control = _control(
         agents={
             "coder": {
-                "resolved_capabilities": {
-                    "permissions": ["environment.check", "environment.manifest.read"]
-                }
+                "resolved_capabilities": {},
             }
         }
     )
@@ -135,4 +127,4 @@ def test_environment_run_rejects_missing_permission_for_selected_agent() -> None
             agent_id="coder",
         )
 
-    assert raised.value.error == "environment_agent_permission_mismatch"
+    assert raised.value.error == "environment_agent_not_allowed"

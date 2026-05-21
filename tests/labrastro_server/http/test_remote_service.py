@@ -2081,13 +2081,7 @@ class TestRemoteRelayHTTPService:
                     "environment_configurator": {
                         "runtime_profile": "environment_local",
                         "capability_refs": ["environment"],
-                        "resolved_capabilities": {
-                            "permissions": [
-                                "environment.check",
-                                "environment.configure",
-                                "environment.manifest.read",
-                            ]
-                        },
+                        "resolved_capabilities": {},
                     }
                 },
             }
