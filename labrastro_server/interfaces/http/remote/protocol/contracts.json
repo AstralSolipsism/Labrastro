@@ -158,11 +158,54 @@
         "prompt": "hello",
         "session_hint": "session_contract",
         "mode": "chat",
-        "locale": "zh-CN"
+        "locale": "zh-CN",
+        "mentions": [
+          {
+            "kind": "file",
+            "name": "README.md",
+            "path": "README.md",
+            "source": "workspace_files"
+          }
+        ]
       },
       "response": {
         "chat_id": "chat_contract",
         "error": null
+      }
+    },
+    {
+      "name": "chat.command_dispatch",
+      "method": "POST",
+      "path": "/remote/chat/command",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "text": "/help",
+        "command_id": "system.help",
+        "trigger": "/help",
+        "args": "",
+        "session_hint": "session_contract",
+        "client_request_id": "cmd_contract",
+        "mentions": [
+          {
+            "kind": "file",
+            "path": "README.md"
+          }
+        ]
+      },
+      "response": {
+        "ok": true,
+        "action": "continue",
+        "session_id": "session_contract",
+        "events": [
+          {
+            "type": "output",
+            "payload": {
+              "format": "plain",
+              "content": "help"
+            }
+          }
+        ]
       }
     },
     {

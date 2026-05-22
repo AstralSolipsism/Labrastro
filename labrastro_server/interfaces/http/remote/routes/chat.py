@@ -20,6 +20,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyResponse,
     ChatCancelRequest,
     ChatCancelResponse,
+    ChatCommandDispatchRequest,
     ChatFollowUpCancelRequest,
     ChatFollowUpRequest,
     ChatFollowUpResponse,
@@ -170,6 +171,7 @@ class RemoteChatRoutes:
                 model_id=req.model_id,
                 model_parameters=req.parameters,
                 locale=getattr(req, "locale", None),
+                mentions=req.mentions,
                 initial_prompt=req.prompt,
             )
             session.append_event(
@@ -182,6 +184,7 @@ class RemoteChatRoutes:
                     "provider_id": req.provider_id,
                     "model_id": req.model_id,
                     "locale": getattr(req, "locale", None),
+                    "mentions": req.mentions,
                 },
             )
             session.mark_running()
@@ -296,6 +299,7 @@ class RemoteChatRoutes:
             client_request_id=req.client_request_id,
             model_parameters=req.parameters,
             locale=req.locale,
+            mentions=req.mentions,
             initial_prompt=req.prompt,
         )
         session.append_event(
@@ -308,6 +312,7 @@ class RemoteChatRoutes:
                 "provider_id": req.provider_id,
                 "model_id": req.model_id,
                 "locale": req.locale,
+                "mentions": req.mentions,
             },
         )
         session.mark_running()
@@ -334,6 +339,35 @@ class RemoteChatRoutes:
                 session_id=session.session_id,
             ).to_dict(),
         )
+
+    def _handle_chat_command(self) -> None:
+        payload = self._read_json()
+        try:
+            req = ChatCommandDispatchRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_command_request")
+            return
+
+        peer_id = self.service.relay_server.token_manager.verify_peer_token(
+            req.peer_token
+        )
+        if peer_id is None:
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+            return
+        if self.service.chat_command_handler is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "chat_command_unavailable")
+            return
+        if not req.command_text.startswith("/"):
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_chat_command",
+                "chat command dispatch requires slash command text",
+            )
+            return
+
+        with self.service._get_peer_chat_lock(peer_id):
+            result = self.service.chat_command_handler(peer_id, req)
+        self._send_json(HTTPStatus.OK, result.to_dict())
 
     def _handle_chat_events(self) -> None:
         payload = self._read_json()

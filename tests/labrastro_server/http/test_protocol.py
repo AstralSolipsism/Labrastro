@@ -11,6 +11,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     CleanupRequest,
     CleanupResult,
     ChatRequest,
+    ChatCommandDispatchRequest,
+    ChatCommandDispatchResponse,
     ChatStartRequest,
     ChatStartResponse,
     ChatStatusRequest,
@@ -138,6 +140,8 @@ class TestRemoteHTTPContract:
         SessionModelSwitchRequest.from_dict(fixtures["sessions.model"]["request"])
         ChatStartRequest.from_dict(fixtures["chat.start"]["request"])
         ChatStartResponse.from_dict(fixtures["chat.start"]["response"])
+        ChatCommandDispatchRequest.from_dict(fixtures["chat.command_dispatch"]["request"])
+        ChatCommandDispatchResponse.from_dict(fixtures["chat.command_dispatch"]["response"])
         ChatEventsRequest.from_dict(fixtures["chat.events"]["request"])
         ChatEventsBatch.from_dict(fixtures["chat.events"]["response"])
         ChatStatusRequest.from_dict(fixtures["chat.status"]["request"])
@@ -156,6 +160,12 @@ class TestRemoteHTTPContract:
         )
         assert registry["chat.events"]["path"] == "/remote/chat/events"
         assert registry["chat.events"]["response_shape"] == "ChatEventsBatch"
+        assert registry["chat.command_dispatch"]["path"] == "/remote/chat/command"
+        assert registry["chat.command_dispatch"]["request_model"] == "ChatCommandDispatchRequest"
+        assert (
+            registry["admin.toolchains.behavior_catalog"]["path"]
+            == "/remote/admin/toolchains/behavior-catalog"
+        )
         assert registry["peer.disconnect"]["request_model"] == "PeerDisconnectRequest"
         for name in (
             "taskflow.get",
@@ -292,6 +302,7 @@ class TestChatStartRequest:
             workflow_mode="taskflow",
             taskflow_id="taskflow-1",
             locale="zh-CN",
+            mentions=[{"kind": "file", "name": "README.md", "path": "README.md"}],
         )
 
         restored = ChatStartRequest.from_dict(req.to_dict())
@@ -303,6 +314,9 @@ class TestChatStartRequest:
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
         assert restored.locale == "zh-CN"
+        assert restored.mentions == [
+            {"kind": "file", "name": "README.md", "path": "README.md"}
+        ]
 
     def test_serializes_canonical_taskflow_id_only(self) -> None:
         restored = ChatStartRequest.from_dict({
@@ -313,6 +327,53 @@ class TestChatStartRequest:
 
         assert restored.taskflow_id == "taskflow-1"
         assert restored.to_dict()["taskflow_id"] == "taskflow-1"
+
+
+class TestChatCommandDispatchProtocol:
+    def test_request_builds_command_text_from_text_or_trigger_args(self) -> None:
+        explicit = ChatCommandDispatchRequest.from_dict(
+            {
+                "peer_token": "pt_1",
+                "text": " /debug on ",
+                "command_id": "system.debug",
+                "sessionId": "session-1",
+                "clientRequestId": "req-1",
+                "mentions": [{"kind": "file", "path": "README.md"}],
+            }
+        )
+        fallback = ChatCommandDispatchRequest.from_dict(
+            {
+                "peer_token": "pt_1",
+                "trigger": "/model",
+                "args": "planner",
+            }
+        )
+
+        assert explicit.command_text == "/debug on"
+        assert explicit.command_id == "system.debug"
+        assert explicit.session_hint == "session-1"
+        assert explicit.client_request_id == "req-1"
+        assert explicit.mentions == [{"kind": "file", "path": "README.md"}]
+        assert fallback.command_text == "/model planner"
+
+    def test_response_roundtrip_preserves_action_session_and_events(self) -> None:
+        resp = ChatCommandDispatchResponse(
+            ok=False,
+            action="chat",
+            session_id="session-1",
+            events=[{"type": "error", "payload": {"code": "invalid_chat_command"}}],
+            error="invalid_chat_command",
+        )
+
+        restored = ChatCommandDispatchResponse.from_dict(resp.to_dict())
+
+        assert restored.ok is False
+        assert restored.action == "chat"
+        assert restored.session_id == "session-1"
+        assert restored.events == [
+            {"type": "error", "payload": {"code": "invalid_chat_command"}}
+        ]
+        assert restored.error == "invalid_chat_command"
 
 
 class TestChatStatusProtocol:

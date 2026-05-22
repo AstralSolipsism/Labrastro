@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
 @dataclass
 class ChatRequest:
     peer_token: str
@@ -71,6 +76,7 @@ class ChatStartRequest:
     model_id: str | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
     locale: str | None = None
+    mentions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -94,6 +100,8 @@ class ChatStartRequest:
             payload["parameters"] = dict(self.parameters)
         if self.locale is not None:
             payload["locale"] = self.locale
+        if self.mentions:
+            payload["mentions"] = list(self.mentions)
         return payload
 
     @classmethod
@@ -111,6 +119,7 @@ class ChatStartRequest:
             model_id=d.get("model_id"),
             parameters=parameters if isinstance(parameters, dict) else {},
             locale=d.get("locale"),
+            mentions=_dict_list(d.get("mentions")),
         )
 
 @dataclass
@@ -131,6 +140,87 @@ class ChatStartResponse:
             chat_id=d.get("chat_id", ""),
             session_id=d.get("session_id") if isinstance(d.get("session_id"), str) else None,
             error=d.get("error"),
+        )
+
+@dataclass
+class ChatCommandDispatchRequest:
+    peer_token: str
+    text: str = ""
+    command_id: str = ""
+    trigger: str = ""
+    args: str = ""
+    session_hint: str | None = None
+    client_request_id: str | None = None
+    mentions: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def command_text(self) -> str:
+        text = str(self.text or "").strip()
+        if text:
+            return text
+        trigger = str(self.trigger or "").strip()
+        args = str(self.args or "").strip()
+        return f"{trigger} {args}".strip()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "peer_token": self.peer_token,
+            "text": self.text,
+            "command_id": self.command_id,
+            "trigger": self.trigger,
+            "args": self.args,
+        }
+        if self.session_hint is not None:
+            payload["session_hint"] = self.session_hint
+        if self.client_request_id is not None:
+            payload["client_request_id"] = self.client_request_id
+        if self.mentions:
+            payload["mentions"] = list(self.mentions)
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatCommandDispatchRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            text=str(d.get("text") or ""),
+            command_id=str(d.get("command_id") or d.get("commandId") or ""),
+            trigger=str(d.get("trigger") or ""),
+            args=str(d.get("args") or ""),
+            session_hint=d.get("session_hint") or d.get("sessionId") or d.get("session_id"),
+            client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
+            mentions=_dict_list(d.get("mentions")),
+        )
+
+
+@dataclass
+class ChatCommandDispatchResponse:
+    ok: bool
+    action: str = "continue"
+    session_id: str | None = None
+    events: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ok": self.ok,
+            "action": self.action,
+            "events": list(self.events),
+        }
+        if self.session_id is not None:
+            payload["session_id"] = self.session_id
+        if self.error is not None:
+            payload["error"] = self.error
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatCommandDispatchResponse":
+        events = d.get("events")
+        return cls(
+            ok=bool(d.get("ok")),
+            action=str(d.get("action") or "continue"),
+            session_id=d.get("session_id") if isinstance(d.get("session_id"), str) else None,
+            events=events if isinstance(events, list) else [],
+            error=d.get("error") if isinstance(d.get("error"), str) else None,
         )
 
 @dataclass

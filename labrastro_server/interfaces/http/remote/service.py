@@ -29,6 +29,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyResponse,
     ChatCancelRequest,
     ChatCancelResponse,
+    ChatCommandDispatchRequest,
+    ChatCommandDispatchResponse,
     ChatFollowUpCancelRequest,
     ChatFollowUpRequest,
     ChatFollowUpResponse,
@@ -280,6 +282,7 @@ class _RemoteChatSession:
     client_request_id: str | None = None
     model_parameters: dict[str, Any] = field(default_factory=dict)
     locale: str | None = None
+    mentions: list[dict[str, Any]] = field(default_factory=list)
     initial_prompt: str | None = None
     session_id: str | None = None
     status: str = "created"
@@ -826,6 +829,10 @@ class RemoteRelayHTTPService:
         chat_handler: Callable[[str, str], ChatResponse] | None = None,
         chat_events_handler: Callable[[str, str, _RemoteChatSession], None]
         | None = None,
+        chat_command_handler: Callable[
+            [str, ChatCommandDispatchRequest], ChatCommandDispatchResponse
+        ]
+        | None = None,
         session_handler: Callable[[str, str, dict[str, Any]], dict[str, Any]]
         | None = None,
         session_history_status_provider: Callable[[], dict[str, Any]] | None = None,
@@ -861,6 +868,7 @@ class RemoteRelayHTTPService:
         self.artifact_provider = artifact_provider
         self.chat_handler = chat_handler
         self.chat_events_handler = chat_events_handler
+        self.chat_command_handler = chat_command_handler
         self.session_handler = session_handler
         self.session_trace_event_sink: SessionTraceEventSink | None = None
         self.session_history_status_provider = session_history_status_provider
@@ -1091,6 +1099,13 @@ class RemoteRelayHTTPService:
     ) -> None:
         self.chat_events_handler = handler
 
+    def set_chat_command_handler(
+        self,
+        handler: Callable[[str, ChatCommandDispatchRequest], ChatCommandDispatchResponse]
+        | None,
+    ) -> None:
+        self.chat_command_handler = handler
+
     def set_session_handler(
         self,
         handler: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None,
@@ -1110,6 +1125,7 @@ class RemoteRelayHTTPService:
         client_request_id: str | None = None,
         model_parameters: dict[str, Any] | None = None,
         locale: str | None = None,
+        mentions: list[dict[str, Any]] | None = None,
         initial_prompt: str | None = None,
     ) -> _RemoteChatSession:
         self._gc_chat_sessions()
@@ -1125,6 +1141,7 @@ class RemoteRelayHTTPService:
             client_request_id=client_request_id,
             model_parameters=dict(model_parameters or {}),
             locale=locale,
+            mentions=[dict(item) for item in (mentions or []) if isinstance(item, dict)],
             initial_prompt=initial_prompt,
             artifact_root=self._chat_artifact_root,
             max_events=self._chat_max_events,
@@ -1323,6 +1340,9 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/chat/start":
                     self._handle_chat_start()
+                    return
+                if parsed.path == "/remote/chat/command":
+                    self._handle_chat_command()
                     return
                 if parsed.path == "/remote/chat/events":
                     self._handle_chat_events()
