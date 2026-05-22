@@ -254,3 +254,25 @@ def test_tool_executor_keeps_unrepairable_placeholder_as_tool_error(tmp_path, mo
     assert result.startswith("Error: bad arguments for mcp_batch")
     assert "$.paths: expected array, got string" in result
     assert tool.received is None
+
+
+def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
+    tool = SimpleNamespace(
+        name="write_file",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda **kwargs: "should not execute",
+        preflight_validate=lambda **kwargs: None,
+    )
+    agent = _AgentStub(tool)
+    agent.capability_tool_policy_enabled = lambda: True
+    agent.is_tool_authorized = lambda _tool: False
+    executor = ToolExecutor(agent)
+
+    result = executor.execute(
+        ToolCall(id="call_blocked", name="write_file", arguments={})
+    )
+
+    assert result == (
+        "Error: tool 'write_file' is not authorized by this "
+        "Agent's effective_capabilities"
+    )

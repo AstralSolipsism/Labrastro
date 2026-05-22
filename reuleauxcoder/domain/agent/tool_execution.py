@@ -494,6 +494,30 @@ class ToolExecutor:
 
         # First check agent's tools, then fall back to global registry
         tool = self.agent.get_tool(tool_call.name)
+        if tool is None and getattr(
+            self.agent, "capability_tool_policy_enabled", lambda: False
+        )():
+            message = (
+                f"Error: tool '{tool_call.name}' is not authorized by this "
+                "Agent's effective_capabilities"
+            )
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="tool_not_authorized",
+                message=message,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+            )
+            context = self._tool_argument_context(tool_call, tool)
+            self._record_lifecycle_diagnostics([diagnostic], context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
+            return message
         if tool is None:
             tool = get_tool(tool_call.name)
 
@@ -503,6 +527,28 @@ class ToolExecutor:
                 stage=ToolDiagnosticStage.PREFLIGHT,
                 kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
                 code="unknown_tool",
+                message=message,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+            )
+            context = self._tool_argument_context(tool_call, tool)
+            self._record_lifecycle_diagnostics([diagnostic], context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
+            return message
+        if not getattr(self.agent, "is_tool_authorized", lambda _tool: True)(tool):
+            message = (
+                f"Error: tool '{tool_call.name}' is not authorized by this "
+                "Agent's effective_capabilities"
+            )
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code="tool_not_authorized",
                 message=message,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,

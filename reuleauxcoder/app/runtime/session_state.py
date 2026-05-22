@@ -163,6 +163,24 @@ def apply_agent_default_model(config: Config, agent: Agent) -> bool:
     return True
 
 
+def apply_agent_config_model(config: Config, agent: Agent, agent_id: str | None) -> bool:
+    """Apply a configured Agent model binding to a live agent."""
+
+    binding = _agent_model_binding(config, agent_id)
+    if binding is None:
+        return False
+    _apply_model_binding(
+        config,
+        agent,
+        provider=binding.provider,
+        model=binding.model,
+        display_name=binding.display_name,
+        parameters=binding.parameters,
+    )
+    setattr(agent, "session_model_overridden", False)
+    return True
+
+
 def build_session_runtime_state(config: Config, agent: Agent) -> SessionRuntimeState:
     """Capture session-scoped runtime overrides from the live host runtime."""
     session_rules = getattr(agent, "session_approval_rules", None) or []
