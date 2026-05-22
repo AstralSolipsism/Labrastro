@@ -46,6 +46,8 @@ from reuleauxcoder.domain.config.models import (
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from labrastro_server.interfaces.http.remote.protocol import (
+    ChatCommandDispatchRequest,
+    ChatCommandDispatchResponse,
     ChatResponse,
     ChatStartRequest,
     CleanupResult,
@@ -1169,7 +1171,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_admin_toolchain_behavior_catalog_exposes_actions_tools_and_packages(
+    def test_admin_behavior_catalog_exposes_chat_commands_mentions_ui_actions_tools_and_packages(
         self, tmp_path: Path
     ) -> None:
         relay = RelayServer()
@@ -1251,18 +1253,68 @@ class TestRemoteRelayHTTPService:
             )
 
             assert catalog["ok"] is True
-            actions = {item["id"]: item for item in catalog["user_actions"]}
-            assert "system.help" in actions
-            assert actions["system.help"]["feature_id"] == "system"
-            assert actions["system.help"]["triggers"][0]["kind"] == "slash"
+            assert "user_actions" in catalog
+
+            commands = {item["id"]: item for item in catalog["chat_commands"]}
+            assert "system.help" in commands
+            assert commands["system.help"]["feature_id"] == "system"
+            assert commands["system.help"]["trigger"] == "/help"
+            assert commands["system.help"]["trigger_kind"] == "slash"
+            assert commands["system.help"]["ui_targets"] == ["cli", "tui", "vscode"]
+            assert commands["system.help"]["supports_args"] is False
+            assert commands["system.help"]["selection_behavior"] == "dispatch"
+            assert commands["system.help"]["available_during_run"] is True
+            assert commands["system.help"]["visibility"] == "visible"
+            assert commands["system.debug"]["trigger"] == "/debug"
+            assert commands["system.debug"]["supports_args"] is True
+            assert commands["system.debug"]["args_hint"] == "on|off"
+            assert commands["system.debug"]["selection_behavior"] == "insert_for_args"
+            assert commands["model.switch"]["trigger"] == "/model <profile>"
+            assert commands["model.switch"]["supports_args"] is True
+            assert commands["model.switch"]["args_hint"] == "profile"
+            assert commands["model.switch"]["selection_behavior"] == "insert_for_args"
+
+            ui_actions = {item["id"]: item for item in catalog["ui_actions"]}
+            assert "settings.toolchains.refresh_manifest" in ui_actions
+            assert (
+                ui_actions["settings.toolchains.refresh_manifest"]["source_type"]
+                == "settings_ui"
+            )
+            assert "settings.toolchains.refresh_manifest" not in commands
+
+            mention_providers = {
+                item["id"]: item for item in catalog["mention_providers"]
+            }
+            assert mention_providers["workspace_files"]["trigger"] == "@"
+            assert mention_providers["capability_packages"]["source_type"] == "config"
+            assert mention_providers["agent_tools"]["source_type"] == "behavior_catalog"
+            user_actions = {item["id"]: item for item in catalog["user_actions"]}
+            assert user_actions["slash:system.help"]["trigger"] == "/help"
+            assert user_actions["slash:system.help"]["reference_only"] is False
+            assert user_actions["mention:agent_tools"]["trigger"] == "@"
+            assert user_actions["mention:agent_tools"]["reference_only"] is True
 
             tools = {item["id"]: item for item in catalog["agent_tools"]}
             assert tools["builtin:fetch_capabilities"]["source_type"] == "builtin"
+            assert tools["builtin:fetch_capabilities"]["execution_policy"] in {
+                "allow",
+                "deny",
+                "require_user",
+                "escalate",
+                "inherit",
+            }
             assert (
                 tools["builtin:fetch_capabilities"]["registration_path"]
                 == "reuleauxcoder.extensions.tools.registry"
             )
+            assert tools["builtin:fetch_capabilities"]["related_package_ids"] == [
+                "core_builtin_tools"
+            ]
+            assert tools["builtin:fetch_capabilities"]["related_components"] == [
+                "builtin_tool:fetch_capabilities"
+            ]
             assert tools["capability_package:review"]["source_type"] == "capability_package"
+            assert tools["capability_package:review"]["execution_policy"] == "inherit"
             assert (
                 tools["capability_package:review"]["registration_path"]
                 == "agent.capability_refs[]"
@@ -2580,6 +2632,126 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_chat_command_endpoint_routes_to_host_command_handler(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        seen: dict[str, object] = {}
+
+        def chat_command_handler(
+            peer_id: str, req: ChatCommandDispatchRequest
+        ) -> ChatCommandDispatchResponse:
+            seen["peer_id"] = peer_id
+            seen["command_text"] = req.command_text
+            seen["command_id"] = req.command_id
+            seen["session_hint"] = req.session_hint
+            seen["mentions"] = req.mentions
+            return ChatCommandDispatchResponse(
+                ok=True,
+                action="continue",
+                session_id="session-1",
+                events=[
+                    {
+                        "type": "output",
+                        "payload": {
+                            "format": "plain",
+                            "content": f"{peer_id}:{req.command_text}",
+                        },
+                    }
+                ],
+            )
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            chat_command_handler=chat_command_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_id = register_body["payload"]["peer_id"]
+            peer_token = register_body["payload"]["peer_token"]
+
+            status, command_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/command",
+                {
+                    "peer_token": peer_token,
+                    "text": "/help",
+                    "command_id": "system.help",
+                    "trigger": "/help",
+                    "session_hint": "session-1",
+                    "client_request_id": "req-1",
+                    "mentions": [{"kind": "file", "path": "README.md"}],
+                },
+            )
+
+            assert status == 200
+            assert command_body == {
+                "ok": True,
+                "action": "continue",
+                "session_id": "session-1",
+                "events": [
+                    {
+                        "type": "output",
+                        "payload": {
+                            "format": "plain",
+                            "content": f"{peer_id}:/help",
+                        },
+                    }
+                ],
+            }
+            assert seen == {
+                "peer_id": peer_id,
+                "command_text": "/help",
+                "command_id": "system.help",
+                "session_hint": "session-1",
+                "mentions": [{"kind": "file", "path": "README.md"}],
+            }
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_chat_command_endpoint_rejects_non_slash_text(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            chat_command_handler=lambda _peer_id, _req: ChatCommandDispatchResponse(
+                ok=True
+            ),
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/chat/command",
+                    {
+                        "peer_token": register_body["payload"]["peer_token"],
+                        "text": "hello",
+                    },
+                )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "invalid_chat_command"
+            assert "slash command" in body["message"]
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_chat_endpoint_routes_taskflow_to_chat_events_handler(self) -> None:
         relay = RelayServer()
         relay.start()
@@ -2752,11 +2924,12 @@ class TestRemoteRelayHTTPService:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        seen: dict[str, str | None] = {}
+        seen: dict[str, object] = {}
 
         def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             seen["mode"] = session.mode
             seen["locale"] = session.locale
+            seen["mentions"] = session.mentions
             session.append_event("chat_end", {"response": "ok"})
 
         service = RemoteRelayHTTPService(
@@ -2784,6 +2957,14 @@ class TestRemoteRelayHTTPService:
                     "prompt": "use planner mode",
                     "mode": "planner",
                     "locale": "zh-CN",
+                    "mentions": [
+                        {
+                            "kind": "file",
+                            "name": "README.md",
+                            "path": "README.md",
+                            "source": "workspace_files",
+                        }
+                    ],
                 },
             )
             chat_id = start_body["chat_id"]
@@ -2793,6 +2974,18 @@ class TestRemoteRelayHTTPService:
             assert stream_body["done"] is True
             assert seen["mode"] == "planner"
             assert seen["locale"] == "zh-CN"
+            assert seen["mentions"] == [
+                {
+                    "kind": "file",
+                    "name": "README.md",
+                    "path": "README.md",
+                    "source": "workspace_files",
+                }
+            ]
+            chat_start = next(
+                event for event in stream_body["events"] if event["type"] == "chat_start"
+            )
+            assert chat_start["payload"]["mentions"] == seen["mentions"]
         finally:
             service.stop()
             relay.stop()

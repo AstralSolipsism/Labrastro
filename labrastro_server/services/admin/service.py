@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from reuleauxcoder.app.commands.loader import create_builtin_action_registry
+from reuleauxcoder.app.commands.specs import TriggerKind
 from reuleauxcoder.app.runtime.agent_runtime import get_interactive_run_limiter
 from reuleauxcoder.domain.approval_engine import ApprovalPolicyEngine, ToolApprovalContext
 from reuleauxcoder.domain.config.models import (
@@ -19,6 +20,7 @@ from reuleauxcoder.domain.config.models import (
     CapabilityComponentConfig,
     CapabilityPackageConfig,
     ContextConfig,
+    DEFAULT_BUILTIN_TOOL_COMPONENTS,
     DiagnosticsConfig,
     EnvironmentCLIToolConfig,
     EnvironmentSkillConfig,
@@ -36,6 +38,7 @@ from reuleauxcoder.domain.config.models import (
     SandboxProviderConfig,
     SkillsConfig,
     StreamRecoveryConfig,
+    ensure_default_capability_components,
     ensure_default_capability_packages,
     ensure_default_environment_agent_registry,
     infer_provider_compat,
@@ -57,7 +60,7 @@ from reuleauxcoder.services.providers.model_capabilities import (
 )
 from reuleauxcoder.services.providers.manager import ProviderManager
 from reuleauxcoder.extensions.tools.registry import build_tools
-from reuleauxcoder.interfaces.ui_registry import UICapability, UIProfile
+from reuleauxcoder.interfaces.vscode.registration import VSCODE_CHAT_PROFILE
 
 
 ProviderTestHandler = Callable[[ProviderConfig, str, str], dict[str, Any]]
@@ -72,14 +75,7 @@ class AdminConfigResult:
     status: int = 200
 
 
-CATALOG_UI_PROFILE = UIProfile(
-    ui_id="cli",
-    display_name="CLI Catalog",
-    capabilities=frozenset(UICapability),
-)
-
-
-SETTINGS_USER_ACTIONS: tuple[dict[str, Any], ...] = (
+SETTINGS_UI_ACTIONS: tuple[dict[str, Any], ...] = (
     {
         "id": "settings.toolchains.refresh_manifest",
         "feature_id": "toolchains",
@@ -480,11 +476,11 @@ class RemoteAdminConfigManager:
             str(component_id): CapabilityComponentConfig.from_dict(
                 str(component_id), component_data
             ).to_dict()
-            for component_id, component_data in (
-                raw_capability_components.items()
+            for component_id, component_data in ensure_default_capability_components(
+                raw_capability_components
                 if isinstance(raw_capability_components, dict)
-                else []
-            )
+                else {}
+            ).items()
             if isinstance(component_data, dict)
         }
         raw_github = data.get("github", {})
@@ -1524,8 +1520,13 @@ class RemoteAdminConfigManager:
 
     def toolchain_behavior_catalog(self) -> dict[str, Any]:
         data = self._load_data()
+        chat_commands = self._chat_command_catalog()
+        mention_providers = self._mention_provider_catalog(data)
         return {
-            "user_actions": self._user_action_catalog(),
+            "user_actions": self._user_action_catalog(chat_commands, mention_providers),
+            "chat_commands": chat_commands,
+            "mention_providers": mention_providers,
+            "ui_actions": self._ui_action_catalog(),
             "agent_tools": self._agent_tool_catalog(data),
         }
 
@@ -2373,33 +2374,126 @@ class RemoteAdminConfigManager:
             "managed_by": str(view.get("managed_by") or ""),
         }
 
-    def _user_action_catalog(self) -> list[dict[str, Any]]:
+    def _chat_command_catalog(self) -> list[dict[str, Any]]:
         registry = create_builtin_action_registry()
+        commands: list[dict[str, Any]] = []
+        for action in registry.iter_actions(VSCODE_CHAT_PROFILE):
+            slash_triggers = action.matching_triggers(
+                VSCODE_CHAT_PROFILE, kind=TriggerKind.SLASH
+            )
+            for trigger in slash_triggers:
+                commands.append(
+                    {
+                        "id": action.action_id,
+                        "name": str(trigger.value).lstrip("/") or action.action_id,
+                        "display_name": str(trigger.value),
+                        "feature_id": action.feature_id,
+                        "source_type": "action_registry",
+                        "registration_path": "reuleauxcoder.app.commands.registry.ActionRegistry",
+                        "description": action.description,
+                        "trigger_kind": "slash",
+                        "trigger": str(trigger.value),
+                        "ui_targets": sorted(action.ui_targets),
+                        "required_capabilities": self._capability_values(
+                            action.required_capabilities
+                        ),
+                        "interactive": bool(action.interactive),
+                        "supports_args": bool(trigger.supports_args),
+                        "args_hint": str(trigger.args_hint or ""),
+                        "selection_behavior": trigger.selection_behavior.value,
+                        "available_during_run": bool(trigger.available_during_run),
+                        "visibility": trigger.visibility.value,
+                    }
+                )
+        return sorted(commands, key=lambda item: str(item.get("trigger") or ""))
+
+    def _mention_provider_catalog(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        packages = self._capability_package_catalog(data)
+        agent_tools = self._agent_tool_catalog(data)
+        return [
+            {
+                "id": "workspace_files",
+                "name": "workspace_files",
+                "display_name": "Workspace files",
+                "source_type": "workspace",
+                "registration_path": "dogcode.webview-ui.chat.PromptInput",
+                "description": "Search workspace files and insert them as chat context references.",
+                "trigger": "@",
+                "enabled": True,
+                "insert_format": "@path",
+                "item_count": None,
+            },
+            {
+                "id": "capability_packages",
+                "name": "capability_packages",
+                "display_name": "Capability packages",
+                "source_type": "config",
+                "registration_path": "capability_packages",
+                "description": "Mention installed capability packages as context for the agent.",
+                "trigger": "@",
+                "enabled": True,
+                "insert_format": "@capability:<id>",
+                "item_count": len(packages),
+            },
+            {
+                "id": "agent_tools",
+                "name": "agent_tools",
+                "display_name": "Agent tools",
+                "source_type": "behavior_catalog",
+                "registration_path": "agent_tools",
+                "description": "Mention available agent tools without granting direct execution.",
+                "trigger": "@",
+                "enabled": True,
+                "insert_format": "@tool:<name>",
+                "item_count": len(agent_tools),
+            },
+        ]
+
+    def _user_action_catalog(
+        self,
+        chat_commands: list[dict[str, Any]],
+        mention_providers: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
-        for action in registry.iter_actions(CATALOG_UI_PROFILE):
+        for command in chat_commands:
             actions.append(
                 {
-                    "id": action.action_id,
-                    "name": action.action_id,
-                    "feature_id": action.feature_id,
-                    "source_type": "action_registry",
-                    "registration_path": "reuleauxcoder.app.commands.registry.ActionRegistry",
-                    "description": action.description,
-                    "ui_targets": sorted(action.ui_targets),
-                    "required_capabilities": self._capability_values(
-                        action.required_capabilities
-                    ),
-                    "interactive": bool(action.interactive),
-                    "triggers": [
-                        self._trigger_view(trigger, fallback_ui_targets=action.ui_targets)
-                        for trigger in action.matching_triggers(CATALOG_UI_PROFILE)
-                    ],
+                    "id": f"slash:{command.get('id')}",
+                    "name": command.get("name"),
+                    "display_name": command.get("display_name"),
+                    "feature_id": command.get("feature_id"),
+                    "source_type": command.get("source_type"),
+                    "registration_path": command.get("registration_path"),
+                    "description": command.get("description"),
+                    "trigger_kind": "slash",
+                    "trigger": command.get("trigger"),
+                    "ui_targets": command.get("ui_targets", ["chatview"]),
+                    "interactive": True,
+                    "execution_semantics": "registered slash command",
+                    "reference_only": False,
                 }
             )
-        actions.extend(self._settings_action_catalog())
-        return sorted(actions, key=lambda item: str(item.get("id") or ""))
+        for provider in mention_providers:
+            actions.append(
+                {
+                    "id": f"mention:{provider.get('id')}",
+                    "name": provider.get("name"),
+                    "display_name": provider.get("display_name"),
+                    "feature_id": "reference_context",
+                    "source_type": provider.get("source_type"),
+                    "registration_path": provider.get("registration_path"),
+                    "description": provider.get("description"),
+                    "trigger_kind": "mention",
+                    "trigger": provider.get("trigger", "@"),
+                    "ui_targets": ["chatview"],
+                    "interactive": True,
+                    "execution_semantics": "reference_only mention; no tool permission grant",
+                    "reference_only": True,
+                }
+            )
+        return actions
 
-    def _settings_action_catalog(self) -> list[dict[str, Any]]:
+    def _ui_action_catalog(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": str(item["id"]),
@@ -2426,7 +2520,7 @@ class RemoteAdminConfigManager:
                     if isinstance(trigger, dict)
                 ],
             }
-            for item in SETTINGS_USER_ACTIONS
+            for item in SETTINGS_UI_ACTIONS
         ]
 
     def _trigger_view(
@@ -2454,27 +2548,66 @@ class RemoteAdminConfigManager:
         items: dict[str, dict[str, Any]] = {}
         packages = self._capability_package_catalog(data)
         component_package_ids = self._component_package_ids(packages)
+        raw_components = data.get("capability_components", {})
+        components = ensure_default_capability_components(
+            raw_components if isinstance(raw_components, dict) else {}
+        )
         mode_refs = self._mode_refs_by_tool(data)
 
         for tool in build_tools():
             tool_name = str(getattr(tool, "name", "") or "")
             if not tool_name:
                 continue
+            component_id = f"builtin_tool:{tool_name}"
+            component = components.get(component_id, {})
+            related_package_ids = self._string_list(
+                component.get("package_ids") if isinstance(component, dict) else None
+            ) or component_package_ids.get(component_id, [])
+            approval_status = self._approval_action_for_tool(
+                data, tool_name=tool_name, source_type="builtin"
+            )
+            component_execution_policy = str(
+                (
+                    component.get("execution_policy")
+                    if isinstance(component, dict)
+                    else None
+                )
+                or ""
+            ).strip()
+            execution_policy = self._execution_policy_for_approval(approval_status)
+            if (
+                approval_status == "allow"
+                and component_execution_policy
+                and component_execution_policy != "inherit"
+            ):
+                execution_policy = component_execution_policy
             items[f"builtin:{tool_name}"] = {
                 "id": f"builtin:{tool_name}",
                 "name": tool_name,
                 "display_name": tool_name,
                 "source_type": "builtin",
                 "source_label": "Builtin tool",
-                "description": str(getattr(tool, "description", "") or ""),
+                "description": str(
+                    (
+                        component.get("description")
+                        if isinstance(component, dict)
+                        else None
+                    )
+                    or getattr(tool, "description", "")
+                    or ""
+                ),
                 "registration_path": "reuleauxcoder.extensions.tools.registry",
                 "enabled": True,
-                "related_package_ids": [],
-                "related_components": [],
-                "mode_refs": self._tool_mode_refs(mode_refs, tool_name),
-                "approval_status": self._approval_action_for_tool(
-                    data, tool_name=tool_name, source_type="builtin"
+                "related_package_ids": sorted(dict.fromkeys(related_package_ids)),
+                "related_components": (
+                    [component_id]
+                    if component_id in components
+                    or component_id in DEFAULT_BUILTIN_TOOL_COMPONENTS
+                    else []
                 ),
+                "mode_refs": self._tool_mode_refs(mode_refs, tool_name),
+                "approval_status": approval_status,
+                "execution_policy": execution_policy,
             }
 
         for kind in ("cli", "mcp", "skill"):
@@ -2486,6 +2619,12 @@ class RemoteAdminConfigManager:
                 related_package_ids = self._string_list(
                     view.get("package_ids")
                 ) or component_package_ids.get(component_id, [])
+                approval_status = self._approval_action_for_tool(
+                    data,
+                    tool_name=name,
+                    source_type="mcp" if kind == "mcp" else "unknown",
+                    mcp_server=name if kind == "mcp" else None,
+                )
                 items[f"{kind}:{name}"] = {
                     "id": f"{kind}:{name}",
                     "name": name,
@@ -2498,11 +2637,9 @@ class RemoteAdminConfigManager:
                     "related_package_ids": sorted(dict.fromkeys(related_package_ids)),
                     "related_components": [component_id] if component_id else [],
                     "mode_refs": self._tool_mode_refs(mode_refs, name),
-                    "approval_status": self._approval_action_for_tool(
-                        data,
-                        tool_name=name,
-                        source_type="mcp" if kind == "mcp" else "unknown",
-                        mcp_server=name if kind == "mcp" else None,
+                    "approval_status": approval_status,
+                    "execution_policy": self._execution_policy_for_approval(
+                        approval_status
                     ),
                 }
 
@@ -2521,6 +2658,7 @@ class RemoteAdminConfigManager:
                 "related_components": components,
                 "mode_refs": [],
                 "approval_status": "inherits_component_policy",
+                "execution_policy": str(package.get("execution_policy") or "inherit"),
                 "generated_by": str(package.get("generated_by") or ""),
             }
 
@@ -2619,6 +2757,18 @@ class RemoteAdminConfigManager:
             )
         )
         return str(match.action)
+
+    def _execution_policy_for_approval(self, approval_status: str) -> str:
+        status = str(approval_status or "").strip()
+        if status == "allow":
+            return "allow"
+        if status == "deny":
+            return "deny"
+        if status == "warn":
+            return "escalate"
+        if status == "require_approval":
+            return "require_user"
+        return "inherit"
 
     def _tool_source_label(self, kind: str) -> str:
         if kind == "cli":
