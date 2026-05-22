@@ -2,7 +2,7 @@
 
 from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
 from reuleauxcoder.domain.agent_runtime.models import AgentConfig
-from reuleauxcoder.domain.config.models import AgentRegistryConfig, Config
+from reuleauxcoder.domain.config.models import AgentRegistryConfig
 from reuleauxcoder.extensions.tools.builtin.agent import DelegateAgentTool
 
 
@@ -22,17 +22,24 @@ class _ControlPlaneStub:
 
 def _tool() -> tuple[DelegateAgentTool, _ControlPlaneStub]:
     control = _ControlPlaneStub()
-    config = Config(
-        api_key="test",
+    config = SimpleNamespace(
         agent_registry=AgentRegistryConfig(
             agents={
                 "reviewer": AgentConfig(
                     id="reviewer",
                     name="Reviewer",
                     description="Review code changes.",
-                )
+                ),
+                "capability_packager": AgentConfig(
+                    id="capability_packager",
+                    name="Capability Packager",
+                    visibility="internal",
+                    delegable=False,
+                    taskflow_eligible=False,
+                    system_flow_only=["capability_ingest"],
+                ),
             }
-        ),
+        )
     )
     parent = SimpleNamespace(
         runtime_config=config,
@@ -58,6 +65,15 @@ def test_delegate_agent_rejects_missing_agent_config() -> None:
     assert (
         tool.preflight_validate(agent_id="missing", task="review")
         == "Error: AgentConfig not found: missing"
+    )
+
+
+def test_delegate_agent_rejects_internal_agent() -> None:
+    tool, _control = _tool()
+
+    assert (
+        tool.preflight_validate(agent_id="capability_packager", task="review")
+        == "Error: AgentConfig is not delegable: capability_packager. Only user-visible worker Agents may be delegated."
     )
 
 

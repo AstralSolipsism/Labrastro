@@ -9,6 +9,7 @@ import time
 import uuid
 
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentConfig,
     AgentRunSource,
     ArtifactStatus,
     ArtifactType,
@@ -163,6 +164,14 @@ def _coerce_source(value: AgentRunSource | str | None) -> AgentRunSource:
     if value is None or str(value).strip() == "":
         return AgentRunSource.MANUAL
     return AgentRunSource(str(value))
+
+
+def _system_flow_for_source(source: AgentRunSource) -> str:
+    if source == AgentRunSource.ENVIRONMENT:
+        return "environment_config"
+    if source == AgentRunSource.CAPABILITY_INGEST:
+        return "capability_ingest"
+    return source.value
 
 
 @dataclass
@@ -434,6 +443,15 @@ class AgentRunControlPlane:
         agents = _dict_from(snapshot.get("agents"))
         profiles = _dict_from(snapshot.get("runtime_profiles"))
         raw_agent = _dict_from(agents.get(request.agent_id))
+        if raw_agent:
+            agent_config = AgentConfig.from_dict(request.agent_id, raw_agent)
+            if agent_config.visibility != "user":
+                flow = _system_flow_for_source(request.source)
+                if not agent_config.allows_system_flow(flow):
+                    raise ValueError(
+                        "agent is restricted to system flows: "
+                        f"{request.agent_id} does not allow {flow}"
+                    )
 
         agent_profile_id = str(raw_agent.get("runtime_profile") or "").strip()
         profile_id = str(request.runtime_profile_id or agent_profile_id).strip()
@@ -861,9 +879,16 @@ class AgentRunControlPlane:
         snapshot = self.runtime_snapshot
         raw_agent = _dict_from(_dict_from(snapshot.get("agents")).get(task.agent_id))
         resolved = _dict_from(raw_agent.get("resolved_capabilities"))
+        effective = _dict_from(raw_agent.get("effective_capabilities"))
         overlay = _dict_from(resolved.get("capability_overlay"))
         if overlay:
             metadata.setdefault("capability_overlay", overlay)
+        if effective:
+            metadata.setdefault("effective_capabilities", effective)
+            metadata.setdefault(
+                "execution_policies",
+                effective.get("execution_policies", []),
+            )
         return metadata
 
     def _worker_matches_task_locked(

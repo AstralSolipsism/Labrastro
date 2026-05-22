@@ -54,8 +54,9 @@ class DelegateAgentTool(Tool):
             return "Error: delegate_agent is not initialized with a parent Agent."
         if self._runtime_control_plane() is None:
             return "Error: AgentRun control plane is unavailable."
-        if not self._agent_exists(agent_id):
-            return f"Error: AgentConfig not found: {agent_id}"
+        delegation_error = self._delegation_error(agent_id)
+        if delegation_error:
+            return delegation_error
         return None
 
     def execute(
@@ -122,8 +123,16 @@ class DelegateAgentTool(Tool):
         parent = self._parent_agent
         return getattr(parent, "agent_run_control_plane", None)
 
-    def _agent_exists(self, agent_id: str) -> bool:
+    def _delegation_error(self, agent_id: str) -> str | None:
         config = getattr(self._parent_agent, "runtime_config", None)
         registry = getattr(config, "agent_registry", None)
         agents = getattr(registry, "agents", {}) if registry is not None else {}
-        return str(agent_id).strip() in agents
+        agent = agents.get(str(agent_id).strip())
+        if agent is None:
+            return f"Error: AgentConfig not found: {agent_id}"
+        if getattr(agent, "can_delegate", False) is not True:
+            return (
+                "Error: AgentConfig is not delegable: "
+                f"{agent_id}. Only user-visible worker Agents may be delegated."
+            )
+        return None

@@ -24,14 +24,21 @@ class BasicAgentScheduler:
     running_tasks: list[AgentRunRecord] = field(default_factory=list)
 
     def choose_agent(self) -> AgentScheduleDecision:
-        candidates = list(self.agents.values())
-        if not candidates and self.default_agent_id in self.agents:
+        candidates = [
+            agent for agent in self.agents.values() if agent.can_run_taskflow
+        ]
+        default_agent = (
+            self.agents.get(str(self.default_agent_id))
+            if self.default_agent_id is not None
+            else None
+        )
+        if not candidates and default_agent is not None and default_agent.can_run_taskflow:
             return AgentScheduleDecision(
                 agent_id=str(self.default_agent_id),
                 reason="default_agent",
             )
         if not candidates:
-            raise ValueError("no agent is configured")
+            raise ValueError("no taskflow-eligible agent is configured")
 
         ranked = sorted(
             candidates,

@@ -1013,7 +1013,65 @@ def test_basic_scheduler_selects_lowest_running_agent() -> None:
             id="coder",
             max_concurrent_tasks=2,
         ),
+        "capability_packager": AgentConfig(
+            id="capability_packager",
+            visibility="internal",
+            delegable=False,
+            taskflow_eligible=False,
+        ),
     }
     scheduler = BasicAgentScheduler(agents=agents)
 
     assert scheduler.choose_agent().agent_id == "reviewer"
+
+
+def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "agents": {
+                "capability_packager": {
+                    "visibility": "internal",
+                    "delegable": False,
+                    "taskflow_eligible": False,
+                    "system_flow_only": ["capability_ingest"],
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="restricted to system flows"):
+        control.submit_agent_run(
+            AgentRunRequest(
+                issue_id="manual",
+                agent_id="capability_packager",
+                prompt="run",
+                source="manual",
+            )
+        )
+
+
+def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "agents": {
+                "capability_packager": {
+                    "visibility": "internal",
+                    "delegable": False,
+                    "taskflow_eligible": False,
+                    "system_flow_only": ["capability_ingest"],
+                }
+            }
+        }
+    )
+
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="ingest",
+            agent_id="capability_packager",
+            prompt="package",
+            source="capability_ingest",
+        )
+    )
+
+    assert task.agent_id == "capability_packager"
+    assert task.source.value == "capability_ingest"

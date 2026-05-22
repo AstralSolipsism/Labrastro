@@ -65,7 +65,11 @@ class ReuleauxCoderTaskflowDispatcher:
         snapshot = getattr(self.runtime_control_plane, "runtime_snapshot", {}) or {}
         agents = dict(snapshot.get("agents") or {})
         if executor_hint:
-            return executor_hint if executor_hint in agents else None
+            agent_data = agents.get(executor_hint)
+            if not isinstance(agent_data, dict):
+                return None
+            agent = AgentConfig.from_dict(executor_hint, agent_data)
+            return executor_hint if agent.can_run_taskflow else None
         if not agents:
             return None
         parsed_agents = {
