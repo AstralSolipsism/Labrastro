@@ -92,6 +92,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("admin.models.activate", "POST", "/remote/admin/models/activate", "ModelProfileActivateRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.toolchains.list", "POST", "/remote/admin/toolchains/list", "Empty", "ToolchainList", "bearer"),
     RemoteEndpoint("admin.toolchains.dashboard", "POST", "/remote/admin/toolchains/dashboard", "Empty", "ToolchainDashboard", "bearer"),
+    RemoteEndpoint("admin.toolchains.behavior_catalog", "POST", "/remote/admin/toolchains/behavior-catalog", "Empty", "ToolchainBehaviorCatalog", "bearer"),
     RemoteEndpoint("admin.toolchains.record", "POST", "/remote/admin/toolchains/record", "ToolchainRecordRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.toolchains.delete", "POST", "/remote/admin/toolchains/delete", "ToolchainDeleteRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.toolchains.enable", "POST", "/remote/admin/toolchains/enable", "ToolchainEnableRequest", "AdminMutationResult", "bearer"),

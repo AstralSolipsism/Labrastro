@@ -1169,6 +1169,114 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_admin_toolchain_behavior_catalog_exposes_actions_tools_and_packages(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "environment": {
+                    "cli_tools": {
+                        "gh": {
+                            "command": "gh",
+                            "enabled": True,
+                            "description": "GitHub CLI",
+                            "component_id": "cli:gh",
+                            "package_ids": ["review"],
+                        }
+                    }
+                },
+                "mcp": {
+                    "servers": {
+                        "github": {
+                            "command": "github-mcp",
+                            "enabled": True,
+                            "description": "GitHub MCP",
+                            "component_id": "mcp:github",
+                            "package_ids": ["review"],
+                        }
+                    }
+                },
+                "runtime_profiles": {
+                    "codex_remote": {
+                        "executor": "codex",
+                        "execution_location": "remote_server",
+                    }
+                },
+                "agent_registry": {
+                    "agents": {
+                        "reviewer": {
+                            "runtime_profile": "codex_remote",
+                            "capability_refs": ["review"],
+                        }
+                    }
+                },
+                "capability_packages": {
+                    "review": {
+                        "name": "Review",
+                        "description": "Repository review tools",
+                        "components": ["cli:gh", "mcp:github"],
+                    }
+                },
+                "capability_components": {
+                    "cli:gh": {
+                        "kind": "cli",
+                        "name": "gh",
+                        "package_ids": ["review"],
+                    },
+                    "mcp:github": {
+                        "kind": "mcp",
+                        "name": "github",
+                        "package_ids": ["review"],
+                    },
+                },
+            },
+        )
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, catalog = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/toolchains/behavior-catalog",
+                {},
+                headers=TEST_ADMIN_HEADERS,
+            )
+
+            assert catalog["ok"] is True
+            actions = {item["id"]: item for item in catalog["user_actions"]}
+            assert "system.help" in actions
+            assert actions["system.help"]["feature_id"] == "system"
+            assert actions["system.help"]["triggers"][0]["kind"] == "slash"
+
+            tools = {item["id"]: item for item in catalog["agent_tools"]}
+            assert tools["builtin:fetch_capabilities"]["source_type"] == "builtin"
+            assert (
+                tools["builtin:fetch_capabilities"]["registration_path"]
+                == "reuleauxcoder.extensions.tools.registry"
+            )
+            assert tools["capability_package:review"]["source_type"] == "capability_package"
+            assert (
+                tools["capability_package:review"]["registration_path"]
+                == "agent.capability_refs[]"
+            )
+            assert tools["capability_package:review"]["related_components"] == [
+                "cli:gh",
+                "mcp:github",
+            ]
+            assert tools["cli:gh"]["related_package_ids"] == ["review"]
+            assert tools["mcp:github"]["related_package_ids"] == ["review"]
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_admin_write_rolls_back_when_reload_fails(
         self, tmp_path: Path
     ) -> None:

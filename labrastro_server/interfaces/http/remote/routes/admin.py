@@ -560,6 +560,13 @@ class RemoteAdminRoutes:
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
+            elif path == "/remote/admin/toolchains/behavior-catalog":
+                result = {
+                    "ok": True,
+                    **self.service.admin_manager.toolchain_behavior_catalog(),
+                }
+                self._send_json(HTTPStatus.OK, result)
+                return
             elif path == "/remote/admin/toolchains/record":
                 result = self._run_admin_config_mutation(
                     principal,
@@ -800,6 +807,7 @@ class RemoteAdminRoutes:
             "/remote/admin/models/list",
             "/remote/admin/toolchains/list",
             "/remote/admin/toolchains/dashboard",
+            "/remote/admin/toolchains/behavior-catalog",
         }
         if path in read_paths:
             return "admin:read"
