@@ -459,6 +459,15 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 				"semantic_idle_sec": float64(2),
 				"custom_args":       []any{"--color", "never"},
 				"timeout_sec":       "3",
+				"capability_overlay": map[string]any{
+					"env":         map[string]any{"EZ_CAPABILITY": "review"},
+					"skill_roots": []any{"C:/skills/code-review"},
+					"mcp": map[string]any{
+						"servers": map[string]any{
+							"github": map[string]any{"command": "github-mcp-server"},
+						},
+					},
+				},
 			},
 		},
 		map[string]any{
@@ -471,7 +480,11 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 					"env":                 map[string]any{"LABRASTRO_TEST": "1"},
 					"runtime_home_policy": "per_task",
 					"approval_mode":       "autonomous",
-					"mcp":                 map[string]any{"servers": []any{"github"}},
+					"mcp": map[string]any{
+						"servers": map[string]any{
+							"filesystem": map[string]any{"command": "filesystem-mcp"},
+						},
+					},
 				},
 			},
 			"agents": map[string]any{
@@ -493,6 +506,12 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 	if resolved.Options.Env["LABRASTRO_TEST"] != "1" {
 		t.Fatalf("env not resolved: %#v", resolved.Options.Env)
 	}
+	if resolved.Options.Env["EZ_CAPABILITY"] != "review" {
+		t.Fatalf("overlay env not resolved: %#v", resolved.Options.Env)
+	}
+	if !strings.Contains(resolved.Options.Env["EZCODE_SKILL_ROOTS"], "C:/skills/code-review") {
+		t.Fatalf("skill roots not resolved: %#v", resolved.Options.Env)
+	}
 	if resolved.Options.Command != "codex-beta" {
 		t.Fatalf("command = %q", resolved.Options.Command)
 	}
@@ -501,6 +520,9 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 	}
 	if !bytes.Contains(resolved.Options.MCPConfigJSON, []byte("github")) {
 		t.Fatalf("mcp config missing: %s", resolved.Options.MCPConfigJSON)
+	}
+	if !bytes.Contains(resolved.Options.MCPConfigJSON, []byte("filesystem")) {
+		t.Fatalf("base mcp config lost: %s", resolved.Options.MCPConfigJSON)
 	}
 	content, err := os.ReadFile(filepath.Join(resolved.Request.Workdir, "AGENTS.md"))
 	if err != nil {

@@ -3,6 +3,7 @@ package agentruntime
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -95,6 +96,21 @@ func ResolveRun(req RunRequest, runtimeSnapshot map[string]any, plan ExecEnvPlan
 	}
 
 	env := stringMapValue(profile["env"])
+	overlay := mapValue(req.Metadata["capability_overlay"])
+	if overlayEnv := stringMapValue(overlay["env"]); len(overlayEnv) > 0 {
+		if env == nil {
+			env = map[string]string{}
+		}
+		for key, value := range overlayEnv {
+			env[key] = value
+		}
+	}
+	if skillRoots := stringSliceValue(overlay["skill_roots"]); len(skillRoots) > 0 {
+		if env == nil {
+			env = map[string]string{}
+		}
+		env["EZCODE_SKILL_ROOTS"] = strings.Join(skillRoots, string(os.PathListSeparator))
+	}
 	opts := RunOptions{
 		Timeout:          durationValue(firstAny(req.Metadata["timeout_sec"], profile["timeout_sec"]), defaultRunTimeout),
 		Command:          stringValue(profile["command"]),
@@ -108,7 +124,11 @@ func ResolveRun(req RunRequest, runtimeSnapshot map[string]any, plan ExecEnvPlan
 	if opts.CustomArgs == nil {
 		opts.CustomArgs = stringSliceValue(firstAny(req.Metadata["customArgs"], profile["customArgs"]))
 	}
-	if mcpConfig := mapValue(profile["mcp"]); len(mcpConfig) > 0 {
+	mcpConfig := mapValue(profile["mcp"])
+	if overlayMCP := mapValue(overlay["mcp"]); len(overlayMCP) > 0 {
+		mcpConfig = mergeNestedMaps(mcpConfig, overlayMCP)
+	}
+	if len(mcpConfig) > 0 {
 		raw, err := json.Marshal(mcpConfig)
 		if err != nil {
 			return ResolvedRun{}, err
@@ -124,6 +144,28 @@ func ResolveRun(req RunRequest, runtimeSnapshot map[string]any, plan ExecEnvPlan
 		opts.RuntimeHome = plan.CodexHome
 	}
 	return ResolvedRun{Request: req, Options: opts, Plan: plan}, nil
+}
+
+func mergeNestedMaps(base, overlay map[string]any) map[string]any {
+	if len(base) == 0 && len(overlay) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(base)+len(overlay))
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range overlay {
+		if existing, ok := out[key]; ok {
+			existingMap := mapValue(existing)
+			overlayMap := mapValue(value)
+			if len(existingMap) > 0 && len(overlayMap) > 0 {
+				out[key] = mergeNestedMaps(existingMap, overlayMap)
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func PromptFilesFromMetadata(metadata map[string]any) map[string]string {
