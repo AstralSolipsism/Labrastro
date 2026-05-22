@@ -54,6 +54,10 @@ def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> No
             "name": "Code Reviewer",
             "description": "审查代码风险",
             "runtime_profile": "codex_remote",
+            "visibility": "user",
+            "chat_entrypoint": False,
+            "delegable": True,
+            "taskflow_eligible": True,
             "dispatch": {
                 "profile": "适合审查代码风险、阅读仓库并指出缺失测试。",
                 "examples": ["审查后端运行时变更", "检查 PR 的测试覆盖"],
@@ -69,6 +73,10 @@ def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> No
     )
 
     assert agent.id == "code_reviewer"
+    assert agent.visibility == "user"
+    assert agent.chat_entrypoint is False
+    assert agent.can_delegate is True
+    assert agent.can_run_taskflow is True
     assert agent.runtime_profile == "codex_remote"
     assert agent.dispatch.profile.startswith("适合审查代码风险")
     assert agent.dispatch.examples == ["审查后端运行时变更", "检查 PR 的测试覆盖"]
@@ -140,10 +148,23 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
             {
                 "kind": "cli",
                 "name": "gitnexus",
+                "access": "both",
+                "risk_level": "medium",
+                "execution_policy": "escalate",
                 "config": {
                     "command": "gitnexus",
                     "env": {"GITNEXUS_HOME": ".gitnexus"},
                 },
+            },
+        ),
+        "builtin_tool:fetch_capabilities": models.CapabilityComponentConfig.from_dict(
+            "builtin_tool:fetch_capabilities",
+            {
+                "kind": "builtin_tool",
+                "name": "fetch_capabilities",
+                "access": "read",
+                "execution_policy": "allow",
+                "registry_path": "builtin:fetch_capabilities",
             },
         ),
     }
@@ -162,27 +183,58 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
                 "permissions": ["repo.read", "runtime.dispatch"],
             },
         ),
+        "docs": models.CapabilityPackageConfig.from_dict(
+            "docs",
+            {
+                "components": ["builtin_tool:fetch_capabilities"],
+                "effective_capabilities": [
+                    "Fetch documentation evidence for capability package drafts."
+                ],
+                "credentials": ["DOCS_TOKEN"],
+                "risk_level": "low",
+            },
+        ),
     }
 
-    resolved = models.resolve_capability_refs(["repo", "runtime"], packages, components)
+    resolved = models.resolve_capability_refs(["repo", "runtime", "docs"], packages, components)
 
-    assert [package["id"] for package in resolved["packages"]] == ["repo", "runtime"]
+    assert [package["id"] for package in resolved["packages"]] == ["repo", "runtime", "docs"]
     assert resolved["mcp_servers"] == ["github"]
     assert resolved["skills"] == ["code-review"]
     assert resolved["cli_tools"] == ["gitnexus"]
+    assert resolved["tools"] == ["mcp:github", "cli:gitnexus", "builtin:fetch_capabilities"]
+    assert resolved["credentials"] == ["DOCS_TOKEN"]
     assert [component["id"] for component in resolved["components"]] == [
         "mcp:github",
         "skill:code-review",
         "cli:gitnexus",
+        "builtin_tool:fetch_capabilities",
     ]
     assert resolved["capability_overlay"]["component_ids"] == [
         "mcp:github",
         "skill:code-review",
         "cli:gitnexus",
+        "builtin_tool:fetch_capabilities",
     ]
     assert resolved["capability_overlay"]["skill_roots"] == ["/skills/code-review"]
     assert resolved["capability_overlay"]["env"] == {"GITNEXUS_HOME": ".gitnexus"}
     assert resolved["capability_overlay"]["mcp"]["servers"]["github"]["command"] == "github-mcp-server"
+    assert resolved["effective_capabilities"]["tools"] == resolved["tools"]
+    assert resolved["effective_capabilities"]["credentials"] == ["DOCS_TOKEN"]
+    assert resolved["effective_capabilities"]["summaries"] == [
+        "Fetch documentation evidence for capability package drafts."
+    ]
+    assert resolved["packages"][2]["effective_capabilities"] == [
+        "Fetch documentation evidence for capability package drafts."
+    ]
+    assert {
+        "target": "cli:gitnexus",
+        "target_type": "capability_component",
+        "kind": "cli",
+        "policy": "escalate",
+        "risk_level": "medium",
+        "access": "both",
+    } in resolved["effective_capabilities"]["execution_policies"]
     assert "permissions" not in resolved
     assert "permissions" not in resolved["packages"][0]
     assert "permissions" not in resolved["packages"][1]

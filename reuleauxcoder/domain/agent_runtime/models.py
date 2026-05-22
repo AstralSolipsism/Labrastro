@@ -139,6 +139,34 @@ def _dedupe_strings(values: list[str]) -> list[str]:
     return result
 
 
+CAPABILITY_COMPONENT_KINDS = {
+    "builtin_tool",
+    "cli",
+    "cli_tool",
+    "credential",
+    "env",
+    "mcp",
+    "mcp_server",
+    "mcp_tool",
+    "skill",
+}
+AGENT_VISIBILITIES = {"user", "system", "internal"}
+EXECUTION_POLICIES = {"allow", "deny", "require_user", "escalate", "inherit"}
+
+
+def _choice(value: Any, allowed: set[str], fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else fallback
+
+
+def _bool_value(value: Any, fallback: bool) -> bool:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
 def _reject_plaintext_secret_container(data: dict[str, Any], *, owner: str) -> None:
     secret_keys = {"secret", "secrets", "api_key", "api_keys", "token", "tokens"}
     for key in data:
@@ -195,12 +223,18 @@ class CapabilityComponentConfig:
     id: str
     kind: str
     name: str
+    description: str = ""
     enabled: bool = True
     package_ids: list[str] = field(default_factory=list)
     source: CapabilitySourceConfig = field(default_factory=CapabilitySourceConfig)
     config: dict[str, Any] = field(default_factory=dict)
     managed_by: str = "capability_package"
     status: str = "installed"
+    access: str = ""
+    risk_level: str = ""
+    execution_policy: str = "inherit"
+    registry_path: str = ""
+    source_path: str = ""
 
     @classmethod
     def from_dict(
@@ -211,8 +245,8 @@ class CapabilityComponentConfig:
         _reject_plaintext_secret_container(data, owner="capability component")
         raw_config = _dict_value(data.get("config", {}))
         _reject_plaintext_secret_container(raw_config, owner="capability component config")
-        raw_kind = str(data.get("kind", "") or "").strip().lower()
-        kind = raw_kind if raw_kind in {"cli", "mcp", "skill"} else ""
+        raw_kind = str(data.get("kind", data.get("type", "")) or "").strip().lower()
+        kind = raw_kind if raw_kind in CAPABILITY_COMPONENT_KINDS else ""
         name = str(data.get("name", "") or "").strip()
         if not kind or not name:
             parsed_kind, parsed_name = _split_component_id(component_id)
@@ -222,18 +256,29 @@ class CapabilityComponentConfig:
             id=str(component_id),
             kind=kind,
             name=name,
+            description=str(data.get("description", "") or ""),
             enabled=bool(data.get("enabled", True)),
             package_ids=_string_list(data.get("package_ids", [])),
             source=CapabilitySourceConfig.from_value(data.get("source", {})),
             config=raw_config,
             managed_by=str(data.get("managed_by", "capability_package") or "capability_package"),
             status=str(data.get("status", "installed") or "installed"),
+            access=_choice(data.get("access"), {"read", "write", "both"}, ""),
+            risk_level=str(data.get("risk") or data.get("risk_level") or "").strip().lower(),
+            execution_policy=_choice(
+                data.get("execution_policy"),
+                EXECUTION_POLICIES,
+                "inherit",
+            ),
+            registry_path=str(data.get("registry_path", "") or ""),
+            source_path=str(data.get("source_path", "") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "kind": self.kind,
             "name": self.name,
+            "description": self.description,
             "enabled": self.enabled,
             "package_ids": list(self.package_ids),
             "source": self.source.to_dict(),
@@ -241,6 +286,17 @@ class CapabilityComponentConfig:
             "managed_by": self.managed_by,
             "status": self.status,
         }
+        if self.access:
+            result["access"] = self.access
+        if self.risk_level:
+            result["risk_level"] = self.risk_level
+        if self.execution_policy and self.execution_policy != "inherit":
+            result["execution_policy"] = self.execution_policy
+        if self.registry_path:
+            result["registry_path"] = self.registry_path
+        if self.source_path:
+            result["source_path"] = self.source_path
+        return result
 
 
 @dataclass
@@ -254,6 +310,7 @@ class CapabilityPackageDraft:
     components: list[dict[str, Any]] = field(default_factory=list)
     install_plan: list[str] = field(default_factory=list)
     usage: list[str] = field(default_factory=list)
+    effective_capabilities: list[str] = field(default_factory=list)
     evidence: list[dict[str, str]] = field(default_factory=list)
     credentials: list[str] = field(default_factory=list)
     risk_level: str = ""
@@ -278,6 +335,7 @@ class CapabilityPackageDraft:
             components=components,
             install_plan=_string_list(data.get("install_plan", [])),
             usage=_string_list(data.get("usage", [])),
+            effective_capabilities=_string_list(data.get("effective_capabilities", [])),
             evidence=_string_dict_list(data.get("evidence", [])),
             credentials=_string_list(data.get("credentials", [])),
             risk_level=str(data.get("risk_level", "") or ""),
@@ -293,6 +351,7 @@ class CapabilityPackageDraft:
             "components": [dict(item) for item in self.components],
             "install_plan": list(self.install_plan),
             "usage": list(self.usage),
+            "effective_capabilities": list(self.effective_capabilities),
             "evidence": [dict(item) for item in self.evidence],
             "credentials": list(self.credentials),
             "risk_level": self.risk_level,
@@ -313,9 +372,11 @@ class CapabilityPackageConfig:
     status: str = "installed"
     install_plan: list[str] = field(default_factory=list)
     usage: list[str] = field(default_factory=list)
+    effective_capabilities: list[str] = field(default_factory=list)
     evidence: list[dict[str, str]] = field(default_factory=list)
     credentials: list[str] = field(default_factory=list)
     risk_level: str = ""
+    execution_policy: str = "inherit"
     generated_by: str = "capability_packager"
     notes: list[str] = field(default_factory=list)
 
@@ -337,9 +398,15 @@ class CapabilityPackageConfig:
             status=str(data.get("status", "installed") or "installed"),
             install_plan=_string_list(data.get("install_plan", [])),
             usage=_string_list(data.get("usage", [])),
+            effective_capabilities=_string_list(data.get("effective_capabilities", [])),
             evidence=_string_dict_list(data.get("evidence", [])),
             credentials=_string_list(data.get("credentials", [])),
             risk_level=str(data.get("risk_level", "") or ""),
+            execution_policy=_choice(
+                data.get("execution_policy"),
+                EXECUTION_POLICIES,
+                "inherit",
+            ),
             generated_by=str(data.get("generated_by", "capability_packager") or "capability_packager"),
             notes=_string_list(data.get("notes", [])),
         )
@@ -360,12 +427,16 @@ class CapabilityPackageConfig:
             result["install_plan"] = list(self.install_plan)
         if self.usage:
             result["usage"] = list(self.usage)
+        if self.effective_capabilities:
+            result["effective_capabilities"] = list(self.effective_capabilities)
         if self.evidence:
             result["evidence"] = [dict(item) for item in self.evidence]
         if self.credentials:
             result["credentials"] = list(self.credentials)
         if self.risk_level:
             result["risk_level"] = self.risk_level
+        if self.execution_policy and self.execution_policy != "inherit":
+            result["execution_policy"] = self.execution_policy
         if self.notes:
             result["notes"] = list(self.notes)
         return result
@@ -381,8 +452,13 @@ def resolve_capability_refs(
     resolved_packages: list[dict[str, Any]] = []
     resolved_components: list[dict[str, Any]] = []
     mcp_servers: list[str] = []
+    mcp_tools: list[str] = []
     skills: list[str] = []
     cli_tools: list[str] = []
+    tools: list[str] = []
+    credentials: list[str] = []
+    execution_policies: list[dict[str, Any]] = []
+    capability_summaries: list[str] = []
     overlay_mcp_servers: dict[str, Any] = {}
     overlay_env: dict[str, str] = {}
     overlay_skill_roots: list[str] = []
@@ -394,6 +470,17 @@ def resolve_capability_refs(
         package_dict = package.to_dict()
         package_dict["id"] = package.id
         resolved_packages.append(package_dict)
+        capability_summaries.extend(package.effective_capabilities)
+        credentials.extend(package.credentials)
+        if package.execution_policy and package.execution_policy != "inherit":
+            execution_policies.append(
+                {
+                    "target": package.id,
+                    "target_type": "capability_package",
+                    "policy": package.execution_policy,
+                    "risk_level": package.risk_level,
+                }
+            )
         for component_id in package.components:
             component = component_map.get(component_id)
             if component is None or not component.enabled:
@@ -401,24 +488,56 @@ def resolve_capability_refs(
             component_dict = component.to_dict()
             component_dict["id"] = component.id
             resolved_components.append(component_dict)
-            if component.kind == "mcp":
+            execution_policies.append(
+                _component_execution_policy(component, package=package)
+            )
+            if component.kind in {"mcp", "mcp_server"}:
                 mcp_servers.append(component.name)
+                tools.append(component.registry_path or f"mcp:{component.name}")
                 overlay_mcp_servers[component.name] = _mcp_overlay_config(component)
+            elif component.kind == "mcp_tool":
+                mcp_tools.append(component.name)
+                tools.append(component.registry_path or f"mcp_tool:{component.name}")
             elif component.kind == "skill":
                 skills.append(component.name)
                 path_hint = str(component.config.get("path_hint") or "").strip()
                 if path_hint:
                     overlay_skill_roots.append(path_hint)
-            elif component.kind == "cli":
+            elif component.kind in {"cli", "cli_tool"}:
                 cli_tools.append(component.name)
+                tools.append(component.registry_path or f"cli:{component.name}")
                 for key, value in _dict_value(component.config.get("env", {})).items():
                     overlay_env[str(key)] = str(value)
+            elif component.kind == "builtin_tool":
+                tools.append(component.registry_path or f"builtin:{component.name}")
+            elif component.kind == "env":
+                value = str(component.config.get("value") or "").strip()
+                if component.name and value:
+                    overlay_env[component.name] = value
+            elif component.kind == "credential":
+                credentials.append(component.name)
+    effective_capabilities = {
+        "tools": _dedupe_strings(tools),
+        "mcp_servers": _dedupe_strings(mcp_servers),
+        "mcp_tools": _dedupe_strings(mcp_tools),
+        "skills": _dedupe_strings(skills),
+        "cli_tools": _dedupe_strings(cli_tools),
+        "env": dict(overlay_env),
+        "credentials": _dedupe_strings(credentials),
+        "summaries": _dedupe_strings(capability_summaries),
+        "execution_policies": _dedupe_policy_records(execution_policies),
+    }
     return {
         "packages": resolved_packages,
         "components": _dedupe_components(resolved_components),
+        "tools": effective_capabilities["tools"],
         "mcp_servers": _dedupe_strings(mcp_servers),
+        "mcp_tools": effective_capabilities["mcp_tools"],
         "skills": _dedupe_strings(skills),
         "cli_tools": _dedupe_strings(cli_tools),
+        "credentials": effective_capabilities["credentials"],
+        "execution_policies": effective_capabilities["execution_policies"],
+        "effective_capabilities": effective_capabilities,
         "capability_overlay": {
             "component_ids": _dedupe_strings(
                 [str(item.get("id") or "") for item in resolved_components]
@@ -437,7 +556,7 @@ def resolve_capability_refs(
 
 def _split_component_id(component_id: str) -> tuple[str, str]:
     kind, sep, name = str(component_id).partition(":")
-    if sep and kind in {"cli", "mcp", "skill"}:
+    if sep and kind in CAPABILITY_COMPONENT_KINDS:
         return kind, name
     return "", str(component_id)
 
@@ -468,6 +587,46 @@ def _dedupe_components(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         seen.add(component_id)
         result.append(value)
+    return result
+
+
+def _component_execution_policy(
+    component: CapabilityComponentConfig,
+    *,
+    package: CapabilityPackageConfig,
+) -> dict[str, Any]:
+    policy = component.execution_policy or package.execution_policy or "inherit"
+    if policy == "inherit" and package.execution_policy != "inherit":
+        policy = package.execution_policy
+    return {
+        "target": component.id,
+        "target_type": "capability_component",
+        "kind": component.kind,
+        "policy": policy,
+        "risk_level": component.risk_level or package.risk_level,
+        "access": component.access,
+    }
+
+
+def _dedupe_policy_records(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        target = str(value.get("target") or "").strip()
+        target_type = str(value.get("target_type") or "").strip()
+        if not target:
+            continue
+        key = f"{target_type}:{target}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(
+            {
+                key: val
+                for key, val in value.items()
+                if val not in ("", None, [], {})
+            }
+        )
     return result
 
 
@@ -669,6 +828,11 @@ class AgentConfig:
     description: str = ""
     role: str = ""
     entrypoint: bool = False
+    visibility: str = "user"
+    chat_entrypoint: bool = False
+    delegable: bool = True
+    taskflow_eligible: bool = True
+    system_flow_only: list[str] = field(default_factory=list)
     runtime_profile: str = ""
     dispatch: AgentDispatchConfig = field(default_factory=AgentDispatchConfig)
     capability_refs: list[str] = field(default_factory=list)
@@ -696,12 +860,24 @@ class AgentConfig:
             )
         raw_max = data.get("max_concurrent_tasks")
         max_concurrent_tasks = int(raw_max) if raw_max is not None else None
+        visibility = _choice(data.get("visibility"), AGENT_VISIBILITIES, "user")
+        user_visible = visibility == "user"
+        entrypoint = bool(data.get("entrypoint", False))
+        chat_entrypoint = _bool_value(
+            data.get("chat_entrypoint", data.get("entrypoint")),
+            entrypoint,
+        )
         return cls(
             id=str(agent_id),
             name=str(data.get("name", "") or ""),
             description=str(data.get("description", "") or ""),
             role=str(data.get("role", "") or ""),
-            entrypoint=bool(data.get("entrypoint", False)),
+            entrypoint=entrypoint,
+            visibility=visibility,
+            chat_entrypoint=chat_entrypoint,
+            delegable=_bool_value(data.get("delegable"), user_visible),
+            taskflow_eligible=_bool_value(data.get("taskflow_eligible"), user_visible),
+            system_flow_only=_string_list(data.get("system_flow_only", [])),
             runtime_profile=str(data.get("runtime_profile", "") or ""),
             dispatch=AgentDispatchConfig.from_dict(data.get("dispatch")),
             capability_refs=_string_list(data.get("capability_refs", [])),
@@ -719,8 +895,18 @@ class AgentConfig:
             result["description"] = self.description
         if self.role:
             result["role"] = self.role
+        if self.visibility != "user":
+            result["visibility"] = self.visibility
         if self.entrypoint:
             result["entrypoint"] = self.entrypoint
+        if self.chat_entrypoint:
+            result["chat_entrypoint"] = self.chat_entrypoint
+        if self.delegable != (self.visibility == "user"):
+            result["delegable"] = self.delegable
+        if self.taskflow_eligible != (self.visibility == "user"):
+            result["taskflow_eligible"] = self.taskflow_eligible
+        if self.system_flow_only:
+            result["system_flow_only"] = list(self.system_flow_only)
         if self.runtime_profile:
             result["runtime_profile"] = self.runtime_profile
         dispatch = self.dispatch.to_dict()
@@ -739,6 +925,21 @@ class AgentConfig:
         if self.credential_refs:
             result["credential_refs"] = dict(self.credential_refs)
         return result
+
+    @property
+    def user_visible(self) -> bool:
+        return self.visibility == "user"
+
+    @property
+    def can_delegate(self) -> bool:
+        return self.user_visible and self.delegable
+
+    @property
+    def can_run_taskflow(self) -> bool:
+        return self.user_visible and self.taskflow_eligible
+
+    def allows_system_flow(self, flow: str) -> bool:
+        return str(flow).strip() in set(self.system_flow_only)
 
 
 @dataclass

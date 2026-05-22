@@ -18,6 +18,11 @@ from reuleauxcoder.domain.config.models import (
     EnvironmentConfig,
     EnvironmentSkillConfig,
     GitHubConfig,
+    DEFAULT_BUILTIN_TOOL_COMPONENTS,
+    DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
+    DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+    DEFAULT_MAIN_CHAT_AGENT,
+    DEFAULT_MAIN_CHAT_AGENT_ID,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
     MemoryConfig,
@@ -33,6 +38,7 @@ from reuleauxcoder.domain.config.models import (
     RuntimeProfilesConfig,
     SandboxProviderConfig,
     SkillsConfig,
+    ensure_default_capability_components,
     ensure_default_capability_packages,
     ensure_default_environment_agent_registry,
 )
@@ -608,8 +614,13 @@ class ConfigLoader:
             )
 
         capability_components: dict[str, CapabilityComponentConfig] = {}
-        if isinstance(capability_components_config, dict):
-            for component_id, component_data in capability_components_config.items():
+        raw_capability_components = ensure_default_capability_components(
+            capability_components_config
+            if isinstance(capability_components_config, dict)
+            else {}
+        )
+        if isinstance(raw_capability_components, dict):
+            for component_id, component_data in raw_capability_components.items():
                 if not isinstance(component_data, dict):
                     continue
                 capability_components[str(component_id)] = (
@@ -827,9 +838,15 @@ class ConfigLoader:
             },
             "agent_registry": {
                 "agents": {
+                    DEFAULT_MAIN_CHAT_AGENT_ID: DEFAULT_MAIN_CHAT_AGENT,
                     "environment_configurator": {
                         "name": "Environment Configurator",
                         "description": "Checks and configures the local workspace environment from the server manifest.",
+                        "role": "environment",
+                        "visibility": "system",
+                        "delegable": False,
+                        "taskflow_eligible": False,
+                        "system_flow_only": ["environment_config"],
                         "runtime_profile": "environment_local",
                         "dispatch": {
                             "profile": "Best for checking and configuring local workspace environment components from the server manifest.",
@@ -844,6 +861,11 @@ class ConfigLoader:
                     "capability_packager": {
                         "name": "Capability Packager",
                         "description": "Generates capability package drafts from repositories, docs, and project notes.",
+                        "role": "capability_packager",
+                        "visibility": "internal",
+                        "delegable": False,
+                        "taskflow_eligible": False,
+                        "system_flow_only": ["capability_ingest"],
                         "runtime_profile": "capability_packager_local",
                         "dispatch": {
                             "profile": "Best for reading repository and documentation bundles and producing capability package drafts.",
@@ -858,6 +880,7 @@ class ConfigLoader:
                 },
             },
             "capability_packages": {
+                DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID: DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
                 "environment": {
                     "name": "Environment Tools",
                     "description": "Read and configure the local workspace environment manifest.",
@@ -865,7 +888,7 @@ class ConfigLoader:
                     "components": [],
                 }
             },
-            "capability_components": {},
+            "capability_components": DEFAULT_BUILTIN_TOOL_COMPONENTS,
             "sandbox_provider": {
                 "type": "docker",
                 "host_base_url": "http://labrastro-host:8765",

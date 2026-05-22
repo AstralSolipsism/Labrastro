@@ -24,6 +24,8 @@ ProviderCompat = Literal["generic", "deepseek", "kimi", "glm", "qwen", "zenmux"]
 SUPPORTED_PROVIDER_COMPATS = {"generic", "deepseek", "kimi", "glm", "qwen", "zenmux"}
 
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID = "environment_local"
+DEFAULT_MAIN_CHAT_AGENT_ID = "main_chat"
+DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID = "core_builtin_tools"
 DEFAULT_ENVIRONMENT_AGENT_ID = "environment_configurator"
 DEFAULT_CAPABILITY_PACKAGER_AGENT_ID = "capability_packager"
 DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID = "capability_packager_local"
@@ -39,9 +41,36 @@ DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE: dict[str, Any] = {
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
 }
+DEFAULT_MAIN_CHAT_AGENT: dict[str, Any] = {
+    "name": "Main Chat Agent",
+    "description": "Direct ChatView entrypoint agent for user conversation, slash commands, mentions, and confirmations.",
+    "role": "main_chat",
+    "visibility": "user",
+    "chat_entrypoint": True,
+    "delegable": False,
+    "taskflow_eligible": False,
+    "dispatch": {
+        "profile": "Directly handles the user-facing ChatView conversation and delegates work to configured worker Agents when needed.",
+        "examples": [
+            "Answer the user in the ChatView",
+            "Use registered chat commands and reference-only mentions",
+            "Delegate bounded background work to a worker Agent",
+        ],
+        "avoid": [
+            "Being selected as a delegated worker Agent",
+            "Running as an unattended taskflow worker",
+        ],
+    },
+    "capability_refs": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+}
 DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
     "name": "Environment Configurator",
     "description": "Checks and configures the local workspace environment from the server manifest.",
+    "role": "environment",
+    "visibility": "system",
+    "delegable": False,
+    "taskflow_eligible": False,
+    "system_flow_only": ["environment_config"],
     "runtime_profile": DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
     "dispatch": {
         "profile": (
@@ -61,6 +90,11 @@ DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
 DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
     "name": "Capability Packager",
     "description": "Reads repositories and documentation to generate reviewable capability package drafts.",
+    "role": "capability_packager",
+    "visibility": "internal",
+    "delegable": False,
+    "taskflow_eligible": False,
+    "system_flow_only": ["capability_ingest"],
     "runtime_profile": DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID,
     "dispatch": {
         "profile": (
@@ -77,11 +111,130 @@ DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
     },
     "capability_refs": ["environment"],
 }
+DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
+    "builtin_tool:delegate_agent": {
+        "kind": "builtin_tool",
+        "name": "delegate_agent",
+        "description": "Delegate bounded background work to a configured worker Agent.",
+        "access": "write",
+        "risk_level": "medium",
+        "execution_policy": "inherit",
+        "registry_path": "builtin:delegate_agent",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:edit_file": {
+        "kind": "builtin_tool",
+        "name": "edit_file",
+        "description": "Edit files in the active workspace.",
+        "access": "write",
+        "risk_level": "medium",
+        "execution_policy": "inherit",
+        "registry_path": "builtin:edit_file",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:fetch_capabilities": {
+        "kind": "builtin_tool",
+        "name": "fetch_capabilities",
+        "description": "Read-only source fetcher for capability package evidence.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:fetch_capabilities",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:glob": {
+        "kind": "builtin_tool",
+        "name": "glob",
+        "description": "Find files by glob pattern.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:glob",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:grep": {
+        "kind": "builtin_tool",
+        "name": "grep",
+        "description": "Search workspace text by pattern.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:grep",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:list_file": {
+        "kind": "builtin_tool",
+        "name": "list_file",
+        "description": "List files and directories.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:list_file",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:lsp": {
+        "kind": "builtin_tool",
+        "name": "lsp",
+        "description": "Query language server information.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:lsp",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:read_file": {
+        "kind": "builtin_tool",
+        "name": "read_file",
+        "description": "Read workspace file contents.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:read_file",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:shell": {
+        "kind": "builtin_tool",
+        "name": "shell",
+        "description": "Run shell commands in the active workspace.",
+        "access": "both",
+        "risk_level": "high",
+        "execution_policy": "inherit",
+        "registry_path": "builtin:shell",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:write_file": {
+        "kind": "builtin_tool",
+        "name": "write_file",
+        "description": "Write files in the active workspace.",
+        "access": "write",
+        "risk_level": "medium",
+        "execution_policy": "inherit",
+        "registry_path": "builtin:write_file",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+}
 DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE: dict[str, Any] = {
     "name": "Environment Tools",
     "description": "Read and configure the local workspace environment manifest.",
     "source": {"type": "builtin"},
     "components": [],
+}
+DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE: dict[str, Any] = {
+    "name": "Core Built-in Tools",
+    "description": "Built-in tools available to the main ChatView Agent through explicit capability_refs authorization.",
+    "source": {"type": "builtin"},
+    "components": sorted(DEFAULT_BUILTIN_TOOL_COMPONENTS),
+    "usage": [
+        "Mounted by the main_chat Agent so ChatView tools are authorized through capability_refs.",
+        "Runtime filters builtin tools against the resolved effective_capabilities result.",
+    ],
+    "effective_capabilities": [
+        "Allows the main ChatView Agent to use registered built-in tools through capability_refs.",
+        "Keeps tool availability explicit so runtime enforcement can filter unregistered tools.",
+    ],
+    "risk_level": "high",
+    "execution_policy": "inherit",
+    "generated_by": "system",
 }
 
 
@@ -117,6 +270,18 @@ def ensure_default_environment_agent_registry(
     raw_agents = registry.get("agents")
     agents = raw_agents if isinstance(raw_agents, dict) else {}
     registry["agents"] = agents
+    main_agent = agents.get(DEFAULT_MAIN_CHAT_AGENT_ID)
+    if not isinstance(main_agent, dict):
+        agents[DEFAULT_MAIN_CHAT_AGENT_ID] = deepcopy(DEFAULT_MAIN_CHAT_AGENT)
+        main_agent = agents[DEFAULT_MAIN_CHAT_AGENT_ID]
+    else:
+        for key, value in DEFAULT_MAIN_CHAT_AGENT.items():
+            if key not in main_agent:
+                main_agent[key] = deepcopy(value)
+        if not isinstance(main_agent.get("dispatch"), dict):
+            main_agent["dispatch"] = deepcopy(DEFAULT_MAIN_CHAT_AGENT["dispatch"])
+    if not isinstance(main_agent.get("capability_refs"), list):
+        main_agent["capability_refs"] = list(DEFAULT_MAIN_CHAT_AGENT["capability_refs"])
     agent = agents.get(DEFAULT_ENVIRONMENT_AGENT_ID)
     if not isinstance(agent, dict):
         agents[DEFAULT_ENVIRONMENT_AGENT_ID] = deepcopy(DEFAULT_ENVIRONMENT_AGENT)
@@ -162,7 +327,31 @@ def ensure_default_capability_packages(
     else:
         for key, value in DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE.items():
             package.setdefault(key, deepcopy(value))
+    core_package = packages.get(DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID)
+    if not isinstance(core_package, dict):
+        packages[DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID] = deepcopy(
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE
+        )
+    else:
+        for key, value in DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE.items():
+            core_package.setdefault(key, deepcopy(value))
     return packages
+
+
+def ensure_default_capability_components(
+    data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return capability component data with built-in tool components present."""
+
+    components = deepcopy(data) if isinstance(data, dict) else {}
+    for component_id, defaults in DEFAULT_BUILTIN_TOOL_COMPONENTS.items():
+        component = components.get(component_id)
+        if not isinstance(component, dict):
+            components[component_id] = deepcopy(defaults)
+            continue
+        for key, value in defaults.items():
+            component.setdefault(key, deepcopy(value))
+    return components
 
 
 def normalize_provider_compat(value: Any) -> ProviderCompat:
@@ -960,11 +1149,27 @@ def build_agent_run_snapshot(
     """Return the server-authoritative AgentRun snapshot for executors."""
 
     packages = dict(capability_packages or {})
-    components = dict(capability_components or {})
+    components = {
+        component_id: CapabilityComponentConfig.from_dict(component_id, component_data)
+        for component_id, component_data in ensure_default_capability_components(
+            {
+                component_id: component.to_dict()
+                for component_id, component in (capability_components or {}).items()
+            }
+        ).items()
+        if isinstance(component_data, dict)
+    }
     if "environment" not in packages:
         packages["environment"] = CapabilityPackageConfig.from_dict(
             "environment",
             DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+        )
+    if DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID not in packages:
+        packages[DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID] = (
+            CapabilityPackageConfig.from_dict(
+                DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+                DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
+            )
         )
     agents: dict[str, dict[str, Any]] = {}
     for agent_id, agent in agent_registry.agents.items():
@@ -974,6 +1179,9 @@ def build_agent_run_snapshot(
             packages,
             components,
         )
+        agent_dict["effective_capabilities"] = agent_dict[
+            "resolved_capabilities"
+        ].get("effective_capabilities", {})
         agents[agent_id] = agent_dict
     return {
         "max_running_agents": run_limits.max_running_agents,
@@ -1667,7 +1875,22 @@ class Config:
                 "environment",
                 DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
             )
+        if DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID not in capability_packages:
+            capability_packages[DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID] = (
+                CapabilityPackageConfig.from_dict(
+                    DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+                    DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
+                )
+            )
+        built_in_component_ids = set(DEFAULT_BUILTIN_TOOL_COMPONENTS)
+        chat_entrypoint_agent_ids: list[str] = []
         for agent_id, agent in self.agent_registry.agents.items():
+            if agent.chat_entrypoint:
+                chat_entrypoint_agent_ids.append(agent_id)
+                if agent.visibility != "user":
+                    errors.append(
+                        f"agent_registry.agents[{agent_id}].chat_entrypoint requires visibility=user"
+                    )
             if (
                 agent.runtime_profile
                 and agent.runtime_profile not in self.runtime_profiles.profiles
@@ -1688,9 +1911,17 @@ class Config:
                     errors.append(
                         f"agent_registry.agents[{agent_id}].capability_refs references missing capability package {package_ref}"
                     )
+        if len(chat_entrypoint_agent_ids) > 1:
+            errors.append(
+                "agent_registry.agents chat_entrypoint must be unique; found "
+                + ", ".join(sorted(chat_entrypoint_agent_ids))
+            )
         for package_id, package in capability_packages.items():
             for component_id in package.components:
-                if component_id not in self.capability_components:
+                if (
+                    component_id not in self.capability_components
+                    and component_id not in built_in_component_ids
+                ):
                     errors.append(
                         f"capability_packages[{package_id}].components references missing capability_components entry {component_id}"
                     )

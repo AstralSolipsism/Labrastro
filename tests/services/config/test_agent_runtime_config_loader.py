@@ -113,6 +113,12 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     assert "permissions" not in config.capability_packages["github-review"].to_dict()
     assert config.capability_packages["github-review"].components == ["mcp:github"]
     assert config.capability_components["mcp:github"].name == "github"
+    assert "main_chat" in config.agent_registry.agents
+    assert config.agent_registry.agents["main_chat"].chat_entrypoint is True
+    assert config.agent_registry.agents["main_chat"].can_delegate is False
+    assert "core_builtin_tools" in config.capability_packages
+    assert config.capability_packages["core_builtin_tools"].effective_capabilities
+    assert "builtin_tool:fetch_capabilities" in config.capability_components
     assert "environment_local" in config.runtime_profiles.profiles
     assert "environment_configurator" in config.agent_registry.agents
     assert "capability_packager_local" in config.runtime_profiles.profiles
@@ -140,12 +146,29 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     assert profile.execution_location.value == "local_workspace"
     assert profile.runtime_home_policy == "per_task"
     assert profile.approval_mode == "full"
+    main_agent = config.agent_registry.agents["main_chat"]
+    assert main_agent.visibility == "user"
+    assert main_agent.chat_entrypoint is True
+    assert main_agent.can_delegate is False
+    assert main_agent.can_run_taskflow is False
+    assert main_agent.capability_refs == ["core_builtin_tools"]
+    assert "read_file" in {
+        component.name for component in config.capability_components.values()
+    }
     agent = config.agent_registry.agents["environment_configurator"]
     assert agent.runtime_profile == "environment_local"
+    assert agent.visibility == "system"
+    assert agent.can_delegate is False
+    assert agent.can_run_taskflow is False
+    assert agent.allows_system_flow("environment_config") is True
     assert "environment manifest" in agent.dispatch.profile
     assert agent.capability_refs == ["environment"]
     packager = config.agent_registry.agents["capability_packager"]
     assert packager.runtime_profile == "capability_packager_local"
+    assert packager.visibility == "internal"
+    assert packager.can_delegate is False
+    assert packager.can_run_taskflow is False
+    assert packager.allows_system_flow("capability_ingest") is True
     assert "structured draft" in packager.dispatch.profile
     assert "environment" in config.capability_packages
     assert "permissions" not in config.capability_packages["environment"].to_dict()
@@ -331,6 +354,41 @@ def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> 
     assert (
         "agent_registry.agents[reviewer].runtime_profile must exist in runtime_profiles"
         in errors
+    )
+
+
+def test_config_validate_rejects_ambiguous_or_internal_chat_entrypoints() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            **_model_config(),
+            "agent_registry": {
+                "agents": {
+                    "reviewer": {
+                        "chat_entrypoint": True,
+                        "dispatch": {"profile": "Review repository changes"},
+                    },
+                    "internal_entrypoint": {
+                        "visibility": "internal",
+                        "chat_entrypoint": True,
+                        "dispatch": {"profile": "Internal only"},
+                    },
+                }
+            },
+        }
+    )
+
+    errors = config.validate()
+
+    assert (
+        "agent_registry.agents[internal_entrypoint].chat_entrypoint requires visibility=user"
+        in errors
+    )
+    assert any(
+        error.startswith("agent_registry.agents chat_entrypoint must be unique")
+        and "main_chat" in error
+        and "reviewer" in error
+        and "internal_entrypoint" in error
+        for error in errors
     )
 
 
@@ -551,6 +609,7 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
         "capability_packager_local",
     }
     assert set(manager.data["agent_registry"]["agents"]) == {
+        "main_chat",
         "smoke",
         "environment_configurator",
         "capability_packager",
@@ -593,6 +652,7 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
                     "url": "https://github.com/example/review-tools",
                 },
                 "components": [component],
+                "effective_capabilities": ["Inspect pull request metadata with gh."],
                 "install_plan": ["Install gh."],
                 "usage": ["Use gh pr view."],
             }
@@ -600,6 +660,9 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
     )
     assert first.ok is True
     assert manager.data["capability_packages"]["review"]["components"] == ["cli:gh"]
+    assert manager.data["capability_packages"]["review"]["effective_capabilities"] == [
+        "Inspect pull request metadata with gh."
+    ]
     assert manager.data["capability_components"]["cli:gh"]["package_ids"] == ["review"]
     assert manager.data["environment"]["cli_tools"]["gh"]["component_id"] == "cli:gh"
 
