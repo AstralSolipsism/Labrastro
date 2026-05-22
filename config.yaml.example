@@ -226,19 +226,50 @@ approval:
 #       max_concurrent_tasks: 2
 
 # Dispatch profiles describe what an Agent is good at. Capability packages are
-# reusable CLI, MCP, and Skill component bundles selected by `capability_refs`.
+# installed results generated from GitHub/docs/project notes and selected by
+# `capability_refs`. Shared components are stored once and can be referenced by
+# multiple packages.
 # capability_packages:
 #   environment:
 #     name: "Environment Tools"
 #     description: "Read and configure the local workspace environment manifest."
-#     source: "builtin"
+#     source:
+#       type: "builtin"
+#     components: []
 #   github-review:
 #     name: "GitHub Review"
 #     description: "Review repository changes and comment on GitHub issues."
-#     mcp_servers: ["github"]
-#     skills: ["code-review"]
-#     cli_tools: ["gitnexus"]
-#     source: "local"
+#     source:
+#       type: "github_repo"
+#       url: "https://github.com/example/review-tools"
+#     components: ["mcp:github", "skill:code-review", "cli:gh"]
+#     install_plan:
+#       - "Install GitHub CLI and authenticate with gh auth login."
+#     usage:
+#       - "Use gh for PR inspection and GitHub MCP for issue/PR operations."
+# capability_components:
+#   cli:gh:
+#     kind: "cli"
+#     name: "gh"
+#     package_ids: ["github-review"]
+#     source:
+#       type: "github_repo"
+#       url: "https://github.com/cli/cli"
+#     config:
+#       command: "gh"
+#       check: "gh --version"
+#   mcp:github:
+#     kind: "mcp"
+#     name: "github"
+#     package_ids: ["github-review"]
+#     config:
+#       command: "github-mcp-server"
+#   skill:code-review:
+#     kind: "skill"
+#     name: "code-review"
+#     package_ids: ["github-review"]
+#     config:
+#       path_hint: "~/.agents/skills/code-review"
 #
 # Optional execution-room provider for on-demand AgentRun worker sessions.
 # sandbox_provider:

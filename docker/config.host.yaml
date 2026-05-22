@@ -62,7 +62,11 @@ capability_packages:
   environment:
     name: Environment Tools
     description: Read and configure the local workspace environment manifest.
-    source: builtin
+    source:
+      type: builtin
+    components: []
+
+capability_components: {}
 
 persistence:
   backend: auto
