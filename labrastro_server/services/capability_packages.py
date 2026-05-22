@@ -14,6 +14,7 @@ from labrastro_server.services.agent_runtime.control_plane import (
 )
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRecord,
+    CAPABILITY_COMPONENT_KINDS,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
     CapabilityPackageDraft,
@@ -53,6 +54,10 @@ _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
     "evidence",
     "credentials",
     "risk_level",
+    "access",
+    "execution_policy",
+    "registry_path",
+    "source_path",
     "install_prompt",
     "verify_prompt",
     "notes",
@@ -399,6 +404,7 @@ class CapabilityPackageInstaller:
             status="installed",
             install_plan=draft.install_plan,
             usage=draft.usage,
+            effective_capabilities=draft.effective_capabilities,
             evidence=draft.evidence,
             credentials=draft.credentials,
             risk_level=draft.risk_level,
@@ -418,9 +424,12 @@ class CapabilityPackageInstaller:
         item: dict[str, Any],
         package_source: dict[str, Any],
     ) -> CapabilityComponentConfig:
-        kind = str(item.get("kind", "") or "").strip().lower()
-        if kind not in {"cli", "mcp", "skill"}:
-            raise ValueError("component.kind must be cli, mcp, or skill")
+        kind = str(item.get("kind", item.get("type", "")) or "").strip().lower()
+        if kind not in CAPABILITY_COMPONENT_KINDS:
+            raise ValueError(
+                "component.kind must be one of "
+                + ", ".join(sorted(CAPABILITY_COMPONENT_KINDS))
+            )
         name = str(item.get("name", "") or "").strip()
         if not name:
             raise ValueError("component.name is required")
@@ -430,6 +439,12 @@ class CapabilityPackageInstaller:
         for field in _CAPABILITY_COMPONENT_CONFIG_FIELDS:
             if field in item and field not in config:
                 config[field] = item[field]
+        access = str(item.get("access") or "").strip().lower()
+        if access not in {"read", "write", "both"}:
+            access = ""
+        execution_policy = str(item.get("execution_policy") or "inherit").strip().lower()
+        if execution_policy not in {"allow", "deny", "require_user", "escalate", "inherit"}:
+            execution_policy = "inherit"
         return CapabilityComponentConfig(
             id=component_id,
             kind=kind,
@@ -443,6 +458,11 @@ class CapabilityPackageInstaller:
             config=config,
             managed_by="capability_package",
             status=str(item.get("status", "installed") or "installed"),
+            access=access,
+            risk_level=str(item.get("risk") or item.get("risk_level") or "").strip().lower(),
+            execution_policy=execution_policy,
+            registry_path=str(item.get("registry_path") or "").strip(),
+            source_path=str(item.get("source_path") or "").strip(),
         )
 
     def materialize_component(
@@ -450,6 +470,8 @@ class CapabilityPackageInstaller:
         data: dict[str, Any],
         component: CapabilityComponentConfig,
     ) -> None:
+        if component.kind not in {"cli", "cli_tool", "mcp", "skill"}:
+            return
         items = _toolchain_items(data, component.kind)
         payload = dict(component.config)
         payload["enabled"] = component.enabled
@@ -632,10 +654,14 @@ def _render_packager_prompt(*, bundle: dict[str, Any]) -> str:
         "{\n"
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
         '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
-        '  "components": [{"id": "cli:gh", "kind": "cli|mcp|skill", '
-        '"name": "gh", "config": {}}],\n'
+        '  "components": [{"id": "cli:gh", '
+        '"kind": "builtin_tool|cli_tool|credential|env|mcp_server|mcp_tool|skill", '
+        '"name": "gh", "access": "read|write|both", '
+        '"execution_policy": "allow|deny|require_user|escalate|inherit", '
+        '"config": {}}],\n'
+        '  "effective_capabilities": ["Plain language capability added to an Agent"],\n'
         '  "install_plan": [], "usage": [], "evidence": [], "credentials": [], '
-        '"risk_level": "low|medium|high", "notes": []\n'
+        '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
         "}\n\n"
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
@@ -698,17 +724,34 @@ def _document_from_fetch_payload(payload: dict[str, Any]) -> dict[str, Any] | No
 
 def _component_validation_messages(component: dict[str, Any]) -> list[str]:
     messages: list[str] = []
-    kind = str(component.get("kind") or "").strip().lower()
-    if kind not in {"cli", "mcp", "skill"}:
-        messages.append("component.kind must be cli, mcp, or skill")
+    kind = str(component.get("kind") or component.get("type") or "").strip().lower()
+    if kind not in CAPABILITY_COMPONENT_KINDS:
+        messages.append(
+            "component.kind must be one of "
+            + ", ".join(sorted(CAPABILITY_COMPONENT_KINDS))
+        )
     name = str(component.get("name") or "").strip()
     if not name:
         messages.append("component.name is required")
+    access = str(component.get("access") or "").strip().lower()
+    if access and access not in {"read", "write", "both"}:
+        messages.append("component.access must be read, write, or both")
+    execution_policy = str(component.get("execution_policy") or "").strip().lower()
+    if execution_policy and execution_policy not in {
+        "allow",
+        "deny",
+        "require_user",
+        "escalate",
+        "inherit",
+    }:
+        messages.append(
+            "component.execution_policy must be allow, deny, require_user, escalate, or inherit"
+        )
     component_id = str(component.get("id") or "").strip()
     if component_id:
         parsed_kind, sep, parsed_name = component_id.partition(":")
-        if sep and parsed_kind in {"cli", "mcp", "skill"}:
-            if kind in {"cli", "mcp", "skill"} and parsed_kind != kind:
+        if sep and parsed_kind in CAPABILITY_COMPONENT_KINDS:
+            if kind in CAPABILITY_COMPONENT_KINDS and parsed_kind != kind:
                 messages.append("component.id kind must match component.kind")
             if name and parsed_name and parsed_name != name:
                 messages.append("component.id name must match component.name")
@@ -760,6 +803,8 @@ def _evidence_search_text(
 
 
 def _toolchain_items(data: dict[str, Any], kind: str) -> dict[str, Any]:
+    if kind == "cli_tool":
+        kind = "cli"
     if kind in {"cli", "skill"}:
         environment = data.setdefault("environment", {})
         if not isinstance(environment, dict):
@@ -784,6 +829,8 @@ def _toolchain_items(data: dict[str, Any], kind: str) -> dict[str, Any]:
 
 
 def _normalize_toolchain_item(kind: str, name: str, item: dict[str, Any]) -> dict[str, Any]:
+    if kind == "cli_tool":
+        kind = "cli"
     if kind == "cli":
         return EnvironmentCLIToolConfig.from_dict(name, item).to_dict()
     if kind == "skill":

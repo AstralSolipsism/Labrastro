@@ -212,7 +212,7 @@ def test_draft_validator_requires_valid_components_and_evidence() -> None:
     )
 
     assert result.ok is False
-    assert "component.kind must be cli, mcp, or skill" in result.messages
+    assert any(message.startswith("component.kind must be one of ") for message in result.messages)
     assert "draft.evidence is required" in result.messages
     assert "risk_level is required" in result.messages
 
