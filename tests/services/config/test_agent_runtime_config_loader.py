@@ -3,7 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 import os
 
+from labrastro_server.services.admin import service as admin_service
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
+from labrastro_server.services.capability_packages import CapabilityPackageInstallResult
+from reuleauxcoder.domain.agent_runtime.models import CapabilityPackageConfig
 from reuleauxcoder.domain.config.models import build_agent_run_snapshot
 from reuleauxcoder.interfaces.entrypoint.runner import build_capability_catalog
 from reuleauxcoder.services.config.loader import ConfigLoader
@@ -628,6 +631,81 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
     assert deleted_pr.ok is True
     assert "cli:gh" not in manager.data["capability_components"]
     assert "gh" not in manager.data["environment"]["cli_tools"]
+
+
+def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data = {
+                **_model_config(),
+                "capability_packages": {},
+                "capability_components": {},
+            }
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+        def _commit_config(self, data: dict, previous_data: dict):
+            del previous_data
+            self.data = deepcopy(data)
+            return None
+
+    class FakeInstaller:
+        def __init__(self) -> None:
+            self.calls: list[tuple[dict, dict, str]] = []
+
+        def install_draft(
+            self,
+            data: dict,
+            raw_draft: dict,
+            *,
+            package_id: str = "",
+        ) -> CapabilityPackageInstallResult:
+            self.calls.append((data, raw_draft, package_id))
+            data["capability_components"] = {
+                "cli:gh": {
+                    "kind": "cli",
+                    "name": "gh",
+                    "enabled": True,
+                    "package_ids": ["review"],
+                    "source": {"type": "project_notes"},
+                    "config": {"command": "gh"},
+                    "managed_by": "capability_package",
+                    "status": "installed",
+                }
+            }
+            data["capability_packages"] = {
+                "review": {
+                    "enabled": True,
+                    "status": "installed",
+                    "source": {"type": "project_notes"},
+                    "components": ["cli:gh"],
+                    "generated_by": "capability_packager",
+                    "name": "Review",
+                }
+            }
+            package = CapabilityPackageConfig.from_dict(
+                "review",
+                data["capability_packages"]["review"],
+            )
+            return CapabilityPackageInstallResult(
+                package_id="review",
+                package=package,
+                component_ids=["cli:gh"],
+            )
+
+    installer = FakeInstaller()
+    monkeypatch.setattr(admin_service, "CapabilityPackageInstaller", lambda: installer)
+
+    result = MemoryAdminManager().accept_capability_package_draft(
+        {"draft": {"id": "review", "components": [{"kind": "cli", "name": "gh"}]}}
+    )
+
+    assert result.ok is True
+    assert installer.calls
+    assert installer.calls[0][2] == "review"
+    assert result.payload["package_id"] == "review"
 
 
 def test_admin_server_settings_update_rejects_missing_agent_profile() -> None:
