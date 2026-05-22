@@ -30,6 +30,7 @@ class SkillsService:
         scan_project: bool = True,
         scan_user: bool = True,
         disabled_names: list[str] | None = None,
+        extra_paths: list[Path] | None = None,
         config_store: SkillsConfigStore | None = None,
     ):
         self.workspace_dir = workspace_dir
@@ -37,6 +38,7 @@ class SkillsService:
         self.enabled = enabled
         self.scan_project = scan_project
         self.scan_user = scan_user
+        self.extra_paths = list(extra_paths or [])
         self._disabled_names: set[str] = set(disabled_names or [])
         self._config_store = config_store or SkillsConfigStore()
 
@@ -68,6 +70,7 @@ class SkillsService:
             scan_project=self.scan_project,
             scan_user=self.scan_user,
             disabled_names=self._disabled_names,
+            extra_paths=self.extra_paths,
         )
         current = {skill.name: skill for skill in discovered}
         current_names = set(current)
@@ -169,6 +172,7 @@ class SkillsService:
             "config_enabled": self.enabled,
             "scan_project": self.scan_project,
             "scan_user": self.scan_user,
+            "extra_paths": [str(path) for path in self.extra_paths],
             "catalog_loaded": bool(self._catalog),
         }
 
@@ -178,6 +182,8 @@ class SkillsService:
         lines.append(
             f"Config: enabled=`{self.enabled}` project_scan=`{self.scan_project}` user_scan=`{self.scan_user}`"
         )
+        if self.extra_paths:
+            lines.append("Package paths: " + ", ".join(f"`{path}`" for path in self.extra_paths))
         lines.append("")
 
         last = self._last_reload

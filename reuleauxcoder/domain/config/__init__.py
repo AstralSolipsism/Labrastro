@@ -2,6 +2,7 @@
 
 from reuleauxcoder.domain.config.models import (
     Config,
+    CapabilityComponentConfig,
     CapabilityPackageConfig,
     GitHubConfig,
     MCPArtifactConfig,
@@ -20,6 +21,7 @@ from reuleauxcoder.domain.config.models import (
 
 __all__ = [
     "Config",
+    "CapabilityComponentConfig",
     "CapabilityPackageConfig",
     "GitHubConfig",
     "MCPArtifactConfig",

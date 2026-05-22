@@ -18,6 +18,7 @@ from reuleauxcoder.domain.config.models import (
     EnvironmentConfig,
     EnvironmentSkillConfig,
     GitHubConfig,
+    CapabilityComponentConfig,
     CapabilityPackageConfig,
     MemoryConfig,
     MCPServerConfig,
@@ -89,6 +90,7 @@ class ConfigLoader:
         "approval",
         "auth",
         "capability_packages",
+        "capability_components",
         "cli",
         "context",
         "diagnostics",
@@ -493,6 +495,7 @@ class ConfigLoader:
         runtime_profiles_config = data.get("runtime_profiles", {})
         run_limits_config = data.get("run_limits", {})
         capability_packages_config = data.get("capability_packages", {})
+        capability_components_config = data.get("capability_components", {})
         persistence_config = data.get("persistence", {})
         diagnostics_config = data.get("diagnostics", {})
         sandbox_provider_config = data.get("sandbox_provider", {})
@@ -604,6 +607,17 @@ class ConfigLoader:
                 str(package_id), package_data
             )
 
+        capability_components: dict[str, CapabilityComponentConfig] = {}
+        if isinstance(capability_components_config, dict):
+            for component_id, component_data in capability_components_config.items():
+                if not isinstance(component_data, dict):
+                    continue
+                capability_components[str(component_id)] = (
+                    CapabilityComponentConfig.from_dict(
+                        str(component_id), component_data
+                    )
+                )
+
         agent_registry_data, runtime_profiles_data = ensure_default_environment_agent_registry(
             agent_registry_config if isinstance(agent_registry_config, dict) else {},
             runtime_profiles_config if isinstance(runtime_profiles_config, dict) else {},
@@ -713,6 +727,7 @@ class ConfigLoader:
             runtime_profiles=runtime_profiles,
             run_limits=run_limits,
             capability_packages=capability_packages,
+            capability_components=capability_components,
             persistence=PersistenceConfig.from_dict(
                 persistence_config if isinstance(persistence_config, dict) else {}
             ),
@@ -802,6 +817,12 @@ class ConfigLoader:
                     "execution_location": "local_workspace",
                     "runtime_home_policy": "per_task",
                     "approval_mode": "full",
+                },
+                "capability_packager_local": {
+                    "executor": "reuleauxcoder",
+                    "execution_location": "local_workspace",
+                    "runtime_home_policy": "per_task",
+                    "approval_mode": "full",
                 }
             },
             "agent_registry": {
@@ -819,6 +840,20 @@ class ConfigLoader:
                             "avoid": ["General implementation and code review tasks."],
                         },
                         "capability_refs": ["environment"],
+                    },
+                    "capability_packager": {
+                        "name": "Capability Packager",
+                        "description": "Generates capability package drafts from repositories, docs, and project notes.",
+                        "runtime_profile": "capability_packager_local",
+                        "dispatch": {
+                            "profile": "Best for reading repository and documentation bundles and producing capability package drafts.",
+                            "examples": [
+                                "Analyze a GitHub repository README and docs to infer CLI, MCP, and Skill installation details.",
+                                "Extract credentials, risks, install steps, and usage instructions for a capability package.",
+                            ],
+                            "avoid": ["Executing install commands."],
+                        },
+                        "capability_refs": ["environment"],
                     }
                 },
             },
@@ -826,8 +861,11 @@ class ConfigLoader:
                 "environment": {
                     "name": "Environment Tools",
                     "description": "Read and configure the local workspace environment manifest.",
+                    "source": {"type": "builtin"},
+                    "components": [],
                 }
             },
+            "capability_components": {},
             "sandbox_provider": {
                 "type": "docker",
                 "host_base_url": "http://labrastro-host:8765",

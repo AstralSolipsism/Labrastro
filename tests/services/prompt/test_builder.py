@@ -44,6 +44,18 @@ def test_system_prompt_contains_only_static_and_semi_static_blocks() -> None:
     assert "- Working directory: " not in prompt
 
 
+def test_system_prompt_includes_capability_catalog_before_user_instructions() -> None:
+    prompt = system_prompt(
+        [_Tool("read_file", "Read file")],
+        user_system_append="Always answer in Chinese.",
+        capability_catalog="- `review`: Review\n  - `cli:gh` [cli] gh",
+    )
+
+    assert "# Capability Packages" in prompt
+    assert "`cli:gh`" in prompt
+    assert prompt.index("# Capability Packages") < prompt.index("# User Instructions")
+
+
 def test_system_prompt_includes_clickable_markdown_link_guidance() -> None:
     prompt = system_prompt([_Tool("read_file", "Read file")])
 

@@ -1275,6 +1275,11 @@ class PostgresAgentRunStore:
             metadata.setdefault("prompt_metadata", rendered.metadata)
             if rendered.metadata.get("system_prompt"):
                 metadata.setdefault("system_prompt", rendered.metadata["system_prompt"])
+        raw_agent = _dict_from(_dict_from(self.runtime_snapshot.get("agents")).get(task.agent_id))
+        resolved = _dict_from(raw_agent.get("resolved_capabilities"))
+        overlay = _dict_from(resolved.get("capability_overlay"))
+        if overlay:
+            metadata.setdefault("capability_overlay", overlay)
         return metadata
 
     def _render_prompt_for_task(self, task: AgentRunRecord, executor: ExecutorType) -> Any:

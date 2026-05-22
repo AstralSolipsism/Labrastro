@@ -56,6 +56,46 @@ from reuleauxcoder.services.config.loader import ConfigValidationError
 from reuleauxcoder.services.llm.client import LLM
 
 
+def build_capability_catalog(config: Config) -> str:
+    lines: list[str] = []
+    components = config.capability_components
+    for package_id, package in sorted(config.capability_packages.items()):
+        if not package.enabled or package_id == "environment":
+            continue
+        title = package.name or package_id
+        description = f" - {package.description}" if package.description else ""
+        lines.append(f"- `{package_id}`: {title}{description}")
+        for component_id in package.components:
+            component = components.get(component_id)
+            if component is None or not component.enabled:
+                continue
+            details = _capability_component_details(component.config)
+            suffix = f" ({details})" if details else ""
+            lines.append(
+                f"  - `{component.id}` [{component.kind}] {component.name}{suffix}"
+            )
+        if package.usage:
+            lines.append("  - usage: " + " | ".join(package.usage[:3]))
+    return "\n".join(lines)
+
+
+def _capability_component_details(config: dict[str, Any]) -> str:
+    parts: list[str] = []
+    command = str(config.get("command") or "").strip()
+    path_hint = str(config.get("path_hint") or "").strip()
+    check = str(config.get("check") or "").strip()
+    env = config.get("env")
+    if command:
+        parts.append(f"command `{command}`")
+    if path_hint:
+        parts.append(f"path `{path_hint}`")
+    if check:
+        parts.append(f"check `{check}`")
+    if isinstance(env, dict) and env:
+        parts.append("env " + ", ".join(sorted(str(key) for key in env)))
+    return "; ".join(parts)
+
+
 class AppRunner:
     """Application runner that handles initialization and cleanup."""
 
@@ -153,6 +193,7 @@ class AppRunner:
         tools = self.dependencies.load_tools(tool_backend)
         agent = self.dependencies.create_agent(llm, tools, config)
         setattr(agent, "runtime_config", config)
+        setattr(agent, "capability_catalog", build_capability_catalog(config))
         setattr(agent, "current_session_id", None)
         setattr(agent, "session_fingerprint", get_session_fingerprint(config, agent))
         bind_memory_scope_to_agent(
@@ -173,6 +214,10 @@ class AppRunner:
 
     def _bind_remote_chat_handler(self, agent: Agent) -> None:
         bind_remote_chat_handler(self, agent)
+
+    @staticmethod
+    def build_capability_catalog(config: Config) -> str:
+        return build_capability_catalog(config)
 
     def _register_hooks(self, agent: Agent, config: Config) -> None:
         """Register hooks discovered via decorator mechanism."""
@@ -257,6 +302,11 @@ class AppRunner:
             scan_project=config.skills.scan_project,
             scan_user=config.skills.scan_user,
             disabled_names=list(config.skills.disabled),
+            extra_paths=[
+                Path(str(skill.path_hint)).expanduser()
+                for skill in config.environment.skills.values()
+                if getattr(skill, "enabled", True) and str(skill.path_hint or "").strip()
+            ],
         )
         reload_result = skills_service.reload()
         setattr(agent, "skills_service", skills_service)

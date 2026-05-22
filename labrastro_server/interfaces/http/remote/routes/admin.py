@@ -50,6 +50,10 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorRunResult,
 )
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
+from labrastro_server.services.capability_packages import (
+    CapabilityPackageIngestError,
+    CapabilityPackageIngestService,
+)
 from labrastro_server.services.environment_run import (
     EnvironmentRunError,
     EnvironmentRunService,
@@ -379,6 +383,75 @@ class RemoteAdminRoutes:
                 )
                 self._send_json(result.status, result.payload)
                 return
+            if path == "/remote/admin/capability-packages/ingest/start":
+                if self.service.runtime_control_plane is None:
+                    self._send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "agent_runs_unavailable",
+                    )
+                    return
+                try:
+                    result = CapabilityPackageIngestService(
+                        self.service.runtime_control_plane
+                    ).start(payload)
+                except CapabilityPackageIngestError as exc:
+                    self._send_error(exc.status, exc.error, exc.message)
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
+                            result.agent_run.id
+                        ),
+                        "source": result.source,
+                        "source_bundle": result.source_bundle,
+                    },
+                )
+                return
+            if path == "/remote/admin/capability-packages/ingest/status":
+                if self.service.runtime_control_plane is None:
+                    self._send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "agent_runs_unavailable",
+                    )
+                    return
+                try:
+                    result = CapabilityPackageIngestService(
+                        self.service.runtime_control_plane
+                    ).status(str(payload.get("agent_run_id") or ""))
+                except CapabilityPackageIngestError as exc:
+                    self._send_error(exc.status, exc.error, exc.message)
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/remote/admin/capability-packages/drafts/accept":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.accept_capability_package_draft(payload),
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/delete":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.delete_capability_package(payload),
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/enable":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.enable_capability_package(payload),
+                )
+                self._send_json(result.status, result.payload)
+                return
             if path == "/remote/admin/diagnostics/tool-diagnostics/stats":
                 self._send_json(
                     HTTPStatus.OK,
@@ -588,6 +661,9 @@ class RemoteAdminRoutes:
             "/remote/admin/providers/enable",
             "/remote/admin/models/record",
             "/remote/admin/models/activate",
+            "/remote/admin/capability-packages/drafts/accept",
+            "/remote/admin/capability-packages/delete",
+            "/remote/admin/capability-packages/enable",
             "/remote/admin/toolchains/record",
             "/remote/admin/toolchains/delete",
             "/remote/admin/toolchains/enable",
@@ -625,9 +701,12 @@ class RemoteAdminRoutes:
             if isinstance(payload.get("github"), dict):
                 targets.append("github")
             return operation, ",".join(sorted(set(targets))) or "server_settings"
-        for key in ("provider_id", "profile_id", "name", "id", "target_id"):
+        for key in ("provider_id", "profile_id", "package_id", "name", "id", "target_id"):
             if payload.get(key) is not None:
                 return operation, str(payload.get(key) or "")
+        draft = payload.get("draft")
+        if isinstance(draft, dict) and draft.get("id") is not None:
+            return operation, str(draft.get("id") or "")
         toolchain = payload.get("toolchain")
         if isinstance(toolchain, dict) and toolchain.get("name") is not None:
             return operation, str(toolchain.get("name") or "")

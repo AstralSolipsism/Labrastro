@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from reuleauxcoder.app.runtime.agent_runtime import get_interactive_run_limiter
+from reuleauxcoder.domain.agent_runtime.models import CapabilityPackageDraft
 from reuleauxcoder.domain.config.models import (
     AgentRegistryConfig,
     ApprovalConfig,
     ApprovalRuleConfig,
+    CapabilityComponentConfig,
     CapabilityPackageConfig,
     ContextConfig,
     DiagnosticsConfig,
@@ -412,6 +414,7 @@ class RemoteAdminConfigManager:
     def read_server_settings(self) -> dict[str, Any]:
         data = self._load_data()
         raw_capability_packages = data.get("capability_packages", {})
+        raw_capability_components = data.get("capability_components", {})
         agent_registry, runtime_profiles, run_limits = self._agent_settings_from_data(data)
         capability_packages = {
             str(package_id): CapabilityPackageConfig.from_dict(
@@ -423,6 +426,17 @@ class RemoteAdminConfigManager:
                 else {}
             ).items()
             if isinstance(package_data, dict)
+        }
+        capability_components = {
+            str(component_id): CapabilityComponentConfig.from_dict(
+                str(component_id), component_data
+            ).to_dict()
+            for component_id, component_data in (
+                raw_capability_components.items()
+                if isinstance(raw_capability_components, dict)
+                else []
+            )
+            if isinstance(component_data, dict)
         }
         raw_github = data.get("github", {})
         github = GitHubConfig.from_dict(raw_github if isinstance(raw_github, dict) else {})
@@ -441,6 +455,7 @@ class RemoteAdminConfigManager:
                 "runtime_profiles": runtime_profiles.to_dict(),
                 "run_limits": run_limits.to_dict(),
                 "capability_packages": capability_packages,
+                "capability_components": capability_components,
                 "tool_output": self._tool_output_settings(data),
                 "context": self._context_settings(data),
                 "memory": self._memory_settings(data),
@@ -473,6 +488,7 @@ class RemoteAdminConfigManager:
         raw_runtime_profiles = payload.get("runtime_profiles")
         raw_run_limits = payload.get("run_limits")
         raw_capability_packages = payload.get("capability_packages")
+        raw_capability_components = payload.get("capability_components")
         raw_tool_output = payload.get("tool_output")
         raw_context = payload.get("context")
         raw_memory = payload.get("memory")
@@ -493,6 +509,8 @@ class RemoteAdminConfigManager:
             raw_run_limits = raw_settings.get("run_limits")
         if isinstance(raw_settings, dict) and raw_capability_packages is None:
             raw_capability_packages = raw_settings.get("capability_packages")
+        if isinstance(raw_settings, dict) and raw_capability_components is None:
+            raw_capability_components = raw_settings.get("capability_components")
         if isinstance(raw_settings, dict) and raw_tool_output is None:
             raw_tool_output = raw_settings.get("tool_output")
         if isinstance(raw_settings, dict) and raw_context is None:
@@ -522,6 +540,7 @@ class RemoteAdminConfigManager:
             and not isinstance(raw_runtime_profiles, dict)
             and not isinstance(raw_run_limits, dict)
             and not isinstance(raw_capability_packages, dict)
+            and not isinstance(raw_capability_components, dict)
             and not isinstance(raw_tool_output, dict)
             and not isinstance(raw_context, dict)
             and not isinstance(raw_memory, dict)
@@ -544,6 +563,30 @@ class RemoteAdminConfigManager:
                 if isinstance(previous_data.get("capability_packages"), dict)
                 else {}
             )
+            previous_components = (
+                previous_data.get("capability_components", {})
+                if isinstance(previous_data.get("capability_components"), dict)
+                else {}
+            )
+            raw_components_for_parse = (
+                raw_capability_components
+                if isinstance(raw_capability_components, dict)
+                else previous_components
+            )
+            try:
+                capability_components = {
+                    str(component_id): CapabilityComponentConfig.from_dict(
+                        str(component_id), component_data
+                    )
+                    for component_id, component_data in raw_components_for_parse.items()
+                    if isinstance(component_data, dict)
+                }
+            except Exception as exc:
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_capability_components", "message": str(exc)},
+                    400,
+                )
             raw_packages_for_parse = (
                 raw_capability_packages
                 if isinstance(raw_capability_packages, dict)
@@ -569,6 +612,11 @@ class RemoteAdminConfigManager:
                 data["capability_packages"] = {
                     package_id: package.to_dict()
                     for package_id, package in capability_packages.items()
+                }
+            if isinstance(raw_capability_components, dict):
+                data["capability_components"] = {
+                    component_id: component.to_dict()
+                    for component_id, component in capability_components.items()
                 }
             if isinstance(raw_tool_output, dict):
                 previous_tool_output = (
@@ -1256,6 +1304,278 @@ class RemoteAdminConfigManager:
                 400,
             )
         return None
+
+    def accept_capability_package_draft(self, payload: dict[str, Any]) -> AdminConfigResult:
+        raw_draft = payload.get("draft")
+        if not isinstance(raw_draft, dict):
+            raw_draft = payload
+        package_id = str(
+            raw_draft.get("id") or payload.get("package_id") or payload.get("id") or ""
+        ).strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        try:
+            draft = CapabilityPackageDraft.from_dict(package_id, raw_draft)
+            component_specs = [
+                self._component_from_draft(package_id, item, draft.source.to_dict())
+                for item in draft.components
+            ]
+        except Exception as exc:
+            return AdminConfigResult(
+                False,
+                {"error": "invalid_capability_package_draft", "message": str(exc)},
+                400,
+            )
+        if not component_specs:
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "capability_package_components_required",
+                    "message": "capability package draft must contain at least one component",
+                },
+                400,
+            )
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            components = data.setdefault("capability_components", {})
+            if not isinstance(components, dict):
+                components = {}
+                data["capability_components"] = components
+            packages = ensure_default_capability_packages(
+                data.get("capability_packages", {})
+                if isinstance(data.get("capability_packages"), dict)
+                else {}
+            )
+            component_ids: list[str] = []
+            for component in component_specs:
+                existing_raw = components.get(component.id)
+                if isinstance(existing_raw, dict):
+                    existing = CapabilityComponentConfig.from_dict(
+                        component.id,
+                        existing_raw,
+                    )
+                    if (
+                        existing.kind != component.kind
+                        or existing.name != component.name
+                        or _stable_json(existing.config) != _stable_json(component.config)
+                    ):
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "capability_component_conflict",
+                                "component_id": component.id,
+                                "message": "shared component id already exists with different definition",
+                            },
+                            409,
+                        )
+                    package_ids = _unique_strings([*existing.package_ids, package_id])
+                    existing.package_ids = package_ids
+                    component = existing
+                else:
+                    component.package_ids = _unique_strings([*component.package_ids, package_id])
+                components[component.id] = component.to_dict()
+                component_ids.append(component.id)
+                self._materialize_capability_component(data, component)
+
+            package = CapabilityPackageConfig(
+                id=package_id,
+                name=draft.name or package_id,
+                description=draft.description,
+                source=draft.source,
+                components=_unique_strings(component_ids),
+                enabled=True,
+                status="installed",
+                install_plan=draft.install_plan,
+                usage=draft.usage,
+                evidence=draft.evidence,
+                credentials=draft.credentials,
+                risk_level=draft.risk_level,
+                notes=draft.notes,
+            )
+            packages[package_id] = package.to_dict()
+            data["capability_packages"] = packages
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "capability_package": package.to_dict(),
+                    "components": [
+                        self._capability_component_view(data, component_id)
+                        for component_id in component_ids
+                    ],
+                    **self.read_server_settings(),
+                },
+            )
+
+    def delete_capability_package(self, payload: dict[str, Any]) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        if package_id == "environment":
+            return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            packages = data.get("capability_packages", {})
+            if not isinstance(packages, dict) or package_id not in packages:
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            package = CapabilityPackageConfig.from_dict(
+                package_id,
+                packages.get(package_id) if isinstance(packages.get(package_id), dict) else {},
+            )
+            del packages[package_id]
+            components = data.get("capability_components", {})
+            if not isinstance(components, dict):
+                components = {}
+                data["capability_components"] = components
+            removed_components: list[str] = []
+            for component_id in package.components:
+                raw_component = components.get(component_id)
+                if not isinstance(raw_component, dict):
+                    continue
+                component = CapabilityComponentConfig.from_dict(component_id, raw_component)
+                component.package_ids = [
+                    item for item in component.package_ids if item != package_id
+                ]
+                if component.package_ids:
+                    components[component_id] = component.to_dict()
+                    self._materialize_capability_component(data, component)
+                    continue
+                del components[component_id]
+                removed_components.append(component_id)
+                self._remove_materialized_capability_component(data, component)
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "deleted": True,
+                    "removed_components": removed_components,
+                    **self.read_server_settings(),
+                },
+            )
+
+    def enable_capability_package(self, payload: dict[str, Any]) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        enabled = _bool_field(payload, "enabled", True)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            packages = ensure_default_capability_packages(
+                data.get("capability_packages", {})
+                if isinstance(data.get("capability_packages"), dict)
+                else {}
+            )
+            raw_package = packages.get(package_id)
+            if not isinstance(raw_package, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            package = CapabilityPackageConfig.from_dict(package_id, raw_package)
+            package.enabled = enabled
+            packages[package_id] = package.to_dict()
+            data["capability_packages"] = packages
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "enabled": enabled,
+                    "capability_package": package.to_dict(),
+                    **self.read_server_settings(),
+                },
+            )
+
+    def _component_from_draft(
+        self,
+        package_id: str,
+        item: dict[str, Any],
+        package_source: dict[str, Any],
+    ) -> CapabilityComponentConfig:
+        kind = str(item.get("kind", "") or "").strip().lower()
+        if kind not in {"cli", "mcp", "skill"}:
+            raise ValueError("component.kind must be cli, mcp, or skill")
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            raise ValueError("component.name is required")
+        component_id = str(item.get("id") or f"{kind}:{name}").strip()
+        raw_config = item.get("config")
+        config = dict(raw_config) if isinstance(raw_config, dict) else {}
+        for field in _CAPABILITY_COMPONENT_CONFIG_FIELDS:
+            if field in item and field not in config:
+                config[field] = item[field]
+        return CapabilityComponentConfig(
+            id=component_id,
+            kind=kind,
+            name=name,
+            enabled=_bool_field(item, "enabled", True),
+            package_ids=[package_id],
+            source=CapabilityPackageConfig.from_dict(
+                package_id,
+                {"source": item.get("source", package_source)},
+            ).source,
+            config=config,
+            managed_by="capability_package",
+            status=str(item.get("status", "installed") or "installed"),
+        )
+
+    def _materialize_capability_component(
+        self,
+        data: dict[str, Any],
+        component: CapabilityComponentConfig,
+    ) -> None:
+        items = self._toolchain_items(data, component.kind)
+        payload = dict(component.config)
+        payload["enabled"] = component.enabled
+        payload["component_id"] = component.id
+        payload["package_ids"] = list(component.package_ids)
+        payload["managed_by"] = "capability_package"
+        payload.setdefault("source", component.source.url or component.source.type)
+        if component.source.url:
+            payload.setdefault("repo_url", component.source.url)
+        payload.setdefault("last_action", "capability_package_accept")
+        normalized = self._normalize_toolchain_item(component.kind, component.name, payload)
+        items[component.name] = normalized
+
+    def _remove_materialized_capability_component(
+        self,
+        data: dict[str, Any],
+        component: CapabilityComponentConfig,
+    ) -> None:
+        items = self._toolchain_items(data, component.kind)
+        current = items.get(component.name)
+        if not isinstance(current, dict):
+            return
+        if str(current.get("component_id") or "") != component.id:
+            return
+        if str(current.get("managed_by") or "") != "capability_package":
+            return
+        del items[component.name]
+
+    def _capability_component_view(
+        self,
+        data: dict[str, Any],
+        component_id: str,
+    ) -> dict[str, Any]:
+        components = data.get("capability_components", {})
+        raw = components.get(component_id) if isinstance(components, dict) else None
+        if not isinstance(raw, dict):
+            return {"id": component_id}
+        view = CapabilityComponentConfig.from_dict(component_id, raw).to_dict()
+        view["id"] = component_id
+        return view
 
     def list_toolchains(self) -> dict[str, Any]:
         data = self._load_data()
@@ -2113,6 +2433,13 @@ class RemoteAdminConfigManager:
             "enabled": _bool_field(view, "enabled", True),
             "last_action": str(view.get("last_action") or ""),
             "last_updated": str(view.get("last_updated") or ""),
+            "component_id": str(view.get("component_id") or ""),
+            "package_ids": (
+                [str(item) for item in view.get("package_ids") or []]
+                if isinstance(view.get("package_ids"), list)
+                else []
+            ),
+            "managed_by": str(view.get("managed_by") or ""),
         }
 
     def _provider_view(self, provider_id: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -2198,6 +2525,48 @@ def _toolchain_payload(payload: dict[str, Any]) -> tuple[str | None, dict[str, A
     raw_payload = payload.get("payload")
     item_payload = dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
     return kind, item_payload
+
+
+_CAPABILITY_COMPONENT_CONFIG_FIELDS = {
+    "command",
+    "args",
+    "env",
+    "cwd",
+    "placement",
+    "distribution",
+    "requirements",
+    "scope",
+    "check",
+    "install",
+    "version",
+    "source",
+    "description",
+    "path_hint",
+    "repo_url",
+    "docs",
+    "evidence",
+    "credentials",
+    "risk_level",
+    "install_prompt",
+    "verify_prompt",
+    "notes",
+}
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _normalize_provider_models(value: Any) -> list[dict[str, Any]]:

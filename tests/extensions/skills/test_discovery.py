@@ -38,6 +38,24 @@ def test_discover_skills_discovers_project_and_user_skills(tmp_path: Path) -> No
     assert missing == ()
 
 
+def test_discover_skills_includes_capability_package_paths(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    home_dir = tmp_path / "home"
+    package_skill = tmp_path / "package-skill"
+    _write_skill(package_skill, "review", "review")
+
+    skills, diagnostics, missing = discover_skills(
+        workspace_dir=workspace_dir,
+        home_dir=home_dir,
+        extra_paths=[package_skill / "review"],
+    )
+
+    assert [skill.name for skill in skills] == ["review"]
+    assert skills[0].scope == "package"
+    assert diagnostics == ()
+    assert missing == ()
+
+
 def test_discover_skills_project_overrides_user_for_same_skill_name(
     tmp_path: Path,
 ) -> None:

@@ -220,11 +220,30 @@ CONFIG_SCHEMA = {
         "package_id": {
             "name": "string (optional)",
             "description": "string (optional)",
-            "mcp_servers": ["server-name", "..."],
-            "skills": ["skill-name", "..."],
-            "cli_tools": ["tool-name", "..."],
-            "source": "string (optional, e.g. builtin/local/market)",
-            "market": "dict (optional, package-market metadata)",
+            "source": {
+                "type": "string (github_repo/docs_url/project_notes/builtin)",
+                "url": "string (optional)",
+                "notes": "string (optional)",
+            },
+            "components": ["cli:gh", "mcp:github", "skill:code-review"],
+            "enabled": "bool (default true)",
+            "install_plan": "list of strings (optional)",
+            "usage": "list of strings (optional)",
+            "evidence": "list of dicts with url/title/excerpt (optional)",
+            "credentials": "list of credential names required by package (optional)",
+            "risk_level": "string (optional)",
+        }
+    },
+    "capability_components": {
+        "component_id": {
+            "kind": "string (cli/mcp/skill)",
+            "name": "string",
+            "enabled": "bool (default true)",
+            "package_ids": ["package-id", "..."],
+            "source": "same shape as capability_packages.source",
+            "config": "dict (component-specific command/path/MCP config)",
+            "managed_by": "string (capability_package/manual)",
+            "status": "string (optional)",
         }
     },
     "persistence": {

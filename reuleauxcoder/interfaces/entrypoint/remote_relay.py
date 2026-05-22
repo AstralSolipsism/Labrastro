@@ -17,6 +17,7 @@ from reuleauxcoder.app.runtime.session_state import (
     apply_session_runtime_state,
     apply_session_model_override,
     build_session_runtime_state,
+    get_session_fingerprint,
     restore_config_runtime_defaults,
 )
 from reuleauxcoder.app.runtime.agent_runtime import (
@@ -422,6 +423,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         return runtime_config["value"]
 
     def _reload_config() -> None:
+        nonlocal skills_service
         next_config = runner.dependencies.load_config(runner.options.config_path)
         setattr(next_config, "_source_path", runner.options.config_path)
         if runner.options.server_mode:
@@ -443,8 +445,16 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     runtime_profiles=next_config.runtime_profiles,
                     run_limits=next_config.run_limits,
                     capability_packages=next_config.capability_packages,
+                    capability_components=next_config.capability_components,
                 ),
             )
+        setattr(agent, "runtime_config", next_config)
+        setattr(
+            agent,
+            "capability_catalog",
+            runner.build_capability_catalog(next_config),
+        )
+        setattr(agent, "session_fingerprint", get_session_fingerprint(next_config, agent))
         runner._relay_http_service.mcp_servers = list(next_config.mcp_servers)
         runner._relay_http_service.mcp_artifact_root = Path(
             next_config.mcp_artifact_root
@@ -455,6 +465,18 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         runner._relay_http_service.environment_skills = dict(
             next_config.environment.skills
         )
+        if ui_bus is not None:
+            old_mcp_manager = getattr(agent, "mcp_manager", None)
+            if old_mcp_manager is not None:
+                try:
+                    old_mcp_manager.stop()
+                except Exception:
+                    pass
+            agent.tools = [
+                tool for tool in agent.tools if getattr(tool, "tool_source", "") != "mcp"
+            ]
+            skills_service = runner._init_skills(next_config, agent, ui_bus)
+            runner._attach_mcp_if_configured(next_config, agent, ui_bus)
         if ui_bus is not None:
             ui_bus.info("Remote admin config reloaded.", kind=UIEventKind.REMOTE)
 

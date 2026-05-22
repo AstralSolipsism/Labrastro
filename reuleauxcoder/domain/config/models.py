@@ -8,6 +8,7 @@ from typing import Any, Literal, Optional
 
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentConfig,
+    CapabilityComponentConfig,
     CapabilityPackageConfig,
     RuntimeProfileConfig,
     resolve_capability_refs,
@@ -24,7 +25,15 @@ SUPPORTED_PROVIDER_COMPATS = {"generic", "deepseek", "kimi", "glm", "qwen", "zen
 
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID = "environment_local"
 DEFAULT_ENVIRONMENT_AGENT_ID = "environment_configurator"
+DEFAULT_CAPABILITY_PACKAGER_AGENT_ID = "capability_packager"
+DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID = "capability_packager_local"
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE: dict[str, Any] = {
+    "executor": "reuleauxcoder",
+    "execution_location": "local_workspace",
+    "runtime_home_policy": "per_task",
+    "approval_mode": "full",
+}
+DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE: dict[str, Any] = {
     "executor": "reuleauxcoder",
     "execution_location": "local_workspace",
     "runtime_home_policy": "per_task",
@@ -49,10 +58,30 @@ DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
     },
     "capability_refs": ["environment"],
 }
+DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
+    "name": "Capability Packager",
+    "description": "Reads repositories and documentation to generate reviewable capability package drafts.",
+    "runtime_profile": DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID,
+    "dispatch": {
+        "profile": (
+            "Best for analyzing README, docs, and project notes to extract MCP, "
+            "Skill, and CLI installation and usage instructions into a structured draft."
+        ),
+        "examples": [
+            "Generate a capability package draft from a GitHub repository README",
+            "Extract MCP server launch and install instructions from official docs",
+        ],
+        "avoid": [
+            "Installing tools or mutating the workspace during discovery",
+        ],
+    },
+    "capability_refs": ["environment"],
+}
 DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE: dict[str, Any] = {
     "name": "Environment Tools",
     "description": "Read and configure the local workspace environment manifest.",
-    "source": "builtin",
+    "source": {"type": "builtin"},
+    "components": [],
 }
 
 
@@ -76,6 +105,14 @@ def ensure_default_environment_agent_registry(
     else:
         for key, value in DEFAULT_ENVIRONMENT_RUNTIME_PROFILE.items():
             profile.setdefault(key, deepcopy(value))
+    packager_profile = profiles.get(DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID)
+    if not isinstance(packager_profile, dict):
+        profiles[DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID] = deepcopy(
+            DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE
+        )
+    else:
+        for key, value in DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE.items():
+            packager_profile.setdefault(key, deepcopy(value))
 
     raw_agents = registry.get("agents")
     agents = raw_agents if isinstance(raw_agents, dict) else {}
@@ -83,14 +120,33 @@ def ensure_default_environment_agent_registry(
     agent = agents.get(DEFAULT_ENVIRONMENT_AGENT_ID)
     if not isinstance(agent, dict):
         agents[DEFAULT_ENVIRONMENT_AGENT_ID] = deepcopy(DEFAULT_ENVIRONMENT_AGENT)
+        agent = agents[DEFAULT_ENVIRONMENT_AGENT_ID]
     else:
         for key, value in DEFAULT_ENVIRONMENT_AGENT.items():
             if key not in agent:
                 agent[key] = deepcopy(value)
         if not isinstance(agent.get("dispatch"), dict):
             agent["dispatch"] = deepcopy(DEFAULT_ENVIRONMENT_AGENT["dispatch"])
-        if not isinstance(agent.get("capability_refs"), list):
-            agent["capability_refs"] = list(DEFAULT_ENVIRONMENT_AGENT["capability_refs"])
+    if not isinstance(agent.get("capability_refs"), list):
+        agent["capability_refs"] = list(DEFAULT_ENVIRONMENT_AGENT["capability_refs"])
+    packager_agent = agents.get(DEFAULT_CAPABILITY_PACKAGER_AGENT_ID)
+    if not isinstance(packager_agent, dict):
+        agents[DEFAULT_CAPABILITY_PACKAGER_AGENT_ID] = deepcopy(
+            DEFAULT_CAPABILITY_PACKAGER_AGENT
+        )
+        packager_agent = agents[DEFAULT_CAPABILITY_PACKAGER_AGENT_ID]
+    else:
+        for key, value in DEFAULT_CAPABILITY_PACKAGER_AGENT.items():
+            if key not in packager_agent:
+                packager_agent[key] = deepcopy(value)
+        if not isinstance(packager_agent.get("dispatch"), dict):
+            packager_agent["dispatch"] = deepcopy(
+                DEFAULT_CAPABILITY_PACKAGER_AGENT["dispatch"]
+            )
+    if not isinstance(packager_agent.get("capability_refs"), list):
+        packager_agent["capability_refs"] = list(
+            DEFAULT_CAPABILITY_PACKAGER_AGENT["capability_refs"]
+        )
     return registry, profiles
 
 
@@ -415,6 +471,9 @@ class MCPServerConfig:
     risk_level: str = ""
     last_action: str = ""
     last_updated: str = ""
+    component_id: str = ""
+    package_ids: list[str] = field(default_factory=list)
+    managed_by: str = ""
 
     def to_dict(self) -> dict:
         """Convert to dictionary format for serialization."""
@@ -449,6 +508,9 @@ class MCPServerConfig:
             "risk_level": self.risk_level,
             "last_action": self.last_action,
             "last_updated": self.last_updated,
+            "component_id": self.component_id,
+            "package_ids": list(self.package_ids),
+            "managed_by": self.managed_by,
         }
 
     @classmethod
@@ -528,6 +590,9 @@ class MCPServerConfig:
             risk_level=str(d.get("risk_level", "")),
             last_action=str(d.get("last_action", "")),
             last_updated=str(d.get("last_updated", "")),
+            component_id=str(d.get("component_id", "")),
+            package_ids=_string_list_config_value(d.get("package_ids", [])),
+            managed_by=str(d.get("managed_by", "")),
         )
 
 
@@ -890,10 +955,12 @@ def build_agent_run_snapshot(
     runtime_profiles: RuntimeProfilesConfig,
     run_limits: RunLimitsConfig,
     capability_packages: dict[str, CapabilityPackageConfig] | None = None,
+    capability_components: dict[str, CapabilityComponentConfig] | None = None,
 ) -> dict[str, Any]:
     """Return the server-authoritative AgentRun snapshot for executors."""
 
     packages = dict(capability_packages or {})
+    components = dict(capability_components or {})
     if "environment" not in packages:
         packages["environment"] = CapabilityPackageConfig.from_dict(
             "environment",
@@ -905,6 +972,7 @@ def build_agent_run_snapshot(
         agent_dict["resolved_capabilities"] = resolve_capability_refs(
             agent.capability_refs,
             packages,
+            components,
         )
         agents[agent_id] = agent_dict
     return {
@@ -915,6 +983,10 @@ def build_agent_run_snapshot(
         "capability_packages": {
             package_id: package.to_dict()
             for package_id, package in packages.items()
+        },
+        "capability_components": {
+            component_id: component.to_dict()
+            for component_id, component in components.items()
         },
     }
 
@@ -1172,6 +1244,9 @@ class EnvironmentCLIToolConfig:
     risk_level: str = ""
     last_action: str = ""
     last_updated: str = ""
+    component_id: str = ""
+    package_ids: list[str] = field(default_factory=list)
+    managed_by: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -1194,6 +1269,9 @@ class EnvironmentCLIToolConfig:
             "risk_level": self.risk_level,
             "last_action": self.last_action,
             "last_updated": self.last_updated,
+            "component_id": self.component_id,
+            "package_ids": list(self.package_ids),
+            "managed_by": self.managed_by,
         }
         if self.version is not None:
             data["version"] = self.version
@@ -1243,6 +1321,9 @@ class EnvironmentCLIToolConfig:
             risk_level=str(d.get("risk_level", "")),
             last_action=str(d.get("last_action", "")),
             last_updated=str(d.get("last_updated", "")),
+            component_id=str(d.get("component_id", "")),
+            package_ids=_string_list_config_value(d.get("package_ids", [])),
+            managed_by=str(d.get("managed_by", "")),
         )
 
 
@@ -1270,6 +1351,9 @@ class EnvironmentSkillConfig:
     risk_level: str = ""
     last_action: str = ""
     last_updated: str = ""
+    component_id: str = ""
+    package_ids: list[str] = field(default_factory=list)
+    managed_by: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -1290,6 +1374,9 @@ class EnvironmentSkillConfig:
             "risk_level": self.risk_level,
             "last_action": self.last_action,
             "last_updated": self.last_updated,
+            "component_id": self.component_id,
+            "package_ids": list(self.package_ids),
+            "managed_by": self.managed_by,
         }
         if self.version is not None:
             data["version"] = self.version
@@ -1327,6 +1414,9 @@ class EnvironmentSkillConfig:
             risk_level=str(d.get("risk_level", "")),
             last_action=str(d.get("last_action", "")),
             last_updated=str(d.get("last_updated", "")),
+            component_id=str(d.get("component_id", "")),
+            package_ids=_string_list_config_value(d.get("package_ids", [])),
+            managed_by=str(d.get("managed_by", "")),
         )
 
 
@@ -1442,8 +1532,9 @@ class Config:
     runtime_profiles: RuntimeProfilesConfig = field(default_factory=RuntimeProfilesConfig)
     run_limits: RunLimitsConfig = field(default_factory=RunLimitsConfig)
 
-    # Reusable capability packages installed from local config or a future market.
+    # Confirmed capability packages and their shared installed components.
     capability_packages: dict[str, CapabilityPackageConfig] = field(default_factory=dict)
+    capability_components: dict[str, CapabilityComponentConfig] = field(default_factory=dict)
 
     # Durable persistence settings
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
@@ -1597,24 +1688,11 @@ class Config:
                     errors.append(
                         f"agent_registry.agents[{agent_id}].capability_refs references missing capability package {package_ref}"
                     )
-        mcp_names = {server.name for server in self.mcp_servers}
-        cli_tool_names = set(self.environment.cli_tools)
-        skill_names = set(self.environment.skills)
         for package_id, package in capability_packages.items():
-            for server_name in package.mcp_servers:
-                if server_name not in mcp_names:
+            for component_id in package.components:
+                if component_id not in self.capability_components:
                     errors.append(
-                        f"capability_packages[{package_id}].mcp_servers references missing mcp.servers entry {server_name}"
-                    )
-            for tool_name in package.cli_tools:
-                if tool_name not in cli_tool_names:
-                    errors.append(
-                        f"capability_packages[{package_id}].cli_tools references missing environment.cli_tools entry {tool_name}"
-                    )
-            for skill_name in package.skills:
-                if skill_name not in skill_names:
-                    errors.append(
-                        f"capability_packages[{package_id}].skills references missing environment.skills entry {skill_name}"
+                        f"capability_packages[{package_id}].components references missing capability_components entry {component_id}"
                     )
         valid_actions = {"allow", "warn", "require_approval", "deny"}
         if (

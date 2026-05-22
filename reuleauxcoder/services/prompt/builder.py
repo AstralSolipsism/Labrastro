@@ -126,6 +126,16 @@ def _skills_block(skills_catalog: str) -> PromptBlock:
     )
 
 
+def _capability_catalog_block(capability_catalog: str) -> PromptBlock:
+    return PromptBlock(
+        key="capability_catalog",
+        title="Capability Packages",
+        zone=PromptZone.SEMI_STATIC,
+        order=105,
+        body=capability_catalog,
+    )
+
+
 def _user_instructions_block(user_system_append: str) -> PromptBlock:
     return PromptBlock(
         key="user_instructions",
@@ -245,6 +255,7 @@ def system_prompt(
     mode_switch_hints: list[str] | None = None,
     available_modes: list[tuple[str, str]] | None = None,
     skills_catalog: str = "",
+    capability_catalog: str = "",
     workflow_mode: str | None = None,
     workflow_prompt_append: str = "",
 ) -> str:
@@ -255,6 +266,7 @@ def system_prompt(
     assembler.add(_rules_block())
     assembler.add(_markdown_formatting_block())
     assembler.add(_skills_block(skills_catalog))
+    assembler.add(_capability_catalog_block(capability_catalog))
     assembler.add(_user_instructions_block(user_system_append))
 
     mode_block = _mode_block(mode_name, mode_prompt_append)

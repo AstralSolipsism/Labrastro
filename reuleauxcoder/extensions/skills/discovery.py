@@ -15,6 +15,7 @@ def discover_skills(
     scan_project: bool = True,
     scan_user: bool = True,
     disabled_names: set[str] | None = None,
+    extra_paths: list[Path] | None = None,
 ) -> tuple[tuple[Skill, ...], tuple[SkillDiagnostic, ...], tuple[str, ...]]:
     """Discover skills from configured roots."""
     disabled_names = set(disabled_names or set())
@@ -107,5 +108,66 @@ def discover_skills(
                 enabled=enabled,
             )
 
+    for path in extra_paths or []:
+        try:
+            skill_files = _extra_skill_files(path)
+        except OSError as exc:
+            diagnostics.append(
+                SkillDiagnostic(
+                    level="warning",
+                    message=f"Failed to scan {path}: {exc}",
+                    path=str(path),
+                )
+            )
+            continue
+        for skill_md_path in skill_files:
+            skill, skill_diagnostics = parse_skill_file(
+                skill_md_path,
+                scope="package",
+                enabled=skill_md_path.parent.name not in disabled_names,
+            )
+            diagnostics.extend(skill_diagnostics)
+            if skill is None:
+                continue
+            enabled = skill.name not in disabled_names
+            if skill.name in discovered:
+                previous = discovered[skill.name]
+                diagnostics.append(
+                    SkillDiagnostic(
+                        level="warning",
+                        message=(
+                            f"Skill '{skill.name}' from {skill.location} overrides {previous.location}."
+                        ),
+                        skill_name=skill.name,
+                        path=skill.location,
+                    )
+                )
+            discovered[skill.name] = Skill(
+                name=skill.name,
+                description=skill.description,
+                location=skill.location,
+                skill_dir=skill.skill_dir,
+                body=skill.body,
+                scope="package",
+                enabled=enabled,
+            )
+
     skills = tuple(sorted(discovered.values(), key=lambda s: s.name))
     return skills, tuple(diagnostics), tuple(sorted(set(missing)))
+
+
+def _extra_skill_files(path: Path) -> list[Path]:
+    if not path.exists():
+        return []
+    if path.is_file() and path.name == "SKILL.md":
+        return [path]
+    if not path.is_dir():
+        return []
+    exact = path / "SKILL.md"
+    if exact.is_file():
+        return [exact]
+    return [
+        item / "SKILL.md"
+        for item in sorted(path.iterdir(), key=lambda p: p.name)
+        if item.is_dir() and (item / "SKILL.md").is_file()
+    ]

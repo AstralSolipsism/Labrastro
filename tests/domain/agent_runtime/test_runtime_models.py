@@ -118,30 +118,71 @@ def test_agent_config_rejects_removed_mixed_capability_fields() -> None:
 def test_resolve_capability_refs_merges_all_packages() -> None:
     models = _models()
 
+    components = {
+        "mcp:github": models.CapabilityComponentConfig.from_dict(
+            "mcp:github",
+            {
+                "kind": "mcp",
+                "name": "github",
+                "config": {"command": "github-mcp-server", "args": ["stdio"]},
+            },
+        ),
+        "skill:code-review": models.CapabilityComponentConfig.from_dict(
+            "skill:code-review",
+            {
+                "kind": "skill",
+                "name": "code-review",
+                "config": {"path_hint": "/skills/code-review"},
+            },
+        ),
+        "cli:gitnexus": models.CapabilityComponentConfig.from_dict(
+            "cli:gitnexus",
+            {
+                "kind": "cli",
+                "name": "gitnexus",
+                "config": {
+                    "command": "gitnexus",
+                    "env": {"GITNEXUS_HOME": ".gitnexus"},
+                },
+            },
+        ),
+    }
     packages = {
         "repo": models.CapabilityPackageConfig.from_dict(
             "repo",
             {
-                "mcp_servers": ["github"],
-                "skills": ["code-review"],
+                "components": ["mcp:github", "skill:code-review"],
                 "permissions": ["repo.read"],
             },
         ),
         "runtime": models.CapabilityPackageConfig.from_dict(
             "runtime",
             {
-                "cli_tools": ["gitnexus"],
+                "components": ["cli:gitnexus"],
                 "permissions": ["repo.read", "runtime.dispatch"],
             },
         ),
     }
 
-    resolved = models.resolve_capability_refs(["repo", "runtime"], packages)
+    resolved = models.resolve_capability_refs(["repo", "runtime"], packages, components)
 
     assert [package["id"] for package in resolved["packages"]] == ["repo", "runtime"]
     assert resolved["mcp_servers"] == ["github"]
     assert resolved["skills"] == ["code-review"]
     assert resolved["cli_tools"] == ["gitnexus"]
+    assert [component["id"] for component in resolved["components"]] == [
+        "mcp:github",
+        "skill:code-review",
+        "cli:gitnexus",
+    ]
+    assert resolved["capability_overlay"]["component_ids"] == [
+        "mcp:github",
+        "skill:code-review",
+        "cli:gitnexus",
+    ]
+    assert resolved["capability_overlay"]["skill_roots"] == ["/skills/code-review"]
+    assert resolved["capability_overlay"]["env"] == {"GITNEXUS_HOME": ".gitnexus"}
+    assert resolved["capability_overlay"]["mcp"]["servers"]["github"]["command"] == "github-mcp-server"
     assert "permissions" not in resolved
     assert "permissions" not in resolved["packages"][0]
     assert "permissions" not in resolved["packages"][1]

@@ -5248,16 +5248,22 @@ class TestRemoteRelayHTTPService:
             assert update_body["settings"]["run_limits"]["max_running_agents"] == 3
             assert update_body["settings"]["run_limits"]["max_shells_per_agent"] == 1
             assert set(update_body["settings"]["runtime_profiles"]) == {
-                "environment_local"
+                "environment_local",
+                "capability_packager_local",
             }
             assert set(update_body["settings"]["agent_registry"]["agents"]) == {
-                "environment_configurator"
+                "environment_configurator",
+                "capability_packager",
             }
             assert control.max_running_tasks == 3
             assert set(control.runtime_snapshot["runtime_profiles"]) == {
-                "environment_local"
+                "environment_local",
+                "capability_packager_local",
             }
-            assert set(control.runtime_snapshot["agents"]) == {"environment_configurator"}
+            assert set(control.runtime_snapshot["agents"]) == {
+                "environment_configurator",
+                "capability_packager",
+            }
         finally:
             service.stop()
             relay.stop()

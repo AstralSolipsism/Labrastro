@@ -5,6 +5,7 @@ import os
 
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
 from reuleauxcoder.domain.config.models import build_agent_run_snapshot
+from reuleauxcoder.interfaces.entrypoint.runner import build_capability_catalog
 from reuleauxcoder.services.config.loader import ConfigLoader
 
 
@@ -72,8 +73,16 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
             "capability_packages": {
                 "github-review": {
                     "name": "GitHub Review",
+                    "components": ["mcp:github"],
                     "permissions": ["repo.read"],
                 }
+            },
+            "capability_components": {
+                "mcp:github": {
+                    "kind": "mcp",
+                    "name": "github",
+                    "config": {"command": "github-mcp-server"},
+                },
             },
         }
     )
@@ -99,8 +108,12 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
         "github-review",
     ]
     assert "permissions" not in config.capability_packages["github-review"].to_dict()
+    assert config.capability_packages["github-review"].components == ["mcp:github"]
+    assert config.capability_components["mcp:github"].name == "github"
     assert "environment_local" in config.runtime_profiles.profiles
     assert "environment_configurator" in config.agent_registry.agents
+    assert "capability_packager_local" in config.runtime_profiles.profiles
+    assert "capability_packager" in config.agent_registry.agents
 
 
 def test_parse_config_injects_environment_configurator_by_default() -> None:
@@ -128,6 +141,9 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     assert agent.runtime_profile == "environment_local"
     assert "environment manifest" in agent.dispatch.profile
     assert agent.capability_refs == ["environment"]
+    packager = config.agent_registry.agents["capability_packager"]
+    assert packager.runtime_profile == "capability_packager_local"
+    assert "structured draft" in packager.dispatch.profile
     assert "environment" in config.capability_packages
     assert "permissions" not in config.capability_packages["environment"].to_dict()
 
@@ -205,12 +221,91 @@ def test_agent_run_snapshot_keeps_credential_refs_but_not_plaintext_secrets() ->
         runtime_profiles=config.runtime_profiles,
         run_limits=config.run_limits,
         capability_packages=config.capability_packages,
+        capability_components=config.capability_components,
     )
 
     assert "cred_codex_team" in str(snapshot)
     assert "cred_repo_writer" in str(snapshot)
     assert "OPENAI_API_KEY" not in str(snapshot)
     assert "sk-" not in str(snapshot)
+
+
+def test_agent_run_snapshot_resolves_capability_component_overlay() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            **_model_config(),
+            "runtime_profiles": {
+                "codex_remote": {
+                    "executor": "codex",
+                    "credential_refs": {"model": "cred_codex_team"},
+                }
+            },
+            "agent_registry": {
+                "agents": {
+                    "reviewer": {
+                        "runtime_profile": "codex_remote",
+                        "capability_refs": ["github-review"],
+                        "dispatch": {"profile": "Reviews GitHub pull requests."},
+                    }
+                },
+            },
+            "capability_packages": {
+                "github-review": {
+                    "name": "GitHub Review",
+                    "components": ["mcp:github", "skill:code-review", "cli:gh"],
+                    "source": {
+                        "type": "github_repo",
+                        "url": "https://github.com/example/review-tools",
+                    },
+                }
+            },
+            "capability_components": {
+                "mcp:github": {
+                    "kind": "mcp",
+                    "name": "github",
+                    "config": {"command": "github-mcp-server"},
+                },
+                "skill:code-review": {
+                    "kind": "skill",
+                    "name": "code-review",
+                    "config": {"path_hint": "/skills/code-review"},
+                },
+                "cli:gh": {
+                    "kind": "cli",
+                    "name": "gh",
+                    "config": {
+                        "command": "gh",
+                        "env": {"GH_CONFIG_DIR": ".gh"},
+                    },
+                },
+            },
+        }
+    )
+
+    snapshot = build_agent_run_snapshot(
+        agent_registry=config.agent_registry,
+        runtime_profiles=config.runtime_profiles,
+        run_limits=config.run_limits,
+        capability_packages=config.capability_packages,
+        capability_components=config.capability_components,
+    )
+
+    resolved = snapshot["agents"]["reviewer"]["resolved_capabilities"]
+    assert resolved["mcp_servers"] == ["github"]
+    assert resolved["skills"] == ["code-review"]
+    assert resolved["cli_tools"] == ["gh"]
+    assert resolved["capability_overlay"]["component_ids"] == [
+        "mcp:github",
+        "skill:code-review",
+        "cli:gh",
+    ]
+    assert resolved["capability_overlay"]["mcp"]["servers"]["github"]["command"] == "github-mcp-server"
+    assert resolved["capability_overlay"]["skill_roots"] == ["/skills/code-review"]
+    assert resolved["capability_overlay"]["env"] == {"GH_CONFIG_DIR": ".gh"}
+    catalog = build_capability_catalog(config)
+    assert "`github-review`" in catalog
+    assert "`cli:gh` [cli] gh" in catalog
+    assert "command `gh`" in catalog
 
 
 def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> None:
@@ -447,8 +542,92 @@ def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agent
     assert result.ok is True
     assert manager.data["run_limits"]["max_running_agents"] == 3
     assert manager.data["run_limits"]["max_shells_per_agent"] == 2
-    assert set(manager.data["runtime_profiles"]) == {"fake_daemon", "environment_local"}
-    assert set(manager.data["agent_registry"]["agents"]) == {"smoke", "environment_configurator"}
+    assert set(manager.data["runtime_profiles"]) == {
+        "fake_daemon",
+        "environment_local",
+        "capability_packager_local",
+    }
+    assert set(manager.data["agent_registry"]["agents"]) == {
+        "smoke",
+        "environment_configurator",
+        "capability_packager",
+    }
+
+
+def test_accept_and_delete_capability_package_manages_shared_components() -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data = {
+                **_model_config(),
+                "capability_packages": {},
+                "capability_components": {},
+            }
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+        def _commit_config(self, data: dict, previous_data: dict):
+            del previous_data
+            self.data = deepcopy(data)
+            return None
+
+    manager = MemoryAdminManager()
+    component = {
+        "id": "cli:gh",
+        "kind": "cli",
+        "name": "gh",
+        "config": {"command": "gh", "check": "gh --version"},
+    }
+
+    first = manager.accept_capability_package_draft(
+        {
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "source": {
+                    "type": "github_repo",
+                    "url": "https://github.com/example/review-tools",
+                },
+                "components": [component],
+                "install_plan": ["Install gh."],
+                "usage": ["Use gh pr view."],
+            }
+        }
+    )
+    assert first.ok is True
+    assert manager.data["capability_packages"]["review"]["components"] == ["cli:gh"]
+    assert manager.data["capability_components"]["cli:gh"]["package_ids"] == ["review"]
+    assert manager.data["environment"]["cli_tools"]["gh"]["component_id"] == "cli:gh"
+
+    second = manager.accept_capability_package_draft(
+        {
+            "draft": {
+                "id": "pr",
+                "name": "Pull Request",
+                "source": {
+                    "type": "github_repo",
+                    "url": "https://github.com/example/pr-tools",
+                },
+                "components": [component],
+            }
+        }
+    )
+    assert second.ok is True
+    assert manager.data["capability_components"]["cli:gh"]["package_ids"] == [
+        "review",
+        "pr",
+    ]
+
+    deleted_review = manager.delete_capability_package({"package_id": "review"})
+    assert deleted_review.ok is True
+    assert manager.data["capability_components"]["cli:gh"]["package_ids"] == ["pr"]
+    assert "gh" in manager.data["environment"]["cli_tools"]
+
+    deleted_pr = manager.delete_capability_package({"package_id": "pr"})
+    assert deleted_pr.ok is True
+    assert "cli:gh" not in manager.data["capability_components"]
+    assert "gh" not in manager.data["environment"]["cli_tools"]
 
 
 def test_admin_server_settings_update_rejects_missing_agent_profile() -> None:

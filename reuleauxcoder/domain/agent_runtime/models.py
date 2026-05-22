@@ -40,6 +40,7 @@ class AgentRunSource(str, Enum):
     DELEGATION = "delegation"
     TASKFLOW = "taskflow"
     ENVIRONMENT = "environment"
+    CAPABILITY_INGEST = "capability_ingest"
     MANUAL = "manual"
 
 
@@ -148,17 +149,175 @@ def _reject_plaintext_secret_container(data: dict[str, Any], *, owner: str) -> N
 
 
 @dataclass
-class CapabilityPackageConfig:
-    """Reusable Agent capability package assembled from component inventories."""
+class CapabilitySourceConfig:
+    """Source material used to generate a capability package."""
+
+    type: str = "manual"
+    url: str = ""
+    ref: str = ""
+    paths: list[str] = field(default_factory=list)
+    notes: str = ""
+
+    @classmethod
+    def from_value(cls, value: Any) -> "CapabilitySourceConfig":
+        if isinstance(value, dict):
+            return cls(
+                type=str(value.get("type", "manual") or "manual"),
+                url=str(value.get("url", "") or ""),
+                ref=str(value.get("ref", "") or ""),
+                paths=_string_list(value.get("paths", [])),
+                notes=str(value.get("notes", "") or ""),
+            )
+        if value is None:
+            return cls()
+        text = str(value).strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            return cls(type="docs_url", url=text)
+        return cls(type=text or "manual")
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"type": self.type or "manual"}
+        if self.url:
+            result["url"] = self.url
+        if self.ref:
+            result["ref"] = self.ref
+        if self.paths:
+            result["paths"] = list(self.paths)
+        if self.notes:
+            result["notes"] = self.notes
+        return result
+
+
+@dataclass
+class CapabilityComponentConfig:
+    """Shared installed component referenced by one or more capability packages."""
+
+    id: str
+    kind: str
+    name: str
+    enabled: bool = True
+    package_ids: list[str] = field(default_factory=list)
+    source: CapabilitySourceConfig = field(default_factory=CapabilitySourceConfig)
+    config: dict[str, Any] = field(default_factory=dict)
+    managed_by: str = "capability_package"
+    status: str = "installed"
+
+    @classmethod
+    def from_dict(
+        cls, component_id: str, data: dict[str, Any] | None
+    ) -> "CapabilityComponentConfig":
+        if not isinstance(data, dict):
+            data = {}
+        _reject_plaintext_secret_container(data, owner="capability component")
+        raw_config = _dict_value(data.get("config", {}))
+        _reject_plaintext_secret_container(raw_config, owner="capability component config")
+        raw_kind = str(data.get("kind", "") or "").strip().lower()
+        kind = raw_kind if raw_kind in {"cli", "mcp", "skill"} else ""
+        name = str(data.get("name", "") or "").strip()
+        if not kind or not name:
+            parsed_kind, parsed_name = _split_component_id(component_id)
+            kind = kind or parsed_kind
+            name = name or parsed_name
+        return cls(
+            id=str(component_id),
+            kind=kind,
+            name=name,
+            enabled=bool(data.get("enabled", True)),
+            package_ids=_string_list(data.get("package_ids", [])),
+            source=CapabilitySourceConfig.from_value(data.get("source", {})),
+            config=raw_config,
+            managed_by=str(data.get("managed_by", "capability_package") or "capability_package"),
+            status=str(data.get("status", "installed") or "installed"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "name": self.name,
+            "enabled": self.enabled,
+            "package_ids": list(self.package_ids),
+            "source": self.source.to_dict(),
+            "config": dict(self.config),
+            "managed_by": self.managed_by,
+            "status": self.status,
+        }
+
+
+@dataclass
+class CapabilityPackageDraft:
+    """Agent-generated capability package proposal awaiting user confirmation."""
 
     id: str
     name: str = ""
     description: str = ""
-    mcp_servers: list[str] = field(default_factory=list)
-    skills: list[str] = field(default_factory=list)
-    cli_tools: list[str] = field(default_factory=list)
-    source: str = ""
-    market: dict[str, Any] = field(default_factory=dict)
+    source: CapabilitySourceConfig = field(default_factory=CapabilitySourceConfig)
+    components: list[dict[str, Any]] = field(default_factory=list)
+    install_plan: list[str] = field(default_factory=list)
+    usage: list[str] = field(default_factory=list)
+    evidence: list[dict[str, str]] = field(default_factory=list)
+    credentials: list[str] = field(default_factory=list)
+    risk_level: str = ""
+    notes: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, package_id: str, data: dict[str, Any] | None) -> "CapabilityPackageDraft":
+        if not isinstance(data, dict):
+            data = {}
+        _reject_plaintext_secret_container(data, owner="capability package draft")
+        raw_components = data.get("components", [])
+        components = [
+            dict(item)
+            for item in (raw_components if isinstance(raw_components, list) else [])
+            if isinstance(item, dict)
+        ]
+        return cls(
+            id=str(data.get("id") or package_id),
+            name=str(data.get("name", "") or ""),
+            description=str(data.get("description", "") or ""),
+            source=CapabilitySourceConfig.from_value(data.get("source", {})),
+            components=components,
+            install_plan=_string_list(data.get("install_plan", [])),
+            usage=_string_list(data.get("usage", [])),
+            evidence=_string_dict_list(data.get("evidence", [])),
+            credentials=_string_list(data.get("credentials", [])),
+            risk_level=str(data.get("risk_level", "") or ""),
+            notes=_string_list(data.get("notes", [])),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "source": self.source.to_dict(),
+            "components": [dict(item) for item in self.components],
+            "install_plan": list(self.install_plan),
+            "usage": list(self.usage),
+            "evidence": [dict(item) for item in self.evidence],
+            "credentials": list(self.credentials),
+            "risk_level": self.risk_level,
+            "notes": list(self.notes),
+        }
+
+
+@dataclass
+class CapabilityPackageConfig:
+    """Confirmed capability package generated from source docs or repositories."""
+
+    id: str
+    name: str = ""
+    description: str = ""
+    source: CapabilitySourceConfig = field(default_factory=CapabilitySourceConfig)
+    components: list[str] = field(default_factory=list)
+    enabled: bool = True
+    status: str = "installed"
+    install_plan: list[str] = field(default_factory=list)
+    usage: list[str] = field(default_factory=list)
+    evidence: list[dict[str, str]] = field(default_factory=list)
+    credentials: list[str] = field(default_factory=list)
+    risk_level: str = ""
+    generated_by: str = "capability_packager"
+    notes: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(
@@ -167,62 +326,167 @@ class CapabilityPackageConfig:
         if not isinstance(data, dict):
             data = {}
         _reject_plaintext_secret_container(data, owner="capability package")
+        component_refs = data.get("components", data.get("component_refs", []))
         return cls(
             id=str(package_id),
             name=str(data.get("name", "") or ""),
             description=str(data.get("description", "") or ""),
-            mcp_servers=_string_list(data.get("mcp_servers", [])),
-            skills=_string_list(data.get("skills", [])),
-            cli_tools=_string_list(data.get("cli_tools", [])),
-            source=str(data.get("source", "") or ""),
-            market=_dict_value(data.get("market", {})),
+            source=CapabilitySourceConfig.from_value(data.get("source", {})),
+            components=_string_list(component_refs),
+            enabled=bool(data.get("enabled", True)),
+            status=str(data.get("status", "installed") or "installed"),
+            install_plan=_string_list(data.get("install_plan", [])),
+            usage=_string_list(data.get("usage", [])),
+            evidence=_string_dict_list(data.get("evidence", [])),
+            credentials=_string_list(data.get("credentials", [])),
+            risk_level=str(data.get("risk_level", "") or ""),
+            generated_by=str(data.get("generated_by", "capability_packager") or "capability_packager"),
+            notes=_string_list(data.get("notes", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {}
+        result: dict[str, Any] = {
+            "enabled": self.enabled,
+            "status": self.status,
+            "source": self.source.to_dict(),
+            "components": list(self.components),
+            "generated_by": self.generated_by,
+        }
         if self.name:
             result["name"] = self.name
         if self.description:
             result["description"] = self.description
-        if self.mcp_servers:
-            result["mcp_servers"] = list(self.mcp_servers)
-        if self.skills:
-            result["skills"] = list(self.skills)
-        if self.cli_tools:
-            result["cli_tools"] = list(self.cli_tools)
-        if self.source:
-            result["source"] = self.source
-        if self.market:
-            result["market"] = dict(self.market)
+        if self.install_plan:
+            result["install_plan"] = list(self.install_plan)
+        if self.usage:
+            result["usage"] = list(self.usage)
+        if self.evidence:
+            result["evidence"] = [dict(item) for item in self.evidence]
+        if self.credentials:
+            result["credentials"] = list(self.credentials)
+        if self.risk_level:
+            result["risk_level"] = self.risk_level
+        if self.notes:
+            result["notes"] = list(self.notes)
         return result
 
 
 def resolve_capability_refs(
     capability_refs: list[str],
     packages: dict[str, CapabilityPackageConfig],
+    components: dict[str, CapabilityComponentConfig] | None = None,
 ) -> dict[str, Any]:
-    """Resolve package refs into executor-facing capability components."""
+    """Resolve package refs into executor-facing package and component overlay."""
 
     resolved_packages: list[dict[str, Any]] = []
+    resolved_components: list[dict[str, Any]] = []
     mcp_servers: list[str] = []
     skills: list[str] = []
     cli_tools: list[str] = []
+    overlay_mcp_servers: dict[str, Any] = {}
+    overlay_env: dict[str, str] = {}
+    overlay_skill_roots: list[str] = []
+    component_map = components or {}
     for package_id in capability_refs:
         package = packages.get(package_id)
-        if package is None:
+        if package is None or not package.enabled:
             continue
         package_dict = package.to_dict()
         package_dict["id"] = package.id
         resolved_packages.append(package_dict)
-        mcp_servers.extend(package.mcp_servers)
-        skills.extend(package.skills)
-        cli_tools.extend(package.cli_tools)
+        for component_id in package.components:
+            component = component_map.get(component_id)
+            if component is None or not component.enabled:
+                continue
+            component_dict = component.to_dict()
+            component_dict["id"] = component.id
+            resolved_components.append(component_dict)
+            if component.kind == "mcp":
+                mcp_servers.append(component.name)
+                overlay_mcp_servers[component.name] = _mcp_overlay_config(component)
+            elif component.kind == "skill":
+                skills.append(component.name)
+                path_hint = str(component.config.get("path_hint") or "").strip()
+                if path_hint:
+                    overlay_skill_roots.append(path_hint)
+            elif component.kind == "cli":
+                cli_tools.append(component.name)
+                for key, value in _dict_value(component.config.get("env", {})).items():
+                    overlay_env[str(key)] = str(value)
     return {
         "packages": resolved_packages,
+        "components": _dedupe_components(resolved_components),
         "mcp_servers": _dedupe_strings(mcp_servers),
         "skills": _dedupe_strings(skills),
         "cli_tools": _dedupe_strings(cli_tools),
+        "capability_overlay": {
+            "component_ids": _dedupe_strings(
+                [str(item.get("id") or "") for item in resolved_components]
+            ),
+            "mcp": {"servers": overlay_mcp_servers},
+            "skill_roots": _dedupe_strings(overlay_skill_roots),
+            "env": overlay_env,
+            "cli_tools": [
+                item
+                for item in _dedupe_components(resolved_components)
+                if item.get("kind") == "cli"
+            ],
+        },
     }
+
+
+def _split_component_id(component_id: str) -> tuple[str, str]:
+    kind, sep, name = str(component_id).partition(":")
+    if sep and kind in {"cli", "mcp", "skill"}:
+        return kind, name
+    return "", str(component_id)
+
+
+def _string_dict_list(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        mapped = {
+            str(key): str(val)
+            for key, val in item.items()
+            if str(key).strip() and val is not None
+        }
+        if mapped:
+            result.append(mapped)
+    return result
+
+
+def _dedupe_components(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        component_id = str(value.get("id") or "").strip()
+        if not component_id or component_id in seen:
+            continue
+        seen.add(component_id)
+        result.append(value)
+    return result
+
+
+def _mcp_overlay_config(component: CapabilityComponentConfig) -> dict[str, Any]:
+    config = dict(component.config)
+    result: dict[str, Any] = {}
+    command = str(config.get("command") or "").strip()
+    if command:
+        result["command"] = command
+    args = _string_list(config.get("args", []))
+    if args:
+        result["args"] = args
+    env = _dict_value(config.get("env", {}))
+    if env:
+        result["env"] = {str(key): str(value) for key, value in env.items()}
+    cwd = str(config.get("cwd") or "").strip()
+    if cwd:
+        result["cwd"] = cwd
+    return result
 
 
 @dataclass

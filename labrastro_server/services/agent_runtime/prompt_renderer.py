@@ -124,6 +124,18 @@ class ExecutorPromptRenderer:
                     lines.append(f"- {label}")
                 else:
                     lines.append(f"- `{package}`")
+        components = resolved.get("components")
+        if isinstance(components, list) and components:
+            lines.append("")
+            lines.append("Installed components:")
+            for component in components:
+                if not isinstance(component, dict):
+                    continue
+                component_id = str(component.get("id") or "").strip()
+                kind = str(component.get("kind") or "").strip()
+                name = str(component.get("name") or component_id).strip()
+                label = f"{kind}:{name}" if kind and name else name or component_id
+                lines.append(f"- `{label}`")
         sections = (
             ("mcp_servers", "MCP servers"),
             ("skills", "Skills"),

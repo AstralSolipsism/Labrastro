@@ -144,6 +144,7 @@ class AgentLoop:
             mode_switch_hints=suggested_modes,
             available_modes=available_modes,
             skills_catalog=getattr(self.agent, "skills_catalog", ""),
+            capability_catalog=getattr(self.agent, "capability_catalog", ""),
             workflow_mode=getattr(self.agent, "workflow_mode", None),
             workflow_prompt_append=getattr(
                 self.agent, "workflow_prompt_append", ""

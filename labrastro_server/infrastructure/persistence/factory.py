@@ -69,6 +69,7 @@ def create_runtime_control_plane(config: Config) -> AgentRunControlPlane:
         runtime_profiles=config.runtime_profiles,
         run_limits=config.run_limits,
         capability_packages=config.capability_packages,
+        capability_components=config.capability_components,
     )
     engine = _engine_for(config)
     if engine is None or not config.persistence.runtime_enabled:

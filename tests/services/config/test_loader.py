@@ -931,6 +931,12 @@ def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
     assert agent_registry["agents"]["environment_configurator"]["capability_refs"] == [
         "environment"
     ]
+    assert runtime_profiles["capability_packager_local"]["executor"] == "reuleauxcoder"
+    assert "capability_packager" in agent_registry["agents"]
+    assert (
+        agent_registry["agents"]["capability_packager"]["runtime_profile"]
+        == "capability_packager_local"
+    )
 
 
 def test_load_does_not_copy_global_environment_manifest_into_workspace(
