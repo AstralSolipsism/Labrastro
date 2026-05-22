@@ -20,6 +20,20 @@ class TriggerKind(str, Enum):
     SHORTCUT = "shortcut"
 
 
+class TriggerSelectionBehavior(str, Enum):
+    """How a UI composer should handle a selected trigger."""
+
+    DISPATCH = "dispatch"
+    INSERT_FOR_ARGS = "insert_for_args"
+
+
+class TriggerVisibility(str, Enum):
+    """Whether a trigger should appear in user-facing command catalogs."""
+
+    VISIBLE = "visible"
+    HIDDEN = "hidden"
+
+
 @dataclass(frozen=True, slots=True)
 class TriggerSpec:
     """One way to invoke an action."""
@@ -28,6 +42,11 @@ class TriggerSpec:
     value: str
     ui_targets: frozenset[str] = field(default_factory=frozenset)
     required_capabilities: frozenset[UICapability] = field(default_factory=frozenset)
+    supports_args: bool = False
+    args_hint: str = ""
+    selection_behavior: TriggerSelectionBehavior = TriggerSelectionBehavior.DISPATCH
+    available_during_run: bool = False
+    visibility: TriggerVisibility = TriggerVisibility.VISIBLE
 
     def is_available_in(
         self,

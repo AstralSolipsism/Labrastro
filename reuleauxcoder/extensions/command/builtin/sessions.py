@@ -334,7 +334,10 @@ def register_actions(registry: ActionRegistry) -> None:
                 description="[session-index] List saved sessions for the current fingerprint by default, or all with `/sessions all`",
                 ui_targets=UI_TARGETS,
                 required_capabilities=TEXT_REQUIRED,
-                triggers=(slash_trigger("/sessions"), slash_trigger("/sessions all")),
+                triggers=(
+                    slash_trigger("/sessions", available_during_run=True),
+                    slash_trigger("/sessions all", available_during_run=True),
+                ),
                 parser=_parse_list_sessions,
                 handler=_handle_list_sessions,
             ),
@@ -344,7 +347,14 @@ def register_actions(registry: ActionRegistry) -> None:
                 description="[session-index] Resume a saved session by id or latest visible fingerprint match",
                 ui_targets=UI_TARGETS,
                 required_capabilities=TEXT_REQUIRED,
-                triggers=(slash_trigger("/session <id|latest>"),),
+                triggers=(
+                    slash_trigger(
+                        "/session <id|latest>",
+                        supports_args=True,
+                        args_hint="id|latest",
+                        selection_behavior="insert_for_args",
+                    ),
+                ),
                 parser=_parse_resume_session,
                 handler=_handle_resume_session,
             ),

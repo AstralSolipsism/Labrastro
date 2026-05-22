@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from reuleauxcoder.app.commands.params import EnumParam, StrParam
-from reuleauxcoder.app.commands.specs import TriggerKind, TriggerSpec
+from reuleauxcoder.app.commands.specs import (
+    TriggerKind,
+    TriggerSelectionBehavior,
+    TriggerSpec,
+    TriggerVisibility,
+)
 from reuleauxcoder.interfaces.ui_registry import UICapability
 
 UI_TARGETS = frozenset({"cli", "tui", "vscode"})
@@ -17,13 +22,36 @@ class EmptyCommand:
     """Marker command object for actions with no parse payload."""
 
 
-def slash_trigger(value: str) -> TriggerSpec:
-    """Build a CLI slash trigger declaration with text-input capability requirement."""
+def slash_trigger(
+    value: str,
+    *,
+    supports_args: bool = False,
+    args_hint: str = "",
+    selection_behavior: TriggerSelectionBehavior | str = TriggerSelectionBehavior.DISPATCH,
+    available_during_run: bool = False,
+    visibility: TriggerVisibility | str = TriggerVisibility.VISIBLE,
+) -> TriggerSpec:
+    """Build a slash trigger declaration with text-input capability requirement."""
+    selection = (
+        selection_behavior
+        if isinstance(selection_behavior, TriggerSelectionBehavior)
+        else TriggerSelectionBehavior(str(selection_behavior))
+    )
+    trigger_visibility = (
+        visibility
+        if isinstance(visibility, TriggerVisibility)
+        else TriggerVisibility(str(visibility))
+    )
     return TriggerSpec(
         kind=TriggerKind.SLASH,
         value=value,
-        ui_targets=frozenset({"cli"}),
+        ui_targets=UI_TARGETS,
         required_capabilities=TEXT_REQUIRED,
+        supports_args=supports_args,
+        args_hint=args_hint,
+        selection_behavior=selection,
+        available_during_run=available_during_run,
+        visibility=trigger_visibility,
     )
 
 

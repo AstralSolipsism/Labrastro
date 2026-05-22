@@ -3,6 +3,7 @@
 from reuleauxcoder.app.commands.dispatcher import dispatch_command
 from reuleauxcoder.app.commands.models import CommandResult
 from reuleauxcoder.app.commands.registry import ActionRegistry
+from reuleauxcoder.app.commands.shared import slash_trigger
 from reuleauxcoder.app.commands.specs import ActionSpec, TriggerKind, TriggerSpec
 from reuleauxcoder.interfaces.ui_registry import UICapability, UIProfile
 
@@ -22,7 +23,7 @@ def _slash_action(
         description="test",
         ui_targets=ui_targets,
         required_capabilities=frozenset({UICapability.TEXT_INPUT}),
-        triggers=(TriggerSpec(kind=TriggerKind.SLASH, value="/test"),),
+        triggers=(slash_trigger("/test"),),
         parser=parser,
         handler=handler,
     )
@@ -67,6 +68,22 @@ def test_action_registry_parse_skips_actions_without_available_slash_trigger() -
     registry = ActionRegistry([action])
 
     assert registry.parse("/test", ui_profile=CLI_PROFILE) is None
+
+
+def test_slash_trigger_declares_command_selection_metadata() -> None:
+    trigger = slash_trigger(
+        "/debug",
+        supports_args=True,
+        args_hint="on|off",
+        selection_behavior="insert_for_args",
+        available_during_run=True,
+    )
+
+    assert trigger.supports_args is True
+    assert trigger.args_hint == "on|off"
+    assert trigger.selection_behavior.value == "insert_for_args"
+    assert trigger.available_during_run is True
+    assert trigger.visibility.value == "visible"
 
 
 def test_action_registry_dispatch_returns_continue_when_handler_missing() -> None:
