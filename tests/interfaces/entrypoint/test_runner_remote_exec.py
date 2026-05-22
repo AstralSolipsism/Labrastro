@@ -22,6 +22,8 @@ from reuleauxcoder.domain.config.models import (
     AuthSuperadminConfig,
     Config,
     ContextConfig,
+    DEFAULT_MAIN_CHAT_AGENT,
+    DEFAULT_MAIN_CHAT_AGENT_ID,
     MCPServerConfig,
     ModelProfileConfig,
     ModeConfig,
@@ -543,6 +545,9 @@ def _build_runner_with_fake_agent(
             "fake-main" if model_profiles is None else None
         ),
         providers=providers or default_providers,
+        agent_registry=AgentRegistryConfig.from_dict(
+            {"agents": {DEFAULT_MAIN_CHAT_AGENT_ID: DEFAULT_MAIN_CHAT_AGENT}}
+        ),
     )
     config.skills.enabled = False
     return AppRunner(
@@ -644,6 +649,20 @@ def test_remote_relay_maps_memory_context_to_dedicated_event_type() -> None:
     assert payload["schema"] == "memory_context.v1"
     assert payload["context_kind"] == "memory_injection"
     assert payload["provided_items"] == 1
+
+
+def test_remote_relay_maps_chat_mentions_to_reference_only_context() -> None:
+    source = (
+        Path(__file__).resolve().parents[3]
+        / "reuleauxcoder"
+        / "interfaces"
+        / "entrypoint"
+        / "remote_relay.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"mention_context"' in source
+    assert '"reference_only": True' in source
+    assert "These @ mentions are context references only and do not grant new tool permissions." in source
 
 
 def test_switch_session_model_updates_runtime_without_transcript_pollution() -> None:
@@ -1146,6 +1165,9 @@ class TestRunnerRemoteExec:
             assert payload["fingerprint"]
             assert payload["mode"] == "coder"
             assert payload["model"]
+            assert payload["main_agent_id"] == "main_chat"
+            assert payload["agent_config_id"] == "main_chat"
+            assert "builtin:fetch_capabilities" in payload["effective_capabilities"]["tools"]
             assert not any(
                 event["type"] == "output"
                 and "REMOTE PEER READY" in event["payload"].get("content", "")
@@ -2666,5 +2688,57 @@ class TestRunnerRemoteExec:
                 and "Open view:" in event["payload"].get("content", "")
                 for event in events
             )
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_stream_chat_only_dispatches_registered_leading_slash_commands(
+        self,
+    ) -> None:
+        workspace = Path(__file__).resolve().parent
+        port = _free_port()
+        captured_prompts: list[str] = []
+
+        def chat_behavior(_agent: FakeAgent, prompt: str) -> str:
+            captured_prompts.append(prompt)
+            return f"ok:{prompt}"
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            prompts = [" /help", "/path/to/file", "/unknown"]
+            for prompt in prompts:
+                _, start_body = _json_request(
+                    "POST",
+                    f"{runner._relay_http_service.base_url}/remote/chat/start",
+                    {"peer_token": peer_token, "prompt": prompt},
+                )
+                events = _collect_stream_events(
+                    runner._relay_http_service.base_url,
+                    peer_token,
+                    start_body["chat_id"],
+                )
+                assert any(
+                    event["type"] == "chat_end"
+                    and event["payload"].get("response") == f"ok:{prompt}"
+                    for event in events
+                )
+                assert not any(
+                    event["type"] == "error"
+                    and event["payload"].get("code") == "invalid_chat_command"
+                    for event in events
+                )
+                assert not any(event["type"] == "view" for event in events)
+
+            assert captured_prompts == prompts
         finally:
             runner.cleanup(ctx.agent)

@@ -14,6 +14,7 @@ from rich.console import Console
 
 from reuleauxcoder.app.runtime.session_state import (
     apply_agent_default_model,
+    apply_agent_config_model,
     apply_session_runtime_state,
     apply_session_model_override,
     build_session_runtime_state,
@@ -49,6 +50,7 @@ from reuleauxcoder.domain.approval import (
 )
 from reuleauxcoder.domain.config.models import (
     Config,
+    DEFAULT_MAIN_CHAT_AGENT_ID,
     PromptConfig,
     build_agent_run_snapshot,
 )
@@ -56,6 +58,8 @@ from reuleauxcoder.domain.session.models import Session, SessionMetadata, Sessio
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from labrastro_server.interfaces.http.remote.protocol import (
+    ChatCommandDispatchRequest,
+    ChatCommandDispatchResponse,
     ChatResponse,
     ToolMutationPreviewState,
     ToolPreviewResult,
@@ -64,10 +68,10 @@ from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.extensions.skills.service import SkillsService
 from reuleauxcoder.extensions.tools.backend import ExecutionContext
 from reuleauxcoder.interfaces.cli.commands import handle_command
-from reuleauxcoder.interfaces.cli.registration import CLI_PROFILE
 from reuleauxcoder.interfaces.cli.render import CLIRenderer
 from reuleauxcoder.interfaces.entrypoint.dependencies import AppDependencies
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
+from reuleauxcoder.interfaces.vscode.registration import VSCODE_CHAT_PROFILE
 from reuleauxcoder.services.llm.factory import llm_trace_enabled, resolve_model_runtime
 from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
 from labrastro_server.taskflow.application.taskflow_service import (
@@ -250,6 +254,71 @@ def _runtime_config_with_chat_locale(
         config,
         prompt=replace(current_prompt, system_append=merged_append),
     )
+
+
+def _chat_entrypoint_agent_config(config: Config | None) -> Any | None:
+    if config is None:
+        return None
+    registry = getattr(config, "agent_registry", None)
+    agents = getattr(registry, "agents", {}) if registry is not None else {}
+    if not isinstance(agents, dict):
+        return None
+    default_agent = agents.get(DEFAULT_MAIN_CHAT_AGENT_ID)
+    if getattr(default_agent, "chat_entrypoint", False):
+        return default_agent
+    candidates = [
+        agent
+        for agent in agents.values()
+        if getattr(agent, "chat_entrypoint", False)
+        and getattr(agent, "visibility", "user") == "user"
+    ]
+    candidates.sort(key=lambda item: str(getattr(item, "id", "")))
+    return candidates[0] if candidates else None
+
+
+def _runtime_config_with_chat_agent_prompt(
+    config: Config | None,
+    agent_config: Any | None,
+) -> Config | None:
+    if config is None or agent_config is None:
+        return config
+    prompt_config = getattr(agent_config, "prompt", None)
+    if prompt_config is None:
+        return config
+    additions: list[str] = []
+    agent_md = str(getattr(prompt_config, "agent_md", "") or "").strip()
+    system_append = str(getattr(prompt_config, "system_append", "") or "").strip()
+    if agent_md:
+        additions.append(f"Agent profile for `{agent_config.id}`:\n{agent_md}")
+    if system_append:
+        additions.append(system_append)
+    if not additions:
+        return config
+
+    current_prompt = getattr(config, "prompt", None) or PromptConfig()
+    current_append = str(getattr(current_prompt, "system_append", "") or "")
+    merged_append = "\n\n".join(
+        part for part in [current_append.strip(), *additions] if part
+    )
+    return replace(
+        config,
+        prompt=replace(current_prompt, system_append=merged_append),
+    )
+
+
+def _effective_capabilities_for_agent(config: Config, agent_id: str) -> dict[str, Any]:
+    snapshot = build_agent_run_snapshot(
+        agent_registry=config.agent_registry,
+        runtime_profiles=config.runtime_profiles,
+        run_limits=config.run_limits,
+        capability_packages=config.capability_packages,
+        capability_components=config.capability_components,
+    )
+    agent = snapshot.get("agents", {}).get(agent_id)
+    if not isinstance(agent, dict):
+        return {}
+    effective = agent.get("effective_capabilities")
+    return effective if isinstance(effective, dict) else {}
 
 
 def switch_session_model(
@@ -879,6 +948,30 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
     if callable(set_trace_sink):
         set_trace_sink(_append_session_trace_event)
 
+    def _apply_chat_entrypoint_runtime(
+        peer_agent: Agent,
+        current_config: Config,
+    ) -> Any | None:
+        chat_agent = _chat_entrypoint_agent_config(current_config)
+        if chat_agent is None:
+            return None
+        agent_id = str(getattr(chat_agent, "id", "") or "").strip()
+        if not agent_id:
+            return None
+        setattr(peer_agent, "agent_config_id", agent_id)
+        setattr(peer_agent, "main_agent_id", agent_id)
+        setattr(peer_agent, "effective_capabilities", _effective_capabilities_for_agent(current_config, agent_id))
+        setattr(peer_agent, "enforce_effective_capabilities", True)
+        if not getattr(peer_agent, "session_model_overridden", False):
+            apply_agent_config_model(current_config, peer_agent, agent_id)
+        runtime_config = _runtime_config_with_chat_agent_prompt(
+            getattr(peer_agent, "runtime_config", current_config),
+            chat_agent,
+        )
+        if runtime_config is not None:
+            setattr(peer_agent, "runtime_config", runtime_config)
+        return chat_agent
+
     def _create_peer_agent(
         peer_id: str,
         remote_stream_handler: Callable[..., None] | None = None,
@@ -901,6 +994,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if server_mcp_tools:
             peer_agent.add_tools(server_mcp_tools)
         setattr(peer_agent, "runtime_config", current_config)
+        setattr(peer_agent, "capability_catalog", runner.build_capability_catalog(current_config))
         bind_memory_scope_to_agent(
             peer_agent,
             owner_agent_id=f"peer:{peer_id}",
@@ -952,6 +1046,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 apply_session_runtime_state(loaded, current_config, peer_agent)
             else:
                 restore_config_runtime_defaults(current_config, peer_agent)
+            _apply_chat_entrypoint_runtime(peer_agent, current_config)
             setattr(peer_agent, "current_session_id", session_hint)
             return peer_agent
 
@@ -961,10 +1056,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 loaded = session_store.load(latest.id)
                 if loaded is not None:
                     apply_session_runtime_state(loaded, current_config, peer_agent)
+                    _apply_chat_entrypoint_runtime(peer_agent, current_config)
                     setattr(peer_agent, "current_session_id", latest.id)
                     return peer_agent
 
         restore_config_runtime_defaults(current_config, peer_agent)
+        _apply_chat_entrypoint_runtime(peer_agent, current_config)
         setattr(peer_agent, "current_session_id", session_store.generate_session_id())
         return peer_agent
 
@@ -1101,6 +1198,177 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return agent_obj.chat(prompt, clear_stop_request=clear_stop_request)
         return agent_obj.chat(prompt)
 
+    def _normalized_chat_mentions(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        mentions: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").strip()
+            name = str(item.get("name") or item.get("path") or item.get("id") or "").strip()
+            if kind not in {"file", "capability", "agent_tool", "mcp", "plugin"} or not name:
+                continue
+            mention = {
+                "kind": kind,
+                "name": name,
+            }
+            mention["reference_only"] = True
+            for key in ("id", "path", "source", "insertText", "insert_text"):
+                raw = item.get(key)
+                if raw is not None and str(raw).strip():
+                    mention[key] = str(raw).strip()
+            mentions.append(mention)
+        return mentions
+
+    def _prompt_with_mention_context(prompt: str, mentions: list[dict[str, Any]]) -> str:
+        if not mentions:
+            return prompt
+        lines = [
+            "",
+            "Referenced context objects from the user's @ mentions:",
+        ]
+        for mention in mentions:
+            target = mention.get("path") or mention.get("id") or mention.get("name")
+            source = mention.get("source") or "unknown"
+            lines.append(
+                f"- {mention['kind']}: {mention['name']} ({target}; source={source}; reference_only=true)"
+            )
+        lines.append(
+            "These @ mentions are context references only and do not grant new tool permissions."
+        )
+        return f"{prompt}\n" + "\n".join(lines)
+
+    def _dispatch_vscode_command(
+        peer_agent: Agent,
+        peer_id: str,
+        command_text: str,
+    ) -> ChatCommandDispatchResponse:
+        current_config = _current_config()
+        if current_config is None:
+            return ChatCommandDispatchResponse(
+                ok=False,
+                action="continue",
+                session_id=getattr(peer_agent, "current_session_id", None),
+                events=[
+                    {
+                        "type": "error",
+                        "payload": {
+                            "message": "config_unavailable",
+                            "code": "config_unavailable",
+                        },
+                    }
+                ],
+                error="config_unavailable",
+            )
+
+        command_bus = UIEventBus()
+        peer_context_manager = getattr(peer_agent, "context", None)
+        previous_context_bus = getattr(peer_context_manager, "_ui_bus", None)
+        if peer_context_manager is not None:
+            peer_context_manager._ui_bus = command_bus
+        try:
+            command_result = handle_command(
+                command_text,
+                peer_agent,
+                current_config,
+                getattr(peer_agent, "current_session_id", None),
+                command_bus,
+                VSCODE_CHAT_PROFILE,
+                runner.dependencies.create_action_registry(),
+                sessions_dir,
+                skills_service,
+            )
+        finally:
+            if peer_context_manager is not None:
+                peer_context_manager._ui_bus = previous_context_bus
+
+        session_id = command_result["session_id"]
+        events = [
+            {
+                "type": _structured_ui_event_type(event),
+                "payload": _structured_ui_event_payload(event),
+            }
+            for event in getattr(command_bus, "_history", [])
+        ]
+        if command_result["action"] == "chat":
+            events.append(
+                {
+                    "type": "error",
+                    "payload": {
+                        "message": f"Unknown or invalid command: {command_text}",
+                        "code": "invalid_chat_command",
+                    },
+                }
+            )
+            return ChatCommandDispatchResponse(
+                ok=False,
+                action="chat",
+                session_id=session_id,
+                events=events,
+                error="invalid_chat_command",
+            )
+
+        setattr(peer_agent, "current_session_id", session_id)
+        if command_result["action"] == "exit":
+            events.append(
+                {
+                    "type": "output",
+                    "payload": {
+                        "format": "plain",
+                        "content": "Exit command received. Use Ctrl+C to terminate remote peer.\n",
+                    },
+                }
+            )
+        _save_peer_session(peer_agent, peer_id)
+        return ChatCommandDispatchResponse(
+            ok=True,
+            action=str(command_result["action"]),
+            session_id=session_id,
+            events=events,
+        )
+
+    def _dispatch_chat_command(
+        peer_id: str, req: ChatCommandDispatchRequest
+    ) -> ChatCommandDispatchResponse:
+        command_text = req.command_text
+        peer_agent = _create_peer_agent(
+            peer_id,
+            session_hint=req.session_hint,
+            resume_latest=False,
+        )
+        _bind_main_chat_account_memory_scope(peer_agent, peer_id)
+        response = _dispatch_vscode_command(peer_agent, peer_id, command_text)
+        response.events.insert(
+            0,
+            {
+                "type": "chat_start",
+                "payload": {
+                    "prompt": command_text,
+                    "command_id": req.command_id,
+                    "trigger": req.trigger,
+                    "mentions": req.mentions,
+                },
+            },
+        )
+        response.events.append({"type": "chat_end", "payload": {"response": ""}})
+        return response
+
+    def _is_registered_vscode_chat_command(
+        peer_agent: Agent,
+        command_text: str,
+    ) -> bool:
+        if not command_text.startswith("/"):
+            return False
+        return (
+            runner.dependencies.create_action_registry().parse(
+                command_text,
+                ui_profile=VSCODE_CHAT_PROFILE,
+                current_session_id=getattr(peer_agent, "current_session_id", None),
+            )
+            is not None
+        )
+
     def _stream_chat(peer_id: str, prompt: str, remote_session) -> None:
         peer_agent = _create_peer_agent(
             peer_id,
@@ -1182,6 +1450,17 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         runtime_agent_id = f"chat:{getattr(remote_session, 'chat_id', uuid.uuid4().hex)}"
         setattr(peer_agent, "runtime_agent_id", runtime_agent_id)
 
+        mention_refs = _normalized_chat_mentions(getattr(remote_session, "mentions", []))
+        if mention_refs:
+            remote_session.append_event(
+                "mention_context",
+                {
+                    "mentions": mention_refs,
+                    "reference_only": True,
+                },
+            )
+            prompt = _prompt_with_mention_context(prompt, mention_refs)
+
         def _emit_runtime_status(payload: dict[str, Any]) -> None:
             remote_session.append_event("runtime_status", payload)
 
@@ -1220,6 +1499,11 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "mode": getattr(peer_agent, "active_mode", "-") or "-",
                     "model": getattr(getattr(peer_agent, "llm", None), "model", "-")
                     or "-",
+                    "main_agent_id": getattr(peer_agent, "main_agent_id", None),
+                    "agent_config_id": getattr(peer_agent, "agent_config_id", None),
+                    "effective_capabilities": getattr(
+                        peer_agent, "effective_capabilities", {}
+                    ),
                     "workspace_root": getattr(peer_info, "workspace_root", None)
                     if peer_info is not None
                     else None,
@@ -1227,49 +1511,18 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             )
             startup_announced.add(startup_key)
 
-        current_config = _current_config()
-        if prompt.strip().startswith("/") and current_config is not None:
-            command_bus = UIEventBus()
-            peer_context_manager = getattr(peer_agent, "context", None)
-            previous_context_bus = getattr(peer_context_manager, "_ui_bus", None)
-            if peer_context_manager is not None:
-                peer_context_manager._ui_bus = command_bus
-            try:
-                command_result = handle_command(
-                    prompt.strip(),
-                    peer_agent,
-                    current_config,
-                    getattr(peer_agent, "current_session_id", None),
-                    command_bus,
-                    CLI_PROFILE,
-                    runner.dependencies.create_action_registry(),
-                    sessions_dir,
-                    skills_service,
+        if _is_registered_vscode_chat_command(peer_agent, prompt):
+            command_response = _dispatch_vscode_command(
+                peer_agent, peer_id, prompt
+            )
+            for event in command_response.events:
+                remote_session.append_event(
+                    str(event.get("type") or "output"),
+                    event.get("payload") if isinstance(event.get("payload"), dict) else {},
                 )
-            finally:
-                if peer_context_manager is not None:
-                    peer_context_manager._ui_bus = previous_context_bus
-            if command_result["action"] != "chat":
-                setattr(peer_agent, "current_session_id", command_result["session_id"])
-
-                for event in getattr(command_bus, "_history", []):
-                    remote_session.append_event(
-                        _structured_ui_event_type(event),
-                        _structured_ui_event_payload(event),
-                    )
-
-                if command_result["action"] == "exit":
-                    remote_session.append_event(
-                        "output",
-                        {
-                            "format": "plain",
-                            "content": "Exit command received. Use Ctrl+C to terminate remote peer.\n",
-                        },
-                    )
-                _save_peer_session(peer_agent, peer_id)
-                remote_session.append_event("chat_end", {"response": ""})
-                interactive_run_limiter.release_agent_slot(runtime_agent_id)
-                return
+            remote_session.append_event("chat_end", {"response": ""})
+            interactive_run_limiter.release_agent_slot(runtime_agent_id)
+            return
 
         ansi_console = Console(
             record=True, force_terminal=True, color_system="truecolor"
@@ -1883,6 +2136,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             renderer.close()
 
     runner._relay_http_service.set_chat_handler(_chat)
+    runner._relay_http_service.set_chat_command_handler(_dispatch_chat_command)
     runner._relay_http_service.set_chat_events_handler(_stream_chat)
 
 
