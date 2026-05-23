@@ -597,6 +597,10 @@ class TestExecToolRequest:
             cwd="/tmp",
             timeout_sec=60,
             expected_state=ToolMutationPreviewState(old_sha256="abc"),
+            permission_context={
+                "agent_id": "main_chat",
+                "decision": {"action": "allow", "authorized": True},
+            },
         )
         d = req.to_dict()
         restored = ExecToolRequest.from_dict(d)
@@ -605,6 +609,10 @@ class TestExecToolRequest:
         assert restored.cwd == "/tmp"
         assert restored.timeout_sec == 60
         assert restored.expected_state == ToolMutationPreviewState(old_sha256="abc")
+        assert restored.permission_context == {
+            "agent_id": "main_chat",
+            "decision": {"action": "allow", "authorized": True},
+        }
 
     def test_defaults(self) -> None:
         req = ExecToolRequest(tool_name="read_file")
@@ -612,6 +620,7 @@ class TestExecToolRequest:
         assert req.cwd is None
         assert req.timeout_sec == 30
         assert req.expected_state is None
+        assert req.permission_context == {}
 
     def test_expected_state_ignores_preview_mtime(self) -> None:
         state = ToolMutationPreviewState.from_preview(

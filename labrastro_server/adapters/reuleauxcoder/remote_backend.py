@@ -74,6 +74,7 @@ class RemoteRelayToolBackend(ToolBackend):
             cwd=self.context.cwd,
             timeout_sec=timeout,
             tool_call_id=tool_call_id,
+            permission_context=dict(self.context.permission_context or {}),
             expected_state=self._approved_preview_states.pop(
                 self._request_key(tool_name, args), None
             ),

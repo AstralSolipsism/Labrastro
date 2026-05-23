@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -15,6 +16,7 @@ class ExecutionContext:
     execution_target: str = "local"
     remote_stream_handler: object | None = None
     current_tool_call_id: str | None = None
+    permission_context: dict[str, Any] = field(default_factory=dict)
 
 
 class ToolBackend:

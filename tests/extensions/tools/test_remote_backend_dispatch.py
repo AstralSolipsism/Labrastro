@@ -16,6 +16,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
 )
 from labrastro_server.relay.server import RelayServer
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
+from reuleauxcoder.extensions.tools.backend import ExecutionContext
 from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
 from reuleauxcoder.extensions.tools.builtin.glob import GlobTool
 from reuleauxcoder.extensions.tools.builtin.grep import GrepTool
@@ -265,6 +266,10 @@ class TestRemoteBackendDispatch:
             backend = RemoteRelayToolBackend(relay_server=srv)
             backend.context.peer_id = resp.peer_id
             backend.context.current_tool_call_id = "call-mcp-1"
+            backend.context.permission_context = {
+                "agent_id": "reviewer",
+                "decision": {"action": "allow", "authorized": True},
+            }
             tool = RemotePeerMCPTool(
                 backend,
                 RemoteMCPToolInfo(
@@ -291,6 +296,10 @@ class TestRemoteBackendDispatch:
             assert len(received) == 1
             env = received[0][1]
             assert env.payload["tool_call_id"] == "call-mcp-1"
+            assert env.payload["permission_context"] == {
+                "agent_id": "reviewer",
+                "decision": {"action": "allow", "authorized": True},
+            }
             assert env.payload["tool_name"] == "mcp"
             assert env.payload["args"]["server_name"] == "docs"
             assert env.payload["args"]["tool_name"] == "search"
@@ -306,6 +315,69 @@ class TestRemoteBackendDispatch:
             )
             t.join(timeout=2)
             assert holder["result"] == "mcp-ok"
+        finally:
+            srv.stop()
+
+    def test_remote_backend_forwards_permission_context(self) -> None:
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import RegisterRequest
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                )
+            )
+            backend = RemoteRelayToolBackend(
+                relay_server=srv,
+                context=ExecutionContext(
+                    peer_id=resp.peer_id,
+                    permission_context={
+                        "agent_id": "worker",
+                        "decision": {"action": "allow", "authorized": True},
+                    },
+                ),
+            )
+            tool = ShellTool(backend=backend)
+
+            import threading
+            import time
+            from labrastro_server.interfaces.http.remote.protocol import RelayEnvelope
+
+            holder: dict[str, object] = {}
+
+            def run_tool() -> None:
+                holder["result"] = tool.execute(command="echo hello")
+
+            t = threading.Thread(target=run_tool)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            assert env.payload["permission_context"] == {
+                "agent_id": "worker",
+                "decision": {"action": "allow", "authorized": True},
+            }
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="ok").to_dict(),
+                ),
+            )
+            t.join(timeout=2)
+            assert holder["result"] == "ok"
         finally:
             srv.stop()
 

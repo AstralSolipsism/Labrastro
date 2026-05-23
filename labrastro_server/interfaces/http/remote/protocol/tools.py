@@ -74,6 +74,7 @@ class ExecToolRequest:
     timeout_sec: int = 30
     expected_state: ToolMutationPreviewState | None = None
     tool_call_id: str | None = None
+    permission_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +86,7 @@ class ExecToolRequest:
                 self.expected_state.to_dict() if self.expected_state is not None else {}
             ),
             "tool_call_id": self.tool_call_id,
+            "permission_context": dict(self.permission_context or {}),
         }
 
     @classmethod
@@ -96,6 +98,9 @@ class ExecToolRequest:
             timeout_sec=d.get("timeout_sec", 30),
             tool_call_id=d.get("tool_call_id"),
             expected_state=ToolMutationPreviewState.from_dict(d.get("expected_state")),
+            permission_context=d.get("permission_context", {})
+            if isinstance(d.get("permission_context", {}), dict)
+            else {},
         )
 
 
