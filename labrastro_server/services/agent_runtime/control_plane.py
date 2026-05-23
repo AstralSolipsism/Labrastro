@@ -31,6 +31,10 @@ from labrastro_server.services.agent_runtime.environment_events import (
     expand_environment_executor_event,
 )
 from labrastro_server.services.agent_runtime.lifecycle import IssueStatus, TaskLifecycleState
+from labrastro_server.services.agent_runtime.permission_events import (
+    blocked_review_event_payload,
+    should_block_waiting_approval,
+)
 from labrastro_server.services.agent_runtime.prompt_renderer import (
     CanonicalAgentContext,
     ExecutorPromptRenderer,
@@ -889,7 +893,26 @@ class AgentRunControlPlane:
                 "execution_policies",
                 effective.get("execution_policies", []),
             )
+        metadata.setdefault(
+            "permission_context",
+            {
+                "agent_id": task.agent_id,
+                "source": task.source.value,
+                "interactive": task.source == AgentRunSource.CHAT,
+                "runtime_profile_id": task.runtime_profile_id or str(raw_agent.get("runtime_profile") or ""),
+                "effective_capabilities": effective,
+            },
+        )
         return metadata
+
+    def _session_metadata(
+        self,
+        task: AgentRunRecord,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session_metadata = self._executor_metadata(task)
+        session_metadata.update(dict(metadata or {}))
+        return session_metadata
 
     def _worker_matches_task_locked(
         self,
@@ -981,6 +1004,7 @@ class AgentRunControlPlane:
                 workdir=task.workdir,
                 branch=task.branch_name,
                 executor_session_id=task.executor_session_id,
+                metadata=self._session_metadata(task, session.metadata),
             )
             self._sessions[task_id] = pinned
             self._append_event_locked(
@@ -1041,6 +1065,7 @@ class AgentRunControlPlane:
                 executor_session_id=(
                     executor_session_id if executor_session_id else None
                 ),
+                metadata=self._session_metadata(task, metadata),
             )
             self.pin_session(task_id, session)
             if metadata:
@@ -1096,7 +1121,15 @@ class AgentRunControlPlane:
             if event.type.value == "status":
                 status = str(event.data.get("status", ""))
                 if status == "waiting_approval":
-                    task.status = TaskStatus.WAITING_APPROVAL
+                    if should_block_waiting_approval(task.source):
+                        task.status = TaskStatus.BLOCKED
+                        self._append_event_locked(
+                            task_id,
+                            "permission.blocked_review",
+                            blocked_review_event_payload(event.data),
+                        )
+                    else:
+                        task.status = TaskStatus.WAITING_APPROVAL
                 elif status == "running":
                     task.status = TaskStatus.RUNNING
                 elif status == "blocked":
@@ -1181,6 +1214,7 @@ class AgentRunControlPlane:
                     workdir=task.workdir,
                     branch=task.branch_name,
                     executor_session_id=task.executor_session_id,
+                    metadata=self._session_metadata(task),
                 )
             for event in result.events:
                 self._append_event_locked(task_id, event.type.value, event.to_dict())
@@ -1506,6 +1540,7 @@ class AgentRunControlPlane:
                 "workdir": session.workdir,
                 "branch": session.branch,
                 "executor_session_id": session.executor_session_id,
+                "metadata": dict(session.metadata),
             }
             if session is not None
             else None,

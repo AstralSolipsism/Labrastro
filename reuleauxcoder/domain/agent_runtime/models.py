@@ -1040,7 +1040,9 @@ class TaskSessionRef:
     workdir: str | None = None
     branch: str | None = None
     executor_session_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.executor = ExecutorType(_enum_value(self.executor))
         self.execution_location = ExecutionLocation(_enum_value(self.execution_location))
+        self.metadata = _dict_value(self.metadata)

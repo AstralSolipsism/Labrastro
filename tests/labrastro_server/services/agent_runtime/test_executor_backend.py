@@ -138,6 +138,60 @@ def test_reuleauxcoder_backend_wraps_chat_output_as_executor_events() -> None:
     assert agents[0].clear_stop_request is True
 
 
+def test_reuleauxcoder_backend_binds_permission_context_to_agent() -> None:
+    backend_module = _executor_backend()
+
+    class FakeAgent:
+        current_session_id = "session-1"
+
+        def chat(self, prompt: str, *, clear_stop_request: bool = True) -> str:  # noqa: ARG002
+            return "done"
+
+    agents: list[FakeAgent] = []
+
+    def create_agent(_request):
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    backend = backend_module.ReuleauxCoderExecutorBackend(create_agent=create_agent)
+    backend.start(
+        backend_module.ExecutorRunRequest(
+            task_id="task-1",
+            agent_id="reviewer",
+            executor="reuleauxcoder",
+            prompt="run",
+            workdir="/workspace/repo",
+            runtime_profile_id="codex",
+            metadata={
+                "permission_context": {
+                    "agent_id": "reviewer",
+                    "source": "taskflow",
+                    "interactive": False,
+                    "runtime_profile_id": "codex",
+                    "effective_capabilities": {
+                        "tools": ["builtin:read_file"],
+                        "execution_policies": [],
+                    },
+                }
+            },
+        )
+    )
+
+    agent = agents[0]
+    assert getattr(agent, "agent_config_id") == "reviewer"
+    assert getattr(agent, "runtime_task_id") == "task-1"
+    assert getattr(agent, "runtime_workspace_root") == "/workspace/repo"
+    assert getattr(agent, "permission_trigger_source") == "taskflow"
+    assert getattr(agent, "permission_interactive") is False
+    assert getattr(agent, "runtime_profile_id") == "codex"
+    assert getattr(agent, "effective_capabilities") == {
+        "tools": ["builtin:read_file"],
+        "execution_policies": [],
+    }
+    assert getattr(agent, "enforce_effective_capabilities") is True
+
+
 def test_reuleauxcoder_backend_resume_restores_executor_session_id() -> None:
     backend_module = _executor_backend()
 
@@ -165,6 +219,62 @@ def test_reuleauxcoder_backend_resume_restores_executor_session_id() -> None:
 
     assert result.output == "session-1: continue"
     assert result.executor_session_id == "session-1"
+
+
+def test_reuleauxcoder_backend_resume_restores_permission_context() -> None:
+    backend_module = _executor_backend()
+
+    class FakeAgent:
+        current_session_id = "session-1"
+
+        def chat(self, prompt: str, *, clear_stop_request: bool = True) -> str:  # noqa: ARG002
+            return "resumed"
+
+    agents: list[FakeAgent] = []
+
+    def create_agent(_request):
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    backend = backend_module.ReuleauxCoderExecutorBackend(create_agent=create_agent)
+    backend.resume(
+        backend_module.TaskSessionRef(
+            agent_id="reviewer",
+            executor="reuleauxcoder",
+            execution_location="local_workspace",
+            issue_id="issue-1",
+            task_id="task-1",
+            workdir="/workspace/repo",
+            executor_session_id="session-1",
+            metadata={
+                "permission_context": {
+                    "agent_id": "reviewer",
+                    "source": "taskflow",
+                    "interactive": False,
+                    "runtime_profile_id": "codex",
+                    "effective_capabilities": {
+                        "tools": ["builtin:read_file"],
+                        "execution_policies": [],
+                    },
+                }
+            },
+        ),
+        prompt="continue",
+    )
+
+    agent = agents[0]
+    assert getattr(agent, "agent_config_id") == "reviewer"
+    assert getattr(agent, "runtime_task_id") == "task-1"
+    assert getattr(agent, "runtime_workspace_root") == "/workspace/repo"
+    assert getattr(agent, "permission_trigger_source") == "taskflow"
+    assert getattr(agent, "permission_interactive") is False
+    assert getattr(agent, "runtime_profile_id") == "codex"
+    assert getattr(agent, "effective_capabilities") == {
+        "tools": ["builtin:read_file"],
+        "execution_policies": [],
+    }
+    assert getattr(agent, "enforce_effective_capabilities") is True
 
 
 def test_reuleauxcoder_backend_cancel_delegates_to_active_agent() -> None:

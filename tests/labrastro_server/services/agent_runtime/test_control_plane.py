@@ -457,8 +457,16 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
                         "agent_md": "docs/coder.md",
                         "system_append": "Use the repo conventions.",
                     },
-                    "mcp": {"servers": ["github"]},
                     "credential_refs": {"git": "cred-git"},
+                    "effective_capabilities": {
+                        "tools": ["builtin:read_file"],
+                        "execution_policies": [
+                            {
+                                "target": "builtin_tool:read_file",
+                                "policy": "allow",
+                            }
+                        ],
+                    },
                 }
             },
         }
@@ -485,6 +493,21 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
         "git": "cred-git",
     }
     assert metadata["system_prompt"] == metadata["prompt_files"]["AGENTS.md"]
+    assert metadata["permission_context"] == {
+        "agent_id": "coder",
+        "source": "manual",
+        "interactive": False,
+        "runtime_profile_id": "codex",
+        "effective_capabilities": {
+            "tools": ["builtin:read_file"],
+            "execution_policies": [
+                {
+                    "target": "builtin_tool:read_file",
+                    "policy": "allow",
+                }
+            ],
+        },
+    }
     assert control.get_agent_run(task.id).status.value == "dispatched"
 
 
@@ -633,6 +656,66 @@ def test_waiting_approval_event_updates_task_status() -> None:
     )
 
     assert control.get_agent_run(task.id).status.value == "waiting_approval"
+
+
+def test_taskflow_waiting_approval_event_becomes_blocked_review() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="taskflow-1",
+            agent_id="worker",
+            prompt="run background",
+            source="taskflow",
+        ),
+        task_id="taskflow-approval",
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "waiting_approval",
+            approval_id="approval-1",
+            tool_name="shell",
+            reason="shell requires approval",
+        ),
+    )
+
+    assert control.get_agent_run(task.id).status.value == "blocked"
+    events = control.list_events(task.id, after_seq=0)
+    blocked = [event for event in events if event.type == "permission.blocked_review"]
+    assert blocked
+    assert blocked[-1].payload["permission"]["action"] == "blocked_review"
+    assert blocked[-1].payload["tool_name"] == "shell"
+
+
+def test_delegation_waiting_approval_event_becomes_blocked_review() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="delegation-1",
+            agent_id="worker",
+            prompt="run delegated task",
+            source="delegation",
+        ),
+        task_id="delegation-approval",
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "waiting_approval",
+            approval_id="approval-1",
+            tool_name="shell",
+            reason="shell requires approval",
+        ),
+    )
+
+    assert control.get_agent_run(task.id).status.value == "blocked"
+    events = control.list_events(task.id, after_seq=0)
+    blocked = [event for event in events if event.type == "permission.blocked_review"]
+    assert blocked
+    assert blocked[-1].payload["permission"]["action"] == "blocked_review"
+    assert blocked[-1].payload["tool_name"] == "shell"
 
 
 def test_claim_filters_by_workspace_and_execution_location() -> None:

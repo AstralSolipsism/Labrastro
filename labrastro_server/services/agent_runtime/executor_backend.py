@@ -275,6 +275,7 @@ class ReuleauxCoderExecutorBackend:
     def start(self, request: ExecutorRunRequest) -> ExecutorRunResult:
         agent = self._create_agent(request)
         self._bind_memory_scope(request, agent)
+        self._bind_permission_context(request, agent)
         self._active_agents[request.task_id] = agent
         return self._run_agent(request, agent)
 
@@ -289,9 +290,11 @@ class ReuleauxCoderExecutorBackend:
             branch=session.branch,
             executor_session_id=session.executor_session_id,
             prompt=prompt,
+            metadata=dict(session.metadata),
         )
         agent = self._create_agent(request)
         self._bind_memory_scope(request, agent)
+        self._bind_permission_context(request, agent)
         if request.executor_session_id:
             setattr(agent, "current_session_id", request.executor_session_id)
         self._active_agents[request.task_id] = agent
@@ -352,6 +355,35 @@ class ReuleauxCoderExecutorBackend:
             taskflow_id=metadata.get("taskflow_id"),
             issue_id=request.issue_id,
         )
+
+    @staticmethod
+    def _bind_permission_context(request: ExecutorRunRequest, agent: Any) -> None:
+        metadata = dict(request.metadata or {})
+        context = metadata.get("permission_context")
+        permission_context = context if isinstance(context, dict) else {}
+        agent_id = str(permission_context.get("agent_id") or request.agent_id or "")
+        source = str(permission_context.get("source") or "taskflow")
+        runtime_profile_id = str(
+            permission_context.get("runtime_profile_id")
+            or request.runtime_profile_id
+            or ""
+        )
+        effective = permission_context.get("effective_capabilities")
+        if not isinstance(effective, dict):
+            effective = metadata.get("effective_capabilities")
+
+        if agent_id:
+            setattr(agent, "agent_config_id", agent_id)
+        setattr(agent, "runtime_task_id", request.task_id)
+        if request.workdir:
+            setattr(agent, "runtime_workspace_root", request.workdir)
+        setattr(agent, "permission_trigger_source", source)
+        setattr(agent, "permission_interactive", permission_context.get("interactive") is True)
+        if runtime_profile_id:
+            setattr(agent, "runtime_profile_id", runtime_profile_id)
+        if isinstance(effective, dict):
+            setattr(agent, "effective_capabilities", effective)
+            setattr(agent, "enforce_effective_capabilities", True)
 
     @staticmethod
     def _agent_chat(agent: Any, prompt: str) -> str:

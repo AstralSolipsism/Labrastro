@@ -28,6 +28,10 @@ from labrastro_server.services.agent_runtime.environment_events import (
     environment_summary_event,
     expand_environment_executor_event,
 )
+from labrastro_server.services.agent_runtime.permission_events import (
+    blocked_review_event_payload,
+    should_block_waiting_approval,
+)
 from labrastro_server.services.agent_runtime.lifecycle import IssueStatus
 from labrastro_server.services.agent_runtime.prompt_renderer import (
     CanonicalAgentContext,
@@ -559,7 +563,12 @@ class PostgresAgentRunStore:
     def pin_session(self, task_id: str, session: TaskSessionRef) -> None:
         task = self.get_agent_run(task_id)
         with self.engine.begin() as conn:
-            self._pin_session_with_conn(conn, task, session, metadata={})
+            self._pin_session_with_conn(
+                conn,
+                task,
+                session,
+                metadata=self._session_metadata(task, session.metadata),
+            )
 
     def pin_claimed_session(
         self,
@@ -592,8 +601,14 @@ class PostgresAgentRunStore:
                 workdir=workdir if workdir else None,
                 branch=branch if branch else None,
                 executor_session_id=executor_session_id if executor_session_id else None,
+                metadata=self._session_metadata(task, metadata),
             )
-            self._pin_session_with_conn(conn, task, session, metadata=metadata or {})
+            self._pin_session_with_conn(
+                conn,
+                task,
+                session,
+                metadata=session.metadata,
+            )
             if metadata:
                 self._append_event(
                     conn,
@@ -651,6 +666,24 @@ class PostgresAgentRunStore:
                 )
             if event.type.value == "status":
                 status = str(event.data.get("status", ""))
+                if status == "waiting_approval" and should_block_waiting_approval(task.source):
+                    self._append_event(
+                        conn,
+                        task_id,
+                        "permission.blocked_review",
+                        blocked_review_event_payload(event.data),
+                    )
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE labrastro_agent_runs
+                            SET status='blocked', updated_at=now()
+                            WHERE id=:task_id
+                            """
+                        ),
+                        {"task_id": task_id},
+                    )
+                    return True, ""
                 mapped = {
                     "waiting_approval": "waiting_approval",
                     "running": "running",
@@ -763,6 +796,7 @@ class PostgresAgentRunStore:
                     conn,
                     task,
                     executor_session_id=result.executor_session_id,
+                    metadata=self._session_metadata(task),
                 )
             for event, expansion in expanded_events:
                 self._append_event(conn, task_id, event.type.value, event.to_dict())
@@ -1277,10 +1311,36 @@ class PostgresAgentRunStore:
                 metadata.setdefault("system_prompt", rendered.metadata["system_prompt"])
         raw_agent = _dict_from(_dict_from(self.runtime_snapshot.get("agents")).get(task.agent_id))
         resolved = _dict_from(raw_agent.get("resolved_capabilities"))
+        effective = _dict_from(raw_agent.get("effective_capabilities"))
         overlay = _dict_from(resolved.get("capability_overlay"))
         if overlay:
             metadata.setdefault("capability_overlay", overlay)
+        if effective:
+            metadata.setdefault("effective_capabilities", effective)
+            metadata.setdefault(
+                "execution_policies",
+                effective.get("execution_policies", []),
+            )
+        metadata.setdefault(
+            "permission_context",
+            {
+                "agent_id": task.agent_id,
+                "source": task.source.value,
+                "interactive": task.source.value == "chat",
+                "runtime_profile_id": task.runtime_profile_id or str(raw_agent.get("runtime_profile") or ""),
+                "effective_capabilities": effective,
+            },
+        )
         return metadata
+
+    def _session_metadata(
+        self,
+        task: AgentRunRecord,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session_metadata = self._executor_metadata(task)
+        session_metadata.update(dict(metadata or {}))
+        return session_metadata
 
     def _render_prompt_for_task(self, task: AgentRunRecord, executor: ExecutorType) -> Any:
         agents = _dict_from(self.runtime_snapshot.get("agents"))
@@ -1420,6 +1480,8 @@ class PostgresAgentRunStore:
         *,
         metadata: dict[str, Any],
     ) -> None:
+        session_metadata = self._session_metadata(task, metadata)
+        session_metadata.update(session.metadata)
         conn.execute(
             text(
                 """
@@ -1472,7 +1534,7 @@ class PostgresAgentRunStore:
                 "workdir": session.workdir,
                 "branch": session.branch,
                 "executor_session_id": session.executor_session_id,
-                "metadata": _json(metadata),
+                "metadata": _json(session_metadata),
             },
         )
         self._append_event(
@@ -1492,7 +1554,9 @@ class PostgresAgentRunStore:
         task: AgentRunRecord,
         *,
         executor_session_id: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
+        session_metadata = self._session_metadata(task, metadata)
         conn.execute(
             text(
                 """
@@ -1501,12 +1565,13 @@ class PostgresAgentRunStore:
                     workdir, branch, executor_session_id, metadata
                 ) VALUES (
                     :task_id, :agent_id, :executor, :execution_location, :issue_id,
-                    :workdir, :branch, :executor_session_id, CAST('{}' AS JSONB)
+                    :workdir, :branch, :executor_session_id, CAST(:metadata AS JSONB)
                 )
                 ON CONFLICT (task_id) DO UPDATE SET
                     workdir=COALESCE(EXCLUDED.workdir, labrastro_agent_run_sessions.workdir),
                     branch=COALESCE(EXCLUDED.branch, labrastro_agent_run_sessions.branch),
                     executor_session_id=EXCLUDED.executor_session_id,
+                    metadata=labrastro_agent_run_sessions.metadata || EXCLUDED.metadata,
                     updated_at=now()
                 """
             ),
@@ -1521,6 +1586,7 @@ class PostgresAgentRunStore:
                 "workdir": task.workdir,
                 "branch": task.branch_name,
                 "executor_session_id": executor_session_id,
+                "metadata": _json(session_metadata),
             },
         )
 
