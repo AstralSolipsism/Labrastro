@@ -15,28 +15,29 @@ if TYPE_CHECKING:
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 from reuleauxcoder.domain.agent.loop import AgentLoop
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
-from reuleauxcoder.domain.config.models import ModeConfig
+from reuleauxcoder.domain.config.models import ApprovalConfig, ApprovalRuleConfig, ModeConfig
 from reuleauxcoder.domain.context.manager import ContextManager
 from reuleauxcoder.domain.hooks import HookBase, HookPoint, HookRegistry
+from reuleauxcoder.domain.llm.models import ToolCall
+from reuleauxcoder.domain.permission_gateway import (
+    PermissionDecision,
+    PermissionGateway,
+    PermissionRequest,
+    PermissionSubject,
+    PermissionTarget,
+)
 from reuleauxcoder.infrastructure.platform import get_platform_info
 from reuleauxcoder.services.prompt.builder import system_prompt
 
 
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _tool_name_from_registry_path(value: str) -> str:
-    text = value.strip()
-    if not text:
-        return ""
-    if ":" in text:
-        prefix, suffix = text.split(":", 1)
-        if prefix in {"builtin", "tool", "builtin_tool"}:
-            return suffix.strip()
-    return text
+def _same_approval_target(left: ApprovalRuleConfig, right: ApprovalRuleConfig) -> bool:
+    return (
+        left.tool_name == right.tool_name
+        and left.tool_source == right.tool_source
+        and left.mcp_server == right.mcp_server
+        and left.effect_class == right.effect_class
+        and left.profile == right.profile
+    )
 
 
 @dataclass
@@ -254,31 +255,11 @@ class Agent:
 
     def get_active_tools(self) -> list["Tool"]:
         """Return tools visible to the LLM in current mode."""
-        mode = self.get_active_mode_config()
-        if mode is None:
-            return [tool for tool in self.tools if self.is_tool_authorized(tool)]
-
-        if not mode.tools or "*" in mode.tools:
-            return [tool for tool in self.tools if self.is_tool_authorized(tool)]
-
-        allowed = set(mode.tools)
-        return [
-            tool
-            for tool in self.tools
-            if tool.name in allowed and self.is_tool_authorized(tool)
-        ]
+        return [tool for tool in self.tools if self.is_tool_authorized(tool)]
 
     def get_blocked_tools(self) -> list["Tool"]:
         """Return tools hidden/blocked by current mode."""
-        mode = self.get_active_mode_config()
-        if mode is None or not mode.tools or "*" in mode.tools:
-            return [tool for tool in self.tools if not self.is_tool_authorized(tool)]
-        allowed = set(mode.tools)
-        return [
-            tool
-            for tool in self.tools
-            if tool.name not in allowed or not self.is_tool_authorized(tool)
-        ]
+        return [tool for tool in self.tools if not self.is_tool_authorized(tool)]
 
     def capability_tool_policy_enabled(self) -> bool:
         """Return whether effective_capabilities is an active tool boundary."""
@@ -289,41 +270,172 @@ class Agent:
         value = getattr(self, "effective_capabilities", None)
         return value if isinstance(value, dict) else {}
 
-    def _authorized_builtin_tool_names(self) -> set[str]:
-        effective = self._effective_capabilities()
-        names = {
-            name
-            for name in (
-                _tool_name_from_registry_path(item)
-                for item in _string_list(effective.get("tools"))
+    def _runtime_config(self) -> "Config" | None:
+        config = getattr(self, "runtime_config", None)
+        if config is not None:
+            return config
+        return self.config
+
+    def _current_agent_id(self) -> str:
+        for attr in ("agent_config_id", "main_agent_id", "runtime_agent_id"):
+            value = str(getattr(self, attr, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _current_agent_config(self) -> object | None:
+        agent_id = self._current_agent_id()
+        config = self._runtime_config()
+        registry = getattr(config, "agent_registry", None)
+        agents = getattr(registry, "agents", {}) if registry is not None else {}
+        if agent_id and isinstance(agents, dict):
+            return agents.get(agent_id)
+        return None
+
+    def _runtime_profile_for_agent(self, agent_config: object | None) -> dict:
+        profile_id = str(
+            getattr(agent_config, "runtime_profile", "")
+            or getattr(self, "runtime_profile_id", "")
+            or ""
+        ).strip()
+        config = self._runtime_config()
+        profiles = getattr(config, "runtime_profiles", {}) if config is not None else {}
+        profile_map = getattr(profiles, "profiles", profiles)
+        profile = profile_map.get(profile_id) if isinstance(profile_map, dict) else None
+        to_dict = getattr(profile, "to_dict", None)
+        if callable(to_dict):
+            return to_dict()
+        return dict(profile) if isinstance(profile, dict) else {}
+
+    def _runtime_approval_config(self) -> ApprovalConfig | None:
+        runtime_approval = getattr(self, "runtime_approval_config", None)
+        if isinstance(runtime_approval, ApprovalConfig):
+            return runtime_approval
+        config = self._runtime_config()
+        base = getattr(config, "approval", None)
+        if base is None:
+            return None
+        session_rules = [
+            rule
+            for rule in list(getattr(self, "session_approval_rules", []) or [])
+            if isinstance(rule, ApprovalRuleConfig)
+        ]
+        if not session_rules:
+            return base
+        global_rules = [
+            rule
+            for rule in base.rules
+            if not any(_same_approval_target(rule, session_rule) for session_rule in session_rules)
+        ]
+        return ApprovalConfig(
+            default_mode=base.default_mode,
+            rules=[*global_rules, *session_rules],
+        )
+
+    def _permission_subject(self) -> PermissionSubject:
+        agent_config = self._current_agent_config()
+        source = str(getattr(self, "permission_trigger_source", "") or "").strip()
+        if not source:
+            source = "chat" if str(getattr(self, "main_agent_id", "") or "").strip() else "manual"
+        explicit_interactive = getattr(self, "permission_interactive", None)
+        interactive = (
+            bool(explicit_interactive)
+            if explicit_interactive is not None
+            else source in {"chat", "manual"}
+        )
+        return PermissionSubject(
+            agent_id=self._current_agent_id(),
+            role=str(getattr(agent_config, "role", "") or ""),
+            visibility=str(getattr(agent_config, "visibility", "user") or "user"),
+            trigger_source=source,
+            interactive=interactive,
+            runtime_profile_id=str(
+                getattr(agent_config, "runtime_profile", "")
+                or getattr(self, "runtime_profile_id", "")
+                or ""
+            ),
+            session_id=getattr(self, "current_session_id", None),
+            task_id=getattr(self, "runtime_task_id", None),
+            workspace_root=getattr(self, "runtime_workspace_root", None),
+        )
+
+    def _permission_target_for_tool(self, tool: "Tool") -> PermissionTarget:
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        tool_source = str(getattr(tool, "tool_source", "") or "").strip()
+        if not tool_source:
+            tool_source = "builtin"
+        if tool_source == "mcp":
+            return PermissionTarget(
+                kind="mcp_tool",
+                name=tool_name,
+                tool_source="mcp",
+                mcp_server=str(getattr(tool, "server_name", "") or "") or None,
+                mcp_tool=tool_name,
             )
-            if name
+        if tool_source == "cli":
+            return PermissionTarget(
+                kind="cli_tool",
+                name=tool_name,
+                tool_source="cli",
+                registry_path=f"cli:{tool_name}" if tool_name else "",
+                component_id=f"cli:{tool_name}" if tool_name else "",
+            )
+        if tool_source == "skill":
+            return PermissionTarget(
+                kind="skill",
+                name=tool_name,
+                tool_source="skill",
+                registry_path=f"skill:{tool_name}" if tool_name else "",
+                component_id=f"skill:{tool_name}" if tool_name else "",
+            )
+        return PermissionTarget(
+            kind="builtin_tool",
+            name=tool_name,
+            tool_source="builtin",
+            registry_path=f"builtin:{tool_name}" if tool_name else "",
+            component_id=f"builtin_tool:{tool_name}" if tool_name else "",
+        )
+
+    def _permission_metadata_for_tool(self, tool: "Tool") -> dict:
+        mode = self.get_active_mode_config()
+        mode_tools = list(getattr(mode, "tools", []) or []) if mode is not None else []
+        return {
+            "active_mode": self.active_mode or "",
+            "mode_tools": mode_tools,
+            "suggested_modes": self.suggest_modes_for_tool(
+                str(getattr(tool, "name", "") or "")
+            ),
         }
-        names.update(_string_list(effective.get("builtin_tools")))
-        return names
 
-    def _authorized_mcp_servers(self) -> set[str]:
-        return set(_string_list(self._effective_capabilities().get("mcp_servers")))
+    def evaluate_tool_permission(
+        self,
+        tool: "Tool",
+        *,
+        tool_call: ToolCall | None = None,
+        action: str = "execute",
+    ) -> PermissionDecision:
+        """Evaluate runtime permission for a tool through the unified gateway."""
 
-    def _authorized_mcp_tool_names(self) -> set[str]:
-        return set(_string_list(self._effective_capabilities().get("mcp_tools")))
+        agent_config = self._current_agent_config()
+        return PermissionGateway().evaluate(
+            PermissionRequest(
+                subject=self._permission_subject(),
+                target=self._permission_target_for_tool(tool),
+                action=action,
+                tool_call=tool_call,
+                effective_capabilities=self._effective_capabilities(),
+                approval=self._runtime_approval_config(),
+                runtime_profile=self._runtime_profile_for_agent(agent_config),
+                agent_config=agent_config,
+                enforce_effective_capabilities=self.capability_tool_policy_enabled(),
+                metadata=self._permission_metadata_for_tool(tool),
+            )
+        )
 
     def is_tool_authorized(self, tool: "Tool") -> bool:
-        """Return whether the resolved capability policy allows this tool."""
+        """Return whether the unified permission gateway allows tool visibility."""
 
-        if not self.capability_tool_policy_enabled():
-            return True
-        tool_name = str(getattr(tool, "name", "") or "").strip()
-        if not tool_name:
-            return False
-        tool_source = str(getattr(tool, "tool_source", "") or "").strip()
-        if tool_source == "mcp":
-            server_name = str(getattr(tool, "server_name", "") or "").strip()
-            return (
-                tool_name in self._authorized_mcp_tool_names()
-                or server_name in self._authorized_mcp_servers()
-            )
-        return tool_name in self._authorized_builtin_tool_names()
+        return self.evaluate_tool_permission(tool).allowed
 
     def suggest_modes_for_tool(self, tool_name: str) -> list[str]:
         """Return mode names that allow the given tool."""
