@@ -171,7 +171,7 @@ class RemoteChatRoutes:
                 model_id=req.model_id,
                 model_parameters=req.parameters,
                 locale=getattr(req, "locale", None),
-                mentions=req.mentions,
+                mentions=getattr(req, "mentions", []),
                 initial_prompt=req.prompt,
             )
             session.append_event(
@@ -184,7 +184,7 @@ class RemoteChatRoutes:
                     "provider_id": req.provider_id,
                     "model_id": req.model_id,
                     "locale": getattr(req, "locale", None),
-                    "mentions": req.mentions,
+                    "mentions": getattr(req, "mentions", []),
                 },
             )
             session.mark_running()
