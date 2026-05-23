@@ -20,6 +20,9 @@ _SKIP_DIRS = {
     "build",
 }
 
+_BINARY_SAMPLE_BYTES = 8192
+_MAX_MATCH_LINE_CHARS = 4096
+
 
 @register_tool
 class GrepTool(Tool):
@@ -86,17 +89,25 @@ class GrepTool(Tool):
             files = self._walk(base, include)
 
         matches = []
+        skipped_binary = 0
         for fp in files:
-            try:
-                text = fp.read_text(errors="ignore")
-            except OSError:
+            text, is_binary = self._read_searchable_text(fp)
+            if is_binary:
+                if base.is_file():
+                    return f"Skipped binary file: {fp}"
+                skipped_binary += 1
+                continue
+            if text is None:
                 continue
             for lineno, line in enumerate(text.splitlines(), 1):
                 if regex.search(line):
-                    matches.append(f"{fp}:{lineno}: {line.rstrip()}")
+                    matches.append(self._format_match(fp, lineno, line))
                     if len(matches) >= 200:
                         matches.append("... (200 match limit reached)")
                         return "\n".join(matches)
+
+        if skipped_binary:
+            matches.append(f"Skipped {skipped_binary} binary file(s).")
 
         return "\n".join(matches) if matches else "No matches found."
 
@@ -111,3 +122,25 @@ class GrepTool(Tool):
             if len(results) >= 5000:
                 break
         return results
+
+    @staticmethod
+    def _read_searchable_text(path: Path) -> tuple[str | None, bool]:
+        try:
+            with path.open("rb") as fh:
+                sample = fh.read(_BINARY_SAMPLE_BYTES)
+                if b"\x00" in sample:
+                    return None, True
+                rest = fh.read()
+        except OSError:
+            return None, False
+
+        if b"\x00" in rest:
+            return None, True
+        return (sample + rest).decode("utf-8", errors="replace"), False
+
+    @staticmethod
+    def _format_match(path: Path, lineno: int, line: str) -> str:
+        text = line.rstrip()
+        if len(text) > _MAX_MATCH_LINE_CHARS:
+            text = text[:_MAX_MATCH_LINE_CHARS].rstrip() + "... (line truncated)"
+        return f"{path}:{lineno}: {text}"
