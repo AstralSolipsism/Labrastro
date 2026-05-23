@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import threading
 import time
 from http import HTTPStatus
@@ -60,6 +61,8 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorRunResult,
 )
 from reuleauxcoder.interfaces.events import UIEventKind
+
+logger = logging.getLogger(__name__)
 
 
 def _chat_events_handler_error_payload(exc: Exception) -> dict[str, str]:
@@ -192,6 +195,10 @@ class RemoteChatRoutes:
                 try:
                     self.service.chat_events_handler(peer_id, req.prompt, session)
                 except Exception as exc:
+                    logger.exception(
+                        "Remote chat handler failed",
+                        extra={"peer_id": peer_id, "chat_id": session.chat_id},
+                    )
                     payload = _chat_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
@@ -322,6 +329,10 @@ class RemoteChatRoutes:
                 try:
                     self.service.chat_events_handler(peer_id, req.prompt, session)
                 except Exception as exc:
+                    logger.exception(
+                        "Remote chat handler failed",
+                        extra={"peer_id": peer_id, "chat_id": session.chat_id},
+                    )
                     payload = _chat_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
@@ -542,6 +553,10 @@ class RemoteChatRoutes:
                 try:
                     self.service.chat_events_handler(peer_id, prompt, session)
                 except Exception as exc:
+                    logger.exception(
+                        "Remote chat recovery handler failed",
+                        extra={"peer_id": peer_id, "chat_id": session.chat_id},
+                    )
                     payload = _chat_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
