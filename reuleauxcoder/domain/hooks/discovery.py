@@ -77,7 +77,6 @@ def discover_hook_specs() -> list[HookSpec]:
         LspDiagnosticInjectorHook,
         LspEditObserverHook,
         ToolOutputTruncationHook,
-        ToolPolicyGuardHook,
         ProjectContextHook,
         ProjectContextStartupNotifier,
     )

@@ -5,8 +5,6 @@ from reuleauxcoder.domain.config.models import (
     ApprovalRuleConfig,
     Config,
 )
-from reuleauxcoder.domain.hooks import HookPoint
-from reuleauxcoder.domain.hooks.builtin import ToolPolicyGuardHook
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.extensions.command.builtin.approval import (
     SetApprovalRuleCommand,
@@ -20,10 +18,6 @@ from reuleauxcoder.interfaces.events import UIEventBus, UIEventLevel
 def _build_ctx() -> SimpleNamespace:
     config = Config(approval=ApprovalConfig())
     hook_registry = HookRegistry()
-    hook_registry.register(
-        HookPoint.BEFORE_TOOL_EXECUTE,
-        ToolPolicyGuardHook(approval_config=config.approval),
-    )
     agent = SimpleNamespace(hook_registry=hook_registry)
     ui_bus = UIEventBus()
     return SimpleNamespace(config=config, agent=agent, ui_bus=ui_bus)
@@ -75,6 +69,11 @@ def test_set_global_approval_rule_updates_config_and_runtime(monkeypatch) -> Non
     assert ctx.config.approval.rules[0].action == "warn"
     assert getattr(ctx.agent, "session_approval_rules", []) == []
     assert result.payload["saved_path"] == "/tmp/config.yaml"
+    runtime_approval = getattr(ctx.agent, "runtime_approval_config")
+    assert [(rule.tool_name, rule.action) for rule in runtime_approval.rules] == [
+        ("shell", "warn")
+    ]
+    assert ctx.agent.hook_registry._hooks == {}
     assert any(
         event.level == UIEventLevel.SUCCESS
         and "Updated global approval rule" in event.message

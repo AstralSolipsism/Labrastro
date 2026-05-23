@@ -177,3 +177,4 @@ def test_memory_hooks_are_builtin_core_hooks() -> None:
     assert "MemoryContextHook" in names
     assert "MemorySessionSaveHook" in names
     assert "MemoryToolCaptureHook" in names
+    assert "ToolPolicyGuardHook" not in names

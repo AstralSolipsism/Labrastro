@@ -11,8 +11,6 @@ from reuleauxcoder.domain.approval_engine import (
 )
 from reuleauxcoder.domain.config.models import ApprovalConfig, ApprovalRuleConfig
 from reuleauxcoder.domain.config.schema import DEFAULTS
-from reuleauxcoder.domain.hooks import HookPoint
-from reuleauxcoder.domain.hooks.builtin import ToolPolicyGuardHook
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.extensions.mcp.runtime import find_mcp_server
 from reuleauxcoder.extensions.tools.registry import build_tools
@@ -180,11 +178,9 @@ def resolve_mcp_server_action(config, server_name: str) -> str:
 
 
 def refresh_approval_runtime(agent, approval_config: ApprovalConfig) -> None:
-    """Push approval config changes into live runtime hooks."""
-    hooks = agent.hook_registry._hooks.get(HookPoint.BEFORE_TOOL_EXECUTE, [])
-    for hook in hooks:
-        if isinstance(hook, ToolPolicyGuardHook):
-            hook.update_approval_config(approval_config)
+    """Store the effective approval config consumed by PermissionGateway."""
+
+    setattr(agent, "runtime_approval_config", approval_config)
 
 
 def is_disabled_mcp_rule(config, rule: ApprovalRuleConfig) -> bool:
