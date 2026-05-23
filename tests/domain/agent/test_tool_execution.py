@@ -2,8 +2,10 @@
 
 from types import SimpleNamespace
 
+from reuleauxcoder.domain.approval import ApprovalDecision
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
 from reuleauxcoder.domain.llm.models import ToolCall
+from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
 from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
 
@@ -264,8 +266,14 @@ def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
         preflight_validate=lambda **kwargs: None,
     )
     agent = _AgentStub(tool)
-    agent.capability_tool_policy_enabled = lambda: True
-    agent.is_tool_authorized = lambda _tool: False
+    agent.evaluate_tool_permission = lambda _tool, tool_call=None: PermissionDecision(
+        action=PermissionAction.DENY,
+        authorized=False,
+        reason=(
+            "builtin_tool 'write_file' is not authorized by this Agent's "
+            "effective_capabilities"
+        ),
+    )
     executor = ToolExecutor(agent)
 
     result = executor.execute(
@@ -273,6 +281,490 @@ def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
     )
 
     assert result == (
-        "Error: tool 'write_file' is not authorized by this "
-        "Agent's effective_capabilities"
+        "Error: tool 'write_file' denied by permission gateway: builtin_tool "
+        "'write_file' is not authorized by this Agent's effective_capabilities"
     )
+
+
+def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> None:
+    class CaptureTool:
+        description = "Write a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            if getattr(tool, "name", "") == "write_file":
+                return PermissionDecision(
+                    action=PermissionAction.DENY,
+                    authorized=False,
+                    reason="write_file denied after transform",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    result = ToolExecutor(TransformingAgent()).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert (
+        result
+        == "Error: tool 'write_file' denied by permission gateway: write_file denied after transform"
+    )
+
+
+def test_tool_executor_reevaluates_permission_after_in_place_argument_transform() -> None:
+    class CaptureTool:
+        name = "read_file"
+        description = "Read a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self) -> None:
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            self.tool = CaptureTool()
+            super().__init__(self.tool)
+            self.permission_checks = []
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call.arguments["file_path"] = "/private/secret.txt"
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            file_path = str((tool_call.arguments or {}).get("file_path") or "")
+            self.permission_checks.append(file_path)
+            if file_path.startswith("/private/"):
+                return PermissionDecision(
+                    action=PermissionAction.DENY,
+                    authorized=False,
+                    reason="private path denied after transform",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call-original",
+            name="read_file",
+            arguments={"file_path": "/tmp/ok.txt"},
+        )
+    )
+
+    assert result == (
+        "Error: tool 'read_file' denied by permission gateway: "
+        "private path denied after transform"
+    )
+    assert agent.permission_checks == ["/tmp/ok.txt", "/private/secret.txt"]
+    assert agent.tool.executed is False
+
+
+def test_tool_executor_requests_approval_after_tool_call_transform() -> None:
+    class CaptureTool:
+        description = "Write a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "executed"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.allow_once("ok")
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self.approval_provider = ApprovalProvider()
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            if getattr(tool, "name", "") == "write_file":
+                return PermissionDecision(
+                    action=PermissionAction.REQUIRE_APPROVAL,
+                    authorized=True,
+                    reason="write_file requires approval after transform",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == "executed"
+    assert len(agent.approval_provider.requests) == 1
+    assert agent.approval_provider.requests[0].tool_name == "write_file"
+
+
+def test_tool_executor_reapproves_when_transform_changes_arguments_after_approval() -> None:
+    class CaptureTool:
+        name = "write_file"
+        description = "Write a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self) -> None:
+            self.received = None
+
+        def execute(self, **kwargs) -> str:
+            self.received = kwargs
+            return f"executed:{kwargs.get('file_path')}"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.allow_once("ok")
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            self.tool = CaptureTool()
+            super().__init__(self.tool)
+            self.approval_provider = ApprovalProvider()
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call.arguments["file_path"] = "/tmp/after.txt"
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason="write_file requires approval",
+            )
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call-original",
+            name="write_file",
+            arguments={"file_path": "/tmp/before.txt"},
+        )
+    )
+
+    assert result == "executed:/tmp/after.txt"
+    assert [request.tool_args for request in agent.approval_provider.requests] == [
+        {"file_path": "/tmp/before.txt"},
+        {"file_path": "/tmp/after.txt"},
+    ]
+    assert agent.tool.received == {"file_path": "/tmp/after.txt"}
+
+
+def test_tool_executor_reapproves_when_transform_changes_tool_after_approval() -> None:
+    class CaptureTool:
+        description = "Capture"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return f"executed:{self.name}"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.allow_once("ok")
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self.approval_provider = ApprovalProvider()
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason=f"{getattr(tool, 'name', '')} requires approval",
+            )
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == "executed:write_file"
+    assert [request.tool_name for request in agent.approval_provider.requests] == [
+        "read_file",
+        "write_file",
+    ]
+    assert agent._tools["read_file"].executed is False
+    assert agent._tools["write_file"].executed is True
+
+
+def test_tool_executor_blocks_background_approval_after_transform_without_prompting() -> None:
+    class CaptureTool:
+        description = "Write a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def request_approval(self, request):  # noqa: ARG002
+            raise AssertionError("background blocked_review must not prompt")
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self.approval_provider = ApprovalProvider()
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            if getattr(tool, "name", "") == "write_file":
+                return PermissionDecision(
+                    action=PermissionAction.BLOCKED_REVIEW,
+                    authorized=False,
+                    reason="write_file requires background review",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == (
+        "Error: tool 'write_file' blocked pending review: "
+        "write_file requires background review"
+    )
+    assert agent._tools["write_file"].executed is False
+
+
+def test_tool_executor_handles_interrupted_approval_after_transform() -> None:
+    class CaptureTool:
+        description = "Write a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def request_approval(self, request):  # noqa: ARG002
+            raise EOFError
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self.approval_provider = ApprovalProvider()
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            if getattr(tool, "name", "") == "write_file":
+                return PermissionDecision(
+                    action=PermissionAction.REQUIRE_APPROVAL,
+                    authorized=True,
+                    reason="write_file requires approval after transform",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == "Tool 'write_file' approval interrupted by user"
+    assert agent._tools["write_file"].executed is False
+
+
+def test_tool_executor_executes_transformed_tool_when_permission_allows() -> None:
+    class CaptureTool:
+        description = "Capture"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return f"executed:{self.name}"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.permission_checks = []
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            self.permission_checks.append(getattr(tool, "name", ""))
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = TransformingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == "executed:write_file"
+    assert agent.permission_checks == ["read_file", "write_file"]
+    assert agent._tools["read_file"].executed is False
+    assert agent._tools["write_file"].executed is True

@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 import concurrent.futures
 from contextlib import nullcontext
+import copy
 import re
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ from reuleauxcoder.domain.hooks.types import (
     BeforeToolExecuteContext,
     HookPoint,
 )
+from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from reuleauxcoder.extensions.tools.registry import get_tool
 from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
@@ -124,6 +126,177 @@ class ToolExecutor:
             "model": getattr(llm, "model", None),
         }
 
+    def _evaluate_permission(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+    ) -> PermissionDecision | None:
+        evaluator = getattr(self.agent, "evaluate_tool_permission", None)
+        if not callable(evaluator):
+            return None
+        permission_tool = tool
+        if permission_tool is None:
+            permission_tool = type(
+                "_PermissionTool",
+                (),
+                {"name": tc.name, "tool_source": "unknown"},
+            )()
+        return evaluator(permission_tool, tool_call=tc)
+
+    def _permission_context_payload(
+        self,
+        decision: PermissionDecision,
+    ) -> dict:
+        audit = dict(decision.audit or {})
+        return {
+            "agent_id": audit.get("agent_id", ""),
+            "source": audit.get("source", ""),
+            "interactive": audit.get("interactive", False),
+            "target": {
+                "kind": audit.get("target_kind", ""),
+                "name": audit.get("target_name", ""),
+                "tool_source": audit.get("tool_source", ""),
+                "mcp_server": audit.get("mcp_server", ""),
+            },
+            "decision": decision.to_dict(),
+        }
+
+    def _permission_block_message(
+        self,
+        decision: PermissionDecision,
+        tool_name: str,
+    ) -> str:
+        reason = decision.reason or "blocked by permission gateway"
+        if decision.action == PermissionAction.BLOCKED_REVIEW:
+            return f"Error: tool '{tool_name}' blocked pending review: {reason}"
+        return f"Error: tool '{tool_name}' denied by permission gateway: {reason}"
+
+    def _return_permission_block(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+        decision: PermissionDecision,
+        *,
+        validation_meta: dict | None = None,
+    ) -> str:
+        message = self._permission_block_message(decision, tc.name)
+        diagnostic = tool_diagnostic_from_failure(
+            stage=ToolDiagnosticStage.PREFLIGHT,
+            kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+            code=f"permission_{decision.action.value}",
+            message=message,
+            tool_name=tc.name,
+            tool_call_id=tc.id,
+            metadata={"permission": decision.to_dict()},
+        )
+        context = self._tool_argument_context(tc, tool)
+        self._record_lifecycle_diagnostics([diagnostic], context)
+        self._emit_tool_end(
+            tc,
+            message,
+            tool=tool,
+            meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+        )
+        return message
+
+    def _request_permission_approval(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+        decision: PermissionDecision,
+        validation_context: dict,
+        validation_meta: dict | None,
+    ) -> str | None:
+        provider = self.agent.approval_provider
+        if provider is None:
+            message = (
+                decision.reason
+                or f"Tool '{tc.name}' requires approval, but no approval provider is configured"
+            )
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.APPROVAL,
+                kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                code="approval_provider_missing",
+                message=message,
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
+            return message
+        try:
+            decision_result = provider.request_approval(
+                ApprovalRequest(
+                    tool_name=tc.name,
+                    tool_args=dict(tc.arguments),
+                    tool_source=getattr(tool, "tool_source", "builtin_tool")
+                    if tool is not None
+                    else "unknown",
+                    reason=decision.reason,
+                    metadata={
+                        "tool_call_id": tc.id,
+                        "permission": decision.to_dict(),
+                    },
+                )
+            )
+        except (KeyboardInterrupt, EOFError):
+            message = f"Tool '{tc.name}' approval interrupted by user"
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.APPROVAL,
+                kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                code="approval_interrupted",
+                message=message,
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
+            return message
+        if decision_result.approved:
+            return None
+        message = decision_result.reason or f"Tool '{tc.name}' denied by approval provider"
+        decision_diagnostics = [
+            diagnostic_to_dict(item)
+            for item in decision_result.meta.get("tool_diagnostics", [])
+            if isinstance(item, (ToolDiagnostic, dict))
+        ]
+        if not decision_diagnostics:
+            decision_diagnostics = [
+                tool_diagnostic_from_failure(
+                    stage=ToolDiagnosticStage.APPROVAL,
+                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                    code="approval_denied",
+                    message=message,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                ).to_dict()
+            ]
+        self._record_lifecycle_diagnostics(decision_diagnostics, validation_context)
+        failure_meta = {
+            "failure_kind": decision_result.meta.get(
+                "failure_kind", ToolFailureKind.APPROVAL_DENIED.value
+            ),
+            **decision_result.meta,
+            "tool_diagnostics": decision_diagnostics,
+        }
+        self._emit_tool_end(
+            tc,
+            message,
+            tool=tool,
+            meta=self._merge_meta(validation_meta, failure_meta),
+        )
+        return message
+
     def _persist_tool_diagnostics(
         self,
         diagnostics_payload: list[ToolDiagnostic | dict],
@@ -196,6 +369,11 @@ class ToolExecutor:
         if tool is None:
             tool = get_tool(tc.name)
 
+        # Tool permissions are centralized in PermissionGateway; this hook point
+        # is reserved for transforms/observers, not guard-chain authorization.
+        permission_decision = self._evaluate_permission(tc, tool)
+        approved_permission_key: tuple[str, dict] | None = None
+
         before_context = BeforeToolExecuteContext(
             hook_point=HookPoint.BEFORE_TOOL_EXECUTE,
             tool_call=tc,
@@ -209,33 +387,19 @@ class ToolExecutor:
                 "mcp_server": getattr(tool, "server_name", None),
                 "tool_description": getattr(tool, "description", None),
                 "tool_schema": getattr(tool, "parameters", None),
+                "permission_decision": (
+                    permission_decision.to_dict()
+                    if permission_decision is not None
+                    else {}
+                ),
             },
         )
 
-        guard_decisions = self.agent.hook_registry.run_guards(
-            HookPoint.BEFORE_TOOL_EXECUTE,
-            before_context,
-        )
-        denied = next((d for d in guard_decisions if not d.allowed), None)
-        if denied is not None:
-            message = denied.reason or f"Tool '{tc.name}' blocked by guard hook"
-            diagnostic = tool_diagnostic_from_failure(
-                stage=ToolDiagnosticStage.PREFLIGHT,
-                kind=ToolDiagnosticKind.APPROVAL_DENIED,
-                code="guard_denied",
-                message=message,
-                tool_name=tc.name,
-                tool_call_id=tc.id,
-            )
-            context = self._tool_argument_context(tc, tool)
-            self._record_lifecycle_diagnostics([diagnostic], context)
-            self._emit_tool_end(
-                tc,
-                message,
-                tool=tool,
-                meta=self._diagnostics_meta([diagnostic]),
-            )
-            return message
+        if permission_decision is not None and permission_decision.action in {
+            PermissionAction.DENY,
+            PermissionAction.BLOCKED_REVIEW,
+        }:
+            return self._return_permission_block(tc, tool, permission_decision)
 
         argument_error = getattr(tc, "argument_error", None)
         if argument_error:
@@ -352,135 +516,20 @@ class ToolExecutor:
             )
             return preflight_error
 
-        if not self.agent.is_tool_allowed_in_mode(tc.name):
-            mode_name = self.agent.active_mode or "default"
-            suggested_modes = self.agent.suggest_modes_for_tool(tc.name)
-            if suggested_modes:
-                suggestions = ", ".join(
-                    f"/mode switch {name}" for name in suggested_modes
-                )
-                message = (
-                    f"Tool '{tc.name}' is not available in current mode '{mode_name}'. "
-                    f"Ask user to switch mode first: {suggestions}"
-                )
-            else:
-                message = (
-                    f"Tool '{tc.name}' is not available in current mode '{mode_name}'"
-                )
-            diagnostic = tool_diagnostic_from_failure(
-                stage=ToolDiagnosticStage.PREFLIGHT,
-                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
-                code="tool_unavailable_in_mode",
-                message=message,
-                tool_name=tc.name,
-                tool_call_id=tc.id,
-                repairable=True,
-                metadata={"mode": mode_name, "suggested_modes": suggested_modes},
-            )
-            self._record_lifecycle_diagnostics([diagnostic], validation_context)
-            self._emit_tool_end(
+        if (
+            permission_decision is not None
+            and permission_decision.action == PermissionAction.REQUIRE_APPROVAL
+        ):
+            approval_message = self._request_permission_approval(
                 tc,
-                message,
-                tool=tool,
-                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+                tool,
+                permission_decision,
+                validation_context,
+                validation_meta,
             )
-            return message
-
-        approval_required = next(
-            (d for d in guard_decisions if d.requires_approval), None
-        )
-        if approval_required is not None:
-            provider = self.agent.approval_provider
-            if provider is None:
-                message = (
-                    approval_required.reason
-                    or f"Tool '{tc.name}' requires approval, but no approval provider is configured"
-                )
-                diagnostic = tool_diagnostic_from_failure(
-                    stage=ToolDiagnosticStage.APPROVAL,
-                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
-                    code="approval_provider_missing",
-                    message=message,
-                    tool_name=tc.name,
-                    tool_call_id=tc.id,
-                )
-                self._record_lifecycle_diagnostics([diagnostic], validation_context)
-                self._emit_tool_end(
-                    tc,
-                    message,
-                    tool=tool,
-                    meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
-                )
-                return message
-            try:
-                decision = provider.request_approval(
-                    ApprovalRequest(
-                        tool_name=tc.name,
-                        tool_args=dict(tc.arguments),
-                        tool_source=getattr(tool, "tool_source", "builtin_tool")
-                        if tool is not None
-                        else "unknown",
-                        reason=approval_required.reason,
-                        metadata={"tool_call_id": tc.id},
-                    )
-                )
-            except (KeyboardInterrupt, EOFError):
-                message = f"Tool '{tc.name}' approval interrupted by user"
-                diagnostic = tool_diagnostic_from_failure(
-                    stage=ToolDiagnosticStage.APPROVAL,
-                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
-                    code="approval_interrupted",
-                    message=message,
-                    tool_name=tc.name,
-                    tool_call_id=tc.id,
-                )
-                self._record_lifecycle_diagnostics([diagnostic], validation_context)
-                self._emit_tool_end(
-                    tc,
-                    message,
-                    tool=tool,
-                    meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
-                )
-                return message
-
-            if not decision.approved:
-                message = (
-                    decision.reason or f"Tool '{tc.name}' denied by approval provider"
-                )
-                decision_diagnostics = [
-                    diagnostic_to_dict(item)
-                    for item in decision.meta.get("tool_diagnostics", [])
-                    if isinstance(item, (ToolDiagnostic, dict))
-                ]
-                if not decision_diagnostics:
-                    decision_diagnostics = [
-                        tool_diagnostic_from_failure(
-                            stage=ToolDiagnosticStage.APPROVAL,
-                            kind=ToolDiagnosticKind.APPROVAL_DENIED,
-                            code="approval_denied",
-                            message=message,
-                            tool_name=tc.name,
-                            tool_call_id=tc.id,
-                        ).to_dict()
-                    ]
-                self._record_lifecycle_diagnostics(
-                    decision_diagnostics,
-                    validation_context,
-                )
-                failure_meta = {
-                    "failure_kind": decision.meta.get(
-                        "failure_kind", ToolFailureKind.APPROVAL_DENIED.value
-                    ),
-                    **decision.meta,
-                    "tool_diagnostics": decision_diagnostics,
-                }
-                self._emit_tool_end(
-                    tc,
-                    message,
-                    tool=tool,
-                    meta=self._merge_meta(validation_meta, failure_meta),
-                )
-                return message
+            if approval_message is not None:
+                return approval_message
+            approved_permission_key = (tc.name, copy.deepcopy(dict(tc.arguments or {})))
 
         before_context = self.agent.hook_registry.run_transforms(
             HookPoint.BEFORE_TOOL_EXECUTE,
@@ -494,30 +543,6 @@ class ToolExecutor:
 
         # First check agent's tools, then fall back to global registry
         tool = self.agent.get_tool(tool_call.name)
-        if tool is None and getattr(
-            self.agent, "capability_tool_policy_enabled", lambda: False
-        )():
-            message = (
-                f"Error: tool '{tool_call.name}' is not authorized by this "
-                "Agent's effective_capabilities"
-            )
-            diagnostic = tool_diagnostic_from_failure(
-                stage=ToolDiagnosticStage.PREFLIGHT,
-                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
-                code="tool_not_authorized",
-                message=message,
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-            )
-            context = self._tool_argument_context(tool_call, tool)
-            self._record_lifecycle_diagnostics([diagnostic], context)
-            self._emit_tool_end(
-                tool_call,
-                message,
-                tool=tool,
-                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
-            )
-            return message
         if tool is None:
             tool = get_tool(tool_call.name)
 
@@ -540,29 +565,40 @@ class ToolExecutor:
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
-        if not getattr(self.agent, "is_tool_authorized", lambda _tool: True)(tool):
-            message = (
-                f"Error: tool '{tool_call.name}' is not authorized by this "
-                "Agent's effective_capabilities"
-            )
-            diagnostic = tool_diagnostic_from_failure(
-                stage=ToolDiagnosticStage.PREFLIGHT,
-                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
-                code="tool_not_authorized",
-                message=message,
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-            )
-            context = self._tool_argument_context(tool_call, tool)
-            self._record_lifecycle_diagnostics([diagnostic], context)
-            self._emit_tool_end(
+        permission_decision = self._evaluate_permission(tool_call, tool)
+        if permission_decision is not None and permission_decision.action in {
+            PermissionAction.DENY,
+            PermissionAction.BLOCKED_REVIEW,
+        }:
+            return self._return_permission_block(
                 tool_call,
-                message,
-                tool=tool,
-                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+                tool,
+                permission_decision,
+                validation_meta=validation_meta,
             )
-            return message
-
+        if (
+            permission_decision is not None
+            and permission_decision.action == PermissionAction.REQUIRE_APPROVAL
+        ):
+            already_approved = (
+                approved_permission_key is not None
+                and approved_permission_key[0] == tool_call.name
+                and approved_permission_key[1] == tool_call.arguments
+            )
+            if not already_approved:
+                transformed_validation_context = self._tool_argument_context(
+                    tool_call,
+                    tool,
+                )
+                approval_message = self._request_permission_approval(
+                    tool_call,
+                    tool,
+                    permission_decision,
+                    transformed_validation_context,
+                    validation_meta,
+                )
+                if approval_message is not None:
+                    return approval_message
         execution_context = self._tool_argument_context(tool_call, tool)
         backend = getattr(tool, "backend", None)
         context = getattr(backend, "context", None)
@@ -571,11 +607,21 @@ class ToolExecutor:
             "local" if backend_id in (None, "local") else str(backend_id)
         )
         previous_tool_call_id = getattr(context, "current_tool_call_id", None)
+        previous_permission_context = getattr(context, "permission_context", {})
         if context is not None:
             try:
                 setattr(context, "current_tool_call_id", tool_call.id)
             except Exception:
                 pass
+            if permission_decision is not None:
+                try:
+                    setattr(
+                        context,
+                        "permission_context",
+                        self._permission_context_payload(permission_decision),
+                    )
+                except Exception:
+                    pass
         try:
             shell_context = nullcontext()
             if tool_call.name == "shell":
@@ -706,6 +752,10 @@ class ToolExecutor:
             if context is not None:
                 try:
                     setattr(context, "current_tool_call_id", previous_tool_call_id)
+                except Exception:
+                    pass
+                try:
+                    setattr(context, "permission_context", previous_permission_context)
                 except Exception:
                     pass
 
