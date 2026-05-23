@@ -71,10 +71,11 @@ def test_delegate_agent_rejects_missing_agent_config() -> None:
 def test_delegate_agent_rejects_internal_agent() -> None:
     tool, _control = _tool()
 
-    assert (
-        tool.preflight_validate(agent_id="capability_packager", task="review")
-        == "Error: AgentConfig is not delegable: capability_packager. Only user-visible worker Agents may be delegated."
-    )
+    result = tool.preflight_validate(agent_id="capability_packager", task="review")
+
+    assert result is not None
+    assert "permission gateway" in result
+    assert "system flow" in result
 
 
 def test_delegate_agent_submits_agent_run() -> None:

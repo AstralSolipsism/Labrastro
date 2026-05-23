@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
+from reuleauxcoder.domain.permission_gateway import PermissionGateway
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
@@ -130,9 +131,14 @@ class DelegateAgentTool(Tool):
         agent = agents.get(str(agent_id).strip())
         if agent is None:
             return f"Error: AgentConfig not found: {agent_id}"
-        if getattr(agent, "can_delegate", False) is not True:
+        decision = PermissionGateway().evaluate_agent_invocation(
+            agent,
+            source="delegation",
+            interactive=False,
+        )
+        if not decision.allowed:
             return (
-                "Error: AgentConfig is not delegable: "
-                f"{agent_id}. Only user-visible worker Agents may be delegated."
+                "Error: AgentConfig delegation denied by permission gateway: "
+                f"{decision.reason}"
             )
         return None
