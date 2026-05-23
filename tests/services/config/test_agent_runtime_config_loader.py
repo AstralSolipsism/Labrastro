@@ -334,6 +334,58 @@ def test_agent_run_snapshot_resolves_capability_component_overlay() -> None:
     assert "command `gh`" in catalog
 
 
+def test_agent_run_snapshot_keeps_worker_capabilities_separate_from_main_chat() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            **_model_config(),
+            "runtime_profiles": {"codex_remote": {"executor": "codex"}},
+            "agent_registry": {
+                "agents": {
+                    "main_chat": {
+                        "runtime_profile": "codex_remote",
+                        "capability_refs": ["repo-admin"],
+                    },
+                    "reviewer": {
+                        "runtime_profile": "codex_remote",
+                        "capability_refs": ["review"],
+                    },
+                },
+            },
+            "capability_packages": {
+                "repo-admin": {
+                    "components": ["builtin_tool:shell"],
+                },
+                "review": {
+                    "components": ["builtin_tool:read_file"],
+                },
+            },
+            "capability_components": {
+                "builtin_tool:shell": {
+                    "kind": "builtin_tool",
+                    "name": "shell",
+                },
+                "builtin_tool:read_file": {
+                    "kind": "builtin_tool",
+                    "name": "read_file",
+                },
+            },
+        }
+    )
+
+    snapshot = build_agent_run_snapshot(
+        agent_registry=config.agent_registry,
+        runtime_profiles=config.runtime_profiles,
+        run_limits=config.run_limits,
+        capability_packages=config.capability_packages,
+        capability_components=config.capability_components,
+    )
+
+    assert "builtin:shell" in snapshot["agents"]["main_chat"]["effective_capabilities"]["tools"]
+    assert snapshot["agents"]["reviewer"]["effective_capabilities"]["tools"] == [
+        "builtin:read_file"
+    ]
+
+
 def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> None:
     config = ConfigLoader()._parse_config(
         {
