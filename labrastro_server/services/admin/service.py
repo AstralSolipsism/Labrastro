@@ -38,6 +38,7 @@ from reuleauxcoder.domain.config.models import (
     SandboxProviderConfig,
     SkillsConfig,
     StreamRecoveryConfig,
+    build_agent_run_snapshot,
     ensure_default_capability_components,
     ensure_default_capability_packages,
     ensure_default_environment_agent_registry,
@@ -49,6 +50,12 @@ from labrastro_server.services.capability_packages import (
 )
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.domain.llm.models import ToolCall
+from reuleauxcoder.domain.permission_gateway import (
+    PermissionGateway,
+    PermissionRequest,
+    PermissionSubject,
+    PermissionTarget,
+)
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.llm.diagnostics import summarize_tool_diagnostic_events
@@ -2544,6 +2551,118 @@ class RemoteAdminConfigManager:
             getattr(capability, "value", str(capability)) for capability in capabilities
         )
 
+    def _agent_tool_permission_context(self, data: dict[str, Any]) -> dict[str, Any]:
+        agent_registry, runtime_profiles, run_limits = self._agent_settings_from_data(data)
+        packages = {
+            str(package_id): CapabilityPackageConfig.from_dict(
+                str(package_id), package_data
+            )
+            for package_id, package_data in ensure_default_capability_packages(
+                data.get("capability_packages", {})
+                if isinstance(data.get("capability_packages"), dict)
+                else {}
+            ).items()
+            if isinstance(package_data, dict)
+        }
+        components = {
+            str(component_id): CapabilityComponentConfig.from_dict(
+                str(component_id), component_data
+            )
+            for component_id, component_data in ensure_default_capability_components(
+                data.get("capability_components", {})
+                if isinstance(data.get("capability_components"), dict)
+                else {}
+            ).items()
+            if isinstance(component_data, dict)
+        }
+        snapshot = build_agent_run_snapshot(
+            agent_registry=agent_registry,
+            runtime_profiles=runtime_profiles,
+            run_limits=run_limits,
+            capability_packages=packages,
+            capability_components=components,
+        )
+        agent_id = ""
+        for candidate_id, agent in agent_registry.agents.items():
+            if agent.chat_entrypoint:
+                agent_id = candidate_id
+                break
+        if not agent_id and "main_chat" in agent_registry.agents:
+            agent_id = "main_chat"
+        if not agent_id and agent_registry.agents:
+            agent_id = next(iter(agent_registry.agents))
+        agent = agent_registry.agents.get(agent_id)
+        raw_agent = (
+            snapshot.get("agents", {}).get(agent_id, {})
+            if isinstance(snapshot.get("agents"), dict)
+            else {}
+        )
+        effective = (
+            raw_agent.get("effective_capabilities", {})
+            if isinstance(raw_agent, dict)
+            else {}
+        )
+        approval_settings = self._approval_settings(data)
+        approval = ApprovalConfig(
+            default_mode=str(
+                approval_settings.get("default_mode")
+                or DEFAULTS["approval_default_mode"]
+            ),
+            rules=[
+                ApprovalRuleConfig(
+                    tool_name=rule.get("tool_name"),
+                    tool_source=rule.get("tool_source"),
+                    mcp_server=rule.get("mcp_server"),
+                    effect_class=rule.get("effect_class"),
+                    profile=rule.get("profile"),
+                    action=rule.get("action", "require_approval"),
+                )
+                for rule in approval_settings.get("rules", [])
+                if isinstance(rule, dict)
+            ],
+        )
+        profile_id = str(getattr(agent, "runtime_profile", "") or "")
+        profile = runtime_profiles.profiles.get(profile_id)
+        return {
+            "agent_id": agent_id,
+            "agent": agent,
+            "subject": PermissionSubject(
+                agent_id=agent_id,
+                role=str(getattr(agent, "role", "") or ""),
+                visibility=str(getattr(agent, "visibility", "user") or "user"),
+                trigger_source="chat",
+                interactive=True,
+                runtime_profile_id=profile_id,
+            ),
+            "effective_capabilities": effective if isinstance(effective, dict) else {},
+            "approval": approval,
+            "runtime_profile": profile.to_dict() if profile is not None else {},
+        }
+
+    def _permission_view_for_agent_tool(
+        self,
+        permission_context: dict[str, Any],
+        target: PermissionTarget,
+    ) -> dict[str, Any]:
+        decision = PermissionGateway().evaluate(
+            PermissionRequest(
+                subject=permission_context["subject"],
+                target=target,
+                tool_call=ToolCall(
+                    id="behavior-catalog-preview",
+                    name=target.name,
+                    arguments={},
+                ),
+                effective_capabilities=permission_context["effective_capabilities"],
+                approval=permission_context["approval"],
+                runtime_profile=permission_context["runtime_profile"],
+                agent_config=permission_context["agent"],
+                enforce_effective_capabilities=True,
+                metadata={"catalog_agent_id": permission_context.get("agent_id", "")},
+            )
+        )
+        return decision.to_dict()
+
     def _agent_tool_catalog(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         items: dict[str, dict[str, Any]] = {}
         packages = self._capability_package_catalog(data)
@@ -2553,6 +2672,7 @@ class RemoteAdminConfigManager:
             raw_components if isinstance(raw_components, dict) else {}
         )
         mode_refs = self._mode_refs_by_tool(data)
+        permission_context = self._agent_tool_permission_context(data)
 
         for tool in build_tools():
             tool_name = str(getattr(tool, "name", "") or "")
@@ -2581,6 +2701,16 @@ class RemoteAdminConfigManager:
                 and component_execution_policy != "inherit"
             ):
                 execution_policy = component_execution_policy
+            permission = self._permission_view_for_agent_tool(
+                permission_context,
+                PermissionTarget(
+                    kind="builtin_tool",
+                    name=tool_name,
+                    tool_source="builtin",
+                    registry_path=f"builtin:{tool_name}",
+                    component_id=component_id,
+                ),
+            )
             items[f"builtin:{tool_name}"] = {
                 "id": f"builtin:{tool_name}",
                 "name": tool_name,
@@ -2608,6 +2738,7 @@ class RemoteAdminConfigManager:
                 "mode_refs": self._tool_mode_refs(mode_refs, tool_name),
                 "approval_status": approval_status,
                 "execution_policy": execution_policy,
+                "permission": permission,
             }
 
         for kind in ("cli", "mcp", "skill"):
@@ -2625,6 +2756,22 @@ class RemoteAdminConfigManager:
                     source_type="mcp" if kind == "mcp" else "unknown",
                     mcp_server=name if kind == "mcp" else None,
                 )
+                target_kind = (
+                    "mcp_tool"
+                    if kind == "mcp"
+                    else "cli_tool"
+                    if kind == "cli"
+                    else "skill"
+                )
+                target = PermissionTarget(
+                    kind=target_kind,
+                    name=name,
+                    tool_source="mcp" if kind == "mcp" else kind,
+                    component_id=component_id,
+                    registry_path=f"{kind}:{name}",
+                    mcp_server=name if kind == "mcp" else None,
+                    mcp_tool=name if kind == "mcp" else None,
+                )
                 items[f"{kind}:{name}"] = {
                     "id": f"{kind}:{name}",
                     "name": name,
@@ -2640,6 +2787,10 @@ class RemoteAdminConfigManager:
                     "approval_status": approval_status,
                     "execution_policy": self._execution_policy_for_approval(
                         approval_status
+                    ),
+                    "permission": self._permission_view_for_agent_tool(
+                        permission_context,
+                        target,
                     ),
                 }
 

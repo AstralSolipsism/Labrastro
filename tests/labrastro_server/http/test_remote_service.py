@@ -1313,6 +1313,11 @@ class TestRemoteRelayHTTPService:
             assert tools["builtin:fetch_capabilities"]["related_components"] == [
                 "builtin_tool:fetch_capabilities"
             ]
+            assert tools["builtin:fetch_capabilities"]["permission"]["action"] == "allow"
+            assert (
+                tools["builtin:fetch_capabilities"]["permission"]["capability_matched"]
+                == "builtin:fetch_capabilities"
+            )
             assert tools["capability_package:review"]["source_type"] == "capability_package"
             assert tools["capability_package:review"]["execution_policy"] == "inherit"
             assert (
@@ -1324,6 +1329,8 @@ class TestRemoteRelayHTTPService:
                 "mcp:github",
             ]
             assert tools["cli:gh"]["related_package_ids"] == ["review"]
+            assert tools["cli:gh"]["permission"]["action"] == "deny"
+            assert "effective_capabilities" in tools["cli:gh"]["permission"]["reason"]
             assert tools["mcp:github"]["related_package_ids"] == ["review"]
         finally:
             service.stop()
