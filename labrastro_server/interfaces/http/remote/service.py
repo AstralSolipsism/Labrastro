@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import queue
 import shutil
 import tempfile
@@ -90,6 +91,8 @@ from labrastro_server.services.github.service import (
     WebhookService,
 )
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -500,6 +503,22 @@ class _RemoteChatSession:
                 True,
             )
         except Exception:
+            try:
+                payload_bytes = len(
+                    json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                )
+            except Exception:
+                payload_bytes = None
+            logger.exception(
+                "Failed to persist remote chat trace event",
+                extra={
+                    "session_id": self.session_id,
+                    "chat_id": self.chat_id,
+                    "event_type": str(event.get("type") or ""),
+                    "chat_seq": int(event.get("seq") or 0),
+                    "payload_bytes": payload_bytes,
+                },
+            )
             return
         if session_event_seq is not None:
             event["session_event_seq"] = int(session_event_seq)
