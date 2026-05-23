@@ -5,9 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from reuleauxcoder.domain.hooks.types import GuardDecision
 from reuleauxcoder.domain.llm.models import ToolCall
-from reuleauxcoder.extensions.tools.policies.base import ToolPolicy
+from reuleauxcoder.extensions.tools.policies.base import ToolPolicy, ToolPolicyDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,17 +28,17 @@ class ShellDangerousCommandPolicy(ToolPolicy):
         (r"\bwget\b.*\|\s*(sudo\s+)?bash", "pipe wget to bash"),
     )
 
-    def evaluate(self, tool_call: ToolCall) -> GuardDecision | None:
+    def evaluate(self, tool_call: ToolCall) -> ToolPolicyDecision | None:
         if tool_call.name != "shell":
             return None
 
         command = tool_call.arguments.get("command")
         if not isinstance(command, str):
-            return GuardDecision.deny("shell tool requires a string 'command' argument")
+            return ToolPolicyDecision.deny("shell tool requires a string 'command' argument")
 
         for pattern, reason in self.patterns:
             if re.search(pattern, command):
-                return GuardDecision.deny(
+                return ToolPolicyDecision.deny(
                     f"Blocked by shell policy: {reason}. Command: {command}"
                 )
-        return GuardDecision.allow()
+        return ToolPolicyDecision.allow()
