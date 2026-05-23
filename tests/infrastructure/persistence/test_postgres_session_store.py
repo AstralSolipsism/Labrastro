@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import json
 import os
 
 import pytest
@@ -123,6 +125,96 @@ def test_postgres_session_store_trace_events_reduce_to_document_and_compress_pay
         assert row["payload"] is None
         assert row["payload_blob"] is not None
         assert row["payload_encoding"] == "json+gzip"
+    finally:
+        store.delete(session_id)
+
+
+def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> None:
+    store = _store()
+    session_id = store.save(
+        messages=[{"role": "user", "content": "a\x00b"}],
+        model="m1",
+        fingerprint="pg-test",
+    )
+
+    try:
+        loaded = store.load(session_id)
+        assert loaded is not None
+        assert loaded.messages[0]["content"] == "a\ufffdb"
+
+        store.append_trace_event(
+            session_id,
+            "chat_start",
+            {"prompt": "hi\x00there"},
+            chat_id="chat-nul",
+            chat_seq=1,
+        )
+        store.append_trace_event(
+            session_id,
+            "tool_call_end",
+            {
+                "tool_name": "grep",
+                "tool_call_id": "tool-nul",
+                "tool_result": "x\x00y",
+            },
+            chat_id="chat-nul",
+            chat_seq=2,
+        )
+
+        events = store.list_trace_events(session_id)
+        assert events[0]["payload"]["prompt"] == "hi\ufffdthere"
+        assert events[1]["payload"]["tool_result"] == "x\ufffdy"
+
+        document = store.load_document(session_id)
+        assert document is not None
+        assert document["turns"][0]["userMessage"]["text"] == "hi\ufffdthere"
+        tool_parts = document["turns"][0]["assistantMessages"][0]["parts"]
+        assert tool_parts[0]["toolOutput"] == "x\ufffdy"
+    finally:
+        store.delete(session_id)
+
+
+def test_postgres_session_store_sanitizes_nul_before_payload_compression() -> None:
+    engine = _engine()
+    store = PostgresSessionStore(engine, payload_compress_threshold_bytes=64)
+    session_id = store.save(
+        messages=[{"role": "user", "content": "compressed-nul"}],
+        model="m1",
+        fingerprint="pg-test",
+    )
+
+    try:
+        store.append_trace_event(
+            session_id,
+            "tool_call_end",
+            {
+                "tool_name": "grep",
+                "tool_call_id": "tool-compressed-nul",
+                "tool_result": "x\x00" + ("y" * 512),
+            },
+            chat_id="chat-compressed-nul",
+            chat_seq=1,
+        )
+
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT payload, payload_blob, payload_encoding
+                    FROM labrastro_session_trace_events
+                    WHERE session_id=:session_id AND seq=1
+                    """
+                ),
+                {"session_id": session_id},
+            ).mappings().one()
+
+        assert row["payload"] is None
+        assert row["payload_blob"] is not None
+        assert row["payload_encoding"] == "json+gzip"
+        raw = gzip.decompress(row["payload_blob"])
+        assert b"\\u0000" not in raw
+        assert b"\x00" not in raw
+        assert json.loads(raw.decode("utf-8"))["tool_result"].startswith("x\ufffd")
     finally:
         store.delete(session_id)
 

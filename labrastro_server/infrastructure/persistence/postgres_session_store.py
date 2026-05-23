@@ -38,13 +38,26 @@ def _require_sqlalchemy() -> None:
         raise RuntimeError("Postgres session store requires sqlalchemy and psycopg.")
 
 
+def _jsonb_safe(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "\uFFFD")
+    if isinstance(value, dict):
+        return {
+            _jsonb_safe(key) if isinstance(key, str) else key: _jsonb_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_jsonb_safe(item) for item in value]
+    return value
+
+
 def _json(value: Any) -> str:
-    return json.dumps(value if value is not None else {}, ensure_ascii=False)
+    return json.dumps(_jsonb_safe(value if value is not None else {}), ensure_ascii=False)
 
 
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(
-        value if value is not None else {},
+        _jsonb_safe(value if value is not None else {}),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
