@@ -5562,6 +5562,7 @@ class TestRemoteRelayHTTPService:
             assert set(update_body["settings"]["agent_registry"]["agents"]) == {
                 "environment_configurator",
                 "capability_packager",
+                "main_chat",
             }
             assert control.max_running_tasks == 3
             assert set(control.runtime_snapshot["runtime_profiles"]) == {
@@ -5571,6 +5572,7 @@ class TestRemoteRelayHTTPService:
             assert set(control.runtime_snapshot["agents"]) == {
                 "environment_configurator",
                 "capability_packager",
+                "main_chat",
             }
         finally:
             service.stop()
