@@ -31,6 +31,7 @@ from reuleauxcoder.domain.config.models import (
     ModelProfileConfig,
     PersistenceConfig,
     PromptConfig,
+    PROVIDER_CONFIG_FIELDS,
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
@@ -121,19 +122,7 @@ class ConfigLoader:
         "tool_output",
     }
     _PROVIDERS_FIELDS = {"items"}
-    _PROVIDER_ITEM_FIELDS = {
-        "api_features",
-        "api_key",
-        "base_url",
-        "compat",
-        "enabled",
-        "extra",
-        "headers",
-        "max_retries",
-        "models",
-        "timeout_sec",
-        "type",
-    }
+    _PROVIDER_ITEM_FIELDS = set(PROVIDER_CONFIG_FIELDS) | {"models"}
     _MODELS_FIELDS = {"active_main", "active_sub", "profiles"}
     _MODEL_PROFILE_FIELDS = {
         "backfill_reasoning_content_for_tool_calls",

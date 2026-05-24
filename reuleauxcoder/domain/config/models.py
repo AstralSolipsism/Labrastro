@@ -22,6 +22,19 @@ ProviderType = Literal["openai_chat", "anthropic_messages", "openai_responses"]
 ProviderCompat = Literal["generic", "deepseek", "kimi", "glm", "qwen", "zenmux"]
 
 SUPPORTED_PROVIDER_COMPATS = {"generic", "deepseek", "kimi", "glm", "qwen", "zenmux"}
+PROVIDER_CONFIG_FIELDS: tuple[str, ...] = (
+    "type",
+    "compat",
+    "enabled",
+    "api_key",
+    "base_url",
+    "headers",
+    "timeout_sec",
+    "max_retries",
+    "api_features",
+    "stream_recovery",
+    "extra",
+)
 
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID = "environment_local"
 DEFAULT_MAIN_CHAT_AGENT_ID = "main_chat"

@@ -26,12 +26,15 @@ CONFIG_SCHEMA = {
             "provider_id": {
                 "type": "string (one of openai_chat, anthropic_messages, openai_responses)",
                 "compat": "string (optional, one of generic, deepseek, kimi, glm, qwen, zenmux; inferred from base_url when omitted)",
+                "enabled": "bool (default: true)",
                 "api_key": "string (optional, supports ${ENV_NAME})",
                 "base_url": "string (optional, supports ${ENV_NAME})",
                 "headers": "dict of strings (optional)",
                 "timeout_sec": "int (default: 120)",
                 "max_retries": "int (default: 3)",
                 "api_features": "dict of booleans (optional)",
+                "stream_recovery": "dict (optional, provider stream retry/continue policy)",
+                "models": "list (optional, cached/discovered provider model metadata)",
                 "extra": "dict (optional, provider-specific settings)",
             }
         }
