@@ -19,6 +19,7 @@ class AgentEventType(Enum):
     CHAT_END = "chat_end"
     STREAM_TOKEN = "stream_token"
     REASONING_TOKEN = "reasoning_token"
+    TOOL_CALL_DELTA = "tool_call_delta"
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
@@ -84,14 +85,48 @@ class AgentEvent:
         *,
         tool_call_id: str | None = None,
         tool_source: str | None = None,
+        index: int | None = None,
     ) -> "AgentEvent":
         """Create a tool call start event."""
+        data = {
+            **({"tool_source": tool_source} if tool_source else {}),
+            **({"index": index} if index is not None else {}),
+        }
         return cls(
             event_type=AgentEventType.TOOL_CALL_START,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
             tool_args=tool_args,
-            data={"tool_source": tool_source} if tool_source else {},
+            data=data,
+        )
+
+    @classmethod
+    def tool_call_delta(
+        cls,
+        *,
+        index: int,
+        tool_call_id: str | None = None,
+        tool_name: str | None = None,
+        arguments_delta: str = "",
+        arguments_preview: str = "",
+        tool_source: str | None = None,
+    ) -> "AgentEvent":
+        """Create a UI-only event for a streamed tool-call draft."""
+        name = tool_name or None
+        payload = {
+            "index": index,
+            "tool_call_id": tool_call_id or "",
+            "tool_name": tool_name or "",
+            "arguments_delta": arguments_delta,
+            "arguments_preview": arguments_preview,
+            "status": "preparing",
+            **({"tool_source": tool_source} if tool_source else {}),
+        }
+        return cls(
+            event_type=AgentEventType.TOOL_CALL_DELTA,
+            tool_name=name,
+            tool_call_id=tool_call_id or None,
+            data=payload,
         )
 
     @classmethod

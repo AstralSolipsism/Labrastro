@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 _LIVE_ONLY_SESSION_EVENTS = frozenset(
-    {"assistant_delta", "reasoning_delta", "tool_call_stream"}
+    {"assistant_delta", "reasoning_delta", "tool_call_delta", "tool_call_stream"}
 )
 _DEFAULT_SESSION_TITLES = frozenset({"", "新会话"})
 

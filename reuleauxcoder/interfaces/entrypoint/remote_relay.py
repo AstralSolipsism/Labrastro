@@ -128,6 +128,13 @@ def _stable_digest(value: Any) -> str:
     return f"sha256-{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _tool_arguments_preview(value: Any, limit: int = 240) -> str:
+    text = str(value or "").replace("\x00", "\uFFFD")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
 def init_remote_relay(runner, config: Config, ui_bus: UIEventBus) -> None:
     """Initialize remote relay server if enabled and host_mode."""
     try:
@@ -1966,6 +1973,22 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 _append_final_stream_content()
                 remote_session.append_event("chat_interrupted", event.data)
                 return
+            if event.event_type == AgentEventType.TOOL_CALL_DELTA:
+                remote_session.append_event(
+                    "tool_call_delta",
+                    {
+                        "index": event.data.get("index", 0),
+                        "tool_name": event.data.get("tool_name") or event.tool_name,
+                        "tool_call_id": event.data.get("tool_call_id") or event.tool_call_id,
+                        "tool_source": event.data.get("tool_source"),
+                        "arguments_preview": _tool_arguments_preview(
+                            event.data.get("arguments_preview")
+                        ),
+                        "status": "preparing",
+                        "started_at": event.timestamp,
+                    },
+                )
+                return
             if event.event_type == AgentEventType.TOOL_CALL_START:
                 if event.tool_name and event.tool_call_id:
                     active_tool_calls_by_name.setdefault(event.tool_name, []).append(
@@ -1978,6 +2001,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         "tool_call_id": event.tool_call_id,
                         "tool_args": event.tool_args or {},
                         "tool_source": event.data.get("tool_source"),
+                        "index": event.data.get("index"),
                         "started_at": event.timestamp,
                     },
                 )

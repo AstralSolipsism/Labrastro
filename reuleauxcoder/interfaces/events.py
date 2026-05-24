@@ -260,6 +260,7 @@ class AgentEventBridge:
         ):
             level = UIEventLevel.ERROR
         elif event.event_type in (
+            AgentEventType.TOOL_CALL_DELTA,
             AgentEventType.TOOL_CALL_START,
             AgentEventType.TOOL_CALL_END,
             AgentEventType.DELEGATED_RUN_COMPLETED,

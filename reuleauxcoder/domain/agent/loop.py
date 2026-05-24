@@ -300,11 +300,29 @@ class AgentLoop:
                 streamed_reasoning = True
                 self.agent._emit_event(AgentEvent.reasoning_token(token))
 
+            def _on_tool_call_delta(delta: dict[str, object]) -> None:
+                raw_name = str(delta.get("tool_name") or "")
+                try:
+                    index = int(delta.get("index") or 0)
+                except (TypeError, ValueError):
+                    index = 0
+                self.agent._emit_event(
+                    AgentEvent.tool_call_delta(
+                        index=index,
+                        tool_call_id=str(delta.get("tool_call_id") or "") or None,
+                        tool_name=raw_name or None,
+                        arguments_delta=str(delta.get("arguments_delta") or ""),
+                        arguments_preview=str(delta.get("arguments_preview") or ""),
+                        tool_source=self._tool_source(raw_name) if raw_name else None,
+                    )
+                )
+
             resp = self.agent.llm.chat(
                 messages=self._full_messages(),
                 tools=self._tool_schemas(),
                 on_token=_on_token,
                 on_reasoning_token=_on_reasoning_token,
+                on_tool_call_delta=_on_tool_call_delta,
                 hook_registry=self.agent.hook_registry,
                 session_id=getattr(self.agent, "current_session_id", None),
                 ui_bus=self._ui_bus(),
@@ -349,6 +367,7 @@ class AgentLoop:
                         tc.arguments,
                         tool_call_id=tc.id,
                         tool_source=self._tool_source(tc.name),
+                        index=0,
                     )
                 )
                 result = self.agent._executor.execute(tc)
@@ -363,7 +382,7 @@ class AgentLoop:
             else:
                 # If approval is interactive, run sequentially to keep terminal UX stable.
                 if self.agent.approval_provider is not None:
-                    for tc in resp.tool_calls:
+                    for tool_index, tc in enumerate(resp.tool_calls):
                         if self.agent.stop_requested():
                             return "(stopped by cancellation request)"
                         self.agent._emit_event(
@@ -372,6 +391,7 @@ class AgentLoop:
                                 tc.arguments,
                                 tool_call_id=tc.id,
                                 tool_source=self._tool_source(tc.name),
+                                index=tool_index,
                             )
                         )
                         result = self.agent._executor.execute(tc)
@@ -387,13 +407,14 @@ class AgentLoop:
                     # No interactive approval needed: keep parallel execution.
                     if self.agent.stop_requested():
                         return "(stopped by cancellation request)"
-                    for tc in resp.tool_calls:
+                    for tool_index, tc in enumerate(resp.tool_calls):
                         self.agent._emit_event(
                             AgentEvent.tool_call_start(
                                 tc.name,
                                 tc.arguments,
                                 tool_call_id=tc.id,
                                 tool_source=self._tool_source(tc.name),
+                                index=tool_index,
                             )
                         )
                     results = self.agent._executor.execute_parallel(resp.tool_calls)
