@@ -492,6 +492,7 @@ class LLM:
             tool_choice=request.tool_choice,
             on_token=request.on_token,
             on_reasoning_token=request.on_reasoning_token,
+            on_tool_call_delta=request.on_tool_call_delta,
             metadata=recovery_metadata,
         )
 
@@ -586,6 +587,7 @@ class LLM:
         tools: Optional[list[dict]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         on_reasoning_token: Optional[Callable[[str], None]] = None,
+        on_tool_call_delta: Optional[Callable[[dict[str, Any]], None]] = None,
         hook_registry: HookRegistry | None = None,
         session_id: str | None = None,
         trace_id: str | None = None,
@@ -633,6 +635,7 @@ class LLM:
             thinking_enabled=self.thinking_enabled,
             on_token=on_token,
             on_reasoning_token=on_reasoning_token,
+            on_tool_call_delta=on_tool_call_delta,
             metadata=dict(metadata or {}),
         )
         params: dict[str, Any] = {}

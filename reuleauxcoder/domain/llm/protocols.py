@@ -16,6 +16,7 @@ class LLMProtocol(Protocol):
         tools: Optional[list[dict]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         on_reasoning_token: Optional[Callable[[str], None]] = None,
+        on_tool_call_delta: Optional[Callable[[dict[str, Any]], None]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages and receive a response.
@@ -25,6 +26,7 @@ class LLMProtocol(Protocol):
             tools: Optional list of tool schemas
             on_token: Optional callback invoked for each streamed text chunk
             on_reasoning_token: Optional callback invoked for each streamed reasoning chunk
+            on_tool_call_delta: Optional callback invoked for streamed tool-call arguments
 
         Returns:
             LLMResponse with content, tool calls, and token counts

@@ -17,6 +17,10 @@ from reuleauxcoder.services.providers.compat import (
     deepseek_anthropic_budget_is_provider_managed,
 )
 from reuleauxcoder.services.providers.stream_supervisor import StreamSupervisor
+from reuleauxcoder.services.providers.tool_call_delta import (
+    emit_tool_call_delta,
+    tool_arguments_preview,
+)
 from reuleauxcoder.services.providers.tool_arguments import (
     parse_provider_tool_arguments,
 )
@@ -346,11 +350,20 @@ class AnthropicMessagesProvider:
                 index = int(getattr(event, "index", len(tool_blocks)) or 0)
                 block = getattr(event, "content_block", None)
                 if getattr(block, "type", None) == "tool_use":
+                    name = str(getattr(block, "name", "") or "")
                     tool_blocks[index] = {
                         "id": str(getattr(block, "id", "") or ""),
-                        "name": str(getattr(block, "name", "") or ""),
+                        "name": name,
                         "args": "",
                     }
+                    emit_tool_call_delta(
+                        request,
+                        index=index,
+                        tool_call_id=tool_blocks[index]["id"],
+                        tool_name=name,
+                        arguments_delta="",
+                        arguments_preview="",
+                    )
                 return
             if event_type == "content_block_delta":
                 index = int(getattr(event, "index", 0) or 0)
@@ -372,10 +385,20 @@ class AnthropicMessagesProvider:
                 elif delta_type == "signature_delta":
                     reasoning_signature = str(getattr(delta, "signature", "") or "")
                 elif delta_type == "input_json_delta":
-                    tool_blocks.setdefault(
+                    raw = tool_blocks.setdefault(
                         index,
                         {"id": f"tool_call_{index}", "name": "", "args": ""},
-                    )["args"] += str(getattr(delta, "partial_json", "") or "")
+                    )
+                    partial_json = str(getattr(delta, "partial_json", "") or "")
+                    raw["args"] += partial_json
+                    emit_tool_call_delta(
+                        request,
+                        index=index,
+                        tool_call_id=raw.get("id") or "",
+                        tool_name=raw.get("name") or "",
+                        arguments_delta=partial_json,
+                        arguments_preview=tool_arguments_preview(raw.get("args", "")),
+                    )
                 return
             if event_type == "message_delta":
                 usage = getattr(event, "usage", None)

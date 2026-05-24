@@ -15,6 +15,10 @@ from reuleauxcoder.domain.providers.models import (
 )
 from reuleauxcoder.services.providers.compat import apply_openai_responses_qwen
 from reuleauxcoder.services.providers.stream_supervisor import StreamSupervisor
+from reuleauxcoder.services.providers.tool_call_delta import (
+    emit_tool_call_delta,
+    tool_arguments_preview,
+)
 from reuleauxcoder.services.providers.tool_arguments import (
     parse_provider_tool_arguments,
 )
@@ -344,23 +348,43 @@ class OpenAIResponsesProvider:
                 item = getattr(event, "item", None)
                 if getattr(item, "type", None) == "function_call":
                     item_id = str(getattr(item, "id", None) or getattr(item, "call_id", ""))
+                    arguments = str(getattr(item, "arguments", "") or "")
+                    name = str(getattr(item, "name", "") or "")
                     tool_calls[item_id] = {
                         "id": str(getattr(item, "call_id", item_id) or item_id),
-                        "name": str(getattr(item, "name", "") or ""),
-                        "args": str(getattr(item, "arguments", "") or ""),
+                        "name": name,
+                        "args": arguments,
                     }
+                    emit_tool_call_delta(
+                        request,
+                        index=len(tool_calls) - 1,
+                        tool_call_id=tool_calls[item_id]["id"],
+                        tool_name=name,
+                        arguments_delta=arguments,
+                        arguments_preview=tool_arguments_preview(arguments),
+                    )
                 return
             if event_type == "response.function_call_arguments.delta":
                 item_id = str(getattr(event, "item_id", "") or getattr(event, "call_id", ""))
                 if item_id:
-                    tool_calls.setdefault(
+                    raw = tool_calls.setdefault(
                         item_id,
                         {
                             "id": str(getattr(event, "call_id", item_id) or item_id),
                             "name": "",
                             "args": "",
                         },
-                    )["args"] += str(getattr(event, "delta", "") or "")
+                    )
+                    delta = str(getattr(event, "delta", "") or "")
+                    raw["args"] += delta
+                    emit_tool_call_delta(
+                        request,
+                        index=list(tool_calls).index(item_id),
+                        tool_call_id=raw.get("id") or "",
+                        tool_name=raw.get("name") or "",
+                        arguments_delta=delta,
+                        arguments_preview=tool_arguments_preview(raw.get("args", "")),
+                    )
                 return
             if event_type == "response.output_item.done":
                 item = getattr(event, "item", None)

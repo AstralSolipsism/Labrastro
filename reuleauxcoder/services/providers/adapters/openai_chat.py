@@ -33,6 +33,10 @@ from reuleauxcoder.services.providers.stream_supervisor import (
     ProviderStreamInterruptedError,
     StreamSupervisor,
 )
+from reuleauxcoder.services.providers.tool_call_delta import (
+    emit_tool_call_delta,
+    tool_arguments_preview,
+)
 from reuleauxcoder.services.providers.tool_arguments import (
     parse_provider_tool_arguments,
 )
@@ -620,13 +624,28 @@ class OpenAIChatProvider:
                         idx = tc_delta.index
                         if idx not in tc_map:
                             tc_map[idx] = {"id": "", "name": "", "args": ""}
+                        name_changed = False
+                        args_delta = ""
                         if tc_delta.id:
                             tc_map[idx]["id"] = tc_delta.id
                         if tc_delta.function:
                             if tc_delta.function.name:
                                 tc_map[idx]["name"] = tc_delta.function.name
+                                name_changed = True
                             if tc_delta.function.arguments:
-                                tc_map[idx]["args"] += tc_delta.function.arguments
+                                args_delta = str(tc_delta.function.arguments)
+                                tc_map[idx]["args"] += args_delta
+                        if name_changed or args_delta:
+                            emit_tool_call_delta(
+                                request,
+                                index=idx,
+                                tool_call_id=tc_map[idx].get("id") or "",
+                                tool_name=tc_map[idx].get("name") or "",
+                                arguments_delta=args_delta,
+                                arguments_preview=tool_arguments_preview(
+                                    tc_map[idx].get("args", "")
+                                ),
+                            )
 
             StreamSupervisor(
                 provider_id=self.config.id,
