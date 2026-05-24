@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
@@ -73,6 +74,8 @@ from reuleauxcoder.interfaces.vscode.registration import VSCODE_CHAT_PROFILE
 ProviderTestHandler = Callable[[ProviderConfig, str, str], dict[str, Any]]
 ProviderModelsHandler = Callable[[ProviderConfig], dict[str, Any]]
 ConfigReloadHandler = Callable[[], None]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -2074,6 +2077,12 @@ class RemoteAdminConfigManager:
         try:
             self.reload_handler()
         except Exception as exc:
+            logger.exception(
+                "Admin config reload failed for %s: %s: %s",
+                self.config_path,
+                type(exc).__name__,
+                exc,
+            )
             return AdminConfigResult(False, {"error": "config_reload_failed", "message": str(exc)}, 500)
         return None
 
