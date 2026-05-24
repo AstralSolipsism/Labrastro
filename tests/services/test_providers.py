@@ -388,6 +388,7 @@ def test_responses_provider_parses_streaming_text_and_function_call() -> None:
     provider.client = SimpleNamespace(
         responses=SimpleNamespace(create=_fake_create)
     )
+    deltas: list[dict] = []
 
     response = provider.chat(
         ProviderRequest(
@@ -399,6 +400,7 @@ def test_responses_provider_parses_streaming_text_and_function_call() -> None:
                     "function": {"name": "shell", "parameters": {"type": "object"}},
                 }
             ],
+            on_tool_call_delta=deltas.append,
         )
     )
 
@@ -415,6 +417,24 @@ def test_responses_provider_parses_streaming_text_and_function_call() -> None:
     }
     assert response.tool_calls[0].id == "call_1"
     assert response.tool_calls[0].arguments == {"command": "pwd"}
+    assert deltas == [
+        {
+            "index": 0,
+            "tool_call_id": "call_1",
+            "tool_name": "shell",
+            "arguments_delta": "",
+            "arguments_preview": "",
+            "status": "preparing",
+        },
+        {
+            "index": 0,
+            "tool_call_id": "call_1",
+            "tool_name": "shell",
+            "arguments_delta": '{"command":"pwd"}',
+            "arguments_preview": '{"command":"pwd"}',
+            "status": "preparing",
+        },
+    ]
 
 
 def test_chat_provider_parses_reasoning_delta_field() -> None:
@@ -576,6 +596,106 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
     )
 
 
+def test_chat_provider_emits_tool_call_delta_callback() -> None:
+    provider = OpenAIChatProvider(
+        ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=None,
+                    )
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_1",
+                                function=SimpleNamespace(
+                                    name="grep",
+                                    arguments='{"pattern":"remote',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                function=SimpleNamespace(
+                                    name=None,
+                                    arguments='PeerState"}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=1)),
+    ]
+    provider.call_with_retry = lambda _params, **_kwargs: iter(events)
+    deltas: list[dict] = []
+
+    response = provider.chat(
+        ProviderRequest(
+            model="gpt-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            on_tool_call_delta=deltas.append,
+        )
+    )
+
+    assert response.tool_calls[0].name == "grep"
+    assert deltas == [
+        {
+            "index": 0,
+            "tool_call_id": "call_1",
+            "tool_name": "grep",
+            "arguments_delta": '{"pattern":"remote',
+            "arguments_preview": '{"pattern":"remote',
+            "status": "preparing",
+        },
+        {
+            "index": 0,
+            "tool_call_id": "call_1",
+            "tool_name": "grep",
+            "arguments_delta": 'PeerState"}',
+            "arguments_preview": '{"pattern":"remotePeerState"}',
+            "status": "preparing",
+        },
+    ]
+
+
 def test_chat_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
     provider = OpenAIChatProvider(
         ProviderConfig(id="chat", type="openai_chat", api_key="sk-test")
@@ -710,18 +830,79 @@ def test_anthropic_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
     provider.client = SimpleNamespace(
         messages=SimpleNamespace(create=lambda **_params: iter(events))
     )
+    deltas: list[dict] = []
 
     response = provider.chat(
         ProviderRequest(
             model="claude-demo",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=4096,
+            on_tool_call_delta=deltas.append,
         )
     )
 
     assert response.tool_calls[0].argument_error == "missing tool arguments"
     assert response.diagnostics[0].code == "invalid_tool_arguments"
     assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "write_file"
+    assert deltas == [
+        {
+            "index": 0,
+            "tool_call_id": "call_1",
+            "tool_name": "write_file",
+            "arguments_delta": "",
+            "arguments_preview": "",
+            "status": "preparing",
+        }
+    ]
+
+
+def test_anthropic_provider_emits_tool_argument_delta_callback() -> None:
+    provider = AnthropicMessagesProvider(
+        ProviderConfig(id="anthropic", type="anthropic_messages", api_key="sk-test")
+    )
+    events = [
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(
+                type="tool_use",
+                id="call_1",
+                name="grep",
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(
+                type="input_json_delta",
+                partial_json='{"pattern":"RunStatusBar"}',
+            ),
+        ),
+    ]
+    provider.client = SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **_params: iter(events))
+    )
+    deltas: list[dict] = []
+
+    response = provider.chat(
+        ProviderRequest(
+            model="claude-demo",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096,
+            on_tool_call_delta=deltas.append,
+        )
+    )
+
+    assert response.tool_calls[0].name == "grep"
+    assert response.tool_calls[0].arguments == {"pattern": "RunStatusBar"}
+    assert deltas[-1] == {
+        "index": 0,
+        "tool_call_id": "call_1",
+        "tool_name": "grep",
+        "arguments_delta": '{"pattern":"RunStatusBar"}',
+        "arguments_preview": '{"pattern":"RunStatusBar"}',
+        "status": "preparing",
+    }
 
 
 def test_anthropic_provider_emits_thinking_delta_callback() -> None:
