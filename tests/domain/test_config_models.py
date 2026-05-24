@@ -11,6 +11,7 @@
     MCPServerConfig,
     ModeConfig,
     ModelProfileConfig,
+    PROVIDER_CONFIG_FIELDS,
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
@@ -196,6 +197,10 @@ def test_provider_config_roundtrip() -> None:
     restored = ProviderConfig.from_dict("anthropic-main", config.to_dict())
 
     assert restored == config
+
+
+def test_provider_config_fields_match_serialized_shape() -> None:
+    assert set(ProviderConfig(id="demo").to_dict()) == set(PROVIDER_CONFIG_FIELDS)
 
 
 def test_provider_config_reads_and_infers_compat() -> None:

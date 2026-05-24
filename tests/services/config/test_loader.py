@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 import pytest
 
+from reuleauxcoder.domain.config.models import ProviderConfig
+from reuleauxcoder.domain.config.schema import CONFIG_SCHEMA
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError
 from reuleauxcoder.services.config.loader import ConfigSchemaError
@@ -151,6 +153,80 @@ def test_parse_config_rejects_unknown_llm_config_shape() -> None:
     assert "Unknown config field: llm_debug_trace" in message
     assert "Unknown config field: models.profiles.main.api_key" in message
     assert "Unknown config field: models.profiles.main.base_url" in message
+
+
+def test_parse_config_accepts_provider_stream_recovery_policy() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "providers": {
+                "items": {
+                    "zenmux": {
+                        "type": "openai_chat",
+                        "compat": "zenmux",
+                        "api_key": "sk-test",
+                        "base_url": "https://gateway.example/v1",
+                        "stream_recovery": {
+                            "enabled": False,
+                            "max_continue_attempts": 2,
+                            "retry_empty_once": False,
+                            "retry_tool_delta_once": True,
+                            "fallback_models": [
+                                {"provider": "backup", "model": "backup-model"}
+                            ],
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+    recovery = config.providers.items["zenmux"].stream_recovery
+    assert recovery.enabled is False
+    assert recovery.max_continue_attempts == 2
+    assert recovery.retry_empty_once is False
+    assert recovery.retry_tool_delta_once is True
+    assert recovery.fallback_models == [{"provider": "backup", "model": "backup-model"}]
+
+
+def test_provider_config_to_dict_round_trips_through_config_loader() -> None:
+    provider = ProviderConfig(
+        id="custom",
+        type="openai_chat",
+        compat="generic",
+        api_key="sk-test",
+        base_url="https://gateway.example/v1",
+    )
+
+    config = ConfigLoader()._parse_config(
+        {"providers": {"items": {"custom": provider.to_dict()}}}
+    )
+
+    assert config.providers.items["custom"].stream_recovery.enabled is True
+
+
+def test_provider_schema_documents_loader_provider_fields() -> None:
+    schema_fields = set(CONFIG_SCHEMA["providers"]["items"]["provider_id"])
+
+    assert schema_fields == ConfigLoader._PROVIDER_ITEM_FIELDS
+
+
+def test_parse_config_still_rejects_unknown_provider_fields() -> None:
+    with pytest.raises(ConfigSchemaError) as exc:
+        ConfigLoader()._parse_config(
+            {
+                "providers": {
+                    "items": {
+                        "custom": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                            "unknown_provider_field": True,
+                        }
+                    }
+                }
+            }
+        )
+
+    assert "Unknown config field: providers.items.custom.unknown_provider_field" in str(exc.value)
 
 
 def test_load_explicit_config_ignores_global_example(

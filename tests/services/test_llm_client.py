@@ -721,6 +721,35 @@ def test_llm_chat_continues_after_partial_stream_interruption(
     assert calls[1]["messages"][-1]["content"].startswith("<stream_recovery>")
 
 
+def test_llm_flat_fallback_provider_preserves_stream_recovery_without_models() -> None:
+    llm = LLM(model="demo-model", api_key="sk-test-12345678")
+
+    provider = llm._fallback_provider_config(
+        {
+            "provider": "backup",
+            "type": "openai_chat",
+            "compat": "generic",
+            "api_key": "sk-backup",
+            "base_url": "https://backup.example/v1",
+            "models": [{"id": "cached-model"}],
+            "stream_recovery": {
+                "enabled": False,
+                "max_continue_attempts": 0,
+                "retry_empty_once": False,
+                "retry_tool_delta_once": False,
+            },
+        }
+    )
+
+    assert provider is not None
+    assert provider.id == "backup"
+    assert provider.stream_recovery.enabled is False
+    assert provider.stream_recovery.max_continue_attempts == 0
+    assert provider.stream_recovery.retry_empty_once is False
+    assert provider.stream_recovery.retry_tool_delta_once is False
+    assert not hasattr(provider, "models")
+
+
 def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(
     tmp_path, monkeypatch
 ) -> None:

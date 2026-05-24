@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import hashlib
+import logging
 import os
 import shutil
 import socket
@@ -45,6 +46,7 @@ from reuleauxcoder.domain.config.models import (
 )
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
+from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
@@ -796,6 +798,74 @@ class TestRemoteRelayHTTPService:
 
         assert manager.model_capabilities_status()["model_capabilities"]["enabled"] is True
 
+    def test_admin_record_provider_writes_reloadable_stream_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "remote_exec": {"enabled": True, "host_mode": True},
+                "auth": {
+                    "enabled": True,
+                    "token_secret": "test-secret",
+                    "superadmins": [
+                        {"username": "admin", "password": "test-password"}
+                    ],
+                },
+                "providers": {"items": {}},
+            },
+        )
+        manager = RemoteAdminConfigManager(config_path, reload_handler=lambda: None)
+
+        result = manager.record_provider(
+            {
+                "provider_id": "zenmux",
+                "type": "openai_chat",
+                "compat": "zenmux",
+                "api_key": "sk-test",
+                "base_url": "https://gateway.example/v1",
+            }
+        )
+
+        assert result.ok is True
+        loaded = ConfigLoader.from_path(config_path)
+        provider = loaded.providers.items["zenmux"]
+        assert provider.stream_recovery.enabled is True
+        assert loaded.validate() == []
+
+    def test_admin_reload_failure_logs_original_exception(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(config_path, {"providers": {"items": {}}})
+        manager = RemoteAdminConfigManager(
+            config_path,
+            reload_handler=lambda: (_ for _ in ()).throw(
+                RuntimeError("reload exploded")
+            ),
+        )
+
+        with caplog.at_level(logging.ERROR):
+            result = manager.record_provider(
+                {
+                    "provider_id": "broken",
+                    "type": "openai_chat",
+                    "api_key": "sk-test",
+                    "base_url": "https://broken.invalid/v1",
+                }
+            )
+
+        assert result.ok is False
+        assert result.status == 500
+        assert result.payload == {
+            "error": "config_reload_failed",
+            "message": "reload exploded",
+        }
+        assert str(config_path) in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert "reload exploded" in caplog.text
+
     def test_admin_record_model_profile_rejects_profile_credentials(
         self, tmp_path: Path
     ) -> None:
@@ -1379,6 +1449,7 @@ class TestRemoteRelayHTTPService:
                 assert exc.code == 500
                 body = json.loads(exc.read().decode("utf-8"))
                 assert body["error"] == "config_reload_failed"
+                assert body["message"] == "reload failed"
             raw = config_path.read_text(encoding="utf-8")
             assert "existing" in raw
             assert "sk-existing" in raw

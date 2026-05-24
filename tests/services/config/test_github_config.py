@@ -45,7 +45,6 @@ def test_github_env_refs_are_expanded(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_github_enabled_requires_postgres() -> None:
     config = Config(
-        api_key="test",
         github=GitHubConfig(
             enabled=True,
             app_id="123",
