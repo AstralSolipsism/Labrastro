@@ -18,10 +18,35 @@ def test_agent_event_reasoning_token_contains_token() -> None:
 
 
 def test_agent_event_tool_call_start_contains_name_and_args() -> None:
-    event = AgentEvent.tool_call_start("shell", {"command": "ls"})
+    event = AgentEvent.tool_call_start("shell", {"command": "ls"}, index=2)
     assert event.event_type is AgentEventType.TOOL_CALL_START
     assert event.tool_name == "shell"
     assert event.tool_args == {"command": "ls"}
+    assert event.data["index"] == 2
+
+
+def test_agent_event_tool_call_delta_contains_preview() -> None:
+    event = AgentEvent.tool_call_delta(
+        index=0,
+        tool_call_id="call-1",
+        tool_name="grep",
+        arguments_delta='{"pattern"',
+        arguments_preview='{"pattern": "remotePeerState"}',
+        tool_source="builtin",
+    )
+
+    assert event.event_type is AgentEventType.TOOL_CALL_DELTA
+    assert event.tool_name == "grep"
+    assert event.tool_call_id == "call-1"
+    assert event.data == {
+        "index": 0,
+        "tool_call_id": "call-1",
+        "tool_name": "grep",
+        "arguments_delta": '{"pattern"',
+        "arguments_preview": '{"pattern": "remotePeerState"}',
+        "status": "preparing",
+        "tool_source": "builtin",
+    }
 
 
 def test_agent_event_tool_call_end_keeps_full_long_result_with_preview() -> None:

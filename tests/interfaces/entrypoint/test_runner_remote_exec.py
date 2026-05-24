@@ -1828,6 +1828,7 @@ class TestRunnerRemoteExec:
     def test_runner_stream_chat_uses_structured_tool_events(self) -> None:
         workspace = Path(__file__).resolve().parent
         long_result = "file body\n" + ("x" * 700)
+        long_preview = '{"file_path":"' + ("x" * 300) + '"}'
 
         def emit(agent: FakeAgent, event: AgentEvent) -> None:
             for handler in list(agent._event_handlers):
@@ -1838,10 +1839,21 @@ class TestRunnerRemoteExec:
             emit(agent, AgentEvent.stream_token("Before tool"))
             emit(
                 agent,
+                AgentEvent.tool_call_delta(
+                    index=0,
+                    tool_name="read_file",
+                    arguments_delta='{"file_path":"',
+                    arguments_preview=long_preview,
+                    tool_source="builtin",
+                ),
+            )
+            emit(
+                agent,
                 AgentEvent.tool_call_start(
                     "read_file",
                     {"file_path": str(workspace / "decision.md")},
                     tool_call_id="call-read-1",
+                    index=0,
                 ),
             )
             emit(
@@ -1906,9 +1918,18 @@ class TestRunnerRemoteExec:
             assert "TOOL CALL" not in terminal_text
             assert "read_file(" not in terminal_text
             assert "file body" not in terminal_text
+            tool_call_delta = next(
+                event for event in events if event["type"] == "tool_call_delta"
+            )
+            assert tool_call_delta["payload"].get("tool_name") == "read_file"
+            assert tool_call_delta["payload"].get("arguments_preview") == f"{long_preview[:240]}..."
+            assert len(tool_call_delta["payload"].get("arguments_preview", "")) <= 243
+            assert tool_call_delta["payload"].get("status") == "preparing"
+            assert "arguments_delta" not in tool_call_delta["payload"]
             assert any(
                 event["type"] == "tool_call_start"
                 and event["payload"].get("tool_name") == "read_file"
+                and event["payload"].get("index") == 0
                 for event in events
             )
             assert any(
