@@ -8,7 +8,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional
 
-from reuleauxcoder.domain.config.models import ProviderConfig, infer_provider_compat
+from reuleauxcoder.domain.config.models import (
+    PROVIDER_CONFIG_FIELDS,
+    ProviderConfig,
+    infer_provider_compat,
+)
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import (
     AfterLLMResponseContext,
@@ -440,19 +444,7 @@ class LLM:
             provider_data = {
                 key: value
                 for key, value in raw.items()
-                if key
-                in {
-                    "type",
-                    "compat",
-                    "enabled",
-                    "api_key",
-                    "base_url",
-                    "headers",
-                    "timeout_sec",
-                    "max_retries",
-                    "api_features",
-                    "extra",
-                }
+                if key in PROVIDER_CONFIG_FIELDS
             }
         if not provider_data:
             return None
