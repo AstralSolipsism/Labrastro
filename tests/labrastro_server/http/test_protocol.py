@@ -162,6 +162,9 @@ class TestRemoteHTTPContract:
         assert registry["chat.events"]["response_shape"] == "ChatEventsBatch"
         assert registry["chat.command_dispatch"]["path"] == "/remote/chat/command"
         assert registry["chat.command_dispatch"]["request_model"] == "ChatCommandDispatchRequest"
+        assert registry["admin.models.delete"]["path"] == "/remote/admin/models/delete"
+        assert registry["admin.models.delete"]["request_model"] == "ModelProfileDeleteRequest"
+        assert registry["admin.models.delete"]["auth"] == "bearer"
         assert (
             registry["admin.toolchains.behavior_catalog"]["path"]
             == "/remote/admin/toolchains/behavior-catalog"

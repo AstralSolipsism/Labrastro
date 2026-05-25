@@ -1020,6 +1020,161 @@ class TestRemoteRelayHTTPService:
         assert profile.capability_user_configured is True
         assert profile.capability_source is None
 
+    def test_admin_delete_model_profile_preserves_provider_models_and_repairs_active(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "zenmux": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                            "models": [
+                                {"id": "anthropic/claude-opus-4.6"},
+                                {"id": "anthropic/claude-sonnet-4.5"},
+                            ],
+                        }
+                    }
+                },
+                "models": {
+                    "active_main": "opus",
+                    "active_sub": "opus",
+                    "profiles": {
+                        "opus": {
+                            "provider": "zenmux",
+                            "model": "anthropic/claude-opus-4.6",
+                            "max_tokens": 32000,
+                            "max_context_tokens": 200000,
+                        },
+                        "sonnet": {
+                            "provider": "zenmux",
+                            "model": "anthropic/claude-sonnet-4.5",
+                            "max_tokens": 64000,
+                            "max_context_tokens": 200000,
+                        },
+                    },
+                },
+            },
+        )
+        manager = RemoteAdminConfigManager(
+            config_path,
+            reload_handler=lambda: ConfigLoader.from_path(config_path),
+        )
+
+        result = manager.delete_model_profile({"profile_id": "opus"})
+
+        assert result.ok is True
+        assert result.payload["deleted"] is True
+        assert result.payload["profile_id"] == "opus"
+        assert result.payload["active_main"] == "sonnet"
+        assert result.payload["active_sub"] == "sonnet"
+        assert [profile["id"] for profile in result.payload["model_profiles"]] == ["sonnet"]
+        raw = load_yaml_config(config_path)
+        assert raw["providers"]["items"]["zenmux"]["models"] == [
+            {"id": "anthropic/claude-opus-4.6"},
+            {"id": "anthropic/claude-sonnet-4.5"},
+        ]
+        loaded = ConfigLoader.from_path(config_path)
+        assert set(loaded.model_profiles) == {"sonnet"}
+        assert loaded.active_main_model_profile == "sonnet"
+        assert loaded.active_sub_model_profile == "sonnet"
+
+    def test_admin_delete_model_profile_rejects_missing_profile(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "models": {
+                    "profiles": {
+                        "main": {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "max_tokens": 4096,
+                            "max_context_tokens": 128000,
+                        }
+                    }
+                }
+            },
+        )
+        manager = RemoteAdminConfigManager(config_path)
+
+        result = manager.delete_model_profile({"profile_id": "missing"})
+
+        assert result.ok is False
+        assert result.status == 404
+        assert result.payload == {
+            "error": "profile_not_found",
+            "profile_id": "missing",
+        }
+
+    def test_admin_delete_model_profile_http_endpoint(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                            "models": [{"id": "deepseek-chat"}],
+                        }
+                    }
+                },
+                "models": {
+                    "active_main": "main",
+                    "active_sub": "main",
+                    "profiles": {
+                        "main": {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "max_tokens": 4096,
+                            "max_context_tokens": 128000,
+                        }
+                    },
+                },
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/models/delete",
+                {"profile_id": "main"},
+                headers=TEST_ADMIN_HEADERS,
+            )
+
+            assert status == 200
+            assert body["ok"] is True
+            assert body["deleted"] is True
+            assert body["profile_id"] == "main"
+            assert body["model_profiles"] == []
+            assert body["active_main"] is None
+            assert body["active_sub"] is None
+            raw = load_yaml_config(config_path)
+            assert raw["providers"]["items"]["deepseek"]["models"] == [
+                {"id": "deepseek-chat"}
+            ]
+            assert raw["models"]["profiles"] == {}
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_admin_model_capabilities_list_and_apply_profile_recommendation(
         self, tmp_path: Path
     ) -> None:

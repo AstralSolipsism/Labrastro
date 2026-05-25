@@ -2013,6 +2013,57 @@ class RemoteAdminConfigManager:
                 },
             )
 
+    def delete_model_profile(self, payload: dict[str, Any]) -> AdminConfigResult:
+        profile_id = str(payload.get("profile_id") or payload.get("id") or "").strip()
+        if not profile_id:
+            return AdminConfigResult(False, {"error": "profile_id_required"}, 400)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            models = data.setdefault("models", {})
+            if not isinstance(models, dict):
+                return AdminConfigResult(
+                    False,
+                    {"error": "profile_not_found", "profile_id": profile_id},
+                    404,
+                )
+            profiles = models.setdefault("profiles", {})
+            if not isinstance(profiles, dict) or profile_id not in profiles:
+                return AdminConfigResult(
+                    False,
+                    {"error": "profile_not_found", "profile_id": profile_id},
+                    404,
+                )
+
+            del profiles[profile_id]
+            next_profile_id = next(iter(sorted(profiles)), None)
+            if models.get("active_main") == profile_id:
+                if next_profile_id:
+                    models["active_main"] = next_profile_id
+                else:
+                    models.pop("active_main", None)
+            if models.get("active_sub") == profile_id:
+                active_main = models.get("active_main")
+                if isinstance(active_main, str) and active_main in profiles:
+                    models["active_sub"] = active_main
+                elif next_profile_id:
+                    models["active_sub"] = next_profile_id
+                else:
+                    models.pop("active_sub", None)
+
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "deleted": True,
+                    "profile_id": profile_id,
+                    **self.list_model_profiles(),
+                },
+            )
+
     def activate_model_profile(self, payload: dict[str, Any]) -> AdminConfigResult:
         profile_id = str(payload.get("profile_id") or payload.get("id") or "").strip()
         target = str(payload.get("target") or "main").strip().lower()

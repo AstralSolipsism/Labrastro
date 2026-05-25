@@ -539,6 +539,13 @@ class RemoteAdminRoutes:
                     payload,
                     lambda: self.service.admin_manager.record_model_profile(payload),
                 )
+            elif path == "/remote/admin/models/delete":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.delete_model_profile(payload),
+                )
             elif path == "/remote/admin/models/activate":
                 result = self._run_admin_config_mutation(
                     principal,
@@ -670,6 +677,7 @@ class RemoteAdminRoutes:
             "/remote/admin/providers/copy",
             "/remote/admin/providers/enable",
             "/remote/admin/models/record",
+            "/remote/admin/models/delete",
             "/remote/admin/models/activate",
             "/remote/admin/capability-packages/drafts/accept",
             "/remote/admin/capability-packages/delete",
