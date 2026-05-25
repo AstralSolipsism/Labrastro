@@ -15,7 +15,6 @@ def test_lsp_config_defaults_when_section_missing() -> None:
 
 def test_lsp_config_parses_server_overrides() -> None:
     config = Config(
-        api_key="key",
         lsp={
             "enabled": False,
             "poll_timeout_ms": 1000,

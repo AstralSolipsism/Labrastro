@@ -362,27 +362,30 @@ class SessionStore:
                 tuple[tuple[int, datetime, str], SessionMetadata]
             ] = []
             for file_path in self._sessions_dir.glob("*.json"):
+                if self._is_session_sidecar_path(file_path):
+                    continue
                 try:
                     data = json.loads(file_path.read_text(encoding="utf-8"))
                     session = Session.from_dict(data)
                     if fingerprint is not None and session.fingerprint != fingerprint:
                         continue
                     document = self.load_document(session.id or file_path.stem)
-                    if not isinstance(document, dict):
+                    metadata_fallback = {
+                        "id": session.id or file_path.stem,
+                        "model": session.model,
+                        "saved_at": session.saved_at,
+                        "preview": session.get_preview(),
+                        "fingerprint": session.fingerprint,
+                    }
+                    if self._document_has_turns(document):
+                        metadata_payload = session_metadata_from_document(
+                            document,
+                            metadata_fallback,
+                        )
+                    elif self.has_history_content(session.messages):
+                        metadata_payload = metadata_fallback
+                    else:
                         continue
-                    if not isinstance(document.get("turns"), list) or not document.get("turns"):
-                        continue
-
-                    metadata_payload = session_metadata_from_document(
-                        document,
-                        {
-                            "id": session.id or file_path.stem,
-                            "model": session.model,
-                            "saved_at": session.saved_at,
-                            "preview": session.get_preview(),
-                            "fingerprint": session.fingerprint,
-                        },
-                    )
                     metadata = SessionMetadata(
                         id=str(metadata_payload["id"]),
                         model=str(metadata_payload["model"]),
@@ -417,6 +420,17 @@ class SessionStore:
         """Return the most recent session metadata, if any."""
         sessions = self.list(limit=1, fingerprint=fingerprint)
         return sessions[0] if sessions else None
+
+    @staticmethod
+    def _is_session_sidecar_path(path: Path) -> bool:
+        return path.name.endswith((".document.json", ".ui.json"))
+
+    @staticmethod
+    def _document_has_turns(document: dict | None) -> bool:
+        if not isinstance(document, dict):
+            return False
+        turns = document.get("turns")
+        return isinstance(turns, list) and bool(turns)
 
     @staticmethod
     def has_history_content(messages: list[dict]) -> bool:

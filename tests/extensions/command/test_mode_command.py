@@ -18,7 +18,6 @@ class FakeAgent:
 
 def _build_ctx() -> SimpleNamespace:
     config = Config(
-        api_key="key",
         approval=ApprovalConfig(),
         modes={
             "coder": ModeConfig(name="coder", description="Default coding mode"),

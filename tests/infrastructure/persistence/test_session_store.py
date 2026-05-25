@@ -44,6 +44,43 @@ def test_session_store_save_and_load_roundtrip(tmp_path: Path) -> None:
     assert loaded.fingerprint == "local"
 
 
+def test_session_store_list_falls_back_to_saved_session_metadata(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    session_id = store.save(
+        messages=[{"role": "user", "content": "hello from saved json"}],
+        model="gpt-4o",
+        fingerprint="local",
+    )
+
+    listed = store.list(limit=10, fingerprint="local")
+    latest = store.get_latest(fingerprint="local")
+
+    assert [item.id for item in listed] == [session_id]
+    assert listed[0].model == "gpt-4o"
+    assert "hello from saved json" in listed[0].preview
+    assert latest is not None
+    assert latest.id == session_id
+
+
+def test_session_store_list_skips_json_sidecar_files(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session_id = store.save(
+        messages=[{"role": "user", "content": "visible session"}],
+        model="gpt-4o",
+        fingerprint="local",
+    )
+    (tmp_path / f"{session_id}.ui.json").write_text(
+        json.dumps({"id": "ui-sidecar", "messages": [{"role": "user", "content": "bad"}]}),
+        encoding="utf-8",
+    )
+
+    listed = store.list(limit=10, fingerprint="local")
+
+    assert [item.id for item in listed] == [session_id]
+
+
 def test_session_store_save_with_exit_appends_exit_marker(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     session_id = store.save(
