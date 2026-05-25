@@ -155,6 +155,40 @@ def test_parse_config_rejects_unknown_llm_config_shape() -> None:
     assert "Unknown config field: models.profiles.main.base_url" in message
 
 
+def test_parse_config_accepts_model_profile_capability_metadata() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "providers": {
+                "items": {
+                    "zenmux": {
+                        "type": "openai_chat",
+                        "api_key": "sk-test",
+                        "base_url": "https://zenmux.ai/api/v1",
+                    }
+                }
+            },
+            "models": {
+                "profiles": {
+                    "Zenmux-anthropic-claude-opus-4.6": {
+                        "provider": "zenmux",
+                        "model": "anthropic/claude-opus-4.6",
+                        "max_tokens": 32000,
+                        "max_context_tokens": 200000,
+                        "capability_source": "openrouter",
+                        "capability_user_configured": False,
+                        "capability_applied_at": "2026-05-25T01:20:00Z",
+                    }
+                }
+            },
+        }
+    )
+
+    profile = config.model_profiles["Zenmux-anthropic-claude-opus-4.6"]
+    assert profile.capability_source == "openrouter"
+    assert profile.capability_user_configured is False
+    assert profile.capability_applied_at == "2026-05-25T01:20:00Z"
+
+
 def test_parse_config_accepts_provider_stream_recovery_policy() -> None:
     config = ConfigLoader()._parse_config(
         {

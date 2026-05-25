@@ -814,6 +814,9 @@ class ModelProfileConfig:
     thinking_enabled: Optional[bool] = None
     reasoning_replay_mode: Optional[str] = None
     reasoning_replay_placeholder: Optional[str] = None
+    capability_user_configured: bool = False
+    capability_source: Optional[str] = None
+    capability_applied_at: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary format for serialization."""
@@ -829,6 +832,9 @@ class ModelProfileConfig:
             "thinking_enabled": self.thinking_enabled,
             "reasoning_replay_mode": self.reasoning_replay_mode,
             "reasoning_replay_placeholder": self.reasoning_replay_placeholder,
+            "capability_user_configured": self.capability_user_configured,
+            "capability_source": self.capability_source,
+            "capability_applied_at": self.capability_applied_at,
         }
 
     @classmethod
@@ -849,6 +855,17 @@ class ModelProfileConfig:
             thinking_enabled=d.get("thinking_enabled"),
             reasoning_replay_mode=d.get("reasoning_replay_mode"),
             reasoning_replay_placeholder=d.get("reasoning_replay_placeholder"),
+            capability_user_configured=bool(d.get("capability_user_configured", False)),
+            capability_source=(
+                str(d["capability_source"])
+                if d.get("capability_source") is not None
+                else None
+            ),
+            capability_applied_at=(
+                str(d["capability_applied_at"])
+                if d.get("capability_applied_at") is not None
+                else None
+            ),
         )
 
 

@@ -126,6 +126,9 @@ class ConfigLoader:
     _MODELS_FIELDS = {"active_main", "active_sub", "profiles"}
     _MODEL_PROFILE_FIELDS = {
         "backfill_reasoning_content_for_tool_calls",
+        "capability_applied_at",
+        "capability_source",
+        "capability_user_configured",
         "max_context_tokens",
         "max_tokens",
         "model",

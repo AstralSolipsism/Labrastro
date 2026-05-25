@@ -18,6 +18,9 @@ CONFIG_SCHEMA = {
                 "reasoning_effort": "string (optional, provider-specific reasoning effort, e.g. high/max)",
                 "reasoning_replay_mode": "string (optional, one of: none, tool_calls; controls which historical assistant reasoning_content is replayed)",
                 "reasoning_replay_placeholder": "string (optional, placeholder text injected when backfilling missing reasoning_content; default: [PLACE_HOLDER])",
+                "capability_user_configured": "bool (default: false, true when token limits are explicitly user-entered rather than capability defaults)",
+                "capability_source": "string (optional, source label for the applied model capability defaults)",
+                "capability_applied_at": "string (optional, ISO timestamp when model capability defaults were applied)",
             }
         },
     },

@@ -977,6 +977,46 @@ class TestRemoteRelayHTTPService:
         assert profile["max_context_tokens"] == 1000000
         assert profile["capability_user_configured"] is False
 
+    def test_admin_record_model_profile_writes_reloadable_capability_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "zenmux": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                            "base_url": "https://zenmux.ai/api/v1",
+                        }
+                    }
+                }
+            },
+        )
+        manager = RemoteAdminConfigManager(
+            config_path,
+            reload_handler=lambda: ConfigLoader.from_path(config_path),
+        )
+
+        result = manager.record_model_profile(
+            {
+                "profile_id": "Zenmux-anthropic-claude-opus-4.6",
+                "provider": "zenmux",
+                "model": "anthropic/claude-opus-4.6",
+                "max_tokens": 32000,
+                "max_context_tokens": 200000,
+                "capability_user_configured": True,
+            }
+        )
+
+        assert result.ok is True
+        loaded = ConfigLoader.from_path(config_path)
+        profile = loaded.model_profiles["Zenmux-anthropic-claude-opus-4.6"]
+        assert profile.capability_user_configured is True
+        assert profile.capability_source is None
+
     def test_admin_model_capabilities_list_and_apply_profile_recommendation(
         self, tmp_path: Path
     ) -> None:
