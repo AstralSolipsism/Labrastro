@@ -1544,6 +1544,9 @@ class TestRunnerRemoteExec:
             session_id = created["metadata"]["id"]
             assert created["ok"] is True
             assert session_id
+            assert created["record"]["schema_version"] == 2
+            assert created["record"]["metadata"]["id"] == session_id
+            assert created["record"]["transcript"]["turns"] == []
 
             _, listed = _json_request(
                 "POST",
@@ -1558,6 +1561,8 @@ class TestRunnerRemoteExec:
                 {"peer_token": peer_token, "session_id": session_id},
             )
             assert empty_loaded["document"]["turns"] == []
+            assert empty_loaded["record"]["metadata"]["id"] == session_id
+            assert empty_loaded["record"]["transcript"]["turns"] == []
 
             _, start_body = _json_request(
                 "POST",
@@ -1598,6 +1603,8 @@ class TestRunnerRemoteExec:
             )
             assert loaded["metadata"]["id"] == session_id
             assert loaded["document"]["turns"][0]["userMessage"]["text"] == "hello"
+            assert loaded["record"]["metadata"]["id"] == session_id
+            assert loaded["record"]["transcript"]["turns"][0]["userMessage"]["text"] == "hello"
             assert loaded["last_event_seq"] >= 1
 
             _, deleted = _json_request(

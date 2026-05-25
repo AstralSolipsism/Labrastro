@@ -9,7 +9,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from reuleauxcoder.domain.context.manager import ensure_message_token_counts
 from reuleauxcoder.domain.session.models import (
@@ -74,6 +74,7 @@ class SessionStore:
                         existing.messages
                     ):
                         path.unlink()
+                        self._delete_legacy_sidecars(session_id)
                 return session_id
 
             if is_exit:
@@ -104,12 +105,7 @@ class SessionStore:
                 total_completion_tokens=total_completion_tokens,
                 runtime_state=effective_runtime,
             )
-            path = self._get_session_path(session_id)
-            path.write_text(
-                json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            self._save_document_metadata(session)
+            self._write_session_record(session)
             return session_id
 
     def save_runtime_state(
@@ -145,12 +141,7 @@ class SessionStore:
                 total_completion_tokens=total_completion_tokens,
                 runtime_state=effective_runtime,
             )
-            path = self._get_session_path(session_id)
-            path.write_text(
-                json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            self._save_document_metadata(session)
+            self._write_session_record(session)
             return session_id
 
     def append_system_message(
@@ -211,11 +202,16 @@ class SessionStore:
                 session.runtime_state.model = session.model
             if session.runtime_state.active_mode is None:
                 session.runtime_state.active_mode = session.active_mode
-            if updated_messages != data.get("messages"):
-                path.write_text(
-                    json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
+            persisted_messages = (
+                data.get("history", {}).get("messages")
+                if data.get("schema_version") == 2 and isinstance(data.get("history"), dict)
+                else data.get("messages")
+            )
+            if updated_messages != persisted_messages:
+                record_for_update = (
+                    data if data.get("schema_version") == 2 else self.load_record(session_id)
                 )
+                self._write_session_record(session, existing_record=record_for_update)
             return session
 
     def delete(self, session_id: str) -> bool:
@@ -225,11 +221,15 @@ class SessionStore:
             if not path.exists():
                 return False
             path.unlink()
-            self.delete_document(session_id)
-            self.delete_trace_events(session_id)
+            self._delete_legacy_sidecars(session_id)
             return True
 
     def load_document(self, session_id: str) -> dict | None:
+        record = self.load_record(session_id)
+        if isinstance(record, dict):
+            transcript = record.get("transcript")
+            if isinstance(transcript, dict):
+                return transcript
         path = self._get_document_path(session_id)
         if not path.exists():
             return None
@@ -242,13 +242,32 @@ class SessionStore:
     def save_document(self, session_id: str, document: dict) -> None:
         if not isinstance(document, dict):
             document = empty_session_document(session_id)
-        path = self._get_document_path(session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        with self._lock:
+            record = self.load_record(session_id)
+            if isinstance(record, dict):
+                session = Session.from_dict(record)
+                record = session.to_record(
+                    transcript=document,
+                    events=self._record_events(record),
+                )
+            else:
+                session = Session(
+                    id=session_id,
+                    model="",
+                    saved_at=datetime.now().isoformat(timespec="microseconds"),
+                    messages=[],
+                )
+                record = session.to_record(transcript=document, events=[])
+            self._write_record_payload(session_id, record)
 
     def delete_document(self, session_id: str) -> bool:
+        with self._lock:
+            record = self.load_record(session_id)
+            if isinstance(record, dict) and isinstance(record.get("transcript"), dict):
+                record["transcript"] = None
+                self._write_record_payload(session_id, record)
+                self._delete_legacy_document(session_id)
+                return True
         path = self._get_document_path(session_id)
         if not path.exists():
             return False
@@ -266,10 +285,8 @@ class SessionStore:
         source: str = "remote_chat",
         replayable: bool = True,
     ) -> int:
-        """Append a replayable session trace event to a sidecar JSONL ledger."""
+        """Append a replayable session trace event to the unified session record."""
         with self._lock:
-            path = self._get_trace_events_path(session_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
             seq = self.latest_trace_event_seq(session_id) + 1
             event = {
                 "session_id": session_id,
@@ -282,10 +299,21 @@ class SessionStore:
                 "source": source,
                 "replayable": bool(replayable),
             }
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
-                handle.write("\n")
-            document = self.load_document(session_id) or empty_session_document(session_id)
+            record = self.load_record(session_id)
+            if isinstance(record, dict):
+                session = Session.from_dict(record)
+                events = self._record_events(record)
+                document = self._record_document(record) or empty_session_document(session_id)
+            else:
+                session = Session(
+                    id=session_id,
+                    model="",
+                    saved_at=datetime.now().isoformat(timespec="microseconds"),
+                    messages=[],
+                )
+                events = []
+                document = empty_session_document(session_id)
+            events.append(event)
             document = apply_session_event(
                 document,
                 session_id=session_id,
@@ -295,7 +323,8 @@ class SessionStore:
                 chat_id=chat_id,
                 chat_seq=chat_seq,
             )
-            self.save_document(session_id, document)
+            record = session.to_record(transcript=document, events=events)
+            self._write_record_payload(session_id, record)
             return seq
 
     def list_trace_events(
@@ -307,6 +336,17 @@ class SessionStore:
         replayable_only: bool = True,
     ) -> list[dict]:
         """Return persisted session trace events after the given session seq."""
+        record = self.load_record(session_id)
+        if isinstance(record, dict):
+            events = self._record_events(record)
+            filtered = self._filter_trace_events(
+                events,
+                after_seq=after_seq,
+                limit=limit,
+                replayable_only=replayable_only,
+            )
+            if filtered or events:
+                return filtered
         path = self._get_trace_events_path(session_id)
         if not path.exists():
             return []
@@ -341,6 +381,13 @@ class SessionStore:
         return max(int(event.get("session_event_seq") or event.get("seq") or 0) for event in events)
 
     def delete_trace_events(self, session_id: str) -> bool:
+        with self._lock:
+            record = self.load_record(session_id)
+            if isinstance(record, dict) and self._record_events(record):
+                record["events"] = []
+                self._write_record_payload(session_id, record)
+                self._delete_legacy_trace_events(session_id)
+                return True
         path = self._get_trace_events_path(session_id)
         if not path.exists():
             return False
@@ -491,8 +538,34 @@ class SessionStore:
         return path.with_name(f"{path.stem}.events.jsonl")
 
     def _save_document_metadata(self, session: Session) -> None:
+        self._write_session_record(session)
+
+    def load_record(self, session_id: str) -> dict[str, Any] | None:
+        """Load the unified persisted SessionRecord payload."""
+        with self._lock:
+            path = self._get_session_path(session_id)
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(data, dict):
+                return None
+            if data.get("schema_version") == 2:
+                return data
+            return self._legacy_payload_to_record(data, session_id)
+
+    def _write_session_record(
+        self,
+        session: Session,
+        *,
+        existing_record: dict[str, Any] | None = None,
+    ) -> None:
+        record = existing_record if isinstance(existing_record, dict) else self.load_record(session.id)
+        document = self._record_document(record)
         document = update_session_document_metadata(
-            self.load_document(session.id),
+            document,
             session_id=session.id,
             model=session.model,
             saved_at=session.saved_at,
@@ -500,7 +573,107 @@ class SessionStore:
             fingerprint=session.fingerprint,
             runtime_state=session.runtime_state.to_dict(),
         )
-        self.save_document(session.id, document)
+        events = self._record_events(record)
+        self._write_record_payload(
+            session.id,
+            session.to_record(transcript=document, events=events),
+        )
+
+    def _write_record_payload(self, session_id: str, record: dict[str, Any]) -> None:
+        path = self._get_session_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._delete_legacy_sidecars(session_id)
+
+    def _legacy_payload_to_record(
+        self, data: dict[str, Any], session_id: str
+    ) -> dict[str, Any]:
+        session = Session.from_dict(data)
+        if not session.id:
+            session.id = session_id
+        document = self._load_legacy_document(session.id)
+        events = self._load_legacy_trace_events(session.id)
+        return session.to_record(transcript=document, events=events)
+
+    @staticmethod
+    def _record_document(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        document = record.get("transcript")
+        return document if isinstance(document, dict) else None
+
+    @staticmethod
+    def _record_events(record: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(record, dict):
+            return []
+        events = record.get("events")
+        if not isinstance(events, list):
+            return []
+        return [dict(event) for event in events if isinstance(event, dict)]
+
+    @staticmethod
+    def _filter_trace_events(
+        events: list[dict[str, Any]],
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        replayable_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        max_count = max(1, int(limit)) if limit is not None else None
+        for event in events:
+            seq = int(event.get("session_event_seq") or event.get("seq") or 0)
+            if seq <= int(after_seq or 0):
+                continue
+            if replayable_only and event.get("replayable") is False:
+                continue
+            filtered.append(dict(event))
+            if max_count is not None and len(filtered) >= max_count:
+                break
+        return filtered
+
+    def _load_legacy_document(self, session_id: str) -> dict[str, Any] | None:
+        path = self._get_document_path(session_id)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _load_legacy_trace_events(self, session_id: str) -> list[dict[str, Any]]:
+        path = self._get_trace_events_path(session_id)
+        if not path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def _delete_legacy_sidecars(self, session_id: str) -> None:
+        self._delete_legacy_document(session_id)
+        self._delete_legacy_trace_events(session_id)
+
+    def _delete_legacy_document(self, session_id: str) -> None:
+        path = self._get_document_path(session_id)
+        if path.exists():
+            path.unlink()
+
+    def _delete_legacy_trace_events(self, session_id: str) -> None:
+        path = self._get_trace_events_path(session_id)
+        if path.exists():
+            path.unlink()
 
     @staticmethod
     def _snapshot_event_seq(snapshot: dict) -> int:

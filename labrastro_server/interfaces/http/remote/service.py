@@ -167,6 +167,27 @@ class _ChatEventBuffer:
         self._total_bytes += size_bytes
         self._prune()
 
+    def patch_event_metadata(self, event: dict[str, Any]) -> None:
+        seq = int(event.get("seq", 0) or 0)
+        if seq <= 0:
+            return
+        metadata = {
+            key: event[key]
+            for key in ("session_event_seq", "last_event_seq", "document_revision")
+            if key in event
+        }
+        if not metadata:
+            return
+        for item in self._items:
+            if int(item.event.get("seq", 0) or 0) != seq:
+                continue
+            next_event = {**item.event, **metadata}
+            next_size = self._event_size(next_event)
+            self._total_bytes += next_size - item.size_bytes
+            item.event = next_event
+            item.size_bytes = next_size
+            return
+
     def events_after(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
         cursor = max(0, int(cursor or 0))
         events = [
@@ -311,6 +332,7 @@ class _RemoteChatSession:
     max_payload_bytes: int = 256 * 1024
     max_total_bytes: int = 4 * 1024 * 1024
     trace_event_sink: SessionTraceEventSink | None = None
+    trace_persistence_enabled: bool = False
     last_activity_at: float = field(default_factory=time.time)
     _event_buffer: _ChatEventBuffer = field(init=False, repr=False)
     _pending_trace_events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
@@ -472,11 +494,18 @@ class _RemoteChatSession:
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
         if not _is_replayable_chat_event(str(event.get("type") or "")):
             return
-        if self.session_id:
+        if self.session_id and self.trace_persistence_enabled:
             self._flush_pending_trace_events()
             self._persist_trace_event(event)
             return
-        self._pending_trace_events.append(dict(event))
+        self._pending_trace_events.append(event)
+
+    def enable_trace_persistence(self, session_id: str | None = None) -> None:
+        with self.cond:
+            if session_id:
+                self.session_id = session_id
+            self.trace_persistence_enabled = True
+            self._flush_pending_trace_events()
 
     def _flush_pending_trace_events(self) -> None:
         if not self.session_id or not self._pending_trace_events:
@@ -485,6 +514,7 @@ class _RemoteChatSession:
         self._pending_trace_events = []
         for event in pending:
             self._persist_trace_event(event)
+            self._event_buffer.patch_event_metadata(event)
 
     def _persist_trace_event(self, event: dict[str, Any]) -> None:
         if not self.session_id or self.trace_event_sink is None:

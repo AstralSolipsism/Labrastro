@@ -323,7 +323,7 @@ def _peer_register_payload(
     }
 
 
-def test_remote_chat_session_flushes_pending_replayable_events_when_session_id_arrives(
+def test_remote_chat_session_flushes_pending_replayable_events_when_trace_persistence_is_enabled(
     tmp_path: Path,
 ) -> None:
     persisted: list[dict] = []
@@ -364,6 +364,9 @@ def test_remote_chat_session_flushes_pending_replayable_events_when_session_id_a
     assert persisted == []
 
     session.append_event("remote_peer_ready", {"session_id": "session-1"})
+    assert persisted == []
+
+    session.enable_trace_persistence("session-1")
     session.append_event("assistant_message", {"content": "stored"})
     session.append_event("chat_end", {"response": "done"})
 

@@ -641,6 +641,41 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return None
         return document if isinstance(document, dict) else None
 
+    def _record_transcript(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        transcript = record.get("transcript")
+        return transcript if isinstance(transcript, dict) else None
+
+    def _load_session_record(
+        session_id: str,
+        loaded: Session | None = None,
+    ) -> dict[str, Any] | None:
+        loader = getattr(session_store, "load_record", None)
+        if callable(loader):
+            try:
+                record = loader(session_id)
+            except Exception:
+                record = None
+            if isinstance(record, dict):
+                return record
+        session = loaded or session_store.load(session_id)
+        if session is None:
+            return None
+        list_events = getattr(session_store, "list_trace_events", None)
+        events: list[dict[str, Any]] = []
+        if callable(list_events):
+            try:
+                raw_events = list_events(session_id, replayable_only=False)
+            except Exception:
+                raw_events = []
+            if isinstance(raw_events, list):
+                events = [dict(event) for event in raw_events if isinstance(event, dict)]
+        return session.to_record(
+            transcript=_load_session_document(session_id),
+            events=events,
+        )
+
     def _save_session_document(session_id: str, document: dict[str, Any]) -> None:
         saver = getattr(session_store, "save_document", None)
         if callable(saver):
@@ -732,10 +767,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "current_fingerprint": fingerprint,
                     "_status": 403,
                 }
-            document = _load_session_document(session_id)
+            record = _load_session_record(session_id, loaded)
+            document = _record_transcript(record) or _load_session_document(session_id)
             return {
                 "ok": True,
                 "fingerprint": fingerprint,
+                "record": record,
                 "metadata": _session_metadata_payload(loaded),
                 "document": document,
                 "runtime_state": loaded.runtime_state.to_dict(),
@@ -778,10 +815,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     fingerprint=fingerprint,
                 )
             loaded = session_store.load(session_id)
-            document = _load_session_document(session_id)
+            record = _load_session_record(session_id, loaded)
+            document = _record_transcript(record) or _load_session_document(session_id)
             return {
                 "ok": True,
                 "fingerprint": fingerprint,
+                "record": record,
                 "metadata": _session_metadata_payload(loaded)
                 if loaded is not None
                 else {
@@ -805,7 +844,9 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             )
             session_id = str(result.get("session_id") or payload.get("session_id") or "")
             if result.get("ok") and session_id:
-                document = _load_session_document(session_id)
+                record = _load_session_record(session_id)
+                document = _record_transcript(record) or _load_session_document(session_id)
+                result["record"] = record
                 result["document"] = document
                 result["last_event_seq"] = int((document or {}).get("last_event_seq") or 0)
             return result
@@ -926,13 +967,15 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 if isinstance(turns, list) and keep_through_message_index >= 0:
                     document["turns"] = turns[: keep_through_message_index + 1]
                 _save_session_document(session_id, document)
-            document = _load_session_document(session_id)
+            record = _load_session_record(session_id, saved)
+            document = _record_transcript(record) or _load_session_document(session_id)
             return {
                 "ok": True,
                 "session_id": session_id,
                 "source_session_id": source_session_id,
                 "keep_through_message_index": keep_through_message_index,
                 "fingerprint": fingerprint,
+                "record": record,
                 "metadata": _session_metadata_payload(saved)
                 if saved is not None
                 else {
@@ -1097,6 +1140,22 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             fingerprint=_peer_fingerprint(peer_id),
         )
         setattr(peer_agent, "current_session_id", sid)
+
+    def _enable_remote_session_trace_persistence(
+        peer_agent: Agent,
+        peer_id: str,
+        remote_session: Any,
+    ) -> None:
+        current_config = _current_config()
+        if current_config is None or not getattr(current_config, "session_auto_save", True):
+            return
+        _persist_session_placeholder(peer_agent, peer_id)
+        session_id = str(getattr(peer_agent, "current_session_id", "") or "")
+        enable_trace_persistence = getattr(
+            remote_session, "enable_trace_persistence", None
+        )
+        if session_id and callable(enable_trace_persistence):
+            enable_trace_persistence(session_id)
 
     def _apply_remote_chat_model_override(
         peer_agent: Agent,
@@ -1382,6 +1441,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             session_hint=getattr(remote_session, "session_hint", None),
             resume_latest=False,
         )
+        _enable_remote_session_trace_persistence(peer_agent, peer_id, remote_session)
         requested_mode = str(getattr(remote_session, "mode", "") or "").strip()
         if requested_mode:
             try:
@@ -1488,7 +1548,6 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return
 
         session_id = getattr(peer_agent, "current_session_id", "-") or "-"
-        _persist_session_placeholder(peer_agent, peer_id)
         peer_info = relay_server.registry.get(peer_id)
         connection_marker = (
             f"{getattr(peer_info, 'connected_at', 0):.6f}"

@@ -44,6 +44,42 @@ def test_session_store_save_and_load_roundtrip(tmp_path: Path) -> None:
     assert loaded.fingerprint == "local"
 
 
+def test_session_store_writes_single_session_record_for_history_document_and_events(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+
+    session_id = store.save(
+        messages=[{"role": "user", "content": "single source"}],
+        model="gpt-4o",
+        active_mode="coder",
+        runtime_state=SessionRuntimeState(model="gpt-4o", active_mode="coder"),
+        fingerprint="local",
+    )
+    event_seq = store.append_trace_event(
+        session_id,
+        "chat_start",
+        {"prompt": "single source"},
+        chat_id="chat-1",
+        chat_seq=1,
+    )
+
+    assert event_seq == 1
+    assert sorted(path.name for path in tmp_path.glob(f"{session_id}*")) == [
+        f"{session_id}.json"
+    ]
+    record = json.loads((tmp_path / f"{session_id}.json").read_text(encoding="utf-8"))
+    assert record["schema_version"] == 2
+    assert record["metadata"]["id"] == session_id
+    assert record["metadata"]["fingerprint"] == "local"
+    assert record["history"]["messages"][0]["content"] == "single source"
+    assert record["runtime_state"]["active_mode"] == "coder"
+    assert record["transcript"]["turns"][0]["userMessage"]["text"] == "single source"
+    assert record["transcript"]["last_event_seq"] == 1
+    assert record["events"][0]["type"] == "chat_start"
+    assert record["events"][0]["session_event_seq"] == 1
+
+
 def test_session_store_list_falls_back_to_saved_session_metadata(
     tmp_path: Path,
 ) -> None:
@@ -131,7 +167,7 @@ def test_session_store_load_backfills_missing_message_token_counts(
     import json
 
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["messages"][0].pop(MESSAGE_TOKEN_KEY, None)
+    data["history"]["messages"][0].pop(MESSAGE_TOKEN_KEY, None)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     loaded = store.load(session_id)
@@ -139,7 +175,7 @@ def test_session_store_load_backfills_missing_message_token_counts(
     assert isinstance(loaded.messages[0].get(MESSAGE_TOKEN_KEY), int)
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert isinstance(persisted["messages"][0].get(MESSAGE_TOKEN_KEY), int)
+    assert isinstance(persisted["history"]["messages"][0].get(MESSAGE_TOKEN_KEY), int)
 
 
 def test_session_store_list_filters_by_fingerprint(tmp_path: Path) -> None:

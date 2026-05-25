@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import gzip
-import json
 import os
 
 import pytest
@@ -67,7 +65,61 @@ def test_postgres_session_store_save_load_document_delete() -> None:
     assert store.load_document(session_id) is None
 
 
-def test_postgres_session_store_trace_events_reduce_to_document_and_compress_payload() -> None:
+def test_postgres_session_store_writes_single_session_record() -> None:
+    engine = _engine()
+    store = PostgresSessionStore(engine)
+    session_id = store.save(
+        messages=[{"role": "user", "content": "postgres-record"}],
+        model="m1",
+        fingerprint="pg-test",
+    )
+
+    try:
+        seq = store.append_trace_event(
+            session_id,
+            "chat_start",
+            {"prompt": "postgres-record"},
+            chat_id="chat-record",
+            chat_seq=1,
+        )
+
+        assert seq == 1
+        record = store.load_record(session_id)
+        assert record is not None
+        assert record["schema_version"] == 2
+        assert record["metadata"]["id"] == session_id
+        assert record["history"]["messages"][0]["content"] == "postgres-record"
+        assert record["transcript"]["turns"][0]["userMessage"]["text"] == "postgres-record"
+        assert record["events"][0]["type"] == "chat_start"
+
+        with engine.begin() as conn:
+            document_count = conn.execute(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM labrastro_session_documents
+                    WHERE session_id=:session_id
+                    """
+                ),
+                {"session_id": session_id},
+            ).scalar_one()
+            event_count = conn.execute(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM labrastro_session_trace_events
+                    WHERE session_id=:session_id
+                    """
+                ),
+                {"session_id": session_id},
+            ).scalar_one()
+        assert int(document_count or 0) == 0
+        assert int(event_count or 0) == 0
+    finally:
+        store.delete(session_id)
+
+
+def test_postgres_session_store_trace_events_reduce_to_record_document() -> None:
     engine = _engine()
     store = PostgresSessionStore(engine, payload_compress_threshold_bytes=64)
     session_id = store.save(
@@ -112,19 +164,21 @@ def test_postgres_session_store_trace_events_reduce_to_document_and_compress_pay
         assert tool_parts[0]["toolOutput"] == "x" * 512
 
         with engine.begin() as conn:
-            row = conn.execute(
+            event_count = conn.execute(
                 text(
                     """
-                    SELECT payload, payload_blob, payload_encoding
+                    SELECT count(*)
                     FROM labrastro_session_trace_events
-                    WHERE session_id=:session_id AND seq=2
+                    WHERE session_id=:session_id
                     """
                 ),
                 {"session_id": session_id},
-            ).mappings().one()
-        assert row["payload"] is None
-        assert row["payload_blob"] is not None
-        assert row["payload_encoding"] == "json+gzip"
+            ).scalar_one()
+        assert int(event_count or 0) == 0
+
+        record = store.load_record(session_id)
+        assert record is not None
+        assert record["events"][1]["payload"]["tool_result"] == "x" * 512
     finally:
         store.delete(session_id)
 
@@ -174,7 +228,7 @@ def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> 
         store.delete(session_id)
 
 
-def test_postgres_session_store_sanitizes_nul_before_payload_compression() -> None:
+def test_postgres_session_store_sanitizes_nul_in_record_payloads() -> None:
     engine = _engine()
     store = PostgresSessionStore(engine, payload_compress_threshold_bytes=64)
     session_id = store.save(
@@ -200,26 +254,24 @@ def test_postgres_session_store_sanitizes_nul_before_payload_compression() -> No
             row = conn.execute(
                 text(
                     """
-                    SELECT payload, payload_blob, payload_encoding
-                    FROM labrastro_session_trace_events
-                    WHERE session_id=:session_id AND seq=1
+                    SELECT record::text AS record_text
+                    FROM labrastro_sessions
+                    WHERE id=:session_id
                     """
                 ),
                 {"session_id": session_id},
             ).mappings().one()
 
-        assert row["payload"] is None
-        assert row["payload_blob"] is not None
-        assert row["payload_encoding"] == "json+gzip"
-        raw = gzip.decompress(row["payload_blob"])
-        assert b"\\u0000" not in raw
-        assert b"\x00" not in raw
-        assert json.loads(raw.decode("utf-8"))["tool_result"].startswith("x\ufffd")
+        record = store.load_record(session_id)
+        assert record is not None
+        assert record["events"][0]["payload"]["tool_result"].startswith("x\ufffd")
+        assert "\\u0000" not in row["record_text"]
+        assert "\x00" not in row["record_text"]
     finally:
         store.delete(session_id)
 
 
-def test_persistence_maintenance_does_not_touch_session_documents() -> None:
+def test_persistence_maintenance_does_not_touch_session_record_document() -> None:
     engine = _engine()
     store = PostgresSessionStore(engine)
     session_id = store.save(

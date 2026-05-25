@@ -97,6 +97,26 @@ class Session:
     @classmethod
     def from_dict(cls, d: dict) -> "Session":
         """Create from dictionary."""
+        if d.get("schema_version") == 2:
+            metadata = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+            history = d.get("history") if isinstance(d.get("history"), dict) else {}
+            runtime_state = SessionRuntimeState.from_dict(d.get("runtime_state"))
+            if runtime_state.model is None:
+                runtime_state.model = metadata.get("model")
+            if runtime_state.active_mode is None:
+                runtime_state.active_mode = history.get("active_mode")
+            return cls(
+                id=str(metadata.get("id") or d.get("id") or ""),
+                model=str(metadata.get("model") or runtime_state.model or "?"),
+                saved_at=str(metadata.get("saved_at") or d.get("saved_at") or "?"),
+                fingerprint=str(metadata.get("fingerprint") or d.get("fingerprint") or "local"),
+                messages=history.get("messages") if isinstance(history.get("messages"), list) else [],
+                active_mode=history.get("active_mode") or runtime_state.active_mode,
+                total_prompt_tokens=int(history.get("total_prompt_tokens") or 0),
+                total_completion_tokens=int(history.get("total_completion_tokens") or 0),
+                runtime_state=runtime_state,
+            )
+
         runtime_state = SessionRuntimeState.from_dict(d.get("runtime_state"))
         if runtime_state.model is None:
             runtime_state.model = d.get("model")
@@ -126,6 +146,34 @@ class Session:
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
             "runtime_state": self.runtime_state.to_dict(),
+        }
+
+    def to_record(
+        self,
+        *,
+        transcript: dict[str, Any] | None = None,
+        events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Convert to the unified persisted SessionRecord shape."""
+        preview = self.get_preview()
+        return {
+            "schema_version": 2,
+            "metadata": {
+                "id": self.id,
+                "model": self.model,
+                "saved_at": self.saved_at,
+                "preview": preview,
+                "fingerprint": self.fingerprint,
+            },
+            "runtime_state": self.runtime_state.to_dict(),
+            "history": {
+                "messages": self.messages,
+                "active_mode": self.active_mode,
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "total_completion_tokens": self.total_completion_tokens,
+            },
+            "transcript": transcript,
+            "events": list(events or []),
         }
 
     def get_preview(self) -> str:

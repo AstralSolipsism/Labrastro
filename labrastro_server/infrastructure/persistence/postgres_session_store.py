@@ -143,48 +143,27 @@ class PostgresSessionStore:
             runtime_state=effective_runtime,
         )
         with self.engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO labrastro_sessions (
-                        id, fingerprint, model, saved_at, preview, messages,
-                        runtime_state, active_mode, total_prompt_tokens,
-                        total_completion_tokens, has_history_content, deleted_at
-                    ) VALUES (
-                        :id, :fingerprint, :model, :saved_at, :preview,
-                        CAST(:messages AS JSONB), CAST(:runtime_state AS JSONB),
-                        :active_mode, :total_prompt_tokens,
-                        :total_completion_tokens, TRUE, NULL
-                    )
-                    ON CONFLICT (id) DO UPDATE SET
-                        fingerprint=EXCLUDED.fingerprint,
-                        model=EXCLUDED.model,
-                        saved_at=EXCLUDED.saved_at,
-                        preview=EXCLUDED.preview,
-                        messages=EXCLUDED.messages,
-                        runtime_state=EXCLUDED.runtime_state,
-                        active_mode=EXCLUDED.active_mode,
-                        total_prompt_tokens=EXCLUDED.total_prompt_tokens,
-                        total_completion_tokens=EXCLUDED.total_completion_tokens,
-                        has_history_content=TRUE,
-                        deleted_at=NULL,
-                        updated_at=now()
-                    """
-                ),
-                {
-                    "id": session.id,
-                    "fingerprint": session.fingerprint,
-                    "model": session.model,
-                    "saved_at": _saved_at_to_dt(session.saved_at),
-                    "preview": session.get_preview(),
-                    "messages": _json(session.messages),
-                    "runtime_state": _json(session.runtime_state.to_dict()),
-                    "active_mode": session.active_mode,
-                    "total_prompt_tokens": session.total_prompt_tokens,
-                    "total_completion_tokens": session.total_completion_tokens,
-                },
+            self._lock_session(conn, session.id)
+            existing_record = self._load_record(conn, session.id, promote_legacy=True)
+            document = update_session_document_metadata(
+                self._record_document(existing_record),
+                session_id=session.id,
+                model=session.model,
+                saved_at=session.saved_at,
+                preview=session.get_preview(),
+                fingerprint=session.fingerprint,
+                runtime_state=session.runtime_state.to_dict(),
             )
-            self._upsert_document_metadata(conn, session)
+            record = session.to_record(
+                transcript=document,
+                events=self._record_events(existing_record),
+            )
+            self._upsert_session_record(
+                conn,
+                session,
+                record,
+                has_history_content=True,
+            )
         return session_id
 
     def save_runtime_state(
@@ -219,49 +198,27 @@ class PostgresSessionStore:
         )
         has_history = SessionStore.has_history_content(saved_messages)
         with self.engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO labrastro_sessions (
-                        id, fingerprint, model, saved_at, preview, messages,
-                        runtime_state, active_mode, total_prompt_tokens,
-                        total_completion_tokens, has_history_content, deleted_at
-                    ) VALUES (
-                        :id, :fingerprint, :model, :saved_at, :preview,
-                        CAST(:messages AS JSONB), CAST(:runtime_state AS JSONB),
-                        :active_mode, :total_prompt_tokens,
-                        :total_completion_tokens, :has_history_content, NULL
-                    )
-                    ON CONFLICT (id) DO UPDATE SET
-                        fingerprint=EXCLUDED.fingerprint,
-                        model=EXCLUDED.model,
-                        saved_at=EXCLUDED.saved_at,
-                        preview=EXCLUDED.preview,
-                        messages=EXCLUDED.messages,
-                        runtime_state=EXCLUDED.runtime_state,
-                        active_mode=EXCLUDED.active_mode,
-                        total_prompt_tokens=EXCLUDED.total_prompt_tokens,
-                        total_completion_tokens=EXCLUDED.total_completion_tokens,
-                        has_history_content=EXCLUDED.has_history_content,
-                        deleted_at=NULL,
-                        updated_at=now()
-                    """
-                ),
-                {
-                    "id": session.id,
-                    "fingerprint": session.fingerprint,
-                    "model": session.model,
-                    "saved_at": _saved_at_to_dt(session.saved_at),
-                    "preview": session.get_preview(),
-                    "messages": _json(session.messages),
-                    "runtime_state": _json(session.runtime_state.to_dict()),
-                    "active_mode": session.active_mode,
-                    "total_prompt_tokens": session.total_prompt_tokens,
-                    "total_completion_tokens": session.total_completion_tokens,
-                    "has_history_content": has_history,
-                },
+            self._lock_session(conn, session.id)
+            existing_record = self._load_record(conn, session.id, promote_legacy=True)
+            document = update_session_document_metadata(
+                self._record_document(existing_record),
+                session_id=session.id,
+                model=session.model,
+                saved_at=session.saved_at,
+                preview=session.get_preview(),
+                fingerprint=session.fingerprint,
+                runtime_state=session.runtime_state.to_dict(),
             )
-            self._upsert_document_metadata(conn, session)
+            record = session.to_record(
+                transcript=document,
+                events=self._record_events(existing_record),
+            )
+            self._upsert_session_record(
+                conn,
+                session,
+                record,
+                has_history_content=has_history,
+            )
         return session_id
 
     def append_system_message(
@@ -300,18 +257,11 @@ class PostgresSessionStore:
 
     def load(self, session_id: str) -> Session | None:
         with self.engine.begin() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    SELECT * FROM labrastro_sessions
-                    WHERE id=:id AND deleted_at IS NULL
-                    """
-                ),
-                {"id": session_id},
-            ).mappings().first()
-        if row is None:
+            self._lock_session(conn, session_id)
+            record = self._load_record(conn, session_id, promote_legacy=True)
+        if record is None:
             return None
-        return self._session_from_row(row)
+        return self._session_from_record(record)
 
     def delete(self, session_id: str) -> bool:
         with self.engine.begin() as conn:
@@ -325,8 +275,8 @@ class PostgresSessionStore:
                 ),
                 {"id": session_id},
             )
-            self._delete_document(conn, session_id)
-            self.delete_trace_events(session_id)
+            self._delete_legacy_document(conn, session_id)
+            self._delete_legacy_trace_events(conn, session_id)
             return int(result.rowcount or 0) > 0
 
     def list(
@@ -345,14 +295,14 @@ class PostgresSessionStore:
                 text(
                     f"""
                     SELECT sessions.id, sessions.model, sessions.saved_at,
-                           sessions.preview, sessions.fingerprint,
-                           documents.document
+                           sessions.preview, sessions.fingerprint, sessions.record
                     FROM labrastro_sessions sessions
-                    JOIN labrastro_session_documents documents
-                      ON documents.session_id = sessions.id
                     WHERE {' AND '.join(clauses)}
-                      AND jsonb_array_length(COALESCE(documents.document->'turns', '[]'::jsonb)) > 0
-                    ORDER BY documents.updated_at DESC, sessions.saved_at DESC
+                      AND (
+                        sessions.has_history_content IS TRUE
+                        OR jsonb_array_length(COALESCE(sessions.record->'transcript'->'turns', '[]'::jsonb)) > 0
+                      )
+                    ORDER BY sessions.saved_at DESC
                     LIMIT :limit
                     """
                 ),
@@ -360,17 +310,35 @@ class PostgresSessionStore:
             ).mappings().all()
         sessions: list[SessionMetadata] = []
         for row in rows:
+            record = self._row_record(row)
+            metadata_record = (
+                record.get("metadata") if isinstance(record, dict) else None
+            )
+            metadata_record = metadata_record if isinstance(metadata_record, dict) else {}
             fallback = {
-                "id": str(row["id"]),
-                "model": str(row["model"]),
-                "saved_at": row["saved_at"].isoformat()
-                if hasattr(row["saved_at"], "isoformat")
-                else str(row["saved_at"]),
-                "preview": str(row["preview"] or ""),
-                "fingerprint": str(row["fingerprint"] or DEFAULT_SESSION_FINGERPRINT),
+                "id": str(metadata_record.get("id") or row["id"]),
+                "model": str(metadata_record.get("model") or row["model"]),
+                "saved_at": str(
+                    metadata_record.get("saved_at")
+                    or (
+                        row["saved_at"].isoformat()
+                        if hasattr(row["saved_at"], "isoformat")
+                        else str(row["saved_at"])
+                    )
+                ),
+                "preview": str(metadata_record.get("preview") or row["preview"] or ""),
+                "fingerprint": str(
+                    metadata_record.get("fingerprint")
+                    or row["fingerprint"]
+                    or DEFAULT_SESSION_FINGERPRINT
+                ),
             }
-            document = row.get("document") if isinstance(row.get("document"), dict) else {}
-            metadata = session_metadata_from_document(document, fallback)
+            document = self._record_document(record) or {}
+            metadata = (
+                session_metadata_from_document(document, fallback)
+                if document.get("turns")
+                else fallback
+            )
             sessions.append(
                 SessionMetadata(
                     id=str(metadata["id"]),
@@ -389,28 +357,47 @@ class PostgresSessionStore:
         return sessions[0] if sessions else None
 
     def load_document(self, session_id: str) -> dict | None:
-        with self.engine.begin() as conn:
-            return self._load_document(conn, session_id)
+        record = self.load_record(session_id)
+        return self._record_document(record)
 
     def save_document(self, session_id: str, document: dict) -> None:
         if not isinstance(document, dict):
             document = empty_session_document(session_id)
         with self.engine.begin() as conn:
-            conn.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:session_id))"),
-                {"session_id": session_id},
+            self._lock_session(conn, session_id)
+            record = self._load_record(conn, session_id, promote_legacy=True)
+            if record is None:
+                session = Session(
+                    id=session_id,
+                    model=str(document.get("model") or ""),
+                    saved_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    messages=[],
+                )
+                record = session.to_record(transcript=document, events=[])
+                self._upsert_session_record(
+                    conn,
+                    session,
+                    record,
+                    has_history_content=False,
+                )
+                return
+            session = self._session_from_record(record)
+            record = session.to_record(
+                transcript=document,
+                events=self._record_events(record),
             )
-            self._upsert_document(
-                conn,
-                session_id,
-                document,
-                int(document.get("revision") or 0),
-                int(document.get("last_event_seq") or 0),
-            )
+            self._update_record(conn, session_id, record)
 
     def delete_document(self, session_id: str) -> bool:
         with self.engine.begin() as conn:
-            return self._delete_document(conn, session_id)
+            self._lock_session(conn, session_id)
+            record = self._load_record(conn, session_id, promote_legacy=True)
+            had_document = isinstance(self._record_document(record), dict)
+            if isinstance(record, dict):
+                record["transcript"] = None
+                self._update_record(conn, session_id, record)
+            legacy_deleted = self._delete_legacy_document(conn, session_id)
+            return had_document or legacy_deleted
 
     def append_trace_event(
         self,
@@ -423,100 +410,64 @@ class PostgresSessionStore:
         source: str = "remote_chat",
         replayable: bool = True,
     ) -> int:
-        payload_json, payload_blob, payload_encoding, payload_bytes = (
-            self._encode_event_payload(payload if isinstance(payload, dict) else {})
-        )
         with self.engine.begin() as conn:
-            conn.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:session_id))"),
-                {"session_id": session_id},
-            )
-            seq = conn.execute(
-                text(
-                    """
-                    SELECT COALESCE(max(seq), 0) + 1
-                    FROM labrastro_session_trace_events
-                    WHERE session_id=:session_id
-                    """
-                ),
-                {"session_id": session_id},
-            ).scalar_one()
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO labrastro_session_trace_events (
-                        session_id, seq, type, payload, chat_id, chat_seq,
-                        source, replayable, payload_blob, payload_encoding,
-                        payload_bytes
-                    ) VALUES (
-                        :session_id, :seq, :type, CAST(:payload AS JSONB),
-                        :chat_id, :chat_seq, :source, :replayable,
-                        :payload_blob, :payload_encoding, :payload_bytes
-                    )
-                    ON CONFLICT (session_id, seq) DO NOTHING
-                    """
-                ),
-                {
-                    "session_id": session_id,
-                    "seq": int(seq),
-                    "type": str(event_type),
-                    "payload": payload_json,
-                    "chat_id": chat_id,
-                    "chat_seq": int(chat_seq) if chat_seq is not None else None,
-                    "source": source,
-                    "replayable": bool(replayable),
-                    "payload_blob": payload_blob,
-                    "payload_encoding": payload_encoding,
-                    "payload_bytes": payload_bytes,
+            self._lock_session(conn, session_id)
+            record = self._load_record(conn, session_id, promote_legacy=True)
+            if record is None:
+                session = Session(
+                    id=session_id,
+                    model="",
+                    saved_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    messages=[],
+                )
+                record = session.to_record(
+                    transcript=empty_session_document(session_id),
+                    events=[],
+                )
+                has_history = False
+            else:
+                session = self._session_from_record(record)
+                has_history = SessionStore.has_history_content(session.messages)
+            seq = self._latest_record_event_seq(record) + 1
+            event_payload = _jsonb_safe(payload if isinstance(payload, dict) else {})
+            event = {
+                "session_id": session_id,
+                "session_event_seq": int(seq),
+                "seq": int(chat_seq) if chat_seq is not None else int(seq),
+                "chat_id": chat_id,
+                "chat_seq": int(chat_seq) if chat_seq is not None else None,
+                "type": str(event_type),
+                "payload": event_payload if isinstance(event_payload, dict) else {},
+                "source": source,
+                "replayable": bool(replayable),
+            }
+            events = self._record_events(record)
+            events.append(event)
+            document = self._record_document(record) or empty_session_document(
+                session_id,
+                metadata={
+                    "model": session.model,
+                    "saved_at": session.saved_at,
+                    "preview": session.get_preview(),
+                    "fingerprint": session.fingerprint,
                 },
+                runtime_state=session.runtime_state.to_dict(),
             )
-            document = self._load_document(conn, session_id)
-            if document is None:
-                row = conn.execute(
-                    text(
-                        """
-                        SELECT model, saved_at, preview, fingerprint, runtime_state
-                        FROM labrastro_sessions
-                        WHERE id=:session_id
-                        """
-                    ),
-                    {"session_id": session_id},
-                ).mappings().first()
-                if row is not None:
-                    saved_at = (
-                        row["saved_at"].isoformat()
-                        if hasattr(row["saved_at"], "isoformat")
-                        else str(row["saved_at"])
-                    )
-                    document = empty_session_document(
-                        session_id,
-                        metadata={
-                            "model": str(row["model"] or ""),
-                            "saved_at": saved_at,
-                            "preview": str(row["preview"] or ""),
-                            "fingerprint": str(row["fingerprint"] or DEFAULT_SESSION_FINGERPRINT),
-                        },
-                        runtime_state=row.get("runtime_state")
-                        if isinstance(row.get("runtime_state"), dict)
-                        else {},
-                    )
-                else:
-                    document = empty_session_document(session_id)
             document = apply_session_event(
                 document,
                 session_id=session_id,
                 event_type=str(event_type),
-                payload=payload if isinstance(payload, dict) else {},
+                payload=event["payload"],
                 session_event_seq=int(seq),
                 chat_id=chat_id,
                 chat_seq=chat_seq,
             )
-            self._upsert_document(
+            record = session.to_record(transcript=document, events=events)
+            self._upsert_session_record(
                 conn,
-                session_id,
-                document,
-                int(document.get("revision") or 0),
-                int(document.get("last_event_seq") or 0),
+                session,
+                record,
+                has_history_content=has_history,
             )
             return int(seq)
 
@@ -528,32 +479,253 @@ class PostgresSessionStore:
         limit: int | None = None,
         replayable_only: bool = True,
     ) -> list[dict]:
-        clauses = ["session_id=:session_id", "seq > :after_seq"]
-        params: dict[str, Any] = {
-            "session_id": session_id,
-            "after_seq": max(0, int(after_seq or 0)),
-        }
-        if replayable_only:
-            clauses.append("replayable IS TRUE")
-        limit_sql = ""
-        if limit is not None:
-            params["limit"] = max(1, int(limit))
-            limit_sql = " LIMIT :limit"
+        record = self.load_record(session_id)
+        return self._filter_trace_events(
+            self._record_events(record),
+            after_seq=after_seq,
+            limit=limit,
+            replayable_only=replayable_only,
+        )
+
+    def latest_trace_event_seq(self, session_id: str) -> int:
+        record = self.load_record(session_id)
+        return self._latest_record_event_seq(record)
+
+    def delete_trace_events(self, session_id: str) -> bool:
         with self.engine.begin() as conn:
-            rows = conn.execute(
-                text(
-                    f"""
-                    SELECT session_id, seq, type, payload, chat_id, chat_seq,
-                           source, replayable, payload_blob, payload_encoding,
-                           payload_bytes, created_at
-                    FROM labrastro_session_trace_events
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY seq ASC
-                    {limit_sql}
-                    """
-                ),
-                params,
-            ).mappings().all()
+            self._lock_session(conn, session_id)
+            record = self._load_record(conn, session_id, promote_legacy=True)
+            had_events = bool(self._record_events(record))
+            if isinstance(record, dict):
+                record["events"] = []
+                self._update_record(conn, session_id, record)
+            legacy_deleted = self._delete_legacy_trace_events(conn, session_id)
+            return had_events or legacy_deleted
+
+    def load_record(self, session_id: str) -> dict[str, Any] | None:
+        with self.engine.begin() as conn:
+            self._lock_session(conn, session_id)
+            return self._load_record(conn, session_id, promote_legacy=True)
+
+    @staticmethod
+    def _lock_session(conn: Any, session_id: str) -> None:
+        conn.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:session_id))"),
+            {"session_id": session_id},
+        )
+
+    def _load_record(
+        self,
+        conn: Any,
+        session_id: str,
+        *,
+        promote_legacy: bool,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            text(
+                """
+                SELECT *
+                FROM labrastro_sessions
+                WHERE id=:id AND deleted_at IS NULL
+                """
+            ),
+            {"id": session_id},
+        ).mappings().first()
+        if row is None:
+            return None
+
+        record = self._row_record(row)
+        legacy_document = self._load_legacy_document(conn, session_id)
+        legacy_events = self._load_legacy_trace_events(conn, session_id)
+        should_promote = False
+        if record is None:
+            record = self._legacy_row_to_record(row, legacy_document, legacy_events)
+            should_promote = True
+        else:
+            record = dict(record)
+            if legacy_document is not None and not isinstance(
+                record.get("transcript"), dict
+            ):
+                record["transcript"] = legacy_document
+                should_promote = True
+            if legacy_events and self._latest_event_seq(
+                legacy_events
+            ) > self._latest_event_seq(self._record_events(record)):
+                record["events"] = legacy_events
+                should_promote = True
+        if should_promote and promote_legacy:
+            self._update_record(conn, session_id, record)
+            self._delete_legacy_document(conn, session_id)
+            self._delete_legacy_trace_events(conn, session_id)
+        return record
+
+    def _upsert_session_record(
+        self,
+        conn: Any,
+        session: Session,
+        record: dict[str, Any],
+        *,
+        has_history_content: bool,
+    ) -> None:
+        conn.execute(
+            text(
+                """
+                INSERT INTO labrastro_sessions (
+                    id, fingerprint, model, saved_at, preview, messages,
+                    runtime_state, active_mode, total_prompt_tokens,
+                    total_completion_tokens, has_history_content, record, deleted_at
+                ) VALUES (
+                    :id, :fingerprint, :model, :saved_at, :preview,
+                    CAST(:messages AS JSONB), CAST(:runtime_state AS JSONB),
+                    :active_mode, :total_prompt_tokens,
+                    :total_completion_tokens, :has_history_content,
+                    CAST(:record AS JSONB), NULL
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    fingerprint=EXCLUDED.fingerprint,
+                    model=EXCLUDED.model,
+                    saved_at=EXCLUDED.saved_at,
+                    preview=EXCLUDED.preview,
+                    messages=EXCLUDED.messages,
+                    runtime_state=EXCLUDED.runtime_state,
+                    active_mode=EXCLUDED.active_mode,
+                    total_prompt_tokens=EXCLUDED.total_prompt_tokens,
+                    total_completion_tokens=EXCLUDED.total_completion_tokens,
+                    has_history_content=EXCLUDED.has_history_content,
+                    record=EXCLUDED.record,
+                    deleted_at=NULL,
+                    updated_at=now()
+                """
+            ),
+            {
+                "id": session.id,
+                "fingerprint": session.fingerprint,
+                "model": session.model,
+                "saved_at": _saved_at_to_dt(session.saved_at),
+                "preview": session.get_preview(),
+                "messages": _json(session.messages),
+                "runtime_state": _json(session.runtime_state.to_dict()),
+                "active_mode": session.active_mode,
+                "total_prompt_tokens": session.total_prompt_tokens,
+                "total_completion_tokens": session.total_completion_tokens,
+                "has_history_content": bool(has_history_content),
+                "record": _json(record),
+            },
+        )
+        self._delete_legacy_document(conn, session.id)
+        self._delete_legacy_trace_events(conn, session.id)
+
+    @staticmethod
+    def _update_record(conn: Any, session_id: str, record: dict[str, Any]) -> None:
+        conn.execute(
+            text(
+                """
+                UPDATE labrastro_sessions
+                SET record=CAST(:record AS JSONB), updated_at=now()
+                WHERE id=:session_id AND deleted_at IS NULL
+                """
+            ),
+            {"session_id": session_id, "record": _json(record)},
+        )
+
+    @staticmethod
+    def _row_record(row: Any) -> dict[str, Any] | None:
+        raw = row.get("record") if hasattr(row, "get") else None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        if isinstance(raw, dict) and raw.get("schema_version") == 2:
+            return raw
+        return None
+
+    @staticmethod
+    def _record_document(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        document = record.get("transcript")
+        return document if isinstance(document, dict) else None
+
+    @staticmethod
+    def _record_events(record: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(record, dict):
+            return []
+        events = record.get("events")
+        if not isinstance(events, list):
+            return []
+        return [dict(event) for event in events if isinstance(event, dict)]
+
+    @staticmethod
+    def _filter_trace_events(
+        events: list[dict[str, Any]],
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        replayable_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        max_count = max(1, int(limit)) if limit is not None else None
+        for event in events:
+            seq = int(event.get("session_event_seq") or event.get("seq") or 0)
+            if seq <= int(after_seq or 0):
+                continue
+            if replayable_only and event.get("replayable") is False:
+                continue
+            filtered.append(dict(event))
+            if max_count is not None and len(filtered) >= max_count:
+                break
+        return filtered
+
+    @classmethod
+    def _latest_record_event_seq(cls, record: dict[str, Any] | None) -> int:
+        return cls._latest_event_seq(cls._record_events(record))
+
+    @staticmethod
+    def _latest_event_seq(events: list[dict[str, Any]]) -> int:
+        if not events:
+            return 0
+        return max(int(event.get("session_event_seq") or event.get("seq") or 0) for event in events)
+
+    def _legacy_row_to_record(
+        self,
+        row: Any,
+        document: dict[str, Any] | None,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        session = self._session_from_legacy_row(row)
+        return session.to_record(transcript=document, events=events)
+
+    def _load_legacy_document(self, conn: Any, session_id: str) -> dict | None:
+        row = conn.execute(
+            text(
+                """
+                SELECT document
+                FROM labrastro_session_documents
+                WHERE session_id=:session_id
+                """
+            ),
+            {"session_id": session_id},
+        ).mappings().first()
+        if row is None:
+            return None
+        document = row.get("document")
+        return dict(document) if isinstance(document, dict) else None
+
+    def _load_legacy_trace_events(self, conn: Any, session_id: str) -> list[dict]:
+        rows = conn.execute(
+            text(
+                """
+                SELECT session_id, seq, type, payload, chat_id, chat_seq,
+                       source, replayable, payload_blob, payload_encoding,
+                       payload_bytes, created_at
+                FROM labrastro_session_trace_events
+                WHERE session_id=:session_id
+                ORDER BY seq ASC
+                """
+            ),
+            {"session_id": session_id},
+        ).mappings().all()
         events: list[dict] = []
         for row in rows:
             payload, _error = self._decode_event_payload(row)
@@ -577,19 +749,21 @@ class PostgresSessionStore:
             )
         return events
 
-    def latest_trace_event_seq(self, session_id: str) -> int:
-        with self.engine.begin() as conn:
-            return self._latest_trace_event_seq(conn, session_id)
+    @staticmethod
+    def _delete_legacy_document(conn: Any, session_id: str) -> bool:
+        result = conn.execute(
+            text("DELETE FROM labrastro_session_documents WHERE session_id=:session_id"),
+            {"session_id": session_id},
+        )
+        return int(result.rowcount or 0) > 0
 
-    def delete_trace_events(self, session_id: str) -> bool:
-        with self.engine.begin() as conn:
-            result = conn.execute(
-                text(
-                    "DELETE FROM labrastro_session_trace_events WHERE session_id=:session_id"
-                ),
-                {"session_id": session_id},
-            )
-            return int(result.rowcount or 0) > 0
+    @staticmethod
+    def _delete_legacy_trace_events(conn: Any, session_id: str) -> bool:
+        result = conn.execute(
+            text("DELETE FROM labrastro_session_trace_events WHERE session_id=:session_id"),
+            {"session_id": session_id},
+        )
+        return int(result.rowcount or 0) > 0
 
     def _encode_event_payload(
         self, payload: dict
@@ -618,99 +792,15 @@ class PostgresSessionStore:
         return None, "payload_not_object"
 
     @staticmethod
-    def _latest_trace_event_seq(conn: Any, session_id: str) -> int:
-        value = conn.execute(
-            text(
-                """
-                SELECT COALESCE(max(seq), 0)
-                FROM labrastro_session_trace_events
-                WHERE session_id=:session_id
-                """
-            ),
-            {"session_id": session_id},
-        ).scalar_one()
-        return int(value or 0)
-
-    def _load_document(self, conn: Any, session_id: str) -> dict | None:
-        row = conn.execute(
-            text(
-                """
-                SELECT document
-                FROM labrastro_session_documents
-                WHERE session_id=:session_id
-                """
-            ),
-            {"session_id": session_id},
-        ).mappings().first()
-        if row is None:
-            return None
-        document = row.get("document")
-        return dict(document) if isinstance(document, dict) else None
-
-    def _upsert_document_metadata(self, conn: Any, session: Session) -> None:
-        existing = self._load_document(conn, session.id)
-        document = update_session_document_metadata(
-            existing,
-            session_id=session.id,
-            model=session.model,
-            saved_at=session.saved_at,
-            preview=session.get_preview(),
-            fingerprint=session.fingerprint,
-            runtime_state=session.runtime_state.to_dict(),
-        )
-        self._upsert_document(
-            conn,
-            session.id,
-            document,
-            int(document.get("revision") or 0),
-            int(document.get("last_event_seq") or 0),
-        )
-
-    def _upsert_document(
-        self,
-        conn: Any,
-        session_id: str,
-        document: dict,
-        revision: int,
-        last_event_seq: int,
-    ) -> None:
-        conn.execute(
-            text(
-                """
-                INSERT INTO labrastro_session_documents (
-                    session_id, document, revision, last_event_seq, updated_at
-                ) VALUES (
-                    :session_id, CAST(:document AS JSONB), :revision,
-                    :last_event_seq, now()
-                )
-                ON CONFLICT (session_id) DO UPDATE SET
-                    document=EXCLUDED.document,
-                    revision=EXCLUDED.revision,
-                    last_event_seq=EXCLUDED.last_event_seq,
-                    updated_at=now()
-                """
-            ),
-            {
-                "session_id": session_id,
-                "document": _json(document),
-                "revision": int(revision or 0),
-                "last_event_seq": int(last_event_seq or 0),
-            },
-        )
-
-    @staticmethod
-    def _delete_document(conn: Any, session_id: str) -> bool:
-        result = conn.execute(
-            text("DELETE FROM labrastro_session_documents WHERE session_id=:session_id"),
-            {"session_id": session_id},
-        )
-        return int(result.rowcount or 0) > 0
-
-    @staticmethod
     def get_exit_time(messages: list[dict]) -> str | None:
         return SessionStore.get_exit_time(messages)
 
-    def _session_from_row(self, row: Any) -> Session:
+    def _session_from_record(self, record: dict[str, Any]) -> Session:
+        session = Session.from_dict(record)
+        ensure_message_token_counts(session.messages)
+        return session
+
+    def _session_from_legacy_row(self, row: Any) -> Session:
         messages = list(row["messages"] or [])
         ensure_message_token_counts(messages)
         runtime_state = SessionRuntimeState.from_dict(row["runtime_state"])
@@ -730,4 +820,3 @@ class PostgresSessionStore:
             total_completion_tokens=int(row["total_completion_tokens"] or 0),
             runtime_state=runtime_state,
         )
-
