@@ -159,6 +159,23 @@ class RemoteAdminConfigManager:
             "agent_runs": get_interactive_run_limiter().snapshot(),
         }
 
+    def chat_config(self) -> dict[str, Any]:
+        modes = self.list_modes()
+        data = self._load_data()
+        agents = self._agent_profile_views(data, modes["active_mode"])
+        model_profiles = self._model_profile_state(data)
+        return {
+            "modes": modes["modes"],
+            "active_mode": modes["active_mode"],
+            "model_profiles": model_profiles["model_profiles"],
+            "active_main": model_profiles["active_main"],
+            "active_sub": model_profiles["active_sub"],
+            "active_agent_model": self._active_agent_model(
+                agents,
+                modes["active_mode"],
+            ),
+        }
+
     def config_etag(self, data: dict[str, Any] | None = None) -> str:
         payload = json.dumps(
             data if data is not None else self._load_data(),
@@ -1852,7 +1869,9 @@ class RemoteAdminConfigManager:
         return AdminConfigResult(True, result)
 
     def list_model_profiles(self) -> dict[str, Any]:
-        data = self._load_data()
+        return self._model_profile_state(self._load_data())
+
+    def _model_profile_state(self, data: dict[str, Any]) -> dict[str, Any]:
         models = data.get("models", {})
         models = models if isinstance(models, dict) else {}
         raw_profiles = models.get("profiles", {})

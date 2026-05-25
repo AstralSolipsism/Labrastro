@@ -781,6 +781,87 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_admin_chat_config_read_returns_lightweight_chat_selection_state(
+        self,
+    ) -> None:
+        config_data = {
+            "providers": {
+                "items": {
+                    "deepseek": {
+                        "type": "openai_chat",
+                        "api_key": "sk-ds",
+                        "models": [{"id": "deepseek-chat"}],
+                    }
+                }
+            },
+            "models": {
+                "active_main": "deepseek-main",
+                "profiles": {
+                    "deepseek-main": {
+                        "provider": "deepseek",
+                        "model": "deepseek-chat",
+                        "max_tokens": 4096,
+                        "max_context_tokens": 128000,
+                    }
+                },
+            },
+            "modes": {
+                "active": "planner",
+                "profiles": {
+                    "planner": {
+                        "description": "Plan first",
+                        "tools": ["read_file"],
+                    },
+                },
+            },
+            "agent_registry": {
+                "agents": {
+                    "planner": {
+                        "model": {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                        }
+                    }
+                }
+            },
+        }
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=Path("unused-config.yaml"),
+        )
+        service.start()
+        try:
+            with patch.object(RemoteAdminConfigManager, "_load_data", return_value=config_data):
+                status, body = _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/chat-config/read",
+                    {},
+                    headers=TEST_ADMIN_HEADERS,
+                )
+
+            assert status == 200
+            assert body["ok"] is True
+            assert body["active_mode"] == "planner"
+            assert body["active_main"] == "deepseek-main"
+            assert body["active_agent_model"] == {
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "parameters": {},
+            }
+            assert body["model_profiles"][0]["id"] == "deepseek-main"
+            assert "server_settings" not in body
+            assert "provider_model_catalog" not in body
+            assert "model_capabilities" not in body
+            assert "agent_runs" not in body
+            assert "github" not in body
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_admin_status_falls_back_to_builtin_chat_modes(self) -> None:
         manager = RemoteAdminConfigManager(Path("unused-config.yaml"))
         with patch.object(manager, "_load_data", return_value={}):

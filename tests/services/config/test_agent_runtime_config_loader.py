@@ -595,6 +595,80 @@ def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None
     assert environment_agent["runtime_profile"] == "environment_local"
 
 
+def test_admin_chat_config_exposes_only_chat_selection_state() -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data = {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-ds",
+                            "models": [{"id": "V4PRO", "display_name": "V4 Pro"}],
+                        }
+                    }
+                },
+                "models": {
+                    "active_main": "deepseek-main",
+                    "active_sub": "deepseek-sub",
+                    "profiles": {
+                        "deepseek-main": {
+                            "provider": "deepseek",
+                            "model": "V4PRO",
+                            "max_tokens": 8192,
+                            "max_context_tokens": 128000,
+                        },
+                        "deepseek-sub": {
+                            "provider": "deepseek",
+                            "model": "V4FLASH",
+                            "max_tokens": 4096,
+                            "max_context_tokens": 64000,
+                        },
+                    },
+                },
+                "modes": {"active": "planner", "profiles": {"planner": {}}},
+                "agent_registry": {
+                    "agents": {
+                        "planner": {
+                            "name": "Planner",
+                            "model": {
+                                "provider": "deepseek",
+                                "model": "V4PRO",
+                                "display_name": "V4 Pro",
+                            },
+                        }
+                    }
+                },
+                "model_capabilities": {"enabled": False},
+            }
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+    chat_config = MemoryAdminManager().chat_config()
+
+    assert chat_config["active_mode"] == "planner"
+    assert {mode["name"] for mode in chat_config["modes"]} >= {"coder", "planner"}
+    assert chat_config["active_main"] == "deepseek-main"
+    assert chat_config["active_sub"] == "deepseek-sub"
+    assert [profile["id"] for profile in chat_config["model_profiles"]] == [
+        "deepseek-main",
+        "deepseek-sub",
+    ]
+    assert chat_config["active_agent_model"] == {
+        "provider": "deepseek",
+        "model": "V4PRO",
+        "display_name": "V4 Pro",
+        "parameters": {},
+    }
+    assert "providers" not in chat_config
+    assert "provider_model_catalog" not in chat_config
+    assert "server_settings" not in chat_config
+    assert "model_capabilities" not in chat_config
+    assert "agent_runs" not in chat_config
+
+
 def test_admin_server_settings_update_replace_removes_runtime_profiles_and_agents() -> None:
     class MemoryAdminManager(RemoteAdminConfigManager):
         def __init__(self) -> None:

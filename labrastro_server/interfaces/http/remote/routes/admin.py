@@ -103,6 +103,10 @@ class RemoteAdminRoutes:
                 )
                 self._send_json(HTTPStatus.OK, result)
                 return
+            if path == "/remote/admin/chat-config/read":
+                result = {"ok": True, **self.service.admin_manager.chat_config()}
+                self._send_json(HTTPStatus.OK, result)
+                return
             if path == "/remote/admin/agent-runs/submit":
                 if self.service.runtime_control_plane is None:
                     self._send_error(
@@ -807,6 +811,7 @@ class RemoteAdminRoutes:
     def _admin_scope_for_path(self, path: str) -> str:
         read_paths = {
             "/remote/admin/status",
+            "/remote/admin/chat-config/read",
             "/remote/admin/github/status",
             "/remote/admin/agent-runs/events",
             "/remote/admin/agent-runs/list",
