@@ -3,7 +3,14 @@ from unittest.mock import patch
 
 import pytest
 
-from reuleauxcoder.domain.config.models import ProviderConfig
+from reuleauxcoder.domain.config.models import (
+    DIAGNOSTICS_CONFIG_FIELDS,
+    LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS,
+    MODEL_PROFILE_CONFIG_FIELDS,
+    PROVIDER_CONFIG_FIELDS,
+    TOOL_DIAGNOSTICS_CONFIG_FIELDS,
+    ProviderConfig,
+)
 from reuleauxcoder.domain.config.schema import CONFIG_SCHEMA
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError
@@ -242,6 +249,27 @@ def test_provider_schema_documents_loader_provider_fields() -> None:
     schema_fields = set(CONFIG_SCHEMA["providers"]["items"]["provider_id"])
 
     assert schema_fields == ConfigLoader._PROVIDER_ITEM_FIELDS
+    assert ConfigLoader._PROVIDER_ITEM_FIELDS == set(PROVIDER_CONFIG_FIELDS) | {"models"}
+
+
+def test_model_profile_schema_documents_loader_model_profile_fields() -> None:
+    schema_fields = set(CONFIG_SCHEMA["models"]["profiles"]["profile_name"])
+
+    assert schema_fields == ConfigLoader._MODEL_PROFILE_FIELDS
+    assert ConfigLoader._MODEL_PROFILE_FIELDS == set(MODEL_PROFILE_CONFIG_FIELDS)
+
+
+def test_diagnostics_schema_documents_loader_diagnostics_fields() -> None:
+    schema = CONFIG_SCHEMA["diagnostics"]
+
+    assert set(schema) == ConfigLoader._DIAGNOSTICS_FIELDS
+    assert ConfigLoader._DIAGNOSTICS_FIELDS == set(DIAGNOSTICS_CONFIG_FIELDS)
+    assert set(schema["llm_trace"]) == ConfigLoader._LLM_TRACE_FIELDS
+    assert ConfigLoader._LLM_TRACE_FIELDS == set(LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS)
+    assert set(schema["tool_diagnostics"]) == ConfigLoader._TOOL_DIAGNOSTICS_FIELDS
+    assert ConfigLoader._TOOL_DIAGNOSTICS_FIELDS == set(
+        TOOL_DIAGNOSTICS_CONFIG_FIELDS
+    )
 
 
 def test_parse_config_still_rejects_unknown_provider_fields() -> None:

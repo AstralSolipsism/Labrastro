@@ -5,16 +5,23 @@
     AuthConfig,
     AuthSuperadminConfig,
     Config,
+    DIAGNOSTICS_CONFIG_FIELDS,
+    DiagnosticsConfig,
     EnvironmentCLIToolConfig,
+    LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS,
+    LLMTraceDiagnosticsConfig,
     MCPArtifactConfig,
     MCPLaunchConfig,
     MCPServerConfig,
+    MODEL_PROFILE_CONFIG_FIELDS,
     ModeConfig,
     ModelProfileConfig,
     PROVIDER_CONFIG_FIELDS,
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
+    TOOL_DIAGNOSTICS_CONFIG_FIELDS,
+    ToolDiagnosticsConfig,
     infer_provider_compat,
 )
 from reuleauxcoder.domain.agent_runtime.models import (
@@ -183,6 +190,12 @@ def test_model_profile_config_only_materializes_current_fields() -> None:
     assert not hasattr(profile, "base_url")
 
 
+def test_model_profile_config_fields_match_serialized_shape() -> None:
+    assert set(ModelProfileConfig(name="demo").to_dict()) == set(
+        MODEL_PROFILE_CONFIG_FIELDS
+    )
+
+
 def test_provider_config_roundtrip() -> None:
     config = ProviderConfig(
         id="anthropic-main",
@@ -201,6 +214,16 @@ def test_provider_config_roundtrip() -> None:
 
 def test_provider_config_fields_match_serialized_shape() -> None:
     assert set(ProviderConfig(id="demo").to_dict()) == set(PROVIDER_CONFIG_FIELDS)
+
+
+def test_diagnostics_config_fields_match_serialized_shape() -> None:
+    assert set(DiagnosticsConfig().to_dict()) == set(DIAGNOSTICS_CONFIG_FIELDS)
+    assert set(LLMTraceDiagnosticsConfig().to_dict()) == set(
+        LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS
+    )
+    assert set(ToolDiagnosticsConfig().to_dict()) == set(
+        TOOL_DIAGNOSTICS_CONFIG_FIELDS
+    )
 
 
 def test_provider_config_reads_and_infers_compat() -> None:

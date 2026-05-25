@@ -13,6 +13,7 @@ from reuleauxcoder.domain.config.models import (
     ApprovalRuleConfig,
     Config,
     ContextConfig,
+    DIAGNOSTICS_CONFIG_FIELDS,
     DiagnosticsConfig,
     EnvironmentCLIToolConfig,
     EnvironmentConfig,
@@ -25,9 +26,11 @@ from reuleauxcoder.domain.config.models import (
     DEFAULT_MAIN_CHAT_AGENT_ID,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
+    LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS,
     MemoryConfig,
     MCPServerConfig,
     ModeConfig,
+    MODEL_PROFILE_CONFIG_FIELDS,
     ModelProfileConfig,
     PersistenceConfig,
     PromptConfig,
@@ -39,6 +42,7 @@ from reuleauxcoder.domain.config.models import (
     RuntimeProfilesConfig,
     SandboxProviderConfig,
     SkillsConfig,
+    TOOL_DIAGNOSTICS_CONFIG_FIELDS,
     ensure_default_capability_components,
     ensure_default_capability_packages,
     ensure_default_environment_agent_registry,
@@ -124,25 +128,26 @@ class ConfigLoader:
     _PROVIDERS_FIELDS = {"items"}
     _PROVIDER_ITEM_FIELDS = set(PROVIDER_CONFIG_FIELDS) | {"models"}
     _MODELS_FIELDS = {"active_main", "active_sub", "profiles"}
-    _MODEL_PROFILE_FIELDS = {
-        "backfill_reasoning_content_for_tool_calls",
-        "capability_applied_at",
-        "capability_source",
-        "capability_user_configured",
-        "max_context_tokens",
-        "max_tokens",
-        "model",
-        "preserve_reasoning_content",
-        "provider",
-        "reasoning_effort",
-        "reasoning_replay_mode",
-        "reasoning_replay_placeholder",
-        "temperature",
-        "thinking_enabled",
+    _MODEL_PROFILE_FIELDS = set(MODEL_PROFILE_CONFIG_FIELDS)
+    _DIAGNOSTICS_FIELDS = set(DIAGNOSTICS_CONFIG_FIELDS)
+    _LLM_TRACE_FIELDS = set(LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS)
+    _TOOL_DIAGNOSTICS_FIELDS = set(TOOL_DIAGNOSTICS_CONFIG_FIELDS)
+    _UNKNOWN_FIELD_RULES = (
+        ((), _ROOT_FIELDS),
+        (("providers",), _PROVIDERS_FIELDS),
+        (("providers", "items", "*"), _PROVIDER_ITEM_FIELDS),
+        (("models",), _MODELS_FIELDS),
+        (("models", "profiles", "*"), _MODEL_PROFILE_FIELDS),
+        (("diagnostics",), _DIAGNOSTICS_FIELDS),
+        (("diagnostics", "llm_trace"), _LLM_TRACE_FIELDS),
+        (("diagnostics", "tool_diagnostics"), _TOOL_DIAGNOSTICS_FIELDS),
+    )
+    _SECTION_MAP_KEYS = {
+        "mcp": {"servers"},
+        "models": {"profiles"},
+        "modes": {"profiles"},
+        "providers": {"items"},
     }
-    _DIAGNOSTICS_FIELDS = {"llm_trace", "tool_diagnostics"}
-    _LLM_TRACE_FIELDS = {"enabled", "raw_chunks"}
-    _TOOL_DIAGNOSTICS_FIELDS = {"enabled", "record_clean"}
 
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = Path(config_path) if config_path is not None else None
@@ -243,79 +248,83 @@ class ConfigLoader:
             if str(key) not in allowed:
                 errors.append(f"Unknown config field: {prefix}{key}")
 
+    @staticmethod
+    def _schema_rule_targets(data: dict, path_parts: tuple[str, ...]):
+        targets: list[tuple[str, dict]] = [("", data)]
+        for part in path_parts:
+            next_targets: list[tuple[str, dict]] = []
+            for current_path, current_data in targets:
+                if not isinstance(current_data, dict):
+                    continue
+                if part == "*":
+                    for child_key, child_data in current_data.items():
+                        if not isinstance(child_data, dict):
+                            continue
+                        child_path = (
+                            f"{current_path}.{child_key}"
+                            if current_path
+                            else str(child_key)
+                        )
+                        next_targets.append((child_path, child_data))
+                    continue
+                child_data = current_data.get(part)
+                if not isinstance(child_data, dict):
+                    continue
+                child_path = f"{current_path}.{part}" if current_path else part
+                next_targets.append((child_path, child_data))
+            targets = next_targets
+        return targets
+
     def _reject_unknown_config_fields(self, data: dict) -> None:
         """Reject fields outside the current config schema."""
         if not isinstance(data, dict):
             return
         errors: list[str] = []
-        self._collect_unknown_fields(
-            data, allowed=self._ROOT_FIELDS, path="", errors=errors
-        )
-
-        providers = data.get("providers")
-        if isinstance(providers, dict):
-            self._collect_unknown_fields(
-                providers,
-                allowed=self._PROVIDERS_FIELDS,
-                path="providers",
-                errors=errors,
-            )
-            items = providers.get("items", {})
-            if isinstance(items, dict):
-                for provider_id, provider_data in items.items():
-                    if isinstance(provider_data, dict):
-                        self._collect_unknown_fields(
-                            provider_data,
-                            allowed=self._PROVIDER_ITEM_FIELDS,
-                            path=f"providers.items.{provider_id}",
-                            errors=errors,
-                        )
-
-        models = data.get("models")
-        if isinstance(models, dict):
-            self._collect_unknown_fields(
-                models,
-                allowed=self._MODELS_FIELDS,
-                path="models",
-                errors=errors,
-            )
-            profiles = models.get("profiles", {})
-            if isinstance(profiles, dict):
-                for profile_id, profile_data in profiles.items():
-                    if isinstance(profile_data, dict):
-                        self._collect_unknown_fields(
-                            profile_data,
-                            allowed=self._MODEL_PROFILE_FIELDS,
-                            path=f"models.profiles.{profile_id}",
-                            errors=errors,
-                        )
-
-        diagnostics = data.get("diagnostics")
-        if isinstance(diagnostics, dict):
-            self._collect_unknown_fields(
-                diagnostics,
-                allowed=self._DIAGNOSTICS_FIELDS,
-                path="diagnostics",
-                errors=errors,
-            )
-            llm_trace = diagnostics.get("llm_trace")
-            if isinstance(llm_trace, dict):
+        for path_parts, allowed in self._UNKNOWN_FIELD_RULES:
+            for path, target in self._schema_rule_targets(data, path_parts):
                 self._collect_unknown_fields(
-                    llm_trace,
-                    allowed=self._LLM_TRACE_FIELDS,
-                    path="diagnostics.llm_trace",
-                    errors=errors,
-                )
-            tool_diagnostics = diagnostics.get("tool_diagnostics")
-            if isinstance(tool_diagnostics, dict):
-                self._collect_unknown_fields(
-                    tool_diagnostics,
-                    allowed=self._TOOL_DIAGNOSTICS_FIELDS,
-                    path="diagnostics.tool_diagnostics",
-                    errors=errors,
+                    target, allowed=allowed, path=path, errors=errors
                 )
         if errors:
             raise ConfigSchemaError(errors)
+
+    @staticmethod
+    def _named_config_items(section: object, key: str) -> tuple[tuple[str, dict], ...]:
+        if not isinstance(section, dict):
+            return ()
+        items = section.get(key, {})
+        if not isinstance(items, dict):
+            return ()
+        return tuple(
+            (str(name), item) for name, item in items.items() if isinstance(item, dict)
+        )
+
+    @staticmethod
+    def _config_section(data: dict, key: str) -> dict:
+        section = data.get(key, {})
+        return section if isinstance(section, dict) else {}
+
+    def _merge_named_map(self, base: object, override: dict) -> dict:
+        merged = dict(base) if isinstance(base, dict) else {}
+        for item_name, item_value in override.items():
+            if isinstance(item_value, dict) and isinstance(merged.get(item_name), dict):
+                merged[item_name] = self._merge_dicts(merged[item_name], item_value)
+            else:
+                merged[item_name] = item_value
+        return merged
+
+    def _merge_config_section(
+        self, base: object, override: dict, *, map_keys: set[str]
+    ) -> dict:
+        merged = dict(base) if isinstance(base, dict) else {}
+        for section_key, section_value in override.items():
+            if section_key in map_keys and isinstance(section_value, dict):
+                merged[section_key] = self._merge_named_map(
+                    merged.get(section_key, {}), section_value
+                )
+            else:
+                merged[section_key] = section_value
+        return merged
 
     def _load_yaml(self, path: Path) -> dict:
         """Load YAML file, return empty dict if not exists or invalid."""
@@ -332,55 +341,16 @@ class ConfigLoader:
         """Merge two dicts, override takes priority.
 
         For nested dicts, merge recursively.
-        For profile maps (MCP/model/mode), merge by key (override wins for same key).
+        For configured map sections, merge by key (override wins for same key).
         """
         result = dict(base)
 
         for key, value in override.items():
-            if key in {"mcp", "models", "modes", "providers"} and isinstance(value, dict):
-                result_section = result.get(key, {})
-
-                # Merge scalar fields with override priority.
-                for section_key, section_value in value.items():
-                    if section_key not in {"servers", "profiles", "items"}:
-                        result_section[section_key] = section_value
-
-                # Merge profile maps by name/key, override wins for same key
-                if "servers" in value and isinstance(value.get("servers"), dict):
-                    base_servers = result_section.get("servers", {})
-                    result_section["servers"] = {**base_servers, **value["servers"]}
-                if "profiles" in value and isinstance(value.get("profiles"), dict):
-                    base_profiles = result_section.get("profiles", {})
-                    override_profiles = value["profiles"]
-                    merged_profiles = dict(base_profiles)
-                    for profile_name, profile_value in override_profiles.items():
-                        if isinstance(profile_value, dict) and isinstance(
-                            base_profiles.get(profile_name), dict
-                        ):
-                            merged_profiles[profile_name] = self._merge_dicts(
-                                base_profiles[profile_name],
-                                profile_value,
-                            )
-                        else:
-                            merged_profiles[profile_name] = profile_value
-                    result_section["profiles"] = merged_profiles
-                if "items" in value and isinstance(value.get("items"), dict):
-                    base_items = result_section.get("items", {})
-                    override_items = value["items"]
-                    merged_items = dict(base_items)
-                    for item_name, item_value in override_items.items():
-                        if isinstance(item_value, dict) and isinstance(
-                            base_items.get(item_name), dict
-                        ):
-                            merged_items[item_name] = self._merge_dicts(
-                                base_items[item_name],
-                                item_value,
-                            )
-                        else:
-                            merged_items[item_name] = item_value
-                    result_section["items"] = merged_items
-
-                result[key] = result_section
+            map_keys = self._SECTION_MAP_KEYS.get(key)
+            if map_keys is not None and isinstance(value, dict):
+                result[key] = self._merge_config_section(
+                    result.get(key, {}), value, map_keys=map_keys
+                )
             elif (
                 isinstance(value, dict)
                 and key in result
@@ -478,10 +448,10 @@ class ConfigLoader:
         tool_output_config = data.get("tool_output", {})
         session_config = data.get("session", {})
         cli_config = data.get("cli", {})
-        mcp_config = data.get("mcp", {})
-        models_config = data.get("models", {})
-        providers_config = data.get("providers", {})
-        modes_config = data.get("modes", {})
+        mcp_config = self._config_section(data, "mcp")
+        models_config = self._config_section(data, "models")
+        providers_config = self._config_section(data, "providers")
+        modes_config = self._config_section(data, "modes")
         skills_config = data.get("skills", {})
         prompt_config = data.get("prompt", {})
         context_config = data.get("context", {})
@@ -503,32 +473,26 @@ class ConfigLoader:
             environment_config = {}
 
         providers = ProvidersConfig()
-        provider_items_data = {}
-        if isinstance(providers_config, dict):
-            raw_items = providers_config.get("items", {})
-            if isinstance(raw_items, dict):
-                provider_items_data = raw_items
-        for provider_id, provider_data in provider_items_data.items():
-            if not isinstance(provider_data, dict):
-                continue
+        for provider_id, provider_data in self._named_config_items(
+            providers_config, "items"
+        ):
             providers.items[str(provider_id)] = ProviderConfig.from_dict(
-                str(provider_id), provider_data
+                provider_id, provider_data
             )
 
         # Parse MCP servers
-        mcp_servers = []
-        servers_data = mcp_config.get("servers", {})
-        for name, server_data in servers_data.items():
-            if isinstance(server_data, dict):
-                mcp_servers.append(MCPServerConfig.from_dict(name, server_data))
+        mcp_servers = [
+            MCPServerConfig.from_dict(name, server_data)
+            for name, server_data in self._named_config_items(mcp_config, "servers")
+        ]
 
         # Parse model profiles
-        model_profiles: dict[str, ModelProfileConfig] = {}
-        profiles_data = models_config.get("profiles", {})
-        for name, profile_data in profiles_data.items():
-            if not isinstance(profile_data, dict):
-                continue
-            model_profiles[name] = ModelProfileConfig.from_dict(name, profile_data)
+        model_profiles: dict[str, ModelProfileConfig] = {
+            name: ModelProfileConfig.from_dict(name, profile_data)
+            for name, profile_data in self._named_config_items(
+                models_config, "profiles"
+            )
+        }
 
         active_main_model_profile = models_config.get("active_main")
         if (
@@ -545,12 +509,10 @@ class ConfigLoader:
             active_sub_model_profile = active_main_model_profile
 
         # Parse modes (builtin modes already merged during load())
-        modes: dict[str, ModeConfig] = {}
-        mode_profiles_data = modes_config.get("profiles", {})
-        for name, mode_data in mode_profiles_data.items():
-            if not isinstance(mode_data, dict):
-                continue
-            modes[name] = ModeConfig.from_dict(name, mode_data)
+        modes: dict[str, ModeConfig] = {
+            name: ModeConfig.from_dict(name, mode_data)
+            for name, mode_data in self._named_config_items(modes_config, "profiles")
+        }
 
         active_mode = modes_config.get("active")
         if not isinstance(active_mode, str) or active_mode not in modes:

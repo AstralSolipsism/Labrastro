@@ -93,6 +93,16 @@ CONFIG_SCHEMA = {
         "snip_min_lines": "int (default: 6, min line count to trigger snip)",
         "summarize_keep_recent_turns": "int (default: 5, number of recent user turns to protect during summarize)",
     },
+    "diagnostics": {
+        "tool_diagnostics": {
+            "enabled": "bool (default: true, record tool lifecycle diagnostics)",
+            "record_clean": "bool (default: false, also record clean tool executions)",
+        },
+        "llm_trace": {
+            "enabled": "bool (default: false, persist LLM debug traces)",
+            "raw_chunks": "bool (default: false, include raw streaming chunks in traces)",
+        },
+    },
     "memory": {
         "enabled": "bool (default: true, ReuleauxCoder core executor private memory provide)",
         "backend": "string (one of sqlite, postgres, memory; default sqlite)",

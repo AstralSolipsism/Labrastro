@@ -35,6 +35,34 @@ PROVIDER_CONFIG_FIELDS: tuple[str, ...] = (
     "stream_recovery",
     "extra",
 )
+MODEL_PROFILE_CONFIG_FIELDS: tuple[str, ...] = (
+    "model",
+    "provider",
+    "max_tokens",
+    "temperature",
+    "max_context_tokens",
+    "preserve_reasoning_content",
+    "backfill_reasoning_content_for_tool_calls",
+    "reasoning_effort",
+    "thinking_enabled",
+    "reasoning_replay_mode",
+    "reasoning_replay_placeholder",
+    "capability_user_configured",
+    "capability_source",
+    "capability_applied_at",
+)
+MODEL_PROFILE_ADMIN_INPUT_FIELDS: tuple[str, ...] = (
+    "id",
+    "profile_id",
+    *(
+        field
+        for field in MODEL_PROFILE_CONFIG_FIELDS
+        if field not in {"capability_source", "capability_applied_at"}
+    ),
+)
+DIAGNOSTICS_CONFIG_FIELDS: tuple[str, ...] = ("tool_diagnostics", "llm_trace")
+LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS: tuple[str, ...] = ("enabled", "raw_chunks")
+TOOL_DIAGNOSTICS_CONFIG_FIELDS: tuple[str, ...] = ("enabled", "record_clean")
 
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID = "environment_local"
 DEFAULT_MAIN_CHAT_AGENT_ID = "main_chat"
