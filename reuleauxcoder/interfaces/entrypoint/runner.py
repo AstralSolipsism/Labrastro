@@ -303,9 +303,12 @@ class AppRunner:
             scan_user=config.skills.scan_user,
             disabled_names=list(config.skills.disabled),
             extra_paths=[
-                Path(str(skill.path_hint)).expanduser()
-                for skill in config.environment.skills.values()
-                if getattr(skill, "enabled", True) and str(skill.path_hint or "").strip()
+                Path(str(requirement.path)).expanduser()
+                for requirement in config.environment.requirements.values()
+                if getattr(requirement, "enabled", True)
+                and getattr(requirement, "kind", "") == "path"
+                and "skill_root" in set(getattr(requirement, "tags", []) or [])
+                and str(requirement.path or "").strip()
             ],
         )
         reload_result = skills_service.reload()
