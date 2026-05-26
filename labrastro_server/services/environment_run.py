@@ -71,20 +71,10 @@ class EnvironmentRunService:
         selected_entries = _select_entries(manifest, entry_ids or [])
         selected_ids = [entry["id"] for entry in selected_entries]
         selected_manifest = {
-            "cli_tools": [
+            "environment_requirements": [
                 entry["manifest"]
                 for entry in selected_entries
-                if entry["kind"] == "cli"
-            ],
-            "mcp_servers": [
-                entry["manifest"]
-                for entry in selected_entries
-                if entry["kind"] == "mcp"
-            ],
-            "skills": [
-                entry["manifest"]
-                for entry in selected_entries
-                if entry["kind"] == "skill"
+                if entry["kind"] == "environment_requirement"
             ],
         }
         manifest_hash = _manifest_hash(selected_manifest)
@@ -151,40 +141,18 @@ class EnvironmentRunService:
 
 def _manifest_entries(manifest: EnvironmentManifestResponse) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for tool in manifest.cli_tools:
-        data = tool.to_dict()
+    for requirement in manifest.environment_requirements:
+        data = requirement.to_dict()
         entries.append(
             {
-                "id": f"cli:{tool.name}",
-                "kind": "cli",
-                "name": tool.name,
+                "id": requirement.id,
+                "kind": "environment_requirement",
+                "name": requirement.name,
+                "requirement_kind": requirement.kind,
                 "manifest": data,
                 "check": str(data.get("check", "") or ""),
                 "install": str(data.get("install", "") or ""),
-            }
-        )
-    for server in manifest.mcp_servers:
-        data = server.to_dict()
-        entries.append(
-            {
-                "id": f"mcp:{server.name}",
-                "kind": "mcp",
-                "name": server.name,
-                "manifest": data,
-                "check": str(data.get("check", "") or ""),
-                "install": str(data.get("install", "") or ""),
-            }
-        )
-    for skill in manifest.skills:
-        data = skill.to_dict()
-        entries.append(
-            {
-                "id": f"skill:{skill.name}",
-                "kind": "skill",
-                "name": skill.name,
-                "manifest": data,
-                "check": str(data.get("check", "") or ""),
-                "install": str(data.get("install", "") or ""),
+                "configure": str(data.get("configure", "") or ""),
             }
         )
     return entries
@@ -232,6 +200,17 @@ def _allowed_commands(entries: list[dict[str, Any]], mode: str) -> list[dict[str
                     "command": install,
                 }
             )
+        configure = str(entry.get("configure", "") or "").strip()
+        if mode == "configure" and configure:
+            commands.append(
+                {
+                    "entry_id": str(entry["id"]),
+                    "kind": str(entry["kind"]),
+                    "name": str(entry["name"]),
+                    "phase": "configure",
+                    "command": configure,
+                }
+            )
     return commands
 
 
@@ -253,7 +232,7 @@ def _render_environment_prompt(
     mode_instruction = (
         "Check mode: run only commands whose phase is `check`. Do not run install commands."
         if mode == "check"
-        else "Configure mode: run check commands first; run an install command only when the corresponding check fails and normal approval is granted."
+        else "Configure mode: run check commands first; run install or configure commands only when the corresponding check fails and normal approval is granted."
     )
     return (
         "You are an environment configuration Agent running through the normal Agent runtime.\n"
@@ -261,7 +240,8 @@ def _render_environment_prompt(
         f"Mode: {mode}\n"
         f"Workspace: {workspace}\n\n"
         f"{mode_instruction}\n"
-        "Use only the commands listed in `allowed_commands`. After any install command, rerun that entry's check command.\n"
+        "Use only the commands listed in `allowed_commands`. After any install or configure command, rerun that entry's check command.\n"
+        "Entries without commands are declarative environment requirements; report whether they are satisfied or blocked without inventing commands.\n"
         "If a required base runtime or credential is missing, report it as a blocker instead of installing a substitute.\n"
         "Finish with a compact summary covering each selected entry.\n\n"
         "Selected environment manifest:\n"

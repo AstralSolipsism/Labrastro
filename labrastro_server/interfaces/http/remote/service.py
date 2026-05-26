@@ -41,11 +41,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatStartResponse,
     CleanupResult,
     DisconnectNotice,
-    EnvironmentCLIToolManifest,
-    EnvironmentMCPServerManifest,
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
-    EnvironmentSkillManifest,
+    EnvironmentRequirementManifest,
     ExecToolResult,
     Heartbeat,
     MCPArtifactManifest,
@@ -65,6 +63,13 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ToolPreviewResult,
 )
 from labrastro_server.relay.server import RelayServer
+from reuleauxcoder.domain.environment_requirements import (
+    environment_requirement_kind_from_id,
+    environment_requirement_name_from_id,
+    normalize_environment_placement,
+    normalize_environment_requirement_id,
+    normalize_environment_requirement_kind,
+)
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from labrastro_server.interfaces.http.remote.routes.admin import RemoteAdminRoutes
 from labrastro_server.interfaces.http.remote.routes.artifacts import RemoteArtifactRoutes
@@ -874,7 +879,7 @@ class RemoteRelayHTTPService:
         bind: str,
         *,
         ui_bus: UIEventBus | None = None,
-        artifact_provider: callable | None = None,
+        artifact_provider: Callable[..., Any] | None = None,
         chat_handler: Callable[[str, str], ChatResponse] | None = None,
         chat_events_handler: Callable[[str, str, _RemoteChatSession], None]
         | None = None,
@@ -889,8 +894,7 @@ class RemoteRelayHTTPService:
         bootstrap_token_ttl_sec: int = 300,
         mcp_servers: list[Any] | None = None,
         mcp_artifact_root: str | Path = ".rcoder/mcp-artifacts",
-        environment_cli_tools: dict[str, Any] | None = None,
-        environment_skills: dict[str, Any] | None = None,
+        environment_requirements: dict[str, Any] | None = None,
         admin_config_path: str | Path | None = None,
         admin_config_reload_handler: ConfigReloadHandler | None = None,
         admin_provider_test_handler: ProviderTestHandler | None = None,
@@ -927,8 +931,7 @@ class RemoteRelayHTTPService:
         self.bootstrap_token_ttl_sec = bootstrap_token_ttl_sec
         self.mcp_servers = list(mcp_servers or [])
         self.mcp_artifact_root = Path(mcp_artifact_root)
-        self.environment_cli_tools = dict(environment_cli_tools or {})
-        self.environment_skills = dict(environment_skills or {})
+        self.environment_requirements = dict(environment_requirements or {})
         self.admin_manager = RemoteAdminConfigManager(
             Path(admin_config_path) if admin_config_path is not None else None,
             reload_handler=admin_config_reload_handler,
@@ -1035,7 +1038,8 @@ class RemoteRelayHTTPService:
         self._server = None
 
     def _start_agent_run_recovery(self) -> None:
-        if self.runtime_control_plane is None:
+        runtime_control_plane = self.runtime_control_plane
+        if runtime_control_plane is None:
             return
         if self._agent_run_recovery_thread is not None:
             return
@@ -1046,7 +1050,7 @@ class RemoteRelayHTTPService:
                 self._agent_run_recovery_interval_sec
             ):
                 try:
-                    self.runtime_control_plane.recover_stale_agent_runs()
+                    runtime_control_plane.recover_stale_agent_runs()
                 except Exception:
                     continue
 
@@ -1096,6 +1100,9 @@ class RemoteRelayHTTPService:
     def _start_github_reconcile(self) -> None:
         if self.github_pr_service is None or self.github_reconcile_service is None:
             return
+        github_reconcile_service = self.github_reconcile_service
+        if github_reconcile_service is None:
+            return
         interval = max(
             1,
             int(getattr(self.github_pr_service.config, "reconcile_interval_sec", 300) or 300),
@@ -1107,7 +1114,7 @@ class RemoteRelayHTTPService:
         def loop() -> None:
             while not self._github_reconcile_stop.wait(interval):
                 try:
-                    self.github_reconcile_service.reconcile()
+                    github_reconcile_service.reconcile()
                 except Exception:
                     continue
 
@@ -1450,7 +1457,7 @@ class RemoteRelayHTTPService:
                         "internal_server_error",
                     )
 
-        Handler.service = service
+        setattr(Handler, "service", service)
         return Handler
 
     def _mcp_artifact_root_abs(self) -> Path:
@@ -1560,7 +1567,10 @@ class RemoteRelayHTTPService:
                         cwd=launch_cwd,
                     ),
                     permissions=dict(getattr(server, "permissions", {}) or {}),
-                    requirements=dict(getattr(server, "requirements", {}) or {}),
+                    environment_requirement_refs=[
+                        str(ref)
+                        for ref in getattr(server, "environment_requirement_refs", []) or []
+                    ],
                 )
             )
         return MCPManifestResponse(servers=servers, diagnostics=diagnostics)
@@ -1569,160 +1579,102 @@ class RemoteRelayHTTPService:
         self, os_name: str, arch: str, workspace: str
     ) -> EnvironmentManifestResponse:
         del os_name, arch, workspace
-        tools: list[EnvironmentCLIToolManifest] = []
-        for name, tool in sorted(self.environment_cli_tools.items()):
-            if not _env_bool_value(_env_tool_value(tool, "enabled", True)):
+        environment_requirements: list[EnvironmentRequirementManifest] = []
+        for requirement_id, requirement in sorted(self.environment_requirements.items()):
+            if not _env_bool_value(_env_tool_value(requirement, "enabled", True)):
                 continue
-            placement = str(_env_tool_value(tool, "placement", "local") or "local")
+            placement = normalize_environment_placement(
+                _env_tool_value(requirement, "placement", "peer")
+            )
             if placement == "server":
                 continue
-            tool_name = str(_env_tool_value(tool, "name", name) or name)
-            command = str(_env_tool_value(tool, "command", "") or "")
-            check = str(_env_tool_value(tool, "check", "") or "")
-            if not tool_name or not command or not check:
+            raw_requirement_id = str(
+                _env_tool_value(requirement, "id", requirement_id) or requirement_id
+            )
+            name = str(
+                _env_tool_value(
+                    requirement,
+                    "name",
+                    environment_requirement_name_from_id(raw_requirement_id),
+                )
+                or environment_requirement_name_from_id(raw_requirement_id)
+            ).strip()
+            kind = normalize_environment_requirement_kind(
+                _env_tool_value(
+                    requirement,
+                    "kind",
+                    environment_requirement_kind_from_id(raw_requirement_id),
+                )
+            )
+            check = str(_env_tool_value(requirement, "check", "") or "")
+            configure = str(_env_tool_value(requirement, "configure", "") or "")
+            install = str(_env_tool_value(requirement, "install", "") or "")
+            if not name or not kind:
                 continue
-            tags = _env_tool_value(tool, "tags", [])
+            manifest_id = normalize_environment_requirement_id(
+                raw_requirement_id,
+                kind=kind,
+                name=name,
+            )
+            tags = _env_tool_value(requirement, "tags", [])
             if not isinstance(tags, list):
                 tags = []
-            requirements = _env_tool_value(tool, "requirements", {})
+            requirements = _env_tool_value(requirement, "requirements", {})
             if not isinstance(requirements, dict):
                 requirements = {}
-            version = _env_tool_value(tool, "version", None)
-            tools.append(
-                EnvironmentCLIToolManifest(
-                    name=tool_name,
-                    command=command,
+            args = _env_tool_value(requirement, "args", [])
+            if not isinstance(args, list):
+                args = []
+            env = _env_tool_value(requirement, "env", {})
+            if not isinstance(env, dict):
+                env = {}
+            version = _env_tool_value(requirement, "version", None)
+            environment_requirements.append(
+                EnvironmentRequirementManifest(
+                    id=manifest_id,
+                    kind=kind,
+                    name=name,
+                    command=str(_env_tool_value(requirement, "command", "") or ""),
                     placement=placement,
                     tags=[str(item) for item in tags],
                     requirements={str(k): str(v) for k, v in requirements.items()},
-                    check=check,
-                    install=str(_env_tool_value(tool, "install", "") or ""),
-                    version=str(version) if version is not None else None,
-                    source=str(_env_tool_value(tool, "source", "") or ""),
-                    description=str(_env_tool_value(tool, "description", "") or ""),
-                    repo_url=str(_env_tool_value(tool, "repo_url", "") or ""),
-                    docs=_env_docs_value(_env_tool_value(tool, "docs", [])),
-                    evidence=_env_string_dict_list_value(
-                        _env_tool_value(tool, "evidence", [])
-                    ),
-                    install_prompt=str(
-                        _env_tool_value(tool, "install_prompt", "") or ""
-                    ),
-                    verify_prompt=str(_env_tool_value(tool, "verify_prompt", "") or ""),
-                    notes=_env_string_list_value(_env_tool_value(tool, "notes", [])),
-                    credentials=_env_string_list_value(
-                        _env_tool_value(tool, "credentials", [])
-                    ),
-                    risk_level=str(_env_tool_value(tool, "risk_level", "") or ""),
-                    last_action=str(_env_tool_value(tool, "last_action", "") or ""),
-                    last_updated=str(_env_tool_value(tool, "last_updated", "") or ""),
-                )
-            )
-        mcp_servers: list[EnvironmentMCPServerManifest] = []
-        for server in self.mcp_servers:
-            if not getattr(server, "enabled", True):
-                continue
-            if getattr(server, "placement", "server") not in {"peer", "both"}:
-                continue
-            launch = getattr(server, "launch", None)
-            if launch is None:
-                command = str(getattr(server, "command", "") or "")
-                launch_args = list(getattr(server, "args", []) or [])
-                launch_env = dict(getattr(server, "env", {}) or {})
-                launch_cwd = getattr(server, "cwd", None)
-            else:
-                command = str(getattr(launch, "command", "") or "")
-                launch_args = list(getattr(launch, "args", []) or [])
-                launch_env = dict(getattr(launch, "env", {}) or {})
-                launch_cwd = getattr(launch, "cwd", None)
-            if not command:
-                continue
-            mcp_servers.append(
-                EnvironmentMCPServerManifest(
-                    name=str(getattr(server, "name", "") or ""),
-                    command=command,
-                    args=[str(arg) for arg in launch_args],
-                    env={str(k): str(v) for k, v in launch_env.items()},
-                    cwd=str(launch_cwd) if launch_cwd is not None else None,
-                    placement=str(getattr(server, "placement", "peer") or "peer"),
-                    distribution=str(
-                        getattr(server, "distribution", "command") or "command"
-                    ),
-                    requirements=dict(getattr(server, "requirements", {}) or {}),
-                    check=str(getattr(server, "check", "") or ""),
-                    install=str(getattr(server, "install", "") or ""),
-                    version=(
-                        str(getattr(server, "version"))
-                        if getattr(server, "version", None) is not None
+                    args=[str(item) for item in args],
+                    env={str(k): str(v) for k, v in env.items()},
+                    cwd=(
+                        str(_env_tool_value(requirement, "cwd"))
+                        if _env_tool_value(requirement, "cwd", None) is not None
                         else None
                     ),
-                    source=str(getattr(server, "source", "") or ""),
-                    description=str(getattr(server, "description", "") or ""),
-                    repo_url=str(getattr(server, "repo_url", "") or ""),
-                    docs=_env_docs_value(getattr(server, "docs", [])),
-                    evidence=_env_string_dict_list_value(
-                        getattr(server, "evidence", [])
-                    ),
-                    install_prompt=str(getattr(server, "install_prompt", "") or ""),
-                    verify_prompt=str(getattr(server, "verify_prompt", "") or ""),
-                    notes=_env_string_list_value(getattr(server, "notes", [])),
-                    credentials=_env_string_list_value(
-                        getattr(server, "credentials", [])
-                    ),
-                    risk_level=str(getattr(server, "risk_level", "") or ""),
-                    last_action=str(getattr(server, "last_action", "") or ""),
-                    last_updated=str(getattr(server, "last_updated", "") or ""),
-                )
-            )
-        skills: list[EnvironmentSkillManifest] = []
-        for name, skill in sorted(self.environment_skills.items()):
-            if not _env_bool_value(_env_tool_value(skill, "enabled", True)):
-                continue
-            skill_name = str(_env_tool_value(skill, "name", name) or name)
-            check = str(_env_tool_value(skill, "check", "") or "")
-            if not skill_name or not check:
-                continue
-            version = _env_tool_value(skill, "version", None)
-            requirements = _env_tool_value(skill, "requirements", {})
-            if not isinstance(requirements, dict):
-                requirements = {}
-            skills.append(
-                EnvironmentSkillManifest(
-                    name=skill_name,
-                    scope=str(_env_tool_value(skill, "scope", "project") or "project"),
                     check=check,
-                    install=str(_env_tool_value(skill, "install", "") or ""),
+                    install=install,
+                    configure=configure,
                     version=str(version) if version is not None else None,
-                    source=str(_env_tool_value(skill, "source", "") or ""),
-                    description=str(_env_tool_value(skill, "description", "") or ""),
-                    path_hint=(
-                        str(_env_tool_value(skill, "path_hint"))
-                        if _env_tool_value(skill, "path_hint", None) is not None
-                        else None
-                    ),
-                    requirements={str(k): str(v) for k, v in requirements.items()},
-                    repo_url=str(_env_tool_value(skill, "repo_url", "") or ""),
-                    docs=_env_docs_value(_env_tool_value(skill, "docs", [])),
+                    runtime=str(_env_tool_value(requirement, "runtime", "") or ""),
+                    language=str(_env_tool_value(requirement, "language", "") or ""),
+                    scope=str(_env_tool_value(requirement, "scope", "") or ""),
+                    path=str(_env_tool_value(requirement, "path", "") or ""),
+                    source=str(_env_tool_value(requirement, "source", "") or ""),
+                    description=str(_env_tool_value(requirement, "description", "") or ""),
+                    repo_url=str(_env_tool_value(requirement, "repo_url", "") or ""),
+                    docs=_env_docs_value(_env_tool_value(requirement, "docs", [])),
                     evidence=_env_string_dict_list_value(
-                        _env_tool_value(skill, "evidence", [])
+                        _env_tool_value(requirement, "evidence", [])
                     ),
                     install_prompt=str(
-                        _env_tool_value(skill, "install_prompt", "") or ""
+                        _env_tool_value(requirement, "install_prompt", "") or ""
                     ),
-                    verify_prompt=str(_env_tool_value(skill, "verify_prompt", "") or ""),
-                    notes=_env_string_list_value(_env_tool_value(skill, "notes", [])),
+                    verify_prompt=str(_env_tool_value(requirement, "verify_prompt", "") or ""),
+                    notes=_env_string_list_value(_env_tool_value(requirement, "notes", [])),
                     credentials=_env_string_list_value(
-                        _env_tool_value(skill, "credentials", [])
+                        _env_tool_value(requirement, "credentials", [])
                     ),
-                    risk_level=str(_env_tool_value(skill, "risk_level", "") or ""),
-                    last_action=str(_env_tool_value(skill, "last_action", "") or ""),
-                    last_updated=str(_env_tool_value(skill, "last_updated", "") or ""),
+                    risk_level=str(_env_tool_value(requirement, "risk_level", "") or ""),
+                    last_action=str(_env_tool_value(requirement, "last_action", "") or ""),
+                    last_updated=str(_env_tool_value(requirement, "last_updated", "") or ""),
                 )
             )
         return EnvironmentManifestResponse(
-            cli_tools=tools,
-            mcp_servers=mcp_servers,
-            skills=skills,
+            environment_requirements=environment_requirements,
         )
 
 

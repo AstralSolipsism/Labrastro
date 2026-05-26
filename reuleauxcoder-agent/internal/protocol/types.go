@@ -147,13 +147,13 @@ type MCPLaunchManifest struct {
 }
 
 type MCPServerManifest struct {
-	Name         string               `json:"name"`
-	Version      string               `json:"version"`
-	Distribution string               `json:"distribution,omitempty"`
-	Artifact     *MCPArtifactManifest `json:"artifact,omitempty"`
-	Launch       MCPLaunchManifest    `json:"launch"`
-	Permissions  map[string]any       `json:"permissions,omitempty"`
-	Requirements map[string]string    `json:"requirements,omitempty"`
+	Name                       string               `json:"name"`
+	Version                    string               `json:"version"`
+	Distribution               string               `json:"distribution,omitempty"`
+	Artifact                   *MCPArtifactManifest `json:"artifact,omitempty"`
+	Launch                     MCPLaunchManifest    `json:"launch"`
+	Permissions                map[string]any       `json:"permissions,omitempty"`
+	EnvironmentRequirementRefs []string             `json:"environment_requirement_refs,omitempty"`
 }
 
 type MCPManifestResponse struct {
@@ -186,49 +186,31 @@ type EnvironmentManifestRequest struct {
 	Workspace string `json:"workspace,omitempty"`
 }
 
-type EnvironmentCLIToolManifest struct {
-	Name        string   `json:"name"`
-	Command     string   `json:"command,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	Check       string   `json:"check,omitempty"`
-	Install     string   `json:"install,omitempty"`
-	Version     string   `json:"version,omitempty"`
-	Source      string   `json:"source,omitempty"`
-	Description string   `json:"description,omitempty"`
-}
-
-type EnvironmentMCPServerManifest struct {
+type EnvironmentRequirementManifest struct {
+	ID           string            `json:"id"`
+	Kind         string            `json:"kind"`
 	Name         string            `json:"name"`
 	Command      string            `json:"command,omitempty"`
 	Args         []string          `json:"args,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
 	CWD          string            `json:"cwd,omitempty"`
 	Placement    string            `json:"placement,omitempty"`
-	Distribution string            `json:"distribution,omitempty"`
+	Tags         []string          `json:"tags,omitempty"`
 	Requirements map[string]string `json:"requirements,omitempty"`
 	Check        string            `json:"check,omitempty"`
 	Install      string            `json:"install,omitempty"`
+	Configure    string            `json:"configure,omitempty"`
 	Version      string            `json:"version,omitempty"`
-	Source       string            `json:"source,omitempty"`
-	Description  string            `json:"description,omitempty"`
-}
-
-type EnvironmentSkillManifest struct {
-	Name         string            `json:"name"`
+	Runtime      string            `json:"runtime,omitempty"`
+	Language     string            `json:"language,omitempty"`
 	Scope        string            `json:"scope,omitempty"`
-	Check        string            `json:"check,omitempty"`
-	Install      string            `json:"install,omitempty"`
-	Version      string            `json:"version,omitempty"`
+	Path         string            `json:"path,omitempty"`
 	Source       string            `json:"source,omitempty"`
 	Description  string            `json:"description,omitempty"`
-	PathHint     string            `json:"path_hint,omitempty"`
-	Requirements map[string]string `json:"requirements,omitempty"`
 }
 
 type EnvironmentManifestResponse struct {
-	CLITools   []EnvironmentCLIToolManifest   `json:"cli_tools,omitempty"`
-	MCPServers []EnvironmentMCPServerManifest `json:"mcp_servers,omitempty"`
-	Skills     []EnvironmentSkillManifest     `json:"skills,omitempty"`
+	EnvironmentRequirements []EnvironmentRequirementManifest `json:"environment_requirements,omitempty"`
 }
 
 type ExecToolRequest struct {

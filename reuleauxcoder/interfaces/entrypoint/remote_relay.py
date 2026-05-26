@@ -535,11 +535,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         runner._relay_http_service.mcp_artifact_root = Path(
             next_config.mcp_artifact_root
         )
-        runner._relay_http_service.environment_cli_tools = dict(
-            next_config.environment.cli_tools
-        )
-        runner._relay_http_service.environment_skills = dict(
-            next_config.environment.skills
+        runner._relay_http_service.environment_requirements = dict(
+            next_config.environment.requirements
         )
         if ui_bus is not None:
             old_mcp_manager = getattr(agent, "mcp_manager", None)

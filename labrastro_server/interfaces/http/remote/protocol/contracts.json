@@ -451,9 +451,7 @@
         "workspace": "/workspace"
       },
       "response": {
-        "cli_tools": [],
-        "mcp_servers": [],
-        "skills": []
+        "environment_requirements": []
       }
     },
     {

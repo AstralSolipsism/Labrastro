@@ -157,7 +157,7 @@ def _default_create_remote_artifact_provider(
 
         if shutil.which("go") is None:
             raise RuntimeError(
-                "peer artifact unavailable: no prebuilt binary found and local 'go' toolchain is not installed"
+                "peer artifact unavailable: no prebuilt binary found and local Go SDK is not installed"
             )
 
         target_key = (os_name, arch)
@@ -241,8 +241,7 @@ def _default_create_remote_http_service(
         bootstrap_token_ttl_sec=config.remote_exec.bootstrap_token_ttl_sec,
         mcp_servers=config.mcp_servers,
         mcp_artifact_root=config.mcp_artifact_root,
-        environment_cli_tools=config.environment.cli_tools,
-        environment_skills=config.environment.skills,
+        environment_requirements=config.environment.requirements,
         admin_config_path=getattr(config, "_source_path", None),
         runtime_control_plane=runtime_control_plane,
         taskflow_service=taskflow_service,

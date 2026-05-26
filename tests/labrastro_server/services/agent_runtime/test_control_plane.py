@@ -294,12 +294,12 @@ def test_environment_runtime_events_are_derived_from_allowlisted_shell_commands(
             metadata={
                 "workflow": "environment_config",
                 "environment_mode": "check",
-                "entry_ids": ["cli:gitnexus"],
+                "entry_ids": ["envreq:executable:gitnexus"],
                 "manifest_hash": "hash",
                 "allowed_commands": [
                     {
-                        "entry_id": "cli:gitnexus",
-                        "kind": "cli",
+                        "entry_id": "envreq:executable:gitnexus",
+                        "kind": "environment_requirement",
                         "name": "gitnexus",
                         "phase": "check",
                         "command": "gitnexus --version",
@@ -356,12 +356,12 @@ def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
             metadata={
                 "workflow": "environment_config",
                 "environment_mode": "check",
-                "entry_ids": ["cli:gitnexus"],
+                "entry_ids": ["envreq:executable:gitnexus"],
                 "manifest_hash": "hash",
                 "allowed_commands": [
                     {
-                        "entry_id": "cli:gitnexus",
-                        "kind": "cli",
+                        "entry_id": "envreq:executable:gitnexus",
+                        "kind": "environment_requirement",
                         "name": "gitnexus",
                         "phase": "check",
                         "command": "gitnexus --version",
@@ -401,12 +401,12 @@ def test_environment_runtime_reports_failed_install_command() -> None:
             metadata={
                 "workflow": "environment_config",
                 "environment_mode": "configure",
-                "entry_ids": ["cli:gitnexus"],
+                "entry_ids": ["envreq:executable:gitnexus"],
                 "manifest_hash": "hash",
                 "allowed_commands": [
                     {
-                        "entry_id": "cli:gitnexus",
-                        "kind": "cli",
+                        "entry_id": "envreq:executable:gitnexus",
+                        "kind": "environment_requirement",
                         "name": "gitnexus",
                         "phase": "install",
                         "command": "npm install -g gitnexus",

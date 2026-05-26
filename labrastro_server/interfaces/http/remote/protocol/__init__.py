@@ -33,11 +33,9 @@ from labrastro_server.interfaces.http.remote.protocol.chat import (
     ChatEventsBatch,
 )
 from labrastro_server.interfaces.http.remote.protocol.environment import (
-    EnvironmentCLIToolManifest,
-    EnvironmentMCPServerManifest,
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
-    EnvironmentSkillManifest,
+    EnvironmentRequirementManifest,
 )
 from labrastro_server.interfaces.http.remote.protocol.errors import ErrorMessage
 from labrastro_server.interfaces.http.remote.protocol.mcp import (
@@ -96,11 +94,9 @@ __all__ = [
     "CleanupRequest",
     "CleanupResult",
     "DisconnectNotice",
-    "EnvironmentCLIToolManifest",
-    "EnvironmentMCPServerManifest",
     "EnvironmentManifestRequest",
     "EnvironmentManifestResponse",
-    "EnvironmentSkillManifest",
+    "EnvironmentRequirementManifest",
     "ErrorMessage",
     "ExecToolRequest",
     "ExecToolResult",

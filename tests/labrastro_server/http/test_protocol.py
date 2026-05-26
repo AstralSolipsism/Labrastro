@@ -20,11 +20,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatEventsRequest,
     ChatEventsBatch,
     DisconnectNotice,
-    EnvironmentCLIToolManifest,
-    EnvironmentMCPServerManifest,
-    EnvironmentSkillManifest,
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
+    EnvironmentRequirementManifest,
     ErrorMessage,
     ExecToolRequest,
     ExecToolResult,
@@ -166,8 +164,8 @@ class TestRemoteHTTPContract:
         assert registry["admin.models.delete"]["request_model"] == "ModelProfileDeleteRequest"
         assert registry["admin.models.delete"]["auth"] == "bearer"
         assert (
-            registry["admin.toolchains.behavior_catalog"]["path"]
-            == "/remote/admin/toolchains/behavior-catalog"
+            registry["admin.environment_requirements.behavior_catalog"]["path"]
+            == "/remote/admin/environment-requirements/behavior-catalog"
         )
         assert registry["peer.disconnect"]["request_model"] == "PeerDisconnectRequest"
         for name in (
@@ -458,7 +456,10 @@ class TestMCPManifest:
                         env={"MODE": "local"},
                     ),
                     permissions={"tools": {"write_file": "require_approval"}},
-                    requirements={"node": "required", "npm": "required"},
+                    environment_requirement_refs=[
+                        "envreq:runtime:node",
+                        "envreq:executable:npm",
+                    ],
                 )
             ],
             diagnostics=[{"server": "missing", "level": "error"}],
@@ -471,7 +472,10 @@ class TestMCPManifest:
         assert restored.servers[0].distribution == "artifact"
         assert restored.servers[0].artifact.platform == "linux-amd64"
         assert restored.servers[0].launch.args == ["--root", "{{workspace}}"]
-        assert restored.servers[0].requirements["node"] == "required"
+        assert restored.servers[0].environment_requirement_refs == [
+            "envreq:runtime:node",
+            "envreq:executable:npm",
+        ]
         assert restored.diagnostics[0]["server"] == "missing"
 
     def test_manifest_request_roundtrip(self) -> None:
@@ -506,8 +510,10 @@ class TestMCPManifest:
 class TestEnvironmentManifest:
     def test_manifest_roundtrip(self) -> None:
         response = EnvironmentManifestResponse(
-            cli_tools=[
-                EnvironmentCLIToolManifest(
+            environment_requirements=[
+                EnvironmentRequirementManifest(
+                    id="envreq:executable:gitnexus",
+                    kind="executable",
                     name="gitnexus",
                     command="gitnexus",
                     tags=["repo_index"],
@@ -519,64 +525,47 @@ class TestEnvironmentManifest:
                     install_prompt="Use npm install.",
                     verify_prompt="Run gitnexus --version.",
                     notes=["PATH changes need approval."],
-                )
-            ],
-            mcp_servers=[
-                EnvironmentMCPServerManifest(
-                    name="gitnexus",
-                    command="gitnexus",
-                    args=["mcp"],
-                    placement="peer",
-                    distribution="command",
-                    check="gitnexus --version",
-                    install="npm install -g gitnexus@1.6.3",
-                    requirements={"node": ">=20", "npm": "required"},
-                    docs=[{"title": "GitNexus MCP", "url": "https://example.test/mcp"}],
-                    install_prompt="Use npm package.",
-                    verify_prompt="Run mcp launch check.",
-                    notes=["Do not install node automatically."],
-                )
-            ],
-            skills=[
-                EnvironmentSkillManifest(
-                    name="collaborating-with-claude",
+                ),
+                EnvironmentRequirementManifest(
+                    id="envreq:path:collaborating-with-claude-skill",
+                    kind="path",
+                    name="collaborating-with-claude-skill",
                     scope="user",
                     check="Test-Path ~/.agents/skills/collaborating-with-claude/SKILL.md",
                     install="python install-skill.py",
                     version="1.0.0",
                     source="github",
                     description="Claude bridge skill",
-                    path_hint="~/.agents/skills/collaborating-with-claude/SKILL.md",
+                    path="~/.agents/skills/collaborating-with-claude/SKILL.md",
                     docs=[{"title": "Claude skill", "url": "https://example.test/skill"}],
                     install_prompt="Install the skill files.",
                     verify_prompt="Check SKILL.md exists.",
                     notes=["Use user scope."],
-                )
+                ),
             ],
         )
 
         restored = EnvironmentManifestResponse.from_dict(response.to_dict())
 
-        assert restored.cli_tools[0].name == "gitnexus"
-        assert restored.cli_tools[0].tags == ["repo_index"]
-        assert restored.cli_tools[0].check == "gitnexus --version"
-        assert restored.cli_tools[0].install == "npm install -g gitnexus"
-        assert restored.cli_tools[0].docs[0]["title"] == "GitNexus"
-        assert restored.cli_tools[0].install_prompt == "Use npm install."
-        assert restored.cli_tools[0].verify_prompt == "Run gitnexus --version."
-        assert restored.cli_tools[0].notes == ["PATH changes need approval."]
-        assert restored.mcp_servers[0].name == "gitnexus"
-        assert restored.mcp_servers[0].args == ["mcp"]
-        assert restored.mcp_servers[0].distribution == "command"
-        assert restored.mcp_servers[0].requirements["node"] == ">=20"
-        assert restored.mcp_servers[0].docs[0]["url"] == "https://example.test/mcp"
-        assert restored.mcp_servers[0].install_prompt == "Use npm package."
-        assert restored.skills[0].name == "collaborating-with-claude"
-        assert restored.skills[0].scope == "user"
-        assert restored.skills[0].path_hint == "~/.agents/skills/collaborating-with-claude/SKILL.md"
-        assert restored.skills[0].docs[0]["title"] == "Claude skill"
-        assert restored.skills[0].verify_prompt == "Check SKILL.md exists."
-        assert restored.skills[0].notes == ["Use user scope."]
+        executable = restored.environment_requirements[0]
+        skill_path = restored.environment_requirements[1]
+        assert executable.id == "envreq:executable:gitnexus"
+        assert executable.kind == "executable"
+        assert executable.name == "gitnexus"
+        assert executable.tags == ["repo_index"]
+        assert executable.check == "gitnexus --version"
+        assert executable.install == "npm install -g gitnexus"
+        assert executable.docs[0]["title"] == "GitNexus"
+        assert executable.install_prompt == "Use npm install."
+        assert executable.verify_prompt == "Run gitnexus --version."
+        assert executable.notes == ["PATH changes need approval."]
+        assert "mcp_servers" not in response.to_dict()
+        assert skill_path.kind == "path"
+        assert skill_path.scope == "user"
+        assert skill_path.path == "~/.agents/skills/collaborating-with-claude/SKILL.md"
+        assert skill_path.docs[0]["title"] == "Claude skill"
+        assert skill_path.verify_prompt == "Check SKILL.md exists."
+        assert skill_path.notes == ["Use user scope."]
         assert "prompt" not in response.to_dict()
 
     def test_manifest_request_roundtrip(self) -> None:

@@ -3,8 +3,8 @@
 import pytest
 
 from labrastro_server.interfaces.http.remote.protocol import (
-    EnvironmentCLIToolManifest,
     EnvironmentManifestResponse,
+    EnvironmentRequirementManifest,
 )
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
@@ -38,12 +38,20 @@ def _control(*, agents: dict | None = None) -> AgentRunControlPlane:
 
 def _manifest() -> EnvironmentManifestResponse:
     return EnvironmentManifestResponse(
-        cli_tools=[
-            EnvironmentCLIToolManifest(
+        environment_requirements=[
+            EnvironmentRequirementManifest(
+                id="envreq:executable:gitnexus",
+                kind="executable",
                 name="gitnexus",
                 command="gitnexus",
                 check="gitnexus --version",
                 install="npm install -g gitnexus",
+            ),
+            EnvironmentRequirementManifest(
+                id="envreq:credential:github-token",
+                kind="credential",
+                name="github-token",
+                description="GitHub token from peer environment.",
             )
         ]
     )
@@ -63,11 +71,14 @@ def test_environment_run_uses_default_agent_and_sets_check_metadata() -> None:
     assert task.trigger_mode.value == "environment_config"
     assert task.metadata["workflow"] == "environment_config"
     assert task.metadata["environment_mode"] == "check"
-    assert task.metadata["entry_ids"] == ["cli:gitnexus"]
+    assert task.metadata["entry_ids"] == [
+        "envreq:executable:gitnexus",
+        "envreq:credential:github-token",
+    ]
     assert task.metadata["allowed_commands"] == [
         {
-            "entry_id": "cli:gitnexus",
-            "kind": "cli",
+            "entry_id": "envreq:executable:gitnexus",
+            "kind": "environment_requirement",
             "name": "gitnexus",
             "phase": "check",
             "command": "gitnexus --version",
@@ -89,8 +100,8 @@ def test_environment_run_configure_includes_install_command() -> None:
     task = control.get_agent_run(result.agent_run.id)
     assert task.metadata["environment_mode"] == "configure"
     assert {
-        "entry_id": "cli:gitnexus",
-        "kind": "cli",
+        "entry_id": "envreq:executable:gitnexus",
+        "kind": "environment_requirement",
         "name": "gitnexus",
         "phase": "install",
         "command": "npm install -g gitnexus",
