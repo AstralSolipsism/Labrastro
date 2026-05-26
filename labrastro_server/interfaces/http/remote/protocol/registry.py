@@ -103,6 +103,11 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("admin.mcp_servers.record", "POST", "/remote/admin/mcp-servers/record", "MCPServerRecordRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.mcp_servers.delete", "POST", "/remote/admin/mcp-servers/delete", "MCPServerDeleteRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.mcp_servers.enable", "POST", "/remote/admin/mcp-servers/enable", "MCPServerEnableRequest", "AdminMutationResult", "bearer"),
+    RemoteEndpoint("admin.skills.list", "POST", "/remote/admin/skills/list", "Empty", "SkillList", "bearer"),
+    RemoteEndpoint("admin.skills.dashboard", "POST", "/remote/admin/skills/dashboard", "Empty", "SkillDashboard", "bearer"),
+    RemoteEndpoint("admin.skills.record", "POST", "/remote/admin/skills/record", "SkillRecordRequest", "AdminMutationResult", "bearer"),
+    RemoteEndpoint("admin.skills.delete", "POST", "/remote/admin/skills/delete", "SkillDeleteRequest", "AdminMutationResult", "bearer"),
+    RemoteEndpoint("admin.skills.enable", "POST", "/remote/admin/skills/enable", "SkillEnableRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("mcp.manifest", "POST", "/remote/mcp/manifest", "MCPManifestRequest", "MCPManifestResponse", "peer_token"),
     RemoteEndpoint("mcp.tools", "POST", "/remote/mcp/tools", "PeerMCPToolsReport", "Ok", "peer_token"),
     # Binary artifact download authenticates with the X-RC-Peer-Token header.

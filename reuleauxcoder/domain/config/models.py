@@ -946,6 +946,83 @@ class ApprovalConfig:
 
 
 @dataclass
+class SkillRegistrationConfig:
+    """Registered Skill resource managed by capability settings."""
+
+    name: str
+    enabled: bool = True
+    path_hint: str = ""
+    source_path: str = ""
+    description: str = ""
+    source: str = ""
+    repo_url: str = ""
+    docs: list[dict[str, str]] = field(default_factory=list)
+    evidence: list[dict[str, str]] = field(default_factory=list)
+    install_prompt: str = ""
+    verify_prompt: str = ""
+    notes: list[str] = field(default_factory=list)
+    credentials: list[str] = field(default_factory=list)
+    risk_level: str = ""
+    last_action: str = ""
+    last_updated: str = ""
+    component_id: str = ""
+    package_ids: list[str] = field(default_factory=list)
+    managed_by: str = "user"
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict[str, Any] | None) -> "SkillRegistrationConfig":
+        if not isinstance(data, dict):
+            data = {}
+        resolved_name = str(data.get("name") or name or "").strip()
+        if not resolved_name:
+            resolved_name = str(name or "").strip()
+        return cls(
+            name=resolved_name,
+            enabled=_bool_config_value(data.get("enabled", True)),
+            path_hint=str(data.get("path_hint") or data.get("path") or ""),
+            source_path=str(data.get("source_path") or ""),
+            description=str(data.get("description") or ""),
+            source=str(data.get("source") or ""),
+            repo_url=str(data.get("repo_url") or ""),
+            docs=_docs_config_value(data.get("docs", [])),
+            evidence=_string_dict_list_config_value(data.get("evidence", [])),
+            install_prompt=str(data.get("install_prompt") or ""),
+            verify_prompt=str(data.get("verify_prompt") or ""),
+            notes=_string_list_config_value(data.get("notes", [])),
+            credentials=_string_list_config_value(data.get("credentials", [])),
+            risk_level=str(data.get("risk_level") or ""),
+            last_action=str(data.get("last_action") or ""),
+            last_updated=str(data.get("last_updated") or ""),
+            component_id=str(data.get("component_id") or ""),
+            package_ids=_string_list_config_value(data.get("package_ids", [])),
+            managed_by=str(data.get("managed_by") or "user"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "enabled": self.enabled,
+            "path_hint": self.path_hint,
+            "source_path": self.source_path,
+            "description": self.description,
+            "source": self.source,
+            "repo_url": self.repo_url,
+            "docs": [dict(item) for item in self.docs],
+            "evidence": [dict(item) for item in self.evidence],
+            "install_prompt": self.install_prompt,
+            "verify_prompt": self.verify_prompt,
+            "notes": list(self.notes),
+            "credentials": list(self.credentials),
+            "risk_level": self.risk_level,
+            "last_action": self.last_action,
+            "last_updated": self.last_updated,
+            "component_id": self.component_id,
+            "package_ids": list(self.package_ids),
+            "managed_by": self.managed_by,
+        }
+
+
+@dataclass
 class SkillsConfig:
     """Skills discovery/runtime configuration."""
 
@@ -953,6 +1030,40 @@ class SkillsConfig:
     scan_project: bool = True
     scan_user: bool = True
     disabled: list[str] = field(default_factory=list)
+    items: dict[str, SkillRegistrationConfig] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SkillsConfig":
+        if not isinstance(data, dict):
+            data = {}
+        raw_items = data.get("items", {})
+        items: dict[str, SkillRegistrationConfig] = {}
+        if isinstance(raw_items, dict):
+            for name, item in raw_items.items():
+                if not isinstance(item, dict):
+                    continue
+                skill = SkillRegistrationConfig.from_dict(str(name), item)
+                if skill.name:
+                    items[skill.name] = skill
+        return cls(
+            enabled=_bool_config_value(data.get("enabled", True)),
+            scan_project=_bool_config_value(data.get("scan_project", True)),
+            scan_user=_bool_config_value(data.get("scan_user", True)),
+            disabled=_string_list_config_value(data.get("disabled", [])),
+            items=items,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "scan_project": self.scan_project,
+            "scan_user": self.scan_user,
+            "disabled": list(self.disabled),
+            "items": {
+                name: item.to_dict()
+                for name, item in sorted(self.items.items())
+            },
+        }
 
 
 @dataclass

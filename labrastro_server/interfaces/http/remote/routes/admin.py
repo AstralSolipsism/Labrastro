@@ -585,6 +585,20 @@ class RemoteAdminRoutes:
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
+            elif path == "/remote/admin/skills/list":
+                result = {
+                    "ok": True,
+                    **self.service.admin_manager.list_skills(),
+                }
+                self._send_json(HTTPStatus.OK, result)
+                return
+            elif path == "/remote/admin/skills/dashboard":
+                result = {
+                    "ok": True,
+                    **self.service.admin_manager.skills_dashboard(),
+                }
+                self._send_json(HTTPStatus.OK, result)
+                return
             elif path in {
                 "/remote/admin/environment-requirements/behavior-catalog",
                 "/remote/admin/behavior/catalog",
@@ -636,6 +650,27 @@ class RemoteAdminRoutes:
                     path,
                     payload,
                     lambda: self.service.admin_manager.enable_mcp_server(payload),
+                )
+            elif path == "/remote/admin/skills/record":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.record_skill(payload),
+                )
+            elif path == "/remote/admin/skills/delete":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.delete_skill(payload),
+                )
+            elif path == "/remote/admin/skills/enable":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.enable_skill(payload),
                 )
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found")
@@ -727,6 +762,9 @@ class RemoteAdminRoutes:
             "/remote/admin/mcp-servers/record",
             "/remote/admin/mcp-servers/delete",
             "/remote/admin/mcp-servers/enable",
+            "/remote/admin/skills/record",
+            "/remote/admin/skills/delete",
+            "/remote/admin/skills/enable",
         }
 
     def _admin_config_operation(
@@ -776,6 +814,9 @@ class RemoteAdminRoutes:
         mcp_server = payload.get("mcp_server")
         if isinstance(mcp_server, dict) and mcp_server.get("name") is not None:
             return operation, str(mcp_server.get("name") or "")
+        skill = payload.get("skill")
+        if isinstance(skill, dict) and skill.get("name") is not None:
+            return operation, str(skill.get("name") or "")
         return operation, ""
 
     def _record_admin_config_audit(
@@ -870,6 +911,8 @@ class RemoteAdminRoutes:
             "/remote/admin/environment-requirements/behavior-catalog",
             "/remote/admin/mcp-servers/list",
             "/remote/admin/mcp-servers/dashboard",
+            "/remote/admin/skills/list",
+            "/remote/admin/skills/dashboard",
             "/remote/admin/behavior/catalog",
         }
         if path in read_paths:

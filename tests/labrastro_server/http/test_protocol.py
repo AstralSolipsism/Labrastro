@@ -167,6 +167,9 @@ class TestRemoteHTTPContract:
             registry["admin.environment_requirements.behavior_catalog"]["path"]
             == "/remote/admin/environment-requirements/behavior-catalog"
         )
+        assert registry["admin.skills.list"]["path"] == "/remote/admin/skills/list"
+        assert registry["admin.skills.record"]["request_model"] == "SkillRecordRequest"
+        assert registry["admin.skills.delete"]["auth"] == "bearer"
         assert registry["peer.disconnect"]["request_model"] == "PeerDisconnectRequest"
         for name in (
             "taskflow.get",

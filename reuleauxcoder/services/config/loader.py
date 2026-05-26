@@ -452,6 +452,8 @@ class ConfigLoader:
         providers_config = self._config_section(data, "providers")
         modes_config = self._config_section(data, "modes")
         skills_config = data.get("skills", {})
+        if not isinstance(skills_config, dict):
+            skills_config = {}
         prompt_config = data.get("prompt", {})
         context_config = data.get("context", {})
         memory_config = data.get("memory", {})
@@ -620,16 +622,7 @@ class ConfigLoader:
                 ),
                 rules=approval_rules,
             ),
-            skills=SkillsConfig(
-                enabled=skills_config.get("enabled", True),
-                scan_project=skills_config.get("scan_project", True),
-                scan_user=skills_config.get("scan_user", True),
-                disabled=[
-                    str(name)
-                    for name in skills_config.get("disabled", [])
-                    if str(name).strip()
-                ],
-            ),
+            skills=SkillsConfig.from_dict(skills_config),
             prompt=PromptConfig(
                 system_append=str(prompt_config.get("system_append", "") or ""),
             ),

@@ -24,6 +24,7 @@ from reuleauxcoder.domain.config.models import (
     DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
     EnvironmentRequirementConfig,
     MCPServerConfig,
+    SkillRegistrationConfig,
     ensure_default_capability_packages,
 )
 from reuleauxcoder.domain.environment_requirements import (
@@ -538,13 +539,21 @@ class CapabilityPackageInstaller:
         if component.kind == "environment_requirement":
             items = _environment_requirement_items(data)
             payload["id"] = component.id
+            _assert_materialized_resource_slot(items, component.id, component)
             requirement = EnvironmentRequirementConfig.from_dict(component.id, payload)
             items[requirement.id] = requirement.to_dict()
             return
         if component.kind in {"mcp", "mcp_server"}:
             items = _mcp_server_items(data)
+            _assert_materialized_resource_slot(items, component.name, component)
             server = MCPServerConfig.from_dict(component.name, payload)
             items[server.name] = server.to_dict()
+            return
+        if component.kind == "skill":
+            items = _skill_items(data)
+            _assert_materialized_resource_slot(items, component.name, component)
+            skill = SkillRegistrationConfig.from_dict(component.name, payload)
+            items[skill.name] = skill.to_dict()
 
     def remove_materialized_component(
         self,
@@ -556,6 +565,9 @@ class CapabilityPackageInstaller:
             item_id = component.id
         elif component.kind in {"mcp", "mcp_server"}:
             items = _mcp_server_items(data)
+            item_id = component.name
+        elif component.kind == "skill":
+            items = _skill_items(data)
             item_id = component.name
         else:
             return
@@ -900,6 +912,55 @@ def _mcp_server_items(data: dict[str, Any]) -> dict[str, Any]:
         items = {}
         mcp["servers"] = items
     return items
+
+
+def _skill_items(data: dict[str, Any]) -> dict[str, Any]:
+    skills = data.setdefault("skills", {})
+    if not isinstance(skills, dict):
+        skills = {}
+        data["skills"] = skills
+    items = skills.setdefault("items", {})
+    if not isinstance(items, dict):
+        items = {}
+        skills["items"] = items
+    return items
+
+
+def _assert_materialized_resource_slot(
+    items: dict[str, Any],
+    item_id: str,
+    component: CapabilityComponentConfig,
+) -> None:
+    current = items.get(item_id)
+    if not isinstance(current, dict):
+        return
+    if str(current.get("managed_by") or "") == "capability_package":
+        existing_component_id = str(current.get("component_id") or "").strip()
+        if existing_component_id == component.id:
+            return
+        raw_package_ids = current.get("package_ids", [])
+        package_ids = (
+            _unique_strings([str(item) for item in raw_package_ids])
+            if isinstance(raw_package_ids, list)
+            else []
+        )
+        details = [
+            f"existing component_id={existing_component_id or '<missing>'}",
+            f"incoming component_id={component.id}",
+        ]
+        if package_ids:
+            details.append("package_ids=" + ",".join(package_ids))
+        raise CapabilityPackageIngestError(
+            "capability_resource_conflict",
+            f"{component.kind} resource '{item_id}' is already managed by another capability component; "
+            + "; ".join(details),
+            status=HTTPStatus.CONFLICT,
+        )
+    raise CapabilityPackageIngestError(
+        "capability_resource_conflict",
+        f"{component.kind} resource '{item_id}' is already user-managed",
+        status=HTTPStatus.CONFLICT,
+    )
 
 
 def _bool_field(payload: dict[str, Any], field_name: str, default: Any) -> bool:

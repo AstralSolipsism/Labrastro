@@ -295,6 +295,23 @@ class AppRunner:
         self, config: Config, agent: Agent, ui_bus: UIEventBus
     ) -> SkillsService:
         """Initialize skills service and attach stable catalog to the agent."""
+        environment_skill_paths = [
+            Path(str(requirement.path)).expanduser()
+            for requirement in config.environment.requirements.values()
+            if getattr(requirement, "enabled", True)
+            and getattr(requirement, "kind", "") == "path"
+            and "skill_root" in set(getattr(requirement, "tags", []) or [])
+            and str(requirement.path or "").strip()
+        ]
+        registered_skill_paths = [
+            Path(path).expanduser()
+            for skill in config.skills.items.values()
+            if getattr(skill, "enabled", True)
+            for path in [
+                str(getattr(skill, "path_hint", "") or getattr(skill, "source_path", ""))
+            ]
+            if path.strip()
+        ]
         skills_service = SkillsService(
             workspace_dir=Path.cwd(),
             home_dir=Path.home(),
@@ -302,14 +319,7 @@ class AppRunner:
             scan_project=config.skills.scan_project,
             scan_user=config.skills.scan_user,
             disabled_names=list(config.skills.disabled),
-            extra_paths=[
-                Path(str(requirement.path)).expanduser()
-                for requirement in config.environment.requirements.values()
-                if getattr(requirement, "enabled", True)
-                and getattr(requirement, "kind", "") == "path"
-                and "skill_root" in set(getattr(requirement, "tags", []) or [])
-                and str(requirement.path or "").strip()
-            ],
+            extra_paths=[*environment_skill_paths, *registered_skill_paths],
         )
         reload_result = skills_service.reload()
         setattr(agent, "skills_service", skills_service)

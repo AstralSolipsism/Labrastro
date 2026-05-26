@@ -42,6 +42,7 @@ from reuleauxcoder.domain.config.models import (
     RunLimitsConfig,
     RuntimeProfilesConfig,
     SandboxProviderConfig,
+    SkillRegistrationConfig,
     SkillsConfig,
     StreamRecoveryConfig,
     build_agent_run_snapshot,
@@ -443,24 +444,7 @@ class RemoteAdminConfigManager:
     def _skills_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         raw = data.get("skills", {})
         raw = raw if isinstance(raw, dict) else {}
-        config = SkillsConfig(
-            enabled=bool(raw.get("enabled", True)),
-            scan_project=bool(raw.get("scan_project", True)),
-            scan_user=bool(raw.get("scan_user", True)),
-            disabled=[
-                str(name)
-                for name in raw.get("disabled", [])
-                if str(name).strip()
-            ]
-            if isinstance(raw.get("disabled", []), list)
-            else [],
-        )
-        return {
-            "enabled": config.enabled,
-            "scan_project": config.scan_project,
-            "scan_user": config.scan_user,
-            "disabled": list(config.disabled),
-        }
+        return SkillsConfig.from_dict(raw).to_dict()
 
     def _prompt_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         raw = data.get("prompt", {})
@@ -1012,16 +996,24 @@ class RemoteAdminConfigManager:
                         },
                         400,
                     )
-                data["skills"] = {
-                    "enabled": bool(merged_skills.get("enabled", True)),
-                    "scan_project": bool(merged_skills.get("scan_project", True)),
-                    "scan_user": bool(merged_skills.get("scan_user", True)),
-                    "disabled": [
-                        str(name).strip()
-                        for name in disabled_raw
-                        if str(name).strip()
-                    ],
-                }
+                items_raw = merged_skills.get("items", {})
+                if items_raw is not None and not isinstance(items_raw, dict):
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_skills",
+                            "message": "skills.items must be an object",
+                        },
+                        400,
+                    )
+                try:
+                    data["skills"] = SkillsConfig.from_dict(merged_skills).to_dict()
+                except Exception as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "invalid_skills", "message": str(exc)},
+                        400,
+                    )
             if isinstance(raw_prompt, dict):
                 previous_prompt = (
                     previous_data.get("prompt", {})
@@ -1551,6 +1543,12 @@ class RemoteAdminConfigManager:
             "mcp_servers": self._admin_resource_views(data, "mcp"),
         }
 
+    def list_skills(self) -> dict[str, Any]:
+        data = self._load_data()
+        return {
+            "skills": self._admin_resource_views(data, "skill"),
+        }
+
     def environment_requirements_dashboard(self) -> dict[str, Any]:
         data = self._load_data()
         items = [
@@ -1567,6 +1565,17 @@ class RemoteAdminConfigManager:
         items = [
             self._admin_resource_dashboard_item("mcp", item)
             for item in self._admin_resource_views(data, "mcp")
+        ]
+        return {
+            "items": items,
+            "summary": _admin_resource_dashboard_summary(items),
+        }
+
+    def skills_dashboard(self) -> dict[str, Any]:
+        data = self._load_data()
+        items = [
+            self._admin_resource_dashboard_item("skill", item)
+            for item in self._admin_resource_views(data, "skill")
         ]
         return {
             "items": items,
@@ -1611,7 +1620,13 @@ class RemoteAdminConfigManager:
                 if isinstance(items.get(candidate.id), dict)
                 else {}
             )
+            locked_error = _capability_package_managed_resource_error(
+                "environment_requirement", candidate.id, previous
+            )
+            if locked_error is not None:
+                return locked_error
             merged = {**previous, **item_payload}
+            merged["managed_by"] = "user"
             try:
                 normalized = EnvironmentRequirementConfig.from_dict(candidate.id, merged)
             except ValueError as exc:
@@ -1651,8 +1666,14 @@ class RemoteAdminConfigManager:
             data = deepcopy(previous_data)
             items = self._admin_resource_items(data, "mcp")
             previous = items.get(name, {}) if isinstance(items.get(name), dict) else {}
+            locked_error = _capability_package_managed_resource_error(
+                "mcp_server", name, previous
+            )
+            if locked_error is not None:
+                return locked_error
             merged = {**previous, **item_payload}
             merged.pop("name", None)
+            merged["managed_by"] = "user"
             normalized = MCPServerConfig.from_dict(name, merged)
             items[normalized.name] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
@@ -1667,6 +1688,44 @@ class RemoteAdminConfigManager:
                     "created": not previous,
                     "mcp_server": self._admin_resource_view(
                         "mcp",
+                        normalized.name,
+                        items[normalized.name],
+                    ),
+                },
+            )
+
+    def record_skill(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _skill_payload(payload)
+        name = str(item_payload.get("name") or payload.get("name") or "").strip()
+        if not name:
+            return AdminConfigResult(False, {"error": "skill_name_required"}, 400)
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            items = self._admin_resource_items(data, "skill")
+            previous = items.get(name, {}) if isinstance(items.get(name), dict) else {}
+            locked_error = _capability_package_managed_resource_error(
+                "skill", name, previous
+            )
+            if locked_error is not None:
+                return locked_error
+            merged = {**previous, **item_payload}
+            merged["managed_by"] = "user"
+            normalized = SkillRegistrationConfig.from_dict(name, merged)
+            items[normalized.name] = normalized.to_dict()
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "kind": "skill",
+                    "name": normalized.name,
+                    "created": not previous,
+                    "skill": self._admin_resource_view(
+                        "skill",
                         normalized.name,
                         items[normalized.name],
                     ),
@@ -1700,6 +1759,11 @@ class RemoteAdminConfigManager:
                 return AdminConfigResult(
                     False, {"error": "environment_requirement_not_found"}, 404
                 )
+            locked_error = _capability_package_managed_resource_error(
+                "environment_requirement", item_id, items.get(item_id)
+            )
+            if locked_error is not None:
+                return locked_error
             del items[item_id]
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
@@ -1725,6 +1789,11 @@ class RemoteAdminConfigManager:
             items = self._admin_resource_items(data, "mcp")
             if name not in items:
                 return AdminConfigResult(False, {"error": "mcp_server_not_found"}, 404)
+            locked_error = _capability_package_managed_resource_error(
+                "mcp_server", name, items.get(name)
+            )
+            if locked_error is not None:
+                return locked_error
             del items[name]
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
@@ -1732,6 +1801,29 @@ class RemoteAdminConfigManager:
             return AdminConfigResult(
                 True, {"ok": True, "kind": "mcp_server", "name": name}
             )
+
+    def delete_skill(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _skill_payload(payload)
+        name = str(item_payload.get("name") or payload.get("name") or "").strip()
+        if not name:
+            return AdminConfigResult(False, {"error": "skill_name_required"}, 400)
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            items = self._admin_resource_items(data, "skill")
+            if name not in items:
+                return AdminConfigResult(False, {"error": "skill_not_found"}, 404)
+            locked_error = _capability_package_managed_resource_error(
+                "skill", name, items.get(name)
+            )
+            if locked_error is not None:
+                return locked_error
+            del items[name]
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(True, {"ok": True, "kind": "skill", "name": name})
 
     def enable_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _environment_requirement_payload(payload)
@@ -1762,6 +1854,11 @@ class RemoteAdminConfigManager:
                 return AdminConfigResult(
                     False, {"error": "environment_requirement_not_found"}, 404
                 )
+            locked_error = _capability_package_managed_resource_error(
+                "environment_requirement", item_id, item
+            )
+            if locked_error is not None:
+                return locked_error
             item["enabled"] = enabled
             try:
                 normalized = EnvironmentRequirementConfig.from_dict(item_id, item)
@@ -1801,6 +1898,11 @@ class RemoteAdminConfigManager:
             item = items.get(name)
             if not isinstance(item, dict):
                 return AdminConfigResult(False, {"error": "mcp_server_not_found"}, 404)
+            locked_error = _capability_package_managed_resource_error(
+                "mcp_server", name, item
+            )
+            if locked_error is not None:
+                return locked_error
             item["enabled"] = enabled
             normalized = MCPServerConfig.from_dict(name, item)
             items[name] = normalized.to_dict()
@@ -1814,6 +1916,41 @@ class RemoteAdminConfigManager:
                     "kind": "mcp_server",
                     "name": name,
                     "mcp_server": self._admin_resource_view("mcp", name, items[name]),
+                },
+            )
+
+    def enable_skill(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _skill_payload(payload)
+        name = str(item_payload.get("name") or payload.get("name") or "").strip()
+        if not name:
+            return AdminConfigResult(False, {"error": "skill_name_required"}, 400)
+        enabled = _bool_field(item_payload, "enabled", payload.get("enabled", True))
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            items = self._admin_resource_items(data, "skill")
+            item = items.get(name)
+            if not isinstance(item, dict):
+                return AdminConfigResult(False, {"error": "skill_not_found"}, 404)
+            locked_error = _capability_package_managed_resource_error(
+                "skill", name, item
+            )
+            if locked_error is not None:
+                return locked_error
+            item["enabled"] = enabled
+            normalized = SkillRegistrationConfig.from_dict(name, item)
+            items[name] = normalized.to_dict()
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "kind": "skill",
+                    "name": name,
+                    "skill": self._admin_resource_view("skill", name, items[name]),
                 },
             )
 
@@ -2526,6 +2663,17 @@ class RemoteAdminConfigManager:
                 environment["requirements"] = items
             return items
 
+        if kind == "skill":
+            skills = data.setdefault("skills", {})
+            if not isinstance(skills, dict):
+                skills = {}
+                data["skills"] = skills
+            items = skills.setdefault("items", {})
+            if not isinstance(items, dict):
+                items = {}
+                skills["items"] = items
+            return items
+
         mcp = data.setdefault("mcp", {})
         if not isinstance(mcp, dict):
             mcp = {}
@@ -2551,6 +2699,8 @@ class RemoteAdminConfigManager:
     ) -> dict[str, Any]:
         if kind == "environment_requirement":
             return EnvironmentRequirementConfig.from_dict(name, item).to_dict()
+        if kind == "skill":
+            return SkillRegistrationConfig.from_dict(name, item).to_dict()
         return MCPServerConfig.from_dict(name, item).to_dict()
 
     def _admin_resource_view(
@@ -2562,6 +2712,9 @@ class RemoteAdminConfigManager:
         if kind == "mcp":
             view["kind"] = "mcp_server"
             view["id"] = f"mcp:{name}"
+        elif kind == "skill":
+            view["kind"] = "skill"
+            view["id"] = f"skill:{name}"
         else:
             view.setdefault("id", name)
         return view
@@ -2579,6 +2732,9 @@ class RemoteAdminConfigManager:
         if kind == "mcp":
             placement = placement or "server"
             scope = placement
+        elif kind == "skill":
+            placement = placement or "agent"
+            scope = scope or "skill"
         else:
             placement = placement or "peer"
             scope = scope or placement
@@ -2604,6 +2760,10 @@ class RemoteAdminConfigManager:
             "check": str(view.get("check") or ""),
             "install": str(view.get("install") or ""),
             "command": str(view.get("command") or view.get("path_hint") or ""),
+            "path_hint": str(view.get("path_hint") or ""),
+            "source_path": str(view.get("source_path") or ""),
+            "install_prompt": str(view.get("install_prompt") or ""),
+            "verify_prompt": str(view.get("verify_prompt") or ""),
             "environment_requirement_refs": (
                 [str(item) for item in view.get("environment_requirement_refs") or []]
                 if isinstance(view.get("environment_requirement_refs"), list)
@@ -2753,7 +2913,7 @@ class RemoteAdminConfigManager:
                 "name": str(item["id"]),
                 "feature_id": str(item["feature_id"]),
                 "source_type": "settings_ui",
-                "registration_path": "dogcode.webview-ui.settings.ToolchainsTab",
+                "registration_path": "dogcode.webview-ui.settings.CapabilitiesTab",
                 "description": str(item["description"]),
                 "ui_targets": ["webview"],
                 "required_capabilities": ["buttons", "tabs"],
@@ -3266,6 +3426,45 @@ def _mcp_server_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_payload, dict):
         raw_payload = payload.get("payload")
     return dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
+
+
+def _skill_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = payload.get("skill")
+    if not isinstance(raw_payload, dict):
+        raw_payload = payload.get("payload")
+    return dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
+
+
+def _payload_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None or value == "":
+        return []
+    return [str(value).strip()]
+
+
+def _capability_package_managed_resource_error(
+    kind: str,
+    name: str,
+    item: Any,
+) -> AdminConfigResult | None:
+    if not isinstance(item, dict):
+        return None
+    if str(item.get("managed_by") or "") != "capability_package":
+        return None
+    package_ids = _payload_string_list(item.get("package_ids"))
+    if not package_ids:
+        return None
+    return AdminConfigResult(
+        False,
+        {
+            "error": "capability_package_managed_resource",
+            "kind": kind,
+            "name": name,
+            "package_ids": package_ids,
+        },
+        409,
+    )
 
 
 def _normalize_provider_models(value: Any) -> list[dict[str, Any]]:

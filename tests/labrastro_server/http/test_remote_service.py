@@ -1451,6 +1451,43 @@ class TestRemoteRelayHTTPService:
                 "envreq:runtime:node"
             ]
 
+            _, skill = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/skills/record",
+                {
+                    "skill": {
+                        "name": "code-review",
+                        "path_hint": "~/.agents/skills/code-review/SKILL.md",
+                        "source_path": "~/.agents/skills/code-review",
+                        "description": "Review code changes.",
+                        "docs": [
+                            {
+                                "title": "Skill docs",
+                                "url": "https://example.test/skills/code-review",
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "field": "path_hint",
+                                "excerpt": "SKILL.md exists.",
+                            }
+                        ],
+                        "install_prompt": "Install the code-review skill.",
+                        "verify_prompt": "Open SKILL.md.",
+                    },
+                },
+                headers=admin_headers,
+            )
+            assert skill["skill"]["name"] == "code-review"
+            assert skill["skill"]["path_hint"] == "~/.agents/skills/code-review/SKILL.md"
+            assert skill["skill"]["managed_by"] == "user"
+            skill_record_events = [
+                event
+                for event in service.auth_service.store.audit_events
+                if event["payload"]["path"] == "/remote/admin/skills/record"
+            ]
+            assert skill_record_events[-1]["payload"]["target"] == "code-review"
+
             _, skill_path = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/environment-requirements/record",
@@ -1491,6 +1528,13 @@ class TestRemoteRelayHTTPService:
                 headers=admin_headers,
             )
             assert listed_mcp["mcp_servers"][0]["name"] == "gitnexus-mcp"
+            _, listed_skills = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/skills/list",
+                {},
+                headers=admin_headers,
+            )
+            assert listed_skills["skills"][0]["name"] == "code-review"
 
             _, env_dashboard = _json_request(
                 "POST",
@@ -1517,6 +1561,16 @@ class TestRemoteRelayHTTPService:
             mcp_rows = {item["id"]: item for item in mcp_dashboard["items"]}
             assert mcp_dashboard["summary"]["total"] == 1
             assert mcp_rows["mcp:gitnexus-mcp"]["placement"] == "peer"
+            _, skills_dashboard = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/skills/dashboard",
+                {},
+                headers=admin_headers,
+            )
+            skill_rows = {item["id"]: item for item in skills_dashboard["items"]}
+            assert skills_dashboard["summary"]["total"] == 1
+            assert skill_rows["skill:code-review"]["path_hint"] == "~/.agents/skills/code-review/SKILL.md"
+            assert skill_rows["skill:code-review"]["source_path"] == "~/.agents/skills/code-review"
 
             _, disabled = _json_request(
                 "POST",
@@ -1529,6 +1583,14 @@ class TestRemoteRelayHTTPService:
             )
             assert disabled["environment_requirement"]["enabled"] is False
 
+            _, disabled_skill = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/skills/enable",
+                {"name": "code-review", "enabled": False},
+                headers=admin_headers,
+            )
+            assert disabled_skill["skill"]["enabled"] is False
+
             _, deleted = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/mcp-servers/delete",
@@ -1540,12 +1602,23 @@ class TestRemoteRelayHTTPService:
             assert deleted["name"] == "gitnexus-mcp"
             assert "config_etag" in deleted
 
+            _, deleted_skill = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/skills/delete",
+                {"name": "code-review"},
+                headers=admin_headers,
+            )
+            assert deleted_skill["ok"] is True
+            assert deleted_skill["kind"] == "skill"
+            assert deleted_skill["name"] == "code-review"
+
             raw = config_path.read_text(encoding="utf-8")
             assert "envreq:executable:gitnexus" in raw
             assert "enabled: false" in raw
             assert "envreq:path:collaborating-with-claude-skill" in raw
             assert "gitnexus-mcp" not in raw
-            assert len(reloads) == 5
+            assert "code-review" not in raw
+            assert len(reloads) == 8
         finally:
             service.stop()
             relay.stop()
@@ -1710,6 +1783,19 @@ class TestRemoteRelayHTTPService:
             assert (
                 ui_actions["settings.environment_requirements.refresh_manifest"]["source_type"]
                 == "settings_ui"
+            )
+            settings_registration_paths = {
+                str(item["registration_path"])
+                for item in ui_actions.values()
+                if str(item["id"]).startswith("settings.")
+            }
+            assert settings_registration_paths == {
+                "dogcode.webview-ui.settings.CapabilitiesTab"
+            }
+            old_settings_tab = "dogcode.webview-ui.settings." + "Tool" + "chains" + "Tab"
+            assert all(
+                old_settings_tab not in str(item["registration_path"])
+                for item in ui_actions.values()
             )
             assert "settings.environment_requirements.refresh_manifest" not in commands
 

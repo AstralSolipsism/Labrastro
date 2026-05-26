@@ -38,7 +38,7 @@ Labrastro 把 AI 编程推进为可追踪、可恢复、可分派、可审计的
 ## 一次任务在 Labrastro 里怎么发生
 
 1. 用户登录自托管 Host，前端自动申请一次性 peer bootstrap token。
-2. 受控 peer 或服务端 worker 注册工作区、可用执行器、MCP、skills、环境 CLI 和 capability 清单，以及运行时限制。
+2. 受控 peer 或服务端 worker 注册工作区、可用执行器、MCP、skills、环境要求和 capability 清单，以及运行时限制。
 3. 用户发起会话、Issue assignment、mention 或后台任务。
 4. Labrastro 根据 runtime profile 选择执行位置、执行器、模型、capability 集合、凭据引用和审批边界。
 5. Agent Runtime 创建任务并持续记录事件、产物和状态。
@@ -47,7 +47,7 @@ Labrastro 把 AI 编程推进为可追踪、可恢复、可分派、可审计的
 
 这个流程让 AI 成为可托管、可观察、可恢复的项目成员。
 
-这里的几个概念有明确边界：`runtime profile` 是运行配置组合，描述执行位置、模型、审批、HOME 隔离、凭据引用和 MCP 配置；`执行器 / executor` 决定 Agent 如何调用 AI 并承载一次任务会话，例如 `reuleauxcoder`、Codex、Claude、Gemini；`CLI` 服务于 skills、环境检查和工具链；`capability` 是 MCP、skills、环境能力等可声明、可路由、可展示的能力集合。
+这里的几个概念有明确边界：`runtime profile` 是运行配置组合，描述执行位置、模型、审批、HOME 隔离、凭据引用和 MCP 配置；`执行器 / executor` 决定 Agent 如何调用 AI 并承载一次任务会话，例如 `reuleauxcoder`、Codex、Claude、Gemini；`environment requirement` 描述 skills、MCP 或能力包运行所需的 executable、runtime、SDK、服务、环境变量、凭据和路径；`capability` 是 MCP、skills、环境要求等可声明、可路由、可展示的能力集合。
 
 ## 当前已经实现
 

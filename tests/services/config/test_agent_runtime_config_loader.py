@@ -757,6 +757,22 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
                 **_model_config(),
                 "capability_packages": {},
                 "capability_components": {},
+                "mcp": {
+                    "servers": {
+                        "standalone": {
+                            "command": "standalone-mcp",
+                            "managed_by": "user",
+                        }
+                    }
+                },
+                "skills": {
+                    "items": {
+                        "standalone-review": {
+                            "path_hint": "/skills/standalone-review/SKILL.md",
+                            "managed_by": "user",
+                        }
+                    }
+                },
             }
 
         def _load_data(self) -> dict:
@@ -784,6 +800,16 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
             "environment_requirement_refs": ["envreq:executable:gh"],
         },
     }
+    skill_component = {
+        "id": "skill:code-review",
+        "kind": "skill",
+        "name": "code-review",
+        "config": {
+            "path_hint": "/skills/code-review/SKILL.md",
+            "source_path": "/skills/code-review",
+            "description": "Review code changes.",
+        },
+    }
 
     first = manager.accept_capability_package_draft(
         {
@@ -797,6 +823,7 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
                 "contributions": {
                     "environment_requirements": [component],
                     "mcp_servers": [mcp_component],
+                    "skills": [skill_component],
                 },
                 "effective_capabilities": ["Inspect pull request metadata with gh."],
                 "install_plan": ["Install gh."],
@@ -808,6 +835,7 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
     assert set(manager.data["capability_packages"]["review"]["components"]) == {
         "envreq:executable:gh",
         "mcp_server:github",
+        "skill:code-review",
     }
     assert manager.data["capability_packages"]["review"]["effective_capabilities"] == [
         "Inspect pull request metadata with gh."
@@ -821,6 +849,9 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
     assert manager.data["mcp"]["servers"]["github"]["environment_requirement_refs"] == [
         "envreq:executable:gh"
     ]
+    assert manager.data["skills"]["items"]["code-review"]["component_id"] == "skill:code-review"
+    assert manager.data["skills"]["items"]["code-review"]["managed_by"] == "capability_package"
+    assert manager.data["skills"]["items"]["standalone-review"]["managed_by"] == "user"
 
     second = manager.accept_capability_package_draft(
         {
@@ -831,7 +862,10 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
                     "type": "github_repo",
                     "url": "https://github.com/example/pr-tools",
                 },
-                "contributions": {"environment_requirements": [component]},
+                "contributions": {
+                    "environment_requirements": [component],
+                    "skills": [skill_component],
+                },
             }
         }
     )
@@ -840,18 +874,202 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
         "review",
         "pr",
     ]
+    assert manager.data["capability_components"]["skill:code-review"]["package_ids"] == [
+        "review",
+        "pr",
+    ]
 
     deleted_review = manager.delete_capability_package({"package_id": "review"})
     assert deleted_review.ok is True
     assert manager.data["capability_components"]["envreq:executable:gh"]["package_ids"] == ["pr"]
+    assert manager.data["capability_components"]["skill:code-review"]["package_ids"] == ["pr"]
     assert "envreq:executable:gh" in manager.data["environment"]["requirements"]
+    assert "code-review" in manager.data["skills"]["items"]
+    assert manager.data["skills"]["items"]["code-review"]["package_ids"] == ["pr"]
 
     deleted_pr = manager.delete_capability_package({"package_id": "pr"})
     assert deleted_pr.ok is True
     assert "envreq:executable:gh" not in manager.data["capability_components"]
     assert "mcp_server:github" not in manager.data["capability_components"]
+    assert "skill:code-review" not in manager.data["capability_components"]
     assert "envreq:executable:gh" not in manager.data["environment"]["requirements"]
     assert "github" not in manager.data["mcp"]["servers"]
+    assert "code-review" not in manager.data["skills"]["items"]
+    assert "standalone" in manager.data["mcp"]["servers"]
+    assert "standalone-review" in manager.data["skills"]["items"]
+
+
+def test_capability_package_rejects_materialized_resource_slot_conflicts() -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data = {
+                **_model_config(),
+                "capability_packages": {},
+                "capability_components": {},
+            }
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+        def _commit_config(self, data: dict, previous_data: dict):
+            del previous_data
+            self.data = deepcopy(data)
+            return None
+
+    manager = MemoryAdminManager()
+    first = manager.accept_capability_package_draft(
+        {
+            "draft": {
+                "id": "review-a",
+                "name": "Review A",
+                "contributions": {
+                    "skills": [
+                        {
+                            "id": "skill:review-a",
+                            "kind": "skill",
+                            "name": "code-review",
+                            "config": {"path_hint": "/skills/review-a/SKILL.md"},
+                        }
+                    ],
+                    "mcp_servers": [
+                        {
+                            "id": "mcp_server:github-a",
+                            "kind": "mcp_server",
+                            "name": "github",
+                            "config": {"command": "github-a-mcp"},
+                        }
+                    ],
+                },
+            }
+        }
+    )
+    assert first.ok is True
+    previous = deepcopy(manager.data)
+
+    skill_conflict = manager.accept_capability_package_draft(
+        {
+            "draft": {
+                "id": "review-b",
+                "name": "Review B",
+                "contributions": {
+                    "skills": [
+                        {
+                            "id": "skill:review-b",
+                            "kind": "skill",
+                            "name": "code-review",
+                            "config": {"path_hint": "/skills/review-b/SKILL.md"},
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    assert skill_conflict.ok is False
+    assert skill_conflict.status == 409
+    assert skill_conflict.payload["error"] == "capability_resource_conflict"
+    assert manager.data == previous
+
+    mcp_conflict = manager.accept_capability_package_draft(
+        {
+            "draft": {
+                "id": "github-b",
+                "name": "GitHub B",
+                "contributions": {
+                    "mcp_servers": [
+                        {
+                            "id": "mcp_server:github-b",
+                            "kind": "mcp_server",
+                            "name": "github",
+                            "config": {"command": "github-b-mcp"},
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    assert mcp_conflict.ok is False
+    assert mcp_conflict.status == 409
+    assert mcp_conflict.payload["error"] == "capability_resource_conflict"
+    assert manager.data == previous
+
+
+def test_admin_skill_resource_crud_uses_user_lifecycle_and_blocks_package_managed() -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data = {
+                "skills": {
+                    "items": {
+                        "package-review": {
+                            "enabled": True,
+                            "path_hint": "/skills/package-review/SKILL.md",
+                            "component_id": "skill:package-review",
+                            "package_ids": ["review"],
+                            "managed_by": "capability_package",
+                        }
+                    }
+                }
+            }
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+        def _commit_config(self, data: dict, previous_data: dict):
+            del previous_data
+            self.data = deepcopy(data)
+            return None
+
+    manager = MemoryAdminManager()
+
+    created = manager.record_skill(
+        {
+            "name": "standalone-review",
+            "enabled": True,
+            "path_hint": "/skills/standalone-review/SKILL.md",
+            "source_path": "/skills/standalone-review",
+            "description": "Standalone review helper.",
+            "docs": [{"title": "Skill docs", "url": "https://example.test/skill"}],
+            "evidence": [{"field": "path_hint", "excerpt": "SKILL.md exists."}],
+            "install_prompt": "Install standalone-review.",
+            "verify_prompt": "Open SKILL.md.",
+        }
+    )
+
+    assert created.ok is True
+    assert created.payload["skill"]["name"] == "standalone-review"
+    assert created.payload["skill"]["managed_by"] == "user"
+    assert (
+        manager.data["skills"]["items"]["standalone-review"]["path_hint"]
+        == "/skills/standalone-review/SKILL.md"
+    )
+
+    skills = {item["name"]: item for item in manager.list_skills()["skills"]}
+    assert skills["standalone-review"]["source_path"] == "/skills/standalone-review"
+    dashboard = {item["id"]: item for item in manager.skills_dashboard()["items"]}
+    assert dashboard["skill:standalone-review"]["path_hint"] == "/skills/standalone-review/SKILL.md"
+    assert dashboard["skill:standalone-review"]["managed_by"] == "user"
+
+    disabled = manager.enable_skill({"name": "standalone-review", "enabled": False})
+    assert disabled.ok is True
+    assert disabled.payload["skill"]["enabled"] is False
+
+    for blocked in [
+        manager.record_skill(
+            {"name": "package-review", "path_hint": "/tmp/override/SKILL.md"}
+        ),
+        manager.enable_skill({"name": "package-review", "enabled": False}),
+        manager.delete_skill({"name": "package-review"}),
+    ]:
+        assert blocked.ok is False
+        assert blocked.status == 409
+        assert blocked.payload["error"] == "capability_package_managed_resource"
+        assert blocked.payload["package_ids"] == ["review"]
+
+    deleted = manager.delete_skill({"name": "standalone-review"})
+    assert deleted.ok is True
+    assert "standalone-review" not in manager.data["skills"]["items"]
+    assert "package-review" in manager.data["skills"]["items"]
 
 
 def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> None:
