@@ -8,6 +8,7 @@ from labrastro_server.services.capability_packages import (
     CapabilityDraftValidator,
     CapabilityPackagerRunner,
     CapabilityPackageIngestService,
+    CapabilityPackageInstaller,
     CapabilitySourceCollector,
     EvidenceBundle,
 )
@@ -249,6 +250,51 @@ def test_draft_validator_requires_configure_command_evidence() -> None:
 
     assert result.ok is False
     assert "envreq:executable:gh command lacks evidence: gh auth login" in result.messages
+
+
+def test_package_installer_preserves_environment_requirement_requirements() -> None:
+    data: dict[str, object] = {}
+    result = CapabilityPackageInstaller().install_draft(
+        data,
+        {
+            "id": "dotnet-sdk",
+            "components": [
+                {
+                    "kind": "environment_requirement",
+                    "name": "dotnet",
+                    "resource_kind": "sdk",
+                    "requirements": {"version": ">=8"},
+                }
+            ],
+        },
+    )
+
+    assert result.component_ids == ["envreq:sdk:dotnet"]
+    requirement = data["environment"]["requirements"]["envreq:sdk:dotnet"]
+    assert requirement["kind"] == "sdk"
+    assert requirement["requirements"] == {"version": ">=8"}
+
+
+def test_package_installer_infers_executable_requirement_from_command() -> None:
+    data: dict[str, object] = {}
+    result = CapabilityPackageInstaller().install_draft(
+        data,
+        {
+            "id": "github-cli",
+            "components": [
+                {
+                    "kind": "environment_requirement",
+                    "name": "gh",
+                    "command": "gh",
+                }
+            ],
+        },
+    )
+
+    assert result.component_ids == ["envreq:executable:gh"]
+    requirement = data["environment"]["requirements"]["envreq:executable:gh"]
+    assert requirement["kind"] == "executable"
+    assert requirement["command"] == "gh"
 
 
 def test_ingest_status_extracts_completed_draft_json() -> None:

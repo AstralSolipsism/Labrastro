@@ -30,7 +30,7 @@ from reuleauxcoder.domain.environment_requirements import (
     ENVIRONMENT_COMMAND_FIELDS,
     ENVIRONMENT_REQUIREMENT_KINDS,
     normalize_environment_requirement_id,
-    normalize_environment_requirement_kind,
+    resolve_environment_requirement_kind,
 )
 from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import FetchCapabilitiesTool
 
@@ -452,30 +452,49 @@ class CapabilityPackageInstaller:
         name = str(item.get("name", "") or "").strip()
         if not name:
             raise ValueError("component.name is required")
+        raw_config = item.get("config")
+        config = dict(raw_config) if isinstance(raw_config, dict) else {}
+        if (
+            kind == "environment_requirement"
+            and "requirements" in item
+            and "requirements" not in config
+        ):
+            config["requirements"] = item["requirements"]
         component_id = str(item.get("id") or "").strip()
         if not component_id:
             if kind == "environment_requirement":
-                raw_config_value = item.get("config")
-                raw_requirement_config = (
-                    raw_config_value if isinstance(raw_config_value, dict) else {}
+                requirement_kind = resolve_environment_requirement_kind(
+                    candidates=(
+                        item.get("resource_kind"),
+                        item.get("requirement_kind"),
+                        config.get("resource_kind"),
+                        config.get("requirement_kind"),
+                        config.get("kind"),
+                    ),
+                    command=item.get("command") or config.get("command"),
                 )
-                requirement_kind = str(
-                    item.get("resource_kind")
-                    or item.get("requirement_kind")
-                    or raw_requirement_config.get("kind")
-                    or "runtime"
-                ).strip().lower()
                 component_id = normalize_environment_requirement_id(
-                    kind=normalize_environment_requirement_kind(requirement_kind),
+                    kind=requirement_kind,
                     name=name,
                 )
             else:
                 component_id = f"{kind}:{name}"
-        raw_config = item.get("config")
-        config = dict(raw_config) if isinstance(raw_config, dict) else {}
         for field in _CAPABILITY_COMPONENT_CONFIG_FIELDS:
             if field in item and field not in config:
                 config[field] = item[field]
+        if kind == "environment_requirement":
+            requirement_kind = resolve_environment_requirement_kind(
+                component_id,
+                candidates=(
+                    item.get("resource_kind"),
+                    item.get("requirement_kind"),
+                    config.get("resource_kind"),
+                    config.get("requirement_kind"),
+                    config.get("kind"),
+                ),
+                command=config.get("command"),
+            )
+            config.setdefault("kind", requirement_kind)
         access = str(item.get("access") or "").strip().lower()
         if access not in {"read", "write", "both"}:
             access = ""
