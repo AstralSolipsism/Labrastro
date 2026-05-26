@@ -8,14 +8,19 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from reuleauxcoder.app.commands.loader import create_builtin_action_registry
 from reuleauxcoder.app.commands.specs import TriggerKind
 from reuleauxcoder.app.runtime.agent_runtime import get_interactive_run_limiter
-from reuleauxcoder.domain.approval_engine import ApprovalPolicyEngine, ToolApprovalContext
+from reuleauxcoder.domain.approval_engine import (
+    ApprovalPolicyEngine,
+    ToolApprovalContext,
+    ToolSource,
+)
 from reuleauxcoder.domain.config.models import (
     AgentRegistryConfig,
+    ApprovalAction,
     ApprovalConfig,
     ApprovalRuleConfig,
     CapabilityComponentConfig,
@@ -23,8 +28,7 @@ from reuleauxcoder.domain.config.models import (
     ContextConfig,
     DEFAULT_BUILTIN_TOOL_COMPONENTS,
     DiagnosticsConfig,
-    EnvironmentCLIToolConfig,
-    EnvironmentSkillConfig,
+    EnvironmentRequirementConfig,
     GitHubConfig,
     MemoryConfig,
     MCPServerConfig,
@@ -88,20 +92,20 @@ class AdminConfigResult:
 
 SETTINGS_UI_ACTIONS: tuple[dict[str, Any], ...] = (
     {
-        "id": "settings.toolchains.refresh_manifest",
-        "feature_id": "toolchains",
+        "id": "settings.environment_requirements.refresh_manifest",
+        "feature_id": "environment_requirements",
         "description": "Refresh the environment capability manifest in settings.",
         "triggers": [{"kind": "button", "value": "refreshEnvironmentManifest"}],
     },
     {
-        "id": "settings.toolchains.run_environment_check",
-        "feature_id": "toolchains",
+        "id": "settings.environment_requirements.run_check",
+        "feature_id": "environment_requirements",
         "description": "Run the environment checker agent from settings.",
         "triggers": [{"kind": "button", "value": "runEnvironment(check)"}],
     },
     {
-        "id": "settings.toolchains.run_environment_configure",
-        "feature_id": "toolchains",
+        "id": "settings.environment_requirements.run_configure",
+        "feature_id": "environment_requirements",
         "description": "Run the environment configurator agent from settings.",
         "triggers": [{"kind": "button", "value": "runEnvironment(configure)"}],
     },
@@ -405,7 +409,10 @@ class RemoteAdminConfigManager:
                     }
                 )
         approval = ApprovalConfig(
-            default_mode=str(raw.get("default_mode", DEFAULTS["approval_default_mode"]) or "require_approval"),
+            default_mode=cast(
+                ApprovalAction,
+                str(raw.get("default_mode", DEFAULTS["approval_default_mode"]) or "require_approval"),
+            ),
             rules=[
                 ApprovalRuleConfig(
                     tool_name=rule.get("tool_name"),
@@ -631,6 +638,11 @@ class RemoteAdminConfigManager:
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
+            run_limits = RunLimitsConfig.from_dict(
+                previous_data.get("run_limits", {})
+                if isinstance(previous_data.get("run_limits"), dict)
+                else {}
+            )
             previous_packages = (
                 previous_data.get("capability_packages", {})
                 if isinstance(previous_data.get("capability_packages"), dict)
@@ -1525,28 +1537,43 @@ class RemoteAdminConfigManager:
         view["id"] = component_id
         return view
 
-    def list_toolchains(self) -> dict[str, Any]:
+    def list_environment_requirements(self) -> dict[str, Any]:
         data = self._load_data()
         return {
-            "cli_tools": self._toolchain_views(data, "cli"),
-            "mcp_servers": self._toolchain_views(data, "mcp"),
-            "skills": self._toolchain_views(data, "skill"),
+            "environment_requirements": self._admin_resource_views(
+                data, "environment_requirement"
+            ),
         }
 
-    def toolchain_dashboard(self) -> dict[str, Any]:
+    def list_mcp_servers(self) -> dict[str, Any]:
         data = self._load_data()
-        items: list[dict[str, Any]] = []
-        for kind in ("cli", "mcp", "skill"):
-            items.extend(
-                self._toolchain_dashboard_item(kind, item)
-                for item in self._toolchain_views(data, kind)
-            )
+        return {
+            "mcp_servers": self._admin_resource_views(data, "mcp"),
+        }
+
+    def environment_requirements_dashboard(self) -> dict[str, Any]:
+        data = self._load_data()
+        items = [
+            self._admin_resource_dashboard_item("environment_requirement", item)
+            for item in self._admin_resource_views(data, "environment_requirement")
+        ]
         return {
             "items": items,
-            "summary": _toolchain_dashboard_summary(items),
+            "summary": _admin_resource_dashboard_summary(items),
         }
 
-    def toolchain_behavior_catalog(self) -> dict[str, Any]:
+    def mcp_servers_dashboard(self) -> dict[str, Any]:
+        data = self._load_data()
+        items = [
+            self._admin_resource_dashboard_item("mcp", item)
+            for item in self._admin_resource_views(data, "mcp")
+        ]
+        return {
+            "items": items,
+            "summary": _admin_resource_dashboard_summary(items),
+        }
+
+    def environment_requirements_behavior_catalog(self) -> dict[str, Any]:
         data = self._load_data()
         chat_commands = self._chat_command_catalog()
         mention_providers = self._mention_provider_catalog(data)
@@ -1558,24 +1585,28 @@ class RemoteAdminConfigManager:
             "agent_tools": self._agent_tool_catalog(data),
         }
 
-    def record_toolchain(self, payload: dict[str, Any]) -> AdminConfigResult:
-        kind, item_payload = _toolchain_payload(payload)
-        if kind is None:
-            return AdminConfigResult(False, {"error": "toolchain_kind_required"}, 400)
-        name = str(item_payload.get("name") or payload.get("name") or "").strip()
-        if not name:
-            return AdminConfigResult(False, {"error": "toolchain_name_required"}, 400)
-
+    def record_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _environment_requirement_payload(payload)
+        candidate = EnvironmentRequirementConfig.from_dict(
+            str(item_payload.get("id") or payload.get("id") or ""),
+            item_payload,
+        )
+        if not candidate.id or not candidate.name:
+            return AdminConfigResult(
+                False, {"error": "environment_requirement_id_required"}, 400
+            )
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
-            items = self._toolchain_items(data, kind)
-            previous = items.get(name, {}) if isinstance(items.get(name), dict) else {}
+            items = self._admin_resource_items(data, "environment_requirement")
+            previous = (
+                items.get(candidate.id, {})
+                if isinstance(items.get(candidate.id), dict)
+                else {}
+            )
             merged = {**previous, **item_payload}
-            merged.pop("name", None)
-            merged.pop("kind", None)
-            normalized = self._normalize_toolchain_item(kind, name, merged)
-            items[name] = normalized
+            normalized = EnvironmentRequirementConfig.from_dict(candidate.id, merged)
+            items[normalized.id] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
@@ -1583,51 +1614,129 @@ class RemoteAdminConfigManager:
                 True,
                 {
                     "ok": True,
-                    "kind": kind,
-                    "name": name,
+                    "kind": "environment_requirement",
+                    "id": normalized.id,
+                    "name": normalized.name,
                     "created": not previous,
-                    "toolchain": self._toolchain_view(kind, name, items[name]),
+                    "environment_requirement": self._admin_resource_view(
+                        "environment_requirement",
+                        normalized.id,
+                        items[normalized.id],
+                    ),
                 },
             )
 
-    def delete_toolchain(self, payload: dict[str, Any]) -> AdminConfigResult:
-        kind, item_payload = _toolchain_payload(payload)
-        if kind is None:
-            return AdminConfigResult(False, {"error": "toolchain_kind_required"}, 400)
+    def record_mcp_server(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _mcp_server_payload(payload)
         name = str(item_payload.get("name") or payload.get("name") or "").strip()
         if not name:
-            return AdminConfigResult(False, {"error": "toolchain_name_required"}, 400)
+            return AdminConfigResult(False, {"error": "mcp_server_name_required"}, 400)
 
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
-            items = self._toolchain_items(data, kind)
+            items = self._admin_resource_items(data, "mcp")
+            previous = items.get(name, {}) if isinstance(items.get(name), dict) else {}
+            merged = {**previous, **item_payload}
+            merged.pop("name", None)
+            normalized = MCPServerConfig.from_dict(name, merged)
+            items[normalized.name] = normalized.to_dict()
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "kind": "mcp_server",
+                    "name": normalized.name,
+                    "created": not previous,
+                    "mcp_server": self._admin_resource_view(
+                        "mcp",
+                        normalized.name,
+                        items[normalized.name],
+                    ),
+                },
+            )
+
+    def delete_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _environment_requirement_payload(payload)
+        candidate = EnvironmentRequirementConfig.from_dict(
+            str(item_payload.get("id") or payload.get("id") or ""),
+            item_payload,
+        )
+        item_id = candidate.id
+        if not item_id:
+            return AdminConfigResult(
+                False, {"error": "environment_requirement_id_required"}, 400
+            )
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            items = self._admin_resource_items(data, "environment_requirement")
+            if item_id not in items:
+                return AdminConfigResult(
+                    False, {"error": "environment_requirement_not_found"}, 404
+                )
+            del items[item_id]
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "kind": "environment_requirement",
+                    "name": item_id,
+                },
+            )
+
+    def delete_mcp_server(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _mcp_server_payload(payload)
+        name = str(item_payload.get("name") or payload.get("name") or "").strip()
+        if not name:
+            return AdminConfigResult(False, {"error": "mcp_server_name_required"}, 400)
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            items = self._admin_resource_items(data, "mcp")
             if name not in items:
-                return AdminConfigResult(False, {"error": "toolchain_not_found"}, 404)
+                return AdminConfigResult(False, {"error": "mcp_server_not_found"}, 404)
             del items[name]
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
-            return AdminConfigResult(True, {"ok": True, "kind": kind, "name": name})
+            return AdminConfigResult(
+                True, {"ok": True, "kind": "mcp_server", "name": name}
+            )
 
-    def enable_toolchain(self, payload: dict[str, Any]) -> AdminConfigResult:
-        kind, item_payload = _toolchain_payload(payload)
-        if kind is None:
-            return AdminConfigResult(False, {"error": "toolchain_kind_required"}, 400)
-        name = str(item_payload.get("name") or payload.get("name") or "").strip()
-        if not name:
-            return AdminConfigResult(False, {"error": "toolchain_name_required"}, 400)
+    def enable_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _environment_requirement_payload(payload)
+        candidate = EnvironmentRequirementConfig.from_dict(
+            str(item_payload.get("id") or payload.get("id") or ""),
+            item_payload,
+        )
+        item_id = candidate.id
+        if not item_id:
+            return AdminConfigResult(
+                False, {"error": "environment_requirement_id_required"}, 400
+            )
         enabled = _bool_field(item_payload, "enabled", payload.get("enabled", True))
 
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
-            items = self._toolchain_items(data, kind)
-            item = items.get(name)
+            items = self._admin_resource_items(data, "environment_requirement")
+            item = items.get(item_id)
             if not isinstance(item, dict):
-                return AdminConfigResult(False, {"error": "toolchain_not_found"}, 404)
+                return AdminConfigResult(
+                    False, {"error": "environment_requirement_not_found"}, 404
+                )
             item["enabled"] = enabled
-            items[name] = self._normalize_toolchain_item(kind, name, item)
+            normalized = EnvironmentRequirementConfig.from_dict(item_id, item)
+            items[item_id] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
@@ -1635,9 +1744,41 @@ class RemoteAdminConfigManager:
                 True,
                 {
                     "ok": True,
-                    "kind": kind,
+                    "kind": "environment_requirement",
+                    "name": item_id,
+                    "environment_requirement": self._admin_resource_view(
+                        "environment_requirement", item_id, items[item_id]
+                    ),
+                },
+            )
+
+    def enable_mcp_server(self, payload: dict[str, Any]) -> AdminConfigResult:
+        item_payload = _mcp_server_payload(payload)
+        name = str(item_payload.get("name") or payload.get("name") or "").strip()
+        if not name:
+            return AdminConfigResult(False, {"error": "mcp_server_name_required"}, 400)
+        enabled = _bool_field(item_payload, "enabled", payload.get("enabled", True))
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            items = self._admin_resource_items(data, "mcp")
+            item = items.get(name)
+            if not isinstance(item, dict):
+                return AdminConfigResult(False, {"error": "mcp_server_not_found"}, 404)
+            item["enabled"] = enabled
+            normalized = MCPServerConfig.from_dict(name, item)
+            items[name] = normalized.to_dict()
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "kind": "mcp_server",
                     "name": name,
-                    "toolchain": self._toolchain_view(kind, name, items[name]),
+                    "mcp_server": self._admin_resource_view("mcp", name, items[name]),
                 },
             )
 
@@ -1995,11 +2136,17 @@ class RemoteAdminConfigManager:
                     },
                     400,
                 )
+            raw_temperature = payload.get(
+                "temperature",
+                previous.get("temperature", 0.0),
+            )
+            if raw_temperature is None:
+                raw_temperature = 0.0
             profile_data = {
                 "model": model_name,
                 "provider": provider_id,
                 "max_tokens": max_tokens_int,
-                "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else previous.get("temperature", 0.0)),
+                "temperature": float(raw_temperature),
                 "max_context_tokens": max_context_tokens_int,
                 "preserve_reasoning_content": bool(payload.get("preserve_reasoning_content", previous.get("preserve_reasoning_content", True))),
                 "backfill_reasoning_content_for_tool_calls": bool(payload.get("backfill_reasoning_content_for_tool_calls", previous.get("backfill_reasoning_content_for_tool_calls", False))),
@@ -2332,17 +2479,16 @@ class RemoteAdminConfigManager:
             models["profiles"] = profiles
         return profiles
 
-    def _toolchain_items(self, data: dict[str, Any], kind: str) -> dict[str, Any]:
-        if kind in {"cli", "skill"}:
+    def _admin_resource_items(self, data: dict[str, Any], kind: str) -> dict[str, Any]:
+        if kind == "environment_requirement":
             environment = data.setdefault("environment", {})
             if not isinstance(environment, dict):
                 environment = {}
                 data["environment"] = environment
-            key = "cli_tools" if kind == "cli" else "skills"
-            items = environment.setdefault(key, {})
+            items = environment.setdefault("requirements", {})
             if not isinstance(items, dict):
                 items = {}
-                environment[key] = items
+                environment["requirements"] = items
             return items
 
         mcp = data.setdefault("mcp", {})
@@ -2355,35 +2501,37 @@ class RemoteAdminConfigManager:
             mcp["servers"] = items
         return items
 
-    def _toolchain_views(self, data: dict[str, Any], kind: str) -> list[dict[str, Any]]:
-        items = self._toolchain_items(data, kind)
+    def _admin_resource_views(self, data: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+        items = self._admin_resource_items(data, kind)
         views: list[dict[str, Any]] = []
         for name in sorted(items):
             item = items.get(name)
             if not isinstance(item, dict):
                 continue
-            views.append(self._toolchain_view(kind, str(name), item))
+            views.append(self._admin_resource_view(kind, str(name), item))
         return views
 
-    def _normalize_toolchain_item(
+    def _normalize_admin_resource_item(
         self, kind: str, name: str, item: dict[str, Any]
     ) -> dict[str, Any]:
-        if kind == "cli":
-            return EnvironmentCLIToolConfig.from_dict(name, item).to_dict()
-        if kind == "skill":
-            return EnvironmentSkillConfig.from_dict(name, item).to_dict()
+        if kind == "environment_requirement":
+            return EnvironmentRequirementConfig.from_dict(name, item).to_dict()
         return MCPServerConfig.from_dict(name, item).to_dict()
 
-    def _toolchain_view(
+    def _admin_resource_view(
         self, kind: str, name: str, item: dict[str, Any]
     ) -> dict[str, Any]:
-        view = self._normalize_toolchain_item(kind, name, item)
-        view["kind"] = kind
-        view["name"] = name
-        view["id"] = name
+        view = self._normalize_admin_resource_item(kind, name, item)
+        view["entry_type"] = kind
+        view.setdefault("name", name)
+        if kind == "mcp":
+            view["kind"] = "mcp_server"
+            view["id"] = f"mcp:{name}"
+        else:
+            view.setdefault("id", name)
         return view
 
-    def _toolchain_dashboard_item(
+    def _admin_resource_dashboard_item(
         self, kind: str, view: dict[str, Any]
     ) -> dict[str, Any]:
         name = str(view.get("name") or view.get("id") or "")
@@ -2393,19 +2541,17 @@ class RemoteAdminConfigManager:
             repo_url = str(view.get("source"))
         placement = str(view.get("placement") or "")
         scope = str(view.get("scope") or "")
-        if kind == "cli":
-            placement = placement or "local"
-            scope = placement
-        elif kind == "mcp":
+        if kind == "mcp":
             placement = placement or "server"
             scope = placement
         else:
-            placement = scope or "project"
-            scope = placement
+            placement = placement or "peer"
+            scope = scope or placement
         status = "unchecked" if _bool_field(view, "enabled", True) else "stopped"
         return {
-            "id": f"{kind}:{name}",
-            "kind": kind,
+            "id": str(view.get("id") or f"{kind}:{name}"),
+            "kind": str(view.get("kind") or kind),
+            "entry_type": kind,
             "name": name,
             "alias": str(view.get("alias") or view.get("command") or view.get("path_hint") or name),
             "source": str(view.get("source") or ""),
@@ -2423,10 +2569,10 @@ class RemoteAdminConfigManager:
             "check": str(view.get("check") or ""),
             "install": str(view.get("install") or ""),
             "command": str(view.get("command") or view.get("path_hint") or ""),
-            "requirements": (
-                dict(view.get("requirements") or {})
-                if isinstance(view.get("requirements"), dict)
-                else {}
+            "environment_requirement_refs": (
+                [str(item) for item in view.get("environment_requirement_refs") or []]
+                if isinstance(view.get("environment_requirement_refs"), list)
+                else []
             ),
             "credentials": (
                 [str(item) for item in view.get("credentials") or []]
@@ -2669,9 +2815,12 @@ class RemoteAdminConfigManager:
         )
         approval_settings = self._approval_settings(data)
         approval = ApprovalConfig(
-            default_mode=str(
-                approval_settings.get("default_mode")
-                or DEFAULTS["approval_default_mode"]
+            default_mode=cast(
+                ApprovalAction,
+                str(
+                    approval_settings.get("default_mode")
+                    or DEFAULTS["approval_default_mode"]
+                ),
             ),
             rules=[
                 ApprovalRuleConfig(
@@ -2806,8 +2955,8 @@ class RemoteAdminConfigManager:
                 "permission": permission,
             }
 
-        for kind in ("cli", "mcp", "skill"):
-            for view in self._toolchain_views(data, kind):
+        for kind in ("mcp",):
+            for view in self._admin_resource_views(data, kind):
                 name = str(view.get("name") or view.get("id") or "")
                 if not name:
                     continue
@@ -2821,21 +2970,14 @@ class RemoteAdminConfigManager:
                     source_type="mcp" if kind == "mcp" else "unknown",
                     mcp_server=name if kind == "mcp" else None,
                 )
-                target_kind = (
-                    "mcp_tool"
-                    if kind == "mcp"
-                    else "cli_tool"
-                    if kind == "cli"
-                    else "skill"
-                )
                 target = PermissionTarget(
-                    kind=target_kind,
+                    kind="mcp_tool",
                     name=name,
-                    tool_source="mcp" if kind == "mcp" else kind,
+                    tool_source="mcp",
                     component_id=component_id,
                     registry_path=f"{kind}:{name}",
-                    mcp_server=name if kind == "mcp" else None,
-                    mcp_tool=name if kind == "mcp" else None,
+                    mcp_server=name,
+                    mcp_tool=name,
                 )
                 items[f"{kind}:{name}"] = {
                     "id": f"{kind}:{name}",
@@ -2844,7 +2986,7 @@ class RemoteAdminConfigManager:
                     "source_type": kind,
                     "source_label": self._tool_source_label(kind),
                     "description": str(view.get("description") or ""),
-                    "registration_path": self._toolchain_registration_path(kind, name),
+                    "registration_path": self._admin_resource_registration_path(kind, name),
                     "enabled": _bool_field(view, "enabled", True),
                     "related_package_ids": sorted(dict.fromkeys(related_package_ids)),
                     "related_components": [component_id] if component_id else [],
@@ -2945,7 +3087,10 @@ class RemoteAdminConfigManager:
     ) -> str:
         approval = self._approval_settings(data)
         config = ApprovalConfig(
-            default_mode=str(approval.get("default_mode") or "require_approval"),
+            default_mode=cast(
+                ApprovalAction,
+                str(approval.get("default_mode") or "require_approval"),
+            ),
             rules=[
                 ApprovalRuleConfig(
                     tool_name=rule.get("tool_name"),
@@ -2968,7 +3113,7 @@ class RemoteAdminConfigManager:
             ToolApprovalContext(
                 tool_call=ToolCall(id="catalog", name=tool_name, arguments={}),
                 tool_name=tool_name,
-                tool_source=tool_source,
+                tool_source=cast(ToolSource, tool_source),
                 mcp_server=mcp_server,
             )
         )
@@ -2987,21 +3132,17 @@ class RemoteAdminConfigManager:
         return "inherit"
 
     def _tool_source_label(self, kind: str) -> str:
-        if kind == "cli":
-            return "CLI"
+        if kind == "environment_requirement":
+            return "Environment requirement"
         if kind == "mcp":
             return "MCP"
-        if kind == "skill":
-            return "Skill"
         return kind
 
-    def _toolchain_registration_path(self, kind: str, name: str) -> str:
-        if kind == "cli":
-            return f"environment.cli_tools.{name}"
+    def _admin_resource_registration_path(self, kind: str, name: str) -> str:
+        if kind == "environment_requirement":
+            return f"environment.requirements.{name}"
         if kind == "mcp":
             return f"mcp.servers.{name}"
-        if kind == "skill":
-            return f"environment.skills.{name}"
         return name
 
     def _string_list(self, value: Any) -> list[str]:
@@ -3078,22 +3219,18 @@ def _bool_field(payload: dict[str, Any], field_name: str, default: Any) -> bool:
     return bool(value)
 
 
-def _toolchain_payload(payload: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
-    raw_kind = str(payload.get("kind") or "").strip().lower()
-    kind_map = {
-        "cli": "cli",
-        "cli_tool": "cli",
-        "cli_tools": "cli",
-        "mcp": "mcp",
-        "mcp_server": "mcp",
-        "mcp_servers": "mcp",
-        "skill": "skill",
-        "skills": "skill",
-    }
-    kind = kind_map.get(raw_kind)
-    raw_payload = payload.get("payload")
-    item_payload = dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
-    return kind, item_payload
+def _environment_requirement_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = payload.get("environment_requirement")
+    if not isinstance(raw_payload, dict):
+        raw_payload = payload.get("payload")
+    return dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
+
+
+def _mcp_server_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = payload.get("mcp_server")
+    if not isinstance(raw_payload, dict):
+        raw_payload = payload.get("payload")
+    return dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
 
 
 def _normalize_provider_models(value: Any) -> list[dict[str, Any]]:
@@ -3132,7 +3269,7 @@ def _looks_like_url(value: Any) -> bool:
     return text.startswith("https://") or text.startswith("http://")
 
 
-def _toolchain_dashboard_summary(items: list[dict[str, Any]]) -> dict[str, int]:
+def _admin_resource_dashboard_summary(items: list[dict[str, Any]]) -> dict[str, int]:
     summary = {
         "total": len(items),
         "ready": 0,

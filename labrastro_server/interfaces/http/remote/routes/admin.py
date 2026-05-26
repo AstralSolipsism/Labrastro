@@ -557,50 +557,85 @@ class RemoteAdminRoutes:
                     payload,
                     lambda: self.service.admin_manager.activate_model_profile(payload),
                 )
-            elif path == "/remote/admin/toolchains/list":
+            elif path == "/remote/admin/environment-requirements/list":
                 result = {
                     "ok": True,
-                    **self.service.admin_manager.list_toolchains(),
+                    **self.service.admin_manager.list_environment_requirements(),
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
-            elif path == "/remote/admin/toolchains/dashboard":
+            elif path == "/remote/admin/environment-requirements/dashboard":
                 result = {
                     "ok": True,
-                    **self.service.admin_manager.toolchain_dashboard(),
+                    **self.service.admin_manager.environment_requirements_dashboard(),
+                }
+                self._send_json(HTTPStatus.OK, result)
+                return
+            elif path == "/remote/admin/mcp-servers/list":
+                result = {
+                    "ok": True,
+                    **self.service.admin_manager.list_mcp_servers(),
+                }
+                self._send_json(HTTPStatus.OK, result)
+                return
+            elif path == "/remote/admin/mcp-servers/dashboard":
+                result = {
+                    "ok": True,
+                    **self.service.admin_manager.mcp_servers_dashboard(),
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
             elif path in {
-                "/remote/admin/toolchains/behavior-catalog",
+                "/remote/admin/environment-requirements/behavior-catalog",
                 "/remote/admin/behavior/catalog",
             }:
                 result = {
                     "ok": True,
-                    **self.service.admin_manager.toolchain_behavior_catalog(),
+                    **self.service.admin_manager.environment_requirements_behavior_catalog(),
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
-            elif path == "/remote/admin/toolchains/record":
+            elif path == "/remote/admin/environment-requirements/record":
                 result = self._run_admin_config_mutation(
                     principal,
                     path,
                     payload,
-                    lambda: self.service.admin_manager.record_toolchain(payload),
+                    lambda: self.service.admin_manager.record_environment_requirement(payload),
                 )
-            elif path == "/remote/admin/toolchains/delete":
+            elif path == "/remote/admin/environment-requirements/delete":
                 result = self._run_admin_config_mutation(
                     principal,
                     path,
                     payload,
-                    lambda: self.service.admin_manager.delete_toolchain(payload),
+                    lambda: self.service.admin_manager.delete_environment_requirement(payload),
                 )
-            elif path == "/remote/admin/toolchains/enable":
+            elif path == "/remote/admin/environment-requirements/enable":
                 result = self._run_admin_config_mutation(
                     principal,
                     path,
                     payload,
-                    lambda: self.service.admin_manager.enable_toolchain(payload),
+                    lambda: self.service.admin_manager.enable_environment_requirement(payload),
+                )
+            elif path == "/remote/admin/mcp-servers/record":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.record_mcp_server(payload),
+                )
+            elif path == "/remote/admin/mcp-servers/delete":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.delete_mcp_server(payload),
+                )
+            elif path == "/remote/admin/mcp-servers/enable":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.enable_mcp_server(payload),
                 )
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found")
@@ -686,9 +721,12 @@ class RemoteAdminRoutes:
             "/remote/admin/capability-packages/drafts/accept",
             "/remote/admin/capability-packages/delete",
             "/remote/admin/capability-packages/enable",
-            "/remote/admin/toolchains/record",
-            "/remote/admin/toolchains/delete",
-            "/remote/admin/toolchains/enable",
+            "/remote/admin/environment-requirements/record",
+            "/remote/admin/environment-requirements/delete",
+            "/remote/admin/environment-requirements/enable",
+            "/remote/admin/mcp-servers/record",
+            "/remote/admin/mcp-servers/delete",
+            "/remote/admin/mcp-servers/enable",
         }
 
     def _admin_config_operation(
@@ -729,9 +767,15 @@ class RemoteAdminRoutes:
         draft = payload.get("draft")
         if isinstance(draft, dict) and draft.get("id") is not None:
             return operation, str(draft.get("id") or "")
-        toolchain = payload.get("toolchain")
-        if isinstance(toolchain, dict) and toolchain.get("name") is not None:
-            return operation, str(toolchain.get("name") or "")
+        environment_requirement = payload.get("environment_requirement")
+        if (
+            isinstance(environment_requirement, dict)
+            and environment_requirement.get("id") is not None
+        ):
+            return operation, str(environment_requirement.get("id") or "")
+        mcp_server = payload.get("mcp_server")
+        if isinstance(mcp_server, dict) and mcp_server.get("name") is not None:
+            return operation, str(mcp_server.get("name") or "")
         return operation, ""
 
     def _record_admin_config_audit(
@@ -821,9 +865,11 @@ class RemoteAdminRoutes:
             "/remote/admin/providers/list",
             "/remote/admin/providers/models",
             "/remote/admin/models/list",
-            "/remote/admin/toolchains/list",
-            "/remote/admin/toolchains/dashboard",
-            "/remote/admin/toolchains/behavior-catalog",
+            "/remote/admin/environment-requirements/list",
+            "/remote/admin/environment-requirements/dashboard",
+            "/remote/admin/environment-requirements/behavior-catalog",
+            "/remote/admin/mcp-servers/list",
+            "/remote/admin/mcp-servers/dashboard",
             "/remote/admin/behavior/catalog",
         }
         if path in read_paths:

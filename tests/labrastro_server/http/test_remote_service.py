@@ -35,7 +35,7 @@ from labrastro_server.interfaces.http.remote.routes.chat import (
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
 from reuleauxcoder.domain.config.models import (
-    EnvironmentCLIToolConfig,
+    EnvironmentRequirementConfig,
     AgentRegistryConfig,
     RuntimeProfilesConfig,
     RunLimitsConfig,
@@ -1372,7 +1372,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_admin_toolchain_endpoints_manage_manifest(
+    def test_admin_environment_and_mcp_endpoints_manage_manifest(
         self, tmp_path: Path
     ) -> None:
         relay = RelayServer()
@@ -1390,12 +1390,13 @@ class TestRemoteRelayHTTPService:
         try:
             admin_headers = TEST_ADMIN_HEADERS
 
-            _, cli = _json_request(
+            _, executable = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/record",
+                f"{service.base_url}/remote/admin/environment-requirements/record",
                 {
-                    "kind": "cli",
-                    "payload": {
+                    "environment_requirement": {
+                        "id": "envreq:executable:gitnexus",
+                        "kind": "executable",
                         "name": "gitnexus",
                         "command": "gitnexus",
                         "placement": "both",
@@ -1422,98 +1423,127 @@ class TestRemoteRelayHTTPService:
                 },
                 headers=admin_headers,
             )
-            assert cli["toolchain"]["name"] == "gitnexus"
-            assert cli["toolchain"]["placement"] == "both"
-            assert cli["toolchain"]["docs"][0]["title"] == "GitNexus"
-            assert cli["toolchain"]["evidence"][0]["field"] == "install"
+            assert executable["environment_requirement"]["name"] == "gitnexus"
+            assert executable["environment_requirement"]["kind"] == "executable"
+            assert executable["environment_requirement"]["placement"] == "both"
+            assert executable["environment_requirement"]["docs"][0]["title"] == "GitNexus"
+            assert executable["environment_requirement"]["evidence"][0]["field"] == "install"
 
             _, mcp = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/record",
+                f"{service.base_url}/remote/admin/mcp-servers/record",
                 {
-                    "kind": "mcp",
-                    "payload": {
+                    "mcp_server": {
                         "name": "gitnexus-mcp",
                         "command": "gitnexus",
                         "args": ["mcp"],
                         "placement": "peer",
                         "distribution": "command",
-                        "requirements": {"node": ">=20"},
+                        "environment_requirement_refs": ["envreq:runtime:node"],
                         "check": "gitnexus --version",
                         "install_prompt": "Start MCP with args.",
                     },
                 },
                 headers=admin_headers,
             )
-            assert mcp["toolchain"]["args"] == ["mcp"]
-            assert mcp["toolchain"]["requirements"]["node"] == ">=20"
+            assert mcp["mcp_server"]["args"] == ["mcp"]
+            assert mcp["mcp_server"]["environment_requirement_refs"] == [
+                "envreq:runtime:node"
+            ]
 
-            _, skill = _json_request(
+            _, skill_path = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/record",
+                f"{service.base_url}/remote/admin/environment-requirements/record",
                 {
-                    "kind": "skill",
-                    "payload": {
-                        "name": "collaborating-with-claude",
+                    "environment_requirement": {
+                        "id": "envreq:path:collaborating-with-claude-skill",
+                        "kind": "path",
+                        "name": "collaborating-with-claude-skill",
                         "scope": "user",
                         "check": "Test-Path ~/.agents/skills/collaborating-with-claude/SKILL.md",
                         "install": "python install-skill.py",
-                        "path_hint": "~/.agents/skills/collaborating-with-claude/SKILL.md",
+                        "path": "~/.agents/skills/collaborating-with-claude/SKILL.md",
                         "verify_prompt": "Check SKILL.md.",
                     },
                 },
                 headers=admin_headers,
             )
-            assert skill["toolchain"]["scope"] == "user"
+            assert skill_path["environment_requirement"]["scope"] == "user"
 
             _, listed = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/list",
+                f"{service.base_url}/remote/admin/environment-requirements/list",
                 {},
                 headers=admin_headers,
             )
-            assert listed["cli_tools"][0]["name"] == "gitnexus"
-            assert listed["mcp_servers"][0]["name"] == "gitnexus-mcp"
-            assert listed["skills"][0]["name"] == "collaborating-with-claude"
-
-            _, dashboard = _json_request(
+            requirements = {
+                item["id"]: item for item in listed["environment_requirements"]
+            }
+            assert requirements["envreq:executable:gitnexus"]["name"] == "gitnexus"
+            assert (
+                requirements["envreq:path:collaborating-with-claude-skill"]["kind"]
+                == "path"
+            )
+            _, listed_mcp = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/dashboard",
+                f"{service.base_url}/remote/admin/mcp-servers/list",
                 {},
                 headers=admin_headers,
             )
-            rows = {item["id"]: item for item in dashboard["items"]}
-            assert dashboard["summary"]["total"] == 3
-            assert rows["cli:gitnexus"]["kind"] == "cli"
-            assert rows["cli:gitnexus"]["placement"] == "both"
-            assert rows["cli:gitnexus"]["repo_url"] == "https://example.test/gitnexus/repo"
-            assert rows["cli:gitnexus"]["credentials"] == ["GITNEXUS_TOKEN"]
-            assert rows["mcp:gitnexus-mcp"]["placement"] == "peer"
-            assert rows["skill:collaborating-with-claude"]["scope"] == "user"
+            assert listed_mcp["mcp_servers"][0]["name"] == "gitnexus-mcp"
+
+            _, env_dashboard = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/environment-requirements/dashboard",
+                {},
+                headers=admin_headers,
+            )
+            rows = {item["id"]: item for item in env_dashboard["items"]}
+            assert env_dashboard["summary"]["total"] == 2
+            assert rows["envreq:executable:gitnexus"]["kind"] == "executable"
+            assert rows["envreq:executable:gitnexus"]["placement"] == "both"
+            assert (
+                rows["envreq:executable:gitnexus"]["repo_url"]
+                == "https://example.test/gitnexus/repo"
+            )
+            assert rows["envreq:executable:gitnexus"]["credentials"] == ["GITNEXUS_TOKEN"]
+            assert rows["envreq:path:collaborating-with-claude-skill"]["scope"] == "user"
+            _, mcp_dashboard = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/mcp-servers/dashboard",
+                {},
+                headers=admin_headers,
+            )
+            mcp_rows = {item["id"]: item for item in mcp_dashboard["items"]}
+            assert mcp_dashboard["summary"]["total"] == 1
+            assert mcp_rows["mcp:gitnexus-mcp"]["placement"] == "peer"
 
             _, disabled = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/enable",
-                {"kind": "cli", "name": "gitnexus", "enabled": False},
+                f"{service.base_url}/remote/admin/environment-requirements/enable",
+                {
+                    "id": "envreq:executable:gitnexus",
+                    "enabled": False,
+                },
                 headers=admin_headers,
             )
-            assert disabled["toolchain"]["enabled"] is False
+            assert disabled["environment_requirement"]["enabled"] is False
 
             _, deleted = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/delete",
-                {"kind": "mcp", "name": "gitnexus-mcp"},
+                f"{service.base_url}/remote/admin/mcp-servers/delete",
+                {"name": "gitnexus-mcp"},
                 headers=admin_headers,
             )
             assert deleted["ok"] is True
-            assert deleted["kind"] == "mcp"
+            assert deleted["kind"] == "mcp_server"
             assert deleted["name"] == "gitnexus-mcp"
             assert "config_etag" in deleted
 
             raw = config_path.read_text(encoding="utf-8")
-            assert "gitnexus:" in raw
+            assert "envreq:executable:gitnexus" in raw
             assert "enabled: false" in raw
-            assert "collaborating-with-claude:" in raw
+            assert "envreq:path:collaborating-with-claude-skill" in raw
             assert "gitnexus-mcp" not in raw
             assert len(reloads) == 5
         finally:
@@ -1531,12 +1561,15 @@ class TestRemoteRelayHTTPService:
             config_path,
             {
                 "environment": {
-                    "cli_tools": {
-                        "gh": {
+                    "requirements": {
+                        "envreq:executable:gh": {
+                            "id": "envreq:executable:gh",
+                            "kind": "executable",
+                            "name": "gh",
                             "command": "gh",
                             "enabled": True,
                             "description": "GitHub CLI",
-                            "component_id": "cli:gh",
+                            "component_id": "envreq:executable:gh",
                             "package_ids": ["review"],
                         }
                     }
@@ -1570,13 +1603,14 @@ class TestRemoteRelayHTTPService:
                     "review": {
                         "name": "Review",
                         "description": "Repository review tools",
-                        "components": ["cli:gh", "mcp:github"],
+                        "components": ["envreq:executable:gh", "mcp:github"],
                     }
                 },
                 "capability_components": {
-                    "cli:gh": {
-                        "kind": "cli",
+                    "envreq:executable:gh": {
+                        "kind": "environment_requirement",
                         "name": "gh",
+                        "config": {"kind": "executable", "command": "gh"},
                         "package_ids": ["review"],
                     },
                     "mcp:github": {
@@ -1596,7 +1630,7 @@ class TestRemoteRelayHTTPService:
         try:
             _, catalog = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/toolchains/behavior-catalog",
+                f"{service.base_url}/remote/admin/environment-requirements/behavior-catalog",
                 {},
                 headers=TEST_ADMIN_HEADERS,
             )
@@ -1624,12 +1658,12 @@ class TestRemoteRelayHTTPService:
             assert commands["model.switch"]["selection_behavior"] == "insert_for_args"
 
             ui_actions = {item["id"]: item for item in catalog["ui_actions"]}
-            assert "settings.toolchains.refresh_manifest" in ui_actions
+            assert "settings.environment_requirements.refresh_manifest" in ui_actions
             assert (
-                ui_actions["settings.toolchains.refresh_manifest"]["source_type"]
+                ui_actions["settings.environment_requirements.refresh_manifest"]["source_type"]
                 == "settings_ui"
             )
-            assert "settings.toolchains.refresh_manifest" not in commands
+            assert "settings.environment_requirements.refresh_manifest" not in commands
 
             mention_providers = {
                 item["id"]: item for item in catalog["mention_providers"]
@@ -1674,12 +1708,9 @@ class TestRemoteRelayHTTPService:
                 == "agent.capability_refs[]"
             )
             assert tools["capability_package:review"]["related_components"] == [
-                "cli:gh",
+                "envreq:executable:gh",
                 "mcp:github",
             ]
-            assert tools["cli:gh"]["related_package_ids"] == ["review"]
-            assert tools["cli:gh"]["permission"]["action"] == "deny"
-            assert "effective_capabilities" in tools["cli:gh"]["permission"]["reason"]
             assert tools["mcp:github"]["related_package_ids"] == ["review"]
         finally:
             service.stop()
@@ -2248,7 +2279,10 @@ class TestRemoteRelayHTTPService:
                             ),
                         )
                     },
-                    requirements={"node": "required", "npm": "required"},
+                    environment_requirement_refs=[
+                        "envreq:runtime:node",
+                        "envreq:executable:npm",
+                    ],
                     permissions={"tools": {"write_file": "require_approval"}},
                 ),
                 MCPServerConfig(
@@ -2320,10 +2354,10 @@ class TestRemoteRelayHTTPService:
             assert server_manifest["distribution"] == "artifact"
             assert server_manifest["launch"]["command"] == "{{bundle}}/run.sh"
             assert server_manifest["launch"]["args"] == ["--root", "{{workspace}}"]
-            assert server_manifest["requirements"] == {
-                "node": "required",
-                "npm": "required",
-            }
+            assert server_manifest["environment_requirement_refs"] == [
+                "envreq:runtime:node",
+                "envreq:executable:npm",
+            ]
             assert server_manifest["permissions"]["tools"]["write_file"] == "require_approval"
             assert manifest["diagnostics"][0]["server"] == "missing-platform"
 
@@ -2393,7 +2427,10 @@ class TestRemoteRelayHTTPService:
                     version="1.6.3",
                     check="gitnexus --version",
                     install="npm install -g gitnexus@1.6.3",
-                    requirements={"node": ">=20", "npm": "required"},
+                    environment_requirement_refs=[
+                        "envreq:runtime:node",
+                        "envreq:executable:npm",
+                    ],
                     artifacts={
                         "linux-amd64": MCPArtifactConfig(
                             path="gitnexus/1.6.3/linux-amd64.tar.gz",
@@ -2434,7 +2471,10 @@ class TestRemoteRelayHTTPService:
             assert server["artifact"] is None
             assert server["launch"]["command"] == "gitnexus"
             assert server["launch"]["args"] == ["mcp"]
-            assert server["requirements"]["node"] == ">=20"
+            assert server["environment_requirement_refs"] == [
+                "envreq:runtime:node",
+                "envreq:executable:npm",
+            ]
         finally:
             service.stop()
             relay.stop()
@@ -2455,7 +2495,7 @@ class TestRemoteRelayHTTPService:
                     distribution="command",
                     check="gitnexus --version",
                     install="npm install -g gitnexus@1.6.3",
-                    requirements={"node": ">=20"},
+                    environment_requirement_refs=["envreq:runtime:node"],
                     docs=[{"title": "GitNexus MCP", "url": "https://example.test/mcp"}],
                     install_prompt="Install MCP through npm only.",
                     verify_prompt="Verify MCP starts with the mcp argument.",
@@ -2468,8 +2508,11 @@ class TestRemoteRelayHTTPService:
                     placement="peer",
                 )
             ],
-            environment_cli_tools={
-                "beads": {
+            environment_requirements={
+                "envreq:executable:beads": {
+                    "id": "envreq:executable:beads",
+                    "kind": "executable",
+                    "name": "beads",
                     "command": "beads",
                     "tags": ["issue_tracking"],
                     "check": "beads --version",
@@ -2480,7 +2523,9 @@ class TestRemoteRelayHTTPService:
                     "verify_prompt": "Run beads --version after install.",
                     "notes": ["Do not install node automatically."],
                 },
-                "gitnexus": EnvironmentCLIToolConfig(
+                "envreq:executable:gitnexus": EnvironmentRequirementConfig(
+                    id="envreq:executable:gitnexus",
+                    kind="executable",
                     name="gitnexus",
                     command="gitnexus",
                     tags=["repo_index"],
@@ -2492,30 +2537,43 @@ class TestRemoteRelayHTTPService:
                     verify_prompt="Check gitnexus version output.",
                     notes=["PATH changes require explicit approval."],
                 ),
-                "disabled-cli": EnvironmentCLIToolConfig(
-                    name="disabled-cli",
-                    command="disabled-cli",
+                "envreq:executable:disabled": EnvironmentRequirementConfig(
+                    id="envreq:executable:disabled",
+                    kind="executable",
+                    name="disabled",
+                    command="disabled",
                     enabled=False,
-                    check="disabled-cli --version",
-                )
-            },
-            environment_skills={
-                "collaborating-with-claude": {
+                    check="disabled --version",
+                ),
+                "envreq:path:collaborating-with-claude-skill": {
+                    "id": "envreq:path:collaborating-with-claude-skill",
+                    "kind": "path",
+                    "name": "collaborating-with-claude-skill",
                     "scope": "user",
                     "check": "Test-Path ~/.agents/skills/collaborating-with-claude/SKILL.md",
                     "install": "python install-skill.py",
                     "version": "1.0.0",
                     "source": "github",
                     "description": "Claude bridge skill",
-                    "path_hint": "~/.agents/skills/collaborating-with-claude/SKILL.md",
+                    "path": "~/.agents/skills/collaborating-with-claude/SKILL.md",
                     "docs": [{"title": "Claude skill", "url": "https://example.test/skill"}],
                     "install_prompt": "Install from the curated skill source.",
                     "verify_prompt": "Verify SKILL.md exists.",
                     "notes": ["Use user scope."],
                 },
-                "disabled-skill": {
+                "envreq:path:disabled-skill": {
+                    "id": "envreq:path:disabled-skill",
+                    "kind": "path",
+                    "name": "disabled-skill",
                     "enabled": False,
                     "check": "Test-Path disabled",
+                },
+                "envreq:credential:github-token": {
+                    "id": "envreq:credential:github-token",
+                    "kind": "credential",
+                    "name": "github-token",
+                    "placement": "peer",
+                    "description": "GitHub token supplied by the peer environment.",
                 }
             },
         )
@@ -2553,30 +2611,43 @@ class TestRemoteRelayHTTPService:
             )
 
             assert status == 200
-            tools = {tool["name"]: tool for tool in manifest["cli_tools"]}
-            mcp_servers = {server["name"]: server for server in manifest["mcp_servers"]}
-            skills = {skill["name"]: skill for skill in manifest["skills"]}
-            assert "disabled-cli" not in tools
-            assert "disabled-mcp" not in mcp_servers
-            assert "disabled-skill" not in skills
-            assert tools["gitnexus"]["check"] == "gitnexus --version"
-            assert tools["gitnexus"]["docs"][0]["title"] == "GitNexus"
-            assert tools["gitnexus"]["install_prompt"] == "Use the configured npm command."
-            assert tools["gitnexus"]["verify_prompt"] == "Check gitnexus version output."
-            assert tools["gitnexus"]["notes"] == ["PATH changes require explicit approval."]
-            assert tools["beads"]["tags"] == ["issue_tracking"]
-            assert tools["beads"]["install_prompt"] == "Use npm global install for beads."
-            assert mcp_servers["gitnexus-mcp"]["distribution"] == "command"
-            assert mcp_servers["gitnexus-mcp"]["requirements"]["node"] == ">=20"
-            assert mcp_servers["gitnexus-mcp"]["docs"][0]["url"] == "https://example.test/mcp"
-            assert mcp_servers["gitnexus-mcp"]["install_prompt"] == "Install MCP through npm only."
-            assert skills["collaborating-with-claude"]["scope"] == "user"
+            requirements = {
+                requirement["id"]: requirement
+                for requirement in manifest["environment_requirements"]
+            }
+            assert "envreq:executable:disabled" not in requirements
+            assert "envreq:path:disabled-skill" not in requirements
+            assert "mcp_servers" not in manifest
+            assert requirements["envreq:executable:gitnexus"]["check"] == "gitnexus --version"
+            assert requirements["envreq:executable:gitnexus"]["docs"][0]["title"] == "GitNexus"
             assert (
-                skills["collaborating-with-claude"]["path_hint"]
+                requirements["envreq:executable:gitnexus"]["install_prompt"]
+                == "Use the configured npm command."
+            )
+            assert (
+                requirements["envreq:executable:gitnexus"]["verify_prompt"]
+                == "Check gitnexus version output."
+            )
+            assert requirements["envreq:executable:gitnexus"]["notes"] == [
+                "PATH changes require explicit approval."
+            ]
+            assert requirements["envreq:executable:beads"]["tags"] == ["issue_tracking"]
+            assert (
+                requirements["envreq:executable:beads"]["install_prompt"]
+                == "Use npm global install for beads."
+            )
+            assert requirements["envreq:credential:github-token"]["kind"] == "credential"
+            assert requirements["envreq:credential:github-token"]["check"] == ""
+            skill_requirement = requirements[
+                "envreq:path:collaborating-with-claude-skill"
+            ]
+            assert skill_requirement["scope"] == "user"
+            assert (
+                skill_requirement["path"]
                 == "~/.agents/skills/collaborating-with-claude/SKILL.md"
             )
-            assert skills["collaborating-with-claude"]["docs"][0]["title"] == "Claude skill"
-            assert skills["collaborating-with-claude"]["verify_prompt"] == "Verify SKILL.md exists."
+            assert skill_requirement["docs"][0]["title"] == "Claude skill"
+            assert skill_requirement["verify_prompt"] == "Verify SKILL.md exists."
             assert "prompt" not in manifest
         finally:
             service.stop()
@@ -2607,8 +2678,10 @@ class TestRemoteRelayHTTPService:
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
             runtime_control_plane=control,
-            environment_cli_tools={
-                "gitnexus": EnvironmentCLIToolConfig(
+            environment_requirements={
+                "envreq:executable:gitnexus": EnvironmentRequirementConfig(
+                    id="envreq:executable:gitnexus",
+                    kind="executable",
                     name="gitnexus",
                     command="gitnexus",
                     check="gitnexus --version",
@@ -2624,7 +2697,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "mode": "configure",
                     "workspace_root": "/tmp/peer",
-                    "entry_ids": ["cli:gitnexus"],
+                    "entry_ids": ["envreq:executable:gitnexus"],
                 },
                 headers=TEST_ADMIN_HEADERS,
             )
@@ -2637,8 +2710,8 @@ class TestRemoteRelayHTTPService:
             assert agent_run["metadata"]["workflow"] == "environment_config"
             assert agent_run["metadata"]["environment_mode"] == "configure"
             assert {
-                "entry_id": "cli:gitnexus",
-                "kind": "cli",
+                "entry_id": "envreq:executable:gitnexus",
+                "kind": "environment_requirement",
                 "name": "gitnexus",
                 "phase": "install",
                 "command": "npm install -g gitnexus",
@@ -6011,7 +6084,7 @@ class TestRemoteRelayHTTPService:
         finally:
             _cleanup_provider_build_dir(provider)
 
-    @pytest.mark.skipif(not _GO_AVAILABLE, reason="go toolchain is not installed")
+    @pytest.mark.skipif(not _GO_AVAILABLE, reason="Go SDK is not installed")
     def test_default_artifact_provider_builds_real_agent_binary(self) -> None:
         provider = _default_create_remote_artifact_provider(UIEventBus())
         try:
@@ -6034,7 +6107,7 @@ class TestRemoteRelayHTTPService:
             bind=f"127.0.0.1:{port}",
             artifact_provider=lambda _os_name, _arch, _name: (_ for _ in ()).throw(
                 RuntimeError(
-                    "peer artifact unavailable: no prebuilt binary found and local 'go' toolchain is not installed"
+                    "peer artifact unavailable: no prebuilt binary found and local Go SDK is not installed"
                 )
             ),
         )
@@ -6055,7 +6128,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    @pytest.mark.skipif(not _GO_AVAILABLE, reason="go toolchain is not installed")
+    @pytest.mark.skipif(not _GO_AVAILABLE, reason="Go SDK is not installed")
     def test_go_agent_run_worker_fake_daemon_worktree_end_to_end(
         self, tmp_path: Path
     ) -> None:
@@ -6205,7 +6278,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    @pytest.mark.skipif(not _GO_AVAILABLE, reason="go toolchain is not installed")
+    @pytest.mark.skipif(not _GO_AVAILABLE, reason="Go SDK is not installed")
     def test_go_agent_end_to_end_with_http_host(self, tmp_path: Path) -> None:
         relay = RelayServer()
         relay.start()
