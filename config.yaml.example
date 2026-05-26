@@ -203,8 +203,8 @@ approval:
 #       dispatch:
 #         profile: "Best for checking and configuring local workspace environment components from the server manifest."
 #         examples:
-#           - "Check whether required CLI, MCP, and Skill components are available."
-#           - "Configure missing local tools declared by the environment manifest."
+#           - "Check whether required environment resources are available."
+#           - "Configure missing local resources declared by the environment manifest."
 #         avoid:
 #           - "General implementation and code review tasks."
 #       capability_refs: ["environment"]
@@ -242,20 +242,21 @@ approval:
 #     source:
 #       type: "github_repo"
 #       url: "https://github.com/example/review-tools"
-#     components: ["mcp:github", "skill:code-review", "cli:gh"]
+#     components: ["mcp:github", "skill:code-review", "envreq:executable:gh"]
 #     install_plan:
 #       - "Install GitHub CLI and authenticate with gh auth login."
 #     usage:
 #       - "Use gh for PR inspection and GitHub MCP for issue/PR operations."
 # capability_components:
-#   cli:gh:
-#     kind: "cli"
+#   envreq:executable:gh:
+#     kind: "environment_requirement"
 #     name: "gh"
 #     package_ids: ["github-review"]
 #     source:
 #       type: "github_repo"
 #       url: "https://github.com/cli/cli"
 #     config:
+#       kind: "executable"
 #       command: "gh"
 #       check: "gh --version"
 #   mcp:github:
@@ -288,22 +289,43 @@ skills:
 
 # Optional environment manifest for remote peer environment setup.
 # environment:
-#   cli_tools:
-#     gitnexus:
+#   requirements:
+#     envreq:executable:gitnexus:
+#       id: "envreq:executable:gitnexus"
+#       kind: "executable"
+#       name: "gitnexus"
 #       command: "gitnexus"
 #       tags: ["repo_index"]
 #       check: "gitnexus --version"
 #       install: "npm install -g gitnexus"
 #       source: "npm"
 #       description: "Repository graph CLI"
-#   skills:
-#     collaborating-with-claude:
+#     envreq:path:collaborating-with-claude-skill:
+#       id: "envreq:path:collaborating-with-claude-skill"
+#       kind: "path"
+#       name: "collaborating-with-claude-skill"
 #       scope: "user"
 #       check: "Test-Path $env:USERPROFILE/.agents/skills/collaborating-with-claude/SKILL.md"
 #       install: "python C:/Users/you/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py --repo your/repo --path skills/collaborating-with-claude"
 #       source: "github"
 #       description: "Claude collaboration skill"
-#       path_hint: "~/.agents/skills/collaborating-with-claude/SKILL.md"
+#       path: "~/.agents/skills/collaborating-with-claude/SKILL.md"
+#     envreq:runtime:node:
+#       id: "envreq:runtime:node"
+#       kind: "runtime"
+#       name: "node"
+#       placement: peer
+#       check: "node --version"
+#       install: "Install Node.js 20+ through the approved workspace setup path."
+#       description: "Node.js runtime required by selected peer MCP servers."
+#     envreq:executable:npm:
+#       id: "envreq:executable:npm"
+#       kind: "executable"
+#       name: "npm"
+#       placement: peer
+#       check: "npm --version"
+#       install: "Install npm through the approved workspace setup path."
+#       description: "npm executable required by selected peer MCP servers."
 
 # Optional MCP server examples.
 # `placement: server` runs on the machine running rcoder.
@@ -326,9 +348,9 @@ skills:
 #     local-filesystem-peer:
 #       placement: peer
 #       version: "1.0.0"
-#       requirements:
-#         node: "required"
-#         npm: "required"
+#       environment_requirement_refs:
+#         - "envreq:runtime:node"
+#         - "envreq:executable:npm"
 #       build:
 #         type: "node"
 #         package: "@modelcontextprotocol/server-filesystem"
@@ -371,9 +393,9 @@ skills:
 #         - "@demo/browser-mcp@1.0.0"
 #       env: {}
 #       version: "1.0.0"
-#       requirements:
-#         node: "required"
-#         npm: "required"
+#       environment_requirement_refs:
+#         - "envreq:runtime:node"
+#         - "envreq:executable:npm"
 #       build:
 #         type: "node"
 #         package: "@demo/browser-mcp"
