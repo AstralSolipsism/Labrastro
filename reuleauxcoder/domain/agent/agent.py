@@ -372,13 +372,13 @@ class Agent:
                 mcp_server=str(getattr(tool, "server_name", "") or "") or None,
                 mcp_tool=tool_name,
             )
-        if tool_source == "cli":
+        if tool_source == "environment_requirement":
             return PermissionTarget(
-                kind="cli_tool",
+                kind="environment_requirement",
                 name=tool_name,
-                tool_source="cli",
-                registry_path=f"cli:{tool_name}" if tool_name else "",
-                component_id=f"cli:{tool_name}" if tool_name else "",
+                tool_source="environment_requirement",
+                registry_path=f"envreq:executable:{tool_name}" if tool_name else "",
+                component_id=f"envreq:executable:{tool_name}" if tool_name else "",
             )
         if tool_source == "skill":
             return PermissionTarget(

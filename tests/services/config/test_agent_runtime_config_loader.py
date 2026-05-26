@@ -278,7 +278,11 @@ def test_agent_run_snapshot_resolves_capability_component_overlay() -> None:
             "capability_packages": {
                 "github-review": {
                     "name": "GitHub Review",
-                    "components": ["mcp:github", "skill:code-review", "cli:gh"],
+                    "components": [
+                        "mcp:github",
+                        "skill:code-review",
+                        "envreq:executable:gh",
+                    ],
                     "source": {
                         "type": "github_repo",
                         "url": "https://github.com/example/review-tools",
@@ -296,11 +300,13 @@ def test_agent_run_snapshot_resolves_capability_component_overlay() -> None:
                     "name": "code-review",
                     "config": {"path_hint": "/skills/code-review"},
                 },
-                "cli:gh": {
-                    "kind": "cli",
+                "envreq:executable:gh": {
+                    "kind": "environment_requirement",
                     "name": "gh",
                     "config": {
+                        "kind": "executable",
                         "command": "gh",
+                        "check": "gh --version",
                         "env": {"GH_CONFIG_DIR": ".gh"},
                     },
                 },
@@ -319,18 +325,19 @@ def test_agent_run_snapshot_resolves_capability_component_overlay() -> None:
     resolved = snapshot["agents"]["reviewer"]["resolved_capabilities"]
     assert resolved["mcp_servers"] == ["github"]
     assert resolved["skills"] == ["code-review"]
-    assert resolved["cli_tools"] == ["gh"]
+    assert resolved["environment_requirements"][0]["id"] == "envreq:executable:gh"
+    assert resolved["environment_requirements"][0]["kind"] == "executable"
     assert resolved["capability_overlay"]["component_ids"] == [
         "mcp:github",
         "skill:code-review",
-        "cli:gh",
+        "envreq:executable:gh",
     ]
     assert resolved["capability_overlay"]["mcp"]["servers"]["github"]["command"] == "github-mcp-server"
     assert resolved["capability_overlay"]["skill_roots"] == ["/skills/code-review"]
     assert resolved["capability_overlay"]["env"] == {"GH_CONFIG_DIR": ".gh"}
     catalog = build_capability_catalog(config)
     assert "`github-review`" in catalog
-    assert "`cli:gh` [cli] gh" in catalog
+    assert "`envreq:executable:gh` [environment_requirement] gh" in catalog
     assert "command `gh`" in catalog
 
 
@@ -762,10 +769,20 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
 
     manager = MemoryAdminManager()
     component = {
-        "id": "cli:gh",
-        "kind": "cli",
+        "id": "envreq:executable:gh",
+        "kind": "environment_requirement",
         "name": "gh",
-        "config": {"command": "gh", "check": "gh --version"},
+        "config": {"kind": "executable", "command": "gh", "check": "gh --version"},
+    }
+    mcp_component = {
+        "id": "mcp_server:github",
+        "kind": "mcp_server",
+        "name": "github",
+        "config": {
+            "command": "github-mcp",
+            "placement": "peer",
+            "environment_requirement_refs": ["envreq:executable:gh"],
+        },
     }
 
     first = manager.accept_capability_package_draft(
@@ -777,7 +794,10 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
                     "type": "github_repo",
                     "url": "https://github.com/example/review-tools",
                 },
-                "components": [component],
+                "contributions": {
+                    "environment_requirements": [component],
+                    "mcp_servers": [mcp_component],
+                },
                 "effective_capabilities": ["Inspect pull request metadata with gh."],
                 "install_plan": ["Install gh."],
                 "usage": ["Use gh pr view."],
@@ -785,12 +805,22 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
         }
     )
     assert first.ok is True
-    assert manager.data["capability_packages"]["review"]["components"] == ["cli:gh"]
+    assert set(manager.data["capability_packages"]["review"]["components"]) == {
+        "envreq:executable:gh",
+        "mcp_server:github",
+    }
     assert manager.data["capability_packages"]["review"]["effective_capabilities"] == [
         "Inspect pull request metadata with gh."
     ]
-    assert manager.data["capability_components"]["cli:gh"]["package_ids"] == ["review"]
-    assert manager.data["environment"]["cli_tools"]["gh"]["component_id"] == "cli:gh"
+    assert manager.data["capability_components"]["envreq:executable:gh"]["package_ids"] == ["review"]
+    assert (
+        manager.data["environment"]["requirements"]["envreq:executable:gh"]["component_id"]
+        == "envreq:executable:gh"
+    )
+    assert manager.data["mcp"]["servers"]["github"]["component_id"] == "mcp_server:github"
+    assert manager.data["mcp"]["servers"]["github"]["environment_requirement_refs"] == [
+        "envreq:executable:gh"
+    ]
 
     second = manager.accept_capability_package_draft(
         {
@@ -801,25 +831,27 @@ def test_accept_and_delete_capability_package_manages_shared_components() -> Non
                     "type": "github_repo",
                     "url": "https://github.com/example/pr-tools",
                 },
-                "components": [component],
+                "contributions": {"environment_requirements": [component]},
             }
         }
     )
     assert second.ok is True
-    assert manager.data["capability_components"]["cli:gh"]["package_ids"] == [
+    assert manager.data["capability_components"]["envreq:executable:gh"]["package_ids"] == [
         "review",
         "pr",
     ]
 
     deleted_review = manager.delete_capability_package({"package_id": "review"})
     assert deleted_review.ok is True
-    assert manager.data["capability_components"]["cli:gh"]["package_ids"] == ["pr"]
-    assert "gh" in manager.data["environment"]["cli_tools"]
+    assert manager.data["capability_components"]["envreq:executable:gh"]["package_ids"] == ["pr"]
+    assert "envreq:executable:gh" in manager.data["environment"]["requirements"]
 
     deleted_pr = manager.delete_capability_package({"package_id": "pr"})
     assert deleted_pr.ok is True
-    assert "cli:gh" not in manager.data["capability_components"]
-    assert "gh" not in manager.data["environment"]["cli_tools"]
+    assert "envreq:executable:gh" not in manager.data["capability_components"]
+    assert "mcp_server:github" not in manager.data["capability_components"]
+    assert "envreq:executable:gh" not in manager.data["environment"]["requirements"]
+    assert "github" not in manager.data["mcp"]["servers"]
 
 
 def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> None:
@@ -853,13 +885,13 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
         ) -> CapabilityPackageInstallResult:
             self.calls.append((data, raw_draft, package_id))
             data["capability_components"] = {
-                "cli:gh": {
-                    "kind": "cli",
+                "envreq:executable:gh": {
+                    "kind": "environment_requirement",
                     "name": "gh",
                     "enabled": True,
                     "package_ids": ["review"],
                     "source": {"type": "project_notes"},
-                    "config": {"command": "gh"},
+                    "config": {"kind": "executable", "command": "gh"},
                     "managed_by": "capability_package",
                     "status": "installed",
                 }
@@ -869,7 +901,7 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
                     "enabled": True,
                     "status": "installed",
                     "source": {"type": "project_notes"},
-                    "components": ["cli:gh"],
+                    "components": ["envreq:executable:gh"],
                     "generated_by": "capability_packager",
                     "name": "Review",
                 }
@@ -881,14 +913,23 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
             return CapabilityPackageInstallResult(
                 package_id="review",
                 package=package,
-                component_ids=["cli:gh"],
+                component_ids=["envreq:executable:gh"],
             )
 
     installer = FakeInstaller()
     monkeypatch.setattr(admin_service, "CapabilityPackageInstaller", lambda: installer)
 
     result = MemoryAdminManager().accept_capability_package_draft(
-        {"draft": {"id": "review", "components": [{"kind": "cli", "name": "gh"}]}}
+        {
+            "draft": {
+                "id": "review",
+                "contributions": {
+                    "environment_requirements": [
+                        {"kind": "executable", "name": "gh", "command": "gh"}
+                    ]
+                },
+            }
+        }
     )
 
     assert result.ok is True

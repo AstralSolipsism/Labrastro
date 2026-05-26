@@ -143,16 +143,18 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
                 "config": {"path_hint": "/skills/code-review"},
             },
         ),
-        "cli:gitnexus": models.CapabilityComponentConfig.from_dict(
-            "cli:gitnexus",
+        "envreq:executable:gitnexus": models.CapabilityComponentConfig.from_dict(
+            "envreq:executable:gitnexus",
             {
-                "kind": "cli",
+                "kind": "environment_requirement",
                 "name": "gitnexus",
                 "access": "both",
                 "risk_level": "medium",
                 "execution_policy": "escalate",
                 "config": {
+                    "kind": "executable",
                     "command": "gitnexus",
+                    "check": "gitnexus --version",
                     "env": {"GITNEXUS_HOME": ".gitnexus"},
                 },
             },
@@ -179,7 +181,7 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
         "runtime": models.CapabilityPackageConfig.from_dict(
             "runtime",
             {
-                "components": ["cli:gitnexus"],
+                "components": ["envreq:executable:gitnexus"],
                 "permissions": ["repo.read", "runtime.dispatch"],
             },
         ),
@@ -201,23 +203,25 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert [package["id"] for package in resolved["packages"]] == ["repo", "runtime", "docs"]
     assert resolved["mcp_servers"] == ["github"]
     assert resolved["skills"] == ["code-review"]
-    assert resolved["cli_tools"] == ["gitnexus"]
-    assert resolved["tools"] == ["mcp:github", "cli:gitnexus", "builtin:fetch_capabilities"]
+    assert resolved["environment_requirements"][0]["id"] == "envreq:executable:gitnexus"
+    assert resolved["environment_requirements"][0]["kind"] == "executable"
+    assert resolved["tools"] == ["mcp:github", "builtin:fetch_capabilities"]
     assert resolved["credentials"] == ["DOCS_TOKEN"]
     assert [component["id"] for component in resolved["components"]] == [
         "mcp:github",
         "skill:code-review",
-        "cli:gitnexus",
+        "envreq:executable:gitnexus",
         "builtin_tool:fetch_capabilities",
     ]
     assert resolved["capability_overlay"]["component_ids"] == [
         "mcp:github",
         "skill:code-review",
-        "cli:gitnexus",
+        "envreq:executable:gitnexus",
         "builtin_tool:fetch_capabilities",
     ]
     assert resolved["capability_overlay"]["skill_roots"] == ["/skills/code-review"]
     assert resolved["capability_overlay"]["env"] == {"GITNEXUS_HOME": ".gitnexus"}
+    assert resolved["capability_overlay"]["environment_requirements"][0]["id"] == "envreq:executable:gitnexus"
     assert resolved["capability_overlay"]["mcp"]["servers"]["github"]["command"] == "github-mcp-server"
     assert resolved["effective_capabilities"]["tools"] == resolved["tools"]
     assert resolved["effective_capabilities"]["credentials"] == ["DOCS_TOKEN"]
@@ -228,9 +232,9 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
         "Fetch documentation evidence for capability package drafts."
     ]
     assert {
-        "target": "cli:gitnexus",
+        "target": "envreq:executable:gitnexus",
         "target_type": "capability_component",
-        "kind": "cli",
+        "kind": "environment_requirement",
         "policy": "escalate",
         "risk_level": "medium",
         "access": "both",

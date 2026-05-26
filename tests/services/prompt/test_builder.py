@@ -48,11 +48,14 @@ def test_system_prompt_includes_capability_catalog_before_user_instructions() ->
     prompt = system_prompt(
         [_Tool("read_file", "Read file")],
         user_system_append="Always answer in Chinese.",
-        capability_catalog="- `review`: Review\n  - `cli:gh` [cli] gh",
+        capability_catalog=(
+            "- `review`: Review\n"
+            "  - `envreq:executable:gh` [environment_requirement] gh"
+        ),
     )
 
     assert "# Capability Packages" in prompt
-    assert "`cli:gh`" in prompt
+    assert "`envreq:executable:gh`" in prompt
     assert prompt.index("# Capability Packages") < prompt.index("# User Instructions")
 
 

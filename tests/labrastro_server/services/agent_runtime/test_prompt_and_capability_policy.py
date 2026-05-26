@@ -29,7 +29,13 @@ def test_prompt_renderer_targets_executor_native_instruction_files() -> None:
             "packages": [{"id": "github-review", "name": "GitHub Review"}],
             "mcp_servers": ["github"],
             "skills": ["code-review"],
-            "cli_tools": ["gitnexus"],
+            "environment_requirements": [
+                {
+                    "id": "envreq:executable:gitnexus",
+                    "kind": "executable",
+                    "name": "gitnexus",
+                }
+            ],
         },
     )
 

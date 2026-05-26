@@ -139,7 +139,7 @@ class ExecutorPromptRenderer:
         sections = (
             ("mcp_servers", "MCP servers"),
             ("skills", "Skills"),
-            ("cli_tools", "CLI tools"),
+            ("builtin_tool_grants", "Built-in tool grants"),
         )
         for key, title in sections:
             values = resolved.get(key)
@@ -148,6 +148,27 @@ class ExecutorPromptRenderer:
             lines.append("")
             lines.append(f"{title}:")
             lines.extend(f"- `{value}`" for value in values)
+        requirements = resolved.get("environment_requirements")
+        if isinstance(requirements, list) and requirements:
+            lines.append("")
+            lines.append("Environment requirements:")
+            for requirement in requirements:
+                if not isinstance(requirement, dict):
+                    continue
+                requirement_id = str(requirement.get("id") or "").strip()
+                kind = str(requirement.get("kind") or "").strip()
+                name = str(requirement.get("name") or requirement_id).strip()
+                label = f"{kind}:{name}" if kind and name else name or requirement_id
+                lines.append(f"- `{label}`")
+        fragments = resolved.get("prompt_fragments")
+        if isinstance(fragments, list) and fragments:
+            lines.append("")
+            lines.append("Prompt fragments:")
+            for fragment in fragments:
+                if isinstance(fragment, dict):
+                    name = str(fragment.get("name") or fragment.get("id") or "").strip()
+                    if name:
+                        lines.append(f"- `{name}`")
 
 
 def _string_list(value: Any) -> list[str]:

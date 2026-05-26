@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from reuleauxcoder.domain.environment_requirements import (
+    ENVIRONMENT_REQUIREMENT_KINDS,
+    environment_requirement_kind_from_id,
+    normalize_environment_requirement_id,
+)
+
 
 class ExecutorType(str, Enum):
     """Supported Agent executor families."""
@@ -141,13 +147,12 @@ def _dedupe_strings(values: list[str]) -> list[str]:
 
 CAPABILITY_COMPONENT_KINDS = {
     "builtin_tool",
-    "cli",
-    "cli_tool",
     "credential",
-    "env",
+    "environment_requirement",
     "mcp",
     "mcp_server",
     "mcp_tool",
+    "prompt_fragment",
     "skill",
 }
 AGENT_VISIBILITIES = {"user", "system", "internal"}
@@ -308,6 +313,7 @@ class CapabilityPackageDraft:
     description: str = ""
     source: CapabilitySourceConfig = field(default_factory=CapabilitySourceConfig)
     components: list[dict[str, Any]] = field(default_factory=list)
+    contributions: dict[str, Any] = field(default_factory=dict)
     install_plan: list[str] = field(default_factory=list)
     usage: list[str] = field(default_factory=list)
     effective_capabilities: list[str] = field(default_factory=list)
@@ -321,18 +327,15 @@ class CapabilityPackageDraft:
         if not isinstance(data, dict):
             data = {}
         _reject_plaintext_secret_container(data, owner="capability package draft")
-        raw_components = data.get("components", [])
-        components = [
-            dict(item)
-            for item in (raw_components if isinstance(raw_components, list) else [])
-            if isinstance(item, dict)
-        ]
+        contributions = _normalize_contributions(data.get("contributions", {}))
+        components = _components_from_manifest(data, contributions)
         return cls(
             id=str(data.get("id") or package_id),
             name=str(data.get("name", "") or ""),
             description=str(data.get("description", "") or ""),
             source=CapabilitySourceConfig.from_value(data.get("source", {})),
             components=components,
+            contributions=contributions or _contributions_from_components(components),
             install_plan=_string_list(data.get("install_plan", [])),
             usage=_string_list(data.get("usage", [])),
             effective_capabilities=_string_list(data.get("effective_capabilities", [])),
@@ -348,7 +351,9 @@ class CapabilityPackageDraft:
             "name": self.name,
             "description": self.description,
             "source": self.source.to_dict(),
-            "components": [dict(item) for item in self.components],
+            "contributions": dict(
+                self.contributions or _contributions_from_components(self.components)
+            ),
             "install_plan": list(self.install_plan),
             "usage": list(self.usage),
             "effective_capabilities": list(self.effective_capabilities),
@@ -442,6 +447,63 @@ class CapabilityPackageConfig:
         return result
 
 
+@dataclass
+class CapabilityContribution:
+    """Normalized contribution exposed by an installed capability package."""
+
+    id: str
+    kind: str
+    name: str
+    config: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_component(
+        cls, component: CapabilityComponentConfig
+    ) -> "CapabilityContribution":
+        return cls(
+            id=component.id,
+            kind=component.kind,
+            name=component.name,
+            config=dict(component.config),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "name": self.name,
+            "config": dict(self.config),
+        }
+
+
+@dataclass
+class ResolvedCapabilitySet:
+    """Executor-facing resolved capability package view."""
+
+    packages: list[dict[str, Any]] = field(default_factory=list)
+    contributions: list[dict[str, Any]] = field(default_factory=list)
+    environment_requirements: list[dict[str, Any]] = field(default_factory=list)
+    skill_roots: list[str] = field(default_factory=list)
+    mcp_servers: list[str] = field(default_factory=list)
+    builtin_tool_grants: list[str] = field(default_factory=list)
+    credential_refs: list[str] = field(default_factory=list)
+    prompt_fragments: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "packages": [dict(item) for item in self.packages],
+            "contributions": [dict(item) for item in self.contributions],
+            "environment_requirements": [
+                dict(item) for item in self.environment_requirements
+            ],
+            "skill_roots": list(self.skill_roots),
+            "mcp_servers": list(self.mcp_servers),
+            "builtin_tool_grants": list(self.builtin_tool_grants),
+            "credential_refs": list(self.credential_refs),
+            "prompt_fragments": [dict(item) for item in self.prompt_fragments],
+        }
+
+
 def resolve_capability_refs(
     capability_refs: list[str],
     packages: dict[str, CapabilityPackageConfig],
@@ -451,12 +513,15 @@ def resolve_capability_refs(
 
     resolved_packages: list[dict[str, Any]] = []
     resolved_components: list[dict[str, Any]] = []
+    resolved_contributions: list[dict[str, Any]] = []
     mcp_servers: list[str] = []
     mcp_tools: list[str] = []
     skills: list[str] = []
-    cli_tools: list[str] = []
     tools: list[str] = []
     credentials: list[str] = []
+    builtin_tool_grants: list[str] = []
+    prompt_fragments: list[dict[str, Any]] = []
+    environment_requirements: list[dict[str, Any]] = []
     execution_policies: list[dict[str, Any]] = []
     capability_summaries: list[str] = []
     overlay_mcp_servers: dict[str, Any] = {}
@@ -488,6 +553,9 @@ def resolve_capability_refs(
             component_dict = component.to_dict()
             component_dict["id"] = component.id
             resolved_components.append(component_dict)
+            resolved_contributions.append(
+                CapabilityContribution.from_component(component).to_dict()
+            )
             execution_policies.append(
                 _component_execution_policy(component, package=package)
             )
@@ -503,25 +571,30 @@ def resolve_capability_refs(
                 path_hint = str(component.config.get("path_hint") or "").strip()
                 if path_hint:
                     overlay_skill_roots.append(path_hint)
-            elif component.kind in {"cli", "cli_tool"}:
-                cli_tools.append(component.name)
-                tools.append(component.registry_path or f"cli:{component.name}")
-                for key, value in _dict_value(component.config.get("env", {})).items():
-                    overlay_env[str(key)] = str(value)
             elif component.kind == "builtin_tool":
+                builtin_tool_grants.append(component.name)
                 tools.append(component.registry_path or f"builtin:{component.name}")
-            elif component.kind == "env":
-                value = str(component.config.get("value") or "").strip()
-                if component.name and value:
-                    overlay_env[component.name] = value
             elif component.kind == "credential":
                 credentials.append(component.name)
+            elif component.kind == "prompt_fragment":
+                prompt_fragments.append(_prompt_fragment_from_component(component))
+            elif component.kind == "environment_requirement":
+                requirement = _environment_requirement_from_component(component)
+                environment_requirements.append(requirement)
+                for key, value in _dict_value(requirement.get("env", {})).items():
+                    overlay_env[str(key)] = str(value)
+                if requirement.get("kind") == "env_var":
+                    value = str(requirement.get("value") or "").strip()
+                    if component.name and value:
+                        overlay_env[component.name] = value
     effective_capabilities = {
         "tools": _dedupe_strings(tools),
         "mcp_servers": _dedupe_strings(mcp_servers),
         "mcp_tools": _dedupe_strings(mcp_tools),
         "skills": _dedupe_strings(skills),
-        "cli_tools": _dedupe_strings(cli_tools),
+        "builtin_tool_grants": _dedupe_strings(builtin_tool_grants),
+        "environment_requirements": _dedupe_requirements(environment_requirements),
+        "prompt_fragments": _dedupe_components(prompt_fragments),
         "env": dict(overlay_env),
         "credentials": _dedupe_strings(credentials),
         "summaries": _dedupe_strings(capability_summaries),
@@ -530,12 +603,17 @@ def resolve_capability_refs(
     return {
         "packages": resolved_packages,
         "components": _dedupe_components(resolved_components),
+        "contributions": _dedupe_components(resolved_contributions),
         "tools": effective_capabilities["tools"],
         "mcp_servers": _dedupe_strings(mcp_servers),
         "mcp_tools": effective_capabilities["mcp_tools"],
         "skills": _dedupe_strings(skills),
-        "cli_tools": _dedupe_strings(cli_tools),
+        "skill_roots": _dedupe_strings(overlay_skill_roots),
+        "builtin_tool_grants": effective_capabilities["builtin_tool_grants"],
+        "environment_requirements": effective_capabilities["environment_requirements"],
+        "prompt_fragments": effective_capabilities["prompt_fragments"],
         "credentials": effective_capabilities["credentials"],
+        "credential_refs": effective_capabilities["credentials"],
         "execution_policies": effective_capabilities["execution_policies"],
         "effective_capabilities": effective_capabilities,
         "capability_overlay": {
@@ -545,17 +623,16 @@ def resolve_capability_refs(
             "mcp": {"servers": overlay_mcp_servers},
             "skill_roots": _dedupe_strings(overlay_skill_roots),
             "env": overlay_env,
-            "cli_tools": [
-                item
-                for item in _dedupe_components(resolved_components)
-                if item.get("kind") == "cli"
-            ],
+            "environment_requirements": effective_capabilities["environment_requirements"],
         },
     }
 
 
 def _split_component_id(component_id: str) -> tuple[str, str]:
     kind, sep, name = str(component_id).partition(":")
+    if sep and kind == "envreq":
+        _, _, requirement_name = name.partition(":")
+        return "environment_requirement", requirement_name or name
     if sep and kind in CAPABILITY_COMPONENT_KINDS:
         return kind, name
     return "", str(component_id)
@@ -578,6 +655,123 @@ def _string_dict_list(value: Any) -> list[dict[str, str]]:
     return result
 
 
+_CONTRIBUTION_KIND_BY_SECTION = {
+    "skills": "skill",
+    "mcp_servers": "mcp_server",
+    "builtin_tools": "builtin_tool",
+    "prompt_fragments": "prompt_fragment",
+    "credential_refs": "credential",
+    "environment_requirements": "environment_requirement",
+}
+
+
+def _normalize_contributions(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in _CONTRIBUTION_KIND_BY_SECTION:
+        raw_items = value.get(key, [])
+        if not isinstance(raw_items, list):
+            continue
+        items = [dict(item) for item in raw_items if isinstance(item, dict)]
+        if items:
+            result[key] = items
+    return result
+
+
+def _components_from_manifest(
+    data: dict[str, Any],
+    contributions: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_components = data.get("components", [])
+    components = [
+        dict(item)
+        for item in (raw_components if isinstance(raw_components, list) else [])
+        if isinstance(item, dict)
+    ]
+    for section, component_kind in _CONTRIBUTION_KIND_BY_SECTION.items():
+        raw_items = contributions.get(section, [])
+        if not isinstance(raw_items, list):
+            continue
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            item.setdefault("kind", component_kind)
+            if component_kind == "environment_requirement":
+                item = _environment_requirement_component_item(item)
+            components.append(item)
+    return components
+
+
+def _environment_requirement_component_item(item: dict[str, Any]) -> dict[str, Any]:
+    config = _dict_value(item.get("config", {}))
+    requirement_kind = _environment_requirement_kind(item, config)
+    name = str(item.get("name") or config.get("name") or "").strip()
+    if not name:
+        raw_id = str(item.get("id") or "").strip()
+        if raw_id.startswith("envreq:"):
+            _, _, rest = raw_id.partition(":")
+            _, _, name = rest.partition(":")
+        elif ":" in raw_id:
+            _, _, name = raw_id.partition(":")
+    item["kind"] = "environment_requirement"
+    if requirement_kind:
+        config.setdefault("kind", requirement_kind)
+    if name:
+        item["name"] = name
+        config.setdefault("name", name)
+    if not item.get("id") and requirement_kind and name:
+        item["id"] = normalize_environment_requirement_id(
+            kind=requirement_kind,
+            name=name,
+        )
+    item["config"] = config
+    return item
+
+
+def _environment_requirement_kind(
+    item: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    candidates = (
+        item.get("resource_kind"),
+        item.get("requirement_kind"),
+        item.get("kind"),
+        config.get("resource_kind"),
+        config.get("requirement_kind"),
+        config.get("kind"),
+        config.get("type"),
+    )
+    for value in candidates:
+        text = str(value or "").strip().lower()
+        if text in ENVIRONMENT_REQUIREMENT_KINDS:
+            return text
+    raw_id = str(item.get("id") or "").strip()
+    id_kind = environment_requirement_kind_from_id(raw_id)
+    if id_kind:
+        return id_kind
+    return "executable" if config.get("command") else "runtime"
+
+
+def _contributions_from_components(components: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, list[dict[str, Any]]] = {
+        key: [] for key in _CONTRIBUTION_KIND_BY_SECTION
+    }
+    section_by_kind = {
+        kind: section for section, kind in _CONTRIBUTION_KIND_BY_SECTION.items()
+    }
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        kind = str(component.get("kind") or "").strip()
+        section = section_by_kind.get(kind)
+        if section is None:
+            continue
+        result[section].append(dict(component))
+    return {key: value for key, value in result.items() if value}
+
+
 def _dedupe_components(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
@@ -588,6 +782,104 @@ def _dedupe_components(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(component_id)
         result.append(value)
     return result
+
+
+def _dedupe_requirements(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        requirement_id = str(value.get("id") or "").strip()
+        if not requirement_id:
+            requirement_id = _environment_requirement_id(value)
+            value["id"] = requirement_id
+        if not requirement_id or requirement_id in seen:
+            continue
+        seen.add(requirement_id)
+        result.append(value)
+    return result
+
+
+def _environment_requirement_from_component(
+    component: CapabilityComponentConfig,
+) -> dict[str, Any]:
+    config = dict(component.config)
+    requirement_kind = _environment_requirement_kind(
+        {
+            "id": component.id,
+            "kind": config.get("kind"),
+            "name": component.name,
+            "resource_kind": config.get("resource_kind"),
+            "requirement_kind": config.get("requirement_kind"),
+        },
+        config,
+    )
+    name = str(config.get("name") or component.name).strip()
+    result: dict[str, Any] = {
+        "id": _environment_requirement_id(
+            {"id": component.id, "kind": requirement_kind, "name": name}
+        ),
+        "kind": requirement_kind,
+        "name": name,
+        "enabled": component.enabled,
+        "component_id": component.id,
+        "package_ids": list(component.package_ids),
+        "managed_by": component.managed_by,
+    }
+    for field_name in (
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "placement",
+        "requirements",
+        "check",
+        "install",
+        "configure",
+        "version",
+        "runtime",
+        "language",
+        "scope",
+        "path",
+        "source",
+        "description",
+        "repo_url",
+        "docs",
+        "evidence",
+        "credentials",
+        "risk_level",
+        "install_prompt",
+        "verify_prompt",
+        "notes",
+        "value",
+    ):
+        if field_name in config and config[field_name] not in (None, "", [], {}):
+            result[field_name] = config[field_name]
+    return result
+
+
+def _environment_requirement_id(value: dict[str, Any]) -> str:
+    return normalize_environment_requirement_id(
+        value.get("id"),
+        kind=value.get("kind"),
+        name=value.get("name"),
+    )
+
+
+def _prompt_fragment_from_component(
+    component: CapabilityComponentConfig,
+) -> dict[str, Any]:
+    config = dict(component.config)
+    return {
+        key: value
+        for key, value in {
+            "id": component.id,
+            "name": component.name,
+            "description": component.description,
+            "content": config.get("content"),
+            "path": config.get("path"),
+        }.items()
+        if value not in ("", None, [], {})
+    }
 
 
 def _component_execution_policy(

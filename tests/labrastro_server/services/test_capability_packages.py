@@ -114,7 +114,7 @@ def test_source_collector_uses_fetch_capabilities_for_url_sources() -> None:
     assert fetch_tool.calls == [
         {
             "url": "https://docs.example.com/example-tool",
-            "focus": "install setup configure authentication requirements cli mcp skill",
+                "focus": "install setup configure authentication requirements runtime sdk executable mcp skill",
             "source_hint": "docs_url",
             "max_chars": 36000,
         }
@@ -217,6 +217,40 @@ def test_draft_validator_requires_valid_components_and_evidence() -> None:
     assert "risk_level is required" in result.messages
 
 
+def test_draft_validator_requires_configure_command_evidence() -> None:
+    validator = CapabilityDraftValidator()
+    bundle = EvidenceBundle(
+        source={"type": "project_notes"},
+        documents=[{"title": "Project notes", "url": "", "content": "Install gh."}],
+        evidence=[{"title": "Project notes", "source_url": "", "excerpt": "Install gh."}],
+    )
+
+    result = validator.validate(
+        {
+            "id": "review",
+            "components": [
+                {
+                    "id": "envreq:executable:gh",
+                    "kind": "environment_requirement",
+                    "name": "gh",
+                    "config": {
+                        "kind": "executable",
+                        "configure": "gh auth login",
+                    },
+                }
+            ],
+            "install_plan": ["Install gh."],
+            "usage": ["Use gh."],
+            "evidence": [{"title": "Project notes", "excerpt": "Install gh."}],
+            "risk_level": "low",
+        },
+        bundle,
+    )
+
+    assert result.ok is False
+    assert "envreq:executable:gh command lacks evidence: gh auth login" in result.messages
+
+
 def test_ingest_status_extracts_completed_draft_json() -> None:
     control = _control_plane()
     service = CapabilityPackageIngestService(control)
@@ -232,17 +266,20 @@ def test_ingest_status_extracts_completed_draft_json() -> None:
         "id": "review",
         "name": "Review",
         "source": {"type": "project_notes"},
-        "components": [
-            {
-                "id": "cli:gh",
-                "kind": "cli",
-                "name": "gh",
-                "config": {"command": "gh"},
-            }
-        ],
+        "contributions": {
+            "environment_requirements": [
+                {
+                    "id": "envreq:executable:gh",
+                    "kind": "executable",
+                    "name": "gh",
+                    "command": "gh",
+                    "check": "gh --version",
+                }
+            ]
+        },
         "install_plan": ["Install GitHub CLI."],
         "usage": ["Use gh pr view."],
-        "evidence": [{"title": "Project notes", "excerpt": "Install gh"}],
+        "evidence": [{"title": "Project notes", "excerpt": "Install gh and run gh --version"}],
         "credentials": ["GITHUB_TOKEN"],
         "risk_level": "low",
     }
@@ -260,5 +297,8 @@ def test_ingest_status_extracts_completed_draft_json() -> None:
 
     assert status["agent_run"]["status"] == "completed"
     assert status["draft"]["id"] == "review"
-    assert status["draft"]["components"][0]["id"] == "cli:gh"
+    assert (
+        status["draft"]["contributions"]["environment_requirements"][0]["id"]
+        == "envreq:executable:gh"
+    )
     assert status["validation"]["ok"] is True

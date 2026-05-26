@@ -7,7 +7,11 @@ from enum import Enum
 from typing import Any
 
 from reuleauxcoder.domain.agent_runtime.models import AgentConfig
-from reuleauxcoder.domain.approval_engine import ApprovalPolicyEngine, ToolApprovalContext
+from reuleauxcoder.domain.approval_engine import (
+    ApprovalPolicyEngine,
+    ToolApprovalContext,
+    ToolSource,
+)
 from reuleauxcoder.domain.config.models import ApprovalConfig, ApprovalRuleConfig
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.extensions.tools.policies import DEFAULT_TOOL_POLICIES, ToolPolicy
@@ -366,10 +370,16 @@ class PermissionGateway:
                     return candidate
             return ""
 
-        if target.kind in {"cli", "cli_tool"}:
-            cli_tools = _string_set(effective.get("cli_tools"))
-            if target.name in cli_tools:
-                return f"cli:{target.name}"
+        if (
+            target.kind == "environment_requirement"
+            or target.tool_source == "environment_requirement"
+        ):
+            requirement_match = _executable_requirement_match(
+                effective.get("environment_requirements"),
+                target.name,
+            )
+            if requirement_match:
+                return requirement_match
             for candidate in candidates:
                 if candidate in tools:
                     return candidate
@@ -610,7 +620,7 @@ def _source_flow(source: str) -> str:
     return value or "manual"
 
 
-def _approval_tool_source(target: PermissionTarget) -> str:
+def _approval_tool_source(target: PermissionTarget) -> ToolSource:
     source = str(target.tool_source or "").strip()
     if source in {"builtin_tool", "builtin"}:
         return "builtin"
@@ -640,8 +650,8 @@ def _target_candidates(target: PermissionTarget) -> set[str]:
             values.update({f"builtin:{name}", f"builtin_tool:{name}"})
         if target.tool_source == "mcp" or kind in {"mcp", "mcp_tool"}:
             values.add(f"mcp_tool:{name}")
-        if kind in {"cli", "cli_tool"}:
-            values.add(f"cli:{name}")
+        if kind == "environment_requirement" or target.tool_source == "environment_requirement":
+            values.add(f"envreq:executable:{name}")
         if kind == "skill":
             values.add(f"skill:{name}")
     if target.mcp_server:
@@ -649,6 +659,22 @@ def _target_candidates(target: PermissionTarget) -> set[str]:
     if target.mcp_tool:
         values.add(f"mcp_tool:{target.mcp_tool}")
     return {value for value in values if value}
+
+
+def _executable_requirement_match(value: object, name: str) -> str:
+    target_name = str(name or "").strip()
+    if not target_name or not isinstance(value, list):
+        return ""
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() != "executable":
+            continue
+        item_name = str(item.get("name") or "").strip()
+        command = str(item.get("command") or "").strip()
+        if target_name in {item_name, command}:
+            return str(item.get("id") or f"envreq:executable:{item_name}")
+    return ""
 
 
 __all__ = [

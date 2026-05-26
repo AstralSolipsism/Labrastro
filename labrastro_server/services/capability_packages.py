@@ -22,17 +22,22 @@ from reuleauxcoder.domain.agent_runtime.models import (
 )
 from reuleauxcoder.domain.config.models import (
     DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
-    EnvironmentCLIToolConfig,
-    EnvironmentSkillConfig,
+    EnvironmentRequirementConfig,
     MCPServerConfig,
     ensure_default_capability_packages,
+)
+from reuleauxcoder.domain.environment_requirements import (
+    ENVIRONMENT_COMMAND_FIELDS,
+    ENVIRONMENT_REQUIREMENT_KINDS,
+    normalize_environment_requirement_id,
+    normalize_environment_requirement_kind,
 )
 from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import FetchCapabilitiesTool
 
 
 CAPABILITY_INGEST_WORKFLOW = "capability_package_ingest"
 MAX_SNIPPET_CHARS = 36_000
-DEFAULT_CAPABILITY_FOCUS = "install setup configure authentication requirements cli mcp skill"
+DEFAULT_CAPABILITY_FOCUS = "install setup configure authentication requirements runtime sdk executable mcp skill"
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
     "command",
@@ -41,7 +46,7 @@ _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
     "cwd",
     "placement",
     "distribution",
-    "requirements",
+    "environment_requirement_refs",
     "scope",
     "check",
     "install",
@@ -61,6 +66,11 @@ _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
     "install_prompt",
     "verify_prompt",
     "notes",
+    "configure",
+    "runtime",
+    "language",
+    "path",
+    "value",
 }
 
 
@@ -101,9 +111,10 @@ class EvidenceBundle:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any] | None) -> "EvidenceBundle":
-        data = value if isinstance(value, dict) else {}
+        data: dict[str, Any] = value if isinstance(value, dict) else {}
+        source = data.get("source")
         return cls(
-            source=dict(data.get("source") if isinstance(data.get("source"), dict) else {}),
+            source=dict(source) if isinstance(source, dict) else {},
             documents=[
                 dict(item)
                 for item in data.get("documents", [])
@@ -425,6 +436,14 @@ class CapabilityPackageInstaller:
         package_source: dict[str, Any],
     ) -> CapabilityComponentConfig:
         kind = str(item.get("kind", item.get("type", "")) or "").strip().lower()
+        if kind in ENVIRONMENT_REQUIREMENT_KINDS:
+            item = dict(item)
+            raw_config = item.get("config")
+            config: dict[str, Any] = dict(raw_config) if isinstance(raw_config, dict) else {}
+            config.setdefault("kind", kind)
+            item["kind"] = "environment_requirement"
+            item["config"] = config
+            kind = "environment_requirement"
         if kind not in CAPABILITY_COMPONENT_KINDS:
             raise ValueError(
                 "component.kind must be one of "
@@ -433,7 +452,25 @@ class CapabilityPackageInstaller:
         name = str(item.get("name", "") or "").strip()
         if not name:
             raise ValueError("component.name is required")
-        component_id = str(item.get("id") or f"{kind}:{name}").strip()
+        component_id = str(item.get("id") or "").strip()
+        if not component_id:
+            if kind == "environment_requirement":
+                raw_config_value = item.get("config")
+                raw_requirement_config = (
+                    raw_config_value if isinstance(raw_config_value, dict) else {}
+                )
+                requirement_kind = str(
+                    item.get("resource_kind")
+                    or item.get("requirement_kind")
+                    or raw_requirement_config.get("kind")
+                    or "runtime"
+                ).strip().lower()
+                component_id = normalize_environment_requirement_id(
+                    kind=normalize_environment_requirement_kind(requirement_kind),
+                    name=name,
+                )
+            else:
+                component_id = f"{kind}:{name}"
         raw_config = item.get("config")
         config = dict(raw_config) if isinstance(raw_config, dict) else {}
         for field in _CAPABILITY_COMPONENT_CONFIG_FIELDS:
@@ -470,9 +507,6 @@ class CapabilityPackageInstaller:
         data: dict[str, Any],
         component: CapabilityComponentConfig,
     ) -> None:
-        if component.kind not in {"cli", "cli_tool", "mcp", "skill"}:
-            return
-        items = _toolchain_items(data, component.kind)
         payload = dict(component.config)
         payload["enabled"] = component.enabled
         payload["component_id"] = component.id
@@ -482,26 +516,38 @@ class CapabilityPackageInstaller:
         if component.source.url:
             payload.setdefault("repo_url", component.source.url)
         payload.setdefault("last_action", "capability_package_accept")
-        items[component.name] = _normalize_toolchain_item(
-            component.kind,
-            component.name,
-            payload,
-        )
+        if component.kind == "environment_requirement":
+            items = _environment_requirement_items(data)
+            payload["id"] = component.id
+            requirement = EnvironmentRequirementConfig.from_dict(component.id, payload)
+            items[requirement.id] = requirement.to_dict()
+            return
+        if component.kind in {"mcp", "mcp_server"}:
+            items = _mcp_server_items(data)
+            server = MCPServerConfig.from_dict(component.name, payload)
+            items[server.name] = server.to_dict()
 
     def remove_materialized_component(
         self,
         data: dict[str, Any],
         component: CapabilityComponentConfig,
     ) -> None:
-        items = _toolchain_items(data, component.kind)
-        current = items.get(component.name)
+        if component.kind == "environment_requirement":
+            items = _environment_requirement_items(data)
+            item_id = component.id
+        elif component.kind in {"mcp", "mcp_server"}:
+            items = _mcp_server_items(data)
+            item_id = component.name
+        else:
+            return
+        current = items.get(item_id)
         if not isinstance(current, dict):
             return
         if str(current.get("component_id") or "") != component.id:
             return
         if str(current.get("managed_by") or "") != "capability_package":
             return
-        del items[component.name]
+        del items[item_id]
 
 
 class CapabilityPackageIngestService:
@@ -524,11 +570,8 @@ class CapabilityPackageIngestService:
         self.draft_validator = draft_validator or CapabilityDraftValidator()
 
     def start(self, payload: dict[str, Any]) -> CapabilityPackageIngestResult:
-        source_payload = (
-            payload.get("source")
-            if isinstance(payload.get("source"), dict)
-            else payload
-        )
+        raw_source = payload.get("source")
+        source_payload: dict[str, Any] = raw_source if isinstance(raw_source, dict) else payload
         evidence_bundle = self.collector.collect(source_payload)
         workspace_root = str(payload.get("workspace_root") or "").strip()
         agent_run = self.packager_runner.start(
@@ -654,11 +697,15 @@ def _render_packager_prompt(*, bundle: dict[str, Any]) -> str:
         "{\n"
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
         '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
-        '  "components": [{"id": "cli:gh", '
-        '"kind": "builtin_tool|cli_tool|credential|env|mcp_server|mcp_tool|skill", '
-        '"name": "gh", "access": "read|write|both", '
-        '"execution_policy": "allow|deny|require_user|escalate|inherit", '
-        '"config": {}}],\n'
+        '  "contributions": {\n'
+        '    "skills": [], "mcp_servers": [], "builtin_tools": [],\n'
+        '    "prompt_fragments": [], "credential_refs": [],\n'
+        '    "environment_requirements": [\n'
+        '      {"id": "envreq:executable:gh", "kind": "executable", '
+        '"name": "gh", "command": "gh", "check": "gh --version", '
+        '"install": "winget install GitHub.cli", "placement": "peer"}\n'
+        "    ]\n"
+        "  },\n"
         '  "effective_capabilities": ["Plain language capability added to an Agent"],\n'
         '  "install_plan": [], "usage": [], "evidence": [], "credentials": [], '
         '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
@@ -683,7 +730,10 @@ def _extract_draft(value: Any) -> dict[str, Any] | None:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and isinstance(parsed.get("components"), list):
+        if isinstance(parsed, dict) and (
+            isinstance(parsed.get("contributions"), dict)
+            or isinstance(parsed.get("components"), list)
+        ):
             return parsed
     return None
 
@@ -725,10 +775,13 @@ def _document_from_fetch_payload(payload: dict[str, Any]) -> dict[str, Any] | No
 def _component_validation_messages(component: dict[str, Any]) -> list[str]:
     messages: list[str] = []
     kind = str(component.get("kind") or component.get("type") or "").strip().lower()
-    if kind not in CAPABILITY_COMPONENT_KINDS:
+    validation_kind = (
+        "environment_requirement" if kind in ENVIRONMENT_REQUIREMENT_KINDS else kind
+    )
+    if validation_kind not in CAPABILITY_COMPONENT_KINDS:
         messages.append(
             "component.kind must be one of "
-            + ", ".join(sorted(CAPABILITY_COMPONENT_KINDS))
+                + ", ".join(sorted(CAPABILITY_COMPONENT_KINDS))
         )
     name = str(component.get("name") or "").strip()
     if not name:
@@ -750,8 +803,11 @@ def _component_validation_messages(component: dict[str, Any]) -> list[str]:
     component_id = str(component.get("id") or "").strip()
     if component_id:
         parsed_kind, sep, parsed_name = component_id.partition(":")
+        if parsed_kind == "envreq":
+            parsed_kind = "environment_requirement"
+            _, _, parsed_name = parsed_name.partition(":")
         if sep and parsed_kind in CAPABILITY_COMPONENT_KINDS:
-            if kind in CAPABILITY_COMPONENT_KINDS and parsed_kind != kind:
+            if validation_kind in CAPABILITY_COMPONENT_KINDS and parsed_kind != validation_kind:
                 messages.append("component.id kind must match component.kind")
             if name and parsed_name and parsed_name != name:
                 messages.append("component.id name must match component.name")
@@ -775,8 +831,9 @@ def _component_command_evidence_messages(
 
 def _component_command_values(component: dict[str, Any]) -> list[str]:
     values: list[str] = []
-    config = component.get("config") if isinstance(component.get("config"), dict) else {}
-    for field in ("command", "check", "install"):
+    raw_config = component.get("config")
+    config: dict[str, Any] = dict(raw_config) if isinstance(raw_config, dict) else {}
+    for field in ENVIRONMENT_COMMAND_FIELDS:
         for container in (component, config):
             value = container.get(field)
             if isinstance(value, str) and value.strip():
@@ -802,21 +859,19 @@ def _evidence_search_text(
     return "\n".join(parts)
 
 
-def _toolchain_items(data: dict[str, Any], kind: str) -> dict[str, Any]:
-    if kind == "cli_tool":
-        kind = "cli"
-    if kind in {"cli", "skill"}:
-        environment = data.setdefault("environment", {})
-        if not isinstance(environment, dict):
-            environment = {}
-            data["environment"] = environment
-        key = "cli_tools" if kind == "cli" else "skills"
-        items = environment.setdefault(key, {})
-        if not isinstance(items, dict):
-            items = {}
-            environment[key] = items
-        return items
+def _environment_requirement_items(data: dict[str, Any]) -> dict[str, Any]:
+    environment = data.setdefault("environment", {})
+    if not isinstance(environment, dict):
+        environment = {}
+        data["environment"] = environment
+    items = environment.setdefault("requirements", {})
+    if not isinstance(items, dict):
+        items = {}
+        environment["requirements"] = items
+    return items
 
+
+def _mcp_server_items(data: dict[str, Any]) -> dict[str, Any]:
     mcp = data.setdefault("mcp", {})
     if not isinstance(mcp, dict):
         mcp = {}
@@ -826,16 +881,6 @@ def _toolchain_items(data: dict[str, Any], kind: str) -> dict[str, Any]:
         items = {}
         mcp["servers"] = items
     return items
-
-
-def _normalize_toolchain_item(kind: str, name: str, item: dict[str, Any]) -> dict[str, Any]:
-    if kind == "cli_tool":
-        kind = "cli"
-    if kind == "cli":
-        return EnvironmentCLIToolConfig.from_dict(name, item).to_dict()
-    if kind == "skill":
-        return EnvironmentSkillConfig.from_dict(name, item).to_dict()
-    return MCPServerConfig.from_dict(name, item).to_dict()
 
 
 def _bool_field(payload: dict[str, Any], field_name: str, default: Any) -> bool:
