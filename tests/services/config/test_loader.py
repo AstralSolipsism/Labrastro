@@ -744,7 +744,10 @@ def test_parse_config_reads_peer_mcp_artifacts() -> None:
                                 "launch": {"command": "{{bundle}}/run.sh"},
                             }
                         },
-                        "requirements": {"node": "required", "npm": "required"},
+                        "environment_requirement_refs": [
+                            "envreq:runtime:node",
+                            "envreq:executable:npm",
+                        ],
                         "build": {"type": "node", "package": "@demo/filesystem"},
                         "permissions": {
                             "tools": {"write_file": "require_approval"}
@@ -766,7 +769,10 @@ def test_parse_config_reads_peer_mcp_artifacts() -> None:
     assert server.artifacts["linux-amd64"].launch is not None
     assert server.artifacts["linux-amd64"].launch.command == "{{bundle}}/run.sh"
     assert server.artifacts["linux-amd64"].sha256 == "abc123"
-    assert server.requirements["node"] == "required"
+    assert server.environment_requirement_refs == [
+        "envreq:runtime:node",
+        "envreq:executable:npm",
+    ]
     assert server.build["type"] == "node"
     assert server.permissions["tools"]["write_file"] == "require_approval"
 
@@ -787,7 +793,10 @@ def test_parse_config_reads_command_mcp_manifest_fields() -> None:
                         "install": "npm install -g gitnexus@1.6.3",
                         "source": "npm:gitnexus",
                         "description": "Repository indexing MCP server",
-                        "requirements": {"node": ">=20", "npm": "required"},
+                        "environment_requirement_refs": [
+                            "envreq:runtime:node",
+                            "envreq:executable:npm",
+                        ],
                         "docs": [{"title": "GitNexus MCP", "url": "https://example.test/mcp"}],
                         "install_prompt": "Install through npm.",
                         "verify_prompt": "Verify mcp startup.",
@@ -807,21 +816,26 @@ def test_parse_config_reads_command_mcp_manifest_fields() -> None:
     assert server.install == "npm install -g gitnexus@1.6.3"
     assert server.source == "npm:gitnexus"
     assert server.description == "Repository indexing MCP server"
-    assert server.requirements["node"] == ">=20"
+    assert server.environment_requirement_refs == [
+        "envreq:runtime:node",
+        "envreq:executable:npm",
+    ]
     assert server.docs[0]["title"] == "GitNexus MCP"
     assert server.install_prompt == "Install through npm."
     assert server.verify_prompt == "Verify mcp startup."
     assert server.notes == ["Do not install node automatically."]
 
 
-def test_parse_config_reads_environment_cli_tools() -> None:
+def test_parse_config_reads_environment_requirements() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
             "modes": {"profiles": {"coder": {}}},
             "environment": {
-                "cli_tools": {
-                    "gitnexus": {
+                "requirements": {
+                    "envreq:executable:gitnexus": {
+                        "kind": "executable",
+                        "name": "gitnexus",
                         "command": "gitnexus",
                         "tags": ["repo_index"],
                         "check": "gitnexus --version",
@@ -839,35 +853,38 @@ def test_parse_config_reads_environment_cli_tools() -> None:
         }
     )
 
-    tool = config.environment.cli_tools["gitnexus"]
-    assert tool.command == "gitnexus"
-    assert tool.tags == ["repo_index"]
-    assert tool.check == "gitnexus --version"
-    assert tool.install == "npm install -g gitnexus"
-    assert tool.version == "latest"
-    assert tool.source == "npm"
-    assert tool.description == "Repository graph CLI"
-    assert tool.docs[0]["url"] == "https://example.test/gitnexus"
-    assert tool.install_prompt == "Use configured npm command."
-    assert tool.verify_prompt == "Run version check."
-    assert tool.notes == ["PATH changes need approval."]
+    requirement = config.environment.requirements["envreq:executable:gitnexus"]
+    assert requirement.kind == "executable"
+    assert requirement.command == "gitnexus"
+    assert requirement.tags == ["repo_index"]
+    assert requirement.check == "gitnexus --version"
+    assert requirement.install == "npm install -g gitnexus"
+    assert requirement.version == "latest"
+    assert requirement.source == "npm"
+    assert requirement.description == "Repository graph CLI"
+    assert requirement.docs[0]["url"] == "https://example.test/gitnexus"
+    assert requirement.install_prompt == "Use configured npm command."
+    assert requirement.verify_prompt == "Run version check."
+    assert requirement.notes == ["PATH changes need approval."]
 
 
-def test_parse_config_reads_environment_skills() -> None:
+def test_parse_config_reads_skill_path_environment_requirement() -> None:
     loader = ConfigLoader()
     config = loader._parse_config(
         {
             "modes": {"profiles": {"coder": {}}},
             "environment": {
-                "skills": {
-                    "collaborating-with-claude": {
+                "requirements": {
+                    "envreq:path:collaborating-with-claude-skill": {
+                        "kind": "path",
+                        "name": "collaborating-with-claude-skill",
                         "scope": "user",
                         "check": "Test-Path ~/.agents/skills/collaborating-with-claude/SKILL.md",
                         "install": "python install-skill.py",
                         "version": "1.0.0",
                         "source": "github",
                         "description": "Claude bridge skill",
-                        "path_hint": "~/.agents/skills/collaborating-with-claude/SKILL.md",
+                        "path": "~/.agents/skills/collaborating-with-claude/SKILL.md",
                         "docs": [{"title": "Claude skill", "url": "https://example.test/skill"}],
                         "install_prompt": "Install the skill files.",
                         "verify_prompt": "Check SKILL.md exists.",
@@ -878,18 +895,21 @@ def test_parse_config_reads_environment_skills() -> None:
         }
     )
 
-    skill = config.environment.skills["collaborating-with-claude"]
-    assert skill.scope == "user"
-    assert skill.check == "Test-Path ~/.agents/skills/collaborating-with-claude/SKILL.md"
-    assert skill.install == "python install-skill.py"
-    assert skill.version == "1.0.0"
-    assert skill.source == "github"
-    assert skill.description == "Claude bridge skill"
-    assert skill.path_hint == "~/.agents/skills/collaborating-with-claude/SKILL.md"
-    assert skill.docs[0]["title"] == "Claude skill"
-    assert skill.install_prompt == "Install the skill files."
-    assert skill.verify_prompt == "Check SKILL.md exists."
-    assert skill.notes == ["Use user scope."]
+    requirement = config.environment.requirements[
+        "envreq:path:collaborating-with-claude-skill"
+    ]
+    assert requirement.kind == "path"
+    assert requirement.scope == "user"
+    assert requirement.check == "Test-Path ~/.agents/skills/collaborating-with-claude/SKILL.md"
+    assert requirement.install == "python install-skill.py"
+    assert requirement.version == "1.0.0"
+    assert requirement.source == "github"
+    assert requirement.description == "Claude bridge skill"
+    assert requirement.path == "~/.agents/skills/collaborating-with-claude/SKILL.md"
+    assert requirement.docs[0]["title"] == "Claude skill"
+    assert requirement.install_prompt == "Install the skill files."
+    assert requirement.verify_prompt == "Check SKILL.md exists."
+    assert requirement.notes == ["Use user scope."]
 
 
 def test_parse_config_falls_back_when_active_profile_missing() -> None:
@@ -1098,8 +1118,10 @@ models:
       max_tokens: 8192
       max_context_tokens: 128000
 environment:
-  cli_tools:
-    gitnexus:
+  requirements:
+    envreq:executable:gitnexus:
+      kind: executable
+      name: gitnexus
       command: gitnexus
       check: gitnexus --version
 """.strip(),
@@ -1112,7 +1134,7 @@ environment:
         config = ConfigLoader().load()
 
     workspace_data = ConfigLoader()._load_yaml(workspace_path)
-    assert "gitnexus" in config.environment.cli_tools
+    assert "envreq:executable:gitnexus" in config.environment.requirements
     assert "environment" not in workspace_data
     assert workspace_data["meta"]["workspace_bootstrapped"] is True
     assert "modes" in workspace_data

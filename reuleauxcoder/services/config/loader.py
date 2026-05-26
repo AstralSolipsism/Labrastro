@@ -15,9 +15,8 @@ from reuleauxcoder.domain.config.models import (
     ContextConfig,
     DIAGNOSTICS_CONFIG_FIELDS,
     DiagnosticsConfig,
-    EnvironmentCLIToolConfig,
     EnvironmentConfig,
-    EnvironmentSkillConfig,
+    EnvironmentRequirementConfig,
     GitHubConfig,
     DEFAULT_BUILTIN_TOOL_COMPONENTS,
     DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
@@ -534,25 +533,17 @@ class ConfigLoader:
             for rule in approval_config.get("rules", DEFAULTS["approval_rules"])
         ]
 
-        cli_tools: dict[str, EnvironmentCLIToolConfig] = {}
-        cli_tools_data = environment_config.get("cli_tools", {})
-        if isinstance(cli_tools_data, dict):
-            for name, tool_data in cli_tools_data.items():
-                if not isinstance(tool_data, dict):
+        environment_requirements: dict[str, EnvironmentRequirementConfig] = {}
+        requirements_data = environment_config.get("requirements", {})
+        if isinstance(requirements_data, dict):
+            for requirement_id, requirement_data in requirements_data.items():
+                if not isinstance(requirement_data, dict):
                     continue
-                cli_tools[str(name)] = EnvironmentCLIToolConfig.from_dict(
-                    str(name), tool_data
+                requirement = EnvironmentRequirementConfig.from_dict(
+                    str(requirement_id), requirement_data
                 )
-
-        skills: dict[str, EnvironmentSkillConfig] = {}
-        skills_data = environment_config.get("skills", {})
-        if isinstance(skills_data, dict):
-            for name, skill_data in skills_data.items():
-                if not isinstance(skill_data, dict):
-                    continue
-                skills[str(name)] = EnvironmentSkillConfig.from_dict(
-                    str(name), skill_data
-                )
+                if requirement.id:
+                    environment_requirements[requirement.id] = requirement
 
         capability_packages: dict[str, CapabilityPackageConfig] = {}
         raw_capability_packages = ensure_default_capability_packages(
@@ -705,7 +696,7 @@ class ConfigLoader:
             github=GitHubConfig.from_dict(
                 github_config if isinstance(github_config, dict) else {}
             ),
-            environment=EnvironmentConfig(cli_tools=cli_tools, skills=skills),
+            environment=EnvironmentConfig(requirements=environment_requirements),
             session_auto_save=session_config.get(
                 "auto_save", DEFAULTS["session_auto_save"]
             ),
@@ -805,8 +796,8 @@ class ConfigLoader:
                         "dispatch": {
                             "profile": "Best for checking and configuring local workspace environment components from the server manifest.",
                             "examples": [
-                                "Check whether required CLI, MCP, and Skill components are available.",
-                                "Configure missing local tools declared by the environment manifest.",
+                                "Check whether required environment resources are available.",
+                                "Configure missing local resources declared by the environment manifest.",
                             ],
                             "avoid": ["General implementation and code review tasks."],
                         },
@@ -824,7 +815,7 @@ class ConfigLoader:
                         "dispatch": {
                             "profile": "Best for reading repository and documentation bundles and producing capability package drafts.",
                             "examples": [
-                                "Analyze a GitHub repository README and docs to infer CLI, MCP, and Skill installation details.",
+                                "Analyze a GitHub repository README and docs to infer skills, MCP servers, and environment requirements.",
                                 "Extract credentials, risks, install steps, and usage instructions for a capability package.",
                             ],
                             "avoid": ["Executing install commands."],

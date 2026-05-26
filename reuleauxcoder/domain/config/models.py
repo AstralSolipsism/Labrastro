@@ -13,11 +13,18 @@ from reuleauxcoder.domain.agent_runtime.models import (
     RuntimeProfileConfig,
     resolve_capability_refs,
 )
+from reuleauxcoder.domain.environment_requirements import (
+    EnvironmentPlacement,
+    environment_requirement_kind_from_id,
+    environment_requirement_name_from_id,
+    normalize_environment_placement,
+    normalize_environment_requirement_id,
+    normalize_environment_requirement_kind,
+)
 
 
 MCPPlacement = Literal["server", "peer", "both"]
 MCPDistribution = Literal["command", "artifact"]
-CLIPlacement = Literal["server", "local", "both"]
 ProviderType = Literal["openai_chat", "anthropic_messages", "openai_responses"]
 ProviderCompat = Literal["generic", "deepseek", "kimi", "glm", "qwen", "zenmux"]
 
@@ -116,7 +123,7 @@ DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
     "dispatch": {
         "profile": (
             "Best for reading the environment manifest and checking or configuring "
-            "local workspace CLI, MCP, and Skill components from that manifest."
+            "local workspace environment requirements from that manifest."
         ),
         "examples": [
             "Check whether the current workspace satisfies the server environment manifest",
@@ -139,8 +146,8 @@ DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
     "runtime_profile": DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID,
     "dispatch": {
         "profile": (
-            "Best for analyzing README, docs, and project notes to extract MCP, "
-            "Skill, and CLI installation and usage instructions into a structured draft."
+            "Best for analyzing README, docs, and project notes to extract skills, "
+            "MCP servers, and environment requirements into a structured draft."
         ),
         "examples": [
             "Generate a capability package draft from a GitHub repository README",
@@ -685,7 +692,7 @@ class MCPServerConfig:
     launch: MCPLaunchConfig | None = None
     artifacts: dict[str, MCPArtifactConfig] = field(default_factory=dict)
     permissions: dict[str, Any] = field(default_factory=dict)
-    requirements: dict[str, str] = field(default_factory=dict)
+    environment_requirement_refs: list[str] = field(default_factory=list)
     build: dict[str, Any] = field(default_factory=dict)
     check: str = ""
     install: str = ""
@@ -722,7 +729,7 @@ class MCPServerConfig:
                 for platform, artifact in self.artifacts.items()
             },
             "permissions": self.permissions,
-            "requirements": self.requirements,
+            "environment_requirement_refs": list(self.environment_requirement_refs),
             "build": self.build,
             "check": self.check,
             "install": self.install,
@@ -777,7 +784,7 @@ class MCPServerConfig:
             else None
         )
         raw_permissions = d.get("permissions", {})
-        raw_requirements = d.get("requirements", {})
+        raw_environment_requirement_refs = d.get("environment_requirement_refs", [])
         raw_build = d.get("build", {})
         raw_args = d.get("args", [])
         raw_env = d.get("env", {})
@@ -800,10 +807,8 @@ class MCPServerConfig:
             permissions=(
                 dict(raw_permissions) if isinstance(raw_permissions, dict) else {}
             ),
-            requirements=(
-                {str(k): str(v) for k, v in raw_requirements.items()}
-                if isinstance(raw_requirements, dict)
-                else {}
+            environment_requirement_refs=_string_list_config_value(
+                raw_environment_requirement_refs
             ),
             build=dict(raw_build) if isinstance(raw_build, dict) else {},
             check=str(d.get("check", "")),
@@ -1486,18 +1491,28 @@ def _mask_secret_hint(value: str) -> str:
 
 
 @dataclass
-class EnvironmentCLIToolConfig:
-    """Declarative CLI tool entry consumed by environment-capable Agents."""
+class EnvironmentRequirementConfig:
+    """Declarative environment requirement consumed by environment-capable Agents."""
 
+    id: str
+    kind: str
     name: str
-    command: str = ""
     enabled: bool = True
-    placement: CLIPlacement = "local"
+    placement: EnvironmentPlacement = "peer"
     tags: list[str] = field(default_factory=list)
     requirements: dict[str, str] = field(default_factory=dict)
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: Optional[str] = None
     check: str = ""
     install: str = ""
+    configure: str = ""
     version: Optional[str] = None
+    runtime: str = ""
+    language: str = ""
+    scope: str = ""
+    path: str = ""
     source: str = ""
     description: str = ""
     repo_url: str = ""
@@ -1516,50 +1531,103 @@ class EnvironmentCLIToolConfig:
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
-            "command": self.command,
+            "id": self.id,
+            "kind": self.kind,
+            "name": self.name,
             "enabled": self.enabled,
             "placement": self.placement,
-            "tags": list(self.tags),
-            "requirements": dict(self.requirements),
-            "check": self.check,
-            "install": self.install,
-            "source": self.source,
-            "description": self.description,
-            "repo_url": self.repo_url,
-            "docs": [dict(item) for item in self.docs],
-            "evidence": [dict(item) for item in self.evidence],
-            "install_prompt": self.install_prompt,
-            "verify_prompt": self.verify_prompt,
-            "notes": list(self.notes),
-            "credentials": list(self.credentials),
-            "risk_level": self.risk_level,
-            "last_action": self.last_action,
-            "last_updated": self.last_updated,
-            "component_id": self.component_id,
-            "package_ids": list(self.package_ids),
-            "managed_by": self.managed_by,
         }
+        if self.tags:
+            data["tags"] = list(self.tags)
+        if self.requirements:
+            data["requirements"] = dict(self.requirements)
+        if self.command:
+            data["command"] = self.command
+        if self.args:
+            data["args"] = list(self.args)
+        if self.env:
+            data["env"] = dict(self.env)
+        if self.cwd is not None:
+            data["cwd"] = self.cwd
+        if self.check:
+            data["check"] = self.check
+        if self.install:
+            data["install"] = self.install
+        if self.configure:
+            data["configure"] = self.configure
         if self.version is not None:
             data["version"] = self.version
+        if self.runtime:
+            data["runtime"] = self.runtime
+        if self.language:
+            data["language"] = self.language
+        if self.scope:
+            data["scope"] = self.scope
+        if self.path:
+            data["path"] = self.path
+        if self.source:
+            data["source"] = self.source
+        if self.description:
+            data["description"] = self.description
+        if self.repo_url:
+            data["repo_url"] = self.repo_url
+        if self.docs:
+            data["docs"] = [dict(item) for item in self.docs]
+        if self.evidence:
+            data["evidence"] = [dict(item) for item in self.evidence]
+        if self.install_prompt:
+            data["install_prompt"] = self.install_prompt
+        if self.verify_prompt:
+            data["verify_prompt"] = self.verify_prompt
+        if self.notes:
+            data["notes"] = list(self.notes)
+        if self.credentials:
+            data["credentials"] = list(self.credentials)
+        if self.risk_level:
+            data["risk_level"] = self.risk_level
+        if self.last_action:
+            data["last_action"] = self.last_action
+        if self.last_updated:
+            data["last_updated"] = self.last_updated
+        if self.component_id:
+            data["component_id"] = self.component_id
+        if self.package_ids:
+            data["package_ids"] = list(self.package_ids)
+        if self.managed_by:
+            data["managed_by"] = self.managed_by
         return data
 
     @classmethod
-    def from_dict(cls, name: str, d: dict[str, Any]) -> "EnvironmentCLIToolConfig":
-        if "capabilities" in d:
-            raise ValueError(
-                "environment.cli_tools capabilities was removed; use tags for component labeling"
-            )
+    def from_dict(cls, requirement_id: str, d: dict[str, Any]) -> "EnvironmentRequirementConfig":
         raw_tags = d.get("tags", [])
         raw_requirements = d.get("requirements", {})
-        raw_placement = str(d.get("placement", "local")).lower()
-        placement: CLIPlacement
-        if raw_placement in {"server", "both"}:
-            placement = raw_placement  # type: ignore[assignment]
-        else:
-            placement = "local"
-        return cls(
+        raw_args = d.get("args", [])
+        raw_env = d.get("env", {})
+        raw_requirement_id = str(d.get("id") or requirement_id)
+        placement = normalize_environment_placement(d.get("placement", "peer"))
+        kind = str(
+            d.get("kind")
+            or d.get("resource_kind")
+            or d.get("requirement_kind")
+            or ""
+        ).strip().lower()
+        kind = normalize_environment_requirement_kind(
+            kind or environment_requirement_kind_from_id(raw_requirement_id)
+        )
+        name = str(
+            d.get("name") or environment_requirement_name_from_id(raw_requirement_id)
+        ).strip()
+        if not name:
+            name = raw_requirement_id.strip()
+        normalized_id = normalize_environment_requirement_id(
+            raw_requirement_id,
+            kind=kind,
             name=name,
-            command=str(d.get("command", "")),
+        )
+        return cls(
+            id=normalized_id,
+            kind=kind,
+            name=name,
             enabled=_bool_config_value(d.get("enabled", True)),
             placement=placement,
             tags=(
@@ -1572,104 +1640,24 @@ class EnvironmentCLIToolConfig:
                 if isinstance(raw_requirements, dict)
                 else {}
             ),
-            check=str(d.get("check", "")),
-            install=str(d.get("install", "")),
-            version=str(d["version"]) if d.get("version") is not None else None,
-            source=str(d.get("source", "")),
-            description=str(d.get("description", "")),
-            repo_url=str(d.get("repo_url", "")),
-            docs=_docs_config_value(d.get("docs", [])),
-            evidence=_string_dict_list_config_value(d.get("evidence", [])),
-            install_prompt=str(d.get("install_prompt", "")),
-            verify_prompt=str(d.get("verify_prompt", "")),
-            notes=_string_list_config_value(d.get("notes", [])),
-            credentials=_string_list_config_value(d.get("credentials", [])),
-            risk_level=str(d.get("risk_level", "")),
-            last_action=str(d.get("last_action", "")),
-            last_updated=str(d.get("last_updated", "")),
-            component_id=str(d.get("component_id", "")),
-            package_ids=_string_list_config_value(d.get("package_ids", [])),
-            managed_by=str(d.get("managed_by", "")),
-        )
-
-
-@dataclass
-class EnvironmentSkillConfig:
-    """Declarative skill entry consumed by environment-capable Agents."""
-
-    name: str
-    enabled: bool = True
-    scope: str = "project"
-    check: str = ""
-    install: str = ""
-    version: Optional[str] = None
-    source: str = ""
-    description: str = ""
-    path_hint: Optional[str] = None
-    requirements: dict[str, str] = field(default_factory=dict)
-    repo_url: str = ""
-    docs: list[dict[str, str]] = field(default_factory=list)
-    evidence: list[dict[str, str]] = field(default_factory=list)
-    install_prompt: str = ""
-    verify_prompt: str = ""
-    notes: list[str] = field(default_factory=list)
-    credentials: list[str] = field(default_factory=list)
-    risk_level: str = ""
-    last_action: str = ""
-    last_updated: str = ""
-    component_id: str = ""
-    package_ids: list[str] = field(default_factory=list)
-    managed_by: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "enabled": self.enabled,
-            "scope": self.scope,
-            "check": self.check,
-            "install": self.install,
-            "source": self.source,
-            "description": self.description,
-            "requirements": dict(self.requirements),
-            "repo_url": self.repo_url,
-            "docs": [dict(item) for item in self.docs],
-            "evidence": [dict(item) for item in self.evidence],
-            "install_prompt": self.install_prompt,
-            "verify_prompt": self.verify_prompt,
-            "notes": list(self.notes),
-            "credentials": list(self.credentials),
-            "risk_level": self.risk_level,
-            "last_action": self.last_action,
-            "last_updated": self.last_updated,
-            "component_id": self.component_id,
-            "package_ids": list(self.package_ids),
-            "managed_by": self.managed_by,
-        }
-        if self.version is not None:
-            data["version"] = self.version
-        if self.path_hint is not None:
-            data["path_hint"] = self.path_hint
-        return data
-
-    @classmethod
-    def from_dict(cls, name: str, d: dict[str, Any]) -> "EnvironmentSkillConfig":
-        raw_requirements = d.get("requirements", {})
-        return cls(
-            name=name,
-            enabled=_bool_config_value(d.get("enabled", True)),
-            scope=str(d.get("scope", "project") or "project"),
-            check=str(d.get("check", "")),
-            install=str(d.get("install", "")),
-            version=str(d["version"]) if d.get("version") is not None else None,
-            source=str(d.get("source", "")),
-            description=str(d.get("description", "")),
-            path_hint=(
-                str(d["path_hint"]) if d.get("path_hint") is not None else None
-            ),
-            requirements=(
-                {str(k): str(v) for k, v in raw_requirements.items()}
-                if isinstance(raw_requirements, dict)
+            command=str(d.get("command", "")),
+            args=[str(item) for item in raw_args] if isinstance(raw_args, list) else [],
+            env=(
+                {str(k): str(v) for k, v in raw_env.items()}
+                if isinstance(raw_env, dict)
                 else {}
             ),
+            cwd=str(d["cwd"]) if d.get("cwd") is not None else None,
+            check=str(d.get("check", "")),
+            install=str(d.get("install", "")),
+            configure=str(d.get("configure", "")),
+            version=str(d["version"]) if d.get("version") is not None else None,
+            runtime=str(d.get("runtime", "")),
+            language=str(d.get("language", "")),
+            scope=str(d.get("scope", "")),
+            path=str(d.get("path") or d.get("path_hint") or ""),
+            source=str(d.get("source", "")),
+            description=str(d.get("description", "")),
             repo_url=str(d.get("repo_url", "")),
             docs=_docs_config_value(d.get("docs", [])),
             evidence=_string_dict_list_config_value(d.get("evidence", [])),
@@ -1688,10 +1676,9 @@ class EnvironmentSkillConfig:
 
 @dataclass
 class EnvironmentConfig:
-    """Server-authoritative lightweight CLI environment manifest."""
+    """Server-authoritative environment requirements manifest."""
 
-    cli_tools: dict[str, EnvironmentCLIToolConfig] = field(default_factory=dict)
-    skills: dict[str, EnvironmentSkillConfig] = field(default_factory=dict)
+    requirements: dict[str, EnvironmentRequirementConfig] = field(default_factory=dict)
 
 
 def _bool_config_value(value: Any) -> bool:

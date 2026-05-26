@@ -7,7 +7,7 @@
     Config,
     DIAGNOSTICS_CONFIG_FIELDS,
     DiagnosticsConfig,
-    EnvironmentCLIToolConfig,
+    EnvironmentRequirementConfig,
     LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS,
     LLMTraceDiagnosticsConfig,
     MCPArtifactConfig,
@@ -43,8 +43,10 @@ def test_mcp_server_config_roundtrip() -> None:
     assert restored == config
 
 
-def test_environment_cli_tool_config_roundtrip() -> None:
-    config = EnvironmentCLIToolConfig(
+def test_environment_requirement_config_roundtrip() -> None:
+    config = EnvironmentRequirementConfig(
+        id="envreq:executable:gitnexus",
+        kind="executable",
         name="gitnexus",
         command="gitnexus",
         tags=["repo_index", "git_graph"],
@@ -55,7 +57,10 @@ def test_environment_cli_tool_config_roundtrip() -> None:
         description="Repository indexing CLI",
     )
 
-    restored = EnvironmentCLIToolConfig.from_dict("gitnexus", config.to_dict())
+    restored = EnvironmentRequirementConfig.from_dict(
+        "envreq:executable:gitnexus",
+        config.to_dict(),
+    )
 
     assert restored == config
 
@@ -80,7 +85,7 @@ def test_peer_mcp_server_config_roundtrip() -> None:
             )
         },
         permissions={"tools": {"write_file": "require_approval"}},
-        requirements={"node": "required", "npm": "required"},
+        environment_requirement_refs=["envreq:runtime:node", "envreq:executable:npm"],
         build={"type": "node", "package": "@demo/filesystem"},
     )
 
@@ -120,7 +125,10 @@ def test_mcp_server_config_reads_manifest_fields() -> None:
             "install": "npm install -g gitnexus@1.6.3",
             "source": "npm:gitnexus",
             "description": "Repository indexing MCP server",
-            "requirements": {"node": ">=20", "npm": "required"},
+            "environment_requirement_refs": [
+                "envreq:runtime:node",
+                "envreq:executable:npm",
+            ],
         },
     )
 
@@ -129,7 +137,10 @@ def test_mcp_server_config_reads_manifest_fields() -> None:
     assert config.install == "npm install -g gitnexus@1.6.3"
     assert config.source == "npm:gitnexus"
     assert config.description == "Repository indexing MCP server"
-    assert config.requirements["node"] == ">=20"
+    assert config.environment_requirement_refs == [
+        "envreq:runtime:node",
+        "envreq:executable:npm",
+    ]
 
 
 def test_mcp_server_config_accepts_both_placement() -> None:
