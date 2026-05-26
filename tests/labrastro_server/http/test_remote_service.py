@@ -1550,6 +1550,54 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_admin_environment_requirement_record_rejects_invalid_kind(
+        self, tmp_path: Path
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=tmp_path / "config.yaml",
+        )
+        service.start()
+        try:
+            with pytest.raises(HTTPError) as explicit_kind:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/environment-requirements/record",
+                    {
+                        "environment_requirement": {
+                            "kind": "runttime",
+                            "name": "node",
+                        },
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+            assert explicit_kind.value.code == 400
+            explicit_body = json.loads(explicit_kind.value.read().decode("utf-8"))
+            assert explicit_body["error"] == "invalid_environment_requirement"
+
+            with pytest.raises(HTTPError) as id_kind:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/environment-requirements/record",
+                    {
+                        "environment_requirement": {
+                            "id": "envreq:runttime:node",
+                            "name": "node",
+                        },
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+            assert id_kind.value.code == 400
+            id_body = json.loads(id_kind.value.read().decode("utf-8"))
+            assert id_body["error"] == "invalid_environment_requirement"
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_admin_behavior_catalog_exposes_chat_commands_mentions_ui_actions_tools_and_packages(
         self, tmp_path: Path
     ) -> None:

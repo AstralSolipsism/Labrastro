@@ -1587,10 +1587,17 @@ class RemoteAdminConfigManager:
 
     def record_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _environment_requirement_payload(payload)
-        candidate = EnvironmentRequirementConfig.from_dict(
-            str(item_payload.get("id") or payload.get("id") or ""),
-            item_payload,
-        )
+        try:
+            candidate = EnvironmentRequirementConfig.from_dict(
+                str(item_payload.get("id") or payload.get("id") or ""),
+                item_payload,
+            )
+        except ValueError as exc:
+            return AdminConfigResult(
+                False,
+                {"error": "invalid_environment_requirement", "message": str(exc)},
+                400,
+            )
         if not candidate.id or not candidate.name:
             return AdminConfigResult(
                 False, {"error": "environment_requirement_id_required"}, 400
@@ -1605,7 +1612,14 @@ class RemoteAdminConfigManager:
                 else {}
             )
             merged = {**previous, **item_payload}
-            normalized = EnvironmentRequirementConfig.from_dict(candidate.id, merged)
+            try:
+                normalized = EnvironmentRequirementConfig.from_dict(candidate.id, merged)
+            except ValueError as exc:
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_environment_requirement", "message": str(exc)},
+                    400,
+                )
             items[normalized.id] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
@@ -1661,10 +1675,17 @@ class RemoteAdminConfigManager:
 
     def delete_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _environment_requirement_payload(payload)
-        candidate = EnvironmentRequirementConfig.from_dict(
-            str(item_payload.get("id") or payload.get("id") or ""),
-            item_payload,
-        )
+        try:
+            candidate = EnvironmentRequirementConfig.from_dict(
+                str(item_payload.get("id") or payload.get("id") or ""),
+                item_payload,
+            )
+        except ValueError as exc:
+            return AdminConfigResult(
+                False,
+                {"error": "invalid_environment_requirement", "message": str(exc)},
+                400,
+            )
         item_id = candidate.id
         if not item_id:
             return AdminConfigResult(
@@ -1714,10 +1735,17 @@ class RemoteAdminConfigManager:
 
     def enable_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _environment_requirement_payload(payload)
-        candidate = EnvironmentRequirementConfig.from_dict(
-            str(item_payload.get("id") or payload.get("id") or ""),
-            item_payload,
-        )
+        try:
+            candidate = EnvironmentRequirementConfig.from_dict(
+                str(item_payload.get("id") or payload.get("id") or ""),
+                item_payload,
+            )
+        except ValueError as exc:
+            return AdminConfigResult(
+                False,
+                {"error": "invalid_environment_requirement", "message": str(exc)},
+                400,
+            )
         item_id = candidate.id
         if not item_id:
             return AdminConfigResult(
@@ -1735,7 +1763,14 @@ class RemoteAdminConfigManager:
                     False, {"error": "environment_requirement_not_found"}, 404
                 )
             item["enabled"] = enabled
-            normalized = EnvironmentRequirementConfig.from_dict(item_id, item)
+            try:
+                normalized = EnvironmentRequirementConfig.from_dict(item_id, item)
+            except ValueError as exc:
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_environment_requirement", "message": str(exc)},
+                    400,
+                )
             items[item_id] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
