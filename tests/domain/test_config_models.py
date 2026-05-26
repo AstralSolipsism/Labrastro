@@ -65,6 +65,52 @@ def test_environment_requirement_config_roundtrip() -> None:
     assert restored == config
 
 
+def test_environment_requirement_config_defaults_missing_kind_to_runtime() -> None:
+    config = EnvironmentRequirementConfig.from_dict(
+        "node",
+        {"name": "node"},
+    )
+
+    assert config.id == "envreq:runtime:node"
+    assert config.kind == "runtime"
+
+
+def test_environment_requirement_config_rejects_invalid_explicit_kind() -> None:
+    try:
+        EnvironmentRequirementConfig.from_dict(
+            "node",
+            {"name": "node", "kind": "runttime"},
+        )
+    except ValueError as exc:
+        assert "environment requirement kind" in str(exc)
+    else:
+        raise AssertionError("invalid explicit environment requirement kind was accepted")
+
+
+def test_environment_requirement_config_rejects_invalid_id_kind() -> None:
+    try:
+        EnvironmentRequirementConfig.from_dict(
+            "envreq:runttime:node",
+            {"name": "node"},
+        )
+    except ValueError as exc:
+        assert "environment requirement kind" in str(exc)
+    else:
+        raise AssertionError("invalid environment requirement id kind was accepted")
+
+
+def test_environment_requirement_config_rejects_invalid_id_kind_with_explicit_kind() -> None:
+    try:
+        EnvironmentRequirementConfig.from_dict(
+            "envreq:runttime:node",
+            {"id": "envreq:runttime:node", "name": "node", "kind": "runtime"},
+        )
+    except ValueError as exc:
+        assert "environment requirement kind" in str(exc)
+    else:
+        raise AssertionError("invalid environment requirement id kind was accepted")
+
+
 def test_peer_mcp_server_config_roundtrip() -> None:
     config = MCPServerConfig(
         name="filesystem",

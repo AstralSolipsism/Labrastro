@@ -15,11 +15,10 @@ from reuleauxcoder.domain.agent_runtime.models import (
 )
 from reuleauxcoder.domain.environment_requirements import (
     EnvironmentPlacement,
-    environment_requirement_kind_from_id,
     environment_requirement_name_from_id,
     normalize_environment_placement,
     normalize_environment_requirement_id,
-    normalize_environment_requirement_kind,
+    resolve_environment_requirement_kind,
 )
 
 
@@ -1605,14 +1604,14 @@ class EnvironmentRequirementConfig:
         raw_env = d.get("env", {})
         raw_requirement_id = str(d.get("id") or requirement_id)
         placement = normalize_environment_placement(d.get("placement", "peer"))
-        kind = str(
-            d.get("kind")
-            or d.get("resource_kind")
-            or d.get("requirement_kind")
-            or ""
-        ).strip().lower()
-        kind = normalize_environment_requirement_kind(
-            kind or environment_requirement_kind_from_id(raw_requirement_id)
+        kind = resolve_environment_requirement_kind(
+            raw_requirement_id,
+            candidates=(
+                d.get("kind"),
+                d.get("resource_kind"),
+                d.get("requirement_kind"),
+            ),
+            command=d.get("command"),
         )
         name = str(
             d.get("name") or environment_requirement_name_from_id(raw_requirement_id)

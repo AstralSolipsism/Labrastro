@@ -7,9 +7,8 @@ from enum import Enum
 from typing import Any
 
 from reuleauxcoder.domain.environment_requirements import (
-    ENVIRONMENT_REQUIREMENT_KINDS,
-    environment_requirement_kind_from_id,
     normalize_environment_requirement_id,
+    resolve_environment_requirement_kind,
 )
 
 
@@ -734,24 +733,22 @@ def _environment_requirement_kind(
     item: dict[str, Any],
     config: dict[str, Any],
 ) -> str:
-    candidates = (
+    candidates = [
         item.get("resource_kind"),
         item.get("requirement_kind"),
-        item.get("kind"),
         config.get("resource_kind"),
         config.get("requirement_kind"),
         config.get("kind"),
         config.get("type"),
+    ]
+    item_kind = str(item.get("kind") or "").strip().lower()
+    if item_kind != "environment_requirement":
+        candidates.append(item_kind)
+    return resolve_environment_requirement_kind(
+        item.get("id"),
+        candidates=tuple(candidates),
+        command=config.get("command"),
     )
-    for value in candidates:
-        text = str(value or "").strip().lower()
-        if text in ENVIRONMENT_REQUIREMENT_KINDS:
-            return text
-    raw_id = str(item.get("id") or "").strip()
-    id_kind = environment_requirement_kind_from_id(raw_id)
-    if id_kind:
-        return id_kind
-    return "executable" if config.get("command") else "runtime"
 
 
 def _contributions_from_components(components: list[dict[str, Any]]) -> dict[str, Any]:
