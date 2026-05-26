@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -116,9 +115,6 @@ func (s *Supervisor) Execute(args map[string]any) protocol.ExecToolResult {
 func (s *Supervisor) startServer(ctx context.Context, server protocol.MCPServerManifest) error {
 	if strings.TrimSpace(server.Name) == "" {
 		return fmt.Errorf("peer MCP manifest contains an empty server name")
-	}
-	if err := checkRequirements(server.Requirements); err != nil {
-		return fmt.Errorf("MCP server %s requirements not met: %w", server.Name, err)
 	}
 	distribution := strings.TrimSpace(server.Distribution)
 	if distribution == "" {
@@ -291,25 +287,4 @@ func expandLaunch(launch protocol.MCPLaunchManifest, vars templateVars) protocol
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
-}
-
-func checkRequirements(requirements map[string]string) error {
-	for name, requirement := range requirements {
-		if strings.TrimSpace(requirement) == "" {
-			continue
-		}
-		switch name {
-		case "node", "npm":
-			if _, err := exec.LookPath(name); err != nil {
-				return fmt.Errorf("required runtime %q not found in PATH", name)
-			}
-		default:
-			if requirement == "required" {
-				if _, err := exec.LookPath(name); err != nil {
-					return fmt.Errorf("required runtime %q not found in PATH", name)
-				}
-			}
-		}
-	}
-	return nil
 }

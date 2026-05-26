@@ -76,7 +76,9 @@ def run_mcp_record_cli(args) -> int:
             placement=args.placement,
             distribution=args.distribution,
             version=str(args.version) if args.version else None,
-            requirements=_parse_requirement_entries(list(args.requirement or [])),
+            environment_requirement_refs=_parse_environment_requirement_refs(
+                list(args.environment_requirement_ref or [])
+            ),
             check=str(args.check or ""),
             install=str(args.install or ""),
             source=str(args.source or ""),
@@ -105,19 +107,17 @@ def _parse_env_entries(entries: list[str]) -> dict[str, str]:
     return env
 
 
-def _parse_requirement_entries(entries: list[str]) -> dict[str, str]:
-    requirements: dict[str, str] = {}
+def _parse_environment_requirement_refs(entries: list[str]) -> list[str]:
+    refs: list[str] = []
     for entry in entries:
-        if "=" not in entry:
+        ref = str(entry or "").strip()
+        if not ref.startswith("envreq:"):
             raise ValueError(
-                f"invalid --requirement entry, expected NAME=VALUE: {entry}"
+                f"invalid --environment-requirement-ref entry, expected envreq:<kind>:<name>: {entry}"
             )
-        key, value = entry.split("=", 1)
-        key = key.strip()
-        if not key:
-            raise ValueError(f"invalid --requirement entry, empty name: {entry}")
-        requirements[key] = value
-    return requirements
+        if ref not in refs:
+            refs.append(ref)
+    return refs
 
 
 __all__ = [

@@ -77,7 +77,7 @@ class MCPArtifactManager:
             rel_path.as_posix(),
             sha256,
             launch=None,
-            requirements=None,
+            environment_requirement_refs=None,
             build_update=None,
             placement="peer",
         )
@@ -355,7 +355,10 @@ class MCPArtifactManager:
             rel_path.as_posix(),
             sha256,
             launch=launch,
-            requirements={"node": "required", "npm": "required"},
+            environment_requirement_refs=[
+                "envreq:runtime:node",
+                "envreq:executable:npm",
+            ],
             build_update={
                 "type": "node",
                 "package": package_name,
@@ -567,7 +570,7 @@ class MCPArtifactManager:
         sha256: str,
         *,
         launch: dict[str, Any] | None,
-        requirements: dict[str, str] | None,
+        environment_requirement_refs: list[str] | None,
         build_update: dict[str, Any] | None,
         placement: str = "peer",
     ) -> None:
@@ -585,9 +588,14 @@ class MCPArtifactManager:
         if launch is not None:
             artifact_data["launch"] = launch
         server_data.setdefault("artifacts", {})[platform] = artifact_data
-        if requirements:
-            existing_requirements = server_data.setdefault("requirements", {})
-            existing_requirements.update(requirements)
+        if environment_requirement_refs:
+            refs = [
+                str(ref)
+                for ref in server_data.get("environment_requirement_refs", [])
+                if str(ref).strip()
+            ]
+            refs.extend(str(ref) for ref in environment_requirement_refs if str(ref).strip())
+            server_data["environment_requirement_refs"] = sorted(dict.fromkeys(refs))
         if build_update:
             existing_build = server_data.setdefault("build", {})
             existing_build.update(build_update)

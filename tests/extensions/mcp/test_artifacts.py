@@ -109,7 +109,10 @@ def test_build_node_creates_platform_artifacts_and_updates_config(
     assert server["placement"] == "peer"
     assert server["distribution"] == "artifact"
     assert server["version"] == "1.2.3"
-    assert server["requirements"] == {"node": "required", "npm": "required"}
+    assert server["environment_requirement_refs"] == [
+        "envreq:executable:npm",
+        "envreq:runtime:node",
+    ]
     assert server["build"]["type"] == "node"
     assert server["build"]["package"] == "@demo/browser-mcp"
     assert server["build"]["package_version"] == "1.2.3"
@@ -207,7 +210,10 @@ def test_install_node_peer_defaults_to_windows_and_linux_artifacts(
     assert server["placement"] == "peer"
     assert server["distribution"] == "artifact"
     assert server["version"] == "1.2.3"
-    assert server["requirements"] == {"node": "required", "npm": "required"}
+    assert server["environment_requirement_refs"] == [
+        "envreq:executable:npm",
+        "envreq:runtime:node",
+    ]
     assert set(server["artifacts"]) == {"windows-amd64", "linux-amd64"}
     assert server["artifacts"]["windows-amd64"]["launch"]["args"] == [
         "--root",

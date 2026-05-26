@@ -44,11 +44,11 @@ def parse_args():
     )
 
     env_parser = subparsers.add_parser(
-        "env", help="Record lightweight CLI environment manifest entries"
+        "env", help="Record lightweight environment requirement manifest entries"
     )
     env_subparsers = env_parser.add_subparsers(dest="env_command")
     env_record = env_subparsers.add_parser(
-        "record", help="Record a server-authoritative CLI environment entry"
+        "record", help="Record a server-authoritative executable requirement"
     )
     env_record.add_argument("tool_name")
     env_record.add_argument("--command", required=True, dest="tool_command")
@@ -122,7 +122,7 @@ def parse_args():
     mcp_record.add_argument("--version")
     mcp_record.add_argument("--check")
     mcp_record.add_argument("--install")
-    mcp_record.add_argument("--requirement", action="append", default=[])
+    mcp_record.add_argument("--environment-requirement-ref", action="append", default=[])
     mcp_record.add_argument("--source")
     mcp_record.add_argument("--description")
 

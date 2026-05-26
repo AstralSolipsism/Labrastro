@@ -22,7 +22,10 @@ def test_record_mcp_server_creates_command_manifest(tmp_path: Path) -> None:
             placement="peer",
             distribution="command",
             version="1.6.3",
-            requirements={"node": ">=20", "npm": "required"},
+            environment_requirement_refs=[
+                "envreq:runtime:node",
+                "envreq:executable:npm",
+            ],
             check="gitnexus --version",
             install="npm install -g gitnexus@1.6.3",
             source="npm:gitnexus",
@@ -36,7 +39,10 @@ def test_record_mcp_server_creates_command_manifest(tmp_path: Path) -> None:
     assert server["distribution"] == "command"
     assert server["command"] == "gitnexus"
     assert server["args"] == ["mcp"]
-    assert server["requirements"]["node"] == ">=20"
+    assert server["environment_requirement_refs"] == [
+        "envreq:runtime:node",
+        "envreq:executable:npm",
+    ]
     assert server["check"] == "gitnexus --version"
     assert server["install"] == "npm install -g gitnexus@1.6.3"
 
@@ -94,7 +100,7 @@ def test_run_mcp_record_cli_requires_authoritative_config(
             placement="peer",
             distribution="command",
             version=None,
-            requirement=[],
+            environment_requirement_ref=[],
             check=None,
             install=None,
             source=None,

@@ -5,6 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+
+def _string_list_value(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if value is None or value == "":
+        return []
+    return [str(value)]
+
+
 @dataclass
 class MCPArtifactManifest:
     platform: str
@@ -69,7 +78,7 @@ class MCPServerManifest:
         default_factory=lambda: MCPLaunchManifest(command="")
     )
     permissions: dict[str, Any] = field(default_factory=dict)
-    requirements: dict[str, str] = field(default_factory=dict)
+    environment_requirement_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,7 +88,7 @@ class MCPServerManifest:
             "artifact": self.artifact.to_dict() if self.artifact is not None else None,
             "launch": self.launch.to_dict(),
             "permissions": self.permissions,
-            "requirements": self.requirements,
+            "environment_requirement_refs": list(self.environment_requirement_refs),
         }
 
     @classmethod
@@ -100,10 +109,8 @@ class MCPServerManifest:
                 if isinstance(d.get("permissions", {}), dict)
                 else {}
             ),
-            requirements=(
-                {str(k): str(v) for k, v in d.get("requirements", {}).items()}
-                if isinstance(d.get("requirements", {}), dict)
-                else {}
+            environment_requirement_refs=_string_list_value(
+                d.get("environment_requirement_refs", [])
             ),
         )
 

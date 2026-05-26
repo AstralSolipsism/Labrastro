@@ -200,10 +200,10 @@ def test_parse_mcp_record(monkeypatch: pytest.MonkeyPatch) -> None:
             "gitnexus --version",
             "--install",
             "npm install -g gitnexus@1.6.3",
-            "--requirement",
-            "node=>=20",
-            "--requirement",
-            "npm=required",
+            "--environment-requirement-ref",
+            "envreq:runtime:node",
+            "--environment-requirement-ref",
+            "envreq:executable:npm",
             "--source",
             "npm:gitnexus",
         ],
@@ -219,7 +219,10 @@ def test_parse_mcp_record(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.mcp_arg == ["mcp"]
     assert args.placement == "peer"
     assert args.distribution == "command"
-    assert args.requirement == ["node=>=20", "npm=required"]
+    assert args.environment_requirement_ref == [
+        "envreq:runtime:node",
+        "envreq:executable:npm",
+    ]
 
 
 def test_parse_mcp_install_node_defaults_to_server(monkeypatch: pytest.MonkeyPatch) -> None:
