@@ -1176,6 +1176,57 @@ class RuntimeProfileConfig:
 
 
 @dataclass
+class AgentMemoryPolicyConfig:
+    """Agent-level memory provider policy."""
+
+    enabled: bool = True
+    primary_provider: str = ""
+    read_providers: list[str] = field(default_factory=list)
+    inject: bool = True
+    capture: bool = True
+    token_budget: int | None = None
+    scope_mode: str = "isolated"
+    expose_tools: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AgentMemoryPolicyConfig":
+        if not isinstance(data, dict):
+            return cls()
+        token_budget_raw = data.get("token_budget")
+        token_budget = int(token_budget_raw) if token_budget_raw is not None else None
+        return cls(
+            enabled=_bool_value(data.get("enabled"), True),
+            primary_provider=str(data.get("primary_provider", "") or "").strip(),
+            read_providers=_string_list(data.get("read_providers", [])),
+            inject=_bool_value(data.get("inject"), True),
+            capture=_bool_value(data.get("capture"), True),
+            token_budget=token_budget,
+            scope_mode=str(data.get("scope_mode", "isolated") or "isolated"),
+            expose_tools=_bool_value(data.get("expose_tools"), False),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        if not self.enabled:
+            result["enabled"] = self.enabled
+        if self.primary_provider:
+            result["primary_provider"] = self.primary_provider
+        if self.read_providers:
+            result["read_providers"] = list(self.read_providers)
+        if not self.inject:
+            result["inject"] = self.inject
+        if not self.capture:
+            result["capture"] = self.capture
+        if self.token_budget is not None:
+            result["token_budget"] = self.token_budget
+        if self.scope_mode != "isolated":
+            result["scope_mode"] = self.scope_mode
+        if self.expose_tools:
+            result["expose_tools"] = self.expose_tools
+        return result
+
+
+@dataclass
 class AgentConfig:
     """Server-authoritative Agent configuration."""
 
@@ -1194,6 +1245,7 @@ class AgentConfig:
     capability_refs: list[str] = field(default_factory=list)
     model: AgentModelConfig = field(default_factory=AgentModelConfig)
     prompt: AgentPromptConfig = field(default_factory=AgentPromptConfig)
+    memory: AgentMemoryPolicyConfig = field(default_factory=AgentMemoryPolicyConfig)
     max_concurrent_tasks: int | None = None
     credential_refs: dict[str, str] = field(default_factory=dict)
 
@@ -1239,6 +1291,7 @@ class AgentConfig:
             capability_refs=_string_list(data.get("capability_refs", [])),
             model=AgentModelConfig.from_dict(data.get("model")),
             prompt=AgentPromptConfig.from_dict(data.get("prompt")),
+            memory=AgentMemoryPolicyConfig.from_dict(data.get("memory")),
             max_concurrent_tasks=max_concurrent_tasks,
             credential_refs=_string_dict(data.get("credential_refs", {})),
         )
@@ -1276,6 +1329,9 @@ class AgentConfig:
         prompt = self.prompt.to_dict()
         if prompt:
             result["prompt"] = prompt
+        memory = self.memory.to_dict()
+        if memory:
+            result["memory"] = memory
         if self.max_concurrent_tasks is not None:
             result["max_concurrent_tasks"] = self.max_concurrent_tasks
         if self.credential_refs:

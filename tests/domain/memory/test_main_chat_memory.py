@@ -2,27 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from reuleauxcoder.domain.memory import (
-    MemoryItem,
-    MemoryProvideRequest,
-    MemoryProvider,
-    MemoryScope,
-    SQLiteMemoryRepository,
-)
 from reuleauxcoder.domain.memory.runtime import (
     GLOBAL_MEMORY_PROJECT_ID,
     MAIN_CHAT_MEMORY_NAMESPACE,
     bind_main_chat_memory_scope_to_agent,
     memory_metadata_from_agent,
 )
-
-
-def _account_scope(project_id: str = GLOBAL_MEMORY_PROJECT_ID) -> MemoryScope:
-    return MemoryScope(
-        owner_agent_id="account:u1",
-        memory_namespace=MAIN_CHAT_MEMORY_NAMESPACE,
-        project_id=project_id,
-    )
 
 
 def test_main_chat_scope_uses_account_identity_without_workspace_fallback() -> None:
@@ -54,92 +39,29 @@ def test_main_chat_scope_falls_back_when_peer_has_no_account() -> None:
     assert bind_main_chat_memory_scope_to_agent(agent, peer_info=peer) is False
 
 
-def test_main_chat_global_scope_reads_only_global_memory(tmp_path) -> None:
-    repo = SQLiteMemoryRepository(tmp_path / "memory.sqlite3")
-    provider = MemoryProvider(repo)
-    repo.upsert(
-        MemoryItem.create(
-            scope=_account_scope(),
-            type="preference",
-            abstract="global",
-            content="memory global",
-        )
+def test_memory_metadata_includes_agent_memory_policy_when_configured() -> None:
+    policy = SimpleNamespace(
+        to_dict=lambda: {
+            "primary_provider": "agentmemory",
+            "read_providers": ["agentmemory"],
+            "inject": True,
+            "capture": False,
+        }
     )
-    repo.upsert(
-        MemoryItem.create(
-            scope=_account_scope("project-a"),
-            type="project",
-            abstract="project",
-            content="memory project",
-        )
+    config = SimpleNamespace(
+        memory=SimpleNamespace(default_agent_id="core", default_namespace=""),
+        agent_registry=SimpleNamespace(
+            agents={"reviewer": SimpleNamespace(memory=policy)}
+        ),
     )
-
-    bundle = provider.provide(
-        _account_scope(),
-        MemoryProvideRequest(query="memory", limit=8, token_budget=800),
+    agent = SimpleNamespace(
+        runtime_config=config,
+        agent_config_id="reviewer",
+        agent_id="reviewer",
     )
 
-    assert [item.project_id for item in bundle.items] == [GLOBAL_MEMORY_PROJECT_ID]
+    metadata = memory_metadata_from_agent(agent)
 
-
-def test_main_chat_project_scope_reads_global_current_and_related_projects(tmp_path) -> None:
-    repo = SQLiteMemoryRepository(tmp_path / "memory.sqlite3")
-    provider = MemoryProvider(repo)
-    for project_id, content in [
-        (GLOBAL_MEMORY_PROJECT_ID, "memory global"),
-        ("project-a", "memory current"),
-        ("project-b", "memory related"),
-    ]:
-        repo.upsert(
-            MemoryItem.create(
-                scope=_account_scope(project_id),
-                type="note",
-                abstract=project_id,
-                content=content,
-            )
-        )
-
-    bundle = provider.provide(
-        _account_scope("project-a"),
-        MemoryProvideRequest(query="memory", limit=8, token_budget=800),
-    )
-
-    assert [item.project_id for item in bundle.items] == [
-        GLOBAL_MEMORY_PROJECT_ID,
-        "project-a",
-        "project-b",
-    ]
-
-
-def test_non_main_chat_agent_keeps_strict_agent_project_scope(tmp_path) -> None:
-    repo = SQLiteMemoryRepository(tmp_path / "memory.sqlite3")
-    provider = MemoryProvider(repo)
-    project_a = MemoryScope(
-        owner_agent_id="agent-a", memory_namespace="agent-a", project_id="project-a"
-    )
-    project_b = MemoryScope(
-        owner_agent_id="agent-a", memory_namespace="agent-a", project_id="project-b"
-    )
-    repo.upsert(
-        MemoryItem.create(
-            scope=project_a,
-            type="note",
-            abstract="project-a",
-            content="memory current",
-        )
-    )
-    repo.upsert(
-        MemoryItem.create(
-            scope=project_b,
-            type="note",
-            abstract="project-b",
-            content="memory related",
-        )
-    )
-
-    bundle = provider.provide(
-        project_a,
-        MemoryProvideRequest(query="memory", limit=8, token_budget=800),
-    )
-
-    assert [item.project_id for item in bundle.items] == ["project-a"]
+    assert metadata["owner_agent_id"] == "reviewer"
+    assert metadata["memory_policy"]["primary_provider"] == "agentmemory"
+    assert metadata["memory_policy"]["capture"] is False

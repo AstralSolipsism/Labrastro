@@ -20,6 +20,10 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     resolve_environment_requirement_kind,
 )
+from reuleauxcoder.domain.memory.registry import (
+    MemoryProviderRegistry,
+    MemorySourceRegistry,
+)
 
 
 MCPPlacement = Literal["server", "peer", "both"]
@@ -1208,40 +1212,226 @@ class ContextConfig:
 
 
 @dataclass
-class MemoryConfig:
-    """Agent-scoped private memory provider configuration."""
+class MemoryProviderInstanceConfig:
+    """One configured memory provider adapter instance."""
 
+    adapter: str
     enabled: bool = True
-    backend: str = "sqlite"
-    store_path: str = ".rcoder/memory.sqlite3"
-    default_agent_id: str = "core"
-    default_namespace: str = ""
-    token_budget: int = 800
-    capture_enabled: bool = True
+    config: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryConfig":
+    def from_dict(
+        cls, provider_id: str, data: dict[str, Any] | None
+    ) -> "MemoryProviderInstanceConfig":
         if not isinstance(data, dict):
-            return cls()
+            raise ValueError(f"memory.providers.{provider_id} must be an object")
+        adapter = str(data.get("adapter", "") or "").strip()
+        if not adapter:
+            raise ValueError(f"memory.providers.{provider_id}.adapter is required")
+        extra = {
+            str(key): value
+            for key, value in data.items()
+            if key not in {"adapter", "enabled"}
+        }
         return cls(
+            adapter=adapter,
             enabled=bool(data.get("enabled", True)),
-            backend=str(data.get("backend", "sqlite") or "sqlite"),
-            store_path=str(data.get("store_path", ".rcoder/memory.sqlite3") or ".rcoder/memory.sqlite3"),
-            default_agent_id=str(data.get("default_agent_id", "core") or "core"),
-            default_namespace=str(data.get("default_namespace", "") or ""),
-            token_budget=int(data.get("token_budget", 800) or 800),
-            capture_enabled=bool(data.get("capture_enabled", True)),
+            config=extra,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {"adapter": self.adapter, "enabled": self.enabled}
+        data.update(dict(self.config))
+        return data
+
+
+@dataclass
+class MemorySourceConfig:
+    """One configured memory source connector."""
+
+    adapter: str
+    enabled: bool = True
+    target_provider: str = ""
+    sync_mode: str = "manual"
+    config: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls, source_id: str, data: dict[str, Any] | None
+    ) -> "MemorySourceConfig":
+        if not isinstance(data, dict):
+            raise ValueError(f"memory.sources.{source_id} must be an object")
+        adapter = str(data.get("adapter", "") or "").strip()
+        if not adapter:
+            raise ValueError(f"memory.sources.{source_id}.adapter is required")
+        extra = {
+            str(key): value
+            for key, value in data.items()
+            if key not in {"adapter", "enabled", "target_provider", "sync_mode"}
+        }
+        return cls(
+            adapter=adapter,
+            enabled=bool(data.get("enabled", True)),
+            target_provider=str(data.get("target_provider", "") or "").strip(),
+            sync_mode=str(data.get("sync_mode", "manual") or "manual"),
+            config=extra,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "adapter": self.adapter,
+            "enabled": self.enabled,
+            "target_provider": self.target_provider,
+            "sync_mode": self.sync_mode,
+        }
+        data.update(dict(self.config))
+        return data
+
+
+@dataclass
+class MemoryRuntimeConfig:
+    """Runtime policy for automatic memory injection and capture."""
+
+    inject_default: bool = True
+    capture_default: bool = True
+    token_budget_default: int = 800
+    fail_mode: str = "open"
+    trace_enabled: bool = True
+    trust_policy: str = "wrap_external"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryRuntimeConfig":
+        raw = data if isinstance(data, dict) else {}
+        return cls(
+            inject_default=bool(raw.get("inject_default", True)),
+            capture_default=bool(raw.get("capture_default", True)),
+            token_budget_default=int(raw.get("token_budget_default", 800) or 800),
+            fail_mode=str(raw.get("fail_mode", "open") or "open"),
+            trace_enabled=bool(raw.get("trace_enabled", True)),
+            trust_policy=str(
+                raw.get("trust_policy", "wrap_external") or "wrap_external"
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "inject_default": self.inject_default,
+            "capture_default": self.capture_default,
+            "token_budget_default": self.token_budget_default,
+            "fail_mode": self.fail_mode,
+            "trace_enabled": self.trace_enabled,
+            "trust_policy": self.trust_policy,
+        }
+
+
+@dataclass
+class MemoryToolsConfig:
+    """Agent-visible memory tools policy."""
+
+    enabled: bool = False
+    provider: str = ""
+    allowed_agents: list[str] = field(default_factory=list)
+    recall: bool = False
+    remember: bool = False
+    forget: bool = False
+    list: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryToolsConfig":
+        raw = data if isinstance(data, dict) else {}
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            provider=str(raw.get("provider", "") or "").strip(),
+            allowed_agents=_string_list_config_value(raw.get("allowed_agents", [])),
+            recall=bool(raw.get("recall", False)),
+            remember=bool(raw.get("remember", False)),
+            forget=bool(raw.get("forget", False)),
+            list=bool(raw.get("list", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
-            "backend": self.backend,
-            "store_path": self.store_path,
+            "provider": self.provider,
+            "allowed_agents": list(self.allowed_agents),
+            "recall": self.recall,
+            "remember": self.remember,
+            "forget": self.forget,
+            "list": self.list,
+        }
+
+
+@dataclass
+class MemoryConfig:
+    """Memory provider contract configuration."""
+
+    enabled: bool = False
+    default_provider: str = ""
+    default_agent_id: str = "core"
+    default_namespace: str = ""
+    runtime: MemoryRuntimeConfig = field(default_factory=MemoryRuntimeConfig)
+    providers: dict[str, MemoryProviderInstanceConfig] = field(default_factory=dict)
+    sources: dict[str, MemorySourceConfig] = field(default_factory=dict)
+    tools: MemoryToolsConfig = field(default_factory=MemoryToolsConfig)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryConfig":
+        if not isinstance(data, dict):
+            return cls()
+        removed_fields = sorted(
+            key
+            for key in ("backend", "store_path", "token_budget", "capture_enabled")
+            if key in data
+        )
+        if removed_fields:
+            raise ValueError(
+                "memory config fields "
+                + ", ".join(removed_fields)
+                + " were removed; use memory.providers and memory.runtime"
+            )
+        providers_raw = data.get("providers", {})
+        providers = {
+            str(provider_id): MemoryProviderInstanceConfig.from_dict(
+                str(provider_id), provider_data
+            )
+            for provider_id, provider_data in (
+                providers_raw.items() if isinstance(providers_raw, dict) else []
+            )
+        }
+        sources_raw = data.get("sources", {})
+        sources = {
+            str(source_id): MemorySourceConfig.from_dict(str(source_id), source_data)
+            for source_id, source_data in (
+                sources_raw.items() if isinstance(sources_raw, dict) else []
+            )
+        }
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            default_provider=str(data.get("default_provider", "") or "").strip(),
+            default_agent_id=str(data.get("default_agent_id", "core") or "core"),
+            default_namespace=str(data.get("default_namespace", "") or ""),
+            runtime=MemoryRuntimeConfig.from_dict(data.get("runtime")),
+            providers=providers,
+            sources=sources,
+            tools=MemoryToolsConfig.from_dict(data.get("tools")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "default_provider": self.default_provider,
             "default_agent_id": self.default_agent_id,
             "default_namespace": self.default_namespace,
-            "token_budget": self.token_budget,
-            "capture_enabled": self.capture_enabled,
+            "runtime": self.runtime.to_dict(),
+            "providers": {
+                provider_id: provider.to_dict()
+                for provider_id, provider in sorted(self.providers.items())
+            },
+            "sources": {
+                source_id: source.to_dict()
+                for source_id, source in sorted(self.sources.items())
+            },
+            "tools": self.tools.to_dict(),
         }
 
 
@@ -2106,18 +2296,47 @@ class Config:
             errors.append("tool_output_max_chars must be positive")
         if self.tool_output_max_lines < 1:
             errors.append("tool_output_max_lines must be positive")
-        if self.memory.backend not in {"sqlite", "postgres", "memory"}:
-            errors.append("memory.backend must be one of sqlite, postgres, memory")
-        if self.memory.enabled and not self.memory.default_agent_id.strip():
-            errors.append("memory.default_agent_id is required when memory.enabled is true")
-        if (
-            self.memory.enabled
-            and self.memory.backend == "postgres"
-            and not self.persistence.database_url
-        ):
-            errors.append("memory.backend postgres requires persistence.database_url")
-        if self.memory.token_budget < 1:
-            errors.append("memory.token_budget must be positive")
+        if self.memory.runtime.fail_mode not in {"open", "closed"}:
+            errors.append("memory.runtime.fail_mode must be one of open, closed")
+        if self.memory.runtime.token_budget_default < 1:
+            errors.append("memory.runtime.token_budget_default must be positive")
+        for provider_id, provider in self.memory.providers.items():
+            if not provider.adapter.strip():
+                errors.append(f"memory.providers.{provider_id}.adapter is required")
+            elif not MemoryProviderRegistry.is_adapter_registered(provider.adapter):
+                errors.append(
+                    f"memory.providers.{provider_id}.adapter is not registered"
+                )
+        if self.memory.enabled:
+            if not self.memory.default_provider.strip():
+                errors.append("memory.default_provider is required when memory.enabled is true")
+            elif self.memory.default_provider not in self.memory.providers:
+                errors.append("memory.default_provider references unknown provider")
+            elif not self.memory.providers[self.memory.default_provider].enabled:
+                errors.append("memory.default_provider references disabled provider")
+            if not self.memory.default_agent_id.strip():
+                errors.append("memory.default_agent_id is required when memory.enabled is true")
+        for source_id, source in self.memory.sources.items():
+            if source.enabled and source.target_provider not in self.memory.providers:
+                errors.append(
+                    f"memory.sources.{source_id}.target_provider references unknown provider"
+                )
+            if source.enabled and source.target_provider in self.memory.providers:
+                if not self.memory.providers[source.target_provider].enabled:
+                    errors.append(
+                        f"memory.sources.{source_id}.target_provider references disabled provider"
+                    )
+            if source.enabled and not MemorySourceRegistry.is_adapter_registered(source.adapter):
+                errors.append(
+                    f"memory.sources.{source_id}.adapter is not registered"
+                )
+        if self.memory.tools.enabled:
+            if not self.memory.tools.provider:
+                errors.append("memory.tools.provider is required when memory.tools.enabled is true")
+            elif self.memory.tools.provider not in self.memory.providers:
+                errors.append("memory.tools.provider references unknown provider")
+            elif not self.memory.providers[self.memory.tools.provider].enabled:
+                errors.append("memory.tools.provider references disabled provider")
         if self.run_limits.max_running_agents < 1:
             errors.append("run_limits.max_running_agents must be positive")
         if self.run_limits.max_shells_per_agent < 1:
@@ -2256,6 +2475,28 @@ class Config:
                 if package_ref not in capability_packages:
                     errors.append(
                         f"agent_registry.agents[{agent_id}].capability_refs references missing capability package {package_ref}"
+                    )
+            agent_memory_configured = bool(agent.memory.to_dict())
+            if agent_memory_configured and agent.memory.enabled:
+                primary_provider = (
+                    agent.memory.primary_provider or self.memory.default_provider
+                )
+                if (agent.memory.inject or agent.memory.capture) and not primary_provider:
+                    errors.append(
+                        f"agent_registry.agents[{agent_id}].memory.primary_provider is required when memory is enabled"
+                    )
+                if primary_provider and primary_provider not in self.memory.providers:
+                    errors.append(
+                        f"agent_registry.agents[{agent_id}].memory.primary_provider references unknown memory provider"
+                    )
+                for provider_id in agent.memory.read_providers:
+                    if provider_id not in self.memory.providers:
+                        errors.append(
+                            f"agent_registry.agents[{agent_id}].memory.read_providers references unknown memory provider {provider_id}"
+                        )
+                if agent.memory.token_budget is not None and agent.memory.token_budget < 1:
+                    errors.append(
+                        f"agent_registry.agents[{agent_id}].memory.token_budget must be positive"
                     )
         if len(chat_entrypoint_agent_ids) > 1:
             errors.append(

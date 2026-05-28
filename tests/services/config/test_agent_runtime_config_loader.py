@@ -11,6 +11,7 @@ from reuleauxcoder.domain.config.models import (
     build_agent_run_snapshot,
     resolve_agent_effective_capability_scope,
 )
+from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry
 from reuleauxcoder.interfaces.entrypoint.runner import build_capability_catalog
 from reuleauxcoder.services.config.loader import ConfigLoader
 
@@ -836,6 +837,44 @@ def test_admin_server_settings_update_preserves_runtime_profiles_and_agents() ->
         "model": "cred-model"
     }
     assert manager.data["agent_registry"]["agents"]["reviewer"]["runtime_profile"] == "codex_remote"
+
+
+def test_admin_server_settings_rejects_unregistered_memory_provider_adapter() -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data: dict = {}
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+        def _commit_config(self, data: dict, previous_data: dict):
+            del previous_data
+            self.data = deepcopy(data)
+            return None
+
+    MemoryProviderRegistry.clear_registered_adapters()
+    manager = MemoryAdminManager()
+
+    result = manager.update_server_settings(
+        {
+            "memory": {
+                "enabled": True,
+                "default_provider": "agentmemory",
+                "providers": {
+                    "agentmemory": {
+                        "adapter": "missing_adapter",
+                    }
+                },
+            }
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 400
+    assert result.payload["error"] == "invalid_memory"
+    assert "adapter is not registered" in result.payload["message"]
+    assert manager.data == {}
 
 
 def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None:

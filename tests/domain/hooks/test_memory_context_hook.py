@@ -6,9 +6,9 @@ from reuleauxcoder.domain.hooks.builtin.memory_context import MemoryContextHook
 from reuleauxcoder.domain.hooks.discovery import discover_hook_specs
 from reuleauxcoder.domain.hooks.types import BeforeLLMRequestContext, HookPoint
 from reuleauxcoder.domain.memory import (
-    MemoryBackendUnavailable,
     MemoryBundle,
-    MemoryItem,
+    MemoryBundleFragment,
+    MemoryProviderUnavailable,
     MemoryProvideRequest,
     MemoryScope,
 )
@@ -27,24 +27,29 @@ def _context(metadata: dict) -> BeforeLLMRequestContext:
     )
 
 
-class RecordingProvider:
+class RecordingRuntime:
+    token_budget_default = 800
+
     def __init__(self) -> None:
         self.scopes: list[MemoryScope] = []
         self.requests: list[MemoryProvideRequest] = []
 
-    def provide(
-        self, scope: MemoryScope, request: MemoryProvideRequest
+    def provide_for_llm_request(
+        self, scope: MemoryScope, request: MemoryProvideRequest, *, policy=None
     ) -> MemoryBundle:
         self.scopes.append(scope)
         self.requests.append(request)
         return MemoryBundle(
             scope=scope,
-            items=[
-                MemoryItem.create(
-                    scope=scope,
-                    type="project",
-                    abstract="Testing preference",
-                    content="This agent prefers pytest for verification.",
+            fragments=[
+                MemoryBundleFragment(
+                    id="mem-1",
+                    text="This agent prefers pytest for verification.",
+                    source_provider="fake",
+                    source_kind="project",
+                    trust_tier="user",
+                    score=1.0,
+                    token_estimate=12,
                 )
             ],
             token_estimate=12,
@@ -52,28 +57,32 @@ class RecordingProvider:
         )
 
 
-class UnavailableProvider:
-    def provide(
-        self, scope: MemoryScope, request: MemoryProvideRequest
+class UnavailableRuntime:
+    token_budget_default = 800
+
+    def provide_for_llm_request(
+        self, scope: MemoryScope, request: MemoryProvideRequest, *, policy=None
     ) -> MemoryBundle:
-        raise MemoryBackendUnavailable("database unavailable")
+        raise MemoryProviderUnavailable("provider unavailable")
 
 
-class EmptyProvider:
-    def provide(
-        self, scope: MemoryScope, request: MemoryProvideRequest
+class EmptyRuntime:
+    token_budget_default = 800
+
+    def provide_for_llm_request(
+        self, scope: MemoryScope, request: MemoryProvideRequest, *, policy=None
     ) -> MemoryBundle:
         return MemoryBundle(
             scope=scope,
-            items=[],
+            fragments=[],
             token_estimate=0,
             provenance={"scope_version": 3},
         )
 
 
 def test_memory_context_hook_injects_after_existing_system_messages() -> None:
-    provider = RecordingProvider()
-    hook = MemoryContextHook(provider=provider)
+    runtime = RecordingRuntime()
+    hook = MemoryContextHook(runtime=runtime)
     context = _context(
         {
             "owner_agent_id": "agent-a",
@@ -89,8 +98,8 @@ def test_memory_context_hook_injects_after_existing_system_messages() -> None:
     assert "Private Agent Memory" in result.messages[2]["content"]
     assert "pytest for verification" in result.messages[2]["content"]
     assert result.messages[3]["role"] == "user"
-    assert provider.scopes[0].owner_agent_id == "agent-a"
-    assert provider.requests[0].query == "What should I remember?"
+    assert runtime.scopes[0].owner_agent_id == "agent-a"
+    assert runtime.requests[0].query == "What should I remember?"
     assert result.metadata["memory"]["provided_items"] == 1
     assert result.metadata["memory"]["scope_version"] == 7
 
@@ -99,7 +108,7 @@ def test_memory_context_hook_emits_memory_context_event_with_rendered_prompt() -
     ui_bus = UIEventBus()
     seen = []
     ui_bus.subscribe(seen.append, replay_history=False)
-    hook = MemoryContextHook(provider=RecordingProvider())
+    hook = MemoryContextHook(runtime=RecordingRuntime())
     context = _context(
         {
             "owner_agent_id": "agent-a",
@@ -127,8 +136,8 @@ def test_memory_context_hook_emits_memory_context_event_with_rendered_prompt() -
     assert payload["token_estimate"] == 12
     assert payload["scope"]["owner_agent_id"] == "agent-a"
     assert payload["scope_version"] == 7
-    assert payload["items"][0]["type"] == "project"
-    assert payload["items"][0]["content"] == "This agent prefers pytest for verification."
+    assert payload["fragments"][0]["source_kind"] == "project"
+    assert payload["fragments"][0]["text"] == "This agent prefers pytest for verification."
     assert payload["rendered_context"] == result.messages[2]["content"]
 
 
@@ -136,7 +145,7 @@ def test_memory_context_hook_does_not_emit_event_for_empty_memory() -> None:
     ui_bus = UIEventBus()
     seen = []
     ui_bus.subscribe(seen.append, replay_history=False)
-    hook = MemoryContextHook(provider=EmptyProvider())
+    hook = MemoryContextHook(runtime=EmptyRuntime())
     context = _context({"owner_agent_id": "agent-a", "memory_namespace": "agent-a"})
     context.ui_bus = ui_bus
 
@@ -148,14 +157,14 @@ def test_memory_context_hook_does_not_emit_event_for_empty_memory() -> None:
 
 
 def test_memory_context_hook_fail_closed_without_owner_agent_id() -> None:
-    hook = MemoryContextHook(provider=RecordingProvider())
+    hook = MemoryContextHook(runtime=RecordingRuntime())
 
     with pytest.raises(ValueError, match="owner_agent_id"):
         hook.run(_context({"project_id": "project-1"}))
 
 
-def test_memory_context_hook_skips_when_backend_is_unavailable() -> None:
-    hook = MemoryContextHook(provider=UnavailableProvider())
+def test_memory_context_hook_skips_when_provider_is_unavailable() -> None:
+    hook = MemoryContextHook(runtime=UnavailableRuntime())
     ui_bus = UIEventBus()
     seen = []
     ui_bus.subscribe(seen.append, replay_history=False)
@@ -166,7 +175,7 @@ def test_memory_context_hook_skips_when_backend_is_unavailable() -> None:
 
     assert len(result.messages) == 3
     assert result.metadata["memory"]["status"] == "unavailable"
-    assert "database unavailable" in result.metadata["memory"]["warning"]
+    assert "provider unavailable" in result.metadata["memory"]["warning"]
     assert seen == []
 
 

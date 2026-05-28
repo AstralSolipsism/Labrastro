@@ -11,6 +11,7 @@ from reuleauxcoder.domain.config.models import (
     TOOL_DIAGNOSTICS_CONFIG_FIELDS,
     ProviderConfig,
 )
+from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry
 from reuleauxcoder.domain.config.schema import CONFIG_SCHEMA
 from reuleauxcoder.services.config.loader import ConfigLoader
 from reuleauxcoder.services.config.loader import ConfigEnvironmentError
@@ -407,27 +408,58 @@ models:
 
 
 def test_parse_config_reads_memory_provider_settings() -> None:
-    config = ConfigLoader()._parse_config(
-        {
-            "memory": {
-                "enabled": True,
-                "backend": "sqlite",
-                "store_path": ".rcoder/test-memory.sqlite3",
-                "default_agent_id": "core",
-                "default_namespace": "core-private",
-                "token_budget": 512,
-                "capture_enabled": True,
+    MemoryProviderRegistry.register_adapter("fake_memory", lambda provider_id, config: None)
+    try:
+        config = ConfigLoader()._parse_config(
+            {
+                "memory": {
+                    "enabled": True,
+                    "default_provider": "agentmemory",
+                    "default_agent_id": "core",
+                    "default_namespace": "core-private",
+                    "runtime": {
+                        "inject_default": True,
+                        "capture_default": True,
+                        "token_budget_default": 512,
+                        "fail_mode": "open",
+                    },
+                    "providers": {
+                        "agentmemory": {
+                            "adapter": "fake_memory",
+                            "base_url": "http://127.0.0.1:3111",
+                        }
+                    },
+                    "tools": {
+                        "enabled": False,
+                        "provider": "agentmemory",
+                    },
+                }
             }
-        }
-    )
+        )
 
-    assert config.memory.enabled is True
-    assert config.memory.backend == "sqlite"
-    assert config.memory.store_path == ".rcoder/test-memory.sqlite3"
-    assert config.memory.default_agent_id == "core"
-    assert config.memory.default_namespace == "core-private"
-    assert config.memory.token_budget == 512
-    assert config.memory.capture_enabled is True
+        assert config.memory.enabled is True
+        assert config.memory.default_provider == "agentmemory"
+        assert config.memory.default_agent_id == "core"
+        assert config.memory.default_namespace == "core-private"
+        assert config.memory.runtime.token_budget_default == 512
+        assert config.memory.providers["agentmemory"].adapter == "fake_memory"
+        assert config.memory.providers["agentmemory"].config["base_url"] == "http://127.0.0.1:3111"
+        assert config.validate() == []
+    finally:
+        MemoryProviderRegistry.clear_registered_adapters()
+
+
+def test_parse_config_rejects_legacy_memory_backend_fields() -> None:
+    with pytest.raises(ValueError, match="were removed"):
+        ConfigLoader()._parse_config(
+            {
+                "memory": {
+                    "enabled": True,
+                    "backend": "sqlite",
+                    "store_path": ".rcoder/test-memory.sqlite3",
+                }
+            }
+        )
 
 
 def test_host_config_keeps_session_auto_save_enabled() -> None:

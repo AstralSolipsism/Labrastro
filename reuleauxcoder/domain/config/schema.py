@@ -104,13 +104,43 @@ CONFIG_SCHEMA = {
         },
     },
     "memory": {
-        "enabled": "bool (default: true, ReuleauxCoder core executor private memory provide)",
-        "backend": "string (one of sqlite, postgres, memory; default sqlite)",
-        "store_path": "string (default: .rcoder/memory.sqlite3 for sqlite development backend)",
+        "enabled": "bool (default: false, enable provider-backed memory runtime)",
+        "default_provider": "string (required when enabled, provider id from memory.providers)",
         "default_agent_id": "string (default: core, stable owner for direct core chats)",
         "default_namespace": "string (optional, defaults to owner_agent_id)",
-        "token_budget": "int (default: 800, max private memory tokens injected per request)",
-        "capture_enabled": "bool (default: true, enqueue session/tool capture jobs)",
+        "runtime": {
+            "inject_default": "bool (default: true, automatic context injection)",
+            "capture_default": "bool (default: true, capture session/tool events)",
+            "token_budget_default": "int (default: 800, max memory tokens injected per request)",
+            "fail_mode": "string (open or closed; default open)",
+            "trace_enabled": "bool (default: true, emit diagnostics/trace metadata)",
+            "trust_policy": "string (default: wrap_external)",
+        },
+        "providers": {
+            "provider_id": {
+                "adapter": "string (required, registered memory provider adapter)",
+                "enabled": "bool (optional, default: true)",
+                "...": "adapter-specific fields",
+            }
+        },
+        "sources": {
+            "source_id": {
+                "adapter": "string (required, registered source connector adapter)",
+                "enabled": "bool (optional, default: true)",
+                "target_provider": "string (provider id to receive synced data)",
+                "sync_mode": "string (manual/scheduled/watch; adapter-specific)",
+                "...": "adapter-specific fields",
+            }
+        },
+        "tools": {
+            "enabled": "bool (default: false, expose memory tools to agents)",
+            "provider": "string (provider id used by memory tools)",
+            "allowed_agents": "list of agent ids",
+            "recall": "bool",
+            "remember": "bool",
+            "forget": "bool",
+            "list": "bool",
+        },
     },
     "mcp": {
         "servers": {
@@ -237,6 +267,16 @@ CONFIG_SCHEMA = {
                 "prompt": {
                     "agent_md": "string (optional)",
                     "system_append": "string (optional)",
+                },
+                "memory": {
+                    "enabled": "bool (default true, use global provider defaults unless false)",
+                    "primary_provider": "string (optional, provider used for writes)",
+                    "read_providers": "list of provider ids (optional)",
+                    "inject": "bool (default true, automatic context injection)",
+                    "capture": "bool (default true, capture runtime events)",
+                    "token_budget": "int (optional, overrides memory.runtime token budget)",
+                    "scope_mode": "string (default isolated)",
+                    "expose_tools": "bool (default false, opt into memory tool surface)",
                 },
                 "max_concurrent_tasks": "int (optional)",
                 "credential_refs": "dict of strings (optional)",

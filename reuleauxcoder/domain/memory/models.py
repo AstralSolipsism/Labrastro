@@ -1,11 +1,10 @@
-"""Core models for agent-scoped private memory."""
+"""Provider-contract models for agent-scoped memory."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-import uuid
 
 
 def _now() -> str:
@@ -16,15 +15,23 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
-class MemoryBackendUnavailable(RuntimeError):
-    """Raised when the memory backend cannot serve a non-identity request."""
+class MemoryProviderError(RuntimeError):
+    """Base error raised by memory provider adapters or runtime policy."""
+
+
+class MemoryProviderConfigurationError(MemoryProviderError):
+    """Raised when configured memory providers cannot be resolved."""
+
+
+class MemoryProviderUnavailable(MemoryProviderError):
+    """Raised when a resolved memory provider cannot serve a request."""
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryScope:
     """Private memory partition and task/project coordinates.
 
-    `owner_agent_id` is the security boundary. Project and workspace are scoped
+    `owner_agent_id` is the isolation boundary. Project and workspace are scoped
     coordinates inside that owner, not substitutes for the owner.
     """
 
@@ -118,86 +125,66 @@ class MemoryScope:
         )
 
 
-@dataclass(slots=True)
-class MemoryItem:
-    """One private memory item owned by exactly one agent namespace."""
-
-    id: str
-    owner_agent_id: str
-    memory_namespace: str
-    type: str
-    content: str
-    abstract: str = ""
-    fields: dict[str, Any] = field(default_factory=dict)
-    source_refs: list[dict[str, Any]] = field(default_factory=list)
-    confidence: float = 1.0
-    version: int = 1
-    status: str = "active"
-    project_id: str = ""
-    workspace_id: str = ""
-    repo_id: str = ""
-    goal_id: str = ""
-    task_id: str = ""
-    created_at: str = field(default_factory=_now)
-    updated_at: str = field(default_factory=_now)
+@dataclass(frozen=True, slots=True)
+class MemoryProviderCapabilities:
+    provide: bool = False
+    capture: bool = False
+    remember: bool = False
+    forget: bool = False
+    session_lifecycle: bool = False
+    streaming_events: bool = False
 
     @classmethod
-    def create(
-        cls,
-        *,
-        scope: MemoryScope,
-        type: str,
-        content: str,
-        abstract: str = "",
-        fields: dict[str, Any] | None = None,
-        source_refs: list[dict[str, Any]] | None = None,
-        confidence: float = 1.0,
-    ) -> "MemoryItem":
+    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryProviderCapabilities":
+        raw = data if isinstance(data, dict) else {}
         return cls(
-            id=f"mem_{uuid.uuid4().hex}",
-            owner_agent_id=scope.owner_agent_id,
-            memory_namespace=scope.memory_namespace,
-            type=_clean(type) or "note",
-            content=str(content or ""),
-            abstract=str(abstract or ""),
-            fields=dict(fields or {}),
-            source_refs=[dict(ref) for ref in source_refs or []],
-            confidence=float(confidence),
-            project_id=scope.project_id,
-            workspace_id=scope.workspace_id,
-            repo_id=scope.repo_id,
-            goal_id=scope.goal_id,
-            task_id=scope.task_id,
+            provide=bool(raw.get("provide", False)),
+            capture=bool(raw.get("capture", False)),
+            remember=bool(raw.get("remember", False)),
+            forget=bool(raw.get("forget", False)),
+            session_lifecycle=bool(raw.get("session_lifecycle", False)),
+            streaming_events=bool(raw.get("streaming_events", False)),
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, bool]:
         return {
-            "id": self.id,
-            "owner_agent_id": self.owner_agent_id,
-            "memory_namespace": self.memory_namespace,
-            "type": self.type,
-            "content": self.content,
-            "abstract": self.abstract,
-            "fields": dict(self.fields),
-            "source_refs": [dict(ref) for ref in self.source_refs],
-            "confidence": self.confidence,
-            "version": self.version,
-            "status": self.status,
-            "project_id": self.project_id,
-            "workspace_id": self.workspace_id,
-            "repo_id": self.repo_id,
-            "goal_id": self.goal_id,
-            "task_id": self.task_id,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "provide": self.provide,
+            "capture": self.capture,
+            "remember": self.remember,
+            "forget": self.forget,
+            "session_lifecycle": self.session_lifecycle,
+            "streaming_events": self.streaming_events,
         }
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryQuery:
-    query: str = ""
-    limit: int = 8
-    type_filter: str | None = None
+class MemoryProviderStatus:
+    provider_id: str
+    adapter: str = ""
+    available: bool = True
+    message: str = ""
+    capabilities: MemoryProviderCapabilities = field(
+        default_factory=MemoryProviderCapabilities
+    )
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryProviderDiagnostic:
+    provider_id: str
+    severity: str
+    message: str
+    code: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "severity": self.severity,
+            "message": self.message,
+            "code": self.code,
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,16 +192,63 @@ class MemoryProvideRequest:
     query: str = ""
     token_budget: int = 800
     limit: int = 8
-    type_filter: str | None = None
+    source_kind_filter: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryBundleFragment:
+    id: str
+    text: str
+    source_provider: str
+    source_kind: str
+    trust_tier: str
+    score: float = 0.0
+    token_estimate: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _clean(self.id))
+        object.__setattr__(self, "text", str(self.text or ""))
+        object.__setattr__(self, "source_provider", _clean(self.source_provider))
+        object.__setattr__(self, "source_kind", _clean(self.source_kind) or "memory")
+        object.__setattr__(self, "trust_tier", _clean(self.trust_tier) or "external")
+        object.__setattr__(self, "score", float(self.score or 0.0))
+        token_estimate = int(self.token_estimate or 0)
+        if token_estimate < 1:
+            token_estimate = max(1, len(self.text) // 4) if self.text else 0
+        object.__setattr__(self, "token_estimate", token_estimate)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "source_provider": self.source_provider,
+            "source_kind": self.source_kind,
+            "trust_tier": self.trust_tier,
+            "score": self.score,
+            "token_estimate": self.token_estimate,
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryBundle:
     scope: MemoryScope
-    items: list[MemoryItem] = field(default_factory=list)
+    fragments: list[MemoryBundleFragment] = field(default_factory=list)
     token_estimate: int = 0
     provenance: dict[str, Any] = field(default_factory=dict)
+    diagnostics: list[MemoryProviderDiagnostic] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scope": self.scope.to_dict(),
+            "fragments": [fragment.to_dict() for fragment in self.fragments],
+            "token_estimate": self.token_estimate,
+            "provenance": dict(self.provenance),
+            "diagnostics": [diagnostic.to_dict() for diagnostic in self.diagnostics],
+            "warnings": list(self.warnings),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,18 +261,33 @@ class MemoryCaptureEvent:
 
 @dataclass(frozen=True, slots=True)
 class MemoryCaptureReceipt:
-    job_id: str
-    enqueued: bool
-    scope_version: int
+    provider_id: str
+    accepted: bool
+    status: str = "accepted"
+    metadata: dict[str, Any] = field(default_factory=dict)
+    diagnostics: list[MemoryProviderDiagnostic] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryCaptureJob:
-    job_id: str
-    owner_agent_id: str
-    memory_namespace: str
-    kind: str
-    payload: dict[str, Any]
-    idempotency_key: str | None = None
-    status: str = "queued"
-    created_at: str = ""
+class MemoryRememberItem:
+    text: str
+    source_kind: str = "manual"
+    trust_tier: str = "user"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryForgetSelector:
+    id: str = ""
+    query: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMutationResult:
+    provider_id: str
+    accepted: bool
+    status: str = "accepted"
+    item_ids: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    diagnostics: list[MemoryProviderDiagnostic] = field(default_factory=list)

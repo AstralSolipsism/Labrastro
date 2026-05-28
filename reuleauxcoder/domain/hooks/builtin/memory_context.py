@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from reuleauxcoder.domain.hooks.base import ObserverHook, TransformHook
@@ -14,14 +13,14 @@ from reuleauxcoder.domain.hooks.types import (
     SessionSaveContext,
 )
 from reuleauxcoder.domain.memory import (
-    MemoryBackendUnavailable,
     MemoryBundle,
+    MemoryBundleFragment,
     MemoryCaptureEvent,
-    MemoryProvider,
+    MemoryProviderConfigurationError,
+    MemoryProviderUnavailable,
     MemoryProvideRequest,
+    MemoryRuntime,
     MemoryScope,
-    PostgresMemoryRepository,
-    SQLiteMemoryRepository,
 )
 
 if TYPE_CHECKING:
@@ -44,21 +43,23 @@ def _render_bundle(bundle: MemoryBundle) -> str:
         "## Private Agent Memory",
         "These are private memories for this agent only. Treat them as helpful context, not shared project state.",
     ]
-    for item in bundle.items:
-        title = item.abstract or item.type
-        lines.append(f"- [{item.type}] {title}: {item.content}")
+    for fragment in bundle.fragments:
+        lines.append(
+            f"- [{fragment.source_kind}/{fragment.source_provider}] {fragment.text}"
+        )
     return "\n".join(lines)
 
 
-def _memory_item_event_payload(item: Any) -> dict[str, Any]:
+def _memory_fragment_event_payload(fragment: MemoryBundleFragment) -> dict[str, Any]:
     return {
-        "id": item.id,
-        "type": item.type,
-        "abstract": item.abstract,
-        "content": item.content,
-        "confidence": item.confidence,
-        "version": item.version,
-        "updated_at": item.updated_at,
+        "id": fragment.id,
+        "text": fragment.text,
+        "source_provider": fragment.source_provider,
+        "source_kind": fragment.source_kind,
+        "trust_tier": fragment.trust_tier,
+        "score": fragment.score,
+        "token_estimate": fragment.token_estimate,
+        "metadata": dict(fragment.metadata),
     }
 
 
@@ -77,9 +78,12 @@ def _memory_context_event_payload(
         "scope": bundle.scope.to_dict(),
         "scope_version": bundle.provenance.get("scope_version", 0),
         "query": request.query,
-        "provided_items": len(bundle.items),
+        "provided_items": len(bundle.fragments),
         "token_estimate": bundle.token_estimate,
-        "items": [_memory_item_event_payload(item) for item in bundle.items],
+        "fragments": [
+            _memory_fragment_event_payload(fragment)
+            for fragment in bundle.fragments
+        ],
         "rendered_context": rendered_context,
     }
 
@@ -108,34 +112,6 @@ def _insert_after_system_messages(messages: list[dict[str, Any]], message: dict[
     messages.insert(index, message)
 
 
-def _provider_from_config(config: "Config") -> MemoryProvider:
-    memory_config = getattr(config, "memory", None)
-    backend = str(getattr(memory_config, "backend", "sqlite") or "sqlite")
-    if backend == "postgres":
-        database_url = str(getattr(getattr(config, "persistence", None), "database_url", "") or "")
-        if not database_url:
-            return _UnavailableMemoryProvider("memory.backend=postgres requires persistence.database_url")
-        from labrastro_server.infrastructure.persistence.db import create_postgres_engine
-
-        return MemoryProvider(PostgresMemoryRepository(create_postgres_engine(database_url)))
-    store_path = getattr(memory_config, "store_path", ".rcoder/memory.sqlite3")
-    path = Path(str(store_path or ".rcoder/memory.sqlite3"))
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return MemoryProvider(SQLiteMemoryRepository(path))
-
-
-class _UnavailableMemoryProvider:
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-
-    def provide(self, scope: MemoryScope, request: MemoryProvideRequest) -> MemoryBundle:
-        raise MemoryBackendUnavailable(self.reason)
-
-    def capture(self, scope: MemoryScope, event: MemoryCaptureEvent) -> None:
-        raise MemoryBackendUnavailable(self.reason)
-
-
 @register_hook(HookPoint.BEFORE_LLM_REQUEST, priority=40)
 class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
     """Inject private agent-scoped memory into core LLM requests."""
@@ -143,7 +119,7 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
     def __init__(
         self,
         *,
-        provider: Any,
+        runtime: MemoryRuntime,
         enabled: bool = True,
         default_agent_id: str = "",
         default_namespace: str = "",
@@ -151,7 +127,7 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
         priority: int = 40,
     ) -> None:
         super().__init__(name="memory_context", priority=priority, extension_name="core")
-        self.provider = provider
+        self.runtime = runtime
         self.enabled = enabled
         self.default_agent_id = default_agent_id
         self.default_namespace = default_namespace
@@ -160,13 +136,14 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
     @classmethod
     def create_from_config(cls, config: "Config") -> "MemoryContextHook":
         memory_config = getattr(config, "memory", None)
-        enabled = bool(getattr(memory_config, "enabled", True))
+        runtime = MemoryRuntime.from_config(config)
+        enabled = bool(getattr(memory_config, "enabled", False))
         return cls(
-            provider=_provider_from_config(config),
+            runtime=runtime,
             enabled=enabled,
             default_agent_id=str(getattr(memory_config, "default_agent_id", "core") or "core"),
             default_namespace=str(getattr(memory_config, "default_namespace", "") or ""),
-            token_budget=int(getattr(memory_config, "token_budget", 800) or 800),
+            token_budget=runtime.token_budget_default,
             priority=40,
         )
 
@@ -183,8 +160,16 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
             token_budget=self.token_budget,
         )
         try:
-            bundle = self.provider.provide(scope, request)
-        except MemoryBackendUnavailable as exc:
+            bundle = self.runtime.provide_for_llm_request(
+                scope,
+                request,
+                policy=context.metadata.get("memory_policy")
+                if isinstance(context.metadata.get("memory_policy"), dict)
+                else None,
+            )
+        except MemoryProviderConfigurationError:
+            raise
+        except MemoryProviderUnavailable as exc:
             context.metadata["memory"] = {
                 "status": "unavailable",
                 "warning": str(exc),
@@ -192,7 +177,19 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
                 "memory_namespace": scope.memory_namespace,
             }
             return context
-        if not bundle.items:
+        if not bundle.fragments and bundle.warnings:
+            context.metadata["memory"] = {
+                "status": "unavailable",
+                "warning": "; ".join(bundle.warnings),
+                "owner_agent_id": scope.owner_agent_id,
+                "memory_namespace": scope.memory_namespace,
+                "diagnostics": [
+                    diagnostic.to_dict()
+                    for diagnostic in bundle.diagnostics
+                ],
+            }
+            return context
+        if not bundle.fragments:
             context.metadata["memory"] = {
                 "status": "empty",
                 "provided_items": 0,
@@ -208,7 +205,7 @@ class MemoryContextHook(TransformHook[BeforeLLMRequestContext]):
         )
         context.metadata["memory"] = {
             "status": "provided",
-            "provided_items": len(bundle.items),
+            "provided_items": len(bundle.fragments),
             "owner_agent_id": scope.owner_agent_id,
             "memory_namespace": scope.memory_namespace,
             "scope_version": bundle.provenance.get("scope_version", 0),
@@ -233,33 +230,34 @@ class MemorySessionSaveHook(ObserverHook[SessionSaveContext]):
     def __init__(
         self,
         *,
-        provider: Any,
+        runtime: MemoryRuntime,
         enabled: bool = True,
-        capture_enabled: bool = True,
+        capture_default: bool = True,
         default_agent_id: str = "",
         default_namespace: str = "",
         priority: int = 0,
     ) -> None:
         super().__init__(name="memory_session_capture", priority=priority, extension_name="core")
-        self.provider = provider
+        self.runtime = runtime
         self.enabled = enabled
-        self.capture_enabled = capture_enabled
+        self.capture_default = capture_default
         self.default_agent_id = default_agent_id
         self.default_namespace = default_namespace
 
     @classmethod
     def create_from_config(cls, config: "Config") -> "MemorySessionSaveHook":
         memory_config = getattr(config, "memory", None)
+        runtime = MemoryRuntime.from_config(config)
         return cls(
-            provider=_provider_from_config(config),
-            enabled=bool(getattr(memory_config, "enabled", True)),
-            capture_enabled=bool(getattr(memory_config, "capture_enabled", True)),
+            runtime=runtime,
+            enabled=bool(getattr(memory_config, "enabled", False)),
+            capture_default=runtime.capture_default,
             default_agent_id=str(getattr(memory_config, "default_agent_id", "core") or "core"),
             default_namespace=str(getattr(memory_config, "default_namespace", "") or ""),
         )
 
     def run(self, context: SessionSaveContext) -> None:
-        if not self.enabled or not self.capture_enabled:
+        if not self.enabled or not self.capture_default:
             return
         metadata = dict(context.metadata or {})
         metadata.update(dict(context.session_data.get("memory_scope") or {}))
@@ -269,7 +267,7 @@ class MemorySessionSaveHook(ObserverHook[SessionSaveContext]):
             default_namespace=self.default_namespace,
         )
         session_id = context.session_id or context.session_data.get("session_id") or ""
-        self.provider.capture(
+        self.runtime.capture_event(
             scope,
             MemoryCaptureEvent(
                 kind="session_save",
@@ -280,6 +278,9 @@ class MemorySessionSaveHook(ObserverHook[SessionSaveContext]):
                     else None
                 ),
             ),
+            policy=metadata.get("memory_policy")
+            if isinstance(metadata.get("memory_policy"), dict)
+            else None,
         )
 
 
@@ -290,33 +291,34 @@ class MemoryToolCaptureHook(ObserverHook[AfterToolExecuteContext]):
     def __init__(
         self,
         *,
-        provider: Any,
+        runtime: MemoryRuntime,
         enabled: bool = True,
-        capture_enabled: bool = True,
+        capture_default: bool = True,
         default_agent_id: str = "",
         default_namespace: str = "",
         priority: int = 0,
     ) -> None:
         super().__init__(name="memory_tool_capture", priority=priority, extension_name="core")
-        self.provider = provider
+        self.runtime = runtime
         self.enabled = enabled
-        self.capture_enabled = capture_enabled
+        self.capture_default = capture_default
         self.default_agent_id = default_agent_id
         self.default_namespace = default_namespace
 
     @classmethod
     def create_from_config(cls, config: "Config") -> "MemoryToolCaptureHook":
         memory_config = getattr(config, "memory", None)
+        runtime = MemoryRuntime.from_config(config)
         return cls(
-            provider=_provider_from_config(config),
-            enabled=bool(getattr(memory_config, "enabled", True)),
-            capture_enabled=bool(getattr(memory_config, "capture_enabled", True)),
+            runtime=runtime,
+            enabled=bool(getattr(memory_config, "enabled", False)),
+            capture_default=runtime.capture_default,
             default_agent_id=str(getattr(memory_config, "default_agent_id", "core") or "core"),
             default_namespace=str(getattr(memory_config, "default_namespace", "") or ""),
         )
 
     def run(self, context: AfterToolExecuteContext) -> None:
-        if not self.enabled or not self.capture_enabled:
+        if not self.enabled or not self.capture_default:
             return
         scope = MemoryScope.from_metadata(
             context.metadata,
@@ -325,7 +327,7 @@ class MemoryToolCaptureHook(ObserverHook[AfterToolExecuteContext]):
         )
         tool_call = context.tool_call
         tool_call_id = getattr(tool_call, "id", "") if tool_call is not None else ""
-        self.provider.capture(
+        self.runtime.capture_event(
             scope,
             MemoryCaptureEvent(
                 kind="tool_result",
@@ -345,4 +347,7 @@ class MemoryToolCaptureHook(ObserverHook[AfterToolExecuteContext]):
                     else None
                 ),
             ),
+            policy=context.metadata.get("memory_policy")
+            if isinstance(context.metadata.get("memory_policy"), dict)
+            else None,
         )

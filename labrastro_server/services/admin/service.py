@@ -63,6 +63,7 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
 )
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.domain.llm.models import ToolCall
+from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry, MemorySourceRegistry
 from reuleauxcoder.domain.permission_gateway import (
     PermissionGateway,
     PermissionRequest,
@@ -822,6 +823,10 @@ class RemoteAdminConfigManager:
                     previous_memory,
                     raw_memory,
                 )
+                if isinstance(raw_memory.get("providers"), dict):
+                    merged_memory["providers"] = raw_memory["providers"]
+                if isinstance(raw_memory.get("sources"), dict):
+                    merged_memory["sources"] = raw_memory["sources"]
                 try:
                     memory = MemoryConfig.from_dict(merged_memory)
                 except Exception as exc:
@@ -830,33 +835,131 @@ class RemoteAdminConfigManager:
                         {"error": "invalid_memory", "message": str(exc)},
                         400,
                     )
-                if memory.backend not in {"sqlite", "postgres", "memory"}:
+                if memory.runtime.fail_mode not in {"open", "closed"}:
                     return AdminConfigResult(
                         False,
                         {
                             "error": "invalid_memory",
-                            "message": "memory.backend must be one of sqlite, postgres, memory",
+                            "message": "memory.runtime.fail_mode must be one of open, closed",
                         },
                         400,
                     )
-                if memory.enabled and not memory.default_agent_id.strip():
+                if memory.runtime.token_budget_default < 1:
                     return AdminConfigResult(
                         False,
                         {
                             "error": "invalid_memory",
-                            "message": "memory.default_agent_id is required when memory.enabled is true",
+                            "message": "memory.runtime.token_budget_default must be positive",
                         },
                         400,
                     )
-                if memory.token_budget < 1:
-                    return AdminConfigResult(
-                        False,
-                        {
-                            "error": "invalid_memory",
-                            "message": "memory.token_budget must be positive",
-                        },
-                        400,
-                    )
+                for provider_id, provider in memory.providers.items():
+                    if not MemoryProviderRegistry.is_adapter_registered(provider.adapter):
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": f"memory.providers.{provider_id}.adapter is not registered",
+                            },
+                            400,
+                        )
+                if memory.enabled:
+                    if not memory.default_provider.strip():
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.default_provider is required when memory.enabled is true",
+                            },
+                            400,
+                        )
+                    if memory.default_provider not in memory.providers:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.default_provider references unknown provider",
+                            },
+                            400,
+                        )
+                    if not memory.providers[memory.default_provider].enabled:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.default_provider references disabled provider",
+                            },
+                            400,
+                        )
+                    if not memory.default_agent_id.strip():
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.default_agent_id is required when memory.enabled is true",
+                            },
+                            400,
+                        )
+                for source_id, source in memory.sources.items():
+                    if source.enabled and source.target_provider not in memory.providers:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": f"memory.sources.{source_id}.target_provider references unknown provider",
+                            },
+                            400,
+                        )
+                    if (
+                        source.enabled
+                        and source.target_provider in memory.providers
+                        and not memory.providers[source.target_provider].enabled
+                    ):
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": f"memory.sources.{source_id}.target_provider references disabled provider",
+                            },
+                            400,
+                        )
+                    if source.enabled and not MemorySourceRegistry.is_adapter_registered(source.adapter):
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": f"memory.sources.{source_id}.adapter is not registered",
+                            },
+                            400,
+                        )
+                if memory.tools.enabled:
+                    if not memory.tools.provider:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.tools.provider is required when memory.tools.enabled is true",
+                            },
+                            400,
+                        )
+                    if memory.tools.provider not in memory.providers:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.tools.provider references unknown provider",
+                            },
+                            400,
+                        )
+                    if not memory.providers[memory.tools.provider].enabled:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "invalid_memory",
+                                "message": "memory.tools.provider references disabled provider",
+                            },
+                            400,
+                        )
                 data["memory"] = memory.to_dict()
             if isinstance(raw_approval, dict):
                 previous_approval = (

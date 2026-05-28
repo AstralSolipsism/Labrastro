@@ -2155,7 +2155,16 @@ class TestRemoteRelayHTTPService:
             "  database_url: postgresql://example\n"
             "github:\n"
             "  enabled: false\n"
-            "  webhook_secret: super-secret-value\n",
+            "  webhook_secret: super-secret-value\n"
+            "memory:\n"
+            "  enabled: false\n"
+            "  providers:\n"
+            "    old:\n"
+            "      adapter: missing_old_adapter\n"
+            "  sources:\n"
+            "    old_source:\n"
+            "      adapter: missing_old_source_adapter\n"
+            "      target_provider: old\n",
             encoding="utf-8",
         )
         reloads: list[str] = []
@@ -2176,7 +2185,10 @@ class TestRemoteRelayHTTPService:
             settings = read_body["settings"]
             assert settings["tool_output"]["max_chars"] == 12000
             assert settings["context"]["snip_threshold_chars"] == 1500
-            assert settings["memory"]["backend"] == "sqlite"
+            assert settings["memory"]["enabled"] is False
+            assert settings["memory"]["default_provider"] == ""
+            assert "old" in settings["memory"]["providers"]
+            assert "old_source" in settings["memory"]["sources"]
             assert settings["approval"]["default_mode"] == "require_approval"
             assert "coder" in settings["modes"]["profiles"]
             assert settings["skills"]["enabled"] is True
@@ -2205,12 +2217,21 @@ class TestRemoteRelayHTTPService:
                         },
                         "memory": {
                             "enabled": False,
-                            "capture_enabled": False,
-                            "backend": "memory",
-                            "store_path": ".rcoder/memory.sqlite3",
+                            "default_provider": "",
                             "default_agent_id": "core",
                             "default_namespace": "tests",
-                            "token_budget": 256,
+                            "runtime": {
+                                "inject_default": True,
+                                "capture_default": False,
+                                "token_budget_default": 256,
+                                "fail_mode": "open",
+                            },
+                            "providers": {},
+                            "sources": {},
+                            "tools": {
+                                "enabled": False,
+                                "provider": "",
+                            },
                         },
                         "approval": {
                             "default_mode": "warn",
@@ -2275,6 +2296,9 @@ class TestRemoteRelayHTTPService:
             assert updated["tool_output"]["max_chars"] == 24000
             assert updated["context"]["token_fudge_factor"] == 1.3
             assert updated["memory"]["enabled"] is False
+            assert updated["memory"]["runtime"]["token_budget_default"] == 256
+            assert updated["memory"]["providers"] == {}
+            assert updated["memory"]["sources"] == {}
             assert updated["approval"]["rules"][0]["action"] == "deny"
             assert updated["modes"]["active"] == "review"
             assert updated["modes"]["profiles"]["review"]["tools"] == ["read_file"]
@@ -2290,6 +2314,8 @@ class TestRemoteRelayHTTPService:
             assert raw["github"]["webhook_secret"] == "super-secret-value"
             assert raw["persistence"]["backend"] == "postgres"
             assert raw["persistence"]["database_url"] == "postgresql://example"
+            assert raw["memory"]["providers"] == {}
+            assert raw["memory"]["sources"] == {}
             assert len(reloads) == 1
         finally:
             service.stop()
