@@ -10,12 +10,14 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ArtifactType,
     ExecutionLocation,
     ExecutorType,
+    ModelRequestOrigin,
     MergeStatus,
     RuntimeProfileConfig,
     TaskArtifact,
     TaskSessionRef,
     TaskStatus,
     TriggerMode,
+    WorkerKind,
 )
 
 __all__ = [
@@ -28,10 +30,12 @@ __all__ = [
     "ArtifactType",
     "ExecutionLocation",
     "ExecutorType",
+    "ModelRequestOrigin",
     "MergeStatus",
     "RuntimeProfileConfig",
     "TaskArtifact",
     "TaskSessionRef",
     "TaskStatus",
     "TriggerMode",
+    "WorkerKind",
 ]

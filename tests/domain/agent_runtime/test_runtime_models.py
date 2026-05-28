@@ -37,12 +37,31 @@ def test_runtime_profile_config_preserves_cli_isolation_and_credentials() -> Non
     assert profile.executor.value == "codex"
     assert profile.execution_location == models.ExecutionLocation.REMOTE_SERVER
     assert profile.execution_location.value == "remote_server"
+    assert profile.worker_kind == models.WorkerKind.SERVER_WORKER
+    assert profile.model_request_origin == models.ModelRequestOrigin.SERVER_WORKER_CLI
     assert profile.model == "gpt-5.2-codex"
     assert profile.runtime_home_policy == "per_task"
     assert profile.config_isolation == "per_agent"
     assert profile.credential_refs["model"] == "cred_codex_team"
     assert profile.credential_refs["git"] == "cred_github_repo_writer"
     assert profile.mcp["servers"] == ["github"]
+
+
+def test_runtime_profile_config_infers_local_cli_origin_for_local_cli_executor() -> None:
+    models = _models()
+
+    profile = models.RuntimeProfileConfig.from_dict(
+        "codex_local",
+        {
+            "executor": "codex",
+            "execution_location": "local_workspace",
+        },
+    )
+
+    assert profile.worker_kind == models.WorkerKind.LOCAL_PEER
+    assert profile.model_request_origin == models.ModelRequestOrigin.LOCAL_CLI
+    assert profile.to_dict()["worker_kind"] == "local_peer"
+    assert profile.to_dict()["model_request_origin"] == "local_cli"
 
 
 def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> None:

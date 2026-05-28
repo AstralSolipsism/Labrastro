@@ -30,6 +30,22 @@ class ExecutionLocation(str, Enum):
     DAEMON_WORKTREE = "daemon_worktree"
 
 
+class WorkerKind(str, Enum):
+    """Runtime worker identity allowed to claim an AgentRun."""
+
+    LOCAL_PEER = "local_peer"
+    SERVER_WORKER = "server_worker"
+    SANDBOX_WORKER = "sandbox_worker"
+
+
+class ModelRequestOrigin(str, Enum):
+    """Where LLM provider requests originate for a resolved AgentRun."""
+
+    SERVER = "server"
+    SERVER_WORKER_CLI = "server_worker_cli"
+    LOCAL_CLI = "local_cli"
+
+
 class TriggerMode(str, Enum):
     """How an Agent execution was triggered."""
 
@@ -161,6 +177,38 @@ EXECUTION_POLICIES = {"allow", "deny", "require_user", "escalate", "inherit"}
 def _choice(value: Any, allowed: set[str], fallback: str) -> str:
     text = str(value or "").strip().lower()
     return text if text in allowed else fallback
+
+
+def _runtime_worker_kind(
+    value: Any,
+    *,
+    execution_location: ExecutionLocation,
+    sandbox: dict[str, Any] | None = None,
+) -> WorkerKind:
+    text = str(value or "").strip()
+    if text:
+        return WorkerKind(text)
+    if sandbox:
+        return WorkerKind.SANDBOX_WORKER
+    if execution_location == ExecutionLocation.LOCAL_WORKSPACE:
+        return WorkerKind.LOCAL_PEER
+    return WorkerKind.SERVER_WORKER
+
+
+def _runtime_model_request_origin(
+    value: Any,
+    *,
+    executor: ExecutorType,
+    worker_kind: WorkerKind,
+) -> ModelRequestOrigin:
+    text = str(value or "").strip()
+    if text:
+        return ModelRequestOrigin(text)
+    if executor in {ExecutorType.CODEX, ExecutorType.CLAUDE, ExecutorType.GEMINI}:
+        if worker_kind == WorkerKind.LOCAL_PEER:
+            return ModelRequestOrigin.LOCAL_CLI
+        return ModelRequestOrigin.SERVER_WORKER_CLI
+    return ModelRequestOrigin.SERVER
 
 
 def _bool_value(value: Any, fallback: bool) -> bool:
@@ -1048,6 +1096,8 @@ class RuntimeProfileConfig:
     id: str
     executor: ExecutorType = ExecutorType.REULEAUXCODER
     execution_location: ExecutionLocation = ExecutionLocation.REMOTE_SERVER
+    worker_kind: WorkerKind = WorkerKind.SERVER_WORKER
+    model_request_origin: ModelRequestOrigin = ModelRequestOrigin.SERVER
     model: str = ""
     command: str | None = None
     args: list[str] = field(default_factory=list)
@@ -1065,12 +1115,27 @@ class RuntimeProfileConfig:
         if not isinstance(data, dict):
             data = {}
         _reject_plaintext_secret_container(data, owner="runtime profile")
+        executor = ExecutorType(str(data.get("executor", "reuleauxcoder")))
+        execution_location = ExecutionLocation(
+            str(data.get("execution_location", "remote_server"))
+        )
+        sandbox = _dict_value(data.get("sandbox", {}))
+        worker_kind = _runtime_worker_kind(
+            data.get("worker_kind"),
+            execution_location=execution_location,
+            sandbox=sandbox,
+        )
+        model_request_origin = _runtime_model_request_origin(
+            data.get("model_request_origin"),
+            executor=executor,
+            worker_kind=worker_kind,
+        )
         return cls(
             id=str(profile_id),
-            executor=ExecutorType(str(data.get("executor", "reuleauxcoder"))),
-            execution_location=ExecutionLocation(
-                str(data.get("execution_location", "remote_server"))
-            ),
+            executor=executor,
+            execution_location=execution_location,
+            worker_kind=worker_kind,
+            model_request_origin=model_request_origin,
             model=str(data.get("model", "") or ""),
             command=str(data["command"]) if data.get("command") is not None else None,
             args=_string_list(data.get("args", [])),
@@ -1086,6 +1151,8 @@ class RuntimeProfileConfig:
         result: dict[str, Any] = {
             "executor": self.executor.value,
             "execution_location": self.execution_location.value,
+            "worker_kind": self.worker_kind.value,
+            "model_request_origin": self.model_request_origin.value,
         }
         if self.command is not None:
             result["command"] = self.command

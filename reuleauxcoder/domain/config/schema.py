@@ -184,8 +184,12 @@ CONFIG_SCHEMA = {
         ],
     },
     "run_limits": {
-        "max_running_agents": "int (default: 4, global server-side Agent concurrency limit)",
+        "max_running_agents": "int (default: 4, legacy aggregate display limit; runtime_slots define execution capacity)",
         "max_shells_per_agent": "int (default: 1, per-Agent shell concurrency limit)",
+        "server_agent_run_slots": "int (default: max_running_agents, server worker AgentRun capacity)",
+        "server_sandbox_slots": "int (default: 2, server-managed sandbox AgentRun capacity)",
+        "local_peer_agent_run_slots": "int (default: 1, VSIX local peer AgentRun capacity)",
+        "model_request_slots": "int (default: max_running_agents, server-origin model request capacity)",
     },
     "model_capabilities": {
         "enabled": "bool (default: true, periodically sync model capability catalog)",
@@ -194,7 +198,9 @@ CONFIG_SCHEMA = {
     "runtime_profiles": {
         "profile_id": {
             "executor": "string (one of reuleauxcoder, fake, codex, claude, gemini)",
-            "execution_location": "string (one of remote_server, local_workspace)",
+            "execution_location": "string (one of remote_server, local_workspace, daemon_worktree)",
+            "worker_kind": "string (one of local_peer, server_worker, sandbox_worker)",
+            "model_request_origin": "string (one of server, server_worker_cli, local_cli)",
             "command": "string (optional, CLI command for external executors)",
             "args": "list of strings (optional)",
             "env": "dict of strings (optional, non-secret process env)",

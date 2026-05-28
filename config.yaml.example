@@ -161,6 +161,10 @@ approval:
 # run_limits:
 #   max_running_agents: 4
 #   max_shells_per_agent: 1
+#   server_agent_run_slots: 4
+#   server_sandbox_slots: 2
+#   local_peer_agent_run_slots: 1
+#   model_request_slots: 4
 #
 # model_capabilities:
 #   enabled: true
@@ -178,11 +182,22 @@ approval:
 #   environment_local:
 #     executor: "reuleauxcoder"
 #     execution_location: "local_workspace"
+#     worker_kind: "local_peer"
+#     model_request_origin: "server"
+#     runtime_home_policy: "per_task"
+#     approval_mode: "full"
+#   agent_remote:
+#     executor: "reuleauxcoder"
+#     execution_location: "remote_server"
+#     worker_kind: "server_worker"
+#     model_request_origin: "server"
 #     runtime_home_policy: "per_task"
 #     approval_mode: "full"
 #   codex_remote:
 #     executor: "codex"
 #     execution_location: "remote_server"
+#     worker_kind: "server_worker"
+#     model_request_origin: "server_worker_cli"
 #     model: "gpt-5.2-codex"
 #     command: "codex"
 #     runtime_home_policy: "per_task"
@@ -235,7 +250,18 @@ approval:
 #     description: "Read and configure the local workspace environment manifest."
 #     source:
 #       type: "builtin"
-#     components: []
+#     components: ["builtin_tool:shell"]
+#   capability_packager_builtin_tools:
+#     name: "Capability Packager Built-in Tools"
+#     description: "Read-only built-in tools used by the capability packager system Agent."
+#     source:
+#       type: "builtin"
+#     components:
+#       - "builtin_tool:fetch_capabilities"
+#       - "builtin_tool:glob"
+#       - "builtin_tool:grep"
+#       - "builtin_tool:list_file"
+#       - "builtin_tool:read_file"
 #   github-review:
 #     name: "GitHub Review"
 #     description: "Review repository changes and comment on GitHub issues."
