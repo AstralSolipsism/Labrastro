@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any
 
 from labrastro_server.services.agent_runtime.control_plane import (
@@ -163,10 +165,20 @@ class CapabilityDraftValidationResult:
 
 
 @dataclass(frozen=True)
+class CapabilityPackageSkillFileOperation:
+    action: str
+    path: Path
+    content: str = ""
+
+
+@dataclass(frozen=True)
 class CapabilityPackageInstallResult:
     package_id: str
     package: CapabilityPackageConfig
     component_ids: list[str]
+    skill_file_operations: list[CapabilityPackageSkillFileOperation] = field(
+        default_factory=list
+    )
 
 
 class CapabilitySourceCollector:
@@ -341,6 +353,14 @@ class CapabilityDraftValidator:
 class CapabilityPackageInstaller:
     """Install confirmed drafts into capability package and component config."""
 
+    def __init__(self, *, skill_install_root: str | Path | None = None) -> None:
+        self.skill_install_root = Path(
+            skill_install_root
+            if skill_install_root is not None
+            else Path.home() / ".rcoder" / "skills" / "packages"
+        ).expanduser()
+        self.skill_file_operations: list[CapabilityPackageSkillFileOperation] = []
+
     def install_draft(
         self,
         data: dict[str, Any],
@@ -348,6 +368,7 @@ class CapabilityPackageInstaller:
         *,
         package_id: str = "",
     ) -> CapabilityPackageInstallResult:
+        self.skill_file_operations = []
         resolved_package_id = str(
             package_id or raw_draft.get("id") or raw_draft.get("package_id") or ""
         ).strip()
@@ -428,6 +449,7 @@ class CapabilityPackageInstaller:
             package_id=resolved_package_id,
             package=package,
             component_ids=_unique_strings(component_ids),
+            skill_file_operations=list(self.skill_file_operations),
         )
 
     def component_from_draft(
@@ -461,6 +483,10 @@ class CapabilityPackageInstaller:
             and "requirements" not in config
         ):
             config["requirements"] = item["requirements"]
+        if kind == "skill":
+            for field_name in ("skill_content", "content"):
+                if field_name in item and field_name not in config:
+                    config[field_name] = item[field_name]
         component_id = str(item.get("id") or "").strip()
         if not component_id:
             if kind == "environment_requirement":
@@ -552,6 +578,7 @@ class CapabilityPackageInstaller:
         if component.kind == "skill":
             items = _skill_items(data)
             _assert_materialized_resource_slot(items, component.name, component)
+            payload = self._materialized_skill_payload(component, payload)
             skill = SkillRegistrationConfig.from_dict(component.name, payload)
             items[skill.name] = skill.to_dict()
 
@@ -578,7 +605,96 @@ class CapabilityPackageInstaller:
             return
         if str(current.get("managed_by") or "") != "capability_package":
             return
+        if component.kind == "skill":
+            self._queue_remove_canonical_skill_path(str(current.get("path_hint") or ""))
         del items[item_id]
+
+    def _materialized_skill_payload(
+        self,
+        component: CapabilityComponentConfig,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        content = _skill_content_from_payload(payload)
+        if not content:
+            raise CapabilityPackageIngestError(
+                "capability_package_skill_content_required",
+                f"skill component '{component.name}' must include skill_content for canonical installation",
+            )
+        installed_path = self._canonical_skill_path(component.id)
+        self.skill_file_operations.append(
+            CapabilityPackageSkillFileOperation(
+                action="write",
+                path=installed_path,
+                content=content,
+            )
+        )
+        source_path = str(
+            payload.get("source_path")
+            or component.source_path
+            or payload.get("path_hint")
+            or ""
+        ).strip()
+        payload = dict(payload)
+        payload["path_hint"] = str(installed_path)
+        if source_path:
+            payload["source_path"] = source_path
+        payload.setdefault("description", component.description)
+        payload.pop("skill_content", None)
+        payload.pop("content", None)
+        return payload
+
+    def _canonical_skill_path(self, component_id: str) -> Path:
+        return (
+            self.skill_install_root
+            / "components"
+            / _slug_path_segment(component_id)
+            / "SKILL.md"
+        )
+
+    def apply_skill_file_operations(
+        self,
+        operations: list[CapabilityPackageSkillFileOperation] | None = None,
+    ) -> None:
+        pending = operations if operations is not None else self.skill_file_operations
+        for operation in pending:
+            if operation.action == "write":
+                operation.path.parent.mkdir(parents=True, exist_ok=True)
+                operation.path.write_text(operation.content, encoding="utf-8")
+                continue
+            if operation.action == "delete":
+                self._remove_canonical_skill_path(str(operation.path))
+
+    def _queue_remove_canonical_skill_path(self, path_hint: str) -> None:
+        path = self._canonical_removable_skill_path(path_hint)
+        if path is None:
+            return
+        self.skill_file_operations.append(
+            CapabilityPackageSkillFileOperation(action="delete", path=path)
+        )
+
+    def _remove_canonical_skill_path(self, path_hint: str) -> None:
+        path = self._canonical_removable_skill_path(path_hint)
+        if path is None:
+            return
+        shutil.rmtree(path.parent, ignore_errors=True)
+        for parent in (path.parent.parent,):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+
+    def _canonical_removable_skill_path(self, path_hint: str) -> Path | None:
+        if not path_hint:
+            return None
+        root = self.skill_install_root.resolve()
+        path = Path(path_hint).expanduser().resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return None
+        if path.name != "SKILL.md":
+            return None
+        return path
 
 
 class CapabilityPackageIngestService:
@@ -638,14 +754,14 @@ class CapabilityPackageIngestService:
                     draft = _extract_draft(payload.get("text") or payload.get("output"))
                     if draft is not None:
                         break
+        metadata = agent_run.get("metadata") if isinstance(agent_run, dict) else {}
+        source_bundle = (
+            metadata.get("source_bundle")
+            if isinstance(metadata, dict) and isinstance(metadata.get("source_bundle"), dict)
+            else {}
+        )
         validation: dict[str, Any] | None = None
         if draft is not None:
-            metadata = agent_run.get("metadata") if isinstance(agent_run, dict) else {}
-            source_bundle = (
-                metadata.get("source_bundle")
-                if isinstance(metadata, dict) and isinstance(metadata.get("source_bundle"), dict)
-                else {}
-            )
             validation = self.draft_validator.validate(
                 draft,
                 EvidenceBundle.from_dict(source_bundle),
@@ -655,6 +771,7 @@ class CapabilityPackageIngestService:
             "agent_run": agent_run,
             "events": events,
             "draft": draft,
+            "source_bundle": source_bundle,
             "validation": validation,
         }
 
@@ -729,7 +846,10 @@ def _render_packager_prompt(*, bundle: dict[str, Any]) -> str:
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
         '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
         '  "contributions": {\n'
-        '    "skills": [], "mcp_servers": [], "builtin_tools": [],\n'
+        '    "skills": [\n'
+        '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
+        '"skill_content": "---\\nname: code-review\\ndescription: ...\\n---\\n..."}\n'
+        '    ], "mcp_servers": [], "builtin_tools": [],\n'
         '    "prompt_fragments": [], "credential_refs": [],\n'
         '    "environment_requirements": [\n'
         '      {"id": "envreq:executable:gh", "kind": "executable", '
@@ -741,6 +861,8 @@ def _render_packager_prompt(*, bundle: dict[str, Any]) -> str:
         '  "install_plan": [], "usage": [], "evidence": [], "credentials": [], '
         '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
         "}\n\n"
+        "package-managed Skills must be installable into the server canonical Skill directory; "
+        'include "skill_content" for every Skill component or omit the Skill.\n'
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
     )
@@ -817,6 +939,9 @@ def _component_validation_messages(component: dict[str, Any]) -> list[str]:
     name = str(component.get("name") or "").strip()
     if not name:
         messages.append("component.name is required")
+    if validation_kind == "skill" and not _component_skill_content_value(component):
+        component_name = name or str(component.get("id") or "skill")
+        messages.append(f"skill component '{component_name}' requires skill_content")
     access = str(component.get("access") or "").strip().lower()
     if access and access not in {"read", "write", "both"}:
         messages.append("component.access must be read, write, or both")
@@ -872,6 +997,17 @@ def _component_command_values(component: dict[str, Any]) -> list[str]:
             elif isinstance(value, list):
                 values.extend(str(item).strip() for item in value if str(item).strip())
     return _unique_strings(values)
+
+
+def _component_skill_content_value(component: dict[str, Any]) -> str:
+    raw_config = component.get("config")
+    config: dict[str, Any] = dict(raw_config) if isinstance(raw_config, dict) else {}
+    for container in (component, config):
+        for field_name in ("skill_content", "content"):
+            value = container.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
 
 
 def _evidence_search_text(
@@ -972,6 +1108,26 @@ def _bool_field(payload: dict[str, Any], field_name: str, default: Any) -> bool:
     return bool(value)
 
 
+def _skill_content_from_payload(payload: dict[str, Any]) -> str:
+    for field_name in ("skill_content", "content"):
+        value = payload.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.replace("\r\n", "\n")
+    return ""
+
+
+def _slug_path_segment(value: str) -> str:
+    text = str(value or "").strip().lower()
+    chars = [
+        char
+        if char.isalnum() or char in {"-", "_", "."}
+        else "-"
+        for char in text
+    ]
+    slug = "".join(chars).strip(".-")
+    return slug or "item"
+
+
 def _stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -1037,6 +1193,7 @@ __all__ = [
     "CapabilityPackageIngestResult",
     "CapabilityPackageIngestService",
     "CapabilityPackageInstallResult",
+    "CapabilityPackageSkillFileOperation",
     "CapabilityPackageInstaller",
     "CapabilitySourceCollector",
     "EvidenceBundle",

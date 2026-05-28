@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+import pytest
 
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.agent_runtime.executor_backend import ExecutorRunResult
 from labrastro_server.services.capability_packages import (
     CapabilityDraftValidator,
     CapabilityPackagerRunner,
+    CapabilityPackageIngestError,
     CapabilityPackageIngestService,
     CapabilityPackageInstaller,
     CapabilitySourceCollector,
     EvidenceBundle,
 )
+from reuleauxcoder.domain.agent_runtime.models import CapabilityComponentConfig
 from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord
 
 
@@ -20,13 +25,14 @@ def _control_plane() -> AgentRunControlPlane:
         runtime_snapshot={
             "agents": {
                 "capability_packager": {
-                    "runtime_profile": "capability_packager_local",
+                    "runtime_profile": "capability_packager_remote",
                 }
             },
             "runtime_profiles": {
-                "capability_packager_local": {
+                "capability_packager_remote": {
                     "executor": "fake",
-                    "execution_location": "local_workspace",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
                 }
             },
         }
@@ -55,6 +61,8 @@ def test_project_notes_input_creates_read_only_ingest_run() -> None:
     assert result.source_bundle["documents"][0]["title"] == "Project notes"
     assert "capability_packages" not in control.runtime_snapshot
     assert "capability_components" not in control.runtime_snapshot
+    assert '"skill_content"' in result.agent_run.prompt
+    assert "package-managed Skills must be installable into the server canonical Skill directory" in result.agent_run.prompt
 
 
 def test_source_collector_uses_fetch_capabilities_for_url_sources() -> None:
@@ -297,6 +305,155 @@ def test_package_installer_infers_executable_requirement_from_command() -> None:
     assert requirement["command"] == "gh"
 
 
+def test_package_installer_materializes_skill_to_canonical_server_path(tmp_path) -> None:
+    install_root = tmp_path / "skills" / "packages"
+    skill_content = (
+        "---\n"
+        "name: code-review\n"
+        "description: Review code changes.\n"
+        "---\n"
+        "Use the repository review checklist.\n"
+    )
+    data: dict[str, object] = {}
+
+    installer = CapabilityPackageInstaller(skill_install_root=install_root)
+    result = installer.install_draft(
+        data,
+        {
+            "id": "review",
+            "components": [
+                {
+                    "kind": "skill",
+                    "name": "code-review",
+                    "description": "Review code changes.",
+                    "source_path": "skills/code-review/SKILL.md",
+                    "skill_content": skill_content,
+                }
+            ],
+        },
+    )
+
+    installed_path = install_root / "components" / "skill-code-review" / "SKILL.md"
+    assert result.component_ids == ["skill:code-review"]
+    assert not installed_path.exists()
+    installer.apply_skill_file_operations(result.skill_file_operations)
+    assert installed_path.read_text(encoding="utf-8") == skill_content
+    skill = data["skills"]["items"]["code-review"]
+    assert skill["path_hint"] == str(installed_path)
+    assert skill["source_path"] == "skills/code-review/SKILL.md"
+    assert skill["managed_by"] == "capability_package"
+
+
+def test_package_installer_rejects_package_skill_without_installable_content(tmp_path) -> None:
+    data: dict[str, object] = {}
+
+    with pytest.raises(CapabilityPackageIngestError) as exc_info:
+        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+            data,
+            {
+                "id": "review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "path_hint": "/external/skills/code-review/SKILL.md",
+                    }
+                ],
+            },
+        )
+
+    assert exc_info.value.error == "capability_package_skill_content_required"
+    assert "code-review" not in data.get("skills", {}).get("items", {})
+
+
+def test_package_installer_keeps_shared_skill_path_stable_when_owner_changes(tmp_path) -> None:
+    install_root = tmp_path / "skills" / "packages"
+    installer = CapabilityPackageInstaller(skill_install_root=install_root)
+    data: dict[str, object] = {}
+    draft = {
+        "components": [
+            {
+                "kind": "skill",
+                "name": "code-review",
+                "skill_content": "Review code changes.\n",
+            }
+        ],
+    }
+
+    first_result = installer.install_draft(data, {"id": "review-a", **draft})
+    installer.apply_skill_file_operations(first_result.skill_file_operations)
+    first_path = Path(data["skills"]["items"]["code-review"]["path_hint"])
+    second_result = installer.install_draft(data, {"id": "review-b", **draft})
+    installer.apply_skill_file_operations(second_result.skill_file_operations)
+    second_path = Path(data["skills"]["items"]["code-review"]["path_hint"])
+
+    assert first_path == install_root / "components" / "skill-code-review" / "SKILL.md"
+    assert second_path == first_path
+    assert first_path.exists()
+    assert not (install_root / "review-a").exists()
+    assert not (install_root / "review-b").exists()
+
+    component = CapabilityComponentConfig.from_dict(
+        "skill:code-review",
+        data["capability_components"]["skill:code-review"],
+    )
+    component.package_ids = [
+        package_id for package_id in component.package_ids if package_id != "review-a"
+    ]
+    data["capability_components"]["skill:code-review"] = component.to_dict()
+    installer.materialize_component(data, component)
+    installer.apply_skill_file_operations(installer.skill_file_operations)
+
+    assert Path(data["skills"]["items"]["code-review"]["path_hint"]) == first_path
+    assert first_path.exists()
+
+    installer.skill_file_operations = []
+    component.package_ids = []
+    installer.remove_materialized_component(data, component)
+    installer.apply_skill_file_operations(installer.skill_file_operations)
+
+    assert "code-review" not in data["skills"]["items"]
+    assert not first_path.exists()
+    assert not first_path.parent.exists()
+
+
+def test_package_installer_delete_cleans_canonical_skill_path(tmp_path) -> None:
+    install_root = tmp_path / "skills" / "packages"
+    data: dict[str, object] = {}
+    installer = CapabilityPackageInstaller(skill_install_root=install_root)
+    result = installer.install_draft(
+        data,
+        {
+            "id": "review",
+            "components": [
+                {
+                    "kind": "skill",
+                    "name": "code-review",
+                    "skill_content": "Review code changes.\n",
+                }
+            ],
+        },
+    )
+    installed_path = install_root / "components" / "skill-code-review" / "SKILL.md"
+    installer.apply_skill_file_operations(result.skill_file_operations)
+    assert installed_path.exists()
+    component = CapabilityComponentConfig.from_dict(
+        "skill:code-review",
+        data["capability_components"]["skill:code-review"],
+    )
+
+    installer.skill_file_operations = []
+    installer.remove_materialized_component(
+        data,
+        component,
+    )
+    installer.apply_skill_file_operations(installer.skill_file_operations)
+
+    assert "code-review" not in data["skills"]["items"]
+    assert not installed_path.exists()
+    assert not installed_path.parent.exists()
+
+
 def test_ingest_status_extracts_completed_draft_json() -> None:
     control = _control_plane()
     service = CapabilityPackageIngestService(control)
@@ -346,5 +503,8 @@ def test_ingest_status_extracts_completed_draft_json() -> None:
     assert (
         status["draft"]["contributions"]["environment_requirements"][0]["id"]
         == "envreq:executable:gh"
+    )
+    assert status["source_bundle"]["evidence"][0]["excerpt"] == (
+        "Install gh, then use gh pr view for review."
     )
     assert status["validation"]["ok"] is True

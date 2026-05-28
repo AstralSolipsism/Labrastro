@@ -599,13 +599,10 @@ class RemoteAdminRoutes:
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
-            elif path in {
-                "/remote/admin/environment-requirements/behavior-catalog",
-                "/remote/admin/behavior/catalog",
-            }:
+            elif path == "/remote/admin/behavior/catalog":
                 result = {
                     "ok": True,
-                    **self.service.admin_manager.environment_requirements_behavior_catalog(),
+                    **self.service.admin_manager.behavior_catalog(),
                 }
                 self._send_json(HTTPStatus.OK, result)
                 return
@@ -908,7 +905,6 @@ class RemoteAdminRoutes:
             "/remote/admin/models/list",
             "/remote/admin/environment-requirements/list",
             "/remote/admin/environment-requirements/dashboard",
-            "/remote/admin/environment-requirements/behavior-catalog",
             "/remote/admin/mcp-servers/list",
             "/remote/admin/mcp-servers/dashboard",
             "/remote/admin/skills/list",

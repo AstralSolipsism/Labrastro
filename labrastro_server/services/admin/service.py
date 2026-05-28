@@ -23,6 +23,7 @@ from reuleauxcoder.domain.config.models import (
     ApprovalAction,
     ApprovalConfig,
     ApprovalRuleConfig,
+    BUILTIN_CAPABILITY_PACKAGE_IDS,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
     ContextConfig,
@@ -52,8 +53,13 @@ from reuleauxcoder.domain.config.models import (
     infer_provider_compat,
 )
 from labrastro_server.services.capability_packages import (
+    CapabilityDraftValidator,
     CapabilityPackageIngestError,
     CapabilityPackageInstaller,
+    EvidenceBundle,
+)
+from labrastro_server.services.agent_runtime.runtime_policy import (
+    validate_runtime_profile_model_request_origin,
 )
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.domain.llm.models import ToolCall
@@ -1335,7 +1341,14 @@ class RemoteAdminConfigManager:
         *,
         capability_packages: dict[str, CapabilityPackageConfig],
     ) -> AdminConfigResult | None:
-        if run_limits.max_running_agents < 1 or run_limits.max_shells_per_agent < 1:
+        if (
+            run_limits.max_running_agents < 1
+            or run_limits.max_shells_per_agent < 1
+            or run_limits.server_agent_run_slots < 1
+            or run_limits.server_sandbox_slots < 1
+            or run_limits.local_peer_agent_run_slots < 1
+            or run_limits.model_request_slots < 1
+        ):
             return AdminConfigResult(
                 False,
                 {
@@ -1344,6 +1357,22 @@ class RemoteAdminConfigManager:
                 },
                 400,
             )
+        for profile_id, profile in runtime_profiles.profiles.items():
+            try:
+                validate_runtime_profile_model_request_origin(
+                    executor=profile.executor,
+                    worker_kind=profile.worker_kind,
+                    model_request_origin=profile.model_request_origin,
+                )
+            except ValueError as exc:
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "invalid_agent_runtime_profile",
+                        "message": f"runtime_profiles[{profile_id}]: {exc}",
+                    },
+                    400,
+                )
         missing_profiles = [
             agent_id
             for agent_id, agent in agent_registry.agents.items()
@@ -1391,12 +1420,30 @@ class RemoteAdminConfigManager:
         ).strip()
         if not package_id:
             return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        source_bundle = payload.get("source_bundle")
+        validation = CapabilityDraftValidator().validate(
+            raw_draft,
+            EvidenceBundle.from_dict(source_bundle if isinstance(source_bundle, dict) else None),
+        )
+        if not validation.ok:
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "invalid_capability_package_draft",
+                    "messages": validation.messages,
+                    "message": "; ".join(validation.messages),
+                },
+                400,
+            )
 
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
+            installer = CapabilityPackageInstaller(
+                skill_install_root=self._capability_package_skill_install_root()
+            )
             try:
-                install_result = CapabilityPackageInstaller().install_draft(
+                install_result = installer.install_draft(
                     data,
                     raw_draft,
                     package_id=package_id,
@@ -1416,6 +1463,12 @@ class RemoteAdminConfigManager:
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
+            file_error = self._apply_capability_package_skill_file_operations(
+                installer,
+                install_result.skill_file_operations,
+            )
+            if file_error:
+                return file_error
             return AdminConfigResult(
                 True,
                 {
@@ -1434,7 +1487,7 @@ class RemoteAdminConfigManager:
         package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
         if not package_id:
             return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
-        if package_id == "environment":
+        if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS:
             return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
         with self._lock:
             previous_data = self._load_data()
@@ -1452,7 +1505,9 @@ class RemoteAdminConfigManager:
                 components = {}
                 data["capability_components"] = components
             removed_components: list[str] = []
-            installer = CapabilityPackageInstaller()
+            installer = CapabilityPackageInstaller(
+                skill_install_root=self._capability_package_skill_install_root()
+            )
             for component_id in package.components:
                 raw_component = components.get(component_id)
                 if not isinstance(raw_component, dict):
@@ -1471,6 +1526,12 @@ class RemoteAdminConfigManager:
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
                 return reload_error
+            file_error = self._apply_capability_package_skill_file_operations(
+                installer,
+                installer.skill_file_operations,
+            )
+            if file_error:
+                return file_error
             return AdminConfigResult(
                 True,
                 {
@@ -1482,11 +1543,46 @@ class RemoteAdminConfigManager:
                 },
             )
 
+    def _capability_package_skill_install_root(self) -> Path:
+        return self.config_path.parent / "skills" / "packages"
+
+    def _apply_capability_package_skill_file_operations(
+        self,
+        installer: CapabilityPackageInstaller,
+        operations: list[Any],
+    ) -> AdminConfigResult | None:
+        if not operations:
+            return None
+        try:
+            installer.apply_skill_file_operations(operations)
+        except Exception as exc:
+            logger.exception(
+                "Capability package Skill file operation failed for %s: %s: %s",
+                self.config_path,
+                type(exc).__name__,
+                exc,
+            )
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "capability_package_skill_file_operation_failed",
+                    "message": str(exc),
+                },
+                500,
+            )
+        return None
+
     def enable_capability_package(self, payload: dict[str, Any]) -> AdminConfigResult:
         package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
         if not package_id:
             return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
         enabled = _bool_field(payload, "enabled", True)
+        if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS and not enabled:
+            return AdminConfigResult(
+                False,
+                {"error": "builtin_capability_package"},
+                400,
+            )
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
@@ -1499,7 +1595,7 @@ class RemoteAdminConfigManager:
             if not isinstance(raw_package, dict):
                 return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
             package = CapabilityPackageConfig.from_dict(package_id, raw_package)
-            package.enabled = enabled
+            package.enabled = True if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS else enabled
             packages[package_id] = package.to_dict()
             data["capability_packages"] = packages
             reload_error = self._commit_config(data, previous_data)
@@ -1582,7 +1678,7 @@ class RemoteAdminConfigManager:
             "summary": _admin_resource_dashboard_summary(items),
         }
 
-    def environment_requirements_behavior_catalog(self) -> dict[str, Any]:
+    def behavior_catalog(self) -> dict[str, Any]:
         data = self._load_data()
         chat_commands = self._chat_command_catalog()
         mention_providers = self._mention_provider_catalog(data)
