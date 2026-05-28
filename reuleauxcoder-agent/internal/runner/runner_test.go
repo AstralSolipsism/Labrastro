@@ -51,6 +51,58 @@ func TestBaseFeaturesAdvertisesLSPOnlyWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestRuntimeExecutorsAdvertisesOnlyInstalledCLIExecutors(t *testing.T) {
+	oldLookPath := lookPathExecutable
+	defer func() { lookPathExecutable = oldLookPath }()
+
+	lookPathExecutable = func(command string) (string, error) {
+		if command == "codex" {
+			return "/usr/bin/codex", nil
+		}
+		return "", errExecutableNotFound
+	}
+
+	executors := runtimeExecutors()
+
+	if !containsFeature(executors, "fake") {
+		t.Fatalf("executors = %#v, want fake", executors)
+	}
+	if !containsFeature(executors, "codex") {
+		t.Fatalf("executors = %#v, want codex", executors)
+	}
+	if containsFeature(executors, "claude") || containsFeature(executors, "gemini") {
+		t.Fatalf("executors = %#v, want only installed CLI executors", executors)
+	}
+}
+
+func TestLocalPeerRuntimeLocationsDoNotAdvertiseRemoteServer(t *testing.T) {
+	locations := runtimeExecutionLocations()
+
+	if containsFeature(locations, "remote_server") {
+		t.Fatalf("locations = %#v, local peer must not advertise remote_server", locations)
+	}
+	if containsFeature(locations, "daemon_worktree") {
+		t.Fatalf("locations = %#v, local peer must not advertise daemon_worktree", locations)
+	}
+	if !containsFeature(locations, "local_workspace") {
+		t.Fatalf("locations = %#v, want local_workspace", locations)
+	}
+}
+
+func TestServerWorkerRuntimeLocationsAdvertiseServerLocations(t *testing.T) {
+	locations := runtimeExecutionLocationsForWorker("server_worker")
+
+	if !containsFeature(locations, "remote_server") {
+		t.Fatalf("locations = %#v, want remote_server", locations)
+	}
+	if !containsFeature(locations, "daemon_worktree") {
+		t.Fatalf("locations = %#v, want daemon_worktree", locations)
+	}
+	if containsFeature(locations, "local_workspace") {
+		t.Fatalf("locations = %#v, server worker must not advertise local_workspace", locations)
+	}
+}
+
 func containsFeature(features []string, target string) bool {
 	for _, feature := range features {
 		if feature == target {

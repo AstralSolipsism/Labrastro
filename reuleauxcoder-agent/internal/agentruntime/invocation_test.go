@@ -473,13 +473,15 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 		map[string]any{
 			"runtime_profiles": map[string]any{
 				"codex_remote": map[string]any{
-					"executor":            "codex",
-					"model":               "gpt-5.2-codex",
-					"command":             "codex-beta",
-					"args":                []any{"--profile", "default"},
-					"env":                 map[string]any{"LABRASTRO_TEST": "1"},
-					"runtime_home_policy": "per_task",
-					"approval_mode":       "autonomous",
+					"executor":             "codex",
+					"worker_kind":          "server_worker",
+					"model_request_origin": "server_worker_cli",
+					"model":                "gpt-5.2-codex",
+					"command":              "codex-beta",
+					"args":                 []any{"--profile", "default"},
+					"env":                  map[string]any{"LABRASTRO_TEST": "1"},
+					"runtime_home_policy":  "per_task",
+					"approval_mode":        "autonomous",
 					"mcp": map[string]any{
 						"servers": map[string]any{
 							"filesystem": map[string]any{"command": "filesystem-mcp"},
@@ -499,6 +501,9 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 	}
 	if resolved.Request.Executor != "codex" || resolved.Request.Model != "gpt-5.2-codex" {
 		t.Fatalf("request not resolved from snapshot: %#v", resolved.Request)
+	}
+	if resolved.Request.WorkerKind != "server_worker" || resolved.Request.ModelRequestOrigin != "server_worker_cli" {
+		t.Fatalf("worker/model origin not resolved from snapshot: %#v", resolved.Request)
 	}
 	if resolved.Options.RuntimeHome == "" || !strings.Contains(resolved.Options.RuntimeHome, "codex-home") {
 		t.Fatalf("CODEX_HOME not planned: %#v", resolved.Options)

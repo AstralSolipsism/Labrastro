@@ -37,18 +37,20 @@ type TokenUsage struct {
 }
 
 type RunRequest struct {
-	TaskID            string         `json:"task_id"`
-	AgentID           string         `json:"agent_id"`
-	Executor          string         `json:"executor"`
-	Prompt            string         `json:"prompt"`
-	ExecutionLocation string         `json:"execution_location,omitempty"`
-	IssueID           string         `json:"issue_id,omitempty"`
-	RuntimeProfileID  string         `json:"runtime_profile_id,omitempty"`
-	Workdir           string         `json:"workdir,omitempty"`
-	Branch            string         `json:"branch,omitempty"`
-	Model             string         `json:"model,omitempty"`
-	ExecutorSessionID string         `json:"executor_session_id,omitempty"`
-	Metadata          map[string]any `json:"metadata,omitempty"`
+	TaskID             string         `json:"task_id"`
+	AgentID            string         `json:"agent_id"`
+	Executor           string         `json:"executor"`
+	Prompt             string         `json:"prompt"`
+	ExecutionLocation  string         `json:"execution_location,omitempty"`
+	IssueID            string         `json:"issue_id,omitempty"`
+	RuntimeProfileID   string         `json:"runtime_profile_id,omitempty"`
+	WorkerKind         string         `json:"worker_kind,omitempty"`
+	ModelRequestOrigin string         `json:"model_request_origin,omitempty"`
+	Workdir            string         `json:"workdir,omitempty"`
+	Branch             string         `json:"branch,omitempty"`
+	Model              string         `json:"model,omitempty"`
+	ExecutorSessionID  string         `json:"executor_session_id,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
 }
 
 type RunOptions struct {

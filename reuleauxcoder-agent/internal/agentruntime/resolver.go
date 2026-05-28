@@ -79,6 +79,18 @@ func ResolveRun(req RunRequest, runtimeSnapshot map[string]any, plan ExecEnvPlan
 	if req.ExecutionLocation == "" {
 		req.ExecutionLocation = "local_workspace"
 	}
+	if req.WorkerKind == "" {
+		req.WorkerKind = stringValue(profile["worker_kind"])
+	}
+	if req.WorkerKind == "" {
+		req.WorkerKind = inferWorkerKind(req.ExecutionLocation, profile)
+	}
+	if req.ModelRequestOrigin == "" {
+		req.ModelRequestOrigin = stringValue(profile["model_request_origin"])
+	}
+	if req.ModelRequestOrigin == "" {
+		req.ModelRequestOrigin = inferModelRequestOrigin(req.Executor, req.WorkerKind)
+	}
 	if req.RuntimeProfileID == "" {
 		req.RuntimeProfileID = profileID
 	}
@@ -144,6 +156,28 @@ func ResolveRun(req RunRequest, runtimeSnapshot map[string]any, plan ExecEnvPlan
 		opts.RuntimeHome = plan.CodexHome
 	}
 	return ResolvedRun{Request: req, Options: opts, Plan: plan}, nil
+}
+
+func inferWorkerKind(executionLocation string, profile map[string]any) string {
+	if len(mapValue(profile["sandbox"])) > 0 {
+		return "sandbox_worker"
+	}
+	if executionLocation == "local_workspace" {
+		return "local_peer"
+	}
+	return "server_worker"
+}
+
+func inferModelRequestOrigin(executor, workerKind string) string {
+	switch executor {
+	case "codex", "claude", "gemini":
+		if workerKind == "local_peer" {
+			return "local_cli"
+		}
+		return "server_worker_cli"
+	default:
+		return "server"
+	}
 }
 
 func mergeNestedMaps(base, overlay map[string]any) map[string]any {

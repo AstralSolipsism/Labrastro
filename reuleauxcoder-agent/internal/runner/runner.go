@@ -25,6 +25,11 @@ import (
 	"github.com/charmbracelet/glamour"
 )
 
+var (
+	errExecutableNotFound = errors.New("executable not found")
+	lookPathExecutable    = exec.LookPath
+)
+
 type Config struct {
 	Host            string
 	BootstrapToken  string
@@ -35,6 +40,7 @@ type Config struct {
 	Interactive     bool
 	AgentRun        bool
 	WorkerSessionID string
+	WorkerKind      string
 }
 
 type Runner struct {
@@ -86,16 +92,16 @@ func (r *Runner) Run(ctx context.Context) error {
 		"shell":    runtimeShell(),
 	}
 	if r.cfg.AgentRun {
-		features = append(
-			features,
-			"agent_runs",
-			"agent_runs.local_workspace",
-			"agent_runs.daemon_worktree",
-			"agent_runs.remote_server",
-		)
+		workerKind := runtimeWorkerKind(r.cfg.WorkerKind)
+		locations := runtimeExecutionLocationsForWorker(workerKind)
+		features = append(features, "agent_runs", "worker_kind:"+workerKind)
+		for _, location := range locations {
+			features = append(features, "agent_runs."+location)
+		}
 		hostInfo["agent_runs"] = map[string]any{
 			"executors":           runtimeExecutors(),
-			"execution_locations": runtimeExecutionLocations(),
+			"execution_locations": locations,
+			"worker_kind":         workerKind,
 			"workspace_root":      workspaceRoot,
 			"runtime_root":        filepath.Join(workspaceRoot, ".rcoder", "agent-runs"),
 			"executor_features":   runtimeExecutorFeatures(),
@@ -202,6 +208,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 	if strings.TrimSpace(workerID) == "" {
 		workerID = "peer-runtime"
 	}
+	workerKind := runtimeWorkerKind(r.cfg.WorkerKind)
 	backend := agentruntime.SubprocessBackend{}
 	runtimeRoot := filepath.Join(workspaceRoot, ".rcoder", "agent-runs")
 	workspaceID := runtimeWorkspaceID(workspaceRoot)
@@ -214,10 +221,11 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 
 		claimCtx, cancelClaim := context.WithTimeout(ctx, 30*time.Second)
 		claimResp, err := r.client.ClaimAgentRun(claimCtx, protocol.AgentRunClaimRequest{
-			PeerToken: peerToken,
-			WorkerID:  workerID,
-			Executors: runtimeExecutors(),
-			WaitSec:   20,
+			PeerToken:  peerToken,
+			WorkerID:   workerID,
+			WorkerKind: workerKind,
+			Executors:  runtimeExecutors(),
+			WaitSec:    20,
 		})
 		cancelClaim()
 		if err != nil {
@@ -569,18 +577,20 @@ func (r *Runner) sendRuntimeEvent(ctx context.Context, peerToken, requestID, wor
 
 func runtimeRunRequest(req protocol.ExecutorRequest) agentruntime.RunRequest {
 	return agentruntime.RunRequest{
-		TaskID:            req.TaskID,
-		AgentID:           req.AgentID,
-		Executor:          req.Executor,
-		Prompt:            req.Prompt,
-		ExecutionLocation: req.ExecutionLocation,
-		IssueID:           req.IssueID,
-		RuntimeProfileID:  req.RuntimeProfileID,
-		Workdir:           req.Workdir,
-		Branch:            req.Branch,
-		Model:             req.Model,
-		ExecutorSessionID: req.ExecutorSessionID,
-		Metadata:          req.Metadata,
+		TaskID:             req.TaskID,
+		AgentID:            req.AgentID,
+		Executor:           req.Executor,
+		Prompt:             req.Prompt,
+		ExecutionLocation:  req.ExecutionLocation,
+		IssueID:            req.IssueID,
+		RuntimeProfileID:   req.RuntimeProfileID,
+		WorkerKind:         req.WorkerKind,
+		ModelRequestOrigin: req.ModelRequestOrigin,
+		Workdir:            req.Workdir,
+		Branch:             req.Branch,
+		Model:              req.Model,
+		ExecutorSessionID:  req.ExecutorSessionID,
+		Metadata:           req.Metadata,
 	}
 }
 
@@ -1045,11 +1055,41 @@ func runtimeShell() string {
 }
 
 func runtimeExecutors() []string {
-	return []string{"fake", "reuleauxcoder", "codex", "claude", "gemini"}
+	features := runtimeExecutorFeatures()
+	order := []string{"fake", "reuleauxcoder", "codex", "claude", "gemini"}
+	executors := make([]string, 0, len(order))
+	for _, executor := range order {
+		if feature, ok := features[executor].(map[string]any); ok {
+			if installed, _ := feature["installed"].(bool); installed {
+				executors = append(executors, executor)
+			}
+		}
+	}
+	return executors
 }
 
 func runtimeExecutionLocations() []string {
-	return []string{"local_workspace", "daemon_worktree", "remote_server"}
+	return runtimeExecutionLocationsForWorker("local_peer")
+}
+
+func runtimeExecutionLocationsForWorker(workerKind string) []string {
+	switch runtimeWorkerKind(workerKind) {
+	case "server_worker":
+		return []string{"daemon_worktree", "remote_server"}
+	case "sandbox_worker":
+		return []string{"remote_server"}
+	default:
+		return []string{"local_workspace"}
+	}
+}
+
+func runtimeWorkerKind(value string) string {
+	switch strings.TrimSpace(value) {
+	case "server_worker", "sandbox_worker", "local_peer":
+		return strings.TrimSpace(value)
+	default:
+		return "local_peer"
+	}
 }
 
 func runtimeExecutorFeatures() map[string]any {
@@ -1116,7 +1156,7 @@ func commandExecutorFeature(command string, values map[string]any) map[string]an
 	for key, value := range values {
 		out[key] = value
 	}
-	_, err := exec.LookPath(command)
+	_, err := lookPathExecutable(command)
 	out["installed"] = err == nil
 	if err != nil {
 		out["version"] = ""

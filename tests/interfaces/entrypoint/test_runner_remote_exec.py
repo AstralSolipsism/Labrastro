@@ -58,7 +58,7 @@ from reuleauxcoder.interfaces.entrypoint.runner import (
     AppOptions,
     AppRunner,
 )
-from reuleauxcoder.services.config.loader import ConfigValidationError
+from reuleauxcoder.services.config.loader import ConfigLoader, ConfigValidationError
 from reuleauxcoder.interfaces.entrypoint.remote_relay import (
     _chat_locale_prompt_append,
     _runtime_config_with_chat_locale,
@@ -996,6 +996,74 @@ class TestRunnerRemoteExec:
         assert manager == "manager"
         assert agent.mcp_manager == "manager"
         assert started == ["server-only", "shared"]
+
+    def test_attach_mcp_uses_agent_capability_scope(self, monkeypatch) -> None:
+        config = ConfigLoader()._parse_config(
+            {
+                "agent_registry": {
+                    "agents": {
+                        "main_chat": {
+                            "runtime_profile": "agent_remote",
+                            "capability_refs": ["review", "disabled-review"],
+                            "chat_entrypoint": True,
+                            "visibility": "user",
+                        }
+                    }
+                },
+                "runtime_profiles": {
+                    "agent_remote": {
+                        "executor": "reuleauxcoder",
+                        "execution_location": "remote_server",
+                    }
+                },
+                "capability_packages": {
+                    "review": {
+                        "enabled": True,
+                        "components": ["mcp:github"],
+                    },
+                    "disabled-review": {
+                        "enabled": False,
+                        "components": ["mcp:disabled-github"],
+                    },
+                },
+                "capability_components": {
+                    "mcp:github": {
+                        "kind": "mcp",
+                        "name": "github",
+                        "config": {"command": "github-mcp"},
+                    },
+                    "mcp:disabled-github": {
+                        "kind": "mcp",
+                        "name": "disabled-github",
+                        "config": {"command": "disabled-github-mcp"},
+                    },
+                },
+                "mcp": {
+                    "servers": {
+                        "github": {"command": "github-mcp", "placement": "server"},
+                        "disabled-github": {
+                            "command": "disabled-github-mcp",
+                            "placement": "server",
+                        },
+                    }
+                },
+            }
+        )
+        runner = AppRunner(options=AppOptions())
+        agent = SimpleNamespace(agent_config_id="main_chat")
+        started: list[str] = []
+
+        def fake_init_mcp(servers, _agent, _ui_bus):
+            started.extend(server.name for server in servers)
+            return "manager"
+
+        monkeypatch.setattr(runner, "_init_mcp", fake_init_mcp)
+
+        manager = runner._attach_mcp_if_configured(config, agent, None)
+
+        assert manager == "manager"
+        assert agent.mcp_manager == "manager"
+        assert started == ["github"]
 
     def test_server_mode_smoke_auth_bootstrap_token(self, tmp_path: Path) -> None:
         relay_bind = "127.0.0.1:18765"

@@ -83,6 +83,8 @@ class DockerSandboxProvider:
             "--agent-run-worker",
             "--worker-session-id",
             session_id,
+            "--agent-run-worker-kind",
+            "sandbox_worker",
             "--workspace-root",
             self.workspace_path,
             "--cwd",

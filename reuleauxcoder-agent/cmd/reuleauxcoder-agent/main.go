@@ -21,6 +21,7 @@ func main() {
 		interactive     bool
 		agentRun        bool
 		workerSessionID string
+		workerKind      string
 	)
 
 	flag.StringVar(&host, "host", "", "Remote relay host base URL")
@@ -32,6 +33,7 @@ func main() {
 	flag.BoolVar(&interactive, "interactive", false, "Run interactive chat loop proxied through host")
 	flag.BoolVar(&agentRun, "agent-run-worker", false, "Run AgentRun worker loop")
 	flag.StringVar(&workerSessionID, "worker-session-id", "", "Stable worker session id")
+	flag.StringVar(&workerKind, "agent-run-worker-kind", "local_peer", "AgentRun worker kind: local_peer, server_worker, or sandbox_worker")
 	flag.Parse()
 
 	if host == "" {
@@ -53,6 +55,7 @@ func main() {
 		Interactive:     interactive,
 		AgentRun:        agentRun,
 		WorkerSessionID: workerSessionID,
+		WorkerKind:      workerKind,
 	})
 	if err := r.Run(context.Background()); err != nil {
 		log.Printf("agent exited with error: %v", err)

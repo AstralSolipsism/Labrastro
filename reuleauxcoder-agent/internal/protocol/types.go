@@ -184,6 +184,7 @@ type EnvironmentManifestRequest struct {
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
 	Workspace string `json:"workspace,omitempty"`
+	AgentID   string `json:"agent_id,omitempty"`
 }
 
 type EnvironmentRequirementManifest struct {
@@ -274,10 +275,11 @@ type CleanupResult struct {
 }
 
 type AgentRunClaimRequest struct {
-	PeerToken string   `json:"peer_token"`
-	WorkerID  string   `json:"worker_id,omitempty"`
-	Executors []string `json:"executors,omitempty"`
-	WaitSec   int      `json:"wait_sec,omitempty"`
+	PeerToken  string   `json:"peer_token"`
+	WorkerID   string   `json:"worker_id,omitempty"`
+	WorkerKind string   `json:"worker_kind,omitempty"`
+	Executors  []string `json:"executors,omitempty"`
+	WaitSec    int      `json:"wait_sec,omitempty"`
 }
 
 type AgentRunClaimResponse struct {
@@ -293,18 +295,20 @@ type AgentRunClaim struct {
 }
 
 type ExecutorRequest struct {
-	TaskID            string         `json:"agent_run_id"`
-	AgentID           string         `json:"agent_id"`
-	Executor          string         `json:"executor"`
-	Prompt            string         `json:"prompt"`
-	ExecutionLocation string         `json:"execution_location,omitempty"`
-	IssueID           string         `json:"issue_id,omitempty"`
-	RuntimeProfileID  string         `json:"runtime_profile_id,omitempty"`
-	Workdir           string         `json:"workdir,omitempty"`
-	Branch            string         `json:"branch,omitempty"`
-	Model             string         `json:"model,omitempty"`
-	ExecutorSessionID string         `json:"executor_session_id,omitempty"`
-	Metadata          map[string]any `json:"metadata,omitempty"`
+	TaskID             string         `json:"agent_run_id"`
+	AgentID            string         `json:"agent_id"`
+	Executor           string         `json:"executor"`
+	Prompt             string         `json:"prompt"`
+	ExecutionLocation  string         `json:"execution_location,omitempty"`
+	IssueID            string         `json:"issue_id,omitempty"`
+	RuntimeProfileID   string         `json:"runtime_profile_id,omitempty"`
+	WorkerKind         string         `json:"worker_kind,omitempty"`
+	ModelRequestOrigin string         `json:"model_request_origin,omitempty"`
+	Workdir            string         `json:"workdir,omitempty"`
+	Branch             string         `json:"branch,omitempty"`
+	Model              string         `json:"model,omitempty"`
+	ExecutorSessionID  string         `json:"executor_session_id,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
 }
 
 type AgentRunEventReport struct {
