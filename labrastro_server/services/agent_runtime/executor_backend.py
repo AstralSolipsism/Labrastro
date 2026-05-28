@@ -9,7 +9,9 @@ from typing import Any, Callable, Protocol
 from reuleauxcoder.domain.agent_runtime.models import (
     ExecutionLocation,
     ExecutorType,
+    ModelRequestOrigin,
     TaskSessionRef,
+    WorkerKind,
 )
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 
@@ -60,6 +62,8 @@ class ExecutorRunRequest:
     execution_location: ExecutionLocation | str = ExecutionLocation.LOCAL_WORKSPACE
     issue_id: str | None = None
     runtime_profile_id: str | None = None
+    worker_kind: WorkerKind | str | None = None
+    model_request_origin: ModelRequestOrigin | str | None = None
     workdir: str | None = None
     branch: str | None = None
     model: str | None = None
@@ -69,6 +73,13 @@ class ExecutorRunRequest:
     def __post_init__(self) -> None:
         self.executor = _coerce_executor(self.executor)
         self.execution_location = _coerce_execution_location(self.execution_location)
+        if self.worker_kind is not None and not isinstance(self.worker_kind, WorkerKind):
+            self.worker_kind = WorkerKind(str(self.worker_kind))
+        if self.model_request_origin is not None and not isinstance(
+            self.model_request_origin,
+            ModelRequestOrigin,
+        ):
+            self.model_request_origin = ModelRequestOrigin(str(self.model_request_origin))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +90,10 @@ class ExecutorRunRequest:
             "execution_location": self.execution_location.value,
             "issue_id": self.issue_id,
             "runtime_profile_id": self.runtime_profile_id,
+            "worker_kind": self.worker_kind.value if self.worker_kind else None,
+            "model_request_origin": (
+                self.model_request_origin.value if self.model_request_origin else None
+            ),
             "workdir": self.workdir,
             "branch": self.branch,
             "model": self.model,
@@ -100,6 +115,14 @@ class ExecutorRunRequest:
             runtime_profile_id=(
                 str(data["runtime_profile_id"])
                 if data.get("runtime_profile_id") is not None
+                else None
+            ),
+            worker_kind=(
+                str(data["worker_kind"]) if data.get("worker_kind") is not None else None
+            ),
+            model_request_origin=(
+                str(data["model_request_origin"])
+                if data.get("model_request_origin") is not None
                 else None
             ),
             workdir=str(data["workdir"]) if data.get("workdir") is not None else None,

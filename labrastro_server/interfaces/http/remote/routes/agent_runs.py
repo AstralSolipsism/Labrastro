@@ -49,6 +49,7 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorRunResult,
 )
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
+from reuleauxcoder.domain.agent_runtime.models import WorkerKind
 from reuleauxcoder.interfaces.events import UIEventKind
 
 class RemoteAgentRunRoutes:
@@ -127,8 +128,27 @@ class RemoteAgentRunRoutes:
         peer = self.service.relay_server.registry.get(peer_id)
         peer_features = list(peer.features) if peer is not None else []
         workspace_root = peer.workspace_root if peer is not None else None
+        worker_kind = str(payload.get("worker_kind") or "").strip()
+        if worker_kind:
+            try:
+                WorkerKind(worker_kind)
+            except ValueError:
+                self._send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_worker_kind",
+                    "worker_kind must be one of local_peer, server_worker, sandbox_worker",
+                )
+                return
+            if f"worker_kind:{worker_kind}" not in set(peer_features):
+                self._send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "worker_kind_not_registered",
+                    "worker_kind is not registered for this peer",
+                )
+                return
         claim = self.service.runtime_control_plane.claim_agent_run(
             worker_id=worker_id,
+            worker_kind=worker_kind,
             executors=[str(executor) for executor in executors],
             peer_id=peer_id,
             peer_features=peer_features,
@@ -373,5 +393,3 @@ class RemoteAgentRunRoutes:
         if github is not None:
             response["github"] = github
         self._send_json(HTTPStatus.OK, response)
-
-

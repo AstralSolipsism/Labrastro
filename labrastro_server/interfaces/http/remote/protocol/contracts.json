@@ -265,7 +265,8 @@
         "created_at": 1760000000.0,
         "last_activity_at": 1760000001.0,
         "finished_at": null,
-        "error": null
+        "error": null,
+        "approvals": []
       }
     },
     {
@@ -318,6 +319,7 @@
       "request": {
         "peer_token": "pt_contract",
         "worker_id": "worker_contract",
+        "worker_kind": "local_peer",
         "executors": ["codex"],
         "wait_sec": 0
       },
@@ -448,7 +450,8 @@
         "peer_token": "pt_contract",
         "os": "linux",
         "arch": "amd64",
-        "workspace": "/workspace"
+        "workspace": "/workspace",
+        "agent_id": "main_chat"
       },
       "response": {
         "environment_requirements": []

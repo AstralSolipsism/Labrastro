@@ -225,10 +225,16 @@ def test_reuleauxcoder_adapter_submits_agent_run_from_task_run_only() -> None:
     )
 
     runtime = AgentRunControlPlane(
-        runtime_snapshot={
-            "runtime_profiles": {"docs_profile": {"executor": "fake"}},
-            "agents": {
-                "docs": {
+            runtime_snapshot={
+                "runtime_profiles": {
+                    "docs_profile": {
+                        "executor": "fake",
+                        "execution_location": "remote_server",
+                        "worker_kind": "server_worker",
+                    }
+                },
+                "agents": {
+                    "docs": {
                     "runtime_profile": "docs_profile",
                     "dispatch": {"profile": "Best for documentation tasks."},
                 }

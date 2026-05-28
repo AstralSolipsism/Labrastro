@@ -20,6 +20,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     TaskSessionRef,
     TaskStatus,
     TriggerMode,
+    ModelRequestOrigin,
+    WorkerKind,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
@@ -43,6 +45,17 @@ from labrastro_server.services.agent_runtime.runtime_store import (
     DEFAULT_RUNTIME_EVENT_LIMIT,
     AgentRunStore,
     clamp_event_limit,
+    runtime_slots_allow_agent_run_claim,
+)
+from labrastro_server.services.agent_runtime.runtime_policy import (
+    model_request_origin_for_runtime,
+    optional_model_request_origin,
+    optional_worker_kind,
+    system_flow_for_source,
+    validate_agent_run_runtime_policy,
+    worker_kind_for_runtime,
+    worker_matches_agent_run,
+    workspace_key,
 )
 from labrastro_server.services.sandbox.provider import SandboxProfile, SandboxProvider
 
@@ -145,10 +158,6 @@ def _string_list_from(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _workspace_key(value: str | None) -> str:
-    return str(value or "").strip().replace("\\", "/").rstrip("/").lower()
-
-
 def _can_resume_from_parent(request: "AgentRunRequest", parent: AgentRunRecord) -> bool:
     if not parent.executor_session_id:
         return False
@@ -157,7 +166,7 @@ def _can_resume_from_parent(request: "AgentRunRequest", parent: AgentRunRecord) 
         and request.runtime_profile_id == parent.runtime_profile_id
         and request.executor == parent.executor
         and request.execution_location == parent.execution_location
-        and _workspace_key(request.workdir) == _workspace_key(parent.workdir)
+        and workspace_key(request.workdir) == workspace_key(parent.workdir)
         and str(request.branch_name or "") == str(parent.branch_name or "")
     )
 
@@ -170,14 +179,6 @@ def _coerce_source(value: AgentRunSource | str | None) -> AgentRunSource:
     return AgentRunSource(str(value))
 
 
-def _system_flow_for_source(source: AgentRunSource) -> str:
-    if source == AgentRunSource.ENVIRONMENT:
-        return "environment_config"
-    if source == AgentRunSource.CAPABILITY_INGEST:
-        return "capability_ingest"
-    return source.value
-
-
 @dataclass
 class AgentRunRequest:
     """Request accepted by the AgentRun control plane."""
@@ -188,6 +189,8 @@ class AgentRunRequest:
     source: AgentRunSource | str = AgentRunSource.MANUAL
     executor: ExecutorType | str | None = None
     execution_location: ExecutionLocation | str | None = None
+    worker_kind: WorkerKind | str | None = None
+    model_request_origin: ModelRequestOrigin | str | None = None
     trigger_mode: TriggerMode | str = TriggerMode.ISSUE_TASK
     runtime_profile_id: str | None = None
     parent_task_id: str | None = None
@@ -208,6 +211,10 @@ class AgentRunRequest:
         self.source = _coerce_source(self.source)
         self.executor = _optional_executor(self.executor)
         self.execution_location = _optional_location(self.execution_location)
+        self.worker_kind = optional_worker_kind(self.worker_kind)
+        self.model_request_origin = optional_model_request_origin(
+            self.model_request_origin
+        )
         if not isinstance(self.trigger_mode, TriggerMode):
             self.trigger_mode = TriggerMode(str(self.trigger_mode))
 
@@ -349,6 +356,12 @@ class AgentRunControlPlane:
         task_id = task_id or _new_id("task")
         if self._store is not None:
             request = self._resolve_request_against_snapshot(request)
+            request.metadata = self._metadata_with_snapshot_capabilities(
+                dict(request.metadata),
+                agent_id=request.agent_id,
+                source=request.source,
+                runtime_profile_id=request.runtime_profile_id,
+            )
             sandbox_error = self._prepare_sandbox_session(request, task_id)
             task = self._store.submit_agent_run(request, task_id=task_id)
             if sandbox_error:
@@ -373,6 +386,19 @@ class AgentRunControlPlane:
                 metadata.setdefault("parent_run_id", request.parent_run_id)
             if request.model is not None:
                 metadata.setdefault("model", request.model)
+            if request.worker_kind is not None:
+                metadata.setdefault("worker_kind", request.worker_kind.value)
+            if request.model_request_origin is not None:
+                metadata.setdefault(
+                    "model_request_origin",
+                    request.model_request_origin.value,
+                )
+            metadata = self._metadata_with_snapshot_capabilities(
+                metadata,
+                agent_id=request.agent_id,
+                source=request.source,
+                runtime_profile_id=request.runtime_profile_id,
+            )
             task = AgentRunRecord(
                 id=task_id,
                 issue_id=request.issue_id,
@@ -447,10 +473,11 @@ class AgentRunControlPlane:
         agents = _dict_from(snapshot.get("agents"))
         profiles = _dict_from(snapshot.get("runtime_profiles"))
         raw_agent = _dict_from(agents.get(request.agent_id))
+        agent_config: AgentConfig | None = None
         if raw_agent:
             agent_config = AgentConfig.from_dict(request.agent_id, raw_agent)
             if agent_config.visibility != "user":
-                flow = _system_flow_for_source(request.source)
+                flow = system_flow_for_source(request.source)
                 if not agent_config.allows_system_flow(flow):
                     raise ValueError(
                         "agent is restricted to system flows: "
@@ -459,6 +486,10 @@ class AgentRunControlPlane:
 
         agent_profile_id = str(raw_agent.get("runtime_profile") or "").strip()
         profile_id = str(request.runtime_profile_id or agent_profile_id).strip()
+        if raw_agent and not profile_id:
+            raise ValueError(
+                f"agent {request.agent_id} requires a runtime_profile"
+            )
         raw_profile = _dict_from(profiles.get(profile_id)) if profile_id else {}
         if profile_id and not raw_profile:
             raise ValueError(f"runtime profile not found: {profile_id}")
@@ -474,6 +505,22 @@ class AgentRunControlPlane:
             or _optional_location(raw_profile.get("execution_location"))
             or ExecutionLocation.LOCAL_WORKSPACE
         )
+        request.worker_kind = request.worker_kind or worker_kind_for_runtime(
+            raw_profile,
+            request.execution_location,
+        )
+        request.model_request_origin = (
+            request.model_request_origin
+            or model_request_origin_for_runtime(
+                raw_profile,
+                executor=request.executor,
+                worker_kind=request.worker_kind,
+            )
+        )
+        self._validate_runtime_policy(
+            request,
+            agent_config=agent_config,
+        )
         if request.model is None and raw_profile.get("model") is not None:
             request.model = str(raw_profile["model"])
         if (
@@ -483,6 +530,14 @@ class AgentRunControlPlane:
         ):
             request.executor_session_id = parent.executor_session_id
         return request
+
+    def _validate_runtime_policy(
+        self,
+        request: AgentRunRequest,
+        *,
+        agent_config: AgentConfig | None,
+    ) -> None:
+        validate_agent_run_runtime_policy(request, agent_config=agent_config)
 
     def _resolve_request_locked(self, request: AgentRunRequest) -> AgentRunRequest:
         parent = (
@@ -626,6 +681,7 @@ class AgentRunControlPlane:
         self,
         *,
         worker_id: str,
+        worker_kind: WorkerKind | str | None = None,
         executors: list[ExecutorType | str] | None = None,
         peer_id: str | None = None,
         peer_features: list[str] | None = None,
@@ -637,6 +693,7 @@ class AgentRunControlPlane:
         while True:
             claim = self._claim_task_once(
                 worker_id=worker_id,
+                worker_kind=worker_kind,
                 executors=executors,
                 peer_id=peer_id,
                 peer_features=peer_features,
@@ -655,6 +712,7 @@ class AgentRunControlPlane:
         self,
         *,
         worker_id: str,
+        worker_kind: WorkerKind | str | None = None,
         executors: list[ExecutorType | str] | None = None,
         peer_id: str | None = None,
         peer_features: list[str] | None = None,
@@ -664,6 +722,7 @@ class AgentRunControlPlane:
         if self._store is not None:
             return self._store.claim_agent_run(
                 worker_id=worker_id,
+                worker_kind=worker_kind,
                 executors=executors,
                 peer_id=peer_id,
                 peer_features=peer_features,
@@ -676,10 +735,10 @@ class AgentRunControlPlane:
             if peer_features is not None
             else None
         )
+        worker_kind_value = optional_worker_kind(worker_kind)
         with self._lock:
             self.recover_stale_agent_runs()
-            if self._running_count_locked() >= self.max_running_tasks:
-                return None
+            running_tasks = self._running_tasks_locked()
             for state in self._states.values():
                 task = state.task
                 if task.status != TaskStatus.QUEUED:
@@ -687,7 +746,17 @@ class AgentRunControlPlane:
                 if allowed and task.executor not in allowed:
                     continue
                 if not self._worker_matches_task_locked(
-                    task, features=features, workspace_root=workspace_root
+                    task,
+                    worker_kind=worker_kind_value,
+                    features=features,
+                    workspace_root=workspace_root,
+                ):
+                    continue
+                if not runtime_slots_allow_agent_run_claim(
+                    running_tasks,
+                    task,
+                    self.runtime_snapshot,
+                    max_running_tasks=self.max_running_tasks,
                 ):
                     continue
                 task.status = TaskStatus.DISPATCHED
@@ -708,6 +777,8 @@ class AgentRunControlPlane:
                         ),
                         issue_id=task.issue_id,
                         runtime_profile_id=task.runtime_profile_id,
+                        worker_kind=metadata.get("worker_kind"),
+                        model_request_origin=metadata.get("model_request_origin"),
                         workdir=task.workdir,
                         branch=task.branch_name,
                         model=str(task.metadata.get("model"))
@@ -734,6 +805,9 @@ class AgentRunControlPlane:
                     {
                         "worker_id": worker_id,
                         "peer_id": peer_id,
+                        "worker_kind": worker_kind_value.value
+                        if worker_kind_value is not None
+                        else None,
                         "request_id": claim.request_id,
                         "lease_sec": max(1, int(lease_sec or 15)),
                     },
@@ -874,14 +948,35 @@ class AgentRunControlPlane:
     def _executor_metadata(self, task: AgentRunRecord) -> dict[str, Any]:
         metadata = dict(task.metadata)
         executor = task.executor or ExecutorType.REULEAUXCODER
+        worker_kind = str(metadata.get("worker_kind") or "").strip()
+        model_request_origin = str(metadata.get("model_request_origin") or "").strip()
+        if worker_kind:
+            metadata.setdefault("worker_kind", worker_kind)
+        if model_request_origin:
+            metadata.setdefault("model_request_origin", model_request_origin)
         rendered = self._render_prompt_for_task(task, executor)
         if rendered is not None:
             metadata.setdefault("prompt_files", rendered.files)
             metadata.setdefault("prompt_metadata", rendered.metadata)
             if rendered.metadata.get("system_prompt"):
                 metadata.setdefault("system_prompt", rendered.metadata["system_prompt"])
+        return self._metadata_with_snapshot_capabilities(
+            metadata,
+            agent_id=task.agent_id,
+            source=task.source,
+            runtime_profile_id=task.runtime_profile_id,
+        )
+
+    def _metadata_with_snapshot_capabilities(
+        self,
+        metadata: dict[str, Any],
+        *,
+        agent_id: str,
+        source: AgentRunSource,
+        runtime_profile_id: str | None,
+    ) -> dict[str, Any]:
         snapshot = self.runtime_snapshot
-        raw_agent = _dict_from(_dict_from(snapshot.get("agents")).get(task.agent_id))
+        raw_agent = _dict_from(_dict_from(snapshot.get("agents")).get(agent_id))
         resolved = _dict_from(raw_agent.get("resolved_capabilities"))
         effective = _dict_from(raw_agent.get("effective_capabilities"))
         overlay = _dict_from(resolved.get("capability_overlay"))
@@ -896,10 +991,11 @@ class AgentRunControlPlane:
         metadata.setdefault(
             "permission_context",
             {
-                "agent_id": task.agent_id,
-                "source": task.source.value,
-                "interactive": task.source == AgentRunSource.CHAT,
-                "runtime_profile_id": task.runtime_profile_id or str(raw_agent.get("runtime_profile") or ""),
+                "agent_id": agent_id,
+                "source": source.value,
+                "interactive": source == AgentRunSource.CHAT,
+                "runtime_profile_id": runtime_profile_id
+                or str(raw_agent.get("runtime_profile") or ""),
                 "effective_capabilities": effective,
             },
         )
@@ -918,28 +1014,16 @@ class AgentRunControlPlane:
         self,
         task: AgentRunRecord,
         *,
+        worker_kind: WorkerKind | None,
         features: set[str] | None,
         workspace_root: str | None,
     ) -> bool:
-        location = task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
-        if features is None:
-            return True
-        if location == ExecutionLocation.LOCAL_WORKSPACE:
-            if (
-                "agent_runs" not in features
-                and "agent_runs.local_workspace" not in features
-            ):
-                return False
-            bound_workspace = str(task.metadata.get("workspace_root") or "").strip()
-            if bound_workspace:
-                return bool(workspace_root) and _workspace_key(
-                    bound_workspace
-                ) == _workspace_key(workspace_root)
-            return True
-        location_feature = f"agent_runs.{location.value}"
-        if location_feature in features:
-            return True
-        return "agent_runs" in features
+        return worker_matches_agent_run(
+            task,
+            worker_kind=worker_kind,
+            features=features,
+            workspace_root=workspace_root,
+        )
 
     def _render_prompt_for_task(
         self, task: AgentRunRecord, executor: ExecutorType
@@ -1549,12 +1633,15 @@ class AgentRunControlPlane:
         }
 
     def _running_count_locked(self) -> int:
-        return sum(
-            1
+        return len(self._running_tasks_locked())
+
+    def _running_tasks_locked(self) -> list[AgentRunRecord]:
+        return [
+            state.task
             for state in self._states.values()
             if state.task.status
             in {TaskStatus.DISPATCHED, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}
-        )
+        ]
 
     def _task_locked(self, task_id: str) -> AgentRunRecord:
         state = self._states.get(task_id)

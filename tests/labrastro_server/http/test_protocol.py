@@ -163,10 +163,8 @@ class TestRemoteHTTPContract:
         assert registry["admin.models.delete"]["path"] == "/remote/admin/models/delete"
         assert registry["admin.models.delete"]["request_model"] == "ModelProfileDeleteRequest"
         assert registry["admin.models.delete"]["auth"] == "bearer"
-        assert (
-            registry["admin.environment_requirements.behavior_catalog"]["path"]
-            == "/remote/admin/environment-requirements/behavior-catalog"
-        )
+        assert "admin.environment_requirements.behavior_catalog" not in registry
+        assert registry["admin.behavior.catalog"]["path"] == "/remote/admin/behavior/catalog"
         assert registry["admin.skills.list"]["path"] == "/remote/admin/skills/list"
         assert registry["admin.skills.record"]["request_model"] == "SkillRecordRequest"
         assert registry["admin.skills.delete"]["auth"] == "bearer"
@@ -410,6 +408,14 @@ class TestChatStatusProtocol:
             last_activity_at=2.0,
             finished_at=None,
             error=None,
+            approvals=[
+                {
+                    "approval_id": "approval-1",
+                    "tool_call_id": "call-1",
+                    "tool_name": "shell",
+                    "state": "requested",
+                }
+            ],
         )
         restored_resp = ChatStatusResponse.from_dict(resp.to_dict())
 
@@ -419,6 +425,14 @@ class TestChatStatusProtocol:
         assert restored_resp.next_cursor == 9
         assert restored_resp.session_id == "session-1"
         assert restored_resp.workflow_mode == "taskflow"
+        assert restored_resp.approvals == [
+            {
+                "approval_id": "approval-1",
+                "tool_call_id": "call-1",
+                "tool_name": "shell",
+                "state": "requested",
+            }
+        ]
 
 
 class TestSessionModelSwitchRequest:
@@ -573,7 +587,11 @@ class TestEnvironmentManifest:
 
     def test_manifest_request_roundtrip(self) -> None:
         req = EnvironmentManifestRequest(
-            peer_token="pt_1", os="windows", arch="amd64", workspace="G:/repo"
+            peer_token="pt_1",
+            os="windows",
+            arch="amd64",
+            workspace="G:/repo",
+            agent_id="reviewer",
         )
 
         restored = EnvironmentManifestRequest.from_dict(req.to_dict())
@@ -582,6 +600,7 @@ class TestEnvironmentManifest:
         assert restored.os == "windows"
         assert restored.arch == "amd64"
         assert restored.workspace == "G:/repo"
+        assert restored.agent_id == "reviewer"
 
 
 class TestExecToolRequest:

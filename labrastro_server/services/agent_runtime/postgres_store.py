@@ -7,17 +7,20 @@ from typing import Any
 import json
 
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentConfig,
     AgentRunSource,
     ArtifactStatus,
     ArtifactType,
     ExecutionLocation,
     ExecutorType,
+    ModelRequestOrigin,
     MergeStatus,
     TaskArtifact,
     AgentRunRecord,
     TaskSessionRef,
     TaskStatus,
     TriggerMode,
+    WorkerKind,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
@@ -40,6 +43,17 @@ from labrastro_server.services.agent_runtime.prompt_renderer import (
 from labrastro_server.services.agent_runtime.runtime_store import (
     DEFAULT_RUNTIME_EVENT_LIMIT,
     clamp_event_limit,
+    runtime_slots_allow_agent_run_claim,
+)
+from labrastro_server.services.agent_runtime.runtime_policy import (
+    model_request_origin_for_runtime,
+    optional_model_request_origin,
+    optional_worker_kind,
+    system_flow_for_source,
+    validate_agent_run_runtime_policy,
+    worker_kind_for_runtime,
+    worker_matches_agent_run,
+    workspace_key,
 )
 
 
@@ -75,10 +89,6 @@ def _string_list_from(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _workspace_key(value: str | None) -> str:
-    return str(value or "").strip().replace("\\", "/").rstrip("/").lower()
-
-
 def _can_resume_from_parent(request: Any, parent: AgentRunRecord) -> bool:
     if not parent.executor_session_id:
         return False
@@ -87,7 +97,7 @@ def _can_resume_from_parent(request: Any, parent: AgentRunRecord) -> bool:
         and request.runtime_profile_id == parent.runtime_profile_id
         and request.executor == parent.executor
         and request.execution_location == parent.execution_location
-        and _workspace_key(request.workdir) == _workspace_key(parent.workdir)
+        and workspace_key(request.workdir) == workspace_key(parent.workdir)
         and str(request.branch_name or "") == str(parent.branch_name or "")
     )
 
@@ -240,6 +250,13 @@ class PostgresAgentRunStore:
             metadata.setdefault("parent_run_id", request.parent_run_id)
         if request.model is not None:
             metadata.setdefault("model", request.model)
+        if getattr(request, "worker_kind", None) is not None:
+            metadata.setdefault("worker_kind", request.worker_kind.value)
+        if getattr(request, "model_request_origin", None) is not None:
+            metadata.setdefault(
+                "model_request_origin",
+                request.model_request_origin.value,
+            )
         task = AgentRunRecord(
             id=task_id or _new_id("task"),
             issue_id=request.issue_id,
@@ -301,6 +318,7 @@ class PostgresAgentRunStore:
         self,
         *,
         worker_id: str,
+        worker_kind: Any | None = None,
         executors: list[Any] | None = None,
         peer_id: str | None = None,
         peer_features: list[str] | None = None,
@@ -315,21 +333,21 @@ class PostgresAgentRunStore:
             if peer_features is not None
             else None
         )
+        worker_kind_value = optional_worker_kind(worker_kind)
         with self.engine.begin() as conn:
             conn.execute(
                 text("SELECT name FROM labrastro_agent_run_locks WHERE name='global_claim' FOR UPDATE")
             ).first()
             self._recover_stale_with_conn(conn)
-            running = conn.execute(
+            running_rows = conn.execute(
                 text(
                     """
-                    SELECT count(*) FROM labrastro_agent_runs
+                    SELECT * FROM labrastro_agent_runs
                     WHERE status IN ('dispatched', 'running', 'waiting_approval')
                     """
                 )
-            ).scalar_one()
-            if int(running) >= self.max_running_tasks:
-                return None
+            ).mappings().all()
+            running_tasks = [self._task_from_row(row) for row in running_rows]
             rows = conn.execute(
                 text(
                     """
@@ -346,7 +364,17 @@ class PostgresAgentRunStore:
                 if allowed and task.executor not in allowed:
                     continue
                 if not self._worker_matches_task(
-                    task, features=features, workspace_root=workspace_root
+                    task,
+                    worker_kind=worker_kind_value,
+                    features=features,
+                    workspace_root=workspace_root,
+                ):
+                    continue
+                if not runtime_slots_allow_agent_run_claim(
+                    running_tasks,
+                    task,
+                    self.runtime_snapshot,
+                    max_running_tasks=self.max_running_tasks,
                 ):
                     continue
                 if not self._agent_concurrency_allows(conn, task):
@@ -394,7 +422,13 @@ class PostgresAgentRunStore:
                         "lease_sec": effective_lease,
                         "last_heartbeat_at": now,
                         "runtime_snapshot": _json(self.runtime_snapshot),
-                        "metadata": _json({}),
+                        "metadata": _json(
+                            {
+                                "worker_kind": worker_kind_value.value
+                                if worker_kind_value is not None
+                                else "",
+                            }
+                        ),
                     },
                 )
                 self._append_event(
@@ -404,6 +438,9 @@ class PostgresAgentRunStore:
                     {
                         "worker_id": worker_id,
                         "peer_id": peer_id,
+                        "worker_kind": worker_kind_value.value
+                        if worker_kind_value is not None
+                        else None,
                         "request_id": request_id,
                         "lease_sec": effective_lease,
                     },
@@ -422,6 +459,8 @@ class PostgresAgentRunStore:
                         ),
                         issue_id=task.issue_id,
                         runtime_profile_id=task.runtime_profile_id,
+                        worker_kind=metadata.get("worker_kind"),
+                        model_request_origin=metadata.get("model_request_origin"),
                         workdir=task.workdir,
                         branch=task.branch_name,
                         model=str(task.metadata.get("model"))
@@ -1139,8 +1178,22 @@ class PostgresAgentRunStore:
         agents = _dict_from(self.runtime_snapshot.get("agents"))
         profiles = _dict_from(self.runtime_snapshot.get("runtime_profiles"))
         raw_agent = _dict_from(agents.get(request.agent_id))
+        agent_config: AgentConfig | None = None
+        if raw_agent:
+            agent_config = AgentConfig.from_dict(request.agent_id, raw_agent)
+            if agent_config.visibility != "user":
+                flow = system_flow_for_source(request.source)
+                if not agent_config.allows_system_flow(flow):
+                    raise ValueError(
+                        "agent is restricted to system flows: "
+                        f"{request.agent_id} does not allow {flow}"
+                    )
         agent_profile_id = str(raw_agent.get("runtime_profile") or "").strip()
         profile_id = str(request.runtime_profile_id or agent_profile_id).strip()
+        if raw_agent and not profile_id:
+            raise ValueError(
+                f"agent {request.agent_id} requires a runtime_profile"
+            )
         raw_profile = _dict_from(profiles.get(profile_id)) if profile_id else {}
         if profile_id and not raw_profile:
             raise ValueError(f"runtime profile not found: {profile_id}")
@@ -1155,6 +1208,19 @@ class PostgresAgentRunStore:
             or _optional_location(raw_profile.get("execution_location"))
             or ExecutionLocation.LOCAL_WORKSPACE
         )
+        request.worker_kind = request.worker_kind or worker_kind_for_runtime(
+            raw_profile,
+            request.execution_location,
+        )
+        request.model_request_origin = (
+            request.model_request_origin
+            or model_request_origin_for_runtime(
+                raw_profile,
+                executor=request.executor,
+                worker_kind=request.worker_kind,
+            )
+        )
+        self._validate_runtime_policy(request, agent_config=agent_config)
         if request.model is None and raw_profile.get("model") is not None:
             request.model = str(raw_profile["model"])
         if (
@@ -1164,6 +1230,14 @@ class PostgresAgentRunStore:
         ):
             request.executor_session_id = parent.executor_session_id
         return request
+
+    def _validate_runtime_policy(
+        self,
+        request: Any,
+        *,
+        agent_config: AgentConfig | None,
+    ) -> None:
+        validate_agent_run_runtime_policy(request, agent_config=agent_config)
 
     def _append_event(
         self, conn: Any, task_id: str, event_type: str, payload: dict[str, Any]
@@ -1253,28 +1327,16 @@ class PostgresAgentRunStore:
         self,
         task: AgentRunRecord,
         *,
+        worker_kind: WorkerKind | None,
         features: set[str] | None,
         workspace_root: str | None,
     ) -> bool:
-        location = task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
-        if features is None:
-            return True
-        if location == ExecutionLocation.LOCAL_WORKSPACE:
-            if (
-                "agent_runs" not in features
-                and "agent_runs.local_workspace" not in features
-            ):
-                return False
-            bound_workspace = str(task.metadata.get("workspace_root") or "").strip()
-            if bound_workspace:
-                return bool(workspace_root) and _workspace_key(
-                    bound_workspace
-                ) == _workspace_key(workspace_root)
-            return True
-        location_feature = f"agent_runs.{location.value}"
-        if location_feature in features:
-            return True
-        return "agent_runs" in features
+        return worker_matches_agent_run(
+            task,
+            worker_kind=worker_kind,
+            features=features,
+            workspace_root=workspace_root,
+        )
 
     def _agent_concurrency_allows(self, conn: Any, task: AgentRunRecord) -> bool:
         raw_agent = _dict_from(_dict_from(self.runtime_snapshot.get("agents")).get(task.agent_id))

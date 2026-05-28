@@ -13,6 +13,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     TaskSessionRef,
     TriggerMode,
 )
+from reuleauxcoder.domain.config.models import build_agent_run_snapshot
+from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunRequest,
     AgentRunControlPlane,
@@ -22,11 +24,38 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
 )
+from labrastro_server.services.agent_runtime.runtime_store import (
+    runtime_slot_key_for_agent_run,
+)
 from labrastro_server.services.agent_runtime.scheduler import BasicAgentScheduler
 from labrastro_server.services.agent_runtime.worktree import (
     WorktreeManager,
     WorktreeOwnershipError,
 )
+
+
+def _model_config() -> dict:
+    return {
+        "providers": {
+            "items": {
+                "openai": {
+                    "type": "openai_chat",
+                    "api_key": "key",
+                }
+            }
+        },
+        "models": {
+            "active_main": "main",
+            "profiles": {
+                "main": {
+                    "provider": "openai",
+                    "model": "gpt",
+                    "max_tokens": 8192,
+                    "max_context_tokens": 128000,
+                }
+            },
+        },
+    }
 
 
 def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
@@ -579,10 +608,14 @@ def test_submit_resolves_agent_run_profile_defaults() -> None:
     assert task.execution_location == ExecutionLocation.DAEMON_WORKTREE
     assert task.runtime_profile_id == "fake_profile"
     assert task.metadata["model"] == "smoke-model"
+    assert task.metadata["worker_kind"] == "server_worker"
+    assert task.metadata["model_request_origin"] == "server"
     claim = control.claim_agent_run(worker_id="worker-1", executors=["fake"])
     assert claim is not None
     assert claim.executor_request.runtime_profile_id == "fake_profile"
     assert claim.executor_request.executor == ExecutorType.FAKE
+    assert claim.executor_request.worker_kind.value == "server_worker"
+    assert claim.executor_request.model_request_origin.value == "server"
     assert "AGENT_RUNTIME.md" in claim.executor_request.metadata["prompt_files"]
     assert (
         "Review carefully."
@@ -639,6 +672,402 @@ def test_submit_rejects_missing_agent_run_profile() -> None:
         )
 
 
+def test_submit_rejects_user_agent_without_runtime_profile() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "server_default": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
+            "agents": {
+                "reviewer": {
+                    "name": "Reviewer",
+                    "visibility": "user",
+                    "taskflow_eligible": True,
+                }
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a runtime_profile"):
+        control.submit_agent_run(
+            AgentRunRequest(issue_id="issue-1", agent_id="reviewer", prompt="run"),
+            task_id="task-no-profile",
+        )
+
+
+def test_taskflow_rejects_local_only_runtime_profile() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "local_cli": {
+                    "executor": "codex",
+                    "execution_location": "local_workspace",
+                    "worker_kind": "local_peer",
+                }
+            },
+            "agents": {
+                "reviewer": {
+                    "visibility": "user",
+                    "taskflow_eligible": True,
+                    "runtime_profile": "local_cli",
+                }
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="Taskflow agent requires a server-capable runtime profile"):
+        control.submit_agent_run(
+            AgentRunRequest(
+                issue_id="taskflow-1",
+                agent_id="reviewer",
+                prompt="run taskflow",
+                source="taskflow",
+            ),
+            task_id="taskflow-local",
+        )
+
+
+def test_local_peer_cannot_claim_remote_server_agent_run() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "server_fake": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
+            "agents": {"reviewer": {"runtime_profile": "server_fake"}},
+        }
+    )
+    task = control.submit_agent_run(
+        AgentRunRequest(issue_id="issue-1", agent_id="reviewer", prompt="run"),
+        task_id="task-remote-server",
+    )
+
+    assert (
+        control.claim_agent_run(
+            worker_id="local-peer",
+            worker_kind="local_peer",
+            executors=["fake"],
+            peer_features=["agent_runs", "agent_runs.local_workspace"],
+        )
+        is None
+    )
+    claim = control.claim_agent_run(
+        worker_id="server-worker",
+        worker_kind="server_worker",
+        executors=["fake"],
+        peer_features=["agent_runs.remote_server"],
+    )
+
+    assert claim is not None
+    assert claim.task.id == task.id
+    assert claim.executor_request.metadata["worker_kind"] == "server_worker"
+
+
+def test_local_cli_executor_records_local_model_request_origin() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "local_codex": {
+                    "executor": "codex",
+                    "execution_location": "local_workspace",
+                    "worker_kind": "local_peer",
+                }
+            },
+            "agents": {"coder": {"runtime_profile": "local_codex"}},
+        }
+    )
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="issue-1",
+            agent_id="coder",
+            prompt="run local cli",
+            metadata={"workspace_root": "G:/repo/main"},
+        ),
+        task_id="task-local-cli",
+    )
+    claim = control.claim_agent_run(
+        worker_id="local-peer",
+        worker_kind="local_peer",
+        executors=["codex"],
+        peer_features=["agent_runs.local_workspace"],
+        workspace_root="G:/repo/main",
+    )
+
+    assert claim is not None
+    assert claim.task.id == task.id
+    assert task.metadata["model_request_origin"] == "local_cli"
+    assert claim.executor_request.metadata["model_request_origin"] == "local_cli"
+
+
+@pytest.mark.parametrize(
+    ("executor", "worker_kind", "model_request_origin", "message"),
+    [
+        (
+            "codex",
+            "server_worker",
+            "local_cli",
+            "codex runtime profile with server_worker must use model_request_origin=server_worker_cli",
+        ),
+        (
+            "codex",
+            "local_peer",
+            "server_worker_cli",
+            "codex runtime profile with local_peer must use model_request_origin=local_cli",
+        ),
+        (
+            "reuleauxcoder",
+            "server_worker",
+            "server_worker_cli",
+            "reuleauxcoder runtime profile must use model_request_origin=server",
+        ),
+    ],
+)
+def test_submit_rejects_inconsistent_model_request_origin(
+    executor: str,
+    worker_kind: str,
+    model_request_origin: str,
+    message: str,
+) -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "profile": {
+                    "executor": executor,
+                    "execution_location": (
+                        "local_workspace"
+                        if worker_kind == "local_peer"
+                        else "remote_server"
+                    ),
+                    "worker_kind": worker_kind,
+                    "model_request_origin": model_request_origin,
+                }
+            },
+            "agents": {"coder": {"runtime_profile": "profile"}},
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        control.submit_agent_run(
+            AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"),
+            task_id="task-inconsistent-origin",
+        )
+
+
+def test_runtime_slots_limit_server_worker_runs_independently_from_global_limit() -> None:
+    control = AgentRunControlPlane(
+        max_running_tasks=3,
+        runtime_snapshot={
+            "runtime_slots": {
+                "server_agent_run_slots": 1,
+                "server_sandbox_slots": 1,
+                "local_peer_agent_run_slots": 1,
+                "model_request_slots": 3,
+            },
+            "runtime_profiles": {
+                "server_fake": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                },
+            },
+            "agents": {
+                "reviewer": {"runtime_profile": "server_fake"},
+                "builder": {"runtime_profile": "server_fake"},
+            },
+        },
+    )
+    control.submit_agent_run(AgentRunRequest(issue_id="slot-1", agent_id="reviewer", prompt="review"))
+    control.submit_agent_run(AgentRunRequest(issue_id="slot-2", agent_id="builder", prompt="build"))
+
+    first = control.claim_agent_run(
+        worker_id="server-1",
+        worker_kind="server_worker",
+        executors=["fake"],
+        peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
+    )
+    second = control.claim_agent_run(
+        worker_id="server-2",
+        worker_kind="server_worker",
+        executors=["fake"],
+        peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
+    )
+
+    assert first is not None
+    assert second is None
+
+
+def test_runtime_slots_allow_server_and_local_peer_runs_to_progress_separately() -> None:
+    control = AgentRunControlPlane(
+        max_running_tasks=1,
+        runtime_snapshot={
+            "runtime_slots": {
+                "server_agent_run_slots": 1,
+                "server_sandbox_slots": 1,
+                "local_peer_agent_run_slots": 1,
+                "model_request_slots": 3,
+            },
+            "runtime_profiles": {
+                "server_fake": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                },
+                "local_fake": {
+                    "executor": "fake",
+                    "execution_location": "local_workspace",
+                    "worker_kind": "local_peer",
+                },
+            },
+            "agents": {
+                "remote_agent": {"runtime_profile": "server_fake"},
+                "local_agent": {
+                    "runtime_profile": "local_fake",
+                    "taskflow_eligible": False,
+                },
+            },
+        },
+    )
+    control.submit_agent_run(AgentRunRequest(issue_id="slot-remote", agent_id="remote_agent", prompt="remote"))
+    control.submit_agent_run(AgentRunRequest(issue_id="slot-local", agent_id="local_agent", prompt="local"))
+
+    server_claim = control.claim_agent_run(
+        worker_id="server-1",
+        worker_kind="server_worker",
+        executors=["fake"],
+        peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
+    )
+    local_claim = control.claim_agent_run(
+        worker_id="local-1",
+        worker_kind="local_peer",
+        executors=["fake"],
+        peer_features=["worker_kind:local_peer", "agent_runs.local_workspace"],
+    )
+
+    assert server_claim is not None
+    assert local_claim is not None
+
+
+def test_environment_agent_run_uses_local_peer_slot() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "environment_local": {
+                    "executor": "fake",
+                    "execution_location": "local_workspace",
+                    "worker_kind": "local_peer",
+                },
+            },
+            "agents": {
+                "environment_configurator": {
+                    "visibility": "system",
+                    "system_flow_only": ["environment_config"],
+                    "runtime_profile": "environment_local",
+                    "taskflow_eligible": False,
+                },
+            },
+        },
+    )
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="environment",
+            agent_id="environment_configurator",
+            prompt="check environment",
+            source="environment",
+        ),
+        task_id="task-environment-slot",
+    )
+
+    assert runtime_slot_key_for_agent_run(task) == "local_peer_agent_run_slots"
+
+
+def test_default_system_agent_runs_carry_effective_capability_boundaries() -> None:
+    config = ConfigLoader()._parse_config(_model_config())
+    snapshot = build_agent_run_snapshot(
+        agent_registry=config.agent_registry,
+        runtime_profiles=config.runtime_profiles,
+        run_limits=config.run_limits,
+        capability_packages=config.capability_packages,
+        capability_components=config.capability_components,
+    )
+    control = AgentRunControlPlane(runtime_snapshot=snapshot)
+
+    environment_task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="environment",
+            agent_id="environment_configurator",
+            prompt="check",
+            source="environment",
+        ),
+        task_id="task-default-environment",
+    )
+    packager_task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="capability-ingest",
+            agent_id="capability_packager",
+            prompt="draft",
+            source="capability_ingest",
+        ),
+        task_id="task-default-packager",
+    )
+
+    assert environment_task.metadata["effective_capabilities"]["tools"] == [
+        "builtin:shell"
+    ]
+    assert packager_task.metadata["effective_capabilities"]["tools"] == [
+        "builtin:fetch_capabilities",
+        "builtin:glob",
+        "builtin:grep",
+        "builtin:list_file",
+        "builtin:read_file",
+    ]
+
+
+def test_sandbox_worker_claims_only_sandbox_managed_runs() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "sandbox_fake": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "sandbox_worker",
+                },
+            },
+            "agents": {"sandbox_agent": {"runtime_profile": "sandbox_fake"}},
+        },
+    )
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="sandbox-claim",
+            agent_id="sandbox_agent",
+            prompt="sandbox",
+        )
+    )
+
+    server_claim = control.claim_agent_run(
+        worker_id="server-1",
+        worker_kind="server_worker",
+        executors=["fake"],
+        peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
+    )
+    sandbox_claim = control.claim_agent_run(
+        worker_id="sandbox-1",
+        worker_kind="sandbox_worker",
+        executors=["fake"],
+        peer_features=["worker_kind:sandbox_worker", "sandbox_worker"],
+    )
+
+    assert server_claim is None
+    assert sandbox_claim is not None
+    assert sandbox_claim.task.id == task.id
+
+
 def test_waiting_approval_event_updates_task_status() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
@@ -659,7 +1088,23 @@ def test_waiting_approval_event_updates_task_status() -> None:
 
 
 def test_taskflow_waiting_approval_event_becomes_blocked_review() -> None:
-    control = AgentRunControlPlane()
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "server_fake": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
+            "agents": {
+                "worker": {
+                    "runtime_profile": "server_fake",
+                    "taskflow_eligible": True,
+                }
+            },
+        }
+    )
     task = control.submit_agent_run(
         AgentRunRequest(
             issue_id="taskflow-1",
@@ -801,9 +1246,10 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
     )
     claim = control.claim_agent_run(
         worker_id="worker-1",
+        worker_kind="local_peer",
         executors=["fake"],
         peer_id="peer-1",
-        peer_features=["agent_runs"],
+        peer_features=["agent_runs.local_workspace"],
         lease_sec=1,
     )
 
@@ -860,9 +1306,10 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
     )
     stale_claim = control.claim_agent_run(
         worker_id="worker-2",
+        worker_kind="local_peer",
         executors=["fake"],
         peer_id="peer-2",
-        peer_features=["agent_runs"],
+        peer_features=["agent_runs.local_workspace"],
         lease_sec=1,
     )
 
@@ -886,9 +1333,10 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     )
     claim = control.claim_agent_run(
         worker_id="worker-1",
+        worker_kind="local_peer",
         executors=["fake"],
         peer_id="peer-1",
-        peer_features=["agent_runs"],
+        peer_features=["agent_runs.local_workspace"],
     )
 
     assert claim is not None
@@ -962,9 +1410,10 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
     )
     claim = control.claim_agent_run(
         worker_id="worker-1",
+        worker_kind="server_worker",
         executors=["fake"],
         peer_id="peer-1",
-        peer_features=["agent_runs"],
+        peer_features=["agent_runs.daemon_worktree"],
     )
 
     assert claim is not None
@@ -1017,9 +1466,10 @@ def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
     )
     claim = control.claim_agent_run(
         worker_id="worker-1",
+        worker_kind="server_worker",
         executors=["fake"],
         peer_id="peer-1",
-        peer_features=["agent_runs"],
+        peer_features=["agent_runs.daemon_worktree"],
     )
 
     assert claim is not None
@@ -1111,12 +1561,20 @@ def test_basic_scheduler_selects_lowest_running_agent() -> None:
 def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> None:
     control = AgentRunControlPlane(
         runtime_snapshot={
+            "runtime_profiles": {
+                "capability_packager_remote": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
             "agents": {
                 "capability_packager": {
                     "visibility": "internal",
                     "delegable": False,
                     "taskflow_eligible": False,
                     "system_flow_only": ["capability_ingest"],
+                    "runtime_profile": "capability_packager_remote",
                 }
             }
         }
@@ -1136,12 +1594,20 @@ def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> 
 def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
     control = AgentRunControlPlane(
         runtime_snapshot={
+            "runtime_profiles": {
+                "capability_packager_remote": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
             "agents": {
                 "capability_packager": {
                     "visibility": "internal",
                     "delegable": False,
                     "taskflow_eligible": False,
                     "system_flow_only": ["capability_ingest"],
+                    "runtime_profile": "capability_packager_remote",
                 }
             }
         }
