@@ -315,6 +315,7 @@ class ChatStatusResponse:
     finished_at: float | None = None
     error: str | None = None
     recovery: dict[str, Any] | None = None
+    approvals: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -339,6 +340,7 @@ class ChatStatusResponse:
             "finished_at": self.finished_at,
             "error": self.error,
             "recovery": dict(self.recovery) if isinstance(self.recovery, dict) else None,
+            "approvals": _dict_list(self.approvals),
         }
 
     @classmethod
@@ -367,6 +369,7 @@ class ChatStatusResponse:
             finished_at=float(d["finished_at"]) if d.get("finished_at") is not None else None,
             error=d.get("error") if isinstance(d.get("error"), str) else None,
             recovery=d.get("recovery") if isinstance(d.get("recovery"), dict) else None,
+            approvals=_dict_list(d.get("approvals")),
         )
 
 @dataclass
@@ -558,13 +561,18 @@ class ApprovalReplyRequest:
 class ApprovalReplyResponse:
     ok: bool
     error: str | None = None
+    state: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "error": self.error}
+        return {"ok": self.ok, "error": self.error, "state": self.state}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ApprovalReplyResponse":
-        return cls(ok=bool(d.get("ok", False)), error=d.get("error"))
+        return cls(
+            ok=bool(d.get("ok", False)),
+            error=d.get("error"),
+            state=d.get("state") if isinstance(d.get("state"), str) else None,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -320,6 +320,7 @@ class _RemoteChatSession:
     running: bool = False
     seq_next: int = 1
     approval_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
+    approval_resolutions: dict[str, dict[str, Any]] = field(default_factory=dict)
     follow_up_tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_ticket: dict[str, Any] | None = None
     created_at: float = field(default_factory=time.time)
@@ -601,6 +602,13 @@ class _RemoteChatSession:
                 waiter["done"] = True
                 waiter["decision"] = "deny_once"
                 waiter["reason"] = "chat_closed"
+                waiter["state"] = "cancelled"
+                self._record_approval_resolution_locked(
+                    str(waiter.get("approval_id") or ""),
+                    "deny_once",
+                    "chat_closed",
+                    "cancelled",
+                )
             for ticket in self.follow_up_tickets.values():
                 if ticket.get("state") in {"consumed", "cancelled", "unconsumed"}:
                     continue
@@ -647,6 +655,7 @@ class _RemoteChatSession:
                 "finished_at": self.finished_at,
                 "error": self.last_error,
                 "recovery": dict(self.recovery_ticket) if self.recovery_ticket else None,
+                "approvals": self._pending_approvals_locked(),
             }
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
@@ -674,6 +683,13 @@ class _RemoteChatSession:
                 waiter["done"] = True
                 waiter["decision"] = "deny_once"
                 waiter["reason"] = reason
+                waiter["state"] = "cancelled"
+                self._record_approval_resolution_locked(
+                    str(waiter.get("approval_id") or ""),
+                    "deny_once",
+                    reason,
+                    "cancelled",
+                )
             callback = self.cancel_callback
             self.cond.notify_all()
         if callback is not None:
@@ -823,29 +839,56 @@ class _RemoteChatSession:
             "</stream_recovery>"
         )
 
-    def register_approval(self, approval_id: str) -> None:
+    def register_approval(
+        self, approval_id: str, payload: dict[str, Any] | None = None
+    ) -> None:
         with self.cond:
-            self.approval_waiters[approval_id] = {}
+            approval_id = str(approval_id)
+            self.approval_waiters[approval_id] = {
+                "approval_id": approval_id,
+                "state": "requested",
+                "payload": self._approval_payload(approval_id, payload),
+            }
+            self.approval_resolutions.pop(approval_id, None)
 
     def resolve_approval(
         self, approval_id: str, decision: str, reason: str | None
-    ) -> bool:
+    ) -> str | None:
         with self.cond:
             waiter = self.approval_waiters.get(approval_id)
             if waiter is None:
-                return False
+                resolved = self.approval_resolutions.get(approval_id)
+                if resolved and resolved.get("decision") == decision:
+                    return "already_resolved"
+                return None
+            if waiter.get("done"):
+                if waiter.get("decision") == decision:
+                    return "already_resolved"
+                return None
             waiter["done"] = True
             waiter["decision"] = decision
             waiter["reason"] = reason
+            waiter["state"] = "resolved"
+            self._record_approval_resolution_locked(
+                approval_id, decision, reason, "resolved"
+            )
             self.cond.notify_all()
-            return True
+            return "resolved"
 
     def wait_approval(
         self, approval_id: str, timeout_sec: float | None = None
     ) -> tuple[str, str | None]:
         deadline = time.time() + timeout_sec if timeout_sec else None
         with self.cond:
-            waiter = self.approval_waiters.setdefault(approval_id, {})
+            waiter = self.approval_waiters.setdefault(
+                approval_id,
+                {
+                    "approval_id": str(approval_id),
+                    "state": "requested",
+                    "payload": self._approval_payload(approval_id, None),
+                },
+            )
+            waiter.setdefault("approval_id", str(approval_id))
             while not waiter.get("done"):
                 if deadline is None:
                     self.cond.wait(timeout=0.5)
@@ -856,6 +899,12 @@ class _RemoteChatSession:
                 self.cond.wait(timeout=remaining)
             decision = str(waiter.get("decision", "deny_once"))
             reason = waiter.get("reason")
+            self._record_approval_resolution_locked(
+                approval_id,
+                decision,
+                reason if isinstance(reason, str) else None,
+                str(waiter.get("state") or "resolved"),
+            )
             self.approval_waiters.pop(approval_id, None)
             return decision, reason if isinstance(reason, str) else None
 
@@ -867,7 +916,51 @@ class _RemoteChatSession:
                 waiter["done"] = True
                 waiter["decision"] = "deny_once"
                 waiter["reason"] = reason
+                waiter["state"] = "cancelled"
+                self._record_approval_resolution_locked(
+                    str(waiter.get("approval_id") or ""),
+                    "deny_once",
+                    reason,
+                    "cancelled",
+                )
             self.cond.notify_all()
+
+    @staticmethod
+    def _approval_payload(
+        approval_id: str, payload: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        out = dict(payload) if isinstance(payload, dict) else {}
+        out["approval_id"] = str(out.get("approval_id") or approval_id)
+        return out
+
+    def _pending_approvals_locked(self) -> list[dict[str, Any]]:
+        approvals: list[dict[str, Any]] = []
+        for approval_id, waiter in self.approval_waiters.items():
+            if waiter.get("done"):
+                continue
+            payload = self._approval_payload(
+                approval_id,
+                waiter.get("payload") if isinstance(waiter.get("payload"), dict) else None,
+            )
+            payload["state"] = str(waiter.get("state") or "requested")
+            approvals.append(payload)
+        return approvals
+
+    def _record_approval_resolution_locked(
+        self,
+        approval_id: str,
+        decision: str,
+        reason: str | None,
+        state: str,
+    ) -> None:
+        if not approval_id:
+            return
+        self.approval_resolutions[approval_id] = {
+            "approval_id": approval_id,
+            "decision": decision,
+            "reason": reason,
+            "state": state,
+        }
 
 
 class RemoteRelayHTTPService:
@@ -895,6 +988,8 @@ class RemoteRelayHTTPService:
         mcp_servers: list[Any] | None = None,
         mcp_artifact_root: str | Path = ".rcoder/mcp-artifacts",
         environment_requirements: dict[str, Any] | None = None,
+        capability_packages: dict[str, Any] | None = None,
+        environment_requirement_scope_ids: dict[str, set[str]] | None = None,
         admin_config_path: str | Path | None = None,
         admin_config_reload_handler: ConfigReloadHandler | None = None,
         admin_provider_test_handler: ProviderTestHandler | None = None,
@@ -932,6 +1027,12 @@ class RemoteRelayHTTPService:
         self.mcp_servers = list(mcp_servers or [])
         self.mcp_artifact_root = Path(mcp_artifact_root)
         self.environment_requirements = dict(environment_requirements or {})
+        self.capability_packages = dict(capability_packages or {})
+        self.environment_requirement_scope_ids = (
+            _normalize_environment_requirement_scope_ids(
+                environment_requirement_scope_ids
+            )
+        )
         self.admin_manager = RemoteAdminConfigManager(
             Path(admin_config_path) if admin_config_path is not None else None,
             reload_handler=admin_config_reload_handler,
@@ -1576,21 +1677,33 @@ class RemoteRelayHTTPService:
         return MCPManifestResponse(servers=servers, diagnostics=diagnostics)
 
     def _build_environment_manifest(
-        self, os_name: str, arch: str, workspace: str
+        self,
+        os_name: str,
+        arch: str,
+        workspace: str,
+        *,
+        agent_id: str = "",
     ) -> EnvironmentManifestResponse:
         del os_name, arch, workspace
+        scope_ids = self._environment_requirement_scope_for_agent(agent_id)
         environment_requirements: list[EnvironmentRequirementManifest] = []
         for requirement_id, requirement in sorted(self.environment_requirements.items()):
+            raw_requirement_id = str(
+                _env_tool_value(requirement, "id", requirement_id) or requirement_id
+            )
+            if scope_ids is not None and (
+                requirement_id not in scope_ids and raw_requirement_id not in scope_ids
+            ):
+                continue
             if not _env_bool_value(_env_tool_value(requirement, "enabled", True)):
+                continue
+            if not self._package_managed_requirement_available(requirement):
                 continue
             placement = normalize_environment_placement(
                 _env_tool_value(requirement, "placement", "peer")
             )
             if placement == "server":
                 continue
-            raw_requirement_id = str(
-                _env_tool_value(requirement, "id", requirement_id) or requirement_id
-            )
             name = str(
                 _env_tool_value(
                     requirement,
@@ -1677,12 +1790,57 @@ class RemoteRelayHTTPService:
             environment_requirements=environment_requirements,
         )
 
+    def _environment_requirement_scope_for_agent(
+        self, agent_id: str
+    ) -> set[str] | None:
+        normalized_agent_id = str(agent_id or "").strip()
+        if not normalized_agent_id:
+            return None
+        return set(self.environment_requirement_scope_ids.get(normalized_agent_id, set()))
+
+    def _package_managed_requirement_available(self, requirement: Any) -> bool:
+        if str(_env_tool_value(requirement, "managed_by", "") or "") != "capability_package":
+            return True
+        package_ids = _env_string_list_value(_env_tool_value(requirement, "package_ids", []))
+        if not package_ids:
+            return False
+        if not self.capability_packages:
+            return True
+        for package_id in package_ids:
+            package = self.capability_packages.get(package_id)
+            if package is None:
+                continue
+            if _env_bool_value(_env_tool_value(package, "enabled", True)):
+                return True
+        return False
+
 
 def _parse_bind(bind: str) -> tuple[str, int]:
     host, sep, port = bind.rpartition(":")
     if not sep or not host:
         raise ValueError(f"Invalid relay bind address: {bind!r}")
     return host, int(port)
+
+
+def _normalize_environment_requirement_scope_ids(
+    value: dict[str, set[str]] | None,
+) -> dict[str, set[str]]:
+    if not isinstance(value, dict):
+        return {}
+    scopes: dict[str, set[str]] = {}
+    for agent_id, requirement_ids in value.items():
+        normalized_agent_id = str(agent_id or "").strip()
+        if not normalized_agent_id:
+            continue
+        if not isinstance(requirement_ids, (list, tuple, set, frozenset)):
+            scopes[normalized_agent_id] = set()
+            continue
+        scopes[normalized_agent_id] = {
+            str(requirement_id).strip()
+            for requirement_id in requirement_ids
+            if str(requirement_id).strip()
+        }
+    return scopes
 
 
 def _env_tool_value(tool: Any, field_name: str, default: Any = None) -> Any:

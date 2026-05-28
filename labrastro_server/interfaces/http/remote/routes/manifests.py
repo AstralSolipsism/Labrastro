@@ -115,8 +115,10 @@ class RemoteManifestRoutes:
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         response = self.service._build_environment_manifest(
-            req.os, req.arch, req.workspace
+            req.os,
+            req.arch,
+            req.workspace,
+            agent_id=req.agent_id,
         )
         self._send_json(HTTPStatus.OK, response.to_dict())
-
 

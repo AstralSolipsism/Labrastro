@@ -616,8 +616,14 @@ class RemoteChatRoutes:
         if control is None:
             return
         _control_peer_id, session = control
-        ok = session.resolve_approval(req.approval_id, req.decision, req.reason)
-        if not ok:
+        if req.decision not in {"allow_once", "deny_once"}:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_approval_decision")
+            return
+        state = session.resolve_approval(req.approval_id, req.decision, req.reason)
+        if state is None:
             self._send_error(HTTPStatus.NOT_FOUND, "approval_not_found")
             return
-        self._send_json(HTTPStatus.OK, ApprovalReplyResponse(ok=True).to_dict())
+        self._send_json(
+            HTTPStatus.OK,
+            ApprovalReplyResponse(ok=True, state=state).to_dict(),
+        )

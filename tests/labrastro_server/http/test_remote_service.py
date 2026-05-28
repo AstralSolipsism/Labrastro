@@ -44,7 +44,10 @@ from reuleauxcoder.domain.config.models import (
     MCPLaunchConfig,
     MCPServerConfig,
 )
-from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
+from labrastro_server.services.agent_runtime.control_plane import (
+    AgentRunControlPlane,
+    AgentRunRequest,
+)
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.interfaces.http.remote.protocol import (
@@ -1751,7 +1754,7 @@ class TestRemoteRelayHTTPService:
         try:
             _, catalog = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/environment-requirements/behavior-catalog",
+                f"{service.base_url}/remote/admin/behavior/catalog",
                 {},
                 headers=TEST_ADMIN_HEADERS,
             )
@@ -1825,7 +1828,8 @@ class TestRemoteRelayHTTPService:
                 == "reuleauxcoder.extensions.tools.registry"
             )
             assert tools["builtin:fetch_capabilities"]["related_package_ids"] == [
-                "core_builtin_tools"
+                "capability_packager_builtin_tools",
+                "core_builtin_tools",
             ]
             assert tools["builtin:fetch_capabilities"]["related_components"] == [
                 "builtin_tool:fetch_capabilities"
@@ -1846,6 +1850,18 @@ class TestRemoteRelayHTTPService:
                 "mcp:github",
             ]
             assert tools["mcp:github"]["related_package_ids"] == ["review"]
+
+            with pytest.raises(HTTPError) as old_route:
+                old_behavior_path = (
+                    "/remote/admin/environment-requirements/" + "behavior-catalog"
+                )
+                _json_request(
+                    "POST",
+                    f"{service.base_url}{old_behavior_path}",
+                    {},
+                    headers=TEST_ADMIN_HEADERS,
+                )
+            assert old_route.value.code == 404
         finally:
             service.stop()
             relay.stop()
@@ -2642,6 +2658,12 @@ class TestRemoteRelayHTTPService:
                     placement="peer",
                 )
             ],
+            capability_packages={
+                "disabled-package": {
+                    "enabled": False,
+                    "components": ["envreq:executable:package-disabled"],
+                }
+            },
             environment_requirements={
                 "envreq:executable:beads": {
                     "id": "envreq:executable:beads",
@@ -2708,6 +2730,15 @@ class TestRemoteRelayHTTPService:
                     "name": "github-token",
                     "placement": "peer",
                     "description": "GitHub token supplied by the peer environment.",
+                },
+                "envreq:executable:package-disabled": {
+                    "id": "envreq:executable:package-disabled",
+                    "kind": "executable",
+                    "name": "package-disabled",
+                    "command": "package-disabled",
+                    "managed_by": "capability_package",
+                    "package_ids": ["disabled-package"],
+                    "component_id": "envreq:executable:package-disabled",
                 }
             },
         )
@@ -2751,6 +2782,7 @@ class TestRemoteRelayHTTPService:
             }
             assert "envreq:executable:disabled" not in requirements
             assert "envreq:path:disabled-skill" not in requirements
+            assert "envreq:executable:package-disabled" not in requirements
             assert "mcp_servers" not in manifest
             assert requirements["envreq:executable:gitnexus"]["check"] == "gitnexus --version"
             assert requirements["envreq:executable:gitnexus"]["docs"][0]["title"] == "GitNexus"
@@ -2783,6 +2815,110 @@ class TestRemoteRelayHTTPService:
             assert skill_requirement["docs"][0]["title"] == "Claude skill"
             assert skill_requirement["verify_prompt"] == "Verify SKILL.md exists."
             assert "prompt" not in manifest
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_environment_manifest_can_be_scoped_to_agent_capabilities(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            capability_packages={
+                "review-tools": {"enabled": True},
+                "deploy-tools": {"enabled": True},
+            },
+            environment_requirement_scope_ids={
+                "reviewer": {"envreq:executable:gh"},
+            },
+            environment_requirements={
+                "envreq:executable:gh": {
+                    "id": "envreq:executable:gh",
+                    "kind": "executable",
+                    "name": "gh",
+                    "command": "gh",
+                    "managed_by": "capability_package",
+                    "package_ids": ["review-tools"],
+                    "component_id": "envreq:executable:gh",
+                },
+                "envreq:executable:deploy": {
+                    "id": "envreq:executable:deploy",
+                    "kind": "executable",
+                    "name": "deploy",
+                    "command": "deploy",
+                    "managed_by": "capability_package",
+                    "package_ids": ["deploy-tools"],
+                    "component_id": "envreq:executable:deploy",
+                },
+                "envreq:runtime:node": {
+                    "id": "envreq:runtime:node",
+                    "kind": "runtime",
+                    "name": "node",
+                    "check": "node --version",
+                },
+            },
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, scoped_manifest = _json_request(
+                "POST",
+                f"{service.base_url}/remote/environment/manifest",
+                {
+                    "peer_token": peer_token,
+                    "os": "linux",
+                    "arch": "amd64",
+                    "workspace": "/tmp/peer",
+                    "agent_id": "reviewer",
+                },
+            )
+            assert [
+                requirement["id"]
+                for requirement in scoped_manifest["environment_requirements"]
+            ] == ["envreq:executable:gh"]
+
+            _, unknown_agent_manifest = _json_request(
+                "POST",
+                f"{service.base_url}/remote/environment/manifest",
+                {
+                    "peer_token": peer_token,
+                    "os": "linux",
+                    "arch": "amd64",
+                    "workspace": "/tmp/peer",
+                    "agent_id": "unknown-agent",
+                },
+            )
+            assert unknown_agent_manifest["environment_requirements"] == []
+
+            _, global_manifest = _json_request(
+                "POST",
+                f"{service.base_url}/remote/environment/manifest",
+                {
+                    "peer_token": peer_token,
+                    "os": "linux",
+                    "arch": "amd64",
+                    "workspace": "/tmp/peer",
+                },
+            )
+            assert {
+                requirement["id"]
+                for requirement in global_manifest["environment_requirements"]
+            } == {
+                "envreq:executable:gh",
+                "envreq:executable:deploy",
+                "envreq:runtime:node",
+            }
         finally:
             service.stop()
             relay.stop()
@@ -4731,15 +4867,20 @@ class TestRemoteRelayHTTPService:
 
         def chat_events_handler(_peer_id: str, _prompt: str, session) -> None:
             approval_id = "approval-1"
-            session.register_approval(approval_id)
+            approval_payload = {
+                "approval_id": approval_id,
+                "tool_call_id": "call-1",
+                "tool_name": "shell",
+                "tool_source": "builtin",
+                "reason": "need approval",
+                "tool_args": {"command": "echo hi"},
+                "sections": [{"id": "command", "kind": "text", "content": "echo hi"}],
+                "content": "approve echo hi",
+            }
+            session.register_approval(approval_id, approval_payload)
             session.append_event(
                 "approval_request",
-                {
-                    "approval_id": approval_id,
-                    "tool_name": "shell",
-                    "tool_source": "builtin",
-                    "reason": "need approval",
-                },
+                approval_payload,
             )
             decision, reason = session.wait_approval(approval_id, timeout_sec=2)
             session.append_event(
@@ -4784,6 +4925,25 @@ class TestRemoteRelayHTTPService:
             assert approval_events
             approval_id = approval_events[0]["payload"]["approval_id"]
 
+            _, pending_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/chat/status",
+                {"peer_token": peer_token, "chat_id": chat_id, "cursor": 0},
+            )
+            assert pending_status["approvals"] == [
+                {
+                    "approval_id": approval_id,
+                    "tool_call_id": "call-1",
+                    "tool_name": "shell",
+                    "tool_source": "builtin",
+                    "reason": "need approval",
+                    "tool_args": {"command": "echo hi"},
+                    "sections": [{"id": "command", "kind": "text", "content": "echo hi"}],
+                    "content": "approve echo hi",
+                    "state": "requested",
+                }
+            ]
+
             status, reply_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/approval/reply",
@@ -4812,6 +4972,21 @@ class TestRemoteRelayHTTPService:
             assert resolved_events
             assert resolved_events[0]["payload"]["decision"] == "allow_once"
             assert resolved_body["done"] is True
+
+            status, duplicate_reply_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/approval/reply",
+                {
+                    "peer_token": peer_token,
+                    "chat_id": chat_id,
+                    "approval_id": approval_id,
+                    "decision": "allow_once",
+                    "reason": "ok",
+                },
+            )
+            assert status == 200
+            assert duplicate_reply_body["ok"] is True
+            assert duplicate_reply_body["state"] == "already_resolved"
 
             bad_chat_req = request.Request(
                 f"{service.base_url}/remote/approval/reply",
@@ -5914,6 +6089,182 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_agent_run_claim_rejects_invalid_or_unregistered_worker_kind(
+        self,
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane(
+            runtime_snapshot={
+                "runtime_profiles": {
+                    "server_fake": {
+                        "executor": "fake",
+                        "execution_location": "remote_server",
+                        "worker_kind": "server_worker",
+                    }
+                },
+                "agents": {"reviewer": {"runtime_profile": "server_fake"}},
+            }
+        )
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "G:/repo/main",
+                    "workspace_root": "G:/repo/main",
+                    "features": [
+                        "agent_runs",
+                        "worker_kind:local_peer",
+                        "agent_runs.local_workspace",
+                    ],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            control.submit_agent_run(
+                AgentRunRequest(
+                    issue_id="issue-1",
+                    agent_id="reviewer",
+                    prompt="run remote",
+                ),
+                task_id="task-remote-server",
+            )
+
+            with pytest.raises(HTTPError) as invalid_worker_kind:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/claim",
+                    {
+                        "peer_token": peer_token,
+                        "worker_id": "worker-local",
+                        "worker_kind": "bad",
+                        "executors": ["fake"],
+                    },
+                )
+            assert invalid_worker_kind.value.code == 400
+            invalid_body = json.loads(
+                invalid_worker_kind.value.read().decode("utf-8")
+            )
+            assert invalid_body["error"] == "invalid_worker_kind"
+
+            with pytest.raises(HTTPError) as unregistered_worker_kind:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/claim",
+                    {
+                        "peer_token": peer_token,
+                        "worker_id": "worker-local",
+                        "worker_kind": "server_worker",
+                        "executors": ["fake"],
+                    },
+                )
+            assert unregistered_worker_kind.value.code == 400
+            unregistered_body = json.loads(
+                unregistered_worker_kind.value.read().decode("utf-8")
+            )
+            assert unregistered_body["error"] == "worker_kind_not_registered"
+            assert control.get_agent_run("task-remote-server").status.value == "queued"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_server_settings_update_rejects_inconsistent_model_request_origin(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.host.yaml"
+        save_yaml_config(config_path, {})
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/server-settings/update",
+                    {
+                        "runtime_profiles": {
+                            "bad_profile": {
+                                "executor": "codex",
+                                "execution_location": "remote_server",
+                                "worker_kind": "server_worker",
+                                "model_request_origin": "local_cli",
+                            }
+                        },
+                        "agent_registry": {
+                            "agents": {
+                                "reviewer": {"runtime_profile": "bad_profile"}
+                            }
+                        },
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+            assert excinfo.value.code == 400
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert body["error"] == "invalid_agent_runtime_profile"
+            assert "server_worker_cli" in body["message"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_capability_package_routes_protect_builtin_packages(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.host.yaml"
+        save_yaml_config(config_path, {})
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            for package_id in (
+                "environment",
+                "core_builtin_tools",
+                "capability_packager_builtin_tools",
+            ):
+                with pytest.raises(HTTPError) as disable_exc:
+                    _json_request(
+                        "POST",
+                        f"{service.base_url}/remote/admin/capability-packages/enable",
+                        {"package_id": package_id, "enabled": False},
+                        headers=TEST_ADMIN_HEADERS,
+                    )
+                assert disable_exc.value.code == 400
+                disable_body = json.loads(disable_exc.value.read().decode("utf-8"))
+                assert disable_body["error"] == "builtin_capability_package"
+
+                with pytest.raises(HTTPError) as delete_exc:
+                    _json_request(
+                        "POST",
+                        f"{service.base_url}/remote/admin/capability-packages/delete",
+                        {"package_id": package_id},
+                        headers=TEST_ADMIN_HEADERS,
+                    )
+                assert delete_exc.value.code == 400
+                delete_body = json.loads(delete_exc.value.read().decode("utf-8"))
+                assert delete_body["error"] == "builtin_capability_package"
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_server_settings_update_refreshes_runtime_snapshot_for_agent_submit(
         self, tmp_path: Path
     ) -> None:
@@ -6114,7 +6465,8 @@ class TestRemoteRelayHTTPService:
             assert update_body["settings"]["run_limits"]["max_shells_per_agent"] == 1
             assert set(update_body["settings"]["runtime_profiles"]) == {
                 "environment_local",
-                "capability_packager_local",
+                "agent_remote",
+                "capability_packager_remote",
             }
             assert set(update_body["settings"]["agent_registry"]["agents"]) == {
                 "environment_configurator",
@@ -6124,7 +6476,8 @@ class TestRemoteRelayHTTPService:
             assert control.max_running_tasks == 3
             assert set(control.runtime_snapshot["runtime_profiles"]) == {
                 "environment_local",
-                "capability_packager_local",
+                "agent_remote",
+                "capability_packager_remote",
             }
             assert set(control.runtime_snapshot["agents"]) == {
                 "environment_configurator",
@@ -6313,6 +6666,8 @@ class TestRemoteRelayHTTPService:
                 "--agent-run-worker",
                 "--worker-session-id",
                 "worker-session-1",
+                "--agent-run-worker-kind",
+                "server_worker",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

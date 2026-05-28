@@ -198,6 +198,7 @@ class EnvironmentManifestRequest:
     os: str
     arch: str
     workspace: str = ""
+    agent_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -205,6 +206,7 @@ class EnvironmentManifestRequest:
             "os": self.os,
             "arch": self.arch,
             "workspace": self.workspace,
+            "agent_id": self.agent_id,
         }
 
     @classmethod
@@ -214,6 +216,7 @@ class EnvironmentManifestRequest:
             os=str(d.get("os", "")),
             arch=str(d.get("arch", "")),
             workspace=str(d.get("workspace", "")),
+            agent_id=str(d.get("agent_id") or d.get("agentId") or ""),
         )
 
 

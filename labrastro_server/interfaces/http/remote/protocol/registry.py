@@ -94,7 +94,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("admin.models.activate", "POST", "/remote/admin/models/activate", "ModelProfileActivateRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.environment_requirements.list", "POST", "/remote/admin/environment-requirements/list", "Empty", "EnvironmentRequirementList", "bearer"),
     RemoteEndpoint("admin.environment_requirements.dashboard", "POST", "/remote/admin/environment-requirements/dashboard", "Empty", "EnvironmentRequirementDashboard", "bearer"),
-    RemoteEndpoint("admin.environment_requirements.behavior_catalog", "POST", "/remote/admin/environment-requirements/behavior-catalog", "Empty", "BehaviorCatalog", "bearer"),
+    RemoteEndpoint("admin.behavior.catalog", "POST", "/remote/admin/behavior/catalog", "Empty", "BehaviorCatalog", "bearer"),
     RemoteEndpoint("admin.environment_requirements.record", "POST", "/remote/admin/environment-requirements/record", "EnvironmentRequirementRecordRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.environment_requirements.delete", "POST", "/remote/admin/environment-requirements/delete", "EnvironmentRequirementDeleteRequest", "AdminMutationResult", "bearer"),
     RemoteEndpoint("admin.environment_requirements.enable", "POST", "/remote/admin/environment-requirements/enable", "EnvironmentRequirementEnableRequest", "AdminMutationResult", "bearer"),

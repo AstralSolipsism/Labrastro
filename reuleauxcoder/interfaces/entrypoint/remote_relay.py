@@ -53,6 +53,8 @@ from reuleauxcoder.domain.config.models import (
     DEFAULT_MAIN_CHAT_AGENT_ID,
     PromptConfig,
     build_agent_run_snapshot,
+    resolve_agent_environment_requirement_scope_ids,
+    resolve_agent_effective_capability_scope,
 )
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
@@ -525,18 +527,32 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 ),
             )
         setattr(agent, "runtime_config", next_config)
+        chat_agent = _chat_entrypoint_agent_config(next_config)
+        catalog_agent_id = str(getattr(chat_agent, "id", "") or DEFAULT_MAIN_CHAT_AGENT_ID)
         setattr(
             agent,
             "capability_catalog",
-            runner.build_capability_catalog(next_config),
+            runner.build_capability_catalog(next_config, catalog_agent_id),
         )
         setattr(agent, "session_fingerprint", get_session_fingerprint(next_config, agent))
-        runner._relay_http_service.mcp_servers = list(next_config.mcp_servers)
+        if chat_agent is not None:
+            scope = resolve_agent_effective_capability_scope(next_config, catalog_agent_id)
+            runner._relay_http_service.mcp_servers = (
+                list(scope.mcp_servers) if scope.found else list(next_config.mcp_servers)
+            )
+        else:
+            runner._relay_http_service.mcp_servers = list(next_config.mcp_servers)
         runner._relay_http_service.mcp_artifact_root = Path(
             next_config.mcp_artifact_root
         )
         runner._relay_http_service.environment_requirements = dict(
             next_config.environment.requirements
+        )
+        runner._relay_http_service.capability_packages = dict(
+            next_config.capability_packages
+        )
+        runner._relay_http_service.environment_requirement_scope_ids = (
+            resolve_agent_environment_requirement_scope_ids(next_config)
         )
         if ui_bus is not None:
             old_mcp_manager = getattr(agent, "mcp_manager", None)
@@ -1009,6 +1025,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         setattr(peer_agent, "main_agent_id", agent_id)
         setattr(peer_agent, "effective_capabilities", _effective_capabilities_for_agent(current_config, agent_id))
         setattr(peer_agent, "enforce_effective_capabilities", True)
+        setattr(peer_agent, "capability_catalog", runner.build_capability_catalog(current_config, agent_id))
         if not getattr(peer_agent, "session_model_overridden", False):
             apply_agent_config_model(current_config, peer_agent, agent_id)
         runtime_config = _runtime_config_with_chat_agent_prompt(
@@ -1896,7 +1913,6 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         preview_error,
                         meta=preview_meta,
                     )
-                remote_session.register_approval(approval_id)
                 payload = {
                     "approval_id": approval_id,
                     "tool_call_id": tool_call_id,
@@ -1919,6 +1935,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         if part
                     ),
                 }
+                remote_session.register_approval(approval_id, payload)
                 remote_session.append_event("approval_request", payload)
                 decision, reason = remote_session.wait_approval(approval_id)
                 remote_session.append_event(
