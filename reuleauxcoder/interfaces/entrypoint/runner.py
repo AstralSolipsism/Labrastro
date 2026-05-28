@@ -22,7 +22,11 @@ from reuleauxcoder.app.runtime.session_state import (
     restore_config_runtime_defaults,
 )
 from reuleauxcoder.domain.agent.agent import Agent
-from reuleauxcoder.domain.config.models import Config
+from reuleauxcoder.domain.config.models import (
+    Config,
+    DEFAULT_MAIN_CHAT_AGENT_ID,
+    resolve_agent_effective_capability_scope,
+)
 from reuleauxcoder.domain.hooks import (
     HookPoint,
     RunnerShutdownContext,
@@ -56,7 +60,11 @@ from reuleauxcoder.services.config.loader import ConfigValidationError
 from reuleauxcoder.services.llm.client import LLM
 
 
-def build_capability_catalog(config: Config) -> str:
+def build_capability_catalog(config: Config, agent_id: str = "") -> str:
+    if agent_id:
+        scope = resolve_agent_effective_capability_scope(config, agent_id)
+        if scope.found:
+            return scope.capability_catalog
     lines: list[str] = []
     components = config.capability_components
     for package_id, package in sorted(config.capability_packages.items()):
@@ -192,8 +200,16 @@ class AppRunner:
             )
         tools = self.dependencies.load_tools(tool_backend)
         agent = self.dependencies.create_agent(llm, tools, config)
+        main_agent_id = _agent_config_id(config, agent)
         setattr(agent, "runtime_config", config)
-        setattr(agent, "capability_catalog", build_capability_catalog(config))
+        if main_agent_id:
+            setattr(agent, "agent_config_id", main_agent_id)
+            setattr(agent, "main_agent_id", main_agent_id)
+            scope = resolve_agent_effective_capability_scope(config, main_agent_id)
+            if scope.found:
+                setattr(agent, "effective_capabilities", scope.effective_capabilities)
+                setattr(agent, "enforce_effective_capabilities", True)
+        setattr(agent, "capability_catalog", build_capability_catalog(config, main_agent_id))
         setattr(agent, "current_session_id", None)
         setattr(agent, "session_fingerprint", get_session_fingerprint(config, agent))
         bind_memory_scope_to_agent(
@@ -216,8 +232,8 @@ class AppRunner:
         bind_remote_chat_handler(self, agent)
 
     @staticmethod
-    def build_capability_catalog(config: Config) -> str:
-        return build_capability_catalog(config)
+    def build_capability_catalog(config: Config, agent_id: str = "") -> str:
+        return build_capability_catalog(config, agent_id)
 
     def _register_hooks(self, agent: Agent, config: Config) -> None:
         """Register hooks discovered via decorator mechanism."""
@@ -281,9 +297,11 @@ class AppRunner:
     ) -> MCPManager | None:
         """Initialize and attach MCP runtime if servers are configured."""
         mcp_manager = None
+        scope = _agent_capability_scope(config, agent)
+        mcp_servers = scope.mcp_servers if scope is not None else config.mcp_servers
         server_mcp_servers = [
             server
-            for server in config.mcp_servers
+            for server in mcp_servers
             if getattr(server, "placement", "server") in {"server", "both"}
         ]
         if server_mcp_servers:
@@ -295,9 +313,16 @@ class AppRunner:
         self, config: Config, agent: Agent, ui_bus: UIEventBus
     ) -> SkillsService:
         """Initialize skills service and attach stable catalog to the agent."""
+        scope = _agent_capability_scope(config, agent)
+        skills_config = scope.skills if scope is not None else config.skills
+        environment_requirements = (
+            scope.environment.requirements
+            if scope is not None
+            else config.environment.requirements
+        )
         environment_skill_paths = [
             Path(str(requirement.path)).expanduser()
-            for requirement in config.environment.requirements.values()
+            for requirement in environment_requirements.values()
             if getattr(requirement, "enabled", True)
             and getattr(requirement, "kind", "") == "path"
             and "skill_root" in set(getattr(requirement, "tags", []) or [])
@@ -305,7 +330,7 @@ class AppRunner:
         ]
         registered_skill_paths = [
             Path(path).expanduser()
-            for skill in config.skills.items.values()
+            for skill in skills_config.items.values()
             if getattr(skill, "enabled", True)
             for path in [
                 str(getattr(skill, "path_hint", "") or getattr(skill, "source_path", ""))
@@ -315,17 +340,17 @@ class AppRunner:
         skills_service = SkillsService(
             workspace_dir=Path.cwd(),
             home_dir=Path.home(),
-            enabled=config.skills.enabled,
-            scan_project=config.skills.scan_project,
-            scan_user=config.skills.scan_user,
-            disabled_names=list(config.skills.disabled),
+            enabled=skills_config.enabled,
+            scan_project=skills_config.scan_project,
+            scan_user=skills_config.scan_user,
+            disabled_names=list(skills_config.disabled),
             extra_paths=[*environment_skill_paths, *registered_skill_paths],
         )
         reload_result = skills_service.reload()
         setattr(agent, "skills_service", skills_service)
         setattr(agent, "skills_catalog", reload_result.catalog)
 
-        if not config.skills.enabled:
+        if not skills_config.enabled:
             ui_bus.info("Skills disabled by config.", kind=UIEventKind.SYSTEM)
             return skills_service
 
@@ -447,3 +472,21 @@ class AppRunner:
 
         self._mcp_manager = manager
         return manager
+
+
+def _agent_config_id(config: Config, agent: Any) -> str:
+    for attr_name in ("agent_config_id", "main_agent_id"):
+        value = str(getattr(agent, attr_name, "") or "").strip()
+        if value and value in config.agent_registry.agents:
+            return value
+    if DEFAULT_MAIN_CHAT_AGENT_ID in config.agent_registry.agents:
+        return DEFAULT_MAIN_CHAT_AGENT_ID
+    return ""
+
+
+def _agent_capability_scope(config: Config, agent: Any):
+    agent_id = _agent_config_id(config, agent)
+    if not agent_id:
+        return None
+    scope = resolve_agent_effective_capability_scope(config, agent_id)
+    return scope if scope.found else None

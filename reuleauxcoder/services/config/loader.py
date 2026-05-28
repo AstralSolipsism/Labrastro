@@ -1,5 +1,6 @@
 """Configuration loader for host-authoritative and local bootstrap configs."""
 
+from copy import deepcopy
 import os
 from pathlib import Path
 import re
@@ -19,10 +20,24 @@ from reuleauxcoder.domain.config.models import (
     EnvironmentRequirementConfig,
     GitHubConfig,
     DEFAULT_BUILTIN_TOOL_COMPONENTS,
+    DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE,
+    DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
     DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
     DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+    DEFAULT_CAPABILITY_PACKAGER_AGENT,
+    DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+    DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE,
+    DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID,
+    DEFAULT_ENVIRONMENT_AGENT,
+    DEFAULT_ENVIRONMENT_AGENT_ID,
+    DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+    DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
+    DEFAULT_ENVIRONMENT_RUNTIME_PROFILE,
+    DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
     DEFAULT_MAIN_CHAT_AGENT,
     DEFAULT_MAIN_CHAT_AGENT_ID,
+    DEFAULT_USER_RUNTIME_PROFILE,
+    DEFAULT_USER_RUNTIME_PROFILE_ID,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
     LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS,
@@ -759,74 +774,35 @@ class ConfigLoader:
             "run_limits": {
                 "max_running_agents": 4,
                 "max_shells_per_agent": 1,
+                "server_agent_run_slots": 4,
+                "server_sandbox_slots": 2,
+                "local_peer_agent_run_slots": 1,
+                "model_request_slots": 4,
             },
             "runtime_profiles": {
-                "environment_local": {
-                    "executor": "reuleauxcoder",
-                    "execution_location": "local_workspace",
-                    "runtime_home_policy": "per_task",
-                    "approval_mode": "full",
-                },
-                "capability_packager_local": {
-                    "executor": "reuleauxcoder",
-                    "execution_location": "local_workspace",
-                    "runtime_home_policy": "per_task",
-                    "approval_mode": "full",
-                }
+                DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID: deepcopy(
+                    DEFAULT_ENVIRONMENT_RUNTIME_PROFILE
+                ),
+                DEFAULT_USER_RUNTIME_PROFILE_ID: deepcopy(DEFAULT_USER_RUNTIME_PROFILE),
+                DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID: deepcopy(
+                    DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE
+                ),
             },
             "agent_registry": {
                 "agents": {
-                    DEFAULT_MAIN_CHAT_AGENT_ID: DEFAULT_MAIN_CHAT_AGENT,
-                    "environment_configurator": {
-                        "name": "Environment Configurator",
-                        "description": "Checks and configures the local workspace environment from the server manifest.",
-                        "role": "environment",
-                        "visibility": "system",
-                        "delegable": False,
-                        "taskflow_eligible": False,
-                        "system_flow_only": ["environment_config"],
-                        "runtime_profile": "environment_local",
-                        "dispatch": {
-                            "profile": "Best for checking and configuring local workspace environment components from the server manifest.",
-                            "examples": [
-                                "Check whether required environment resources are available.",
-                                "Configure missing local resources declared by the environment manifest.",
-                            ],
-                            "avoid": ["General implementation and code review tasks."],
-                        },
-                        "capability_refs": ["environment"],
-                    },
-                    "capability_packager": {
-                        "name": "Capability Packager",
-                        "description": "Generates capability package drafts from repositories, docs, and project notes.",
-                        "role": "capability_packager",
-                        "visibility": "internal",
-                        "delegable": False,
-                        "taskflow_eligible": False,
-                        "system_flow_only": ["capability_ingest"],
-                        "runtime_profile": "capability_packager_local",
-                        "dispatch": {
-                            "profile": "Best for reading repository and documentation bundles and producing capability package drafts.",
-                            "examples": [
-                                "Analyze a GitHub repository README and docs to infer skills, MCP servers, and environment requirements.",
-                                "Extract credentials, risks, install steps, and usage instructions for a capability package.",
-                            ],
-                            "avoid": ["Executing install commands."],
-                        },
-                        "capability_refs": ["environment"],
-                    }
+                    DEFAULT_MAIN_CHAT_AGENT_ID: deepcopy(DEFAULT_MAIN_CHAT_AGENT),
+                    DEFAULT_ENVIRONMENT_AGENT_ID: deepcopy(DEFAULT_ENVIRONMENT_AGENT),
+                    DEFAULT_CAPABILITY_PACKAGER_AGENT_ID: deepcopy(DEFAULT_CAPABILITY_PACKAGER_AGENT),
                 },
             },
             "capability_packages": {
-                DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID: DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
-                "environment": {
-                    "name": "Environment Tools",
-                    "description": "Read and configure the local workspace environment manifest.",
-                    "source": {"type": "builtin"},
-                    "components": [],
-                }
+                DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID: deepcopy(DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE),
+                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID: deepcopy(DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE),
+                DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID: deepcopy(
+                    DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE
+                ),
             },
-            "capability_components": DEFAULT_BUILTIN_TOOL_COMPONENTS,
+            "capability_components": deepcopy(DEFAULT_BUILTIN_TOOL_COMPONENTS),
             "sandbox_provider": {
                 "type": "docker",
                 "host_base_url": "http://labrastro-host:8765",

@@ -71,20 +71,44 @@ LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS: tuple[str, ...] = ("enabled", "raw_chunks")
 TOOL_DIAGNOSTICS_CONFIG_FIELDS: tuple[str, ...] = ("enabled", "record_clean")
 
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID = "environment_local"
+DEFAULT_USER_RUNTIME_PROFILE_ID = "agent_remote"
 DEFAULT_MAIN_CHAT_AGENT_ID = "main_chat"
+DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID = "environment"
 DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID = "core_builtin_tools"
+DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID = (
+    "capability_packager_builtin_tools"
+)
+BUILTIN_CAPABILITY_PACKAGE_IDS = frozenset(
+    {
+        DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
+        DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+        DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+    }
+)
 DEFAULT_ENVIRONMENT_AGENT_ID = "environment_configurator"
 DEFAULT_CAPABILITY_PACKAGER_AGENT_ID = "capability_packager"
-DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID = "capability_packager_local"
+DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID = "capability_packager_remote"
 DEFAULT_ENVIRONMENT_RUNTIME_PROFILE: dict[str, Any] = {
     "executor": "reuleauxcoder",
     "execution_location": "local_workspace",
+    "worker_kind": "local_peer",
+    "model_request_origin": "server",
+    "runtime_home_policy": "per_task",
+    "approval_mode": "full",
+}
+DEFAULT_USER_RUNTIME_PROFILE: dict[str, Any] = {
+    "executor": "reuleauxcoder",
+    "execution_location": "remote_server",
+    "worker_kind": "server_worker",
+    "model_request_origin": "server",
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
 }
 DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE: dict[str, Any] = {
     "executor": "reuleauxcoder",
-    "execution_location": "local_workspace",
+    "execution_location": "remote_server",
+    "worker_kind": "server_worker",
+    "model_request_origin": "server",
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
 }
@@ -156,7 +180,7 @@ DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
             "Installing tools or mutating the workspace during discovery",
         ],
     },
-    "capability_refs": ["environment"],
+    "capability_refs": [DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID],
 }
 DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
     "builtin_tool:delegate_agent": {
@@ -187,7 +211,10 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "risk_level": "low",
         "execution_policy": "allow",
         "registry_path": "builtin:fetch_capabilities",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+        "package_ids": [
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+        ],
     },
     "builtin_tool:glob": {
         "kind": "builtin_tool",
@@ -197,7 +224,10 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "risk_level": "low",
         "execution_policy": "allow",
         "registry_path": "builtin:glob",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+        "package_ids": [
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+        ],
     },
     "builtin_tool:grep": {
         "kind": "builtin_tool",
@@ -207,7 +237,10 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "risk_level": "low",
         "execution_policy": "allow",
         "registry_path": "builtin:grep",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+        "package_ids": [
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+        ],
     },
     "builtin_tool:list_file": {
         "kind": "builtin_tool",
@@ -217,7 +250,10 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "risk_level": "low",
         "execution_policy": "allow",
         "registry_path": "builtin:list_file",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+        "package_ids": [
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+        ],
     },
     "builtin_tool:lsp": {
         "kind": "builtin_tool",
@@ -237,7 +273,10 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "risk_level": "low",
         "execution_policy": "allow",
         "registry_path": "builtin:read_file",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+        "package_ids": [
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+        ],
     },
     "builtin_tool:shell": {
         "kind": "builtin_tool",
@@ -247,7 +286,10 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "risk_level": "high",
         "execution_policy": "inherit",
         "registry_path": "builtin:shell",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+        "package_ids": [
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
+            DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
+        ],
     },
     "builtin_tool:write_file": {
         "kind": "builtin_tool",
@@ -260,11 +302,29 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
 }
+BUILTIN_TOOL_COMPONENT_FORCED_FIELDS: tuple[str, ...] = (
+    "kind",
+    "name",
+    "description",
+    "access",
+    "risk_level",
+    "execution_policy",
+    "registry_path",
+)
 DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE: dict[str, Any] = {
     "name": "Environment Tools",
     "description": "Read and configure the local workspace environment manifest.",
     "source": {"type": "builtin"},
-    "components": [],
+    "components": ["builtin_tool:shell"],
+    "usage": [
+        "Mounted by the environment_configurator system Agent to run manifest-defined check, install, and configure commands.",
+    ],
+    "effective_capabilities": [
+        "Allows environment checks and configuration through the shell tool only.",
+    ],
+    "risk_level": "high",
+    "execution_policy": "inherit",
+    "generated_by": "system",
 }
 DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE: dict[str, Any] = {
     "name": "Core Built-in Tools",
@@ -281,6 +341,27 @@ DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE: dict[str, Any] = {
     ],
     "risk_level": "high",
     "execution_policy": "inherit",
+    "generated_by": "system",
+}
+DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE: dict[str, Any] = {
+    "name": "Capability Packager Built-in Tools",
+    "description": "Read-only built-in tools used by the capability packager system Agent.",
+    "source": {"type": "builtin"},
+    "components": [
+        "builtin_tool:fetch_capabilities",
+        "builtin_tool:glob",
+        "builtin_tool:grep",
+        "builtin_tool:list_file",
+        "builtin_tool:read_file",
+    ],
+    "usage": [
+        "Mounted by the capability_packager Agent so package discovery can read sources without mutating the workspace.",
+    ],
+    "effective_capabilities": [
+        "Allows read-only source collection and local file inspection for capability package draft generation.",
+    ],
+    "risk_level": "low",
+    "execution_policy": "allow",
     "generated_by": "system",
 }
 
@@ -305,6 +386,14 @@ def ensure_default_environment_agent_registry(
     else:
         for key, value in DEFAULT_ENVIRONMENT_RUNTIME_PROFILE.items():
             profile.setdefault(key, deepcopy(value))
+    user_profile = profiles.get(DEFAULT_USER_RUNTIME_PROFILE_ID)
+    if not isinstance(user_profile, dict):
+        profiles[DEFAULT_USER_RUNTIME_PROFILE_ID] = deepcopy(
+            DEFAULT_USER_RUNTIME_PROFILE
+        )
+    else:
+        for key, value in DEFAULT_USER_RUNTIME_PROFILE.items():
+            user_profile.setdefault(key, deepcopy(value))
     packager_profile = profiles.get(DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID)
     if not isinstance(packager_profile, dict):
         profiles[DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID] = deepcopy(
@@ -359,6 +448,12 @@ def ensure_default_environment_agent_registry(
         packager_agent["capability_refs"] = list(
             DEFAULT_CAPABILITY_PACKAGER_AGENT["capability_refs"]
         )
+    for value in agents.values():
+        if not isinstance(value, dict):
+            continue
+        visibility = str(value.get("visibility") or "user").strip().lower()
+        if visibility == "user" and not str(value.get("runtime_profile") or "").strip():
+            value["runtime_profile"] = DEFAULT_USER_RUNTIME_PROFILE_ID
     return registry, profiles
 
 
@@ -368,12 +463,16 @@ def ensure_default_capability_packages(
     """Return capability package data with built-in packages present."""
 
     packages = deepcopy(data) if isinstance(data, dict) else {}
-    package = packages.get("environment")
+    package = packages.get(DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID)
     if not isinstance(package, dict):
-        packages["environment"] = deepcopy(DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE)
+        packages[DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID] = deepcopy(
+            DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE
+        )
     else:
         for key, value in DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE.items():
             package.setdefault(key, deepcopy(value))
+        package["enabled"] = True
+        package["components"] = list(DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE["components"])
     core_package = packages.get(DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID)
     if not isinstance(core_package, dict):
         packages[DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID] = deepcopy(
@@ -382,6 +481,24 @@ def ensure_default_capability_packages(
     else:
         for key, value in DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE.items():
             core_package.setdefault(key, deepcopy(value))
+        core_package["enabled"] = True
+        core_package["components"] = list(
+            DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE["components"]
+        )
+    packager_package = packages.get(
+        DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID
+    )
+    if not isinstance(packager_package, dict):
+        packages[DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID] = deepcopy(
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE
+        )
+    else:
+        for key, value in DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE.items():
+            packager_package.setdefault(key, deepcopy(value))
+        packager_package["enabled"] = True
+        packager_package["components"] = list(
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE["components"]
+        )
     return packages
 
 
@@ -394,10 +511,16 @@ def ensure_default_capability_components(
     for component_id, defaults in DEFAULT_BUILTIN_TOOL_COMPONENTS.items():
         component = components.get(component_id)
         if not isinstance(component, dict):
-            components[component_id] = deepcopy(defaults)
-            continue
-        for key, value in defaults.items():
-            component.setdefault(key, deepcopy(value))
+            component = deepcopy(defaults)
+            components[component_id] = component
+        for key in BUILTIN_TOOL_COMPONENT_FORCED_FIELDS:
+            if key in defaults:
+                component[key] = deepcopy(defaults[key])
+        component["enabled"] = True
+        component["package_ids"] = _merge_string_lists(
+            component.get("package_ids"),
+            defaults.get("package_ids"),
+        )
     return components
 
 
@@ -1234,24 +1357,45 @@ class AuthConfig:
 
 @dataclass
 class RunLimitsConfig:
-    """Concurrency limits for interactive AgentRun and shell slots."""
+    """Concurrency limits for separate AgentRun runtime resource pools."""
 
     max_running_agents: int = 4
     max_shells_per_agent: int = 1
+    server_agent_run_slots: int = 4
+    server_sandbox_slots: int = 2
+    local_peer_agent_run_slots: int = 1
+    model_request_slots: int = 4
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "RunLimitsConfig":
         if not isinstance(data, dict):
             return cls()
+        max_running_agents = int(data.get("max_running_agents", 4) or 4)
         return cls(
-            max_running_agents=int(data.get("max_running_agents", 4) or 4),
+            max_running_agents=max_running_agents,
             max_shells_per_agent=int(data.get("max_shells_per_agent", 1) or 1),
+            server_agent_run_slots=int(
+                data.get("server_agent_run_slots", max_running_agents)
+                or max_running_agents
+            ),
+            server_sandbox_slots=int(data.get("server_sandbox_slots", 2) or 2),
+            local_peer_agent_run_slots=int(
+                data.get("local_peer_agent_run_slots", 1) or 1
+            ),
+            model_request_slots=int(
+                data.get("model_request_slots", max_running_agents)
+                or max_running_agents
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_running_agents": self.max_running_agents,
             "max_shells_per_agent": self.max_shells_per_agent,
+            "server_agent_run_slots": self.server_agent_run_slots,
+            "server_sandbox_slots": self.server_sandbox_slots,
+            "local_peer_agent_run_slots": self.local_peer_agent_run_slots,
+            "model_request_slots": self.model_request_slots,
         }
 
 
@@ -1332,16 +1476,25 @@ def build_agent_run_snapshot(
         ).items()
         if isinstance(component_data, dict)
     }
-    if "environment" not in packages:
-        packages["environment"] = CapabilityPackageConfig.from_dict(
-            "environment",
-            DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+    if DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID not in packages:
+        packages[DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID] = (
+            CapabilityPackageConfig.from_dict(
+                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
+                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+            )
         )
     if DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID not in packages:
         packages[DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID] = (
             CapabilityPackageConfig.from_dict(
                 DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
                 DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
+            )
+        )
+    if DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID not in packages:
+        packages[DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID] = (
+            CapabilityPackageConfig.from_dict(
+                DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+                DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE,
             )
         )
     agents: dict[str, dict[str, Any]] = {}
@@ -1359,6 +1512,12 @@ def build_agent_run_snapshot(
     return {
         "max_running_agents": run_limits.max_running_agents,
         "max_shells_per_agent": run_limits.max_shells_per_agent,
+        "runtime_slots": {
+            "server_agent_run_slots": run_limits.server_agent_run_slots,
+            "server_sandbox_slots": run_limits.server_sandbox_slots,
+            "local_peer_agent_run_slots": run_limits.local_peer_agent_run_slots,
+            "model_request_slots": run_limits.model_request_slots,
+        },
         "runtime_profiles": runtime_profiles.to_dict(),
         "agents": agents,
         "capability_packages": {
@@ -1805,6 +1964,18 @@ def _string_list_config_value(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _merge_string_lists(*values: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in _string_list_config_value(value):
+            if item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+    return merged
+
+
 def _docs_config_value(value: Any) -> list[dict[str, str]]:
     docs: list[dict[str, str]] = []
     if not isinstance(value, list):
@@ -1951,6 +2122,14 @@ class Config:
             errors.append("run_limits.max_running_agents must be positive")
         if self.run_limits.max_shells_per_agent < 1:
             errors.append("run_limits.max_shells_per_agent must be positive")
+        for field_name in (
+            "server_agent_run_slots",
+            "server_sandbox_slots",
+            "local_peer_agent_run_slots",
+            "model_request_slots",
+        ):
+            if int(getattr(self.run_limits, field_name)) < 1:
+                errors.append(f"run_limits.{field_name} must be positive")
         if self.remote_exec.enabled and self.remote_exec.host_mode:
             if not self.auth.enabled:
                 errors.append("auth.enabled is required for remote host mode")
@@ -2025,10 +2204,12 @@ class Config:
             if self.github.reconcile_interval_sec < 1:
                 errors.append("github.reconcile_interval_sec must be positive")
         capability_packages = dict(self.capability_packages)
-        if "environment" not in capability_packages:
-            capability_packages["environment"] = CapabilityPackageConfig.from_dict(
-                "environment",
-                DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+        if DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID not in capability_packages:
+            capability_packages[DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID] = (
+                CapabilityPackageConfig.from_dict(
+                    DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
+                    DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE,
+                )
             )
         if DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID not in capability_packages:
             capability_packages[DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID] = (
@@ -2036,6 +2217,16 @@ class Config:
                     DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
                     DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE,
                 )
+            )
+        if (
+            DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID
+            not in capability_packages
+        ):
+            capability_packages[
+                DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID
+            ] = CapabilityPackageConfig.from_dict(
+                DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID,
+                DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE,
             )
         built_in_component_ids = set(DEFAULT_BUILTIN_TOOL_COMPONENTS)
         chat_entrypoint_agent_ids: list[str] = []
@@ -2157,3 +2348,191 @@ class Config:
     def is_valid(self) -> bool:
         """Check if configuration is valid."""
         return len(self.validate()) == 0
+
+
+@dataclass(frozen=True)
+class AgentEffectiveCapabilityScope:
+    """Runtime resources visible to one configured Agent."""
+
+    agent_id: str
+    found: bool
+    resolved_capabilities: dict[str, Any] = field(default_factory=dict)
+    effective_capabilities: dict[str, Any] = field(default_factory=dict)
+    mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    capability_catalog: str = ""
+
+
+def resolve_agent_effective_capability_scope(
+    config: Config,
+    agent_id: str,
+) -> AgentEffectiveCapabilityScope:
+    """Return the capability package resources authorized for one Agent.
+
+    Settings/admin screens still use the full config. Runtime callers use this
+    scope so disabled or unreferenced package-managed resources do not leak into
+    prompts, MCP initialization, Skill discovery, or environment views.
+    """
+
+    resolved_agent_id = str(agent_id or "").strip()
+    agent = config.agent_registry.agents.get(resolved_agent_id)
+    if agent is None:
+        return AgentEffectiveCapabilityScope(agent_id=resolved_agent_id, found=False)
+
+    packages = _runtime_capability_packages(config)
+    components = _runtime_capability_components(config)
+    resolved = resolve_capability_refs(agent.capability_refs, packages, components)
+    effective = resolved.get("effective_capabilities")
+    effective_capabilities = effective if isinstance(effective, dict) else {}
+    mcp_server_names = set(_string_list_config_value(effective_capabilities.get("mcp_servers")))
+    skill_names = set(_string_list_config_value(effective_capabilities.get("skills")))
+    environment_requirement_ids = {
+        str(item.get("id") or "").strip()
+        for item in effective_capabilities.get("environment_requirements", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    scoped_mcp_servers = [
+        server
+        for server in config.mcp_servers
+        if getattr(server, "enabled", True)
+        and str(getattr(server, "name", "") or "") in mcp_server_names
+    ]
+    scoped_skills = {
+        name: skill
+        for name, skill in config.skills.items.items()
+        if getattr(skill, "enabled", True)
+        and (name in skill_names or str(getattr(skill, "name", "") or "") in skill_names)
+    }
+    scoped_environment = {
+        requirement_id: requirement
+        for requirement_id, requirement in config.environment.requirements.items()
+        if getattr(requirement, "enabled", True)
+        and (
+            requirement_id in environment_requirement_ids
+            or str(getattr(requirement, "id", "") or "") in environment_requirement_ids
+        )
+    }
+    return AgentEffectiveCapabilityScope(
+        agent_id=resolved_agent_id,
+        found=True,
+        resolved_capabilities=resolved,
+        effective_capabilities=effective_capabilities,
+        mcp_servers=scoped_mcp_servers,
+        skills=SkillsConfig(
+            enabled=config.skills.enabled,
+            scan_project=False,
+            scan_user=False,
+            disabled=list(config.skills.disabled),
+            items=scoped_skills,
+        ),
+        environment=EnvironmentConfig(requirements=scoped_environment),
+        capability_catalog=capability_catalog_from_resolved(resolved),
+    )
+
+
+def resolve_agent_environment_requirement_scope_ids(
+    config: Config,
+) -> dict[str, set[str]]:
+    """Return Agent -> environment requirement ids visible at runtime."""
+
+    scopes: dict[str, set[str]] = {}
+    for agent_id in sorted(config.agent_registry.agents):
+        scope = resolve_agent_effective_capability_scope(config, agent_id)
+        if not scope.found:
+            continue
+        requirement_ids = set(scope.environment.requirements)
+        for requirement in scope.environment.requirements.values():
+            requirement_id = str(getattr(requirement, "id", "") or "").strip()
+            if requirement_id:
+                requirement_ids.add(requirement_id)
+        scopes[agent_id] = requirement_ids
+    return scopes
+
+
+def capability_catalog_from_resolved(resolved_capabilities: dict[str, Any]) -> str:
+    """Render an Agent-scoped capability catalog for prompts."""
+
+    raw_packages = resolved_capabilities.get("packages", [])
+    raw_components = resolved_capabilities.get("components", [])
+    components = {
+        str(item.get("id") or ""): item
+        for item in raw_components
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    lines: list[str] = []
+    package_items = raw_packages if isinstance(raw_packages, list) else []
+    for raw_package in package_items:
+        if not isinstance(raw_package, dict):
+            continue
+        package_id = str(raw_package.get("id") or "").strip()
+        if not package_id or package_id == "environment":
+            continue
+        title = str(raw_package.get("name") or package_id)
+        description = (
+            f" - {raw_package.get('description')}"
+            if str(raw_package.get("description") or "").strip()
+            else ""
+        )
+        lines.append(f"- `{package_id}`: {title}{description}")
+        for component_id in _string_list_config_value(raw_package.get("components")):
+            component = components.get(component_id)
+            if not isinstance(component, dict):
+                continue
+            config = component.get("config")
+            details = _capability_component_details(
+                config if isinstance(config, dict) else {}
+            )
+            suffix = f" ({details})" if details else ""
+            lines.append(
+                f"  - `{component_id}` [{component.get('kind')}] {component.get('name')}{suffix}"
+            )
+        usage = raw_package.get("usage")
+        if isinstance(usage, list) and usage:
+            lines.append("  - usage: " + " | ".join(str(item) for item in usage[:3]))
+    return "\n".join(lines)
+
+
+def _runtime_capability_packages(config: Config) -> dict[str, CapabilityPackageConfig]:
+    package_data = ensure_default_capability_packages(
+        {
+            package_id: package.to_dict()
+            for package_id, package in config.capability_packages.items()
+        }
+    )
+    return {
+        package_id: CapabilityPackageConfig.from_dict(package_id, value)
+        for package_id, value in package_data.items()
+        if isinstance(value, dict)
+    }
+
+
+def _runtime_capability_components(config: Config) -> dict[str, CapabilityComponentConfig]:
+    component_data = ensure_default_capability_components(
+        {
+            component_id: component.to_dict()
+            for component_id, component in config.capability_components.items()
+        }
+    )
+    return {
+        component_id: CapabilityComponentConfig.from_dict(component_id, value)
+        for component_id, value in component_data.items()
+        if isinstance(value, dict)
+    }
+
+
+def _capability_component_details(config: dict[str, Any]) -> str:
+    parts: list[str] = []
+    command = str(config.get("command") or "").strip()
+    path_hint = str(config.get("path_hint") or "").strip()
+    check = str(config.get("check") or "").strip()
+    env = config.get("env")
+    if command:
+        parts.append(f"command `{command}`")
+    if path_hint:
+        parts.append(f"path `{path_hint}`")
+    if check:
+        parts.append(f"check `{check}`")
+    if isinstance(env, dict) and env:
+        parts.append("env " + ", ".join(sorted(str(key) for key in env)))
+    return "; ".join(parts)

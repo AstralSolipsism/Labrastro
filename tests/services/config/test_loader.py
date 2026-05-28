@@ -1085,16 +1085,36 @@ def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
     assert runtime_profiles["environment_local"]["runtime_home_policy"] == "per_task"
     assert runtime_profiles["environment_local"]["approval_mode"] == "full"
     assert "environment_configurator" in agent_registry["agents"]
-    assert "server manifest" in agent_registry["agents"]["environment_configurator"]["dispatch"]["profile"]
+    assert "environment manifest" in agent_registry["agents"]["environment_configurator"]["dispatch"]["profile"]
     assert agent_registry["agents"]["environment_configurator"]["capability_refs"] == [
         "environment"
     ]
-    assert runtime_profiles["capability_packager_local"]["executor"] == "reuleauxcoder"
+    assert runtime_profiles["agent_remote"]["execution_location"] == "remote_server"
+    assert runtime_profiles["capability_packager_remote"]["executor"] == "reuleauxcoder"
+    assert (
+        runtime_profiles["capability_packager_remote"]["execution_location"]
+        == "remote_server"
+    )
     assert "capability_packager" in agent_registry["agents"]
     assert (
         agent_registry["agents"]["capability_packager"]["runtime_profile"]
-        == "capability_packager_local"
+        == "capability_packager_remote"
     )
+    assert agent_registry["agents"]["capability_packager"]["capability_refs"] == [
+        "capability_packager_builtin_tools"
+    ]
+    assert data["capability_packages"]["environment"]["components"] == [
+        "builtin_tool:shell"
+    ]
+    assert data["capability_packages"]["capability_packager_builtin_tools"][
+        "components"
+    ] == [
+        "builtin_tool:fetch_capabilities",
+        "builtin_tool:glob",
+        "builtin_tool:grep",
+        "builtin_tool:list_file",
+        "builtin_tool:read_file",
+    ]
 
 
 def test_load_does_not_copy_global_environment_manifest_into_workspace(

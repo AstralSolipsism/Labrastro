@@ -14,7 +14,12 @@ from typing import Any, Callable
 from reuleauxcoder.app.commands.loader import create_builtin_action_registry
 from reuleauxcoder.app.commands.registry import ActionRegistry
 from reuleauxcoder.domain.agent.agent import Agent
-from reuleauxcoder.domain.config.models import Config
+from reuleauxcoder.domain.config.models import (
+    Config,
+    DEFAULT_MAIN_CHAT_AGENT_ID,
+    resolve_agent_environment_requirement_scope_ids,
+    resolve_agent_effective_capability_scope,
+)
 from reuleauxcoder.extensions.mcp.manager import MCPManager
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
 from labrastro_server.relay.server import RelayServer
@@ -232,6 +237,10 @@ def _default_create_remote_http_service(
             ttl_sec=ttl, claims=claims
         ),
     )
+    main_scope = resolve_agent_effective_capability_scope(
+        config,
+        DEFAULT_MAIN_CHAT_AGENT_ID,
+    )
     service = RemoteRelayHTTPService(
         relay_server=relay_server,
         bind=config.remote_exec.relay_bind,
@@ -239,9 +248,13 @@ def _default_create_remote_http_service(
         artifact_provider=_default_create_remote_artifact_provider(ui_bus),
         auth_service=auth_service,
         bootstrap_token_ttl_sec=config.remote_exec.bootstrap_token_ttl_sec,
-        mcp_servers=config.mcp_servers,
+        mcp_servers=main_scope.mcp_servers if main_scope.found else config.mcp_servers,
         mcp_artifact_root=config.mcp_artifact_root,
         environment_requirements=config.environment.requirements,
+        capability_packages=config.capability_packages,
+        environment_requirement_scope_ids=resolve_agent_environment_requirement_scope_ids(
+            config
+        ),
         admin_config_path=getattr(config, "_source_path", None),
         runtime_control_plane=runtime_control_plane,
         taskflow_service=taskflow_service,
