@@ -792,43 +792,43 @@ func (r *Runner) runInteractiveLoop(ctx context.Context, peerToken string) error
 		if userInput == "/quit" || userInput == "/exit" {
 			return nil
 		}
-		if err := r.runRemoteChat(ctx, peerToken, userInput); err != nil {
+		if err := r.runRemoteSessionRun(ctx, peerToken, userInput); err != nil {
 			return err
 		}
 	}
 }
 
-func (r *Runner) runRemoteChat(ctx context.Context, peerToken, prompt string) error {
-	chatCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	startResp, err := r.client.ChatStart(chatCtx, protocol.ChatStartRequest{
+func (r *Runner) runRemoteSessionRun(ctx context.Context, peerToken, prompt string) error {
+	sessionRunCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	startResp, err := r.client.SessionRunStart(sessionRunCtx, protocol.SessionRunStartRequest{
 		PeerToken: peerToken,
 		Prompt:    prompt,
 	})
 	cancel()
 	if err != nil {
-		return fmt.Errorf("chat start failed: %w", err)
+		return fmt.Errorf("session run start failed: %w", err)
 	}
 	if strings.TrimSpace(startResp.Error) != "" {
-		return fmt.Errorf("chat start failed: %s", startResp.Error)
+		return fmt.Errorf("session run start failed: %s", startResp.Error)
 	}
-	if strings.TrimSpace(startResp.ChatID) == "" {
-		return fmt.Errorf("chat start failed: empty chat id")
+	if strings.TrimSpace(startResp.SessionRunID) == "" {
+		return fmt.Errorf("session run start failed: empty session run id")
 	}
 
-	return r.client.ChatEvents(
+	return r.client.SessionRunEvents(
 		ctx,
-		protocol.ChatEventsRequest{
-			PeerToken:  peerToken,
-			ChatID:     startResp.ChatID,
-			Cursor:     0,
-			TimeoutSec: 30,
+		protocol.SessionRunEventsRequest{
+			PeerToken:    peerToken,
+			SessionRunID: startResp.SessionRunID,
+			Cursor:       0,
+			TimeoutSec:   30,
 		},
-		func(batch protocol.ChatEventsBatch) error {
+		func(batch protocol.SessionRunEventsBatch) error {
 			if strings.TrimSpace(batch.Error) != "" {
-				return fmt.Errorf("chat events failed: %s", batch.Error)
+				return fmt.Errorf("session run events failed: %s", batch.Error)
 			}
 			for _, event := range batch.Events {
-				if err := r.handleChatEvent(ctx, peerToken, startResp.ChatID, event); err != nil {
+				if err := r.handleSessionRunEvent(ctx, peerToken, startResp.SessionRunID, event); err != nil {
 					return err
 				}
 			}
@@ -837,16 +837,16 @@ func (r *Runner) runRemoteChat(ctx context.Context, peerToken, prompt string) er
 	)
 }
 
-func (r *Runner) handleChatEvent(ctx context.Context, peerToken, chatID string, event protocol.ChatEvent) error {
+func (r *Runner) handleSessionRunEvent(ctx context.Context, peerToken, sessionRunID string, event protocol.SessionRunEvent) error {
 	switch event.Type {
-	case "chat_start":
+	case "session_run_start":
 		return nil
 	case "output":
 		r.renderOutputEvent(event.Payload)
 	case "tool_call_stream":
 		r.renderToolStream(event.Payload)
 	case "approval_request":
-		return r.handleApprovalRequest(ctx, peerToken, chatID, event.Payload)
+		return r.handleApprovalRequest(ctx, peerToken, sessionRunID, event.Payload)
 	case "approval_resolved":
 		return nil
 	case "tool_call_start":
@@ -855,7 +855,7 @@ func (r *Runner) handleChatEvent(ctx context.Context, peerToken, chatID string, 
 		}
 	case "tool_call_end":
 		return nil
-	case "chat_end":
+	case "session_run_end":
 		if response, _ := event.Payload["response"].(string); strings.TrimSpace(response) != "" {
 			fmt.Println()
 		}
@@ -869,7 +869,7 @@ func (r *Runner) handleChatEvent(ctx context.Context, peerToken, chatID string, 
 	return nil
 }
 
-func (r *Runner) handleApprovalRequest(ctx context.Context, peerToken, chatID string, payload map[string]any) error {
+func (r *Runner) handleApprovalRequest(ctx context.Context, peerToken, sessionRunID string, payload map[string]any) error {
 	r.renderOutputEvent(payload)
 
 	approvalID, _ := payload["approval_id"].(string)
@@ -891,10 +891,10 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, peerToken, chatID st
 	replyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	replyResp, err := r.client.ApprovalReply(replyCtx, protocol.ApprovalReplyRequest{
-		PeerToken:  peerToken,
-		ChatID:     chatID,
-		ApprovalID: approvalID,
-		Decision:   decision,
+		PeerToken:    peerToken,
+		SessionRunID: sessionRunID,
+		ApprovalID:   approvalID,
+		Decision:     decision,
 	})
 	if err != nil {
 		return fmt.Errorf("approval reply failed: %w", err)

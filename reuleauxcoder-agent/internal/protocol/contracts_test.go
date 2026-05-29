@@ -23,10 +23,10 @@ func TestRemoteContractFixturesDecodePeerProtocolSamples(t *testing.T) {
 	mustDecode(t, fixtures["peer.register"].Request, &RegisterRequest{})
 	mustDecode(t, fixtures["peer.register"].Response, &RegisterResponseEnvelope{})
 	mustDecode(t, fixtures["peer.heartbeat"].Request, &Heartbeat{})
-	mustDecode(t, fixtures["chat.start"].Request, &ChatStartRequest{})
-	mustDecode(t, fixtures["chat.start"].Response, &ChatStartResponse{})
-	mustDecode(t, fixtures["chat.events"].Request, &ChatEventsRequest{})
-	mustDecode(t, fixtures["chat.events"].Response, &ChatEventsBatch{})
+	mustDecode(t, fixtures["session_run.start"].Request, &SessionRunStartRequest{})
+	mustDecode(t, fixtures["session_run.start"].Response, &SessionRunStartResponse{})
+	mustDecode(t, fixtures["session_run.events"].Request, &SessionRunEventsRequest{})
+	mustDecode(t, fixtures["session_run.events"].Response, &SessionRunEventsBatch{})
 	mustDecode(t, fixtures["agent_runs.claim"].Request, &AgentRunClaimRequest{})
 	mustDecode(t, fixtures["agent_runs.claim"].Response, &AgentRunClaimResponse{})
 	mustDecode(t, fixtures["agent_runs.events"].Response, &AgentRunEventsResponse{})
@@ -37,14 +37,14 @@ func TestRemoteContractFixturesDecodePeerProtocolSamples(t *testing.T) {
 	mustDecode(t, fixtures["error.invalid_peer_token"].Response, &ErrorResponse{})
 }
 
-func TestChatStartRequestMarshalsTaskflowID(t *testing.T) {
-	raw, err := json.Marshal(ChatStartRequest{
+func TestSessionRunStartRequestMarshalsTaskflowID(t *testing.T) {
+	raw, err := json.Marshal(SessionRunStartRequest{
 		PeerToken:  "pt_1",
 		Prompt:     "continue",
 		TaskflowID: "taskflow-1",
 	})
 	if err != nil {
-		t.Fatalf("marshal ChatStartRequest: %v", err)
+		t.Fatalf("marshal SessionRunStartRequest: %v", err)
 	}
 
 	var payload map[string]any

@@ -56,28 +56,20 @@ func (c *HTTPClient) Disconnect(ctx context.Context, req protocol.DisconnectRequ
 	return c.postJSON(ctx, "/remote/disconnect", req, nil)
 }
 
-func (c *HTTPClient) Chat(ctx context.Context, req protocol.ChatRequest) (protocol.ChatResponse, error) {
-	var resp protocol.ChatResponse
-	if err := c.postJSON(ctx, "/remote/chat", req, &resp); err != nil {
-		return protocol.ChatResponse{}, err
+func (c *HTTPClient) SessionRunStart(ctx context.Context, req protocol.SessionRunStartRequest) (protocol.SessionRunStartResponse, error) {
+	var resp protocol.SessionRunStartResponse
+	if err := c.postJSON(ctx, "/remote/session-runs/start", req, &resp); err != nil {
+		return protocol.SessionRunStartResponse{}, err
 	}
 	return resp, nil
 }
 
-func (c *HTTPClient) ChatStart(ctx context.Context, req protocol.ChatStartRequest) (protocol.ChatStartResponse, error) {
-	var resp protocol.ChatStartResponse
-	if err := c.postJSON(ctx, "/remote/chat/start", req, &resp); err != nil {
-		return protocol.ChatStartResponse{}, err
-	}
-	return resp, nil
-}
-
-func (c *HTTPClient) ChatEvents(ctx context.Context, reqBody protocol.ChatEventsRequest, onBatch func(protocol.ChatEventsBatch) error) error {
+func (c *HTTPClient) SessionRunEvents(ctx context.Context, reqBody protocol.SessionRunEventsRequest, onBatch func(protocol.SessionRunEventsBatch) error) error {
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/remote/chat/events", bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/remote/session-runs/events", bytes.NewReader(buf))
 	if err != nil {
 		return err
 	}
@@ -100,14 +92,14 @@ func (c *HTTPClient) ChatEvents(ctx context.Context, reqBody protocol.ChatEvents
 		eventName, data, err := readSSEFrame(reader)
 		if err != nil {
 			if err == io.EOF {
-				return fmt.Errorf("chat events stream closed before done")
+				return fmt.Errorf("session run events stream closed before done")
 			}
 			return err
 		}
-		if eventName != "chat" || strings.TrimSpace(data) == "" {
+		if eventName != "session_run" || strings.TrimSpace(data) == "" {
 			continue
 		}
-		var batch protocol.ChatEventsBatch
+		var batch protocol.SessionRunEventsBatch
 		if err := json.Unmarshal([]byte(data), &batch); err != nil {
 			return err
 		}

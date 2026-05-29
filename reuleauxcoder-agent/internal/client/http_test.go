@@ -5,14 +5,31 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/RC-CHN/ReuleauxCoder/reuleauxcoder-agent/internal/protocol"
 )
 
-func TestChatEventsStreamsSSEBatches(t *testing.T) {
+func TestHTTPClientDoesNotExposeLegacyChatOnceProtocol(t *testing.T) {
+	source, err := os.ReadFile("http.go")
+	if err != nil {
+		t.Fatalf("read http.go: %v", err)
+	}
+	if bytes := string(source); bytes != "" {
+		if strings.Contains(bytes, "func (c *HTTPClient) Chat(") {
+			t.Fatal("HTTP client still exposes legacy Chat one-shot protocol")
+		}
+		if strings.Contains(bytes, "\"/remote/chat\"") {
+			t.Fatal("HTTP client still posts to legacy /remote/chat endpoint")
+		}
+	}
+}
+
+func TestSessionRunEventsStreamsSSEBatches(t *testing.T) {
 	var requestPath string
-	var requestBody protocol.ChatEventsRequest
+	var requestBody protocol.SessionRunEventsRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestPath = r.URL.Path
 		if r.Header.Get("Accept") != "text/event-stream" {
@@ -23,36 +40,36 @@ func TestChatEventsStreamsSSEBatches(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(": ping\n\n"))
-		_, _ = w.Write([]byte("event: chat\n"))
+		_, _ = w.Write([]byte("event: session_run\n"))
 		_, _ = w.Write([]byte(`data: {"events":[{"type":"assistant_delta","payload":{"content":"hello"}}],"done":false,"next_cursor":2}` + "\n\n"))
-		_, _ = w.Write([]byte("event: chat\n"))
-		_, _ = w.Write([]byte(`data: {"events":[{"type":"chat_end","payload":{"response":"ok"}}],"done":true,"next_cursor":3}` + "\n\n"))
+		_, _ = w.Write([]byte("event: session_run\n"))
+		_, _ = w.Write([]byte(`data: {"events":[{"type":"session_run_end","payload":{"response":"ok"}}],"done":true,"next_cursor":3}` + "\n\n"))
 	}))
 	defer server.Close()
 
 	client := New(server.URL)
-	var batches []protocol.ChatEventsBatch
-	err := client.ChatEvents(
+	var batches []protocol.SessionRunEventsBatch
+	err := client.SessionRunEvents(
 		context.Background(),
-		protocol.ChatEventsRequest{
-			PeerToken:  "peer-token",
-			ChatID:     "chat-1",
-			Cursor:     1,
-			TimeoutSec: 2,
+		protocol.SessionRunEventsRequest{
+			PeerToken:    "peer-token",
+			SessionRunID: "run-1",
+			Cursor:       1,
+			TimeoutSec:   2,
 		},
-		func(batch protocol.ChatEventsBatch) error {
+		func(batch protocol.SessionRunEventsBatch) error {
 			batches = append(batches, batch)
 			return nil
 		},
 	)
 
 	if err != nil {
-		t.Fatalf("ChatEvents returned error: %v", err)
+		t.Fatalf("SessionRunEvents returned error: %v", err)
 	}
-	if requestPath != "/remote/chat/events" {
-		t.Fatalf("path = %s, want /remote/chat/events", requestPath)
+	if requestPath != "/remote/session-runs/events" {
+		t.Fatalf("path = %s, want /remote/session-runs/events", requestPath)
 	}
-	if requestBody.PeerToken != "peer-token" || requestBody.ChatID != "chat-1" || requestBody.Cursor != 1 {
+	if requestBody.PeerToken != "peer-token" || requestBody.SessionRunID != "run-1" || requestBody.Cursor != 1 {
 		t.Fatalf("request body = %+v", requestBody)
 	}
 	if len(batches) != 2 {
@@ -61,24 +78,24 @@ func TestChatEventsStreamsSSEBatches(t *testing.T) {
 	if batches[0].Events[0].Type != "assistant_delta" || batches[0].NextCursor != 2 || batches[0].Done {
 		t.Fatalf("first batch = %+v", batches[0])
 	}
-	if batches[1].Events[0].Type != "chat_end" || batches[1].NextCursor != 3 || !batches[1].Done {
+	if batches[1].Events[0].Type != "session_run_end" || batches[1].NextCursor != 3 || !batches[1].Done {
 		t.Fatalf("second batch = %+v", batches[1])
 	}
 }
 
-func TestChatEventsReturnsHTTPError(t *testing.T) {
+func TestSessionRunEventsReturnsHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "bad peer", http.StatusUnauthorized)
 	}))
 	defer server.Close()
 
-	err := New(server.URL).ChatEvents(
+	err := New(server.URL).SessionRunEvents(
 		context.Background(),
-		protocol.ChatEventsRequest{PeerToken: "bad", ChatID: "chat-1"},
-		func(protocol.ChatEventsBatch) error { return nil },
+		protocol.SessionRunEventsRequest{PeerToken: "bad", SessionRunID: "run-1"},
+		func(protocol.SessionRunEventsBatch) error { return nil },
 	)
 
 	if err == nil {
-		t.Fatal("ChatEvents returned nil error")
+		t.Fatal("SessionRunEvents returned nil error")
 	}
 }

@@ -66,19 +66,7 @@ type DisconnectRequest struct {
 	Reason    string `json:"reason"`
 }
 
-type ChatRequest struct {
-	PeerToken    string `json:"peer_token"`
-	Prompt       string `json:"prompt"`
-	WorkflowMode string `json:"workflow_mode,omitempty"`
-	TaskflowID   string `json:"taskflow_id,omitempty"`
-}
-
-type ChatResponse struct {
-	Response string `json:"response"`
-	Error    string `json:"error,omitempty"`
-}
-
-type ChatStartRequest struct {
+type SessionRunStartRequest struct {
 	PeerToken    string `json:"peer_token"`
 	Prompt       string `json:"prompt"`
 	SessionHint  string `json:"session_hint,omitempty"`
@@ -86,38 +74,38 @@ type ChatStartRequest struct {
 	TaskflowID   string `json:"taskflow_id,omitempty"`
 }
 
-type ChatStartResponse struct {
-	ChatID string `json:"chat_id"`
-	Error  string `json:"error,omitempty"`
+type SessionRunStartResponse struct {
+	SessionRunID string `json:"session_run_id"`
+	Error        string `json:"error,omitempty"`
 }
 
-type ChatEventsRequest struct {
-	PeerToken  string  `json:"peer_token"`
-	ChatID     string  `json:"chat_id"`
-	Cursor     int     `json:"cursor"`
-	TimeoutSec float64 `json:"timeout_sec,omitempty"`
+type SessionRunEventsRequest struct {
+	PeerToken    string  `json:"peer_token"`
+	SessionRunID string  `json:"session_run_id"`
+	Cursor       int     `json:"cursor"`
+	TimeoutSec   float64 `json:"timeout_sec,omitempty"`
 }
 
-type ChatEvent struct {
-	ChatID  string         `json:"chat_id"`
-	Seq     int            `json:"seq"`
-	Type    string         `json:"type"`
-	Payload map[string]any `json:"payload,omitempty"`
+type SessionRunEvent struct {
+	SessionRunID string         `json:"session_run_id"`
+	Seq          int            `json:"seq"`
+	Type         string         `json:"type"`
+	Payload      map[string]any `json:"payload,omitempty"`
 }
 
-type ChatEventsBatch struct {
-	Events     []ChatEvent `json:"events,omitempty"`
-	Done       bool        `json:"done"`
-	NextCursor int         `json:"next_cursor"`
-	Error      string      `json:"error,omitempty"`
+type SessionRunEventsBatch struct {
+	Events     []SessionRunEvent `json:"events,omitempty"`
+	Done       bool              `json:"done"`
+	NextCursor int               `json:"next_cursor"`
+	Error      string            `json:"error,omitempty"`
 }
 
 type ApprovalReplyRequest struct {
-	PeerToken  string `json:"peer_token"`
-	ChatID     string `json:"chat_id"`
-	ApprovalID string `json:"approval_id"`
-	Decision   string `json:"decision"`
-	Reason     string `json:"reason,omitempty"`
+	PeerToken    string `json:"peer_token"`
+	SessionRunID string `json:"session_run_id"`
+	ApprovalID   string `json:"approval_id"`
+	Decision     string `json:"decision"`
+	Reason       string `json:"reason,omitempty"`
 }
 
 type ApprovalReplyResponse struct {
