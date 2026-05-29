@@ -1715,7 +1715,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         def _append_final_assistant(response: str | None = None) -> None:
             if assistant_content_emitted["value"]:
                 return
-            content = response if response else "".join(assistant_stream_parts)
+            content = "".join(assistant_stream_parts) or (response if response else "")
             if not content:
                 return
             remote_session.append_event(

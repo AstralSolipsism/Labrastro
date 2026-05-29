@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
-_LIVE_ONLY_SESSION_EVENTS = frozenset(
-    {"assistant_delta", "reasoning_delta", "tool_call_delta", "tool_call_stream"}
-)
 _DEFAULT_SESSION_TITLES = frozenset({"", "新会话"})
+_SHELL_OUTPUT_MAX_CHARS = 20000
+_SHELL_OUTPUT_TRUNCATION_MARKER = "\n... 输出过长，已截断早期内容，保留最近输出 ...\n"
 
 
 def utc_now() -> str:
@@ -84,14 +84,15 @@ def apply_session_event(
     _ensure_document_shape(doc, session_id)
     payload = dict(payload or {})
     event_type = str(event_type or "")
-    if event_type in _LIVE_ONLY_SESSION_EVENTS:
-        return doc
     event_seq = max(0, int(session_event_seq or 0))
     timestamp = created_at or utc_now()
     meta = {
         "eventKey": f"session:{session_id}:{event_seq}",
         "sessionEventSeq": event_seq,
     }
+    if session_run_id:
+        meta["sessionRunId"] = session_run_id
+        payload.setdefault("session_run_id", session_run_id)
 
     doc["last_event_seq"] = max(int(doc.get("last_event_seq") or 0), event_seq)
     doc["revision"] = int(doc.get("revision") or 0) + 1
@@ -117,12 +118,28 @@ def apply_session_event(
         })
     elif event_type in {"usage_update", "run_stats"}:
         _apply_usage(doc, payload)
-    elif event_type == "reasoning_message":
-        _upsert_reasoning_part(
+    elif event_type == "reasoning_delta":
+        _upsert_thinking_part(
             doc,
             str(payload.get("content") or ""),
+            meta,
+        )
+    elif event_type == "reasoning_message":
+        _finalize_reasoning_part(
+            doc,
+            str(payload.get("content") or ""),
+            str(payload.get("summary") or ""),
             "plain" if str(payload.get("format") or "") == "plain" else "markdown",
             meta,
+        )
+    elif event_type == "assistant_delta":
+        _append_text_part(
+            doc,
+            str(payload.get("content") or ""),
+            "assistant-stream",
+            "markdown",
+            meta,
+            streaming=True,
         )
     elif event_type == "assistant_message":
         _append_text_part(
@@ -131,10 +148,12 @@ def apply_session_event(
             "assistant-message",
             "markdown",
             meta,
+            replace_stream_key="assistant-stream",
+            append=False,
         )
     elif event_type == "session_run_end":
         _apply_session_run_end(doc, payload, meta)
-    elif event_type in {"output", "tool_call_start", "tool_call_end",
+    elif event_type in {"output", "tool_call_delta", "tool_call_stream", "tool_call_start", "tool_call_end",
                         "tool_call_protocol_error", "approval_request", "approval_resolved"}:
         _apply_tool_or_output_event(doc, event_type, payload, meta)
     elif event_type == "runtime_status":
@@ -143,13 +162,13 @@ def apply_session_event(
         event_type == "context_event" and _is_memory_payload(payload)
     ):
         _append_part(doc, _part("memory", "memory_context", meta, {
-            "memoryTitle": _string(payload, "title") or "注入记忆",
-            "memoryPayload": payload,
+            "title": _string(payload, "title") or "注入记忆",
+            "payload": payload,
         }))
     elif event_type == "context_event":
         _append_part(doc, _part("context", "context_event", meta, {
-            "contextTitle": _string(payload, "message") or _string(payload, "phase") or "上下文事件",
-            "contextPayload": payload,
+            "title": _string(payload, "message") or _string(payload, "phase") or "上下文事件",
+            "payload": payload,
         }))
     elif event_type == "view":
         _append_view_part(doc, payload, meta)
@@ -167,27 +186,32 @@ def apply_session_event(
         "taskflow_started",
     }:
         _append_part(doc, _part(event_type, "ui_event", meta, {
-            "uiEventKind": _string(payload, "kind") or event_type.replace("_event", ""),
-            "uiEventLevel": _string(payload, "level") or "info",
-            "uiEventTitle": _string(payload, "title") or _string(payload, "message") or "运行事件",
-            "uiEventPayload": payload,
+            "kind": _string(payload, "kind") or event_type.replace("_event", ""),
+            "level": _string(payload, "level") or "info",
+            "title": _string(payload, "title") or _string(payload, "message") or "运行事件",
+            "payload": payload,
         }))
+    elif event_type == "provider_stream_interrupted":
+        _append_notice_part(
+            doc,
+            "warning",
+            str(payload.get("message") or "模型输出流中断，正在尝试恢复。"),
+            "stream-recovery",
+            "plain",
+            meta,
+        )
     elif event_type in {"error", "session_run_failed"}:
+        message = str(payload.get("message") or "unknown error")
         _settle_stale_pending_approvals(
             doc,
             status="denied",
-            reason=str(payload.get("message") or "unknown error"),
+            reason=message,
             meta=meta,
         )
-        _patch_run_state(doc, status="error", error=str(payload.get("message") or "unknown error"))
-        if event_type == "session_run_failed":
-            _append_text_part(
-                doc,
-                f"错误：{payload.get('message') or 'unknown error'}",
-                "error",
-                "plain",
-                meta,
-            )
+        if event_type == "error" or not _has_notice_level(doc, "error"):
+            _append_notice_part(doc, "error", f"错误：{message}", "error", "plain", meta)
+        _finalize_run_transcript_items(doc, "error")
+        _patch_run_state(doc, status="error", error=message)
     elif event_type in {"session_run_cancel_requested", "session_run_cancelled"}:
         _patch_run_state(doc, status="cancelled", error=str(payload.get("reason") or "session_run_cancelled"))
         if event_type == "session_run_cancelled":
@@ -197,7 +221,8 @@ def apply_session_event(
                 reason=str(payload.get("reason") or "session_run_cancelled"),
                 meta=meta,
             )
-            _append_text_part(doc, "已取消当前请求。", "cancelled", "plain", meta)
+            _append_notice_part(doc, "info", "已取消当前请求。", "cancelled", "plain", meta)
+            _finalize_run_transcript_items(doc, "cancelled")
 
     _sync_compatible_trace_fields(doc)
     return doc
@@ -365,7 +390,7 @@ def _apply_session_run_start(doc: dict[str, Any], payload: dict[str, Any], times
             "text": prompt,
             "parts": [],
             "timestamp": _timestamp_ms(timestamp),
-            **meta,
+            **_public_meta(meta),
         },
         "assistantMessages": [],
     }
@@ -397,7 +422,17 @@ def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: d
     response = str(payload.get("response") or "")
     rendered = bool(payload.get("response_rendered"))
     if response and not rendered:
-        _append_text_part(doc, response, "assistant-final", "markdown", meta)
+        _append_text_part(
+            doc,
+            response,
+            "assistant-message",
+            "markdown",
+            meta,
+            replace_stream_key="assistant-stream",
+            append=False,
+        )
+    else:
+        _finalize_active_streams(doc, meta)
     _settle_stale_pending_approvals(doc, status="denied", reason="session_run_closed", meta=meta)
     _patch_stats(doc, {"runStatus": "done"})
     _patch_run_state(doc, status="done", error=None)
@@ -480,26 +515,59 @@ def _apply_tool_or_output_event(
         content = str(payload.get("content") or "")
         if str(payload.get("format") or "") == "terminal":
             _append_part(doc, _part("terminal", "terminal", meta, {
-                "terminalTitle": "终端输出",
-                "terminalContent": content,
+                "title": "终端输出",
+                "content": content,
             }))
         else:
-            _append_text_part(
-                doc,
-                content,
-                "output",
-                "markdown" if str(payload.get("format") or "") == "markdown" else "plain",
-                meta,
-            )
+            _append_part(doc, _part("output", "notice", meta, {
+                "level": "info",
+                "text": content,
+                "format": "markdown" if str(payload.get("format") or "") == "markdown" else "plain",
+            }))
         return
 
-    if event_type == "tool_call_start":
+    if event_type == "tool_call_delta":
+        index = _number(payload, "index") or 0
+        tool_call_id = _tool_call_id(payload) or f"preparing:{_string(payload, 'session_run_id') or 'pending'}:{index}"
+        _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
+            "status": "preparing",
+            "toolCallId": tool_call_id,
+            "source": _string(payload, "tool_source"),
+            "startedAt": payload.get("started_at"),
+            "input": {"arguments_preview": _string(payload, "arguments_preview")}
+            if _string(payload, "arguments_preview")
+            else None,
+            "preparingIndex": index,
+        }, meta)
+    elif event_type == "tool_call_stream":
+        tool_call_id = _tool_call_id(payload)
+        if not tool_call_id:
+            return
+        tool_name = str(payload.get("tool_name") or "tool")
+        current = _find_tool_part(doc, tool_call_id) or {}
+        content = _strip_ansi(str(payload.get("content") or ""))
+        source = _string(payload, "tool_source") or str(current.get("source") or "")
+        stream = _normalize_tool_stream(str(payload.get("stream") or "stdout"))
+        output_chunks, output_truncated = _append_output_chunk(_list_value(current.get("outputChunks")), stream, content)
+        _upsert_tool_part(doc, tool_name, {
+            "status": "running",
+            "toolCallId": tool_call_id,
+            "source": source or None,
+            "stream": stream,
+            "output": _build_output_text(output_chunks),
+            "outputChunks": output_chunks,
+            "outputTruncated": output_truncated,
+            "outputFormat": _tool_output_format(payload, tool_name, source),
+        }, meta)
+    elif event_type == "tool_call_start":
         _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
             "status": "running",
             "toolCallId": _tool_call_id(payload),
-            "toolSource": _string(payload, "tool_source"),
-            "toolStartedAt": payload.get("started_at"),
-            "toolInput": payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {},
+            "source": _string(payload, "tool_source"),
+            "startedAt": payload.get("started_at"),
+            "input": payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {},
+            "preparingIndex": _number(payload, "index"),
+            "resultMeta": {},
         }, meta)
     elif event_type == "tool_call_protocol_error":
         code = _string(payload, "code")
@@ -507,9 +575,9 @@ def _apply_tool_or_output_event(
         _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
             "status": "protocol_error",
             "toolCallId": _tool_call_id(payload),
-            "toolOutput": f"[{code}] {message}" if code else message,
-            "toolOutputFormat": "plain",
-            "toolResultMeta": {
+            "output": f"[{code}] {message}" if code else message,
+            "outputFormat": "plain",
+            "resultMeta": {
                 "code": code,
                 "message": message,
                 "failure_kind": _string(payload, "failure_kind"),
@@ -519,14 +587,30 @@ def _apply_tool_or_output_event(
             },
         }, meta)
     elif event_type == "tool_call_end":
-        _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
+        tool_call_id = _tool_call_id(payload)
+        tool_name = str(payload.get("tool_name") or "tool")
+        current = _find_tool_part(doc, tool_call_id) or {}
+        source = _string(payload, "tool_source") or str(current.get("source") or "")
+        final_output = str(payload.get("tool_result") or "")
+        is_shell = _is_shell_tool(tool_name, source)
+        output_chunks = _list_value(current.get("outputChunks"))
+        output = (
+            _reconcile_final_output(str(current.get("output") or ""), final_output, bool(output_chunks))
+            if is_shell
+            else final_output
+        )
+        if is_shell and not output_chunks:
+            output_chunks = _shell_chunks_from_text(output)
+        _upsert_tool_part(doc, tool_name, {
             "status": "returned",
-            "toolCallId": _tool_call_id(payload),
-            "toolSource": _string(payload, "tool_source"),
-            "toolEndedAt": payload.get("ended_at"),
-            "toolOutput": str(payload.get("tool_result") or ""),
-            "toolOutputFormat": "plain",
-            "toolResultMeta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+            "toolCallId": tool_call_id,
+            "source": source or None,
+            "endedAt": payload.get("ended_at"),
+            "output": output,
+            "outputFormat": _tool_output_format(payload, tool_name, source),
+            "outputChunks": output_chunks if is_shell else None,
+            "finalOutput": final_output if is_shell else None,
+            "resultMeta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
         }, meta)
     elif event_type == "approval_request":
         _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
@@ -537,8 +621,8 @@ def _apply_tool_or_output_event(
             "approvalSections": payload.get("sections") if isinstance(payload.get("sections"), list) else [],
             "approvalContent": _string(payload, "content"),
             "toolCallId": _tool_call_id(payload),
-            "toolSource": _string(payload, "tool_source"),
-            "toolInput": payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {},
+            "source": _string(payload, "tool_source"),
+            "input": payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {},
         }, meta)
     elif event_type == "approval_resolved":
         _patch_tool_part(doc, _tool_call_id(payload), _string(payload, "approval_id"), {
@@ -554,6 +638,10 @@ def _append_text_part(
     stream_key: str,
     fmt: str,
     meta: dict[str, Any],
+    *,
+    streaming: bool = False,
+    replace_stream_key: str | None = None,
+    append: bool = True,
 ) -> None:
     if not content:
         return
@@ -562,46 +650,97 @@ def _append_text_part(
     for index, current in enumerate(parts):
         if (
             isinstance(current, dict)
-            and current.get("type") == "text"
-            and current.get("textStreamKey") == stream_key
+            and current.get("type") in {"assistant_text", "text"}
+            and current.get("streamKey", current.get("textStreamKey")) in {stream_key, replace_stream_key}
         ):
             next_part = dict(current)
-            next_part.update(meta)
-            next_part["text"] = f"{current.get('text') or ''}{content}"
-            next_part["textFormat"] = str(current.get("textFormat") or fmt)
+            next_part.update(_public_meta(meta))
+            current_content = str(current.get("markdown", current.get("text")) or "")
+            next_part["type"] = "assistant_text"
+            next_part["markdown"] = f"{current_content}{content}" if append else content
+            next_part["format"] = str(current.get("format", current.get("textFormat")) or fmt)
+            next_part["streaming"] = streaming
+            next_part["streamKey"] = stream_key
+            next_part.pop("text", None)
+            next_part.pop("textFormat", None)
+            next_part.pop("textStreamKey", None)
             parts[index] = next_part
             assistant["parts"] = parts
-            assistant["text"] = f"{assistant.get('text') or ''}{content}"
+            _refresh_assistant_text(assistant)
             return
-    part = _part(stream_key, "text", meta, {
-        "text": content,
-        "textFormat": fmt,
-        "textStreamKey": stream_key,
+    part = _part(stream_key, "assistant_text", meta, {
+        "markdown": content,
+        "format": fmt,
+        "streaming": streaming,
+        "streamKey": stream_key,
     })
+    if stream_key == "assistant-stream":
+        part["id"] = f"assistant-stream-{meta.get('sessionRunId') or meta.get('sessionEventSeq')}"
     assistant["parts"] = [*parts, part]
-    assistant["text"] = f"{assistant.get('text') or ''}{content}"
+    _refresh_assistant_text(assistant)
 
 
-def _upsert_reasoning_part(doc: dict[str, Any], content: str, fmt: str, meta: dict[str, Any]) -> None:
+def _upsert_thinking_part(doc: dict[str, Any], content: str, meta: dict[str, Any]) -> None:
     if not content:
         return
     assistant = _ensure_assistant_message(doc)
     parts = _list_value(assistant.get("parts"))
     for index, part in enumerate(parts):
-        if isinstance(part, dict) and part.get("type") == "reasoning":
-            current = str(part.get("reasoningText") or "")
+        if isinstance(part, dict) and part.get("type") == "thinking" and part.get("streamKey") == "reasoning-stream":
+            current = str(part.get("raw") or "")
             part = dict(part)
-            part.update(meta)
-            part["reasoningText"] = f"{current}{content}"
-            part["reasoningFormat"] = str(part.get("reasoningFormat") or fmt)
-            part["reasoningStreamKey"] = str(part.get("reasoningStreamKey") or "reasoning-stream")
+            part.update(_public_meta(meta))
+            part["title"] = "正在思考"
+            part["active"] = True
+            part["raw"] = f"{current}{content}"
+            part["streamKey"] = "reasoning-stream"
             parts[index] = part
             assistant["parts"] = parts
             return
-    parts.insert(0, _part("reasoning", "reasoning", meta, {
-        "reasoningText": content,
-        "reasoningFormat": fmt,
-        "reasoningStreamKey": "reasoning-stream",
+    part = _part("thinking", "thinking", meta, {
+        "title": "正在思考",
+        "active": True,
+        "raw": content,
+        "streamKey": "reasoning-stream",
+    })
+    part["id"] = f"thinking-{meta.get('sessionRunId') or meta.get('sessionEventSeq')}"
+    parts.append(part)
+    assistant["parts"] = parts
+
+
+def _finalize_reasoning_part(
+    doc: dict[str, Any],
+    content: str,
+    summary: str,
+    fmt: str,
+    meta: dict[str, Any],
+) -> None:
+    if not content and not summary:
+        return
+    assistant = _ensure_assistant_message(doc)
+    parts = _list_value(assistant.get("parts"))
+    for index, part in enumerate(parts):
+        if isinstance(part, dict) and part.get("type") == "thinking" and part.get("streamKey") == "reasoning-stream":
+            parts[index] = _part_from_existing(part, "reasoning", meta, {
+                "summary": summary or None,
+                "raw": content or summary,
+                "format": fmt,
+            })
+            assistant["parts"] = parts
+            return
+    for index, part in enumerate(parts):
+        if isinstance(part, dict) and part.get("type") == "reasoning":
+            parts[index] = _part_from_existing(part, "reasoning", meta, {
+                "summary": summary or part.get("summary"),
+                "raw": content or summary,
+                "format": fmt,
+            })
+            assistant["parts"] = parts
+            return
+    parts.append(_part("reasoning", "reasoning", meta, {
+        "summary": summary or None,
+        "raw": content or summary,
+        "format": fmt,
     }))
     assistant["parts"] = parts
 
@@ -616,10 +755,10 @@ def _append_view_part(
 ) -> None:
     nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
     _append_part(doc, _part("view", "view", meta, {
-        "viewTitle": title or _string(payload, "title") or _string(payload, "message") or "结构化视图",
+        "title": title or _string(payload, "title") or _string(payload, "message") or "结构化视图",
         "viewType": _string(payload, "view_type") or kind or _string(payload, "kind") or "view",
-        "viewLevel": _string(payload, "level") or "info",
-        "viewPayload": nested,
+        "level": _string(payload, "level") or "info",
+        "payload": nested,
     }))
 
 
@@ -640,19 +779,30 @@ def _upsert_tool_part(
         return
     assistant = _ensure_assistant_message(doc)
     parts = _list_value(assistant.get("parts"))
+    preparing_index = patch.get("preparingIndex")
     index = next((
         idx for idx, part in enumerate(parts)
         if isinstance(part, dict) and part.get("type") == "tool" and part.get("toolCallId") == tool_call_id
     ), -1)
+    if index < 0 and preparing_index is not None:
+        index = next((
+            idx for idx, part in enumerate(parts)
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "tool"
+                and part.get("status") == "preparing"
+                and part.get("preparingIndex") == preparing_index
+            )
+        ), -1)
     current = parts[index] if index >= 0 and isinstance(parts[index], dict) else {
         "id": f"tool-{tool_call_id}",
         "type": "tool",
         "tool": tool_name,
         "toolCallId": tool_call_id,
         "status": "running",
-        "toolOutput": "",
+        "output": "",
     }
-    next_part = {**current, **_defined(patch), **meta, "type": "tool", "tool": tool_name, "toolCallId": tool_call_id}
+    next_part = {**current, **_defined(patch), **_public_meta(meta), "type": "tool", "tool": tool_name, "toolCallId": tool_call_id}
     if index >= 0:
         parts[index] = next_part
     else:
@@ -679,7 +829,7 @@ def _patch_tool_part(
         if not tool_call_id and approval_id and part.get("approvalId") != approval_id:
             parts.append(part)
             continue
-        parts.append({**part, **_defined(patch), **meta})
+        parts.append({**part, **_defined(patch), **_public_meta(meta)})
     assistant["parts"] = parts
 
 
@@ -705,7 +855,7 @@ def _patch_existing_tool_part(
                     and part.get("type") == "tool"
                     and part.get("toolCallId") == tool_call_id
                 ):
-                    parts.append({**part, **_defined(patch), **meta})
+                    parts.append({**part, **_defined(patch), **_public_meta(meta)})
                     changed = True
                     continue
                 parts.append(part)
@@ -738,7 +888,7 @@ def _settle_stale_pending_approvals(
                 ):
                     parts.append({
                         **part,
-                        **meta,
+                        **_public_meta(meta),
                         "status": status,
                         "approvalDecision": "deny_once",
                         "approvalResultReason": reason,
@@ -821,12 +971,237 @@ def _part(prefix: str, kind: str, meta: dict[str, Any], extra: dict[str, Any]) -
         "id": f"{prefix}-{meta.get('sessionEventSeq')}",
         "type": kind,
         **extra,
-        **meta,
+        **_public_meta(meta),
     }
+
+
+def _public_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in meta.items() if key != "sessionRunId"}
+
+
+def _part_from_existing(
+    current: dict[str, Any],
+    kind: str,
+    meta: dict[str, Any],
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": str(current.get("id") or f"{kind}-{meta.get('sessionEventSeq')}"),
+        "type": kind,
+        **_defined(extra),
+        **_public_meta(meta),
+    }
+
+
+def _refresh_assistant_text(assistant: dict[str, Any]) -> None:
+    text_parts = []
+    for part in _list_value(assistant.get("parts")):
+        if isinstance(part, dict) and part.get("type") == "assistant_text":
+            text_parts.append(str(part.get("markdown") or ""))
+    assistant["text"] = "".join(text_parts)
+
+
+def _finalize_active_streams(doc: dict[str, Any], meta: dict[str, Any]) -> None:
+    assistant = _ensure_assistant_message(doc)
+    parts = []
+    changed = False
+    for part in _list_value(assistant.get("parts")):
+        if not isinstance(part, dict):
+            parts.append(part)
+            continue
+        if part.get("type") == "assistant_text" and part.get("streamKey") == "assistant-stream":
+            parts.append({**part, "streaming": False, "streamKey": "assistant-message"})
+            changed = True
+            continue
+        if part.get("type") == "thinking" and part.get("streamKey") == "reasoning-stream":
+            parts.append({**part, "active": False})
+            changed = True
+            continue
+        parts.append(part)
+    if changed:
+        assistant["parts"] = parts
+        _refresh_assistant_text(assistant)
+
+
+def _finalize_run_transcript_items(doc: dict[str, Any], status: str) -> None:
+    assistant = _ensure_assistant_message(doc)
+    trace_node_status = "error" if status == "error" else "cancelled" if status == "cancelled" else "success"
+    parts = []
+    changed = False
+    for part in _list_value(assistant.get("parts")):
+        if not isinstance(part, dict):
+            parts.append(part)
+            continue
+        next_part = dict(part)
+        if next_part.get("type") == "assistant_text" and next_part.get("streamKey") == "assistant-stream":
+            next_part["streaming"] = False
+            next_part["streamKey"] = "assistant-message"
+            changed = True
+        if next_part.get("type") == "thinking" and next_part.get("streamKey") == "reasoning-stream":
+            next_part["active"] = False
+            changed = True
+        if (
+            next_part.get("type") == "tool"
+            and status == "cancelled"
+            and next_part.get("status") in {"running", "pending", "preparing", "awaiting_approval"}
+        ):
+            next_part["status"] = "cancelled"
+            changed = True
+        if next_part.get("traceNodeStatus") != trace_node_status:
+            next_part["traceNodeStatus"] = trace_node_status
+            changed = True
+        parts.append(next_part)
+    if changed:
+        assistant["parts"] = parts
+        _refresh_assistant_text(assistant)
+
+
+def _append_notice_part(
+    doc: dict[str, Any],
+    level: str,
+    text: str,
+    prefix: str,
+    fmt: str,
+    meta: dict[str, Any],
+) -> None:
+    content = _strip_ansi(text).strip()
+    if not content:
+        return
+    _append_part(doc, _part(prefix, "notice", meta, {
+        "level": level,
+        "text": content,
+        "format": fmt,
+    }))
+
+
+def _has_notice_level(doc: dict[str, Any], level: str) -> bool:
+    assistant = _ensure_assistant_message(doc)
+    return any(
+        isinstance(part, dict)
+        and part.get("type") == "notice"
+        and part.get("level") == level
+        for part in _list_value(assistant.get("parts"))
+    )
 
 
 def _tool_call_id(payload: dict[str, Any]) -> str:
     return _string(payload, "tool_call_id") or _string(payload, "toolCallId")
+
+
+def _tool_output_format(payload: dict[str, Any], tool_name: str, tool_source: str = "") -> str:
+    explicit = (
+        _string(payload, "format")
+        or _string(payload, "output_format")
+        or _string(payload, "tool_output_format")
+        or _string(payload, "tool_result_format")
+    )
+    if explicit in {"plain", "markdown", "terminal", "json"}:
+        return explicit
+    if _is_shell_tool(tool_name, tool_source):
+        return "terminal"
+    normalized_tool = tool_name.lower()
+    normalized_source = tool_source.lower()
+    if "mcp" in normalized_source or "agent" in normalized_tool or normalized_tool in {"mcp", "delegate_agent"}:
+        return "markdown"
+    return "plain"
+
+
+def _is_shell_tool(tool_name: str, tool_source: str = "") -> bool:
+    normalized_tool = tool_name.lower()
+    normalized_source = tool_source.lower()
+    return normalized_tool in {"shell", "execute_command"} or "terminal" in normalized_source
+
+
+def _normalize_tool_stream(value: str) -> str:
+    normalized = value.lower()
+    if normalized in {"stderr", "result", "system"}:
+        return normalized
+    return "stdout"
+
+
+def _append_output_chunk(
+    chunks: list[Any],
+    stream: str,
+    content: str,
+    max_chars: int = _SHELL_OUTPUT_MAX_CHARS,
+) -> tuple[list[dict[str, Any]], bool]:
+    normalized_stream = _normalize_tool_stream(stream)
+    normalized_chunks = [
+        {**dict(chunk), "stream": _normalize_tool_stream(str(chunk.get("stream") or "stdout"))}
+        for chunk in chunks
+        if isinstance(chunk, dict) and isinstance(chunk.get("content"), str)
+    ]
+    if not content:
+        return normalized_chunks, any(chunk.get("truncated") is True for chunk in normalized_chunks)
+    if normalized_chunks and normalized_chunks[-1].get("stream") == normalized_stream and not normalized_chunks[-1].get("truncated"):
+        last = dict(normalized_chunks[-1])
+        last["content"] = f"{last.get('content') or ''}{content}"
+        normalized_chunks[-1] = last
+        return _limit_output_chunks(normalized_chunks, max_chars)
+    return _limit_output_chunks([*normalized_chunks, {"stream": normalized_stream, "content": content}], max_chars)
+
+
+def _limit_output_chunks(
+    chunks: list[dict[str, Any]],
+    max_chars: int = _SHELL_OUTPUT_MAX_CHARS,
+) -> tuple[list[dict[str, Any]], bool]:
+    total = sum(len(str(chunk.get("content") or "")) for chunk in chunks)
+    already_truncated = any(chunk.get("truncated") is True for chunk in chunks)
+    if total <= max_chars and not already_truncated:
+        return [dict(chunk) for chunk in chunks], False
+
+    budget = max(1000, max_chars - len(_SHELL_OUTPUT_TRUNCATION_MARKER))
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for chunk in reversed(chunks):
+        if chunk.get("truncated") is True:
+            continue
+        content = str(chunk.get("content") or "")
+        if used + len(content) <= budget:
+            kept.insert(0, dict(chunk))
+            used += len(content)
+            continue
+        remaining = budget - used
+        if remaining > 0:
+            next_chunk = dict(chunk)
+            next_chunk["content"] = content[-remaining:]
+            kept.insert(0, next_chunk)
+        break
+
+    return [
+        {"stream": "system", "content": _SHELL_OUTPUT_TRUNCATION_MARKER, "truncated": True},
+        *kept,
+    ], True
+
+
+def _build_output_text(chunks: list[Any]) -> str:
+    return "".join(str(chunk.get("content") or "") for chunk in chunks if isinstance(chunk, dict))
+
+
+def _shell_chunks_from_text(text: str) -> list[dict[str, Any]]:
+    return [{"stream": "result", "content": text}] if text else []
+
+
+def _reconcile_final_output(streamed: str, final: str, has_chunks: bool = False) -> str:
+    if not streamed:
+        return final
+    if not final:
+        return streamed
+    if has_chunks:
+        return streamed
+    if streamed == final or streamed.strip() == final.strip():
+        return streamed
+    normalized_streamed = streamed.replace("\r\n", "\n").strip()
+    normalized_final = final.replace("\r\n", "\n").strip()
+    if normalized_final in normalized_streamed:
+        return streamed
+    if normalized_streamed in normalized_final:
+        return final
+    return f"{streamed.rstrip()}\n\n[最终结果]\n{final}"
+
+
+def _strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", value)
 
 
 def _is_memory_payload(payload: dict[str, Any]) -> bool:
@@ -858,6 +1233,21 @@ def _string(value: dict[str, Any] | None, key: str) -> str:
         return ""
     item = value.get(key)
     return str(item) if item is not None else ""
+
+
+def _number(value: dict[str, Any] | None, key: str) -> int | float | None:
+    if not isinstance(value, dict):
+        return None
+    item = value.get(key)
+    if isinstance(item, (int, float)):
+        return item
+    if isinstance(item, str) and item.strip():
+        try:
+            parsed = float(item)
+        except ValueError:
+            return None
+        return int(parsed) if parsed.is_integer() else parsed
+    return None
 
 
 def _defined(value: dict[str, Any]) -> dict[str, Any]:

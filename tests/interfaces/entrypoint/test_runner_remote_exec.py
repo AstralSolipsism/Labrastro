@@ -1716,7 +1716,7 @@ class TestRunnerRemoteExec:
                 {"peer_token": peer_token},
             )
             session_id = created["metadata"]["id"]
-            missing_session_run_id = "chat-missing"
+            missing_session_run_id = "run-missing"
             session_store.append_trace_event(
                 session_id,
                 "session_run_start",
@@ -1837,7 +1837,7 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
-    def test_runner_remote_session_load_keeps_orphaned_running_chat_approval_when_still_running(self) -> None:
+    def test_runner_remote_session_load_keeps_orphaned_running_session_run_approval_when_still_running(self) -> None:
         workspace = Path(__file__).resolve().parent
         port = _free_port()
         session_store = MemorySessionStore()
@@ -2197,7 +2197,7 @@ class TestRunnerRemoteExec:
             assert reasoning_text == "Need file"
             assert assistant_text == "Before tool"
             assert final_reasoning_text == "Need file"
-            assert final_assistant_text == "done"
+            assert final_assistant_text == "Before tool"
             assert "TOOL CALL" not in terminal_text
             assert "read_file(" not in terminal_text
             assert "file body" not in terminal_text

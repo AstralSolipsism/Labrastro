@@ -354,14 +354,14 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
         return seq
 
     session = _RemoteSessionRun(
-        session_run_id="chat-1",
+        session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
         trace_event_sink=sink,
     )
 
     session.append_event("session_run_start", {"prompt": "hi"})
-    session.append_event("assistant_delta", {"content": "live-only"})
+    session.append_event("assistant_delta", {"content": "live-coalesced"})
     session.append_event("tool_call_stream", {"tool_call_id": "tool-1", "content": "live"})
     assert persisted == []
 
@@ -374,20 +374,24 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
 
     assert [event["type"] for event in persisted] == [
         "session_run_start",
+        "assistant_delta",
+        "tool_call_stream",
         "remote_peer_ready",
         "assistant_message",
         "session_run_end",
     ]
-    assert [event["session_id"] for event in persisted] == ["session-1"] * 4
+    assert [event["session_id"] for event in persisted] == ["session-1"] * 6
     event_by_type = {event["type"]: event for event in session.events}
-    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 2
-    assert event_by_type["assistant_message"]["session_event_seq"] == 3
-    assert event_by_type["session_run_end"]["session_event_seq"] == 4
+    assert event_by_type["assistant_delta"]["session_event_seq"] == 2
+    assert event_by_type["tool_call_stream"]["session_event_seq"] == 3
+    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 4
+    assert event_by_type["assistant_message"]["session_event_seq"] == 5
+    assert event_by_type["session_run_end"]["session_event_seq"] == 6
 
 
 def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -> None:
     session = _RemoteSessionRun(
-        session_run_id="chat-1",
+        session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
     )
@@ -4255,7 +4259,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_session_run_events_accepts_replacement_peer_token_for_existing_session_run(self) -> None:
+    def test_session_run_control_allows_any_valid_peer_token_for_existing_session_run(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
@@ -4293,6 +4297,7 @@ class TestRemoteRelayHTTPService:
             )
             first_token = first_register["payload"]["peer_token"]
             replacement_token = replacement_register["payload"]["peer_token"]
+            assert first_register["payload"]["peer_id"] != replacement_register["payload"]["peer_id"]
 
             _, start_body = _json_request(
                 "POST",
@@ -4314,6 +4319,60 @@ class TestRemoteRelayHTTPService:
                 "session_run_end",
             ]
             assert stream_body["events"][1]["payload"]["text"] == "after-reconnect"
+
+            status_code, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {"peer_token": replacement_token, "session_run_id": start_body["session_run_id"]},
+            )
+            assert status_code == 200
+            assert status_body["session_run_id"] == start_body["session_run_id"]
+            assert status_body["peer_id"] == first_register["payload"]["peer_id"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_control_rejects_invalid_token_and_missing_run(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            session_run_events_handler=lambda _peer_id, _prompt, _session: None,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {"peer_token": "bad-token", "session_run_id": "missing-run"},
+                )
+                raise AssertionError("expected invalid peer token to fail")
+            except HTTPError as exc:
+                body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 401
+                assert body["error"] == "invalid_peer_token"
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {"peer_token": peer_token, "session_run_id": "missing-run"},
+                )
+                raise AssertionError("expected missing session run to fail")
+            except HTTPError as exc:
+                body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 404
+                assert body["error"] == "session_run_not_found"
         finally:
             service.stop()
             relay.stop()
@@ -4983,7 +5042,7 @@ class TestRemoteRelayHTTPService:
                 data=json.dumps(
                     {
                         "peer_token": peer_token,
-                        "session_run_id": "missing-chat",
+                        "session_run_id": "missing-run",
                         "approval_id": approval_id,
                         "decision": "allow_once",
                     }

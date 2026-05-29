@@ -60,7 +60,7 @@ def test_session_store_writes_single_session_record_for_history_document_and_eve
         session_id,
         "session_run_start",
         {"prompt": "single source"},
-        session_run_id="chat-1",
+        session_run_id="run-1",
         session_run_seq=1,
     )
 
@@ -357,14 +357,14 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
         session_id,
         "context_event",
         {"phase": "before"},
-        session_run_id="chat-1",
+        session_run_id="run-1",
         session_run_seq=3,
     )
     second = store.append_trace_event(
         session_id,
         "session_run_end",
         {"response": "done"},
-        session_run_id="chat-1",
+        session_run_id="run-1",
         session_run_seq=4,
     )
 
@@ -374,7 +374,7 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
         {
             "session_id": session_id,
             "session_event_seq": 2,
-            "session_run_id": "chat-1",
+            "session_run_id": "run-1",
             "session_run_seq": 4,
             "seq": 4,
             "type": "session_run_end",
@@ -387,21 +387,32 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
     assert store.list_trace_events(session_id) == []
 
 
-def test_live_trace_events_do_not_mutate_session_document(tmp_path: Path) -> None:
+def test_live_trace_events_mutate_canonical_session_document(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     session_id = store.save(messages=[{"role": "user", "content": "hi"}], model="m1")
-    store.append_trace_event(session_id, "session_run_start", {"prompt": "hi"}, session_run_id="chat-1", session_run_seq=1)
-    before = store.load_document(session_id)
-
+    store.append_trace_event(session_id, "session_run_start", {"prompt": "hi"}, session_run_id="run-1", session_run_seq=1)
     store.append_trace_event(
         session_id,
         "assistant_delta",
         {"content": "live"},
-        session_run_id="chat-1",
+        session_run_id="run-1",
         session_run_seq=2,
     )
 
-    assert store.load_document(session_id) == before
+    document = store.load_document(session_id)
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts == [
+        {
+            "id": "assistant-stream-run-1",
+            "type": "assistant_text",
+            "markdown": "live",
+            "format": "markdown",
+            "streaming": True,
+            "streamKey": "assistant-stream",
+            "eventKey": f"session:{session_id}:2",
+            "sessionEventSeq": 2,
+        }
+    ]
 
 
 def test_session_store_concurrent_save_keeps_sessions_readable(tmp_path: Path) -> None:

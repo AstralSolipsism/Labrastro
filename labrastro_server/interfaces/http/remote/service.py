@@ -108,7 +108,7 @@ SessionTraceEventSink = Callable[
     [str, str, dict[str, Any], str | None, int | None, str, bool], int | None
 ]
 
-_LIVE_ONLY_SESSION_RUN_EVENTS = frozenset(
+_COALESCED_SESSION_RUN_EVENTS = frozenset(
     {"assistant_delta", "reasoning_delta", "tool_call_stream"}
 )
 _LIVE_EVENT_FLUSH_INTERVAL_SEC = 0.04
@@ -116,7 +116,7 @@ _LIVE_EVENT_MAX_CONTENT_CHARS = 1024
 
 
 def _is_replayable_session_run_event(event_type: str) -> bool:
-    return bool(event_type) and event_type not in _LIVE_ONLY_SESSION_RUN_EVENTS
+    return bool(event_type)
 
 
 @dataclass
@@ -367,7 +367,7 @@ class _RemoteSessionRun:
         with self.cond:
             normalized_payload = payload if isinstance(payload, dict) else {}
             now = time.time()
-            if event_type in _LIVE_ONLY_SESSION_RUN_EVENTS:
+            if event_type in _COALESCED_SESSION_RUN_EVENTS:
                 return self._append_live_event_locked(event_type, normalized_payload, now)
             self._flush_live_events_locked(now, force=True)
             if event_type == "approval_resolved":

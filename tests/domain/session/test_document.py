@@ -254,12 +254,299 @@ def test_runtime_projection_contract_keeps_transcript_business_visible() -> None
         )
 
     parts = document["turns"][0]["assistantMessages"][0]["parts"]
-    assert [part["type"] for part in parts] == ["tool", "text"]
+    assert [part["type"] for part in parts] == ["tool", "assistant_text"]
     assert parts[0]["tool"] == "shell"
     assert parts[0]["status"] == "returned"
-    assert parts[0]["toolOutput"] == "ok"
-    assert parts[1]["text"] == "完成"
+    assert parts[0]["output"] == "ok"
+    assert parts[1]["markdown"] == "完成"
     assert document["stats"]["runStatus"] == "done"
+
+
+def test_live_session_run_events_reduce_into_canonical_transcript_blocks() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    events = [
+        ("reasoning_delta", {"content": "plan "}),
+        ("reasoning_delta", {"content": "more"}),
+        ("reasoning_message", {"content": "plan more", "format": "markdown"}),
+        ("assistant_delta", {"content": "hel"}),
+        ("assistant_delta", {"content": "lo"}),
+        ("assistant_message", {"content": "hello", "format": "markdown"}),
+        (
+            "tool_call_delta",
+            {
+                "index": 0,
+                "tool_name": "shell",
+                "arguments_preview": '{"command":"npm test"}',
+            },
+        ),
+        (
+            "tool_call_start",
+            {
+                "index": 0,
+                "tool_call_id": "call-1",
+                "tool_name": "shell",
+                "tool_args": {"command": "npm test"},
+            },
+        ),
+        (
+            "tool_call_stream",
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "shell",
+                "stream": "stdout",
+                "content": "ok",
+            },
+        ),
+        (
+            "tool_call_end",
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "shell",
+                "tool_result": "ok\n",
+            },
+        ),
+        ("session_run_end", {"response": "hello", "response_rendered": True}),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=index,
+            session_run_id="run-1",
+            session_run_seq=index,
+        )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert [part["type"] for part in parts] == [
+        "reasoning",
+        "assistant_text",
+        "tool",
+    ]
+    assert parts[0]["raw"] == "plan more"
+    assert parts[0]["id"] == "thinking-run-1"
+    assert parts[1]["markdown"] == "hello"
+    assert parts[1]["id"] == "assistant-stream-run-1"
+    assert parts[1]["streaming"] is False
+    assert parts[1]["streamKey"] == "assistant-message"
+    assert parts[2]["toolCallId"] == "call-1"
+    assert parts[2]["id"] == "tool-preparing:run-1:0"
+    assert parts[2]["status"] == "returned"
+    assert parts[2]["output"] == "ok"
+    assert parts[2]["outputChunks"] == [{"stream": "stdout", "content": "ok"}]
+    assert parts[2]["finalOutput"] == "ok\n"
+    assert document["stats"]["runStatus"] == "done"
+
+
+def test_session_run_end_finalizes_existing_stream_without_duplicate_when_response_not_rendered() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="assistant_delta",
+        payload={"content": "hel"},
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="session_run_end",
+        payload={"response": "hello", "response_rendered": False},
+        session_event_seq=3,
+        session_run_id="run-1",
+        session_run_seq=3,
+    )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts == [
+        {
+            "id": "assistant-stream-run-1",
+            "type": "assistant_text",
+            "markdown": "hello",
+            "format": "markdown",
+            "streaming": False,
+            "streamKey": "assistant-message",
+            "eventKey": "session:session-1:3",
+            "sessionEventSeq": 3,
+        }
+    ]
+
+
+def test_provider_stream_interrupted_reduces_to_replayable_warning_notice() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="provider_stream_interrupted",
+        payload={"message": "stream lost"},
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts == [
+        {
+            "id": "stream-recovery-2",
+            "type": "notice",
+            "level": "warning",
+            "text": "stream lost",
+            "format": "plain",
+            "eventKey": "session:session-1:2",
+            "sessionEventSeq": 2,
+        }
+    ]
+
+
+def test_shell_tool_stream_truncates_like_frontend_and_preserves_visible_output_on_end() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="tool_call_start",
+        payload={
+            "tool_call_id": "call-1",
+            "tool_name": "shell",
+            "tool_args": {"command": "yes"},
+        },
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="tool_call_stream",
+        payload={
+            "tool_call_id": "call-1",
+            "tool_name": "shell",
+            "stream": "stdout",
+            "content": f"{'x' * 21000}tail",
+        },
+        session_event_seq=3,
+        session_run_id="run-1",
+        session_run_seq=3,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="tool_call_end",
+        payload={
+            "tool_call_id": "call-1",
+            "tool_name": "shell",
+            "tool_result": "final-only",
+        },
+        session_event_seq=4,
+        session_run_id="run-1",
+        session_run_seq=4,
+    )
+
+    tool = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert tool["outputChunks"][0] == {
+        "stream": "system",
+        "content": "\n... 输出过长，已截断早期内容，保留最近输出 ...\n",
+        "truncated": True,
+    }
+    assert tool["outputTruncated"] is True
+    assert len(tool["output"]) <= 20000
+    assert tool["output"].endswith("tail")
+    assert tool["finalOutput"] == "final-only"
+
+
+def test_session_run_cancelled_settles_running_tool_and_appends_notice() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="tool_call_start",
+        payload={
+            "tool_call_id": "call-1",
+            "tool_name": "shell",
+            "tool_args": {"command": "npm test"},
+        },
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="session_run_cancelled",
+        payload={"reason": "user_cancelled"},
+        session_event_seq=3,
+        session_run_id="run-1",
+        session_run_seq=3,
+    )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts[0]["type"] == "tool"
+    assert parts[0]["status"] == "cancelled"
+    assert parts[0]["traceNodeStatus"] == "cancelled"
+    assert parts[1] == {
+        "id": "cancelled-3",
+        "type": "notice",
+        "level": "info",
+        "text": "已取消当前请求。",
+        "format": "plain",
+        "eventKey": "session:session-1:3",
+        "sessionEventSeq": 3,
+        "traceNodeStatus": "cancelled",
+    }
+    assert document["stats"]["runStatus"] == "cancelled"
+
+
+def test_error_then_session_run_failed_keeps_single_error_notice() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    for seq, event_type in enumerate(["error", "session_run_failed"], start=2):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload={"message": "boom"},
+            session_event_seq=seq,
+            session_run_id="run-1",
+            session_run_seq=seq,
+        )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    notices = [part for part in parts if part["type"] == "notice"]
+    assert notices == [
+        {
+            "id": "error-2",
+            "type": "notice",
+            "level": "error",
+            "text": "错误：boom",
+            "format": "plain",
+            "eventKey": "session:session-1:2",
+            "sessionEventSeq": 2,
+            "traceNodeStatus": "error",
+        }
+    ]
+    assert document["stats"]["runStatus"] == "error"
+
+    document = _session_run_start(document, "第二轮", 4)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="session_run_failed",
+        payload={"message": "again failed"},
+        session_event_seq=5,
+        session_run_id="run-2",
+        session_run_seq=5,
+    )
+    notices = [
+        part
+        for turn in document["turns"]
+        for message in turn["assistantMessages"]
+        for part in message["parts"]
+        if part["type"] == "notice"
+    ]
+    assert len(notices) == 2
+    assert notices[1]["text"] == "错误：again failed"
 
 
 def test_terminal_error_settles_stale_pending_approval() -> None:
@@ -292,9 +579,9 @@ def test_terminal_error_settles_stale_pending_approval() -> None:
     assert tool["approvalResultReason"] == "peer_disconnected: peer_shutdown"
 
 
-def test_orphaned_running_chat_settles_stale_pending_approval() -> None:
+def test_orphaned_running_session_run_settles_stale_pending_approval() -> None:
     document = _session_run_start(None, "需要审批", 1)
-    document["run_state"]["session_run_id"] = "chat-missing"
+    document["run_state"]["session_run_id"] = "run-missing"
     document = apply_session_event(
         document,
         session_id="session-1",

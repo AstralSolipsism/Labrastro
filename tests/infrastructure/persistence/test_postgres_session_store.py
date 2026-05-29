@@ -79,7 +79,7 @@ def test_postgres_session_store_writes_single_session_record() -> None:
             session_id,
             "session_run_start",
             {"prompt": "postgres-record"},
-            session_run_id="chat-record",
+            session_run_id="run-record",
             session_run_seq=1,
         )
 
@@ -133,7 +133,7 @@ def test_postgres_session_store_trace_events_reduce_to_record_document() -> None
             session_id,
             "session_run_start",
             {"prompt": "hello"},
-            session_run_id="chat-1",
+            session_run_id="run-1",
             session_run_seq=1,
         )
         second = store.append_trace_event(
@@ -144,7 +144,7 @@ def test_postgres_session_store_trace_events_reduce_to_record_document() -> None
                 "tool_call_id": "tool-1",
                 "tool_result": "x" * 512,
             },
-            session_run_id="chat-1",
+            session_run_id="run-1",
             session_run_seq=2,
         )
 
@@ -161,7 +161,7 @@ def test_postgres_session_store_trace_events_reduce_to_record_document() -> None
         assert document["turns"][0]["userMessage"]["text"] == "hello"
         tool_parts = document["turns"][0]["assistantMessages"][0]["parts"]
         assert tool_parts[0]["type"] == "tool"
-        assert tool_parts[0]["toolOutput"] == "x" * 512
+        assert tool_parts[0]["output"] == "x" * 512
 
         with engine.begin() as conn:
             event_count = conn.execute(
@@ -200,7 +200,7 @@ def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> 
             session_id,
             "session_run_start",
             {"prompt": "hi\x00there"},
-            session_run_id="chat-nul",
+            session_run_id="run-nul",
             session_run_seq=1,
         )
         store.append_trace_event(
@@ -211,7 +211,7 @@ def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> 
                 "tool_call_id": "tool-nul",
                 "tool_result": "x\x00y",
             },
-            session_run_id="chat-nul",
+            session_run_id="run-nul",
             session_run_seq=2,
         )
 
@@ -223,7 +223,7 @@ def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> 
         assert document is not None
         assert document["turns"][0]["userMessage"]["text"] == "hi\ufffdthere"
         tool_parts = document["turns"][0]["assistantMessages"][0]["parts"]
-        assert tool_parts[0]["toolOutput"] == "x\ufffdy"
+        assert tool_parts[0]["output"] == "x\ufffdy"
     finally:
         store.delete(session_id)
 
@@ -246,7 +246,7 @@ def test_postgres_session_store_sanitizes_nul_in_record_payloads() -> None:
                 "tool_call_id": "tool-compressed-nul",
                 "tool_result": "x\x00" + ("y" * 512),
             },
-            session_run_id="chat-compressed-nul",
+            session_run_id="run-compressed-nul",
             session_run_seq=1,
         )
 
