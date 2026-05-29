@@ -4,7 +4,6 @@
 
 This repository is the backend foundation for the Labrastro ecosystem. It is derived from the [RC-CHN/ReuleauxCoder](https://github.com/RC-CHN/ReuleauxCoder) fork lineage, keeps the ReuleauxCoder kernel boundary intact, and adds Labrastro-specific remote relay, session persistence, provider management, MCP distribution, environment manifests, Agent Runtime, and task control plane.
 
-The VS Code/Webview entrypoint lives in the workspace-root `dogcode` repository. It already has the MVP foundation for login, settings, chat, sessions, AgentRun, peer orchestration, and Taskflow chat mode. This repository is the ReuleauxCoder/Labrastro server side: the backend control plane, protocol contract, and execution foundation.
 
 Repository: <https://github.com/AstralSolipsism/Labrastro>
 
@@ -33,7 +32,7 @@ Labrastro-owned control-plane names use the new brand:
 - **Remote Host/Peer relay** where the host runs as `rcoder --server` and peers join through bootstrap tokens.
 - **Agent Runtime control plane** for runtime profiles, executors, models, MCP, skills, credentials, workspace policies, and approval boundaries.
 - **Task and artifact lifecycle** for task, artifact, branch, PR, review, and follow-up states.
-- **VS Code/Webview MVP** in the workspace-root `dogcode` repository, covering login, settings, chat, sessions, AgentRun, peer orchestration, and Taskflow chat mode.
+- **VS Code/Webview MVP** in the workspace-root `Labrastro-vscode-extension` repository, covering login, settings, chat, sessions, AgentRun, peer orchestration, and Taskflow chat mode.
 - **Server-side persistence** with file session storage plus Postgres migrations and wired runtime, session, auth, collaboration, and GitHub PR lifecycle stores. Taskflow tables exist, but Taskflow store wiring is still under construction.
 - **Go worker execution surface** through `reuleauxcoder-agent` for CLI subprocesses, worktrees, repo cache, publishing, and long-running tasks.
 

@@ -7,7 +7,7 @@ upstream:
   last_reviewed_short: "b570877"
   reviewed_at: 2026-05-16
 local:
-  repo: AstralSolipsism/ReuleauxCoder
+  repo: AstralSolipsism/Labrastro
   branch: main
   head_commit: "fbabc6b2d86658d857c39a63786533b08d5327e6"
   head_short: "fbabc6b"
