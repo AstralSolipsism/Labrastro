@@ -67,11 +67,18 @@ type DisconnectRequest struct {
 }
 
 type SessionRunStartRequest struct {
-	PeerToken    string `json:"peer_token"`
-	Prompt       string `json:"prompt"`
-	SessionHint  string `json:"session_hint,omitempty"`
-	WorkflowMode string `json:"workflow_mode,omitempty"`
-	TaskflowID   string `json:"taskflow_id,omitempty"`
+	PeerToken       string           `json:"peer_token"`
+	Prompt          string           `json:"prompt"`
+	SessionHint     string           `json:"session_hint,omitempty"`
+	ClientRequestID string           `json:"client_request_id,omitempty"`
+	Mode            string           `json:"mode,omitempty"`
+	WorkflowMode    string           `json:"workflow_mode,omitempty"`
+	TaskflowID      string           `json:"taskflow_id,omitempty"`
+	ProviderID      string           `json:"provider_id,omitempty"`
+	ModelID         string           `json:"model_id,omitempty"`
+	Parameters      map[string]any   `json:"parameters,omitempty"`
+	Locale          string           `json:"locale,omitempty"`
+	Mentions        []map[string]any `json:"mentions,omitempty"`
 }
 
 type SessionRunStartResponse struct {
