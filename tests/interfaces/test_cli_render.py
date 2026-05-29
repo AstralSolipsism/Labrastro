@@ -1,4 +1,4 @@
-﻿from unittest.mock import Mock
+from unittest.mock import Mock
 
 from rich.markdown import Markdown
 
@@ -21,22 +21,22 @@ def test_cli_renderer_buffers_until_tool_output_then_flushes_plain_text() -> Non
     renderer.on_event(AgentEvent.stream_token("hello "))
     renderer.on_event(AgentEvent.stream_token("world"))
     renderer.on_event(AgentEvent.tool_call_start("shell", {"command": "pwd"}))
-    renderer.on_event(AgentEvent.chat_end("hello world", render_response=False))
+    renderer.on_event(AgentEvent.session_run_end("hello world", render_response=False))
 
     renderer.render_content_markdown.assert_called_once_with("hello world")
     renderer.render_plain_text.assert_called_once_with("\n")
 
 
-def test_cli_renderer_renders_chat_end_when_requested() -> None:
+def test_cli_renderer_renders_session_run_end_when_requested() -> None:
     renderer = _renderer()
     renderer.render_content_markdown = Mock()
 
-    renderer.on_event(AgentEvent.chat_end("final answer", render_response=True))
+    renderer.on_event(AgentEvent.session_run_end("final answer", render_response=True))
 
     renderer.render_content_markdown.assert_called_once_with("final answer")
 
 
-def test_cli_renderer_finalizes_stream_without_rendering_duplicate_chat_end_response() -> (
+def test_cli_renderer_finalizes_stream_without_rendering_duplicate_session_run_end_response() -> (
     None
 ):
     renderer = _renderer()
@@ -44,7 +44,7 @@ def test_cli_renderer_finalizes_stream_without_rendering_duplicate_chat_end_resp
     renderer.render_plain_text = Mock()
 
     renderer.on_event(AgentEvent.stream_token("hello world"))
-    renderer.on_event(AgentEvent.chat_end("hello world", render_response=False))
+    renderer.on_event(AgentEvent.session_run_end("hello world", render_response=False))
 
     renderer.render_content_markdown.assert_called_once_with("hello world")
     renderer.render_plain_text.assert_called_once_with("\n")
@@ -56,7 +56,7 @@ def test_cli_renderer_finalizes_stream_without_tail_patch() -> None:
     renderer.render_plain_text = Mock()
 
     renderer.on_event(AgentEvent.stream_token("hello"))
-    renderer.on_event(AgentEvent.chat_end("hello world", render_response=False))
+    renderer.on_event(AgentEvent.session_run_end("hello world", render_response=False))
 
     renderer.render_content_markdown.assert_called_once_with("hello")
     renderer.render_plain_text.assert_called_once_with("\n")

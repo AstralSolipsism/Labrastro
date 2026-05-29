@@ -141,7 +141,7 @@ class CLIRenderer:
             self._render_tool_end(event.tool_name, event.tool_result)
         elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
             self._render_delegated_run_completed(event.data)
-        elif event.event_type == AgentEventType.CHAT_END:
+        elif event.event_type == AgentEventType.SESSION_RUN_END:
             self.finalize_response(
                 event.data.get("response", ""),
                 render_response=event.data.get("render_response", True),

@@ -495,7 +495,7 @@ class Agent:
             reason="Recovered from previous interrupted turn."
         )
 
-        self._emit_event(AgentEvent.chat_start(user_input))
+        self._emit_event(AgentEvent.session_run_start(user_input))
 
         # Add user message
         self.state.messages.append({"role": "user", "content": user_input})
@@ -519,10 +519,10 @@ class Agent:
         )
         if interrupted:
             payload = getattr(self._loop, "last_interruption_payload", None) or {}
-            self._emit_event(AgentEvent.chat_interrupted(result, payload))
+            self._emit_event(AgentEvent.session_run_interrupted(result, payload))
             return result
         self._emit_event(
-            AgentEvent.chat_end(
+            AgentEvent.session_run_end(
                 result,
                 render_response=not getattr(
                     self._loop, "last_response_streamed", False

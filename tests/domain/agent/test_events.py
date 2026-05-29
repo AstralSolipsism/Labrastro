@@ -5,9 +5,9 @@ from reuleauxcoder.domain.agent.events import (
 )
 
 
-def test_agent_event_chat_start_contains_user_input() -> None:
-    event = AgentEvent.chat_start("hello")
-    assert event.event_type is AgentEventType.CHAT_START
+def test_agent_event_session_run_start_contains_user_input() -> None:
+    event = AgentEvent.session_run_start("hello")
+    assert event.event_type is AgentEventType.SESSION_RUN_START
     assert event.data == {"user_input": "hello"}
 
 

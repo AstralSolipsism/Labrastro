@@ -15,8 +15,8 @@ from reuleauxcoder.domain.agent.tool_diagnostics import (
 class AgentEventType(Enum):
     """Types of agent events."""
 
-    CHAT_START = "chat_start"
-    CHAT_END = "chat_end"
+    SESSION_RUN_START = "session_run_start"
+    SESSION_RUN_END = "session_run_end"
     STREAM_TOKEN = "stream_token"
     REASONING_TOKEN = "reasoning_token"
     TOOL_CALL_DELTA = "tool_call_delta"
@@ -26,7 +26,7 @@ class AgentEventType(Enum):
     PROVIDER_STREAM_INTERRUPTED = "provider_stream_interrupted"
     PROVIDER_STREAM_RECOVERING = "provider_stream_recovering"
     PROVIDER_STREAM_RECOVERED = "provider_stream_recovered"
-    CHAT_INTERRUPTED = "chat_interrupted"
+    SESSION_RUN_INTERRUPTED = "session_run_interrupted"
     DELEGATED_RUN_COMPLETED = "delegated_run_completed"
     # User-visible context compression lifecycle events are currently emitted via
     # UIEventKind.CONTEXT so CLI, remote relay, and webview can share one UI path.
@@ -62,18 +62,18 @@ class AgentEvent:
     error_message: Optional[str] = None
 
     @classmethod
-    def chat_start(cls, user_input: str) -> "AgentEvent":
-        """Create a chat start event."""
+    def session_run_start(cls, user_input: str) -> "AgentEvent":
+        """Create a session run start event."""
         return cls(
-            event_type=AgentEventType.CHAT_START,
+            event_type=AgentEventType.SESSION_RUN_START,
             data={"user_input": user_input},
         )
 
     @classmethod
-    def chat_end(cls, response: str, *, render_response: bool = True) -> "AgentEvent":
-        """Create a chat end event."""
+    def session_run_end(cls, response: str, *, render_response: bool = True) -> "AgentEvent":
+        """Create a session run end event."""
         return cls(
-            event_type=AgentEventType.CHAT_END,
+            event_type=AgentEventType.SESSION_RUN_END,
             data={"response": response, "render_response": render_response},
         )
 
@@ -295,10 +295,10 @@ class AgentEvent:
         return cls(event_type=AgentEventType.PROVIDER_STREAM_RECOVERED, data=payload)
 
     @classmethod
-    def chat_interrupted(cls, response: str, payload: dict[str, Any]) -> "AgentEvent":
-        """Create a terminal recoverable chat interruption event."""
+    def session_run_interrupted(cls, response: str, payload: dict[str, Any]) -> "AgentEvent":
+        """Create a terminal recoverable session run interruption event."""
         return cls(
-            event_type=AgentEventType.CHAT_INTERRUPTED,
+            event_type=AgentEventType.SESSION_RUN_INTERRUPTED,
             data={**payload, "response": response},
             error_message=str(payload.get("message") or ""),
         )
