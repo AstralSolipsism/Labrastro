@@ -1,4 +1,4 @@
-﻿"""Tests for ShellTool CWD tracking and stale-directory recovery."""
+"""Tests for ShellTool CWD tracking and stale-directory recovery."""
 
 import os
 import subprocess
@@ -36,6 +36,63 @@ def _completed(stdout: str = "ok\n") -> subprocess.CompletedProcess:
     )
 
 
+def test_shell_schema_requires_user_facing_intent():
+    schema = ShellTool.parameters
+
+    assert "intent" in schema["properties"]
+    assert "intent" in schema["required"]
+
+
+def test_shell_preflight_rejects_missing_generic_or_command_like_intent():
+    tool = ShellTool()
+
+    assert "intent" in tool.preflight_validate(command="npm test", intent="").lower()
+    assert "intent" in tool.preflight_validate(command="npm test", intent="执行命令").lower()
+    assert "intent" in tool.preflight_validate(command="npm test", intent="npm test").lower()
+    assert "intent" in tool.preflight_validate(
+        command="npm test",
+        intent="这是一段非常长的说明，用很多字解释模型准备执行命令并观察输出，"
+        "它已经超过用户审批小窗需要的一句话长度，会重新增加用户阅读成本。"
+        "审批弹窗不应该承载这么多背景推理、备选路径、技术解释和模型内部判断。",
+    ).lower()
+
+    assert tool.preflight_validate(
+        command="npm view @jshookmcp/jshook@0.1.8 version",
+        intent="查询 npm 包 @jshookmcp/jshook@0.1.8 的版本信息。",
+    ) is None
+
+
+def test_shell_execute_forwards_command_intent_and_timeout_to_remote_backend():
+    class Backend:
+        backend_id = "remote_relay"
+
+        def __init__(self) -> None:
+            self.payload = None
+
+        def exec_tool(self, tool_name: str, payload: dict) -> str:
+            self.payload = (tool_name, payload)
+            return "ok"
+
+    backend = Backend()
+    tool = ShellTool(backend=backend)
+
+    result = tool.execute(
+        command="npm view demo version",
+        intent="查询 npm 包 demo 的版本信息。",
+        timeout=9,
+    )
+
+    assert result == "ok"
+    assert backend.payload == (
+        "shell",
+        {
+            "command": "npm view demo version",
+            "intent": "查询 npm 包 demo 的版本信息。",
+            "timeout": 9,
+        },
+    )
+
+
 def test_execute_local_resets_cwd_when_directory_deleted():
     """When tracked CWD is deleted externally, next command resets to project root."""
     tool = ShellTool()
@@ -47,7 +104,7 @@ def test_execute_local_resets_cwd_when_directory_deleted():
         "reuleauxcoder.extensions.tools.builtin.shell.os.path.isdir",
         return_value=False,
     ):
-        result = tool._execute_local("echo hello")
+        result = tool._execute_local("echo hello", "输出 hello 验证本地 shell 执行。")
 
     assert "working directory no longer exists" in result
     assert "reset to the project root" in result
@@ -59,7 +116,7 @@ def test_execute_local_succeeds_when_cwd_valid():
     """Normal execution works fine when CWD is valid."""
     tool = ShellTool()
 
-    result = tool._execute_local("echo hello")
+    result = tool._execute_local("echo hello", "输出 hello 验证本地 shell 执行。")
 
     assert "hello" in result
     assert "working directory no longer exists" not in result
@@ -70,7 +127,7 @@ def test_execute_local_uses_os_getcwd_when_cwd_is_none():
     tool = ShellTool()
     tool._cwd = None
 
-    result = tool._execute_local("echo hello")
+    result = tool._execute_local("echo hello", "输出 hello 验证本地 shell 执行。")
 
     assert "hello" in result
 
@@ -253,7 +310,7 @@ def test_execute_local_uses_explicit_shell_executable_on_unix():
             return_value=_completed("ok\n"),
         ) as run,
     ):
-        result = tool._execute_local("echo ok", timeout=5)
+        result = tool._execute_local("echo ok", "输出 ok 验证 Unix shell 执行。", timeout=5)
 
     assert result == "ok"
     assert run.call_args.args[0] == ["/bin/sh", "-c", "echo ok"]
@@ -278,7 +335,7 @@ def test_execute_local_falls_back_to_shell_true_when_no_shell():
             return_value=_completed("ok\n"),
         ) as run,
     ):
-        result = tool._execute_local("echo ok", timeout=5)
+        result = tool._execute_local("echo ok", "输出 ok 验证默认 shell 执行。", timeout=5)
 
     assert result == "ok"
     assert run.call_args.args[0] == "echo ok"

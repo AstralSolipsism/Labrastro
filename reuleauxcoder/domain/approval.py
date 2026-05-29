@@ -18,6 +18,7 @@ class ApprovalRequest:
     tool_source: str = "unknown"
     effect_class: str | None = None
     reason: str | None = None
+    intent: str | None = None
     profile: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

@@ -1,4 +1,4 @@
-﻿"""Tool execution - handles tool calls."""
+"""Tool execution - handles tool calls."""
 
 from __future__ import annotations
 from typing import TYPE_CHECKING, List
@@ -171,6 +171,12 @@ class ToolExecutor:
             return f"Error: tool '{tool_name}' blocked pending review: {reason}"
         return f"Error: tool '{tool_name}' denied by permission gateway: {reason}"
 
+    @staticmethod
+    def _approval_payload_args(arguments: dict) -> tuple[dict, str | None]:
+        payload_args = dict(arguments or {})
+        intent = payload_args.pop("intent", None)
+        return payload_args, intent.strip() if isinstance(intent, str) and intent.strip() else None
+
     def _return_permission_block(
         self,
         tc: "ToolCall",
@@ -230,14 +236,16 @@ class ToolExecutor:
             )
             return message
         try:
+            approval_tool_args, approval_intent = self._approval_payload_args(tc.arguments)
             decision_result = provider.request_approval(
                 ApprovalRequest(
                     tool_name=tc.name,
-                    tool_args=dict(tc.arguments),
+                    tool_args=approval_tool_args,
                     tool_source=getattr(tool, "tool_source", "builtin_tool")
                     if tool is not None
                     else "unknown",
                     reason=decision.reason,
+                    intent=approval_intent,
                     metadata={
                         "tool_call_id": tc.id,
                         "permission": decision.to_dict(),

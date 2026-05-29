@@ -12,6 +12,18 @@ from reuleauxcoder.extensions.tools.registry import register_tool
 from reuleauxcoder.infrastructure.platform import ShellType, get_platform_info
 
 
+MAX_INTENT_CHARS = 88
+GENERIC_INTENTS = {
+    "执行命令",
+    "执行一下",
+    "运行命令",
+    "运行一下",
+    "跑一下",
+    "run command",
+    "execute command",
+}
+
+
 @register_tool
 class ShellTool(Tool):
     name = "shell"
@@ -26,31 +38,50 @@ class ShellTool(Tool):
                 "type": "string",
                 "description": "The shell command to run",
             },
+            "intent": {
+                "type": "string",
+                "description": (
+                    "A concise, user-facing sentence explaining what this command "
+                    "is intended to accomplish. Do not repeat the command."
+                ),
+            },
             "timeout": {
                 "type": "integer",
                 "description": "Timeout in seconds (default 120)",
             },
         },
-        "required": ["command"],
+        "required": ["command", "intent"],
     }
 
     def __init__(self, backend: ToolBackend | None = None):
         super().__init__(backend or LocalToolBackend())
         self._cwd: str | None = None
 
-    def execute(self, command: str, timeout: int = 120) -> str:
-        return self.run_backend(command=command, timeout=timeout)
+    def preflight_validate(self, **kwargs) -> str | None:
+        return validate_shell_intent(kwargs.get("command"), kwargs.get("intent"))
+
+    def execute(self, command: str, intent: str, timeout: int = 120) -> str:
+        validation_error = validate_shell_intent(command, intent)
+        if validation_error:
+            return validation_error
+        return self.run_backend(command=command, intent=intent, timeout=timeout)
 
     @backend_handler("remote_relay")
-    def _execute_remote(self, command: str, timeout: int = 120) -> str:
+    def _execute_remote(self, command: str, intent: str, timeout: int = 120) -> str:
         if not isinstance(command, str) or not command:
             return "Error: shell command must be a non-empty string"
+        validation_error = validate_shell_intent(command, intent)
+        if validation_error:
+            return validation_error
         if not isinstance(timeout, int) or timeout < 1:
             return "Error: timeout must be a positive integer"
-        return self.backend.exec_tool("shell", {"command": command, "timeout": timeout})
+        return self.backend.exec_tool("shell", {"command": command, "intent": intent, "timeout": timeout})
 
     @backend_handler("local")
-    def _execute_local(self, command: str, timeout: int = 120) -> str:
+    def _execute_local(self, command: str, intent: str, timeout: int = 120) -> str:
+        validation_error = validate_shell_intent(command, intent)
+        if validation_error:
+            return validation_error
         cwd = self._cwd or os.getcwd()
 
         # Detect stale CWD (e.g. deleted temp dir) and reset to workspace root
@@ -166,3 +197,23 @@ class ShellTool(Tool):
                 )
                 if os.path.isdir(new_dir):
                     self._cwd = new_dir
+
+
+def validate_shell_intent(command: object, intent: object) -> str | None:
+    if not isinstance(intent, str) or not intent.strip():
+        return "Error: shell tool requires a user-facing 'intent' before execution."
+    value = intent.strip()
+    if len(value) < 8:
+        return "Error: shell tool intent is too short; describe the action in one clear sentence."
+    if len(value) > MAX_INTENT_CHARS:
+        return "Error: shell tool intent is too long; keep it to one concise user-facing sentence."
+    normalized_intent = _normalize_intent_for_comparison(value)
+    if normalized_intent in GENERIC_INTENTS:
+        return "Error: shell tool intent is too generic; describe what the command should accomplish."
+    if isinstance(command, str) and normalized_intent == _normalize_intent_for_comparison(command):
+        return "Error: shell tool intent must not just repeat the command."
+    return None
+
+
+def _normalize_intent_for_comparison(value: str) -> str:
+    return re.sub(r"[\s`'\"“”‘’。.!！?？:：;；,，]+", "", value.strip().lower())

@@ -1,4 +1,4 @@
-﻿"""Tests for ToolExecutor, including CWD sync behaviour."""
+"""Tests for ToolExecutor, including CWD sync behaviour."""
 
 from types import SimpleNamespace
 
@@ -7,6 +7,7 @@ from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
+from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
 from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
 
 
@@ -461,6 +462,93 @@ def test_tool_executor_requests_approval_after_tool_call_transform() -> None:
     assert result == "executed"
     assert len(agent.approval_provider.requests) == 1
     assert agent.approval_provider.requests[0].tool_name == "write_file"
+
+
+def test_tool_executor_separates_shell_intent_from_approval_tool_args() -> None:
+    class ShellLikeTool:
+        name = "shell"
+        description = "Execute a shell command"
+        parameters = {}
+        tool_source = "builtin"
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "executed"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.allow_once("ok")
+
+    class ApprovingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(ShellLikeTool())
+            self.approval_provider = ApprovalProvider()
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason="shell requires approval",
+            )
+
+    agent = ApprovingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call-shell",
+            name="shell",
+            arguments={
+                "command": "npm view demo version",
+                "intent": "查询 npm 包 demo 的版本信息。",
+                "timeout": 10,
+            },
+        )
+    )
+
+    assert result == "executed"
+    assert len(agent.approval_provider.requests) == 1
+    request = agent.approval_provider.requests[0]
+    assert request.intent == "查询 npm 包 demo 的版本信息。"
+    assert request.tool_args == {"command": "npm view demo version", "timeout": 10}
+
+
+def test_tool_executor_rejects_shell_without_intent_before_approval() -> None:
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.allow_once("ok")
+
+    class ApprovingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(ShellTool())
+            self.approval_provider = ApprovalProvider()
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason="shell requires approval",
+            )
+
+    agent = ApprovingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call-shell",
+            name="shell",
+            arguments={"command": "npm test"},
+        )
+    )
+
+    assert "intent" in result.lower()
+    assert agent.approval_provider.requests == []
 
 
 def test_tool_executor_reapproves_when_transform_changes_arguments_after_approval() -> None:

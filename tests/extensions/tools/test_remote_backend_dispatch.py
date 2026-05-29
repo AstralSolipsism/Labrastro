@@ -1,4 +1,4 @@
-﻿"""Tests that builtin tools dispatch to the remote backend correctly."""
+"""Tests that builtin tools dispatch to the remote backend correctly."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class TestRemoteBackendDispatch:
         try:
             backend = RemoteRelayToolBackend(relay_server=srv)
             tool = ShellTool(backend=backend)
-            result = tool.execute(command="ls")
+            result = tool.execute(command="ls", intent="列出当前目录内容。")
             assert "no remote peer" in result.lower()
         finally:
             srv.stop()
@@ -183,10 +183,10 @@ class TestRemoteBackendDispatch:
         try:
             backend = RemoteRelayToolBackend(relay_server=srv)
             tool = ShellTool(backend=backend)
-            result = tool.execute(command="")
+            result = tool.execute(command="", intent="验证空命令会被拒绝。")
             assert "non-empty string" in result.lower()
 
-            result = tool.execute(command="echo ok", timeout=0)
+            result = tool.execute(command="echo ok", intent="输出 ok 用于连通性检查。", timeout=0)
             assert "positive integer" in result.lower()
         finally:
             srv.stop()
@@ -217,7 +217,7 @@ class TestRemoteBackendDispatch:
             result_holder = {}
 
             def run_tool():
-                result_holder["result"] = tool.execute(command="echo hello")
+                result_holder["result"] = tool.execute(command="echo hello", intent="输出 hello 用于远端执行测试。")
 
             t = threading.Thread(target=run_tool)
             t.start()
@@ -355,7 +355,7 @@ class TestRemoteBackendDispatch:
             holder: dict[str, object] = {}
 
             def run_tool() -> None:
-                holder["result"] = tool.execute(command="echo hello")
+                holder["result"] = tool.execute(command="echo hello", intent="输出 hello 用于权限上下文测试。")
 
             t = threading.Thread(target=run_tool)
             t.start()
