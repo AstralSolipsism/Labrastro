@@ -63,7 +63,7 @@ def empty_session_document(
         "last_event_seq": 0,
         "run_state": {
             "status": "idle",
-            "chat_id": None,
+            "session_run_id": None,
             "error": None,
         },
     }
@@ -76,8 +76,8 @@ def apply_session_event(
     event_type: str,
     payload: dict[str, Any] | None = None,
     session_event_seq: int,
-    chat_id: str | None = None,
-    chat_seq: int | None = None,
+    session_run_id: str | None = None,
+    session_run_seq: int | None = None,
     created_at: str | None = None,
 ) -> dict[str, Any]:
     doc = deepcopy(document) if isinstance(document, dict) and document else empty_session_document(session_id)
@@ -100,24 +100,17 @@ def apply_session_event(
     metadata = _dict(doc, "metadata")
     metadata["saved_at"] = timestamp
 
-    if chat_id:
+    if session_run_id:
         run_state = _dict(doc, "run_state")
-        run_state["chat_id"] = chat_id
-    if chat_seq is not None:
+        run_state["session_run_id"] = session_run_id
+    if session_run_seq is not None:
         run_state = _dict(doc, "run_state")
-        run_state["last_chat_seq"] = int(chat_seq)
+        run_state["last_session_run_seq"] = int(session_run_seq)
 
-    if event_type == "chat_start":
-        _apply_chat_start(doc, payload, timestamp, meta)
+    if event_type == "session_run_start":
+        _apply_session_run_start(doc, payload, timestamp, meta)
     elif event_type == "remote_peer_ready":
-        _append_part(doc, _part("remote", "remote_status", meta, {
-            "remotePeerId": _string(payload, "peer_id"),
-            "remoteSessionId": _string(payload, "session_id"),
-            "remoteFingerprint": _string(payload, "fingerprint"),
-            "remoteMode": _string(payload, "mode"),
-            "remoteModel": _string(payload, "model"),
-            "remoteWorkspaceRoot": _string(payload, "workspace_root"),
-        }))
+        _apply_remote_peer_ready(doc, payload)
         _patch_stats(doc, {
             "model": _string(payload, "model") or None,
             "mode": _string(payload, "mode") or None,
@@ -139,14 +132,13 @@ def apply_session_event(
             "markdown",
             meta,
         )
-    elif event_type == "chat_end":
-        _apply_chat_end(doc, payload, meta)
+    elif event_type == "session_run_end":
+        _apply_session_run_end(doc, payload, meta)
     elif event_type in {"output", "tool_call_start", "tool_call_end",
                         "tool_call_protocol_error", "approval_request", "approval_resolved"}:
         _apply_tool_or_output_event(doc, event_type, payload, meta)
     elif event_type == "runtime_status":
-        _append_view_part(doc, payload, meta, title="运行状态", kind="runtime_status")
-        _patch_run_state(doc, status="running")
+        _apply_runtime_status(doc, payload, meta)
     elif event_type == "memory_context" or (
         event_type == "context_event" and _is_memory_payload(payload)
     ):
@@ -180,9 +172,15 @@ def apply_session_event(
             "uiEventTitle": _string(payload, "title") or _string(payload, "message") or "运行事件",
             "uiEventPayload": payload,
         }))
-    elif event_type in {"error", "chat_failed"}:
+    elif event_type in {"error", "session_run_failed"}:
+        _settle_stale_pending_approvals(
+            doc,
+            status="denied",
+            reason=str(payload.get("message") or "unknown error"),
+            meta=meta,
+        )
         _patch_run_state(doc, status="error", error=str(payload.get("message") or "unknown error"))
-        if event_type == "chat_failed":
+        if event_type == "session_run_failed":
             _append_text_part(
                 doc,
                 f"错误：{payload.get('message') or 'unknown error'}",
@@ -190,11 +188,48 @@ def apply_session_event(
                 "plain",
                 meta,
             )
-    elif event_type in {"chat_cancel_requested", "chat_cancelled"}:
-        _patch_run_state(doc, status="cancelled", error=str(payload.get("reason") or "chat_cancelled"))
-        if event_type == "chat_cancelled":
+    elif event_type in {"session_run_cancel_requested", "session_run_cancelled"}:
+        _patch_run_state(doc, status="cancelled", error=str(payload.get("reason") or "session_run_cancelled"))
+        if event_type == "session_run_cancelled":
+            _settle_stale_pending_approvals(
+                doc,
+                status="cancelled",
+                reason=str(payload.get("reason") or "session_run_cancelled"),
+                meta=meta,
+            )
             _append_text_part(doc, "已取消当前请求。", "cancelled", "plain", meta)
 
+    _sync_compatible_trace_fields(doc)
+    return doc
+
+
+def settle_orphaned_running_session_run(
+    document: dict[str, Any] | None,
+    *,
+    session_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    doc = deepcopy(document) if isinstance(document, dict) and document else empty_session_document(session_id)
+    _ensure_document_shape(doc, session_id)
+    run_state = _dict(doc, "run_state")
+    stats = _dict(doc, "stats")
+    if str(run_state.get("status") or "") != "running" and str(stats.get("runStatus") or "") != "running":
+        return doc
+
+    event_seq = int(doc.get("last_event_seq") or 0)
+    meta = {
+        "eventKey": f"session:{session_id}:orphaned-session-run",
+        "sessionEventSeq": event_seq,
+    }
+    _settle_stale_pending_approvals(
+        doc,
+        status="denied",
+        reason=reason,
+        meta=meta,
+    )
+    _patch_run_state(doc, status="error", error=reason)
+    _dict(doc, "session")["state"] = "error"
+    doc["revision"] = int(doc.get("revision") or 0) + 1
     _sync_compatible_trace_fields(doc)
     return doc
 
@@ -306,7 +341,7 @@ def _ensure_document_shape(doc: dict[str, Any], session_id: str) -> None:
     doc.setdefault("trace", {"nodes": [], "edges": [], "ui": _empty_trace_ui()})
     doc.setdefault("revision", 0)
     doc.setdefault("last_event_seq", 0)
-    doc.setdefault("run_state", {"status": "idle", "chat_id": None, "error": None})
+    doc.setdefault("run_state", {"status": "idle", "session_run_id": None, "error": None})
     _sync_compatible_trace_fields(doc)
 
 
@@ -320,7 +355,7 @@ def _sync_compatible_trace_fields(doc: dict[str, Any]) -> None:
     doc["traceUI"] = trace.get("ui") if isinstance(trace.get("ui"), dict) else _empty_trace_ui()
 
 
-def _apply_chat_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: str, meta: dict[str, Any]) -> None:
+def _apply_session_run_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: str, meta: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
     user_id = f"user-{meta['sessionEventSeq']}"
     turn = {
@@ -335,7 +370,7 @@ def _apply_chat_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: s
         "assistantMessages": [],
     }
     turns = _list(doc, "turns")
-    should_initialize_title = _should_initialize_chat_title(doc, len(turns))
+    should_initialize_title = _should_initialize_session_title(doc, len(turns))
     turns.append(turn)
     session = _dict(doc, "session")
     if prompt and should_initialize_title:
@@ -351,21 +386,57 @@ def _apply_chat_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: s
     _patch_run_state(doc, status="running", error=None)
 
 
-def _should_initialize_chat_title(doc: dict[str, Any], turns_before: int) -> bool:
+def _should_initialize_session_title(doc: dict[str, Any], turns_before: int) -> bool:
     if turns_before <= 0:
         return True
     title = str(_dict(doc, "session").get("title") or "").strip()
     return title in _DEFAULT_SESSION_TITLES
 
 
-def _apply_chat_end(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
+def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
     response = str(payload.get("response") or "")
     rendered = bool(payload.get("response_rendered"))
     if response and not rendered:
         _append_text_part(doc, response, "assistant-final", "markdown", meta)
+    _settle_stale_pending_approvals(doc, status="denied", reason="session_run_closed", meta=meta)
     _patch_stats(doc, {"runStatus": "done"})
     _patch_run_state(doc, status="done", error=None)
     _dict(doc, "session")["state"] = "success"
+
+
+def _apply_remote_peer_ready(doc: dict[str, Any], payload: dict[str, Any]) -> None:
+    run_state = _dict(doc, "run_state")
+    run_state["remote_peer"] = {
+        "peer_id": _string(payload, "peer_id"),
+        "session_id": _string(payload, "session_id"),
+        "fingerprint": _string(payload, "fingerprint"),
+        "mode": _string(payload, "mode"),
+        "model": _string(payload, "model"),
+        "workspace_root": _string(payload, "workspace_root"),
+    }
+
+
+def _apply_runtime_status(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
+    _dict(doc, "run_state")["runtime_status"] = dict(payload)
+    phase = str(payload.get("phase") or "")
+    if phase == "shell_queue":
+        _apply_shell_queue_runtime_status(doc, payload, meta)
+
+
+def _apply_shell_queue_runtime_status(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
+    tool_call_id = _tool_call_id(payload)
+    if not tool_call_id:
+        return
+    status = str(payload.get("status") or "")
+    if status == "queued":
+        next_status = "pending"
+    elif status == "running":
+        next_status = "running"
+    else:
+        return
+    _patch_existing_tool_part(doc, tool_call_id, {
+        "status": next_status,
+    }, meta)
 
 
 def _apply_usage(doc: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -462,6 +533,7 @@ def _apply_tool_or_output_event(
             "status": "awaiting_approval",
             "approvalId": _string(payload, "approval_id"),
             "approvalReason": _string(payload, "reason"),
+            "approvalIntent": _string(payload, "intent"),
             "approvalSections": payload.get("sections") if isinstance(payload.get("sections"), list) else [],
             "approvalContent": _string(payload, "content"),
             "toolCallId": _tool_call_id(payload),
@@ -609,6 +681,71 @@ def _patch_tool_part(
             continue
         parts.append({**part, **_defined(patch), **meta})
     assistant["parts"] = parts
+
+
+def _patch_existing_tool_part(
+    doc: dict[str, Any],
+    tool_call_id: str,
+    patch: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    if not tool_call_id:
+        return
+    for turn in _list(doc, "turns"):
+        if not isinstance(turn, dict):
+            continue
+        for message in _list_value(turn.get("assistantMessages")):
+            if not isinstance(message, dict):
+                continue
+            parts = []
+            changed = False
+            for part in _list_value(message.get("parts")):
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "tool"
+                    and part.get("toolCallId") == tool_call_id
+                ):
+                    parts.append({**part, **_defined(patch), **meta})
+                    changed = True
+                    continue
+                parts.append(part)
+            if changed:
+                message["parts"] = parts
+                return
+
+
+def _settle_stale_pending_approvals(
+    doc: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    meta: dict[str, Any],
+) -> None:
+    for turn in _list(doc, "turns"):
+        if not isinstance(turn, dict):
+            continue
+        for message in _list_value(turn.get("assistantMessages")):
+            if not isinstance(message, dict):
+                continue
+            parts = []
+            for part in _list_value(message.get("parts")):
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "tool"
+                    and part.get("status") == "awaiting_approval"
+                    and part.get("approvalId")
+                    and not part.get("approvalDecision")
+                ):
+                    parts.append({
+                        **part,
+                        **meta,
+                        "status": status,
+                        "approvalDecision": "deny_once",
+                        "approvalResultReason": reason,
+                    })
+                    continue
+                parts.append(part)
+            message["parts"] = parts
 
 
 def _find_tool_part(doc: dict[str, Any], tool_call_id: str) -> dict[str, Any] | None:

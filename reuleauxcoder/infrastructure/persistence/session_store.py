@@ -280,9 +280,9 @@ class SessionStore:
         event_type: str,
         payload: dict | None = None,
         *,
-        chat_id: str | None = None,
-        chat_seq: int | None = None,
-        source: str = "remote_chat",
+        session_run_id: str | None = None,
+        session_run_seq: int | None = None,
+        source: str = "remote_session_run",
         replayable: bool = True,
     ) -> int:
         """Append a replayable session trace event to the unified session record."""
@@ -291,9 +291,9 @@ class SessionStore:
             event = {
                 "session_id": session_id,
                 "session_event_seq": seq,
-                "chat_id": chat_id,
-                "chat_seq": int(chat_seq) if chat_seq is not None else None,
-                "seq": int(chat_seq) if chat_seq is not None else seq,
+                "session_run_id": session_run_id,
+                "session_run_seq": int(session_run_seq) if session_run_seq is not None else None,
+                "seq": int(session_run_seq) if session_run_seq is not None else seq,
                 "type": str(event_type),
                 "payload": payload if isinstance(payload, dict) else {},
                 "source": source,
@@ -320,8 +320,8 @@ class SessionStore:
                 event_type=str(event_type),
                 payload=payload if isinstance(payload, dict) else {},
                 session_event_seq=seq,
-                chat_id=chat_id,
-                chat_seq=chat_seq,
+                session_run_id=session_run_id,
+                session_run_seq=session_run_seq,
             )
             record = session.to_record(transcript=document, events=events)
             self._write_record_payload(session_id, record)

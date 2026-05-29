@@ -1,4 +1,4 @@
-﻿import json
+import json
 import threading
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 
 
 def _record_turn(store: SessionStore, session_id: str, text: str) -> None:
-    store.append_trace_event(session_id, "chat_start", {"prompt": text})
+    store.append_trace_event(session_id, "session_run_start", {"prompt": text})
 
 
 def test_session_store_save_and_load_roundtrip(tmp_path: Path) -> None:
@@ -58,10 +58,10 @@ def test_session_store_writes_single_session_record_for_history_document_and_eve
     )
     event_seq = store.append_trace_event(
         session_id,
-        "chat_start",
+        "session_run_start",
         {"prompt": "single source"},
-        chat_id="chat-1",
-        chat_seq=1,
+        session_run_id="chat-1",
+        session_run_seq=1,
     )
 
     assert event_seq == 1
@@ -76,7 +76,7 @@ def test_session_store_writes_single_session_record_for_history_document_and_eve
     assert record["runtime_state"]["active_mode"] == "coder"
     assert record["transcript"]["turns"][0]["userMessage"]["text"] == "single source"
     assert record["transcript"]["last_event_seq"] == 1
-    assert record["events"][0]["type"] == "chat_start"
+    assert record["events"][0]["type"] == "session_run_start"
     assert record["events"][0]["session_event_seq"] == 1
 
 
@@ -248,7 +248,7 @@ def test_session_store_list_skips_documentless_sessions(tmp_path: Path) -> None:
     assert store.load(legacy_id) is not None
 
 
-def test_session_store_list_keeps_initial_chat_start_preview_for_multi_turn_session(
+def test_session_store_list_keeps_initial_session_run_start_preview_for_multi_turn_session(
     tmp_path: Path,
 ) -> None:
     store = SessionStore(tmp_path)
@@ -357,15 +357,15 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
         session_id,
         "context_event",
         {"phase": "before"},
-        chat_id="chat-1",
-        chat_seq=3,
+        session_run_id="chat-1",
+        session_run_seq=3,
     )
     second = store.append_trace_event(
         session_id,
-        "chat_end",
+        "session_run_end",
         {"response": "done"},
-        chat_id="chat-1",
-        chat_seq=4,
+        session_run_id="chat-1",
+        session_run_seq=4,
     )
 
     assert (first, second) == (1, 2)
@@ -374,12 +374,12 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
         {
             "session_id": session_id,
             "session_event_seq": 2,
-            "chat_id": "chat-1",
-            "chat_seq": 4,
+            "session_run_id": "chat-1",
+            "session_run_seq": 4,
             "seq": 4,
-            "type": "chat_end",
+            "type": "session_run_end",
             "payload": {"response": "done"},
-            "source": "remote_chat",
+            "source": "remote_session_run",
             "replayable": True,
         }
     ]
@@ -390,15 +390,15 @@ def test_session_store_trace_event_ledger_roundtrip(tmp_path: Path) -> None:
 def test_live_trace_events_do_not_mutate_session_document(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     session_id = store.save(messages=[{"role": "user", "content": "hi"}], model="m1")
-    store.append_trace_event(session_id, "chat_start", {"prompt": "hi"}, chat_id="chat-1", chat_seq=1)
+    store.append_trace_event(session_id, "session_run_start", {"prompt": "hi"}, session_run_id="chat-1", session_run_seq=1)
     before = store.load_document(session_id)
 
     store.append_trace_event(
         session_id,
         "assistant_delta",
         {"content": "live"},
-        chat_id="chat-1",
-        chat_seq=2,
+        session_run_id="chat-1",
+        session_run_seq=2,
     )
 
     assert store.load_document(session_id) == before

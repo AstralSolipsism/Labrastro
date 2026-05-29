@@ -405,9 +405,9 @@ class PostgresSessionStore:
         event_type: str,
         payload: dict | None = None,
         *,
-        chat_id: str | None = None,
-        chat_seq: int | None = None,
-        source: str = "remote_chat",
+        session_run_id: str | None = None,
+        session_run_seq: int | None = None,
+        source: str = "remote_session_run",
         replayable: bool = True,
     ) -> int:
         with self.engine.begin() as conn:
@@ -433,9 +433,9 @@ class PostgresSessionStore:
             event = {
                 "session_id": session_id,
                 "session_event_seq": int(seq),
-                "seq": int(chat_seq) if chat_seq is not None else int(seq),
-                "chat_id": chat_id,
-                "chat_seq": int(chat_seq) if chat_seq is not None else None,
+                "seq": int(session_run_seq) if session_run_seq is not None else int(seq),
+                "session_run_id": session_run_id,
+                "session_run_seq": int(session_run_seq) if session_run_seq is not None else None,
                 "type": str(event_type),
                 "payload": event_payload if isinstance(event_payload, dict) else {},
                 "source": source,
@@ -459,8 +459,8 @@ class PostgresSessionStore:
                 event_type=str(event_type),
                 payload=event["payload"],
                 session_event_seq=int(seq),
-                chat_id=chat_id,
-                chat_seq=chat_seq,
+                session_run_id=session_run_id,
+                session_run_seq=session_run_seq,
             )
             record = session.to_record(transcript=document, events=events)
             self._upsert_session_record(
@@ -716,7 +716,7 @@ class PostgresSessionStore:
         rows = conn.execute(
             text(
                 """
-                SELECT session_id, seq, type, payload, chat_id, chat_seq,
+                SELECT session_id, seq, type, payload, session_run_id, session_run_seq,
                        source, replayable, payload_blob, payload_encoding,
                        payload_bytes, created_at
                 FROM labrastro_session_trace_events
@@ -730,17 +730,17 @@ class PostgresSessionStore:
         for row in rows:
             payload, _error = self._decode_event_payload(row)
             seq = int(row["seq"] or 0)
-            chat_seq = row.get("chat_seq")
+            session_run_seq = row.get("session_run_seq")
             events.append(
                 {
                     "session_id": str(row["session_id"]),
                     "session_event_seq": seq,
-                    "seq": int(chat_seq or seq),
-                    "chat_id": row.get("chat_id"),
-                    "chat_seq": int(chat_seq) if chat_seq is not None else None,
+                    "seq": int(session_run_seq or seq),
+                    "session_run_id": row.get("session_run_id"),
+                    "session_run_seq": int(session_run_seq) if session_run_seq is not None else None,
                     "type": str(row["type"]),
                     "payload": payload if isinstance(payload, dict) else {},
-                    "source": str(row.get("source") or "remote_chat"),
+                    "source": str(row.get("source") or "remote_session_run"),
                     "replayable": bool(row.get("replayable")),
                     "created_at": row["created_at"].isoformat()
                     if hasattr(row["created_at"], "isoformat")

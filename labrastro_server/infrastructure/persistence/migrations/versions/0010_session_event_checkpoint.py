@@ -18,19 +18,19 @@ def upgrade() -> None:
     op.execute(
         """
         ALTER TABLE labrastro_session_trace_events
-            ADD COLUMN IF NOT EXISTS chat_id TEXT
+            ADD COLUMN IF NOT EXISTS session_run_id TEXT
         """
     )
     op.execute(
         """
         ALTER TABLE labrastro_session_trace_events
-            ADD COLUMN IF NOT EXISTS chat_seq BIGINT
+            ADD COLUMN IF NOT EXISTS session_run_seq BIGINT
         """
     )
     op.execute(
         """
         ALTER TABLE labrastro_session_trace_events
-            ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'remote_chat'
+            ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'remote_session_run'
         """
     )
     op.execute(
@@ -127,12 +127,12 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE labrastro_session_trace_events
-            DROP COLUMN IF EXISTS chat_seq
+            DROP COLUMN IF EXISTS session_run_seq
         """
     )
     op.execute(
         """
         ALTER TABLE labrastro_session_trace_events
-            DROP COLUMN IF EXISTS chat_id
+            DROP COLUMN IF EXISTS session_run_id
         """
     )

@@ -77,10 +77,10 @@ def test_postgres_session_store_writes_single_session_record() -> None:
     try:
         seq = store.append_trace_event(
             session_id,
-            "chat_start",
+            "session_run_start",
             {"prompt": "postgres-record"},
-            chat_id="chat-record",
-            chat_seq=1,
+            session_run_id="chat-record",
+            session_run_seq=1,
         )
 
         assert seq == 1
@@ -90,7 +90,7 @@ def test_postgres_session_store_writes_single_session_record() -> None:
         assert record["metadata"]["id"] == session_id
         assert record["history"]["messages"][0]["content"] == "postgres-record"
         assert record["transcript"]["turns"][0]["userMessage"]["text"] == "postgres-record"
-        assert record["events"][0]["type"] == "chat_start"
+        assert record["events"][0]["type"] == "session_run_start"
 
         with engine.begin() as conn:
             document_count = conn.execute(
@@ -131,10 +131,10 @@ def test_postgres_session_store_trace_events_reduce_to_record_document() -> None
     try:
         first = store.append_trace_event(
             session_id,
-            "chat_start",
+            "session_run_start",
             {"prompt": "hello"},
-            chat_id="chat-1",
-            chat_seq=1,
+            session_run_id="chat-1",
+            session_run_seq=1,
         )
         second = store.append_trace_event(
             session_id,
@@ -144,15 +144,15 @@ def test_postgres_session_store_trace_events_reduce_to_record_document() -> None
                 "tool_call_id": "tool-1",
                 "tool_result": "x" * 512,
             },
-            chat_id="chat-1",
-            chat_seq=2,
+            session_run_id="chat-1",
+            session_run_seq=2,
         )
 
         assert (first, second) == (1, 2)
         assert store.latest_trace_event_seq(session_id) == 2
         events = store.list_trace_events(session_id, after_seq=1)
         assert events[0]["session_event_seq"] == 2
-        assert events[0]["chat_seq"] == 2
+        assert events[0]["session_run_seq"] == 2
         assert events[0]["payload"]["tool_result"] == "x" * 512
 
         document = store.load_document(session_id)
@@ -198,10 +198,10 @@ def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> 
 
         store.append_trace_event(
             session_id,
-            "chat_start",
+            "session_run_start",
             {"prompt": "hi\x00there"},
-            chat_id="chat-nul",
-            chat_seq=1,
+            session_run_id="chat-nul",
+            session_run_seq=1,
         )
         store.append_trace_event(
             session_id,
@@ -211,8 +211,8 @@ def test_postgres_session_store_sanitizes_nul_in_messages_and_trace_events() -> 
                 "tool_call_id": "tool-nul",
                 "tool_result": "x\x00y",
             },
-            chat_id="chat-nul",
-            chat_seq=2,
+            session_run_id="chat-nul",
+            session_run_seq=2,
         )
 
         events = store.list_trace_events(session_id)
@@ -246,8 +246,8 @@ def test_postgres_session_store_sanitizes_nul_in_record_payloads() -> None:
                 "tool_call_id": "tool-compressed-nul",
                 "tool_result": "x\x00" + ("y" * 512),
             },
-            chat_id="chat-compressed-nul",
-            chat_seq=1,
+            session_run_id="chat-compressed-nul",
+            session_run_seq=1,
         )
 
         with engine.begin() as conn:
