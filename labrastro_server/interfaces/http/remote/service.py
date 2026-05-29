@@ -28,17 +28,15 @@ from labrastro_server.services.auth.service import AuthService
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
-    ChatCancelRequest,
-    ChatCancelResponse,
+    SessionRunCancelRequest,
+    SessionRunCancelResponse,
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
-    ChatFollowUpCancelRequest,
-    ChatFollowUpRequest,
-    ChatFollowUpResponse,
-    ChatRequest,
-    ChatResponse,
-    ChatStartRequest,
-    ChatStartResponse,
+    SessionRunFollowUpCancelRequest,
+    SessionRunFollowUpRequest,
+    SessionRunFollowUpResponse,
+    SessionRunStartRequest,
+    SessionRunStartResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -101,7 +99,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class _BufferedChatEvent:
+class _BufferedSessionRunEvent:
     event: dict[str, Any]
     size_bytes: int
 
@@ -110,19 +108,19 @@ SessionTraceEventSink = Callable[
     [str, str, dict[str, Any], str | None, int | None, str, bool], int | None
 ]
 
-_LIVE_ONLY_CHAT_EVENTS = frozenset(
+_LIVE_ONLY_SESSION_RUN_EVENTS = frozenset(
     {"assistant_delta", "reasoning_delta", "tool_call_stream"}
 )
 _LIVE_EVENT_FLUSH_INTERVAL_SEC = 0.04
 _LIVE_EVENT_MAX_CONTENT_CHARS = 1024
 
 
-def _is_replayable_chat_event(event_type: str) -> bool:
-    return bool(event_type) and event_type not in _LIVE_ONLY_CHAT_EVENTS
+def _is_replayable_session_run_event(event_type: str) -> bool:
+    return bool(event_type) and event_type not in _LIVE_ONLY_SESSION_RUN_EVENTS
 
 
 @dataclass
-class _PendingLiveChatEvent:
+class _PendingLiveSessionRunEvent:
     key: str
     event_type: str
     payload: dict[str, Any]
@@ -130,22 +128,22 @@ class _PendingLiveChatEvent:
     due_at: float
 
 
-class _ChatEventBuffer:
+class _SessionRunEventBuffer:
     def __init__(
         self,
         *,
-        chat_id: str,
+        session_run_id: str,
         artifact_root: Path,
         max_events: int,
         max_payload_bytes: int,
         max_total_bytes: int,
     ) -> None:
-        self.chat_id = chat_id
-        self.artifact_dir = artifact_root / chat_id
+        self.session_run_id = session_run_id
+        self.artifact_dir = artifact_root / session_run_id
         self.max_events = max(1, int(max_events or 1))
         self.max_payload_bytes = max(1, int(max_payload_bytes or 1))
         self.max_total_bytes = max(self.max_payload_bytes, int(max_total_bytes or self.max_payload_bytes))
-        self._items: list[_BufferedChatEvent] = []
+        self._items: list[_BufferedSessionRunEvent] = []
         self._total_bytes = 0
         self._dropped_count = 0
 
@@ -168,7 +166,7 @@ class _ChatEventBuffer:
     def append(self, event: dict[str, Any]) -> None:
         normalized = self._normalize_event(event)
         size_bytes = self._event_size(normalized)
-        self._items.append(_BufferedChatEvent(normalized, size_bytes))
+        self._items.append(_BufferedSessionRunEvent(normalized, size_bytes))
         self._total_bytes += size_bytes
         self._prune()
 
@@ -205,7 +203,7 @@ class _ChatEventBuffer:
             events.insert(
                 0,
                 {
-                    "chat_id": self.chat_id,
+                    "session_run_id": self.session_run_id,
                     "seq": lost_seq,
                     "type": "events_lost",
                     "payload": {
@@ -252,7 +250,7 @@ class _ChatEventBuffer:
             **event,
             "payload": {
                 "artifact_ref": {
-                    "type": "chat_event_payload",
+                    "type": "session_run_event_payload",
                     "path": str(artifact_path),
                     "encoding": "json+gzip",
                     "bytes": len(payload_bytes),
@@ -299,8 +297,8 @@ class _ChatEventBuffer:
 
 
 @dataclass
-class _RemoteChatSession:
-    chat_id: str
+class _RemoteSessionRun:
+    session_run_id: str
     peer_id: str
     session_hint: str | None = None
     mode: str | None = None
@@ -332,7 +330,7 @@ class _RemoteChatSession:
     follow_up_callback: Callable[[dict[str, Any]], None] | None = None
     follow_up_cancel_callback: Callable[[str], None] | None = None
     artifact_root: Path = field(
-        default_factory=lambda: Path(tempfile.gettempdir()) / "labrastro-chat-events"
+        default_factory=lambda: Path(tempfile.gettempdir()) / "labrastro-session-run-events"
     )
     max_events: int = 1000
     max_payload_bytes: int = 256 * 1024
@@ -340,16 +338,17 @@ class _RemoteChatSession:
     trace_event_sink: SessionTraceEventSink | None = None
     trace_persistence_enabled: bool = False
     last_activity_at: float = field(default_factory=time.time)
-    _event_buffer: _ChatEventBuffer = field(init=False, repr=False)
+    _event_buffer: _SessionRunEventBuffer = field(init=False, repr=False)
     _pending_trace_events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
-    _pending_live_events: list[_PendingLiveChatEvent] = field(default_factory=list, init=False, repr=False)
+    _pending_live_events: list[_PendingLiveSessionRunEvent] = field(default_factory=list, init=False, repr=False)
     _last_live_flush_at: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _approval_resolved_event_ids: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.session_id is None:
             self.session_id = self.session_hint
-        self._event_buffer = _ChatEventBuffer(
-            chat_id=self.chat_id,
+        self._event_buffer = _SessionRunEventBuffer(
+            session_run_id=self.session_run_id,
             artifact_root=self.artifact_root,
             max_events=self.max_events,
             max_payload_bytes=self.max_payload_bytes,
@@ -368,10 +367,13 @@ class _RemoteChatSession:
         with self.cond:
             normalized_payload = payload if isinstance(payload, dict) else {}
             now = time.time()
-            if event_type in _LIVE_ONLY_CHAT_EVENTS:
+            if event_type in _LIVE_ONLY_SESSION_RUN_EVENTS:
                 return self._append_live_event_locked(event_type, normalized_payload, now)
             self._flush_live_events_locked(now, force=True)
-            seq = self._append_event_locked(event_type, normalized_payload)
+            if event_type == "approval_resolved":
+                seq = self._append_approval_resolved_event_locked(normalized_payload)
+            else:
+                seq = self._append_event_locked(event_type, normalized_payload)
             self._update_status_for_event_locked(event_type, normalized_payload)
             self.last_activity_at = now
             self.cond.notify_all()
@@ -381,7 +383,7 @@ class _RemoteChatSession:
         seq = self.seq_next
         self.seq_next += 1
         event = {
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "seq": seq,
             "type": event_type,
             "payload": payload,
@@ -392,6 +394,14 @@ class _RemoteChatSession:
         self._persist_or_queue_trace_event(event)
         self._event_buffer.append(event)
         return seq
+
+    def _append_approval_resolved_event_locked(self, payload: dict[str, Any]) -> int:
+        approval_id = str(payload.get("approval_id") or "")
+        if approval_id:
+            if approval_id in self._approval_resolved_event_ids:
+                return self._event_buffer.latest_seq
+            self._approval_resolved_event_ids.add(approval_id)
+        return self._append_event_locked("approval_resolved", payload)
 
     def _append_live_event_locked(
         self, event_type: str, payload: dict[str, Any], now: float
@@ -411,7 +421,7 @@ class _RemoteChatSession:
 
         pending = self._pending_live_event(key)
         if pending is None:
-            pending = _PendingLiveChatEvent(
+            pending = _PendingLiveSessionRunEvent(
                 key=key,
                 event_type=event_type,
                 payload={**payload, "content": content},
@@ -428,7 +438,7 @@ class _RemoteChatSession:
         self.last_activity_at = now
         return self._event_buffer.latest_seq
 
-    def _pending_live_event(self, key: str) -> _PendingLiveChatEvent | None:
+    def _pending_live_event(self, key: str) -> _PendingLiveSessionRunEvent | None:
         for event in self._pending_live_events:
             if event.key == key:
                 return event
@@ -443,7 +453,7 @@ class _RemoteChatSession:
     ) -> bool:
         if not self._pending_live_events:
             return False
-        remaining: list[_PendingLiveChatEvent] = []
+        remaining: list[_PendingLiveSessionRunEvent] = []
         flushed = False
         for pending in self._pending_live_events:
             selected = keys is None or pending.key in keys
@@ -488,17 +498,17 @@ class _RemoteChatSession:
             self.status = "error"
             message = payload.get("message")
             self.last_error = str(message) if message is not None else "error"
-        elif event_type == "chat_cancelled":
+        elif event_type == "session_run_cancelled":
             self.status = "cancelled"
             reason = payload.get("reason")
-            self.last_error = str(reason) if reason is not None else "chat_cancelled"
-        elif event_type == "chat_interrupted":
+            self.last_error = str(reason) if reason is not None else "session_run_cancelled"
+        elif event_type == "session_run_interrupted":
             self.status = "interrupted"
             message = payload.get("message")
             self.last_error = str(message) if message is not None else "provider stream interrupted"
 
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
-        if not _is_replayable_chat_event(str(event.get("type") or "")):
+        if not _is_replayable_session_run_event(str(event.get("type") or "")):
             return
         if self.session_id and self.trace_persistence_enabled:
             self._flush_pending_trace_events()
@@ -533,9 +543,9 @@ class _RemoteChatSession:
                 self.session_id,
                 str(event.get("type") or ""),
                 payload,
-                self.chat_id,
+                self.session_run_id,
                 int(event.get("seq") or 0),
-                "remote_chat",
+                "remote_session_run",
                 True,
             )
         except Exception:
@@ -546,12 +556,12 @@ class _RemoteChatSession:
             except Exception:
                 payload_bytes = None
             logger.exception(
-                "Failed to persist remote chat trace event",
+                "Failed to persist remote session run trace event",
                 extra={
                     "session_id": self.session_id,
-                    "chat_id": self.chat_id,
+                    "session_run_id": self.session_run_id,
                     "event_type": str(event.get("type") or ""),
-                    "chat_seq": int(event.get("seq") or 0),
+                    "session_run_seq": int(event.get("seq") or 0),
                     "payload_bytes": payload_bytes,
                 },
             )
@@ -586,29 +596,24 @@ class _RemoteChatSession:
             self.status = "running"
             self.last_activity_at = time.time()
 
-    def mark_done(self) -> None:
+    def mark_done(self, reason: str | None = None) -> None:
         unconsumed: list[dict[str, Any]] = []
         with self.cond:
             self._flush_live_events_locked(time.time(), force=True)
+            close_reason = (
+                reason
+                or self.cancel_reason
+                or self.last_error
+                or "session_run_closed"
+            )
+            for event_payload in self._cancel_pending_approvals_locked(close_reason):
+                self._append_approval_resolved_event_locked(event_payload)
             self.running = False
             self.done = True
             if self.status not in {"error", "cancelled", "interrupted"}:
                 self.status = "done"
             self.finished_at = time.time()
             self.last_activity_at = self.finished_at
-            for waiter in self.approval_waiters.values():
-                if waiter.get("done"):
-                    continue
-                waiter["done"] = True
-                waiter["decision"] = "deny_once"
-                waiter["reason"] = "chat_closed"
-                waiter["state"] = "cancelled"
-                self._record_approval_resolution_locked(
-                    str(waiter.get("approval_id") or ""),
-                    "deny_once",
-                    "chat_closed",
-                    "cancelled",
-                )
             for ticket in self.follow_up_tickets.values():
                 if ticket.get("state") in {"consumed", "cancelled", "unconsumed"}:
                     continue
@@ -617,7 +622,7 @@ class _RemoteChatSession:
             self.cond.notify_all()
         for ticket in unconsumed:
             self.append_event(
-                "chat_follow_up_unconsumed",
+                "session_run_follow_up_unconsumed",
                 self._follow_up_event_payload(ticket),
             )
 
@@ -635,7 +640,7 @@ class _RemoteChatSession:
             _events, next_cursor = self._event_buffer.events_after(cursor)
             return {
                 "ok": True,
-                "chat_id": self.chat_id,
+                "session_run_id": self.session_run_id,
                 "peer_id": self.peer_id,
                 "status": self.status,
                 "running": self.running,
@@ -660,7 +665,7 @@ class _RemoteChatSession:
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
         call_immediately = False
-        reason = "chat_cancelled"
+        reason = "session_run_cancelled"
         with self.cond:
             self.cancel_callback = callback
             if self.cancel_requested:
@@ -669,32 +674,21 @@ class _RemoteChatSession:
         if call_immediately:
             callback(reason)
 
-    def request_cancel(self, reason: str = "chat_cancelled") -> bool:
+    def request_cancel(self, reason: str = "session_run_cancelled") -> tuple[bool, list[dict[str, Any]]]:
         callback: Callable[[str], None] | None
         first_request = False
+        resolved_approvals: list[dict[str, Any]]
         with self.cond:
             if not self.cancel_requested:
                 first_request = True
             self.cancel_requested = True
             self.cancel_reason = reason
-            for waiter in self.approval_waiters.values():
-                if waiter.get("done"):
-                    continue
-                waiter["done"] = True
-                waiter["decision"] = "deny_once"
-                waiter["reason"] = reason
-                waiter["state"] = "cancelled"
-                self._record_approval_resolution_locked(
-                    str(waiter.get("approval_id") or ""),
-                    "deny_once",
-                    reason,
-                    "cancelled",
-                )
+            resolved_approvals = self._cancel_pending_approvals_locked(reason)
             callback = self.cancel_callback
             self.cond.notify_all()
         if callback is not None:
             callback(reason)
-        return first_request
+        return first_request, resolved_approvals
 
     def submit_follow_up(
         self,
@@ -723,7 +717,7 @@ class _RemoteChatSession:
             callback = self.follow_up_callback
             self.cond.notify_all()
         self.append_event(
-            "chat_follow_up_accepted",
+            "session_run_follow_up_accepted",
             self._follow_up_event_payload(ticket),
         )
         if callback is not None:
@@ -765,7 +759,7 @@ class _RemoteChatSession:
             self.cond.notify_all()
         if callback is not None:
             callback(followup_id)
-        self.append_event("chat_follow_up_cancelled", payload)
+        self.append_event("session_run_follow_up_cancelled", payload)
         return True
 
     def mark_follow_up_consumed(self, followup_id: str) -> bool:
@@ -777,7 +771,7 @@ class _RemoteChatSession:
             ticket["consumed_at"] = time.time()
             payload = self._follow_up_event_payload(ticket)
             self.cond.notify_all()
-        self.append_event("chat_follow_up_consumed", payload)
+        self.append_event("session_run_follow_up_consumed", payload)
         return True
 
     @staticmethod
@@ -848,6 +842,7 @@ class _RemoteChatSession:
                 "approval_id": approval_id,
                 "state": "requested",
                 "payload": self._approval_payload(approval_id, payload),
+                "registered": True,
             }
             self.approval_resolutions.pop(approval_id, None)
 
@@ -886,6 +881,7 @@ class _RemoteChatSession:
                     "approval_id": str(approval_id),
                     "state": "requested",
                     "payload": self._approval_payload(approval_id, None),
+                    "registered": False,
                 },
             )
             waiter.setdefault("approval_id", str(approval_id))
@@ -908,22 +904,58 @@ class _RemoteChatSession:
             self.approval_waiters.pop(approval_id, None)
             return decision, reason if isinstance(reason, str) else None
 
-    def cancel_pending_approvals(self, reason: str) -> None:
+    def cancel_pending_approvals(self, reason: str) -> list[dict[str, Any]]:
         with self.cond:
-            for waiter in self.approval_waiters.values():
-                if waiter.get("done"):
-                    continue
-                waiter["done"] = True
-                waiter["decision"] = "deny_once"
-                waiter["reason"] = reason
-                waiter["state"] = "cancelled"
-                self._record_approval_resolution_locked(
-                    str(waiter.get("approval_id") or ""),
+            resolved_approvals = self._cancel_pending_approvals_locked(reason)
+            self.cond.notify_all()
+            return resolved_approvals
+
+    def _cancel_pending_approvals_locked(self, reason: str) -> list[dict[str, Any]]:
+        resolved_approvals: list[dict[str, Any]] = []
+        for waiter in self.approval_waiters.values():
+            if waiter.get("done"):
+                continue
+            waiter["done"] = True
+            waiter["decision"] = "deny_once"
+            waiter["reason"] = reason
+            waiter["state"] = "cancelled"
+            self._record_approval_resolution_locked(
+                str(waiter.get("approval_id") or ""),
+                "deny_once",
+                reason,
+                "cancelled",
+            )
+            if waiter.get("registered"):
+                event_payload = self._approval_resolved_event_payload_locked(
+                    waiter,
                     "deny_once",
                     reason,
-                    "cancelled",
                 )
-            self.cond.notify_all()
+                if event_payload:
+                    resolved_approvals.append(event_payload)
+        return resolved_approvals
+
+    def _approval_resolved_event_payload_locked(
+        self,
+        waiter: dict[str, Any],
+        decision: str,
+        reason: str | None,
+    ) -> dict[str, Any]:
+        approval_id = str(waiter.get("approval_id") or "")
+        payload = self._approval_payload(
+            approval_id,
+            waiter.get("payload") if isinstance(waiter.get("payload"), dict) else None,
+        )
+        resolved: dict[str, Any] = {
+            "approval_id": str(payload.get("approval_id") or approval_id),
+            "decision": decision,
+        }
+        tool_call_id = payload.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            resolved["tool_call_id"] = tool_call_id
+        if reason is not None:
+            resolved["reason"] = reason
+        return resolved
 
     @staticmethod
     def _approval_payload(
@@ -973,8 +1005,7 @@ class RemoteRelayHTTPService:
         *,
         ui_bus: UIEventBus | None = None,
         artifact_provider: Callable[..., Any] | None = None,
-        chat_handler: Callable[[str, str], ChatResponse] | None = None,
-        chat_events_handler: Callable[[str, str, _RemoteChatSession], None]
+        session_run_events_handler: Callable[[str, str, _RemoteSessionRun], None]
         | None = None,
         chat_command_handler: Callable[
             [str, ChatCommandDispatchRequest], ChatCommandDispatchResponse
@@ -1000,13 +1031,13 @@ class RemoteRelayHTTPService:
         github_pr_service: PullRequestService | None = None,
         persistence_maintenance_service: Any | None = None,
         max_request_body_bytes: int = 16 * 1024 * 1024,
-        chat_max_events: int = 1000,
-        chat_max_payload_bytes: int = 256 * 1024,
-        chat_max_total_bytes: int = 4 * 1024 * 1024,
-        chat_closed_ttl_sec: float = 300.0,
-        chat_idle_ttl_sec: float = 30 * 60.0,
-        chat_gc_interval_sec: float = 30.0,
-        chat_artifact_root: str | Path | None = None,
+        session_run_max_events: int = 1000,
+        session_run_max_payload_bytes: int = 256 * 1024,
+        session_run_max_total_bytes: int = 4 * 1024 * 1024,
+        session_run_closed_ttl_sec: float = 300.0,
+        session_run_idle_ttl_sec: float = 30 * 60.0,
+        session_run_gc_interval_sec: float = 30.0,
+        session_run_artifact_root: str | Path | None = None,
         require_explicit_chat_model: bool = False,
         require_peer_runtime_context: bool = False,
     ) -> None:
@@ -1014,8 +1045,7 @@ class RemoteRelayHTTPService:
         self.bind = bind
         self.ui_bus = ui_bus
         self.artifact_provider = artifact_provider
-        self.chat_handler = chat_handler
-        self.chat_events_handler = chat_events_handler
+        self.session_run_events_handler = session_run_events_handler
         self.chat_command_handler = chat_command_handler
         self.session_handler = session_handler
         self.session_trace_event_sink: SessionTraceEventSink | None = None
@@ -1072,24 +1102,24 @@ class RemoteRelayHTTPService:
         self._queues_lock = threading.Lock()
         self._peer_chat_locks: dict[str, threading.Lock] = {}
         self._peer_chat_locks_lock = threading.Lock()
-        self._chat_sessions: dict[str, _RemoteChatSession] = {}
-        self._chat_sessions_lock = threading.Lock()
-        self._chat_max_events = max(1, int(chat_max_events or 1))
-        self._chat_max_payload_bytes = max(1, int(chat_max_payload_bytes or 1))
-        self._chat_max_total_bytes = max(
-            self._chat_max_payload_bytes,
-            int(chat_max_total_bytes or self._chat_max_payload_bytes),
+        self._session_runs: dict[str, _RemoteSessionRun] = {}
+        self._session_runs_lock = threading.Lock()
+        self._session_run_max_events = max(1, int(session_run_max_events or 1))
+        self._session_run_max_payload_bytes = max(1, int(session_run_max_payload_bytes or 1))
+        self._session_run_max_total_bytes = max(
+            self._session_run_max_payload_bytes,
+            int(session_run_max_total_bytes or self._session_run_max_payload_bytes),
         )
-        self._chat_session_ttl_sec = max(0.0, float(chat_closed_ttl_sec))
-        self._chat_idle_ttl_sec = max(0.0, float(chat_idle_ttl_sec))
-        self._chat_gc_interval_sec = max(1.0, float(chat_gc_interval_sec))
-        self._chat_artifact_root = (
-            Path(chat_artifact_root)
-            if chat_artifact_root is not None
-            else Path(tempfile.gettempdir()) / "labrastro-chat-events"
+        self._session_run_closed_ttl_sec = max(0.0, float(session_run_closed_ttl_sec))
+        self._session_run_idle_ttl_sec = max(0.0, float(session_run_idle_ttl_sec))
+        self._session_run_gc_interval_sec = max(1.0, float(session_run_gc_interval_sec))
+        self._session_run_artifact_root = (
+            Path(session_run_artifact_root)
+            if session_run_artifact_root is not None
+            else Path(tempfile.gettempdir()) / "labrastro-session-run-events"
         )
-        self._chat_gc_stop = threading.Event()
-        self._chat_gc_thread: threading.Thread | None = None
+        self._session_run_gc_stop = threading.Event()
+        self._session_run_gc_thread: threading.Thread | None = None
         self._agent_run_recovery_stop = threading.Event()
         self._agent_run_recovery_thread: threading.Thread | None = None
         self._agent_run_recovery_interval_sec = 2.0
@@ -1112,7 +1142,7 @@ class RemoteRelayHTTPService:
         self._server = ThreadingHTTPServer((host, port), handler_cls)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        self._start_chat_gc()
+        self._start_session_run_gc()
         self._start_persistence_maintenance()
         self._start_agent_run_recovery()
         self._start_github_reconcile()
@@ -1128,7 +1158,7 @@ class RemoteRelayHTTPService:
         self._stop_github_reconcile()
         self._stop_agent_run_recovery()
         self._stop_persistence_maintenance()
-        self._stop_chat_gc()
+        self._stop_session_run_gc()
         if self._server is None:
             return
         self._server.shutdown()
@@ -1180,23 +1210,23 @@ class RemoteRelayHTTPService:
         if callable(stop):
             stop()
 
-    def _start_chat_gc(self) -> None:
-        if self._chat_gc_thread is not None:
+    def _start_session_run_gc(self) -> None:
+        if self._session_run_gc_thread is not None:
             return
-        self._chat_gc_stop.clear()
+        self._session_run_gc_stop.clear()
 
         def loop() -> None:
-            while not self._chat_gc_stop.wait(self._chat_gc_interval_sec):
-                self._gc_chat_sessions()
+            while not self._session_run_gc_stop.wait(self._session_run_gc_interval_sec):
+                self._gc_session_runs()
 
-        self._chat_gc_thread = threading.Thread(target=loop, daemon=True)
-        self._chat_gc_thread.start()
+        self._session_run_gc_thread = threading.Thread(target=loop, daemon=True)
+        self._session_run_gc_thread.start()
 
-    def _stop_chat_gc(self) -> None:
-        self._chat_gc_stop.set()
-        if self._chat_gc_thread is not None:
-            self._chat_gc_thread.join(timeout=3)
-            self._chat_gc_thread = None
+    def _stop_session_run_gc(self) -> None:
+        self._session_run_gc_stop.set()
+        if self._session_run_gc_thread is not None:
+            self._session_run_gc_thread.join(timeout=3)
+            self._session_run_gc_thread = None
 
     def _start_github_reconcile(self) -> None:
         if self.github_pr_service is None or self.github_reconcile_service is None:
@@ -1245,16 +1275,11 @@ class RemoteRelayHTTPService:
             ttl_sec=ttl_sec, claims=claims
         )
 
-    def set_chat_handler(
-        self, handler: Callable[[str, str], ChatResponse] | None
-    ) -> None:
-        self.chat_handler = handler
-
-    def set_chat_events_handler(
+    def set_session_run_events_handler(
         self,
-        handler: Callable[[str, str, _RemoteChatSession], None] | None,
+        handler: Callable[[str, str, _RemoteSessionRun], None] | None,
     ) -> None:
-        self.chat_events_handler = handler
+        self.session_run_events_handler = handler
 
     def set_chat_command_handler(
         self,
@@ -1269,7 +1294,7 @@ class RemoteRelayHTTPService:
     ) -> None:
         self.session_handler = handler
 
-    def _create_chat_session(
+    def _create_session_run(
         self,
         peer_id: str,
         session_hint: str | None = None,
@@ -1284,10 +1309,10 @@ class RemoteRelayHTTPService:
         locale: str | None = None,
         mentions: list[dict[str, Any]] | None = None,
         initial_prompt: str | None = None,
-    ) -> _RemoteChatSession:
-        self._gc_chat_sessions()
-        session = _RemoteChatSession(
-            chat_id=str(uuid.uuid4()),
+    ) -> _RemoteSessionRun:
+        self._gc_session_runs()
+        session = _RemoteSessionRun(
+            session_run_id=str(uuid.uuid4()),
             peer_id=peer_id,
             session_hint=session_hint,
             mode=mode,
@@ -1300,28 +1325,28 @@ class RemoteRelayHTTPService:
             locale=locale,
             mentions=[dict(item) for item in (mentions or []) if isinstance(item, dict)],
             initial_prompt=initial_prompt,
-            artifact_root=self._chat_artifact_root,
-            max_events=self._chat_max_events,
-            max_payload_bytes=self._chat_max_payload_bytes,
-            max_total_bytes=self._chat_max_total_bytes,
+            artifact_root=self._session_run_artifact_root,
+            max_events=self._session_run_max_events,
+            max_payload_bytes=self._session_run_max_payload_bytes,
+            max_total_bytes=self._session_run_max_total_bytes,
             trace_event_sink=getattr(self, "session_trace_event_sink", None),
         )
-        with self._chat_sessions_lock:
-            self._chat_sessions[session.chat_id] = session
+        with self._session_runs_lock:
+            self._session_runs[session.session_run_id] = session
         return session
 
-    def _get_chat_session_by_request(
+    def _get_session_run_by_request(
         self,
         peer_id: str,
         session_hint: str | None,
         client_request_id: str | None,
-    ) -> _RemoteChatSession | None:
+    ) -> _RemoteSessionRun | None:
         request_id = str(client_request_id or "").strip()
         if not request_id:
             return None
-        self._gc_chat_sessions()
-        with self._chat_sessions_lock:
-            for session in self._chat_sessions.values():
+        self._gc_session_runs()
+        with self._session_runs_lock:
+            for session in self._session_runs.values():
                 if session.peer_id != peer_id:
                     continue
                 if session.client_request_id != request_id:
@@ -1336,43 +1361,45 @@ class RemoteRelayHTTPService:
     ) -> None:
         self.session_trace_event_sink = sink
 
-    def _gc_chat_sessions(self) -> None:
+    def _gc_session_runs(self) -> None:
         now = time.time()
-        with self._chat_sessions_lock:
+        with self._session_runs_lock:
             stale_ids = [
-                chat_id
-                for chat_id, session in self._chat_sessions.items()
+                session_run_id
+                for session_run_id, session in self._session_runs.items()
                 if session.is_stale(
                     now,
-                    closed_ttl_sec=self._chat_session_ttl_sec,
-                    idle_ttl_sec=self._chat_idle_ttl_sec,
+                    closed_ttl_sec=self._session_run_closed_ttl_sec,
+                    idle_ttl_sec=self._session_run_idle_ttl_sec,
                 )
             ]
-            for chat_id in stale_ids:
-                session = self._chat_sessions.pop(chat_id, None)
+            for session_run_id in stale_ids:
+                session = self._session_runs.pop(session_run_id, None)
                 if session is not None:
                     session.cleanup_artifacts()
 
-    def _get_chat_session(self, chat_id: str) -> _RemoteChatSession | None:
-        self._gc_chat_sessions()
-        with self._chat_sessions_lock:
-            return self._chat_sessions.get(chat_id)
+    def _get_session_run(self, session_run_id: str) -> _RemoteSessionRun | None:
+        self._gc_session_runs()
+        with self._session_runs_lock:
+            return self._session_runs.get(session_run_id)
 
     def _get_peer_chat_lock(self, peer_id: str) -> threading.Lock:
         with self._peer_chat_locks_lock:
             return self._peer_chat_locks.setdefault(peer_id, threading.Lock())
 
-    def _abort_peer_chat_sessions(self, peer_id: str, reason: str) -> None:
-        with self._chat_sessions_lock:
+    def _abort_peer_session_runs(self, peer_id: str, reason: str) -> None:
+        with self._session_runs_lock:
             peer_sessions = [
                 session
-                for session in self._chat_sessions.values()
+                for session in self._session_runs.values()
                 if session.peer_id == peer_id and not session.done
             ]
         for session in peer_sessions:
-            session.cancel_pending_approvals(reason)
+            resolved_approvals = session.cancel_pending_approvals(reason)
             session.append_event("error", {"message": reason})
-            session.mark_done()
+            for event_payload in resolved_approvals:
+                session.append_event("approval_resolved", event_payload)
+            session.mark_done(reason)
 
     def _enqueue_outbound(self, peer_id: str, envelope: RelayEnvelope) -> None:
         with self._queues_lock:
@@ -1492,32 +1519,29 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/disconnect":
                     self._handle_disconnect()
                     return
-                if parsed.path == "/remote/chat":
-                    self._handle_chat()
-                    return
-                if parsed.path == "/remote/chat/start":
-                    self._handle_chat_start()
+                if parsed.path == "/remote/session-runs/start":
+                    self._handle_session_run_start()
                     return
                 if parsed.path == "/remote/chat/command":
                     self._handle_chat_command()
                     return
-                if parsed.path == "/remote/chat/events":
-                    self._handle_chat_events()
+                if parsed.path == "/remote/session-runs/events":
+                    self._handle_session_run_events()
                     return
-                if parsed.path == "/remote/chat/status":
-                    self._handle_chat_status()
+                if parsed.path == "/remote/session-runs/status":
+                    self._handle_session_run_status()
                     return
-                if parsed.path == "/remote/chat/recover":
-                    self._handle_chat_recover()
+                if parsed.path == "/remote/session-runs/recover":
+                    self._handle_session_run_recover()
                     return
-                if parsed.path == "/remote/chat/cancel":
-                    self._handle_chat_cancel()
+                if parsed.path == "/remote/session-runs/cancel":
+                    self._handle_session_run_cancel()
                     return
-                if parsed.path == "/remote/chat/follow-up":
-                    self._handle_chat_follow_up()
+                if parsed.path == "/remote/session-runs/follow-up":
+                    self._handle_session_run_follow_up()
                     return
-                if parsed.path == "/remote/chat/follow-up/cancel":
-                    self._handle_chat_follow_up_cancel()
+                if parsed.path == "/remote/session-runs/follow-up/cancel":
+                    self._handle_session_run_follow_up_cancel()
                     return
                 if parsed.path == "/remote/approval/reply":
                     self._handle_approval_reply()

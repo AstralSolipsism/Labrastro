@@ -147,7 +147,7 @@ Pluggable extension system.
 - **mcp/**: MCP server integration — `MCPManager` (independent asyncio loop in background thread), `MCPClient` (stdio JSON-RPC with reconnect-once), `MCPTool` (schema translation wrapping remote tools). Config per-server: `command`, `args`, `env`.
 - **skills/**: Skills system — `SkillsService` discovers skills from `SKILL.md` files, builds catalog with `Skill` objects (`name`, `description`, `location`). Supports enable/disable with persistence via `SkillsConfigStore`.
 - **subagent/**: `SubagentManager` — `_VALID_SUBAGENT_MODES = frozenset({"explore", "execute", "verify"})`, `_DEFAULT_MAX_ROUNDS = 50`, `_DEFAULT_TIMEOUT_SECONDS = 300`, `_MAX_TIMEOUT_SECONDS = 3600`. `SubagentJob` dataclass tracks `job_id`, `status` (PENDING/RUNNING/COMPLETED/FAILED), `start_time`/`end_time`, `result`/`error`. Approval for sub-agents uses a judge-middleware pattern: `build_subagent_approval_provider()` returns `SharedApprovalProvider(handler=..., judges=[ParentLLMJudge(...)])` where `ParentLLMJudge` (a callable `ApprovalJudge`) delegates to the parent LLM first, and only escalates to the human handler if the judge returns `None`. Approval lock (RLock) wraps the handler to serialise terminal access across sub-agents. Manager takes `default_timeout_seconds` and `max_timeout_seconds` as injectable params.
-- **labrastro_server.interfaces.http.remote/**: Remote relay HTTP control plane with `POST /remote/chat/start`, `POST /remote/chat/events` (SSE chat event stream), `POST /remote/approval/reply`, peer registration, manifests, runtime, Taskflow, collaboration, admin, and artifact routes. Bootstrap uses one-time tokens.
+- **labrastro_server.interfaces.http.remote/**: Remote relay HTTP control plane with `POST /remote/session-runs/start`, `POST /remote/session-runs/events` (SSE chat event stream), `POST /remote/approval/reply`, peer registration, manifests, runtime, Taskflow, collaboration, admin, and artifact routes. Bootstrap uses one-time tokens.
 
 ### Application Layer (`app/`)
 Use-case orchestration and shared runtime utilities.
@@ -355,11 +355,11 @@ Application initialization and dependency injection.
 Current remote execution flow is event-stream based and keeps rendering ownership on the host runtime. The HTTP relay host lives under `labrastro_server.interfaces.http.remote`; server-side relay primitives live under `labrastro_server.relay`; ReuleauxCoder-specific remote tool adapters live under `labrastro_server.adapters.reuleauxcoder`.
 
 - Transport endpoints (host HTTP service):
-  - `POST /remote/chat/start`: create chat session and enqueue `chat_start`
-  - `POST /remote/chat/events`: SSE chat event stream with cursor resume
+  - `POST /remote/session-runs/start`: create chat session and enqueue `session_run_start`
+  - `POST /remote/session-runs/events`: SSE chat event stream with cursor resume
   - `POST /remote/approval/reply`: resolve pending approval decisions
 - Stream events include:
-  - `chat_start`, `output`, `approval_request`, `approval_resolved`, `chat_end`, `error`
+  - `session_run_start`, `output`, `approval_request`, `approval_resolved`, `session_run_end`, `error`
 - Rendering model:
   - Host-side CLI renderer (`CLIRenderer`) is reused to produce terminal-formatted output chunks
   - Peer side prints host-provided terminal/plain chunks directly, with markdown fallback only when needed
@@ -383,7 +383,7 @@ Standalone Go binary for remote peer execution:
 - `RegisterRequest/Response`, `Heartbeat`, `PollRequest`, `ResultRequest`
 - `RelayEnvelope` wraps tool execution requests
 - `ExecToolRequest/Result` for tool calls
-- `ChatStartRequest`, `ChatEventsRequest/Batch` for interactive chat SSE batches
+- `SessionRunStartRequest`, `SessionRunEventsRequest/Batch` for interactive chat SSE batches
 - `ApprovalReplyRequest` for remote approval decisions
 
 **Tools** (`internal/tools/execute.go`):

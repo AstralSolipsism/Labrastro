@@ -17,12 +17,10 @@ from labrastro_server.interfaces.http.remote.helpers import (
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
-    ChatCancelRequest,
-    ChatCancelResponse,
-    ChatRequest,
-    ChatResponse,
-    ChatStartRequest,
-    ChatStartResponse,
+    SessionRunCancelRequest,
+    SessionRunCancelResponse,
+    SessionRunStartRequest,
+    SessionRunStartResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -108,5 +106,4 @@ class RemoteSessionRoutes:
             )
             return
         self._send_json(status, result)
-
 

@@ -57,12 +57,12 @@ from reuleauxcoder.domain.config.models import (
     resolve_agent_effective_capability_scope,
 )
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
+from reuleauxcoder.domain.session.document import settle_orphaned_running_session_run
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
-    ChatResponse,
     ToolMutationPreviewState,
     ToolPreviewResult,
 )
@@ -470,7 +470,7 @@ def switch_session_model(
     }
 
 
-def bind_remote_chat_handler(runner, agent: Agent) -> None:
+def bind_remote_session_run_handler(runner, agent: Agent) -> None:
     """Bind remote chat handlers for interactive peers."""
     if runner._relay_http_service is None or runner._relay_server is None:
         return
@@ -694,12 +694,52 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if callable(saver):
             saver(session_id, document)
 
+    def _is_recoverable_live_chat_session(chat_session: Any) -> bool:
+        if chat_session is None:
+            return False
+        if bool(getattr(chat_session, "done", False)):
+            return False
+        if not bool(getattr(chat_session, "running", False)):
+            return False
+        status = str(getattr(chat_session, "status", "") or "").lower()
+        if status in {"done", "error", "cancelled", "interrupted", "failed"}:
+            return False
+        return True
+
+    def _repair_orphaned_running_session_document(
+        session_id: str,
+        document: dict[str, Any] | None,
+        record: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(document, dict):
+            return document
+        run_state = document.get("run_state") if isinstance(document.get("run_state"), dict) else {}
+        stats = document.get("stats") if isinstance(document.get("stats"), dict) else {}
+        session_run_id = str(run_state.get("session_run_id") or "")
+        if not session_run_id:
+            return document
+        if str(run_state.get("status") or "") != "running" and str(stats.get("runStatus") or "") != "running":
+            return document
+        service = runner._relay_http_service
+        live_session = service._get_session_run(session_run_id) if service is not None else None
+        if _is_recoverable_live_chat_session(live_session):
+            return document
+        repaired = settle_orphaned_running_session_run(
+            document,
+            session_id=session_id,
+            reason="审批已失效：远端运行已结束，请重新发起任务。",
+        )
+        _save_session_document(session_id, repaired)
+        if isinstance(record, dict):
+            record["transcript"] = repaired
+        return repaired
+
     def _append_session_trace_event(
         session_id: str,
         event_type: str,
         payload: dict[str, Any],
-        chat_id: str | None,
-        chat_seq: int | None,
+        session_run_id: str | None,
+        session_run_seq: int | None,
         source: str,
         replayable: bool,
     ) -> int | None:
@@ -710,8 +750,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             session_id,
             event_type,
             payload,
-            chat_id=chat_id,
-            chat_seq=chat_seq,
+            session_run_id=session_run_id,
+            session_run_seq=session_run_seq,
             source=source,
             replayable=replayable,
         )
@@ -782,6 +822,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 }
             record = _load_session_record(session_id, loaded)
             document = _record_transcript(record) or _load_session_document(session_id)
+            document = _repair_orphaned_running_session_document(session_id, document, record)
             return {
                 "ok": True,
                 "fingerprint": fingerprint,
@@ -1171,7 +1212,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if session_id and callable(enable_trace_persistence):
             enable_trace_persistence(session_id)
 
-    def _apply_remote_chat_model_override(
+    def _apply_remote_session_run_model_override(
         peer_agent: Agent,
         peer_id: str,
         remote_session: Any,
@@ -1192,12 +1233,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "model_id": model_id,
                 },
             )
-            remote_session.append_event("chat_end", {"response": ""})
+            remote_session.append_event("session_run_end", {"response": ""})
             return False
         current_config = _current_config()
         if current_config is None:
             remote_session.append_event("error", {"message": "config_unavailable"})
-            remote_session.append_event("chat_end", {"response": ""})
+            remote_session.append_event("session_run_end", {"response": ""})
             return False
         session_id = str(
             getattr(peer_agent, "current_session_id", None)
@@ -1225,7 +1266,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "status": result.get("_status"),
                 },
             )
-            remote_session.append_event("chat_end", {"response": ""})
+            remote_session.append_event("session_run_end", {"response": ""})
             return False
         resolved_session_id = str(result.get("session_id") or session_id).strip()
         if resolved_session_id:
@@ -1249,28 +1290,9 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "model_id": model_id,
                 },
             )
-            remote_session.append_event("chat_end", {"response": ""})
+            remote_session.append_event("session_run_end", {"response": ""})
             return False
         return True
-
-    def _chat(peer_id: str, prompt: str) -> ChatResponse:
-        peer_agent = _create_peer_agent(peer_id)
-        _bind_main_chat_account_memory_scope(peer_agent, peer_id)
-        runtime_agent_id = f"chat:{uuid.uuid4().hex[:12]}"
-        setattr(peer_agent, "runtime_agent_id", runtime_agent_id)
-        try:
-            with interactive_run_limiter.agent_slot(
-                runtime_agent_id,
-                agent_type="chat",
-                label=peer_id,
-                is_cancelled=peer_agent.stop_requested,
-            ):
-                response = peer_agent.chat(prompt)
-            _save_peer_session(peer_agent, peer_id)
-            return ChatResponse(response=response)
-        except Exception as exc:
-            _save_peer_session(peer_agent, peer_id)
-            return ChatResponse(response="", error=str(exc))
 
     def _agent_chat(agent_obj: Any, prompt: str, *, clear_stop_request: bool) -> str:
         signature = inspect.signature(agent_obj.chat)
@@ -1422,7 +1444,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         response.events.insert(
             0,
             {
-                "type": "chat_start",
+                "type": "session_run_start",
                 "payload": {
                     "prompt": command_text,
                     "command_id": req.command_id,
@@ -1431,7 +1453,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 },
             },
         )
-        response.events.append({"type": "chat_end", "payload": {"response": ""}})
+        response.events.append({"type": "session_run_end", "payload": {"response": ""}})
         return response
 
     def _is_registered_vscode_chat_command(
@@ -1449,7 +1471,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             is not None
         )
 
-    def _stream_chat(peer_id: str, prompt: str, remote_session) -> None:
+    def _stream_session_run(peer_id: str, prompt: str, remote_session) -> None:
         peer_agent = _create_peer_agent(
             peer_id,
             session_hint=getattr(remote_session, "session_hint", None),
@@ -1472,7 +1494,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         "mode": requested_mode,
                     },
                 )
-                remote_session.append_event("chat_end", {"response": ""})
+                remote_session.append_event("session_run_end", {"response": ""})
                 return
         if getattr(remote_session, "workflow_mode", None) == TASKFLOW_WORKFLOW_MODE:
             taskflow_service = runner._relay_http_service.taskflow_service
@@ -1483,7 +1505,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     raw_goal=prompt,
                     session_id=getattr(peer_agent, "current_session_id", None),
                     peer_id=peer_id,
-                    metadata={"source": "chat_start"},
+                    metadata={"source": "session_run_start"},
                 )
                 taskflow_id = state.meta.taskflow_id
                 remote_session.taskflow_id = taskflow_id
@@ -1500,7 +1522,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             )
         else:
             _bind_main_chat_account_memory_scope(peer_agent, peer_id)
-        if not _apply_remote_chat_model_override(peer_agent, peer_id, remote_session):
+        if not _apply_remote_session_run_model_override(peer_agent, peer_id, remote_session):
             return
         remote_session.set_cancel_callback(
             lambda reason: (
@@ -1528,7 +1550,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         if getattr(remote_session, "cancel_requested", False):
             peer_agent.request_stop()
 
-        runtime_agent_id = f"chat:{getattr(remote_session, 'chat_id', uuid.uuid4().hex)}"
+        runtime_agent_id = f"session_run:{getattr(remote_session, 'session_run_id', uuid.uuid4().hex)}"
         setattr(peer_agent, "runtime_agent_id", runtime_agent_id)
 
         mention_refs = _normalized_chat_mentions(getattr(remote_session, "mentions", []))
@@ -1555,10 +1577,10 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             )
         except AgentRunCancelled:
             remote_session.append_event(
-                "chat_cancelled",
+                "session_run_cancelled",
                 {"reason": getattr(remote_session, "cancel_reason", "user_cancelled")},
             )
-            remote_session.append_event("chat_end", {"response": ""})
+            remote_session.append_event("session_run_end", {"response": ""})
             return
 
         session_id = getattr(peer_agent, "current_session_id", "-") or "-"
@@ -1600,7 +1622,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     str(event.get("type") or "output"),
                     event.get("payload") if isinstance(event.get("payload"), dict) else {},
                 )
-            remote_session.append_event("chat_end", {"response": ""})
+            remote_session.append_event("session_run_end", {"response": ""})
             interactive_run_limiter.release_agent_slot(runtime_agent_id)
             return
 
@@ -1610,7 +1632,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
         renderer = CLIRenderer(console_override=ansi_console)
         assistant_content_emitted = {"value": False}
         reasoning_content_emitted = {"value": False}
-        chat_interrupted_emitted = {"value": False}
+        session_run_interrupted_emitted = {"value": False}
         active_tool_calls_by_name: dict[str, list[str]] = {}
         assistant_stream_parts: list[str] = []
         reasoning_stream_parts: list[str] = []
@@ -1635,7 +1657,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             provider_config = getattr(llm, "provider_config", None)
             return {
                 "session_id": getattr(peer_agent, "current_session_id", None),
-                "chat_id": getattr(remote_session, "chat_id", None),
+                "session_run_id": getattr(remote_session, "session_run_id", None),
                 "peer_id": peer_id,
                 "round_index": getattr(peer_agent.state, "current_round", None),
                 "tool": tool_name,
@@ -1718,14 +1740,28 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             return bool(peer and "tool_preview" in peer.features)
 
         def _args_section(request: ApprovalRequest) -> dict[str, Any] | None:
-            if not request.tool_args:
+            tool_args = _approval_tool_args(request)
+            if not tool_args:
                 return None
             return {
                 "id": "args",
                 "title": "Arguments",
                 "kind": "json",
-                "content": request.tool_args,
+                "content": tool_args,
             }
+
+        def _approval_tool_args(request: ApprovalRequest) -> dict[str, Any]:
+            return {
+                key: value
+                for key, value in dict(request.tool_args or {}).items()
+                if key != "intent"
+            }
+
+        def _approval_intent(request: ApprovalRequest) -> str | None:
+            if isinstance(request.intent, str) and request.intent.strip():
+                return request.intent.strip()
+            value = dict(request.tool_args or {}).get("intent")
+            return value.strip() if isinstance(value, str) and value.strip() else None
 
         def _section_markdown(section: dict[str, Any]) -> str:
             title = str(section.get("title") or "Details")
@@ -1809,7 +1845,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     ),
                 )
 
-            preview = backend.preview_tool(request.tool_name, dict(request.tool_args))
+            preview = backend.preview_tool(request.tool_name, _approval_tool_args(request))
             if not preview.ok:
                 return [], preview, _preview_failure_reason(preview)
             if preview.sections:
@@ -1919,7 +1955,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     "tool_name": request.tool_name,
                     "tool_source": request.tool_source,
                     "reason": request.reason,
-                    "tool_args": request.tool_args,
+                    "intent": _approval_intent(request),
+                    "tool_args": _approval_tool_args(request),
                     "sections": sections,
                     "preview_unavailable": preview is None or not preview.ok,
                     "preview_error": preview_error,
@@ -1928,6 +1965,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                         part
                         for part in [
                             f"## Approval required: {request.tool_name}",
+                            _approval_intent(request) or "",
                             f"Tool `{request.tool_name}` from source `{request.tool_source}` requires approval.",
                             request.reason or "",
                             *[_section_markdown(section) for section in sections],
@@ -1952,7 +1990,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                     if backend is not None and preview is not None and preview.ok:
                         backend.remember_approved_preview(
                             request.tool_name,
-                            dict(request.tool_args),
+                            _approval_tool_args(request),
                             _preview_state(preview),
                         )
                     return ApprovalDecision.allow_once(reason)
@@ -2026,7 +2064,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.RUNTIME_STATUS:
                 remote_session.append_event("runtime_status", event.data)
                 return
-            if event.event_type == AgentEventType.CHAT_END:
+            if event.event_type == AgentEventType.SESSION_RUN_END:
                 response = event.data.get("response", "")
                 if event.data.get("render_response", True) and response:
                     _append_final_stream_content(str(response))
@@ -2040,11 +2078,11 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.PROVIDER_STREAM_RECOVERED:
                 remote_session.append_event("provider_stream_recovered", event.data)
                 return
-            if event.event_type == AgentEventType.CHAT_INTERRUPTED:
-                chat_interrupted_emitted["value"] = True
+            if event.event_type == AgentEventType.SESSION_RUN_INTERRUPTED:
+                session_run_interrupted_emitted["value"] = True
                 remote_session.register_recovery(dict(event.data))
                 _append_final_stream_content()
-                remote_session.append_event("chat_interrupted", event.data)
+                remote_session.append_event("session_run_interrupted", event.data)
                 return
             if event.event_type == AgentEventType.TOOL_CALL_DELTA:
                 remote_session.append_event(
@@ -2149,12 +2187,12 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             _append_final_stream_content(str(result) if result else None)
             if getattr(remote_session, "cancel_requested", False):
                 remote_session.append_event(
-                    "chat_cancelled",
+                    "session_run_cancelled",
                     {"reason": getattr(remote_session, "cancel_reason", None)},
                 )
-            if not chat_interrupted_emitted["value"]:
+            if not session_run_interrupted_emitted["value"]:
                 remote_session.append_event(
-                    "chat_end",
+                    "session_run_end",
                     {
                         "response": result,
                         "response_rendered": assistant_content_emitted["value"],
@@ -2185,7 +2223,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
                 "tool_diagnostics": [diagnostic.to_dict()],
             }
             remote_session.append_event("error", failure_payload)
-            remote_session.append_event("chat_failed", failure_payload)
+            remote_session.append_event("session_run_failed", failure_payload)
         except Exception as exc:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
@@ -2212,7 +2250,7 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             if provider_phase:
                 failure_payload["provider_error_phase"] = str(provider_phase)
             remote_session.append_event("error", failure_payload)
-            remote_session.append_event("chat_failed", failure_payload)
+            remote_session.append_event("session_run_failed", failure_payload)
         finally:
             if localized_runtime_config is not previous_runtime_config:
                 setattr(peer_agent, "runtime_config", previous_runtime_config)
@@ -2232,9 +2270,8 @@ def bind_remote_chat_handler(runner, agent: Agent) -> None:
             interactive_run_limiter.release_agent_slot(runtime_agent_id)
             renderer.close()
 
-    runner._relay_http_service.set_chat_handler(_chat)
     runner._relay_http_service.set_chat_command_handler(_dispatch_chat_command)
-    runner._relay_http_service.set_chat_events_handler(_stream_chat)
+    runner._relay_http_service.set_session_run_events_handler(_stream_session_run)
 
 
 def _structured_ui_event_type(event) -> str:

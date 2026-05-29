@@ -18,12 +18,10 @@ from labrastro_server.interfaces.http.remote.helpers import (
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
-    ChatCancelRequest,
-    ChatCancelResponse,
-    ChatRequest,
-    ChatResponse,
-    ChatStartRequest,
-    ChatStartResponse,
+    SessionRunCancelRequest,
+    SessionRunCancelResponse,
+    SessionRunStartRequest,
+    SessionRunStartResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -305,5 +303,4 @@ class RemoteRelayBaseHandler:
             self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
             return None
         return principal
-
 

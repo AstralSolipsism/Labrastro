@@ -149,9 +149,9 @@
       }
     },
     {
-      "name": "chat.start",
+      "name": "session_run.start",
       "method": "POST",
-      "path": "/remote/chat/start",
+      "path": "/remote/session-runs/start",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
@@ -169,7 +169,7 @@
         ]
       },
       "response": {
-        "chat_id": "chat_contract",
+        "session_run_id": "session_run_contract",
         "error": null
       }
     },
@@ -209,22 +209,22 @@
       }
     },
     {
-      "name": "chat.events",
+      "name": "session_run.events",
       "method": "POST",
-      "path": "/remote/chat/events",
+      "path": "/remote/session-runs/events",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
-        "chat_id": "chat_contract",
+        "session_run_id": "session_run_contract",
         "cursor": 0,
         "timeout_sec": 30.0
       },
       "response": {
         "events": [
           {
-            "chat_id": "chat_contract",
+            "session_run_id": "session_run_contract",
             "seq": 1,
-            "type": "chat_start",
+            "type": "session_run_start",
             "payload": {
               "prompt": "hello"
             }
@@ -236,18 +236,18 @@
       }
     },
     {
-      "name": "chat.status",
+      "name": "session_run.status",
       "method": "POST",
-      "path": "/remote/chat/status",
+      "path": "/remote/session-runs/status",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
-        "chat_id": "chat_contract",
+        "session_run_id": "session_run_contract",
         "cursor": 1
       },
       "response": {
         "ok": true,
-        "chat_id": "chat_contract",
+        "session_run_id": "session_run_contract",
         "peer_id": "peer_contract",
         "status": "running",
         "running": true,
@@ -270,20 +270,20 @@
       }
     },
     {
-      "name": "chat.events_lost_events",
+      "name": "session_run.events_lost_events",
       "method": "POST",
-      "path": "/remote/chat/events",
+      "path": "/remote/session-runs/events",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
-        "chat_id": "chat_contract",
+        "session_run_id": "session_run_contract",
         "cursor": 1,
         "timeout_sec": 0.0
       },
       "response": {
         "events": [
           {
-            "chat_id": "chat_contract",
+            "session_run_id": "session_run_contract",
             "seq": 41,
             "type": "events_lost",
             "payload": {
@@ -292,13 +292,13 @@
             }
           },
           {
-            "chat_id": "chat_contract",
+            "session_run_id": "session_run_contract",
             "seq": 42,
             "type": "delta",
             "payload": {
               "artifact_ref": {
-                "type": "chat_event_payload",
-                "path": "/tmp/labrastro-chat-events/chat_contract/42.json.gz",
+                "type": "session_run_event_payload",
+                "path": "/tmp/labrastro-session-run-events/session_run_contract/42.json.gz",
                 "encoding": "json+gzip",
                 "bytes": 1048576,
                 "preview": "{\"text\":\"large\"}"

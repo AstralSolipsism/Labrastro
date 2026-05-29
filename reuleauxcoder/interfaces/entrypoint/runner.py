@@ -51,7 +51,7 @@ from reuleauxcoder.interfaces.entrypoint.dependencies import (
     _default_create_remote_artifact_provider,
 )
 from reuleauxcoder.interfaces.entrypoint.remote_relay import (
-    bind_remote_chat_handler,
+    bind_remote_session_run_handler,
     init_remote_relay,
 )
 from reuleauxcoder.interfaces.entrypoint.session_lifecycle import restore_session
@@ -133,7 +133,7 @@ class AppRunner:
         action_registry = self.dependencies.create_action_registry()
         self._init_remote_relay(config, ui_bus)
         config, ui_bus, llm, agent = self._build_core(config, ui_bus)
-        self._bind_remote_chat_handler(agent)
+        self._bind_remote_session_run_handler(agent)
         skills_service = self._init_skills(config, agent, ui_bus)
         mcp_manager = self._attach_mcp_if_configured(config, agent, ui_bus)
         sessions_dir = Path(config.session_dir) if config.session_dir else None
@@ -228,8 +228,8 @@ class AppRunner:
     def _init_remote_relay(self, config: Config, ui_bus: UIEventBus) -> None:
         init_remote_relay(self, config, ui_bus)
 
-    def _bind_remote_chat_handler(self, agent: Agent) -> None:
-        bind_remote_chat_handler(self, agent)
+    def _bind_remote_session_run_handler(self, agent: Agent) -> None:
+        bind_remote_session_run_handler(self, agent)
 
     @staticmethod
     def build_capability_catalog(config: Config, agent_id: str = "") -> str:

@@ -17,12 +17,10 @@ from labrastro_server.interfaces.http.remote.helpers import (
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
-    ChatCancelRequest,
-    ChatCancelResponse,
-    ChatRequest,
-    ChatResponse,
-    ChatStartRequest,
-    ChatStartResponse,
+    SessionRunCancelRequest,
+    SessionRunCancelResponse,
+    SessionRunStartRequest,
+    SessionRunStartResponse,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -66,11 +64,11 @@ class RemotePeerRoutes:
                     "session_history_writable": session_history_status[
                         "session_history_writable"
                     ],
-                    "chat_events": self.service.chat_events_handler is not None,
+                    "session_runs": self.service.session_run_events_handler is not None,
                     "taskflow": self.service.taskflow_service is not None,
                     "issue_assignment": self.service.issue_assignment_service
                     is not None,
-                    "fresh_session_without_session_hint": self.service.chat_events_handler
+                    "fresh_session_without_session_hint": self.service.session_run_events_handler
                     is not None,
                     "peer_token_heartbeat_refresh": True,
             "agent_runs": agent_run_features,
@@ -268,7 +266,7 @@ class RemotePeerRoutes:
         notice = DisconnectNotice(
             reason=payload.get("reason", "peer_initiated")
         )
-        self.service._abort_peer_chat_sessions(
+        self.service._abort_peer_session_runs(
             peer_id, f"peer_disconnected: {notice.reason}"
         )
         self.service.relay_server.disconnect_peer(peer_id, notice.reason)

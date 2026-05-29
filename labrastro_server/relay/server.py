@@ -342,7 +342,7 @@ class RelayServer:
         except Exception as e:
             return CleanupResult(ok=False, error_message=str(e))
 
-    def cancel_pending_requests(self, peer_id: str, reason: str = "chat_cancelled") -> int:
+    def cancel_pending_requests(self, peer_id: str, reason: str = "session_run_cancelled") -> int:
         """Ask a peer to cancel all in-flight tool requests for that peer."""
         with self._lock:
             request_ids = [

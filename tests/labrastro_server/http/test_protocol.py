@@ -1,4 +1,4 @@
-﻿"""Tests for remote execution protocol message models."""
+"""Tests for remote execution protocol message models."""
 
 from __future__ import annotations
 
@@ -10,15 +10,14 @@ import pytest
 from labrastro_server.interfaces.http.remote.protocol import (
     CleanupRequest,
     CleanupResult,
-    ChatRequest,
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
-    ChatStartRequest,
-    ChatStartResponse,
-    ChatStatusRequest,
-    ChatStatusResponse,
-    ChatEventsRequest,
-    ChatEventsBatch,
+    SessionRunStartRequest,
+    SessionRunStartResponse,
+    SessionRunStatusRequest,
+    SessionRunStatusResponse,
+    SessionRunEventsRequest,
+    SessionRunEventsBatch,
     DisconnectNotice,
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
@@ -136,14 +135,14 @@ class TestRemoteHTTPContract:
         Heartbeat.from_dict(fixtures["peer.heartbeat"]["request"])
         SessionListRequest.from_dict(fixtures["sessions.list"]["request"])
         SessionModelSwitchRequest.from_dict(fixtures["sessions.model"]["request"])
-        ChatStartRequest.from_dict(fixtures["chat.start"]["request"])
-        ChatStartResponse.from_dict(fixtures["chat.start"]["response"])
+        SessionRunStartRequest.from_dict(fixtures["session_run.start"]["request"])
+        SessionRunStartResponse.from_dict(fixtures["session_run.start"]["response"])
         ChatCommandDispatchRequest.from_dict(fixtures["chat.command_dispatch"]["request"])
         ChatCommandDispatchResponse.from_dict(fixtures["chat.command_dispatch"]["response"])
-        ChatEventsRequest.from_dict(fixtures["chat.events"]["request"])
-        ChatEventsBatch.from_dict(fixtures["chat.events"]["response"])
-        ChatStatusRequest.from_dict(fixtures["chat.status"]["request"])
-        ChatStatusResponse.from_dict(fixtures["chat.status"]["response"])
+        SessionRunEventsRequest.from_dict(fixtures["session_run.events"]["request"])
+        SessionRunEventsBatch.from_dict(fixtures["session_run.events"]["response"])
+        SessionRunStatusRequest.from_dict(fixtures["session_run.status"]["request"])
+        SessionRunStatusResponse.from_dict(fixtures["session_run.status"]["response"])
         EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
         EnvironmentManifestResponse.from_dict(fixtures["environment.manifest"]["response"])
 
@@ -151,13 +150,14 @@ class TestRemoteHTTPContract:
         registry = {endpoint["name"]: endpoint for endpoint in endpoint_registry()}
 
         assert "chat.stream" not in registry
+        assert "chat.once" not in registry
         assert registry["mcp.artifact"]["auth"] == "peer_token"
         assert (
             registry["artifacts.get"]["path"]
             == "/remote/artifacts/{os}/{arch}/{artifact_name}"
         )
-        assert registry["chat.events"]["path"] == "/remote/chat/events"
-        assert registry["chat.events"]["response_shape"] == "ChatEventsBatch"
+        assert registry["session_run.events"]["path"] == "/remote/session-runs/events"
+        assert registry["session_run.events"]["response_shape"] == "SessionRunEventsBatch"
         assert registry["chat.command_dispatch"]["path"] == "/remote/chat/command"
         assert registry["chat.command_dispatch"]["request_model"] == "ChatCommandDispatchRequest"
         assert registry["admin.models.delete"]["path"] == "/remote/admin/models/delete"
@@ -265,38 +265,9 @@ class TestPeerControlPlaneRequests:
         assert restored.reason == "peer_initiated"
 
 
-class TestChatRequest:
+class TestSessionRunStartRequest:
     def test_roundtrip_preserves_mode_and_workflow(self) -> None:
-        req = ChatRequest(
-            peer_token="pt_1",
-            prompt="plan this",
-            mode="taskflow",
-            workflow_mode="taskflow",
-            taskflow_id="taskflow-1",
-        )
-
-        restored = ChatRequest.from_dict(req.to_dict())
-
-        assert restored.peer_token == "pt_1"
-        assert restored.prompt == "plan this"
-        assert restored.mode == "taskflow"
-        assert restored.workflow_mode == "taskflow"
-        assert restored.taskflow_id == "taskflow-1"
-
-    def test_serializes_canonical_taskflow_id_only(self) -> None:
-        restored = ChatRequest.from_dict({
-            "peer_token": "pt_1",
-            "prompt": "continue",
-            "taskflow_id": "taskflow-1",
-        })
-
-        assert restored.taskflow_id == "taskflow-1"
-        assert restored.to_dict()["taskflow_id"] == "taskflow-1"
-
-
-class TestChatStartRequest:
-    def test_roundtrip_preserves_mode_and_workflow(self) -> None:
-        req = ChatStartRequest(
+        req = SessionRunStartRequest(
             peer_token="pt_1",
             prompt="plan this",
             session_hint="session-1",
@@ -307,7 +278,7 @@ class TestChatStartRequest:
             mentions=[{"kind": "file", "name": "README.md", "path": "README.md"}],
         )
 
-        restored = ChatStartRequest.from_dict(req.to_dict())
+        restored = SessionRunStartRequest.from_dict(req.to_dict())
 
         assert restored.peer_token == "pt_1"
         assert restored.prompt == "plan this"
@@ -321,7 +292,7 @@ class TestChatStartRequest:
         ]
 
     def test_serializes_canonical_taskflow_id_only(self) -> None:
-        restored = ChatStartRequest.from_dict({
+        restored = SessionRunStartRequest.from_dict({
             "peer_token": "pt_1",
             "prompt": "continue",
             "taskflow_id": "taskflow-1",
@@ -378,18 +349,18 @@ class TestChatCommandDispatchProtocol:
         assert restored.error == "invalid_chat_command"
 
 
-class TestChatStatusProtocol:
+class TestSessionRunStatusProtocol:
     def test_roundtrip_preserves_recovery_diagnostics(self) -> None:
-        req = ChatStatusRequest(peer_token="pt_1", chat_id="chat-1", cursor=7)
-        restored_req = ChatStatusRequest.from_dict(req.to_dict())
+        req = SessionRunStatusRequest(peer_token="pt_1", session_run_id="run-1", cursor=7)
+        restored_req = SessionRunStatusRequest.from_dict(req.to_dict())
 
         assert restored_req.peer_token == "pt_1"
-        assert restored_req.chat_id == "chat-1"
+        assert restored_req.session_run_id == "run-1"
         assert restored_req.cursor == 7
 
-        resp = ChatStatusResponse(
+        resp = SessionRunStatusResponse(
             ok=True,
-            chat_id="chat-1",
+            session_run_id="run-1",
             peer_id="peer-1",
             status="running",
             running=True,
@@ -417,9 +388,9 @@ class TestChatStatusProtocol:
                 }
             ],
         )
-        restored_resp = ChatStatusResponse.from_dict(resp.to_dict())
+        restored_resp = SessionRunStatusResponse.from_dict(resp.to_dict())
 
-        assert restored_resp.chat_id == "chat-1"
+        assert restored_resp.session_run_id == "run-1"
         assert restored_resp.status == "running"
         assert restored_resp.reconnectable is True
         assert restored_resp.next_cursor == 9

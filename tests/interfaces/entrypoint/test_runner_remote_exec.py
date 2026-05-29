@@ -1,4 +1,4 @@
-﻿"""Tests for runner integration with remote execution."""
+"""Tests for runner integration with remote execution."""
 
 from __future__ import annotations
 
@@ -130,11 +130,11 @@ def _json_request(
         return resp.status, json.loads(body) if body else {}
 
 
-def _chat_events_request(base_url: str, peer_token: str, chat_id: str) -> list[dict]:
-    status, _cursor, events, _done = _chat_events_until(
+def _session_run_events_request(base_url: str, peer_token: str, session_run_id: str) -> list[dict]:
+    status, _cursor, events, _done = _session_run_events_until(
         base_url,
         peer_token,
-        chat_id,
+        session_run_id,
         lambda _event: False,
         until_done=True,
     )
@@ -142,10 +142,10 @@ def _chat_events_request(base_url: str, peer_token: str, chat_id: str) -> list[d
     return events
 
 
-def _chat_events_until(
+def _session_run_events_until(
     base_url: str,
     peer_token: str,
-    chat_id: str,
+    session_run_id: str,
     predicate,
     *,
     until_done: bool = False,
@@ -153,12 +153,12 @@ def _chat_events_until(
 ) -> tuple[int, int, list[dict], bool]:
     payload = {
         "peer_token": peer_token,
-        "chat_id": chat_id,
+        "session_run_id": session_run_id,
         "cursor": 0,
         "timeout_sec": 0.5,
     }
     req = request.Request(
-        f"{base_url}/remote/chat/events",
+        f"{base_url}/remote/session-runs/events",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
         method="POST",
@@ -366,9 +366,9 @@ class MemorySessionStore:
         event_type: str,
         payload: dict | None = None,
         *,
-        chat_id: str | None = None,
-        chat_seq: int | None = None,
-        source: str = "remote_chat",
+        session_run_id: str | None = None,
+        session_run_seq: int | None = None,
+        source: str = "remote_session_run",
         replayable: bool = True,
     ) -> int:
         events = getattr(self, "trace_events", None)
@@ -381,9 +381,9 @@ class MemorySessionStore:
             {
                 "session_id": session_id,
                 "session_event_seq": seq,
-                "seq": chat_seq or seq,
-                "chat_id": chat_id,
-                "chat_seq": chat_seq,
+                "seq": session_run_seq or seq,
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
                 "type": event_type,
                 "payload": payload or {},
                 "source": source,
@@ -396,8 +396,8 @@ class MemorySessionStore:
             event_type=event_type,
             payload=payload or {},
             session_event_seq=seq,
-            chat_id=chat_id,
-            chat_seq=chat_seq,
+            session_run_id=session_run_id,
+            session_run_seq=session_run_seq,
         )
         return seq
 
@@ -598,12 +598,12 @@ def _register_peer(
 
 
 def _collect_stream_events(
-    base_url: str, peer_token: str, chat_id: str, timeout_sec: float = 3.0
+    base_url: str, peer_token: str, session_run_id: str, timeout_sec: float = 3.0
 ) -> list[dict]:
-    status, _cursor, events, done = _chat_events_until(
+    status, _cursor, events, done = _session_run_events_until(
         base_url,
         peer_token,
-        chat_id,
+        session_run_id,
         lambda _event: False,
         until_done=True,
         timeout_sec=timeout_sec,
@@ -1217,11 +1217,11 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             ready_events = [
                 event for event in events if event["type"] == "remote_peer_ready"
@@ -1274,16 +1274,16 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello", "locale": "zh-CN"},
             )
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
 
-            assert any(event["type"] == "chat_end" for event in events)
+            assert any(event["type"] == "session_run_end" for event in events)
             assert "Use Simplified Chinese" in captured["system_append"]
             assert "publicly displayed reasoning/thinking summaries" in captured["system_append"]
         finally:
@@ -1320,17 +1320,17 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
 
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
             failed_events = [
-                event for event in events if event["type"] == "chat_failed"
+                event for event in events if event["type"] == "session_run_failed"
             ]
 
             assert failed_events
@@ -1372,13 +1372,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
-            _, _cursor, events, _done = _chat_events_until(
+            _, _cursor, events, _done = _session_run_events_until(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
                 lambda event: event["type"] == "remote_peer_ready",
             )
             ready = next(
@@ -1409,7 +1409,7 @@ class TestRunnerRemoteExec:
             _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
             _, listed_after = _json_request(
                 "POST",
@@ -1459,7 +1459,7 @@ class TestRunnerRemoteExec:
 
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {
                     "peer_token": peer_token,
                     "prompt": "fresh",
@@ -1467,14 +1467,14 @@ class TestRunnerRemoteExec:
                 },
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             ready = [
                 event["payload"]
                 for event in events
                 if event["type"] == "remote_peer_ready"
             ][0]
-            end = [event for event in events if event["type"] == "chat_end"][-1]
+            end = [event for event in events if event["type"] == "session_run_end"][-1]
             assert ready["session_id"] == "session-new"
             assert "old-context" not in end["payload"]["response"]
             assert "fresh|history=fresh|sid=session-new" in end["payload"]["response"]
@@ -1521,21 +1521,21 @@ class TestRunnerRemoteExec:
 
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {
                     "peer_token": peer_token,
                     "prompt": "fresh",
                 },
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             ready = [
                 event["payload"]
                 for event in events
                 if event["type"] == "remote_peer_ready"
             ][0]
-            end = [event for event in events if event["type"] == "chat_end"][-1]
+            end = [event for event in events if event["type"] == "session_run_end"][-1]
             assert ready["session_id"] != "session-old"
             assert "old-context" not in end["payload"]["response"]
             assert "fresh|history=fresh|sid=session_" in end["payload"]["response"]
@@ -1571,11 +1571,11 @@ class TestRunnerRemoteExec:
 
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "fresh"},
             )
             _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
 
             _, listed = _json_request(
@@ -1634,7 +1634,7 @@ class TestRunnerRemoteExec:
 
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {
                     "peer_token": peer_token,
                     "prompt": "hello",
@@ -1642,7 +1642,7 @@ class TestRunnerRemoteExec:
                 },
             )
             _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
 
             _, listed = _json_request(
@@ -1690,6 +1690,214 @@ class TestRunnerRemoteExec:
                 raise AssertionError("expected deleted session to fail")
             except HTTPError as exc:
                 assert exc.code == 404
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_session_load_repairs_orphaned_running_approval(self) -> None:
+        workspace = Path(__file__).resolve().parent
+        port = _free_port()
+        session_store = MemorySessionStore()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            session_store=session_store,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, created = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/new",
+                {"peer_token": peer_token},
+            )
+            session_id = created["metadata"]["id"]
+            missing_session_run_id = "chat-missing"
+            session_store.append_trace_event(
+                session_id,
+                "session_run_start",
+                {"prompt": "检查 jshook 版本", "mode": "coder"},
+                session_run_id=missing_session_run_id,
+                session_run_seq=1,
+            )
+            session_store.append_trace_event(
+                session_id,
+                "tool_call_start",
+                {
+                    "tool_name": "shell",
+                    "tool_call_id": "call-1",
+                    "tool_args": {
+                        "command": "npm view @jshookmcp/jshook@0.1.8 version description dependencies --json 2>&1"
+                    },
+                },
+                session_run_id=missing_session_run_id,
+                session_run_seq=2,
+            )
+            session_store.append_trace_event(
+                session_id,
+                "approval_request",
+                {
+                    "approval_id": "approval-1",
+                    "tool_name": "shell",
+                    "tool_call_id": "call-1",
+                    "reason": "command approval required",
+                    "tool_args": {
+                        "command": "npm view @jshookmcp/jshook@0.1.8 version description dependencies --json 2>&1"
+                    },
+                },
+                session_run_id=missing_session_run_id,
+                session_run_seq=3,
+            )
+
+            _, loaded = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/load",
+                {"peer_token": peer_token, "session_id": session_id},
+            )
+
+            document = loaded["document"]
+            tool = document["turns"][0]["assistantMessages"][0]["parts"][0]
+            assert document["stats"]["runStatus"] == "error"
+            assert document["run_state"]["status"] == "error"
+            assert tool["status"] == "denied"
+            assert tool["approvalDecision"] == "deny_once"
+            assert "审批已失效" in tool["approvalResultReason"]
+            assert loaded["record"]["transcript"]["stats"]["runStatus"] == "error"
+            assert session_store.load_document(session_id)["stats"]["runStatus"] == "error"
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_session_load_repairs_orphaned_running_approval_when_done_chat_still_in_memory(self) -> None:
+        workspace = Path(__file__).resolve().parent
+        port = _free_port()
+        session_store = MemorySessionStore()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            session_store=session_store,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            peer_id, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, created = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/new",
+                {"peer_token": peer_token},
+            )
+            session_id = created["metadata"]["id"]
+            live_session = runner._relay_http_service._create_session_run(
+                peer_id,
+                session_hint=session_id,
+            )
+            live_session.mark_running()
+            live_session.mark_done()
+            session_store.append_trace_event(
+                session_id,
+                "session_run_start",
+                {"prompt": "检查 jshook 版本", "mode": "coder"},
+                session_run_id=live_session.session_run_id,
+                session_run_seq=1,
+            )
+            session_store.append_trace_event(
+                session_id,
+                "approval_request",
+                {
+                    "approval_id": "approval-done-memory",
+                    "tool_name": "shell",
+                    "tool_call_id": "call-done-memory",
+                    "reason": "command approval required",
+                    "tool_args": {"command": "npm view package version"},
+                },
+                session_run_id=live_session.session_run_id,
+                session_run_seq=2,
+            )
+
+            _, loaded = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/load",
+                {"peer_token": peer_token, "session_id": session_id},
+            )
+
+            document = loaded["document"]
+            tool = document["turns"][0]["assistantMessages"][0]["parts"][0]
+            assert document["stats"]["runStatus"] == "error"
+            assert document["run_state"]["status"] == "error"
+            assert tool["status"] == "denied"
+            assert tool["approvalDecision"] == "deny_once"
+            assert "审批已失效" in tool["approvalResultReason"]
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_session_load_keeps_orphaned_running_chat_approval_when_still_running(self) -> None:
+        workspace = Path(__file__).resolve().parent
+        port = _free_port()
+        session_store = MemorySessionStore()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            session_store=session_store,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            peer_id, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, created = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/new",
+                {"peer_token": peer_token},
+            )
+            session_id = created["metadata"]["id"]
+            live_session = runner._relay_http_service._create_session_run(
+                peer_id,
+                session_hint=session_id,
+            )
+            live_session.mark_running()
+            session_store.append_trace_event(
+                session_id,
+                "session_run_start",
+                {"prompt": "检查 jshook 版本", "mode": "coder"},
+                session_run_id=live_session.session_run_id,
+                session_run_seq=1,
+            )
+            session_store.append_trace_event(
+                session_id,
+                "approval_request",
+                {
+                    "approval_id": "approval-running-memory",
+                    "tool_name": "shell",
+                    "tool_call_id": "call-running-memory",
+                    "reason": "command approval required",
+                    "tool_args": {"command": "npm view package version"},
+                },
+                session_run_id=live_session.session_run_id,
+                session_run_seq=2,
+            )
+
+            _, loaded = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/sessions/load",
+                {"peer_token": peer_token, "session_id": session_id},
+            )
+
+            document = loaded["document"]
+            tool = document["turns"][0]["assistantMessages"][0]["parts"][0]
+            assert document["stats"]["runStatus"] == "running"
+            assert document["run_state"]["status"] == "running"
+            assert tool["status"] == "awaiting_approval"
+            assert tool.get("approvalDecision") is None
         finally:
             runner.cleanup(ctx.agent)
 
@@ -1786,7 +1994,7 @@ class TestRunnerRemoteExec:
 
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {
                     "peer_token": peer_token,
                     "prompt": "hello",
@@ -1794,14 +2002,14 @@ class TestRunnerRemoteExec:
                 },
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             ready = [
                 event["payload"]
                 for event in events
                 if event["type"] == "remote_peer_ready"
             ][0]
-            end = [event for event in events if event["type"] == "chat_end"][-1]
+            end = [event for event in events if event["type"] == "session_run_end"][-1]
             assert ready["model"] == "deep-model"
             assert "hello|model=deep-model|sid=session-model" in end["payload"]["response"]
         finally:
@@ -1837,11 +2045,11 @@ class TestRunnerRemoteExec:
 
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             ready = [
                 event["payload"]
@@ -1872,7 +2080,7 @@ class TestRunnerRemoteExec:
 
             _, fork_start = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {
                     "peer_token": peer_token,
                     "prompt": "follow up",
@@ -1880,14 +2088,14 @@ class TestRunnerRemoteExec:
                 },
             )
             fork_events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, fork_start["chat_id"]
+                runner._relay_http_service.base_url, peer_token, fork_start["session_run_id"]
             )
             fork_ready = [
                 event["payload"]
                 for event in fork_events
                 if event["type"] == "remote_peer_ready"
             ][0]
-            fork_end = [event for event in fork_events if event["type"] == "chat_end"][-1]
+            fork_end = [event for event in fork_events if event["type"] == "session_run_end"][-1]
             assert fork_ready["session_id"] == forked_session_id
             assert "follow up|history=hello|sid=" in fork_end["payload"]["response"]
 
@@ -1954,11 +2162,11 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "read"},
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             assistant_text = "".join(
                 event["payload"].get("content", "")
@@ -2016,7 +2224,7 @@ class TestRunnerRemoteExec:
                 for event in events
             )
             assert any(
-                event["type"] == "chat_end"
+                event["type"] == "session_run_end"
                 and event["payload"].get("response_rendered") is True
                 for event in events
             )
@@ -2059,11 +2267,11 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "compress"},
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             context_events = [
                 event for event in events if event["type"] == "context_event"
@@ -2136,13 +2344,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "write"},
             )
-            _, _cursor, events, _done = _chat_events_until(
+            _, _cursor, events, _done = _session_run_events_until(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
                 lambda event: event["type"] == "approval_request",
             )
             approval_events = [
@@ -2163,7 +2371,7 @@ class TestRunnerRemoteExec:
                 f"{runner._relay_http_service.base_url}/remote/approval/reply",
                 {
                     "peer_token": peer_token,
-                    "chat_id": start_body["chat_id"],
+                    "session_run_id": start_body["session_run_id"],
                     "approval_id": payload["approval_id"],
                     "decision": "allow_once",
                 },
@@ -2171,10 +2379,10 @@ class TestRunnerRemoteExec:
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
             assert any(
-                event["type"] == "chat_end"
+                event["type"] == "session_run_end"
                 and event["payload"].get("response") == "approved"
                 for event in events
             )
@@ -2223,13 +2431,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "write"},
             )
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
 
             assert decisions == [
@@ -2259,9 +2467,9 @@ class TestRunnerRemoteExec:
             assert not any(
                 event["type"] == "tool_call_protocol_error" for event in events
             )
-            assert not any(event["type"] == "chat_failed" for event in events)
+            assert not any(event["type"] == "session_run_failed" for event in events)
             assert any(
-                event["type"] == "chat_end"
+                event["type"] == "session_run_end"
                 and event["payload"].get("response")
                 == "Error [REMOTE_TOOL_ERROR]: old_string not found in demo.txt"
                 for event in events
@@ -2300,13 +2508,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "write"},
             )
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
 
             assert not any(event["type"] == "approval_request" for event in events)
@@ -2323,7 +2531,7 @@ class TestRunnerRemoteExec:
             assert payload["tool_diagnostics"][0]["kind"] == "tool_protocol_error"
             assert any(event["type"] == "error" for event in events)
             failed_events = [
-                event for event in events if event["type"] == "chat_failed"
+                event for event in events if event["type"] == "session_run_failed"
             ]
             assert failed_events
             assert failed_events[0]["payload"]["code"] == "REMOTE_PREVIEW_REQUIRED"
@@ -2367,13 +2575,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "write"},
             )
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
 
             assert not any(event["type"] == "approval_request" for event in events)
@@ -2387,7 +2595,7 @@ class TestRunnerRemoteExec:
             )
             assert protocol_events[0]["payload"]["tool_diagnostics"][0]["stage"] == "protocol"
             failed_events = [
-                event for event in events if event["type"] == "chat_failed"
+                event for event in events if event["type"] == "session_run_failed"
             ]
             assert failed_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
             assert failed_events[0]["payload"]["tool_diagnostics"][0]["stage"] == "chat"
@@ -2401,7 +2609,10 @@ class TestRunnerRemoteExec:
             decision = agent.approval_provider.request_approval(
                 ApprovalRequest(
                     tool_name="shell",
-                    tool_args={"command": "pwd"},
+                    tool_args={
+                        "command": "pwd",
+                        "intent": "查看当前工作目录。",
+                    },
                     tool_source="builtin",
                     reason="confirm shell",
                     metadata={"tool_call_id": "call-shell-1"},
@@ -2423,13 +2634,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "shell"},
             )
-            _, _cursor, events, _done = _chat_events_until(
+            _, _cursor, events, _done = _session_run_events_until(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
                 lambda event: event["type"] == "approval_request",
             )
             approval_payload = next(
@@ -2442,6 +2653,8 @@ class TestRunnerRemoteExec:
             )
             assert approval_payload is not None
             assert approval_payload["tool_name"] == "shell"
+            assert approval_payload["intent"] == "查看当前工作目录。"
+            assert approval_payload["tool_args"] == {"command": "pwd"}
             assert approval_payload["preview_unavailable"] is True
 
             _json_request(
@@ -2449,7 +2662,7 @@ class TestRunnerRemoteExec:
                 f"{runner._relay_http_service.base_url}/remote/approval/reply",
                 {
                     "peer_token": peer_token,
-                    "chat_id": start_body["chat_id"],
+                    "session_run_id": start_body["session_run_id"],
                     "approval_id": approval_payload["approval_id"],
                     "decision": "deny_once",
                 },
@@ -2457,7 +2670,7 @@ class TestRunnerRemoteExec:
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
             assert not any(
                 event["type"] == "tool_call_protocol_error" for event in events
@@ -2492,13 +2705,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "stream"},
             )
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
 
             assert not any(event["type"] == "tool_call_stream" for event in events)
@@ -2518,7 +2731,10 @@ class TestRunnerRemoteExec:
             decision = agent.approval_provider.request_approval(
                 ApprovalRequest(
                     tool_name="shell",
-                    tool_args={"command": "gitnexus --version"},
+                    tool_args={
+                        "command": "gitnexus --version",
+                        "intent": "查看 gitnexus 命令版本。",
+                    },
                     tool_source="builtin_tool",
                     reason="Tool 'shell' requires approval by policy",
                 )
@@ -2539,14 +2755,14 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "run shell"},
             )
 
-            _, _cursor, events, _done = _chat_events_until(
+            _, _cursor, events, _done = _session_run_events_until(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
                 lambda event: event["type"] == "approval_request",
             )
             approval_payload = next(
@@ -2561,10 +2777,10 @@ class TestRunnerRemoteExec:
 
             _, cancelled = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/cancel",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/cancel",
                 {
                     "peer_token": peer_token,
-                    "chat_id": start_body["chat_id"],
+                    "session_run_id": start_body["session_run_id"],
                     "reason": "user_cancelled",
                 },
             )
@@ -2573,10 +2789,10 @@ class TestRunnerRemoteExec:
             events = _collect_stream_events(
                 runner._relay_http_service.base_url,
                 peer_token,
-                start_body["chat_id"],
+                start_body["session_run_id"],
             )
             assert decisions == [(False, "user_cancelled")]
-            assert any(event["type"] == "chat_cancel_requested" for event in events)
+            assert any(event["type"] == "session_run_cancel_requested" for event in events)
             assert any(
                 event["type"] == "approval_resolved"
                 and event["payload"].get("approval_id")
@@ -2585,7 +2801,7 @@ class TestRunnerRemoteExec:
                 and event["payload"].get("reason") == "user_cancelled"
                 for event in events
             )
-            assert any(event["type"] == "chat_cancelled" for event in events)
+            assert any(event["type"] == "session_run_cancelled" for event in events)
         finally:
             runner.cleanup(ctx.agent)
 
@@ -2620,7 +2836,7 @@ class TestRunnerRemoteExec:
             def start_chat(label: str, token: str) -> None:
                 _, body = _json_request(
                     "POST",
-                    f"{runner._relay_http_service.base_url}/remote/chat/start",
+                    f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                     {"peer_token": token, "prompt": label},
                 )
                 starts[label] = body
@@ -2633,10 +2849,10 @@ class TestRunnerRemoteExec:
             t2.join(timeout=3)
 
             events_a = _collect_stream_events(
-                runner._relay_http_service.base_url, token_a, starts["alpha"]["chat_id"]
+                runner._relay_http_service.base_url, token_a, starts["alpha"]["session_run_id"]
             )
             events_b = _collect_stream_events(
-                runner._relay_http_service.base_url, token_b, starts["beta"]["chat_id"]
+                runner._relay_http_service.base_url, token_b, starts["beta"]["session_run_id"]
             )
 
             ready_a = [
@@ -2649,8 +2865,8 @@ class TestRunnerRemoteExec:
                 for event in events_b
                 if event["type"] == "remote_peer_ready"
             ][0]
-            end_a = [event for event in events_a if event["type"] == "chat_end"][-1]
-            end_b = [event for event in events_b if event["type"] == "chat_end"][-1]
+            end_a = [event for event in events_a if event["type"] == "session_run_end"][-1]
+            end_b = [event for event in events_b if event["type"] == "session_run_end"][-1]
 
             assert ready_a["peer_id"] == peer_a
             assert ready_b["peer_id"] == peer_b
@@ -2684,13 +2900,13 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
-            end_event = [event for event in events if event["type"] == "chat_end"][-1]
+            end_event = [event for event in events if event["type"] == "session_run_end"][-1]
             assert end_event["payload"]["response"] == f"cwd:{tmp_path}"
         finally:
             runner.cleanup(ctx.agent)
@@ -2723,11 +2939,11 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "hello"},
             )
             _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
 
             assert captured["target"] == "remote_peer"
@@ -2756,11 +2972,11 @@ class TestRunnerRemoteExec:
             )
             _, start_body = _json_request(
                 "POST",
-                f"{runner._relay_http_service.base_url}/remote/chat/start",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                 {"peer_token": peer_token, "prompt": "/help"},
             )
             events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, start_body["chat_id"]
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
             )
             view_events = [event for event in events if event["type"] == "view"]
             view_payloads = "\n".join(
@@ -2815,16 +3031,16 @@ class TestRunnerRemoteExec:
             for prompt in prompts:
                 _, start_body = _json_request(
                     "POST",
-                    f"{runner._relay_http_service.base_url}/remote/chat/start",
+                    f"{runner._relay_http_service.base_url}/remote/session-runs/start",
                     {"peer_token": peer_token, "prompt": prompt},
                 )
                 events = _collect_stream_events(
                     runner._relay_http_service.base_url,
                     peer_token,
-                    start_body["chat_id"],
+                    start_body["session_run_id"],
                 )
                 assert any(
-                    event["type"] == "chat_end"
+                    event["type"] == "session_run_end"
                     and event["payload"].get("response") == f"ok:{prompt}"
                     for event in events
                 )

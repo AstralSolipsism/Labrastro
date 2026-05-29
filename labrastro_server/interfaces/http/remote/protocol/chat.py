@@ -11,60 +11,7 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in value if isinstance(item, dict)]
 
 @dataclass
-class ChatRequest:
-    peer_token: str
-    prompt: str
-    mode: str | None = None
-    workflow_mode: str | None = None
-    taskflow_id: str | None = None
-    provider_id: str | None = None
-    model_id: str | None = None
-    parameters: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = {"peer_token": self.peer_token, "prompt": self.prompt}
-        if self.mode is not None:
-            payload["mode"] = self.mode
-        if self.workflow_mode is not None:
-            payload["workflow_mode"] = self.workflow_mode
-        if self.taskflow_id is not None:
-            payload["taskflow_id"] = self.taskflow_id
-        if self.provider_id is not None:
-            payload["provider_id"] = self.provider_id
-        if self.model_id is not None:
-            payload["model_id"] = self.model_id
-        if self.parameters:
-            payload["parameters"] = dict(self.parameters)
-        return payload
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatRequest":
-        parameters = d.get("parameters")
-        return cls(
-            peer_token=d["peer_token"],
-            prompt=d["prompt"],
-            mode=d.get("mode"),
-            workflow_mode=d.get("workflow_mode"),
-            taskflow_id=d.get("taskflow_id"),
-            provider_id=d.get("provider_id"),
-            model_id=d.get("model_id"),
-            parameters=parameters if isinstance(parameters, dict) else {},
-        )
-
-@dataclass
-class ChatResponse:
-    response: str
-    error: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"response": self.response, "error": self.error}
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatResponse":
-        return cls(response=d.get("response", ""), error=d.get("error"))
-
-@dataclass
-class ChatStartRequest:
+class SessionRunStartRequest:
     peer_token: str
     prompt: str
     session_hint: str | None = None
@@ -105,7 +52,7 @@ class ChatStartRequest:
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatStartRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunStartRequest":
         parameters = d.get("parameters")
         return cls(
             peer_token=d["peer_token"],
@@ -123,21 +70,21 @@ class ChatStartRequest:
         )
 
 @dataclass
-class ChatStartResponse:
-    chat_id: str
+class SessionRunStartResponse:
+    session_run_id: str
     session_id: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"chat_id": self.chat_id, "error": self.error}
+        payload: dict[str, Any] = {"session_run_id": self.session_run_id, "error": self.error}
         if self.session_id is not None:
             payload["session_id"] = self.session_id
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatStartResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunStartResponse":
         return cls(
-            chat_id=d.get("chat_id", ""),
+            session_run_id=d.get("session_run_id", ""),
             session_id=d.get("session_id") if isinstance(d.get("session_id"), str) else None,
             error=d.get("error"),
         )
@@ -224,31 +171,31 @@ class ChatCommandDispatchResponse:
         )
 
 @dataclass
-class ChatEventsRequest:
+class SessionRunEventsRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     cursor: int = 0
     timeout_sec: float = 30.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "cursor": self.cursor,
             "timeout_sec": self.timeout_sec,
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatEventsRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunEventsRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             cursor=int(d.get("cursor", 0)),
             timeout_sec=float(d.get("timeout_sec", 30.0)),
         )
 
 @dataclass
-class ChatEventsBatch:
+class SessionRunEventsBatch:
     events: list[dict[str, Any]] = field(default_factory=list)
     done: bool = False
     next_cursor: int = 0
@@ -263,7 +210,7 @@ class ChatEventsBatch:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatEventsBatch":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunEventsBatch":
         return cls(
             events=list(d.get("events", [])),
             done=bool(d.get("done", False)),
@@ -272,30 +219,30 @@ class ChatEventsBatch:
         )
 
 @dataclass
-class ChatStatusRequest:
+class SessionRunStatusRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     cursor: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "cursor": self.cursor,
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatStatusRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunStatusRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             cursor=int(d.get("cursor", 0)),
         )
 
 @dataclass
-class ChatStatusResponse:
+class SessionRunStatusResponse:
     ok: bool
-    chat_id: str
+    session_run_id: str
     status: str
     running: bool
     done: bool
@@ -320,7 +267,7 @@ class ChatStatusResponse:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "peer_id": self.peer_id,
             "status": self.status,
             "running": self.running,
@@ -344,10 +291,10 @@ class ChatStatusResponse:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatStatusResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunStatusResponse":
         return cls(
             ok=bool(d.get("ok", False)),
-            chat_id=str(d.get("chat_id", "")),
+            session_run_id=str(d.get("session_run_id", "")),
             peer_id=d.get("peer_id") if isinstance(d.get("peer_id"), str) else None,
             status=str(d.get("status", "")),
             running=bool(d.get("running", False)),
@@ -373,28 +320,28 @@ class ChatStatusResponse:
         )
 
 @dataclass
-class ChatCancelRequest:
+class SessionRunCancelRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "reason": self.reason,
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatCancelRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunCancelRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             reason=d.get("reason"),
         )
 
 @dataclass
-class ChatCancelResponse:
+class SessionRunCancelResponse:
     ok: bool
     error: str | None = None
 
@@ -402,13 +349,13 @@ class ChatCancelResponse:
         return {"ok": self.ok, "error": self.error}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatCancelResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunCancelResponse":
         return cls(ok=bool(d.get("ok", False)), error=d.get("error"))
 
 @dataclass
-class ChatFollowUpRequest:
+class SessionRunFollowUpRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     text: str
     followup_id: str | None = None
     client_request_id: str | None = None
@@ -416,7 +363,7 @@ class ChatFollowUpRequest:
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "text": self.text,
         }
         if self.followup_id is not None:
@@ -426,41 +373,41 @@ class ChatFollowUpRequest:
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatFollowUpRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunFollowUpRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             text=d["text"],
             followup_id=d.get("followup_id") or d.get("followupId"),
             client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
         )
 
 @dataclass
-class ChatFollowUpCancelRequest:
+class SessionRunFollowUpCancelRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     followup_id: str
     reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "followup_id": self.followup_id,
             "reason": self.reason,
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatFollowUpCancelRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunFollowUpCancelRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             followup_id=d.get("followup_id") or d.get("followupId"),
             reason=d.get("reason"),
         )
 
 @dataclass
-class ChatFollowUpResponse:
+class SessionRunFollowUpResponse:
     ok: bool
     followup_id: str | None = None
     state: str | None = None
@@ -475,7 +422,7 @@ class ChatFollowUpResponse:
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatFollowUpResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunFollowUpResponse":
         return cls(
             ok=bool(d.get("ok", False)),
             followup_id=d.get("followup_id") if isinstance(d.get("followup_id"), str) else None,
@@ -484,37 +431,37 @@ class ChatFollowUpResponse:
         )
 
 @dataclass
-class ChatRecoverRequest:
+class SessionRunRecoverRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     action: str = "continue"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "action": self.action,
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatRecoverRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunRecoverRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             action=str(d.get("action") or "continue"),
         )
 
 @dataclass
-class ChatRecoverResponse:
+class SessionRunRecoverResponse:
     ok: bool
-    chat_id: str
+    session_run_id: str
     state: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "ok": self.ok,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "error": self.error,
         }
         if self.state is not None:
@@ -522,10 +469,10 @@ class ChatRecoverResponse:
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ChatRecoverResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunRecoverResponse":
         return cls(
             ok=bool(d.get("ok", False)),
-            chat_id=str(d.get("chat_id") or ""),
+            session_run_id=str(d.get("session_run_id") or ""),
             state=d.get("state") if isinstance(d.get("state"), str) else None,
             error=d.get("error"),
         )
@@ -533,7 +480,7 @@ class ChatRecoverResponse:
 @dataclass
 class ApprovalReplyRequest:
     peer_token: str
-    chat_id: str
+    session_run_id: str
     approval_id: str
     decision: str
     reason: str | None = None
@@ -541,7 +488,7 @@ class ApprovalReplyRequest:
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "chat_id": self.chat_id,
+            "session_run_id": self.session_run_id,
             "approval_id": self.approval_id,
             "decision": self.decision,
             "reason": self.reason,
@@ -551,7 +498,7 @@ class ApprovalReplyRequest:
     def from_dict(cls, d: dict[str, Any]) -> "ApprovalReplyRequest":
         return cls(
             peer_token=d["peer_token"],
-            chat_id=d["chat_id"],
+            session_run_id=d["session_run_id"],
             approval_id=d["approval_id"],
             decision=d["decision"],
             reason=d.get("reason"),
@@ -580,21 +527,19 @@ class ApprovalReplyResponse:
 # ---------------------------------------------------------------------------
 
 __all__ = [
-    "ChatRequest",
-    "ChatResponse",
-    "ChatStartRequest",
-    "ChatStartResponse",
-    "ChatEventsRequest",
-    "ChatEventsBatch",
-    "ChatStatusRequest",
-    "ChatStatusResponse",
-    "ChatCancelRequest",
-    "ChatCancelResponse",
-    "ChatFollowUpRequest",
-    "ChatFollowUpCancelRequest",
-    "ChatFollowUpResponse",
-    "ChatRecoverRequest",
-    "ChatRecoverResponse",
+    "SessionRunStartRequest",
+    "SessionRunStartResponse",
+    "SessionRunEventsRequest",
+    "SessionRunEventsBatch",
+    "SessionRunStatusRequest",
+    "SessionRunStatusResponse",
+    "SessionRunCancelRequest",
+    "SessionRunCancelResponse",
+    "SessionRunFollowUpRequest",
+    "SessionRunFollowUpCancelRequest",
+    "SessionRunFollowUpResponse",
+    "SessionRunRecoverRequest",
+    "SessionRunRecoverResponse",
     "ApprovalReplyRequest",
     "ApprovalReplyResponse",
 ]

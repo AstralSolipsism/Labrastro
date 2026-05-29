@@ -19,22 +19,20 @@ from labrastro_server.interfaces.http.remote.helpers import (
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
-    ChatCancelRequest,
-    ChatCancelResponse,
+    SessionRunCancelRequest,
+    SessionRunCancelResponse,
     ChatCommandDispatchRequest,
-    ChatFollowUpCancelRequest,
-    ChatFollowUpRequest,
-    ChatFollowUpResponse,
-    ChatRecoverRequest,
-    ChatRecoverResponse,
-    ChatRequest,
-    ChatResponse,
-    ChatStartRequest,
-    ChatStartResponse,
-    ChatStatusRequest,
-    ChatStatusResponse,
-    ChatEventsRequest,
-    ChatEventsBatch,
+    SessionRunFollowUpCancelRequest,
+    SessionRunFollowUpRequest,
+    SessionRunFollowUpResponse,
+    SessionRunRecoverRequest,
+    SessionRunRecoverResponse,
+    SessionRunStartRequest,
+    SessionRunStartResponse,
+    SessionRunStatusRequest,
+    SessionRunStatusResponse,
+    SessionRunEventsRequest,
+    SessionRunEventsBatch,
     CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
@@ -65,7 +63,7 @@ from reuleauxcoder.interfaces.events import UIEventKind
 logger = logging.getLogger(__name__)
 
 
-def _chat_events_handler_error_payload(exc: Exception) -> dict[str, str]:
+def _session_run_events_handler_error_payload(exc: Exception) -> dict[str, str]:
     message = str(exc).strip()
     code = getattr(exc, "code", None)
     protocol_message = getattr(exc, "message", None)
@@ -75,8 +73,8 @@ def _chat_events_handler_error_payload(exc: Exception) -> dict[str, str]:
             "code": code,
         }
     if isinstance(exc, ValueError) and message.startswith("remote peer "):
-        return {"message": message, "code": "chat_handler_failed"}
-    return {"message": "chat_handler_failed", "code": "chat_handler_failed"}
+        return {"message": message, "code": "session_run_handler_failed"}
+    return {"message": "session_run_handler_failed", "code": "session_run_handler_failed"}
 
 
 def _sse_wait_timeout(timeout_sec: float) -> float:
@@ -86,7 +84,7 @@ def _sse_wait_timeout(timeout_sec: float) -> float:
 
 
 class RemoteChatRoutes:
-    def _has_chat_model_context(self, peer_id: str, req: ChatStartRequest) -> bool:
+    def _has_chat_model_context(self, peer_id: str, req: SessionRunStartRequest) -> bool:
         provider_id = str(req.provider_id or "").strip()
         model_id = str(req.model_id or "").strip()
         if provider_id and model_id:
@@ -125,25 +123,25 @@ class RemoteChatRoutes:
         ).strip()
         return bool(active_provider and active_model)
 
-    def _get_chat_control_session(self, peer_token: str, chat_id: str):
+    def _get_session_run_control(self, peer_token: str, session_run_id: str):
         control_peer_id = self.service.relay_server.token_manager.verify_peer_token(
             peer_token
         )
         if control_peer_id is None:
             self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return None
-        session = self.service._get_chat_session(chat_id)
+        session = self.service._get_session_run(session_run_id)
         if session is None:
-            self._send_error(HTTPStatus.NOT_FOUND, "chat_not_found")
+            self._send_error(HTTPStatus.NOT_FOUND, "session_run_not_found")
             return None
         return control_peer_id, session
 
-    def _handle_chat(self) -> None:
+    def _handle_session_run_start(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatRequest.from_dict(payload)
+            req = SessionRunStartRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_start_request")
             return
 
         peer_id = self.service.relay_server.token_manager.verify_peer_token(
@@ -152,110 +150,10 @@ class RemoteChatRoutes:
         if peer_id is None:
             self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
-
-        workflow_mode = (
-            str(req.workflow_mode).strip().lower()
-            if req.workflow_mode is not None
-            else None
-        )
-        if workflow_mode == "taskflow":
-            if self.service.chat_events_handler is None:
-                self._send_error(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "chat_events_unavailable",
-                )
-                return
-            session = self.service._create_chat_session(
-                peer_id,
-                mode=req.mode,
-                workflow_mode=workflow_mode,
-                taskflow_id=req.taskflow_id,
-                provider_id=req.provider_id,
-                model_id=req.model_id,
-                model_parameters=req.parameters,
-                locale=getattr(req, "locale", None),
-                mentions=getattr(req, "mentions", []),
-                initial_prompt=req.prompt,
-            )
-            session.append_event(
-                "chat_start",
-                {
-                    "prompt": req.prompt,
-                    "mode": req.mode,
-                    "workflow_mode": workflow_mode,
-                    "taskflow_id": req.taskflow_id,
-                    "provider_id": req.provider_id,
-                    "model_id": req.model_id,
-                    "locale": getattr(req, "locale", None),
-                    "mentions": getattr(req, "mentions", []),
-                },
-            )
-            session.mark_running()
-            with self.service._get_peer_chat_lock(peer_id):
-                try:
-                    self.service.chat_events_handler(peer_id, req.prompt, session)
-                except Exception as exc:
-                    logger.exception(
-                        "Remote chat handler failed",
-                        extra={"peer_id": peer_id, "chat_id": session.chat_id},
-                    )
-                    payload = _chat_events_handler_error_payload(exc)
-                    session.append_event("error", payload)
-                    session.append_event(
-                        "chat_failed",
-                        {**payload, "recoverable": False},
-                    )
-                finally:
-                    session.mark_done()
-            response_text = ""
-            error_text = None
-            for event in session.events:
-                if event["type"] == "chat_end":
-                    response_text = str(
-                        event.get("payload", {}).get("response") or ""
-                    )
-                if event["type"] == "error":
-                    error_text = str(
-                        event.get("payload", {}).get("message") or "error"
-                    )
-            self._send_json(
-                HTTPStatus.OK,
-                ChatResponse(
-                    response=response_text, error=error_text
-                ).to_dict(),
-            )
-            return
-
-        if self.service.chat_handler is None:
-            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "chat_unavailable")
-            return
-
-        with self.service._get_peer_chat_lock(peer_id):
-            try:
-                response = self.service.chat_handler(peer_id, req.prompt)
-            except Exception:
-                response = ChatResponse(response="", error="chat_handler_failed")
-
-        self._send_json(HTTPStatus.OK, response.to_dict())
-
-    def _handle_chat_start(self) -> None:
-        payload = self._read_json()
-        try:
-            req = ChatStartRequest.from_dict(payload)
-        except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_start_request")
-            return
-
-        peer_id = self.service.relay_server.token_manager.verify_peer_token(
-            req.peer_token
-        )
-        if peer_id is None:
-            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
-            return
-        if self.service.chat_events_handler is None:
+        if self.service.session_run_events_handler is None:
             self._send_error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "chat_events_unavailable",
+                "session_run_events_unavailable",
             )
             return
 
@@ -278,10 +176,10 @@ class RemoteChatRoutes:
                 self._send_error(
                     HTTPStatus.BAD_REQUEST,
                     "model_selection_required",
-                    "chat.start requires provider_id and model_id for a new chat session",
+                    "sessionRun.start requires provider_id and model_id for a new session run",
                 )
                 return
-        existing = self.service._get_chat_session_by_request(
+        existing = self.service._get_session_run_by_request(
             peer_id,
             req.session_hint,
             req.client_request_id,
@@ -289,13 +187,13 @@ class RemoteChatRoutes:
         if existing is not None:
             self._send_json(
                 HTTPStatus.OK,
-                ChatStartResponse(
-                    chat_id=existing.chat_id,
+                SessionRunStartResponse(
+                    session_run_id=existing.session_run_id,
                     session_id=existing.session_id,
                 ).to_dict(),
             )
             return
-        session = self.service._create_chat_session(
+        session = self.service._create_session_run(
             peer_id,
             req.session_hint,
             mode=req.mode,
@@ -310,7 +208,7 @@ class RemoteChatRoutes:
             initial_prompt=req.prompt,
         )
         session.append_event(
-            "chat_start",
+            "session_run_start",
             {
                 "prompt": req.prompt,
                 "mode": req.mode,
@@ -327,16 +225,16 @@ class RemoteChatRoutes:
         def _run_chat() -> None:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
-                    self.service.chat_events_handler(peer_id, req.prompt, session)
+                    self.service.session_run_events_handler(peer_id, req.prompt, session)
                 except Exception as exc:
                     logger.exception(
-                        "Remote chat handler failed",
-                        extra={"peer_id": peer_id, "chat_id": session.chat_id},
+                        "Remote session run handler failed",
+                        extra={"peer_id": peer_id, "session_run_id": session.session_run_id},
                     )
-                    payload = _chat_events_handler_error_payload(exc)
+                    payload = _session_run_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
-                        "chat_failed",
+                        "session_run_failed",
                         {**payload, "recoverable": False},
                     )
                 finally:
@@ -345,8 +243,8 @@ class RemoteChatRoutes:
         threading.Thread(target=_run_chat, daemon=True).start()
         self._send_json(
             HTTPStatus.OK,
-            ChatStartResponse(
-                chat_id=session.chat_id,
+            SessionRunStartResponse(
+                session_run_id=session.session_run_id,
                 session_id=session.session_id,
             ).to_dict(),
         )
@@ -380,15 +278,15 @@ class RemoteChatRoutes:
             result = self.service.chat_command_handler(peer_id, req)
         self._send_json(HTTPStatus.OK, result.to_dict())
 
-    def _handle_chat_events(self) -> None:
+    def _handle_session_run_events(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatEventsRequest.from_dict(payload)
+            req = SessionRunEventsRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_events_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_events_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         _control_peer_id, session = control
@@ -403,8 +301,8 @@ class RemoteChatRoutes:
                 )
                 if events or done:
                     self._write_sse_event(
-                        "chat",
-                        ChatEventsBatch(
+                        "session_run",
+                        SessionRunEventsBatch(
                             events=events, done=done, next_cursor=next_cursor
                         ).to_dict(),
                     )
@@ -436,65 +334,67 @@ class RemoteChatRoutes:
         self.wfile.write(f": {comment}\n\n".encode("utf-8"))
         self.wfile.flush()
 
-    def _handle_chat_status(self) -> None:
+    def _handle_session_run_status(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatStatusRequest.from_dict(payload)
+            req = SessionRunStatusRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_status_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_status_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         _control_peer_id, session = control
 
         self._send_json(
             HTTPStatus.OK,
-            ChatStatusResponse.from_dict(
+            SessionRunStatusResponse.from_dict(
                 session.status_payload(req.cursor)
             ).to_dict(),
         )
 
-    def _handle_chat_cancel(self) -> None:
+    def _handle_session_run_cancel(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatCancelRequest.from_dict(payload)
+            req = SessionRunCancelRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_cancel_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_cancel_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         _control_peer_id, session = control
 
-        reason = req.reason or "chat_cancelled"
-        first_request = session.request_cancel(reason)
+        reason = req.reason or "session_run_cancelled"
+        first_request, resolved_approvals = session.request_cancel(reason)
         if first_request:
             session.append_event(
-                "chat_cancel_requested", {"reason": reason}
+                "session_run_cancel_requested", {"reason": reason}
             )
-            session.append_event("chat_cancelled", {"reason": reason})
-            session.mark_done()
+            for event_payload in resolved_approvals:
+                session.append_event("approval_resolved", event_payload)
+            session.append_event("session_run_cancelled", {"reason": reason})
+            session.mark_done(reason)
         self._send_json(
-            HTTPStatus.OK, ChatCancelResponse(ok=True).to_dict()
+            HTTPStatus.OK, SessionRunCancelResponse(ok=True).to_dict()
         )
 
-    def _handle_chat_follow_up(self) -> None:
+    def _handle_session_run_follow_up(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatFollowUpRequest.from_dict(payload)
+            req = SessionRunFollowUpRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_follow_up_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_follow_up_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         _control_peer_id, session = control
         if session.done or not session.running:
-            self._send_error(HTTPStatus.CONFLICT, "chat_not_running")
+            self._send_error(HTTPStatus.CONFLICT, "session_run_not_running")
             return
         try:
             ticket = session.submit_follow_up(
@@ -507,33 +407,33 @@ class RemoteChatRoutes:
             return
         self._send_json(
             HTTPStatus.OK,
-            ChatFollowUpResponse(
+            SessionRunFollowUpResponse(
                 ok=True,
                 followup_id=str(ticket.get("followup_id") or ""),
                 state=str(ticket.get("state") or "pending"),
             ).to_dict(),
         )
 
-    def _handle_chat_recover(self) -> None:
+    def _handle_session_run_recover(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatRecoverRequest.from_dict(payload)
+            req = SessionRunRecoverRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_recover_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_recover_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         peer_id, session = control
-        if self.service.chat_events_handler is None:
+        if self.service.session_run_events_handler is None:
             self._send_error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "chat_events_unavailable",
+                "session_run_events_unavailable",
             )
             return
         if session.running:
-            self._send_error(HTTPStatus.CONFLICT, "chat_already_running")
+            self._send_error(HTTPStatus.CONFLICT, "session_run_already_running")
             return
         try:
             prompt, ticket = session.consume_recovery(req.action)
@@ -541,7 +441,7 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.CONFLICT, str(exc) or "recovery_not_available")
             return
         session.append_event(
-            "chat_recovery_start",
+            "session_run_recovery_start",
             {
                 "recovery_id": ticket.get("recovery_id"),
                 "action": ticket.get("action"),
@@ -551,16 +451,16 @@ class RemoteChatRoutes:
         def _run_recovery() -> None:
             with self.service._get_peer_chat_lock(peer_id):
                 try:
-                    self.service.chat_events_handler(peer_id, prompt, session)
+                    self.service.session_run_events_handler(peer_id, prompt, session)
                 except Exception as exc:
                     logger.exception(
-                        "Remote chat recovery handler failed",
-                        extra={"peer_id": peer_id, "chat_id": session.chat_id},
+                        "Remote session run recovery handler failed",
+                        extra={"peer_id": peer_id, "session_run_id": session.session_run_id},
                     )
-                    payload = _chat_events_handler_error_payload(exc)
+                    payload = _session_run_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(
-                        "chat_failed",
+                        "session_run_failed",
                         {**payload, "recoverable": False},
                     )
                 finally:
@@ -569,22 +469,22 @@ class RemoteChatRoutes:
         threading.Thread(target=_run_recovery, daemon=True).start()
         self._send_json(
             HTTPStatus.OK,
-            ChatRecoverResponse(
+            SessionRunRecoverResponse(
                 ok=True,
-                chat_id=session.chat_id,
+                session_run_id=session.session_run_id,
                 state=str(ticket.get("state") or "consumed"),
             ).to_dict(),
         )
 
-    def _handle_chat_follow_up_cancel(self) -> None:
+    def _handle_session_run_follow_up_cancel(self) -> None:
         payload = self._read_json()
         try:
-            req = ChatFollowUpCancelRequest.from_dict(payload)
+            req = SessionRunFollowUpCancelRequest.from_dict(payload)
         except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_chat_follow_up_cancel_request")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_follow_up_cancel_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         _control_peer_id, session = control
@@ -597,7 +497,7 @@ class RemoteChatRoutes:
             return
         self._send_json(
             HTTPStatus.OK,
-            ChatFollowUpResponse(
+            SessionRunFollowUpResponse(
                 ok=True,
                 followup_id=req.followup_id,
                 state="cancelled",
@@ -612,7 +512,7 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_approval_reply_request")
             return
 
-        control = self._get_chat_control_session(req.peer_token, req.chat_id)
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
         _control_peer_id, session = control

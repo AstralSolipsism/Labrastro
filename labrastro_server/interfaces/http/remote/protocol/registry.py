@@ -1,4 +1,4 @@
-﻿"""Registry for the HTTP remote control-plane contract."""
+"""Registry for the HTTP remote control-plane contract."""
 
 from __future__ import annotations
 
@@ -49,15 +49,14 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("sessions.delete", "POST", "/remote/sessions/delete", "SessionDeleteRequest", "Ok", "peer_token"),
     RemoteEndpoint("sessions.fork", "POST", "/remote/sessions/fork", "SessionForkRequest", "SessionLoadResponse", "peer_token"),
     RemoteEndpoint("sessions.model", "POST", "/remote/sessions/model", "SessionModelSwitchRequest", "Ok", "peer_token"),
-    RemoteEndpoint("chat.once", "POST", "/remote/chat", "ChatRequest", "ChatResponse", "peer_token"),
-    RemoteEndpoint("chat.start", "POST", "/remote/chat/start", "ChatStartRequest", "ChatStartResponse", "peer_token"),
+    RemoteEndpoint("session_run.start", "POST", "/remote/session-runs/start", "SessionRunStartRequest", "SessionRunStartResponse", "peer_token"),
     RemoteEndpoint("chat.command_dispatch", "POST", "/remote/chat/command", "ChatCommandDispatchRequest", "ChatCommandDispatchResponse", "peer_token"),
-    RemoteEndpoint("chat.events", "POST", "/remote/chat/events", "ChatEventsRequest", "ChatEventsBatch", "peer_token"),
-    RemoteEndpoint("chat.status", "POST", "/remote/chat/status", "ChatStatusRequest", "ChatStatusResponse", "peer_token"),
-    RemoteEndpoint("chat.recover", "POST", "/remote/chat/recover", "ChatRecoverRequest", "ChatRecoverResponse", "peer_token"),
-    RemoteEndpoint("chat.cancel", "POST", "/remote/chat/cancel", "ChatCancelRequest", "ChatCancelResponse", "peer_token"),
-    RemoteEndpoint("chat.follow_up", "POST", "/remote/chat/follow-up", "ChatFollowUpRequest", "ChatFollowUpResponse", "peer_token"),
-    RemoteEndpoint("chat.follow_up_cancel", "POST", "/remote/chat/follow-up/cancel", "ChatFollowUpCancelRequest", "ChatFollowUpResponse", "peer_token"),
+    RemoteEndpoint("session_run.events", "POST", "/remote/session-runs/events", "SessionRunEventsRequest", "SessionRunEventsBatch", "peer_token"),
+    RemoteEndpoint("session_run.status", "POST", "/remote/session-runs/status", "SessionRunStatusRequest", "SessionRunStatusResponse", "peer_token"),
+    RemoteEndpoint("session_run.recover", "POST", "/remote/session-runs/recover", "SessionRunRecoverRequest", "SessionRunRecoverResponse", "peer_token"),
+    RemoteEndpoint("session_run.cancel", "POST", "/remote/session-runs/cancel", "SessionRunCancelRequest", "SessionRunCancelResponse", "peer_token"),
+    RemoteEndpoint("session_run.follow_up", "POST", "/remote/session-runs/follow-up", "SessionRunFollowUpRequest", "SessionRunFollowUpResponse", "peer_token"),
+    RemoteEndpoint("session_run.follow_up_cancel", "POST", "/remote/session-runs/follow-up/cancel", "SessionRunFollowUpCancelRequest", "SessionRunFollowUpResponse", "peer_token"),
     RemoteEndpoint("chat.approval_reply", "POST", "/remote/approval/reply", "ApprovalReplyRequest", "ApprovalReplyResponse", "peer_token"),
     RemoteEndpoint("agent_runs.events", "GET", "/remote/agent-runs/{agent_run_id}/events", "AgentRunEventsQuery", "AgentRunEventsResponse", "peer_token"),
     RemoteEndpoint("agent_runs.claim", "POST", "/remote/agent-runs/claim", "AgentRunClaimRequest", "AgentRunClaimResponse", "peer_token"),
