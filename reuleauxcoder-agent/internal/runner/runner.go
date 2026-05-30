@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -28,6 +30,9 @@ import (
 var (
 	errExecutableNotFound = errors.New("executable not found")
 	lookPathExecutable    = exec.LookPath
+	pollRequestTimeout    = 30 * time.Second
+	pollRetryMinDelay     = 500 * time.Millisecond
+	pollRetryMaxDelay     = 10 * time.Second
 )
 
 type Config struct {
@@ -259,6 +264,12 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 			req = resolved.Request
 		}
 		if resolveErr == nil {
+			if strings.EqualFold(resolved.Request.ModelRequestOrigin, "server") {
+				resolved.Options.RemoteBaseURL = r.cfg.Host
+				resolved.Options.PeerToken = peerToken
+				resolved.Options.AgentRunRequestID = claim.RequestID
+				resolved.Options.AgentRunWorkerID = workerID
+			}
 			if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, agentruntime.Event{
 				Type: agentruntime.EventStatus,
 				Data: map[string]any{
@@ -622,6 +633,7 @@ func runtimeUsage(usage map[string]agentruntime.TokenUsage) map[string]any {
 }
 
 func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd, workspaceRoot string, pollInterval time.Duration) error {
+	retry := pollRetryBackoff{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -629,16 +641,30 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd, workspaceRoot 
 		default:
 		}
 
-		pollCtx, cancelPoll := context.WithTimeout(ctx, 30*time.Second)
+		pollCtx, cancelPoll := context.WithTimeout(ctx, pollRequestTimeout)
 		env, err := r.client.Poll(pollCtx, protocol.PollRequest{PeerToken: peerToken})
 		cancelPoll()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if isTransientPollError(err) {
+				attempt, delay := retry.recordFailure(pollInterval)
+				log.Printf("poll transient error: %v (attempt=%d retry_in=%s)", err, attempt, delay)
+				if !sleepWithContext(ctx, delay) {
+					return nil
+				}
+				continue
+			}
 			return fmt.Errorf("poll failed: %w", err)
 		}
+		retry.reset()
 
 		switch env.Type {
 		case "noop", "":
-			time.Sleep(pollInterval)
+			if !sleepWithContext(ctx, pollInterval) {
+				return nil
+			}
 			continue
 		case "exec_tool":
 			execReq, err := protocol.DecodeExecToolRequest(env.Payload)
@@ -718,8 +744,93 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd, workspaceRoot 
 			}
 		default:
 			log.Printf("ignoring unsupported envelope type=%s", env.Type)
-			time.Sleep(pollInterval)
+			if !sleepWithContext(ctx, pollInterval) {
+				return nil
+			}
 		}
+	}
+}
+
+type pollRetryBackoff struct {
+	attempt int
+	delay   time.Duration
+}
+
+func (b *pollRetryBackoff) recordFailure(pollInterval time.Duration) (int, time.Duration) {
+	b.attempt++
+	if b.delay <= 0 {
+		b.delay = pollRetryMinDelay
+		if pollInterval > b.delay {
+			b.delay = pollInterval
+		}
+	} else {
+		b.delay *= 2
+		if b.delay > pollRetryMaxDelay {
+			b.delay = pollRetryMaxDelay
+		}
+	}
+	return b.attempt, b.delay
+}
+
+func (b *pollRetryBackoff) reset() {
+	b.attempt = 0
+	b.delay = 0
+}
+
+func isTransientPollError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var httpErr *client.HTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusRequestTimeout,
+			http.StatusTooManyRequests,
+			http.StatusInternalServerError,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout,
+			521, 522, 523, 524:
+			return true
+		default:
+			return false
+		}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ETIMEDOUT) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "tls: bad record mac") ||
+		strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "i/o timeout") ||
+		strings.Contains(message, "temporary failure") ||
+		strings.Contains(message, "server misbehaving")
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

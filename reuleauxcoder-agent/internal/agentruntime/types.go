@@ -54,17 +54,21 @@ type RunRequest struct {
 }
 
 type RunOptions struct {
-	Timeout          time.Duration
-	Command          string
-	SystemPrompt     string
-	ExtraArgs        []string
-	CustomArgs       []string
-	Env              map[string]string
-	ApprovalMode     string
-	MCPConfigJSON    []byte
-	RuntimeHome      string
-	SemanticIdleTime time.Duration
-	EventSink        func(Event)
+	Timeout           time.Duration
+	Command           string
+	SystemPrompt      string
+	ExtraArgs         []string
+	CustomArgs        []string
+	Env               map[string]string
+	ApprovalMode      string
+	MCPConfigJSON     []byte
+	RuntimeHome       string
+	SemanticIdleTime  time.Duration
+	EventSink         func(Event)
+	RemoteBaseURL     string
+	PeerToken         string
+	AgentRunRequestID string
+	AgentRunWorkerID  string
 }
 
 type RunResult struct {

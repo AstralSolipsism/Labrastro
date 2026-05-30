@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -97,5 +98,31 @@ func TestSessionRunEventsReturnsHTTPError(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("SessionRunEvents returned nil error")
+	}
+}
+
+func TestPollReturnsStructuredHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL).Poll(
+		context.Background(),
+		protocol.PollRequest{PeerToken: "peer-token"},
+	)
+	if err == nil {
+		t.Fatal("Poll returned nil error")
+	}
+
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error = %T %[1]v, want HTTPError", err)
+	}
+	if httpErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", httpErr.StatusCode, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(httpErr.Body, "service unavailable") {
+		t.Fatalf("body = %q, want service unavailable", httpErr.Body)
 	}
 }

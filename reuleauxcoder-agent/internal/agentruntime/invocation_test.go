@@ -146,6 +146,73 @@ func TestBuildReuleauxCoderInvocationUsesOneShotPrompt(t *testing.T) {
 	}
 }
 
+func TestBuildReuleauxCoderInvocationUsesServerOriginConfig(t *testing.T) {
+	inv, err := BuildInvocation(RunRequest{
+		TaskID:             "run-1",
+		Executor:           "reuleauxcoder",
+		Prompt:             "package repo",
+		Model:              "deepseek-v4-pro",
+		ModelRequestOrigin: "server",
+		Metadata: map[string]any{
+			"model_binding": map[string]any{
+				"provider": "deepseek",
+				"model":    "deepseek-v4-pro",
+				"parameters": map[string]any{
+					"max_tokens":         384000,
+					"max_context_tokens": 1000000,
+					"temperature":        0.2,
+				},
+			},
+		},
+	}, RunOptions{
+		RemoteBaseURL:     "http://127.0.0.1:8765/",
+		PeerToken:         "peer-token",
+		AgentRunRequestID: "claim-1",
+		AgentRunWorkerID:  "worker-1",
+		CustomArgs:        []string{"--config", "/tmp/hijack.yaml", "--debug"},
+	})
+	if err != nil {
+		t.Fatalf("BuildInvocation error: %v", err)
+	}
+	defer inv.Cleanup()
+	if inv.Env["RCODER_CONFIG_PATH"] == "" {
+		t.Fatalf("RCODER_CONFIG_PATH missing: %#v", inv.Env)
+	}
+	if inv.Env["LABRASTRO_REMOTE_BASE_URL"] != "http://127.0.0.1:8765" {
+		t.Fatalf("remote base url = %q", inv.Env["LABRASTRO_REMOTE_BASE_URL"])
+	}
+	if inv.Env["LABRASTRO_PEER_TOKEN"] != "peer-token" ||
+		inv.Env["LABRASTRO_AGENT_RUN_ID"] != "run-1" ||
+		inv.Env["LABRASTRO_AGENT_RUN_REQUEST_ID"] != "claim-1" ||
+		inv.Env["LABRASTRO_AGENT_RUN_WORKER_ID"] != "worker-1" {
+		t.Fatalf("server-origin env not populated: %#v", inv.Env)
+	}
+	raw, err := os.ReadFile(inv.Env["RCODER_CONFIG_PATH"])
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	config := string(raw)
+	for _, want := range []string{
+		`"type": "labrastro_server"`,
+		`"model": "deepseek-v4-pro"`,
+		`"max_tokens": 384000`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("generated config missing %s:\n%s", want, config)
+		}
+	}
+	if strings.Contains(config, "peer-token") || strings.Contains(config, "api_key") {
+		t.Fatalf("generated config leaked secret material:\n%s", config)
+	}
+	joined := strings.Join(inv.Args, " ")
+	if strings.Contains(joined, "/tmp/hijack.yaml") || !strings.Contains(joined, "--debug") {
+		t.Fatalf("server-origin args not filtered as expected: %v", inv.Args)
+	}
+	if !strings.Contains(joined, "--model agent-run") || strings.Contains(joined, "deepseek-v4-pro") {
+		t.Fatalf("server-origin args must select generated profile, got: %v", inv.Args)
+	}
+}
+
 func TestBuildInvocationRejectsUnsupportedExecutor(t *testing.T) {
 	_, err := BuildInvocation(RunRequest{Executor: "unknown-cli"}, RunOptions{})
 	if err == nil || !strings.Contains(err.Error(), "unsupported executor") {

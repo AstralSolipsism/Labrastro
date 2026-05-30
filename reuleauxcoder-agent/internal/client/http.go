@@ -19,6 +19,18 @@ type HTTPClient struct {
 	http    *http.Client
 }
 
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("http %d", e.StatusCode)
+	}
+	return fmt.Sprintf("http %d: %s", e.StatusCode, e.Body)
+}
+
 func New(baseURL string) *HTTPClient {
 	return &HTTPClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -84,7 +96,7 @@ func (c *HTTPClient) SessionRunEvents(ctx context.Context, reqBody protocol.Sess
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return &HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 
 	reader := bufio.NewReader(resp.Body)
@@ -146,7 +158,7 @@ func (c *HTTPClient) DownloadMCPArtifact(ctx context.Context, peerToken, artifac
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return body, nil
 }
@@ -253,7 +265,7 @@ func (c *HTTPClient) postJSON(ctx context.Context, path string, reqBody any, out
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return &HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	if out == nil || len(body) == 0 {
 		return nil
