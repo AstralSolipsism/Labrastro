@@ -73,7 +73,7 @@ class DockerSandboxProvider:
             raise KeyError(f"sandbox not found: {sandbox_id}")
         profile = _profile_from_runtime(runtime_profile)
         session_id = f"ssn-{_digest(agent_run_id + sandbox_id)}"
-        name = f"ezcode-{session_id}"
+        name = f"labrastro-{session_id}"
         command = [
             self.worker_command,
             "--host",
@@ -205,7 +205,7 @@ def _profile_from_runtime(runtime_profile: dict[str, Any]) -> SandboxProfile:
         cpu_limit=str(sandbox.get("cpu_limit") or ""),
         memory_limit=str(sandbox.get("memory_limit") or ""),
         network=str(sandbox.get("network") or ""),
-        workspace_volume_prefix=str(sandbox.get("workspace_volume_prefix") or "ezcode-workspace"),
+        workspace_volume_prefix=str(sandbox.get("workspace_volume_prefix") or "labrastro-workspace"),
         idle_ttl_seconds=int(sandbox.get("idle_ttl_seconds") or 3600),
         env={str(k): str(v) for k, v in dict(sandbox.get("env") or {}).items()},
     )

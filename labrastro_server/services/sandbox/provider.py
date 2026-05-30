@@ -18,7 +18,7 @@ class SandboxProfile:
     cpu_limit: str = ""
     memory_limit: str = ""
     network: str = ""
-    workspace_volume_prefix: str = "ezcode-workspace"
+    workspace_volume_prefix: str = "labrastro-workspace"
     idle_ttl_seconds: int = 3600
     env: dict[str, str] = field(default_factory=dict)
 

@@ -94,7 +94,7 @@ SMOKE_AUTH_RE = re.compile(
 SMOKE_PERSISTENCE_RE = re.compile(
     r"\n# agent_run_e2e_smoke(?:_persistence)? [^\n]+\npersistence:\n(?:  .*(?:\n|$))*"
 )
-DEFAULT_SMOKE_DATABASE = "ezcode_smoke"
+DEFAULT_SMOKE_DATABASE = "labrastro_smoke"
 
 
 def utc_timestamp() -> str:

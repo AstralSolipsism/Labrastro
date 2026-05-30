@@ -1107,6 +1107,7 @@ class RuntimeProfileConfig:
     config_isolation: str = ""
     credential_refs: dict[str, str] = field(default_factory=dict)
     mcp: dict[str, Any] = field(default_factory=dict)
+    sandbox: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(
@@ -1145,6 +1146,7 @@ class RuntimeProfileConfig:
             config_isolation=str(data.get("config_isolation", "") or ""),
             credential_refs=_string_dict(data.get("credential_refs", {})),
             mcp=_dict_value(data.get("mcp", {})),
+            sandbox=sandbox,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1172,6 +1174,8 @@ class RuntimeProfileConfig:
             result["credential_refs"] = dict(self.credential_refs)
         if self.mcp:
             result["mcp"] = dict(self.mcp)
+        if self.sandbox or self.worker_kind == WorkerKind.SANDBOX_WORKER:
+            result["sandbox"] = dict(self.sandbox)
         return result
 
 

@@ -16,10 +16,10 @@ def _args(tmp_path: Path, *, database_name: str | None = None) -> SimpleNamespac
     return SimpleNamespace(
         timestamp="20260508T000000Z",
         root=str(tmp_path),
-        host_container="ezcode-host",
+        host_container="labrastro-host",
         pg_container="Postgresql",
         pg_user="user_rBrNr5",
-        pg_password_env="EZCODE_PG_PASSWORD",
+        pg_password_env="LABRASTRO_PG_PASSWORD",
         database_name=database_name,
     )
 
@@ -43,10 +43,10 @@ def test_create_database_recreates_smoke_database(tmp_path: Path) -> None:
     dsn = runner.create_database()
 
     assert calls[:2] == [
-        ("DROP DATABASE IF EXISTS ezcode_smoke WITH (FORCE)", "postgres"),
-        ("CREATE DATABASE ezcode_smoke", "postgres"),
+        ("DROP DATABASE IF EXISTS labrastro_smoke WITH (FORCE)", "postgres"),
+        ("CREATE DATABASE labrastro_smoke", "postgres"),
     ]
-    assert dsn.endswith("/ezcode_smoke")
+    assert dsn.endswith("/labrastro_smoke")
 
 
 def test_required_tables_match_current_taskflow_snapshot_schema() -> None:

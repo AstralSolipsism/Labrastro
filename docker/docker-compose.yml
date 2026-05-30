@@ -18,12 +18,12 @@ services:
     tty: true
     stdin_open: true
     networks:
-      - ezcode-net
+      - labrastro-net
       - labrastro-data-net
 
 networks:
-  ezcode-net:
-    name: ezcode-net
+  labrastro-net:
+    name: labrastro-net
   labrastro-data-net:
     name: ${LABRASTRO_DOCKER_EXTERNAL_NETWORK:-1panel-network}
     external: true

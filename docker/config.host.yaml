@@ -79,8 +79,8 @@ sandbox_provider:
   type: docker
   host_base_url: ${LABRASTRO_SANDBOX_HOST_BASE_URL}
   worker_image: labrastro-host:test
-  workspace_volume_root: ezcode-workspaces
-  network: ezcode-net
+  workspace_volume_root: labrastro-workspaces
+  network: labrastro-net
   idle_ttl_seconds: 3600
   retention_days: 0
 

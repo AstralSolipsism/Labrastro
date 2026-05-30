@@ -807,7 +807,7 @@ class ConfigLoader:
                 "type": "docker",
                 "host_base_url": "http://labrastro-host:8765",
                 "worker_image": "labrastro-host:test",
-                "workspace_volume_root": "ezcode-workspaces",
+                "workspace_volume_root": "labrastro-workspaces",
                 "network": "",
                 "idle_ttl_seconds": 3600,
             },

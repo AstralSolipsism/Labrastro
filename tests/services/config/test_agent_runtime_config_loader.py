@@ -137,7 +137,33 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     assert "agent_remote" in config.runtime_profiles.profiles
     assert "environment_configurator" in config.agent_registry.agents
     assert "capability_packager_remote" in config.runtime_profiles.profiles
+    packager_profile = config.runtime_profiles.profiles["capability_packager_remote"]
+    assert packager_profile.worker_kind.value == "sandbox_worker"
+    assert packager_profile.sandbox == {}
     assert "capability_packager" in config.agent_registry.agents
+
+
+def test_parse_config_forces_capability_packager_sandbox_worker_profile() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            **_model_config(),
+            "runtime_profiles": {
+                "capability_packager_remote": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                    "sandbox": {"workspace_volume_prefix": "old-workspaces"},
+                }
+            },
+        }
+    )
+
+    profile = config.runtime_profiles.profiles["capability_packager_remote"]
+    assert profile.executor.value == "reuleauxcoder"
+    assert profile.execution_location.value == "remote_server"
+    assert profile.worker_kind.value == "sandbox_worker"
+    assert profile.model_request_origin.value == "server"
+    assert profile.sandbox == {}
 
 
 def test_parse_config_injects_environment_configurator_by_default() -> None:

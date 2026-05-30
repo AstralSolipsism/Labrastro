@@ -19,8 +19,8 @@ def test_docker_sandbox_provider_builds_room_and_session_in_dry_run() -> None:
         dry_run=True,
     )
     profile = SandboxProfile(
-        image="ezcode-worker:test",
-        network="ezcode-net",
+        image="labrastro-worker:test",
+        network="labrastro-net",
         memory_limit="1g",
         cpu_limit="1.5",
     )
@@ -30,8 +30,8 @@ def test_docker_sandbox_provider_builds_room_and_session_in_dry_run() -> None:
         sandbox.id,
         {
             "sandbox": {
-                "image": "ezcode-worker:test",
-                "network": "ezcode-net",
+                "image": "labrastro-worker:test",
+                "network": "labrastro-net",
                 "memory_limit": "1g",
                 "cpu_limit": "1.5",
             }
@@ -42,9 +42,10 @@ def test_docker_sandbox_provider_builds_room_and_session_in_dry_run() -> None:
     execution = provider.exec_agent_run(session.id, {"agent_id": "coder"})
 
     assert sandbox.id.startswith("sbx-")
-    assert sandbox.volume_name.startswith("ezcode-workspace-")
+    assert sandbox.volume_name.startswith("labrastro-workspace-")
     assert session.sandbox_id == sandbox.id
     assert session.agent_run_id == "run-1"
+    assert session.metadata["container_name"].startswith("labrastro-ssn-")
     assert mount.path == "/workspace"
     assert execution.status == "dispatched"
     assert provider.stop_session(session.id) is True
@@ -102,14 +103,16 @@ class _FakeSandboxProvider:
         return {"ok": True}
 
 
-def test_control_plane_starts_sandbox_session_for_agent_run_and_stops_on_complete() -> None:
+def test_control_plane_starts_sandbox_session_for_sandbox_worker_run_and_stops_on_complete() -> None:
     provider = _FakeSandboxProvider()
     control = AgentRunControlPlane(
         runtime_snapshot={
             "runtime_profiles": {
                 "docker_profile": {
                     "executor": "reuleauxcoder",
-                    "execution_location": "local_workspace",
+                    "execution_location": "remote_server",
+                    "worker_kind": "sandbox_worker",
+                    "sandbox": {},
                 }
             },
             "agents": {"coder": {"runtime_profile": "docker_profile"}},
@@ -143,8 +146,9 @@ def test_control_plane_starts_sandbox_session_for_agent_run_and_stops_on_complet
 
     claim = control.claim_agent_run(
         worker_id="ssn-run-1",
+        worker_kind="sandbox_worker",
         executors=["reuleauxcoder"],
-        peer_features=["agent_runs.local_workspace"],
+        peer_features=["agent_runs.remote_server", "worker_kind:sandbox_worker"],
         workspace_root="/workspace",
     )
 
@@ -159,11 +163,52 @@ def test_control_plane_starts_sandbox_session_for_agent_run_and_stops_on_complet
     assert provider.stopped == ["ssn-run-1"]
 
 
+def test_control_plane_does_not_start_sandbox_for_server_worker_run() -> None:
+    provider = _FakeSandboxProvider()
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "server_profile": {
+                    "executor": "reuleauxcoder",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
+            "agents": {"coder": {"runtime_profile": "server_profile"}},
+        },
+        sandbox_provider=provider,
+        sandbox_profile=SandboxProfile(image="worker:test"),
+    )
+
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="manual",
+            agent_id="coder",
+            prompt="hello",
+            metadata={"workspace_root": "G:/repo"},
+        ),
+        task_id="run-server-worker",
+    )
+
+    assert provider.calls == []
+    assert task.sandbox_id is None
+    assert task.sandbox_session_id is None
+    assert task.workdir is None
+    assert task.metadata["worker_kind"] == "server_worker"
+
+
 def test_control_plane_cancels_sandbox_session_and_marks_agent_run_cancelled() -> None:
     provider = _FakeSandboxProvider()
     control = AgentRunControlPlane(
         runtime_snapshot={
-            "runtime_profiles": {"docker_profile": {"executor": "reuleauxcoder"}},
+            "runtime_profiles": {
+                "docker_profile": {
+                    "executor": "reuleauxcoder",
+                    "execution_location": "remote_server",
+                    "worker_kind": "sandbox_worker",
+                    "sandbox": {},
+                }
+            },
             "agents": {"coder": {"runtime_profile": "docker_profile"}},
         },
         sandbox_provider=provider,
