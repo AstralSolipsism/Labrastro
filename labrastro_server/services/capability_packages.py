@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
+import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
@@ -271,15 +273,43 @@ class CapabilityPackagerRunner:
         *,
         evidence_bundle: EvidenceBundle,
         workspace_root: str = "",
+        agent_run_metadata: dict[str, Any] | None = None,
+        revision_draft: dict[str, Any] | None = None,
+        revision_instruction: str = "",
     ) -> AgentRunRecord:
         bundle = evidence_bundle.to_dict()
-        prompt = _render_packager_prompt(bundle=bundle)
+        prompt = _render_packager_prompt(
+            bundle=bundle,
+            revision_draft=revision_draft,
+            revision_instruction=revision_instruction,
+        )
         metadata = {
             "workflow": CAPABILITY_INGEST_WORKFLOW,
             "agent_run_source": "capability_ingest",
             "capability_source": evidence_bundle.source,
             "source_bundle": bundle,
         }
+        for key in (
+            "session_id",
+            "session_run_id",
+            "client_request_id",
+            "workflow_mode",
+            "revision_of_agent_run_id",
+            "revision_followup_id",
+        ):
+            value = (agent_run_metadata or {}).get(key)
+            if value is not None and str(value).strip():
+                metadata[key] = str(value)
+        revision_text = str(
+            (agent_run_metadata or {}).get("revision_instruction")
+            or revision_instruction
+            or ""
+        ).strip()
+        if revision_text:
+            metadata["revision_instruction"] = revision_text
+        source_url = str(evidence_bundle.source.get("url") or "").strip()
+        if evidence_bundle.source.get("type") == "github_repo" and source_url:
+            metadata["repo_url"] = source_url
         if workspace_root:
             metadata["workspace_root"] = workspace_root
         return self.runtime_control_plane.submit_agent_run(
@@ -716,7 +746,14 @@ class CapabilityPackageIngestService:
         )
         self.draft_validator = draft_validator or CapabilityDraftValidator()
 
-    def start(self, payload: dict[str, Any]) -> CapabilityPackageIngestResult:
+    def start(
+        self,
+        payload: dict[str, Any],
+        *,
+        agent_run_metadata: dict[str, Any] | None = None,
+        revision_draft: dict[str, Any] | None = None,
+        revision_instruction: str = "",
+    ) -> CapabilityPackageIngestResult:
         raw_source = payload.get("source")
         source_payload: dict[str, Any] = raw_source if isinstance(raw_source, dict) else payload
         evidence_bundle = self.collector.collect(source_payload)
@@ -724,6 +761,9 @@ class CapabilityPackageIngestService:
         agent_run = self.packager_runner.start(
             evidence_bundle=evidence_bundle,
             workspace_root=workspace_root,
+            agent_run_metadata=agent_run_metadata,
+            revision_draft=revision_draft,
+            revision_instruction=revision_instruction,
         )
         return CapabilityPackageIngestResult(
             agent_run=agent_run,
@@ -774,6 +814,472 @@ class CapabilityPackageIngestService:
             "source_bundle": source_bundle,
             "validation": validation,
         }
+
+
+class CapabilityPackageSessionRunService:
+    """Run capability package ingestion as a user-visible SessionRun."""
+
+    TERMINAL_AGENT_STATUSES = {"completed", "failed", "cancelled", "blocked"}
+    INSTALL_TOOL_NAME = "install_capability_package"
+    REVISION_APPROVAL_REASON = "收到修改意见，重新生成草案。"
+
+    def __init__(
+        self,
+        runtime_control_plane: AgentRunControlPlane,
+        admin_manager: Any,
+        *,
+        poll_timeout_sec: float = 0.5,
+    ) -> None:
+        self.runtime_control_plane = runtime_control_plane
+        self.admin_manager = admin_manager
+        self.poll_timeout_sec = max(0.05, float(poll_timeout_sec or 0.5))
+
+    def initial_runtime_state(self) -> dict[str, Any]:
+        return _capability_session_runtime_state(self.runtime_control_plane)
+
+    def start(self, session: Any, payload: dict[str, Any]) -> None:
+        thread = threading.Thread(
+            target=self._run,
+            args=(session, dict(payload)),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run(self, session: Any, payload: dict[str, Any]) -> None:
+        follow_up_lock = threading.Lock()
+        follow_up_queue: list[dict[str, Any]] = []
+        active_approval_id: dict[str, str] = {"value": ""}
+
+        def on_follow_up(ticket: dict[str, Any]) -> None:
+            approval_id = ""
+            followup_id = str(ticket.get("followup_id") or "").strip()
+            with follow_up_lock:
+                if followup_id and any(
+                    str(item.get("followup_id") or "") == followup_id
+                    for item in follow_up_queue
+                ):
+                    return
+                follow_up_queue.append(dict(ticket))
+                approval_id = active_approval_id.get("value", "")
+            if approval_id:
+                session.resolve_approval(
+                    approval_id,
+                    "deny_once",
+                    self.REVISION_APPROVAL_REASON,
+                )
+
+        session.set_follow_up_callback(on_follow_up)
+        try:
+            if getattr(session, "cancel_requested", False):
+                return
+            session.mark_running()
+            session.append_event(
+                "context_event",
+                _capability_context_event(
+                    "开始生成能力包草案",
+                    "capability_package_ingest",
+                    {"agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID},
+                ),
+            )
+            result = CapabilityPackageIngestService(self.runtime_control_plane).start(
+                payload,
+                agent_run_metadata=self._agent_run_metadata(session),
+            )
+            while True:
+                if getattr(session, "cancel_requested", False):
+                    return
+                agent_run_id = result.agent_run.id
+                self._bind_agent_run(session, result.agent_run)
+                self._project_agent_run_events(session, agent_run_id)
+                if getattr(session, "cancel_requested", False):
+                    return
+                completed = self._completed_draft_status(session, agent_run_id)
+                if completed is None:
+                    return
+                draft, source_bundle = completed
+                revision = self._request_install_approval(
+                    session,
+                    draft,
+                    source_bundle,
+                    agent_run_id,
+                    follow_up_queue=follow_up_queue,
+                    follow_up_lock=follow_up_lock,
+                    active_approval_id=active_approval_id,
+                )
+                if revision is None:
+                    return
+                result = self._start_revision_ingest(
+                    session,
+                    payload,
+                    source_bundle,
+                    draft,
+                    str(revision.get("text") or ""),
+                    agent_run_id,
+                    str(revision.get("followup_id") or ""),
+                )
+        except CapabilityPackageIngestError as exc:
+            session.append_event("error", {"message": exc.message, "code": exc.error})
+            session.append_event(
+                "session_run_failed",
+                {"message": exc.message, "code": exc.error, "recoverable": False},
+            )
+        except Exception as exc:
+            session.append_event(
+                "error",
+                {"message": str(exc), "code": "capability_package_session_failed"},
+            )
+            session.append_event(
+                "session_run_failed",
+                {
+                    "message": str(exc),
+                    "code": "capability_package_session_failed",
+                    "recoverable": False,
+                },
+            )
+        finally:
+            session.set_follow_up_callback(None)
+            session.mark_done()
+
+    def _agent_run_metadata(
+        self,
+        session: Any,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = {
+            "session_id": getattr(session, "session_id", None),
+            "session_run_id": getattr(session, "session_run_id", None),
+            "client_request_id": getattr(session, "client_request_id", None),
+            "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
+        }
+        if extra:
+            metadata.update(extra)
+        return metadata
+
+    def _bind_agent_run(self, session: Any, agent_run: AgentRunRecord) -> None:
+        agent_run_id = agent_run.id
+        session.set_cancel_callback(
+            lambda reason, run_id=agent_run_id: self.runtime_control_plane.cancel_agent_run(
+                run_id,
+                reason=reason,
+            )
+        )
+        _set_session_runtime_state(
+            session,
+            _capability_session_runtime_state(
+                self.runtime_control_plane,
+                agent_run=agent_run,
+            ),
+        )
+        metadata = dict(agent_run.metadata or {})
+        is_revision = bool(metadata.get("revision_of_agent_run_id"))
+        session.append_event(
+            "context_event",
+            _capability_context_event(
+                "能力包修改任务已进入 capability_packager"
+                if is_revision
+                else "能力包生成任务已进入 capability_packager",
+                "capability_package_revision" if is_revision else "capability_package_ingest",
+                {
+                    "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+                    "agent_run_id": agent_run_id,
+                    **(
+                        {
+                            "revision_of_agent_run_id": str(metadata.get("revision_of_agent_run_id")),
+                            "revision_followup_id": str(metadata.get("revision_followup_id")),
+                        }
+                        if is_revision
+                        else {}
+                    ),
+                },
+            ),
+        )
+
+    def _completed_draft_status(
+        self,
+        session: Any,
+        agent_run_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        status = CapabilityPackageIngestService(self.runtime_control_plane).status(agent_run_id)
+        task = status.get("agent_run") if isinstance(status.get("agent_run"), dict) else {}
+        task_status = str(task.get("status") or "").strip()
+        if task_status in {"failed", "blocked", "cancelled"}:
+            message = str(task.get("output") or task_status or "capability package ingest failed")
+            session.append_event("error", {"message": message, "code": task_status})
+            session.append_event(
+                "session_run_failed",
+                {"message": message, "code": task_status, "recoverable": False},
+            )
+            return None
+        draft = status.get("draft")
+        validation = status.get("validation") if isinstance(status.get("validation"), dict) else {}
+        messages = [
+            str(item)
+            for item in validation.get("messages", [])
+            if str(item).strip()
+        ] if isinstance(validation.get("messages"), list) else []
+        if not isinstance(draft, dict) or messages:
+            message = "; ".join(messages) if messages else "capability package draft was not produced"
+            session.append_event("error", {"message": message, "code": "invalid_capability_package_draft"})
+            session.append_event(
+                "session_run_failed",
+                {
+                    "message": message,
+                    "code": "invalid_capability_package_draft",
+                    "recoverable": False,
+                },
+            )
+            return None
+        source_bundle = status.get("source_bundle") if isinstance(status.get("source_bundle"), dict) else {}
+        return draft, source_bundle
+
+    def _start_revision_ingest(
+        self,
+        session: Any,
+        payload: dict[str, Any],
+        source_bundle: dict[str, Any],
+        draft: dict[str, Any],
+        instruction: str,
+        previous_agent_run_id: str,
+        followup_id: str,
+    ) -> CapabilityPackageIngestResult:
+        evidence_bundle = EvidenceBundle.from_dict(source_bundle)
+        workspace_root = str(payload.get("workspace_root") or "").strip()
+        agent_run = CapabilityPackagerRunner(self.runtime_control_plane).start(
+            evidence_bundle=evidence_bundle,
+            workspace_root=workspace_root,
+            revision_draft=draft,
+            revision_instruction=instruction,
+            agent_run_metadata=self._agent_run_metadata(
+                session,
+                {
+                    "revision_of_agent_run_id": previous_agent_run_id,
+                    "revision_followup_id": followup_id,
+                    "revision_instruction": instruction,
+                },
+            ),
+        )
+        return CapabilityPackageIngestResult(
+            agent_run=agent_run,
+            source=evidence_bundle.source,
+            source_bundle=evidence_bundle.to_dict(),
+        )
+
+    def _project_agent_run_events(self, session: Any, agent_run_id: str) -> None:
+        cursor = 0
+        while True:
+            events = self.runtime_control_plane.wait_events(
+                agent_run_id,
+                after_seq=cursor,
+                timeout_sec=self.poll_timeout_sec,
+                limit=100,
+            )
+            for event in events:
+                cursor = max(cursor, int(event.seq))
+                for session_event_type, payload in _agent_event_to_session_events(event.to_dict()):
+                    session.append_event(session_event_type, payload)
+            try:
+                task = self.runtime_control_plane.agent_run_to_dict(agent_run_id)
+            except KeyError:
+                return
+            status = str(task.get("status") or "").strip()
+            if status in self.TERMINAL_AGENT_STATUSES and not events:
+                return
+            if status in self.TERMINAL_AGENT_STATUSES:
+                tail = self.runtime_control_plane.list_events(
+                    agent_run_id,
+                    after_seq=cursor,
+                    limit=100,
+                )
+                if not tail:
+                    return
+            if getattr(session, "cancel_requested", False):
+                return
+
+    def _request_install_approval(
+        self,
+        session: Any,
+        draft: dict[str, Any],
+        source_bundle: Any,
+        agent_run_id: str,
+        *,
+        follow_up_queue: list[dict[str, Any]],
+        follow_up_lock: threading.Lock,
+        active_approval_id: dict[str, str],
+    ) -> dict[str, Any] | None:
+        package_id = str(draft.get("id") or "capability-package").strip()
+        approval_id = f"capability-package-install:{session.session_run_id}:{agent_run_id}:{package_id}"
+        tool_call_id = f"capability-package-install:{agent_run_id or session.session_run_id}"
+        approval_payload = _capability_install_approval_payload(
+            approval_id,
+            tool_call_id,
+            draft,
+            agent_run_id,
+        )
+        session.append_event(
+            "tool_call_start",
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": self.INSTALL_TOOL_NAME,
+                "tool_args": {
+                    "package_id": package_id,
+                    "agent_run_id": agent_run_id,
+                },
+                "title": f"安装能力包 {package_id}",
+            },
+        )
+        session.register_approval(approval_id, approval_payload)
+        session.append_event("approval_request", approval_payload)
+        with follow_up_lock:
+            active_approval_id["value"] = approval_id
+            has_pending_revision = bool(follow_up_queue)
+        if has_pending_revision:
+            session.resolve_approval(
+                approval_id,
+                "deny_once",
+                self.REVISION_APPROVAL_REASON,
+            )
+        try:
+            decision, reason = session.wait_approval(approval_id)
+        finally:
+            with follow_up_lock:
+                if active_approval_id.get("value") == approval_id:
+                    active_approval_id["value"] = ""
+        if getattr(session, "cancel_requested", False) or getattr(session, "done", False):
+            return None
+        revision_ticket = self._pop_revision_ticket(session, follow_up_queue, follow_up_lock)
+        if revision_ticket is not None:
+            session.append_event(
+                "approval_resolved",
+                {
+                    "approval_id": approval_id,
+                    "tool_call_id": tool_call_id,
+                    "decision": "deny_once",
+                    "reason": self.REVISION_APPROVAL_REASON,
+                },
+            )
+            response = "已收到修改意见，重新生成能力包草案。"
+            session.append_event(
+                "tool_call_end",
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": self.INSTALL_TOOL_NAME,
+                    "status": "cancelled",
+                    "output": response,
+                },
+            )
+            followup_id = str(revision_ticket.get("followup_id") or "")
+            if followup_id:
+                session.mark_follow_up_consumed(followup_id)
+            instruction = str(revision_ticket.get("text") or "").strip()
+            instruction_title = (
+                f"收到修改意见：{_truncate_single_line(instruction, 80)}"
+                if instruction
+                else "收到修改意见，重新生成能力包草案"
+            )
+            session.append_event(
+                "context_event",
+                _capability_context_event(
+                    instruction_title,
+                    "capability_package_revision_requested",
+                    {
+                        "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+                        "agent_run_id": agent_run_id,
+                        "followup_id": followup_id,
+                        "instruction": instruction,
+                    },
+                ),
+            )
+            return dict(revision_ticket)
+        session.append_event(
+            "approval_resolved",
+            {
+                "approval_id": approval_id,
+                "tool_call_id": tool_call_id,
+                "decision": decision,
+                **({"reason": reason} if reason else {}),
+            },
+        )
+        if decision != "allow_once":
+            response = f"已取消安装能力包 {package_id}。"
+            session.append_event(
+                "tool_call_end",
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": self.INSTALL_TOOL_NAME,
+                    "status": "cancelled",
+                    "output": response,
+                },
+            )
+            session.append_event("session_run_end", {"response": response})
+            return None
+        install_payload = {
+            "draft": draft,
+            "source_bundle": source_bundle if isinstance(source_bundle, dict) else {},
+        }
+        result = self.admin_manager.accept_capability_package_draft(install_payload)
+        if not getattr(result, "ok", False):
+            payload = getattr(result, "payload", {})
+            message = (
+                str(payload.get("message") or payload.get("error") or "")
+                if isinstance(payload, dict)
+                else ""
+            ).strip() or "capability package install failed"
+            session.append_event("error", {"message": message, "code": "capability_package_install_failed"})
+            session.append_event(
+                "tool_call_end",
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": self.INSTALL_TOOL_NAME,
+                    "status": "failed",
+                    "output": message,
+                },
+            )
+            session.append_event(
+                "session_run_failed",
+                {
+                    "message": message,
+                    "code": "capability_package_install_failed",
+                    "recoverable": False,
+                },
+            )
+            return None
+        response = f"能力包 {package_id} 已安装完成。"
+        session.append_event(
+            "tool_call_end",
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": self.INSTALL_TOOL_NAME,
+                "status": "completed",
+                "output": response,
+                "meta": getattr(result, "payload", {}),
+            },
+        )
+        session.append_event("session_run_end", {"response": response})
+        return None
+
+    def _pop_revision_ticket(
+        self,
+        session: Any,
+        follow_up_queue: list[dict[str, Any]],
+        follow_up_lock: threading.Lock,
+    ) -> dict[str, Any] | None:
+        while True:
+            with follow_up_lock:
+                if not follow_up_queue:
+                    return None
+                ticket = follow_up_queue.pop(0)
+            followup_id = str(ticket.get("followup_id") or "").strip()
+            if not followup_id:
+                return dict(ticket)
+            cond = getattr(session, "cond", None)
+            if cond is None:
+                return dict(ticket)
+            with cond:
+                live_ticket = getattr(session, "follow_up_tickets", {}).get(followup_id)
+                if not isinstance(live_ticket, dict):
+                    return dict(ticket)
+                if live_ticket.get("state") == "pending":
+                    return dict(live_ticket)
 
 
 def _normalize_source(payload: dict[str, Any]) -> dict[str, Any]:
@@ -833,8 +1339,338 @@ def _normalize_source(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in source.items() if value not in ("", [])}
 
 
-def _render_packager_prompt(*, bundle: dict[str, Any]) -> str:
+def _capability_session_runtime_state(
+    runtime_control_plane: AgentRunControlPlane,
+    *,
+    agent_run: AgentRunRecord | None = None,
+) -> dict[str, Any]:
+    model_binding: dict[str, Any] = {}
+    if agent_run is not None:
+        raw_binding = agent_run.metadata.get("model_binding")
+        if isinstance(raw_binding, dict):
+            model_binding = dict(raw_binding)
+    if not model_binding:
+        snapshot = getattr(runtime_control_plane, "runtime_snapshot", {})
+        agents = snapshot.get("agents") if isinstance(snapshot, dict) else {}
+        raw_agent = (
+            agents.get(DEFAULT_CAPABILITY_PACKAGER_AGENT_ID)
+            if isinstance(agents, dict)
+            else {}
+        )
+        raw_model = raw_agent.get("model") if isinstance(raw_agent, dict) else {}
+        if isinstance(raw_model, dict):
+            provider = str(raw_model.get("provider") or raw_model.get("provider_id") or "").strip()
+            model = str(raw_model.get("model") or raw_model.get("model_id") or "").strip()
+            if provider and model:
+                model_binding = {
+                    "provider": provider,
+                    "model": model,
+                    **(
+                        {"display_name": str(raw_model.get("display_name"))}
+                        if raw_model.get("display_name")
+                        else {}
+                    ),
+                    **(
+                        {"parameters": dict(raw_model.get("parameters"))}
+                        if isinstance(raw_model.get("parameters"), dict)
+                        else {}
+                    ),
+                }
+    state: dict[str, Any] = {
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
+        "mode": "capability_package",
+        "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+        "active_agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+        "main_agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+    }
+    provider = str(model_binding.get("provider") or "").strip()
+    model = str(model_binding.get("model") or "").strip()
+    if provider and model:
+        state.update(
+            {
+                "active_model_provider": provider,
+                "active_model": model,
+                "active_model_display_name": str(
+                    model_binding.get("display_name") or model
+                ),
+            }
+        )
+        parameters = model_binding.get("parameters")
+        if isinstance(parameters, dict) and parameters:
+            state["active_model_parameters"] = dict(parameters)
+    if agent_run is not None:
+        state.update(
+            {
+                "agent_run_id": agent_run.id,
+                "runtime_profile_id": agent_run.runtime_profile_id,
+                "executor": agent_run.executor.value if agent_run.executor else None,
+                "execution_location": (
+                    agent_run.execution_location.value
+                    if agent_run.execution_location
+                    else None
+                ),
+            }
+        )
+    return state
+
+
+def _set_session_runtime_state(session: Any, runtime_state: dict[str, Any]) -> None:
+    cond = getattr(session, "cond", None)
+    if cond is None:
+        session.runtime_state = dict(runtime_state)
+        return
+    with cond:
+        session.runtime_state = dict(runtime_state)
+
+
+def _capability_context_event(
+    title: str,
+    phase: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "title": title,
+        "message": title,
+        "phase": phase,
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        **(extra or {}),
+    }
+
+
+def _truncate_single_line(value: str, max_chars: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars - 1]}…"
+
+
+def _agent_event_to_session_events(
+    event: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    event_type = str(event.get("type") or "")
+    payload = event.get("payload")
+    data = payload if isinstance(payload, dict) else {}
+    agent_run_id = str(event.get("agent_run_id") or "")
+    base = {
+        "agent_run_id": agent_run_id,
+        "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+    }
+    if event_type == "queued":
+        task = data.get("agent_run") if isinstance(data.get("agent_run"), dict) else {}
+        return [
+            (
+                "context_event",
+                _capability_context_event(
+                    "能力包生成任务已排队",
+                    "agent_run_queued",
+                    {
+                        **base,
+                        "agent_run_status": str(task.get("status") or "queued"),
+                    },
+                ),
+            )
+        ]
+    if event_type == "status":
+        status_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        status = str(status_data.get("status") or "").strip()
+        if not status:
+            return []
+        return [
+            (
+                "context_event",
+                _capability_context_event(
+                    f"capability_packager {status}",
+                    f"agent_run_{status}",
+                    {**base, "agent_run_status": status, **status_data},
+                ),
+            )
+        ]
+    if event_type == "text":
+        text = str(data.get("text") or "")
+        return [("assistant_delta", {**base, "content": text})] if text else []
+    if event_type == "thinking":
+        text = str(data.get("text") or "")
+        return [("reasoning_delta", {**base, "content": text})] if text else []
+    if event_type == "log":
+        text = str(data.get("text") or data.get("message") or "")
+        level_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        level = str(level_data.get("level") or "info")
+        return [
+            (
+                "context_event",
+                _capability_context_event(
+                    text or "capability_packager log",
+                    "agent_run_log",
+                    {**base, "level": level, "log": text},
+                ),
+            )
+        ]
+    if event_type == "error":
+        message = str(data.get("text") or data.get("message") or "capability_packager error")
+        return [("error", {**base, "message": message, "code": "agent_run_error"})]
+    if event_type == "tool_use":
+        tool_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        tool_name = str(
+            tool_data.get("tool_name")
+            or tool_data.get("name")
+            or tool_data.get("tool")
+            or "tool"
+        )
+        tool_call_id = str(
+            tool_data.get("tool_call_id")
+            or tool_data.get("id")
+            or f"{agent_run_id}:tool:{event.get('seq') or 0}"
+        )
+        return [
+            (
+                "tool_call_start",
+                {
+                    **base,
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "tool_args": tool_data.get("input")
+                    if isinstance(tool_data.get("input"), dict)
+                    else tool_data,
+                },
+            )
+        ]
+    if event_type == "tool_result":
+        tool_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        tool_name = str(
+            tool_data.get("tool_name")
+            or tool_data.get("name")
+            or tool_data.get("tool")
+            or "tool"
+        )
+        tool_call_id = str(
+            tool_data.get("tool_call_id")
+            or tool_data.get("id")
+            or f"{agent_run_id}:tool:{event.get('seq') or 0}"
+        )
+        output = tool_data.get("output")
+        if not isinstance(output, str):
+            output = str(data.get("text") or "")
+        return [
+            (
+                "tool_call_end",
+                {
+                    **base,
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "tool_result": output,
+                    "meta": tool_data,
+                },
+            )
+        ]
+    if event_type in {"completed", "failed", "cancelled", "blocked"}:
+        title = {
+            "completed": "能力包草案生成完成",
+            "failed": "能力包草案生成失败",
+            "cancelled": "能力包草案生成已取消",
+            "blocked": "能力包草案生成被阻断",
+        }.get(event_type, event_type)
+        task = data.get("agent_run") if isinstance(data.get("agent_run"), dict) else {}
+        return [
+            (
+                "context_event",
+                _capability_context_event(
+                    title,
+                    f"agent_run_{event_type}",
+                    {
+                        **base,
+                        "agent_run_status": event_type,
+                        "output": str(task.get("output") or ""),
+                    },
+                ),
+            )
+        ]
+    return []
+
+
+def _capability_install_approval_payload(
+    approval_id: str,
+    tool_call_id: str,
+    draft: dict[str, Any],
+    agent_run_id: str,
+) -> dict[str, Any]:
+    package_id = str(draft.get("id") or "capability-package").strip()
+    components = [
+        dict(item)
+        for item in draft.get("components", [])
+        if isinstance(item, dict)
+    ]
+    capabilities = [
+        str(item.get("name") or item.get("id") or "")
+        for item in components
+        if str(item.get("kind") or "") in CAPABILITY_COMPONENT_KINDS
+    ]
+    dependencies = [
+        str(item.get("name") or item.get("id") or "")
+        for item in components
+        if str(item.get("kind") or "") not in CAPABILITY_COMPONENT_KINDS
+    ]
+    sections = [
+        {
+            "title": "能力包",
+            "items": [
+                {"label": "ID", "value": package_id},
+                {"label": "名称", "value": str(draft.get("name") or package_id)},
+                {"label": "风险", "value": str(draft.get("risk_level") or "unrated")},
+            ],
+        },
+        {
+            "title": "组件摘要",
+            "items": [
+                {"label": "能力", "value": ", ".join(_unique_strings(capabilities)) or "无"},
+                {"label": "依赖", "value": ", ".join(_unique_strings(dependencies)) or "无"},
+            ],
+        },
+    ]
+    install_plan = [
+        str(item)
+        for item in draft.get("install_plan", [])
+        if str(item).strip()
+    ] if isinstance(draft.get("install_plan"), list) else []
+    if install_plan:
+        sections.append(
+            {
+                "title": "安装计划",
+                "items": [{"label": str(index + 1), "value": item} for index, item in enumerate(install_plan)],
+            }
+        )
+    return {
+        "approval_id": approval_id,
+        "tool_call_id": tool_call_id,
+        "tool_name": CapabilityPackageSessionRunService.INSTALL_TOOL_NAME,
+        "tool_args": {"package_id": package_id, "agent_run_id": agent_run_id},
+        "intent": f"确认安装能力包 {package_id}",
+        "content": str(draft.get("description") or f"准备安装能力包 {package_id}。"),
+        "sections": sections,
+    }
+
+
+def _render_packager_prompt(
+    *,
+    bundle: dict[str, Any],
+    revision_draft: dict[str, Any] | None = None,
+    revision_instruction: str = "",
+) -> str:
     bundle_json = json.dumps(bundle, ensure_ascii=False, indent=2)
+    revision_text = str(revision_instruction or "").strip()
+    revision_block = ""
+    if revision_text or isinstance(revision_draft, dict):
+        current_draft_json = json.dumps(revision_draft or {}, ensure_ascii=False, indent=2)
+        revision_block = (
+            "\nRevision request:\n"
+            "The user has reviewed the previous draft. Produce a complete revised draft, "
+            "not a patch. Keep every field that remains valid, and apply the user's "
+            "requested changes when they are supported by the evidence bundle.\n"
+            f"User instruction:\n{revision_text or '(no extra text)'}\n"
+            "Previous draft:\n"
+            f"```json\n{current_draft_json}\n```\n"
+        )
     return (
         "You are capability_packager. Analyze the provided repository/docs bundle "
         "and produce one capability package draft.\n"
@@ -865,6 +1701,7 @@ def _render_packager_prompt(*, bundle: dict[str, Any]) -> str:
         'include "skill_content" for every Skill component or omit the Skill.\n'
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
+        f"{revision_block}"
     )
 
 
@@ -1192,6 +2029,7 @@ __all__ = [
     "CapabilityPackageIngestError",
     "CapabilityPackageIngestResult",
     "CapabilityPackageIngestService",
+    "CapabilityPackageSessionRunService",
     "CapabilityPackageInstallResult",
     "CapabilityPackageSkillFileOperation",
     "CapabilityPackageInstaller",

@@ -304,10 +304,12 @@ class _RemoteSessionRun:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
+    agent_id: str | None = None
     provider_id: str | None = None
     model_id: str | None = None
     client_request_id: str | None = None
     model_parameters: dict[str, Any] = field(default_factory=dict)
+    runtime_state: dict[str, Any] = field(default_factory=dict)
     locale: str | None = None
     mentions: list[dict[str, Any]] = field(default_factory=list)
     initial_prompt: str | None = None
@@ -655,6 +657,8 @@ class _RemoteSessionRun:
                 "mode": self.mode,
                 "workflow_mode": self.workflow_mode,
                 "taskflow_id": self.taskflow_id,
+                "agent_id": self.agent_id,
+                "runtime_state": dict(self.runtime_state),
                 "created_at": self.created_at,
                 "last_activity_at": self.last_activity_at,
                 "finished_at": self.finished_at,
@@ -1302,10 +1306,12 @@ class RemoteRelayHTTPService:
         mode: str | None = None,
         workflow_mode: str | None = None,
         taskflow_id: str | None = None,
+        agent_id: str | None = None,
         provider_id: str | None = None,
         model_id: str | None = None,
         client_request_id: str | None = None,
         model_parameters: dict[str, Any] | None = None,
+        runtime_state: dict[str, Any] | None = None,
         locale: str | None = None,
         mentions: list[dict[str, Any]] | None = None,
         initial_prompt: str | None = None,
@@ -1318,10 +1324,12 @@ class RemoteRelayHTTPService:
             mode=mode,
             workflow_mode=workflow_mode,
             taskflow_id=taskflow_id,
+            agent_id=agent_id,
             provider_id=provider_id,
             model_id=model_id,
             client_request_id=client_request_id,
             model_parameters=dict(model_parameters or {}),
+            runtime_state=dict(runtime_state or {}),
             locale=locale,
             mentions=[dict(item) for item in (mentions or []) if isinstance(item, dict)],
             initial_prompt=initial_prompt,
@@ -1395,6 +1403,23 @@ class RemoteRelayHTTPService:
                 if session.peer_id == peer_id and not session.done
             ]
         for session in peer_sessions:
+            runtime_state = session.runtime_state if isinstance(session.runtime_state, dict) else {}
+            if (
+                session.mode == "capability_package"
+                or session.workflow_mode == "capability_package_ingest"
+                or runtime_state.get("workflow_mode") == "capability_package_ingest"
+            ):
+                session.append_event(
+                    "context_event",
+                    {
+                        "title": "前端连接已断开，能力包任务继续在服务端运行",
+                        "message": "前端连接已断开，能力包任务继续在服务端运行",
+                        "phase": "peer_disconnected",
+                        "workflow": "capability_package_ingest",
+                        "reason": reason,
+                    },
+                )
+                continue
             resolved_approvals = session.cancel_pending_approvals(reason)
             session.append_event("error", {"message": reason})
             for event_payload in resolved_approvals:
@@ -1506,6 +1531,9 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/agent-runs/event":
                     self._handle_agent_run_event()
+                    return
+                if parsed.path == "/remote/agent-runs/model-request":
+                    self._handle_agent_run_model_request()
                     return
                 if parsed.path == "/remote/agent-runs/heartbeat":
                     self._handle_agent_run_heartbeat()

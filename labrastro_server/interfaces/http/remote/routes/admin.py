@@ -49,14 +49,25 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 )
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
 from labrastro_server.services.capability_packages import (
+    CAPABILITY_INGEST_WORKFLOW,
     CapabilityPackageIngestError,
     CapabilityPackageIngestService,
+    CapabilityPackageSessionRunService,
 )
 from labrastro_server.services.environment_run import (
     EnvironmentRunError,
     EnvironmentRunService,
 )
 from reuleauxcoder.interfaces.events import UIEventKind
+
+
+def _capability_ingest_prompt(source: dict[str, Any]) -> str:
+    source_type = str(source.get("type") or "github_repo").strip()
+    url = str(source.get("url") or source.get("repo_url") or source.get("docs_url") or "").strip()
+    notes = str(source.get("notes") or "").strip()
+    target = url or notes[:120] or "能力包来源"
+    return f"生成能力包草案：{source_type} {target}".strip()
+
 
 class RemoteAdminRoutes:
     def _handle_admin(self, path: str) -> None:
@@ -384,6 +395,96 @@ class RemoteAdminRoutes:
                     lambda: self.service.admin_manager.update_server_settings(payload),
                 )
                 self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/ingest/session/start":
+                if self.service.runtime_control_plane is None:
+                    self._send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "agent_runs_unavailable",
+                    )
+                    return
+                peer_token = str(payload.get("peer_token") or "").strip()
+                peer_id = self.service.relay_server.token_manager.verify_peer_token(
+                    peer_token
+                )
+                if peer_id is None:
+                    self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+                    return
+                session_id = str(
+                    payload.get("session_id") or payload.get("sessionId") or ""
+                ).strip() or None
+                client_request_id_input = str(
+                    payload.get("client_request_id")
+                    or payload.get("clientRequestId")
+                    or ""
+                ).strip()
+                client_request_id = client_request_id_input or str(uuid.uuid4())
+                if client_request_id_input:
+                    existing = self.service._get_session_run_by_request(
+                        peer_id,
+                        session_id,
+                        client_request_id,
+                    )
+                    if existing is not None:
+                        status_payload = existing.status_payload()
+                        self._send_json(
+                            HTTPStatus.OK,
+                            SessionRunStartResponse(
+                                session_run_id=existing.session_run_id,
+                                session_id=existing.session_id,
+                                agent_id=existing.agent_id,
+                                workflow_mode=existing.workflow_mode,
+                                runtime_state=status_payload.get("runtime_state")
+                                if isinstance(status_payload.get("runtime_state"), dict)
+                                else {},
+                            ).to_dict(),
+                        )
+                        return
+                runner = CapabilityPackageSessionRunService(
+                    self.service.runtime_control_plane,
+                    self.service.admin_manager,
+                )
+                runtime_state = runner.initial_runtime_state()
+                source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+                prompt = _capability_ingest_prompt(source)
+                session = self.service._create_session_run(
+                    peer_id,
+                    session_id,
+                    mode="capability_package",
+                    workflow_mode=CAPABILITY_INGEST_WORKFLOW,
+                    agent_id=runtime_state.get("agent_id")
+                    if isinstance(runtime_state.get("agent_id"), str)
+                    else None,
+                    client_request_id=client_request_id,
+                    runtime_state=runtime_state,
+                    initial_prompt=prompt,
+                )
+                if session_id:
+                    session.enable_trace_persistence(session_id)
+                session.append_event(
+                    "session_run_start",
+                    {
+                        "prompt": prompt,
+                        "mode": "capability_package",
+                        "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
+                        "agent_id": runtime_state.get("agent_id"),
+                        "session_id": session_id,
+                    },
+                )
+                session.mark_running()
+                runner.start(session, payload)
+                self._send_json(
+                    HTTPStatus.OK,
+                    SessionRunStartResponse(
+                        session_run_id=session.session_run_id,
+                        session_id=session.session_id,
+                        agent_id=runtime_state.get("agent_id")
+                        if isinstance(runtime_state.get("agent_id"), str)
+                        else None,
+                        workflow_mode=CAPABILITY_INGEST_WORKFLOW,
+                        runtime_state=runtime_state,
+                    ).to_dict(),
+                )
                 return
             if path == "/remote/admin/capability-packages/ingest/start":
                 if self.service.runtime_control_plane is None:

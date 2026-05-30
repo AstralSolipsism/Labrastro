@@ -44,6 +44,7 @@ from reuleauxcoder.domain.config.models import (
     MCPLaunchConfig,
     MCPServerConfig,
 )
+from reuleauxcoder.domain.providers.models import ProviderResponse
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
     AgentRunRequest,
@@ -3015,6 +3016,339 @@ class TestRemoteRelayHTTPService:
                 "phase": "install",
                 "command": "npm install -g gitnexus",
             } in agent_run["metadata"]["allowed_commands"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_agent_run_model_request_endpoint_uses_server_model_bridge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        created_configs = []
+        seen_requests = []
+
+        class FakeProvider:
+            def chat(self, provider_request):
+                seen_requests.append(provider_request)
+                return ProviderResponse(
+                    content="hi",
+                    prompt_tokens=1,
+                    completion_tokens=2,
+                )
+
+        def create_provider(_self, config):
+            created_configs.append(config)
+            return FakeProvider()
+
+        monkeypatch.setattr(
+            "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+            create_provider,
+        )
+        monkeypatch.setattr(
+            "labrastro_server.services.capability_packages.FetchCapabilitiesTool.execute",
+            lambda _self, **kwargs: json.dumps(
+                {
+                    "ok": True,
+                    "url": kwargs["url"],
+                    "title": "Example Tool",
+                    "sections": [],
+                    "links": [],
+                    "evidence": [],
+                    "errors": [],
+                }
+            ),
+        )
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane(
+            runtime_snapshot={
+                "runtime_profiles": {
+                    "packager": {
+                        "executor": "reuleauxcoder",
+                        "execution_location": "remote_server",
+                        "worker_kind": "sandbox_worker",
+                        "model_request_origin": "server",
+                    }
+                },
+                "agents": {
+                    "capability_packager": {
+                        "visibility": "system",
+                        "system_flow_only": ["capability_ingest"],
+                        "runtime_profile": "packager",
+                        "model": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                            "parameters": {"max_tokens": 384000, "temperature": 0.2},
+                        },
+                    }
+                },
+            }
+        )
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            bootstrap_token = relay.issue_bootstrap_token(ttl_sec=60)
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": bootstrap_token,
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            ingest_payload = {
+                "peer_token": peer_token,
+                "session_id": "session-capability-1",
+                "client_request_id": "capability-ingest-req-1",
+                "source": {
+                    "type": "github_repo",
+                    "url": "https://github.com/acme/example-tool",
+                },
+            }
+            ingest_status, ingest_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
+                ingest_payload,
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert ingest_status == 200
+            assert ingest_body["session_run_id"]
+            assert ingest_body["session_id"] == "session-capability-1"
+            assert ingest_body["runtime_state"]["agent_id"] == "capability_packager"
+            assert ingest_body["runtime_state"]["active_model_provider"] == "deepseek"
+            retry_status, retry_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
+                ingest_payload,
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert retry_status == 200
+            assert retry_body["session_run_id"] == ingest_body["session_run_id"]
+            assert retry_body["session_id"] == ingest_body["session_id"]
+            session_run_id = ingest_body["session_run_id"]
+            agent_run_id = ""
+            deadline = time.time() + 3
+            while time.time() < deadline and not agent_run_id:
+                session = service._get_session_run(session_run_id)
+                assert session is not None
+                for event in session.events:
+                    payload = event.get("payload")
+                    if isinstance(payload, dict) and payload.get("agent_run_id"):
+                        agent_run_id = payload["agent_run_id"]
+                        break
+                if not agent_run_id:
+                    time.sleep(0.02)
+            assert agent_run_id
+            agent_run = control.agent_run_to_dict(agent_run_id)
+            assert agent_run["status"] == "queued"
+            assert agent_run["agent_id"] == "capability_packager"
+            assert agent_run["metadata"]["repo_url"] == "https://github.com/acme/example-tool"
+            assert agent_run["metadata"]["session_id"] == "session-capability-1"
+            assert agent_run["metadata"]["session_run_id"] == session_run_id
+            assert agent_run["metadata"]["client_request_id"] == "capability-ingest-req-1"
+            assert agent_run["metadata"]["workflow"] == "capability_package_ingest"
+            assert "source_bundle" in agent_run["metadata"]
+            assert agent_run["metadata"]["model_binding"]["provider"] == "deepseek"
+            assert agent_run["metadata"]["model_binding"]["model"] == "deepseek-v4-pro"
+            assert len(control.list_agent_runs(agent_id="capability_packager")) == 1
+            status, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "worker_kind": "sandbox_worker",
+                    "executors": ["reuleauxcoder"],
+                },
+            )
+            assert status == 200
+            claim = claim_body["claim"]
+            assert claim["agent_run"]["id"] == agent_run_id
+            assert claim["executor_request"]["metadata"]["repo_url"] == "https://github.com/acme/example-tool"
+            assert claim["executor_request"]["metadata"]["model_binding"]["provider"] == "deepseek"
+
+            status, model_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/model-request",
+                {
+                    "peer_token": peer_token,
+                    "agent_run_id": agent_run_id,
+                    "request_id": claim["request_id"],
+                    "worker_id": "worker-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "parameters": {"max_tokens": 1, "temperature": 0.9},
+                    "metadata": {"sandbox_request_id": "sandbox-1"},
+                    "stream": False,
+                },
+            )
+
+            assert status == 200
+            assert model_body["ok"] is True
+            assert model_body["response"]["content"] == "hi"
+            assert model_body["response"]["prompt_tokens"] == 1
+            assert model_body["response"]["completion_tokens"] == 2
+            assert created_configs[0].id == "deepseek"
+            request = seen_requests[0]
+            assert request.model == "deepseek-v4-pro"
+            assert request.messages == [{"role": "user", "content": "hello"}]
+            assert request.max_tokens == 384000
+            assert request.temperature == 0.2
+            assert request.metadata["agent_run_id"] == agent_run_id
+            assert request.metadata["worker_id"] == "worker-1"
+            assert request.metadata["sandbox_request_id"] == "sandbox-1"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_session_survives_peer_shutdown_and_recovers_by_status(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(config_path, {})
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane(
+            runtime_snapshot={
+                "runtime_profiles": {
+                    "packager": {
+                        "executor": "fake",
+                        "execution_location": "remote_server",
+                        "worker_kind": "sandbox_worker",
+                    }
+                },
+                "agents": {
+                    "capability_packager": {
+                        "visibility": "system",
+                        "system_flow_only": ["capability_ingest"],
+                        "runtime_profile": "packager",
+                    }
+                },
+            }
+        )
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            old_peer_token = register_body["payload"]["peer_token"]
+            _, ingest_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
+                {
+                    "peer_token": old_peer_token,
+                    "session_id": "session-capability-recover",
+                    "client_request_id": "capability-recover-req",
+                    "source": {
+                        "type": "project_notes",
+                        "notes": "Install gh, then use gh pr view.",
+                    },
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+            session_run_id = ingest_body["session_run_id"]
+            agent_run_id = ""
+            deadline = time.time() + 3
+            while time.time() < deadline and not agent_run_id:
+                session = service._get_session_run(session_run_id)
+                assert session is not None
+                for event in session.events:
+                    payload = event.get("payload")
+                    if isinstance(payload, dict) and payload.get("agent_run_id"):
+                        agent_run_id = payload["agent_run_id"]
+                        break
+                if not agent_run_id:
+                    time.sleep(0.02)
+            assert agent_run_id
+
+            status, _ = _json_request(
+                "POST",
+                f"{service.base_url}/remote/disconnect",
+                {"peer_token": old_peer_token, "reason": "peer_shutdown"},
+            )
+            assert status == 200
+            assert control.agent_run_to_dict(agent_run_id)["status"] == "queued"
+
+            _, reconnect_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            new_peer_token = reconnect_body["payload"]["peer_token"]
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": new_peer_token,
+                    "session_run_id": session_run_id,
+                    "cursor": 0,
+                },
+            )
+            assert status == 200
+            assert status_body["session_run_id"] == session_run_id
+            assert status_body["session_id"] == "session-capability-recover"
+            assert status_body["mode"] == "capability_package"
+            assert status_body["workflow_mode"] == "capability_package_ingest"
+            assert status_body["runtime_state"]["agent_id"] == "capability_packager"
+            assert status_body["running"] is True
+            assert status_body["done"] is False
+
+            status, _ = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/cancel",
+                {
+                    "peer_token": new_peer_token,
+                    "session_run_id": session_run_id,
+                    "reason": "user_cancelled",
+                },
+            )
+            assert status == 200
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if control.agent_run_to_dict(agent_run_id)["status"] == "cancelled":
+                    break
+                time.sleep(0.02)
+            assert control.agent_run_to_dict(agent_run_id)["status"] == "cancelled"
         finally:
             service.stop()
             relay.stop()

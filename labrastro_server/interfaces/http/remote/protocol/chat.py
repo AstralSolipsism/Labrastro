@@ -73,12 +73,21 @@ class SessionRunStartRequest:
 class SessionRunStartResponse:
     session_run_id: str
     session_id: str | None = None
+    agent_id: str | None = None
+    workflow_mode: str | None = None
+    runtime_state: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"session_run_id": self.session_run_id, "error": self.error}
         if self.session_id is not None:
             payload["session_id"] = self.session_id
+        if self.agent_id is not None:
+            payload["agent_id"] = self.agent_id
+        if self.workflow_mode is not None:
+            payload["workflow_mode"] = self.workflow_mode
+        if self.runtime_state:
+            payload["runtime_state"] = dict(self.runtime_state)
         return payload
 
     @classmethod
@@ -86,6 +95,9 @@ class SessionRunStartResponse:
         return cls(
             session_run_id=d.get("session_run_id", ""),
             session_id=d.get("session_id") if isinstance(d.get("session_id"), str) else None,
+            agent_id=d.get("agent_id") if isinstance(d.get("agent_id"), str) else None,
+            workflow_mode=d.get("workflow_mode") if isinstance(d.get("workflow_mode"), str) else None,
+            runtime_state=d.get("runtime_state") if isinstance(d.get("runtime_state"), dict) else {},
             error=d.get("error"),
         )
 
@@ -257,6 +269,8 @@ class SessionRunStatusResponse:
     mode: str | None = None
     workflow_mode: str | None = None
     taskflow_id: str | None = None
+    agent_id: str | None = None
+    runtime_state: dict[str, Any] = field(default_factory=dict)
     created_at: float | None = None
     last_activity_at: float | None = None
     finished_at: float | None = None
@@ -282,6 +296,8 @@ class SessionRunStatusResponse:
             "mode": self.mode,
             "workflow_mode": self.workflow_mode,
             "taskflow_id": self.taskflow_id,
+            "agent_id": self.agent_id,
+            "runtime_state": dict(self.runtime_state),
             "created_at": self.created_at,
             "last_activity_at": self.last_activity_at,
             "finished_at": self.finished_at,
@@ -309,6 +325,8 @@ class SessionRunStatusResponse:
             mode=d.get("mode") if isinstance(d.get("mode"), str) else None,
             workflow_mode=d.get("workflow_mode") if isinstance(d.get("workflow_mode"), str) else None,
             taskflow_id=d.get("taskflow_id") if isinstance(d.get("taskflow_id"), str) else None,
+            agent_id=d.get("agent_id") if isinstance(d.get("agent_id"), str) else None,
+            runtime_state=d.get("runtime_state") if isinstance(d.get("runtime_state"), dict) else {},
             created_at=float(d["created_at"]) if d.get("created_at") is not None else None,
             last_activity_at=float(d["last_activity_at"])
             if d.get("last_activity_at") is not None
