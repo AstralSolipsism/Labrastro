@@ -297,6 +297,16 @@ def test_provider_config_reads_and_infers_compat() -> None:
     assert infer_provider_compat("https://dashscope.aliyuncs.com/compatible-mode/v1") == "qwen"
 
 
+def test_provider_config_accepts_labrastro_server_provider() -> None:
+    provider = ProviderConfig.from_dict(
+        "labrastro-server",
+        {"type": "labrastro_server", "enabled": True},
+    )
+
+    assert provider.type == "labrastro_server"
+    assert provider.api_key == ""
+
+
 def test_mode_config_from_dict_normalizes_invalid_fields() -> None:
     mode = ModeConfig.from_dict(
         "coder",
@@ -455,6 +465,7 @@ def test_sandbox_provider_config_defaults_and_validation() -> None:
 
     assert config.sandbox_provider.type == "none"
     assert config.sandbox_provider.worker_image == "labrastro-host:test"
+    assert config.sandbox_provider.workspace_volume_root == "labrastro-workspaces"
     assert config.validate() == []
 
 

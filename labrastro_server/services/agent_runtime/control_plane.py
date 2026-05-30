@@ -150,6 +150,21 @@ def _dict_from(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _agent_model_binding(raw_agent: dict[str, Any]) -> dict[str, Any]:
+    raw_model = _dict_from(raw_agent.get("model"))
+    provider = str(raw_model.get("provider") or "").strip()
+    model = str(raw_model.get("model") or "").strip()
+    if not provider or not model:
+        return {}
+    binding: dict[str, Any] = {"provider": provider, "model": model}
+    if raw_model.get("display_name"):
+        binding["display_name"] = str(raw_model["display_name"])
+    parameters = _dict_from(raw_model.get("parameters"))
+    if parameters:
+        binding["parameters"] = parameters
+    return binding
+
+
 def _string_list_from(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if str(item).strip()]
@@ -517,6 +532,11 @@ class AgentRunControlPlane:
                 worker_kind=request.worker_kind,
             )
         )
+        model_binding = _agent_model_binding(raw_agent)
+        if model_binding:
+            request.metadata.setdefault("model_binding", model_binding)
+            if request.model is None:
+                request.model = str(model_binding["model"])
         self._validate_runtime_policy(
             request,
             agent_config=agent_config,
@@ -593,6 +613,8 @@ class AgentRunControlPlane:
         if request.sandbox_session_id:
             return None
         if request.metadata.get("skip_sandbox") is True:
+            return None
+        if request.worker_kind != WorkerKind.SANDBOX_WORKER:
             return None
         metadata = dict(request.metadata)
         runtime_profile = self._runtime_profile_for_request(request)

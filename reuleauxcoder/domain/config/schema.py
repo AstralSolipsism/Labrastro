@@ -27,7 +27,7 @@ CONFIG_SCHEMA = {
     "providers": {
         "items": {
             "provider_id": {
-                "type": "string (one of openai_chat, anthropic_messages, openai_responses)",
+                "type": "string (one of openai_chat, anthropic_messages, openai_responses, labrastro_server)",
                 "compat": "string (optional, one of generic, deepseek, kimi, glm, qwen, zenmux; inferred from base_url when omitted)",
                 "enabled": "bool (default: true)",
                 "api_key": "string (optional, supports ${ENV_NAME})",

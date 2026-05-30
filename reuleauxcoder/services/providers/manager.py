@@ -15,6 +15,9 @@ from reuleauxcoder.services.providers.adapters.openai_chat import OpenAIChatProv
 from reuleauxcoder.services.providers.adapters.openai_responses import (
     OpenAIResponsesProvider,
 )
+from reuleauxcoder.services.providers.adapters.labrastro_server import (
+    LabrastroServerProvider,
+)
 
 
 class ProviderManager:
@@ -24,6 +27,7 @@ class ProviderManager:
         "openai_chat": OpenAIChatProvider,
         "anthropic_messages": AnthropicMessagesProvider,
         "openai_responses": OpenAIResponsesProvider,
+        "labrastro_server": LabrastroServerProvider,
     }
 
     _known_model_capabilities: dict[str, dict[str, Any]] = {
@@ -55,6 +59,14 @@ class ProviderManager:
                 "unsupported": True,
                 "models": [],
                 "message": "anthropic_messages provider does not expose a generic model listing endpoint.",
+            }
+        if config.type == "labrastro_server":
+            return {
+                "ok": True,
+                "provider_id": config.id,
+                "unsupported": True,
+                "models": [],
+                "message": "labrastro_server provider delegates model selection to the Labrastro server.",
             }
         if config.type not in {"openai_chat", "openai_responses"}:
             raise ValueError(f"Unsupported provider type: {config.type}")

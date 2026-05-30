@@ -28,7 +28,12 @@ from reuleauxcoder.domain.memory.registry import (
 
 MCPPlacement = Literal["server", "peer", "both"]
 MCPDistribution = Literal["command", "artifact"]
-ProviderType = Literal["openai_chat", "anthropic_messages", "openai_responses"]
+ProviderType = Literal[
+    "openai_chat",
+    "anthropic_messages",
+    "openai_responses",
+    "labrastro_server",
+]
 ProviderCompat = Literal["generic", "deepseek", "kimi", "glm", "qwen", "zenmux"]
 
 SUPPORTED_PROVIDER_COMPATS = {"generic", "deepseek", "kimi", "glm", "qwen", "zenmux"}
@@ -111,10 +116,11 @@ DEFAULT_USER_RUNTIME_PROFILE: dict[str, Any] = {
 DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE: dict[str, Any] = {
     "executor": "reuleauxcoder",
     "execution_location": "remote_server",
-    "worker_kind": "server_worker",
+    "worker_kind": "sandbox_worker",
     "model_request_origin": "server",
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
+    "sandbox": {},
 }
 DEFAULT_MAIN_CHAT_AGENT: dict[str, Any] = {
     "name": "Main Chat Agent",
@@ -404,8 +410,20 @@ def ensure_default_environment_agent_registry(
             DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE
         )
     else:
+        forced_packager_keys = {
+            "executor",
+            "execution_location",
+            "worker_kind",
+            "model_request_origin",
+            "runtime_home_policy",
+            "approval_mode",
+            "sandbox",
+        }
         for key, value in DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE.items():
-            packager_profile.setdefault(key, deepcopy(value))
+            if key in forced_packager_keys:
+                packager_profile[key] = deepcopy(value)
+            else:
+                packager_profile.setdefault(key, deepcopy(value))
 
     raw_agents = registry.get("agents")
     agents = raw_agents if isinstance(raw_agents, dict) else {}
@@ -700,7 +718,7 @@ class ProviderConfig:
     def from_dict(cls, provider_id: str, d: dict[str, Any]) -> "ProviderConfig":
         raw_type = str(d.get("type", "openai_chat")).strip().lower()
         provider_type: ProviderType
-        if raw_type in {"anthropic_messages", "openai_responses"}:
+        if raw_type in {"anthropic_messages", "openai_responses", "labrastro_server"}:
             provider_type = raw_type  # type: ignore[assignment]
         else:
             provider_type = "openai_chat"
@@ -1850,7 +1868,7 @@ class SandboxProviderConfig:
     type: str = "none"
     host_base_url: str = ""
     worker_image: str = "labrastro-host:test"
-    workspace_volume_root: str = "ezcode-workspaces"
+    workspace_volume_root: str = "labrastro-workspaces"
     network: str = ""
     cpu_limit: str = ""
     memory_limit: str = ""
@@ -1868,8 +1886,8 @@ class SandboxProviderConfig:
                 or "labrastro-host:test"
             ),
             workspace_volume_root=str(
-                data.get("workspace_volume_root", "ezcode-workspaces")
-                or "ezcode-workspaces"
+                data.get("workspace_volume_root", "labrastro-workspaces")
+                or "labrastro-workspaces"
             ),
             network=str(data.get("network", "") or ""),
             cpu_limit=str(data.get("cpu_limit", "") or ""),
@@ -2552,9 +2570,10 @@ class Config:
                 "openai_chat",
                 "anthropic_messages",
                 "openai_responses",
+                "labrastro_server",
             }:
                 errors.append(
-                    f"providers.items[{provider_id}].type must be one of openai_chat, anthropic_messages, openai_responses"
+                    f"providers.items[{provider_id}].type must be one of openai_chat, anthropic_messages, openai_responses, labrastro_server"
                 )
             if provider.timeout_sec < 1:
                 errors.append(

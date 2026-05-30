@@ -11,6 +11,9 @@ from reuleauxcoder.services.providers.adapters.anthropic_messages import (
     convert_chat_tools_to_anthropic_tools,
     convert_messages_to_anthropic,
 )
+from reuleauxcoder.services.providers.adapters.labrastro_server import (
+    LabrastroServerProvider,
+)
 from reuleauxcoder.services.providers.adapters.openai_chat import (
     OpenAIChatProvider,
     _DEBUG_HTTP_CHUNK_SINK,
@@ -97,6 +100,90 @@ def test_chat_provider_uses_configured_openai_client(monkeypatch) -> None:
     assert captured["timeout"] == 9
     assert captured["default_headers"] == {"X-Test": "yes"}
     assert isinstance(captured["http_client"], httpx.Client)
+
+
+def test_labrastro_server_provider_streams_through_agent_run_bridge(monkeypatch) -> None:
+    monkeypatch.setenv("LABRASTRO_REMOTE_BASE_URL", "http://127.0.0.1:8765/")
+    monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
+
+    class FakeStream:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_lines(self):
+            yield "event: token"
+            yield 'data: {"text": "hel"}'
+            yield ""
+            yield "event: reasoning_token"
+            yield 'data: {"text": "plan"}'
+            yield ""
+            yield "event: tool_call_delta"
+            yield 'data: {"id": "call-1", "name": "read_file"}'
+            yield ""
+            yield "event: done"
+            yield (
+                'data: {"content": "hello", "reasoning_content": "plan", '
+                '"tool_calls": [{"id": "call-1", "name": "read_file", '
+                '"arguments": {"path": "README.md"}}], "prompt_tokens": 1, '
+                '"completion_tokens": 2, "cost_usd": 0.01, '
+                '"diagnostics": [{"code": "notice", "message": "ok"}]}'
+            )
+            yield ""
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def stream(self, method, url, json):
+            self.calls.append({"method": method, "url": url, "json": json})
+            return FakeStream()
+
+    provider = LabrastroServerProvider(
+        ProviderConfig(id="labrastro-server", type="labrastro_server")
+    )
+    fake_client = FakeClient()
+    provider.client = fake_client
+    tokens: list[str] = []
+    reasoning: list[str] = []
+    tool_deltas: list[dict] = []
+
+    response = provider.chat(
+        ProviderRequest(
+            model="agent-run",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=384000,
+            on_token=tokens.append,
+            on_reasoning_token=reasoning.append,
+            on_tool_call_delta=tool_deltas.append,
+        )
+    )
+
+    assert tokens == ["hel"]
+    assert reasoning == ["plan"]
+    assert tool_deltas == [{"id": "call-1", "name": "read_file"}]
+    assert response.content == "hello"
+    assert response.reasoning_content == "plan"
+    assert response.prompt_tokens == 1
+    assert response.completion_tokens == 2
+    assert response.cost_usd == 0.01
+    assert response.diagnostics[0].code == "notice"
+    assert response.tool_calls[0].arguments == {"path": "README.md"}
+    call = fake_client.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == "http://127.0.0.1:8765/remote/agent-runs/model-request"
+    assert call["json"]["peer_token"] == "peer-token"
+    assert call["json"]["agent_run_id"] == "run-1"
+    assert call["json"]["request_id"] == "claim-1"
+    assert call["json"]["worker_id"] == "worker-1"
+    assert call["json"]["parameters"]["max_tokens"] == 384000
 
 
 def test_debug_http_transport_uses_incoming_request_when_wrapping_response(

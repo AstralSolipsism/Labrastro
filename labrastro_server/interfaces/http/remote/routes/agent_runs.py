@@ -46,6 +46,11 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
 )
+from labrastro_server.services.agent_runtime.model_bridge import (
+    AgentRunModelBridge,
+    AgentRunModelBridgeError,
+    provider_response_to_dict,
+)
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
 from reuleauxcoder.domain.agent_runtime.models import WorkerKind
 from reuleauxcoder.interfaces.events import UIEventKind
@@ -297,6 +302,63 @@ class RemoteAgentRunRoutes:
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True})
+
+    def _handle_agent_run_model_request(self) -> None:
+        payload = self._read_json()
+        peer_token = payload.get("peer_token")
+        peer_id = self._verify_peer_token(peer_token)
+        if peer_id is None:
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+            return
+        if self.service.runtime_control_plane is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runs_unavailable")
+            return
+        bridge = AgentRunModelBridge(
+            runtime_control_plane=self.service.runtime_control_plane,
+            admin_manager=self.service.admin_manager,
+        )
+        try:
+            prepared = bridge.prepare(payload, peer_id=peer_id)
+        except AgentRunModelBridgeError as exc:
+            self._send_error(exc.status, exc.code, exc.message)
+            return
+        self.service.relay_server.registry.update_heartbeat(peer_id)
+        if payload.get("stream") is False:
+            try:
+                response = bridge.execute(prepared)
+            except AgentRunModelBridgeError as exc:
+                self._send_error(exc.status, exc.code, exc.message)
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, "response": provider_response_to_dict(response)},
+            )
+            return
+        self._send_sse_headers()
+
+        def write_event(event: str, data: dict[str, Any]) -> None:
+            self._write_sse_event(event, data)
+
+        try:
+            response = bridge.execute(
+                prepared,
+                on_token=lambda text: write_event("token", {"text": text}),
+                on_reasoning_token=lambda text: write_event(
+                    "reasoning_token", {"text": text}
+                ),
+                on_tool_call_delta=lambda delta: write_event(
+                    "tool_call_delta", dict(delta)
+                ),
+            )
+            self._write_sse_event("done", provider_response_to_dict(response))
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except AgentRunModelBridgeError as exc:
+            self._write_sse_event(
+                "error",
+                {"error": exc.code, "message": exc.message},
+            )
+            self.close_connection = True
 
     def _handle_agent_run_complete(self) -> None:
         payload = self._read_json()

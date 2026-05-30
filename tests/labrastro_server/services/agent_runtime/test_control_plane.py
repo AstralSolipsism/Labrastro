@@ -157,6 +157,65 @@ def test_agent_run_request_projects_source_and_sandbox_fields() -> None:
     assert task["parent_run_id"] == "chat:parent"
 
 
+def test_agent_run_snapshots_agent_model_binding_for_server_origin() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "packager": {
+                    "executor": "reuleauxcoder",
+                    "execution_location": "remote_server",
+                    "worker_kind": "sandbox_worker",
+                    "model_request_origin": "server",
+                }
+            },
+            "agents": {
+                "capability_packager": {
+                    "visibility": "system",
+                    "system_flow_only": ["capability_ingest"],
+                    "runtime_profile": "packager",
+                    "model": {
+                        "provider": "deepseek",
+                        "model": "deepseek-v4-pro",
+                        "parameters": {
+                            "max_tokens": 384000,
+                            "max_context_tokens": 1000000,
+                        },
+                    },
+                }
+            },
+        },
+    )
+
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="capability",
+            agent_id="capability_packager",
+            prompt="package repo",
+            source="capability_ingest",
+        ),
+        task_id="run-packager",
+    )
+    claim = control.claim_agent_run(
+        worker_id="worker-1",
+        worker_kind="sandbox_worker",
+        executors=["reuleauxcoder"],
+        peer_id="peer-1",
+        peer_features=["worker_kind:sandbox_worker"],
+    )
+
+    assert claim is not None
+    assert run.metadata["model_binding"] == {
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "parameters": {
+            "max_tokens": 384000,
+            "max_context_tokens": 1000000,
+        },
+    }
+    assert claim.executor_request.model == "deepseek-v4-pro"
+    assert claim.executor_request.metadata["model_binding"]["provider"] == "deepseek"
+
+
 def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
@@ -1027,6 +1086,7 @@ def test_default_system_agent_runs_carry_effective_capability_boundaries() -> No
         "builtin:list_file",
         "builtin:read_file",
     ]
+    assert packager_task.metadata["worker_kind"] == "sandbox_worker"
 
 
 def test_sandbox_worker_claims_only_sandbox_managed_runs() -> None:
@@ -1565,7 +1625,8 @@ def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> 
                 "capability_packager_remote": {
                     "executor": "fake",
                     "execution_location": "remote_server",
-                    "worker_kind": "server_worker",
+                    "worker_kind": "sandbox_worker",
+                    "sandbox": {},
                 }
             },
             "agents": {
@@ -1598,7 +1659,8 @@ def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
                 "capability_packager_remote": {
                     "executor": "fake",
                     "execution_location": "remote_server",
-                    "worker_kind": "server_worker",
+                    "worker_kind": "sandbox_worker",
+                    "sandbox": {},
                 }
             },
             "agents": {
@@ -1624,3 +1686,4 @@ def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
 
     assert task.agent_id == "capability_packager"
     assert task.source.value == "capability_ingest"
+    assert task.metadata["worker_kind"] == "sandbox_worker"

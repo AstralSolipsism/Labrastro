@@ -208,7 +208,7 @@ class LLM:
                 "No chat model is selected. Choose a provider and model before starting chat."
             )
             return
-        if not self.api_key:
+        if not self.api_key and self.provider_type != "labrastro_server":
             self._provider = None
             self.client = None
             self._provider_unavailable_reason = (
