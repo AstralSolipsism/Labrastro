@@ -262,6 +262,29 @@ def test_runtime_projection_contract_keeps_transcript_business_visible() -> None
     assert document["stats"]["runStatus"] == "done"
 
 
+def test_output_event_preserves_warning_notice_level() -> None:
+    document = _session_run_start(None, "生成能力包", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="output",
+        payload={
+            "content": "资料抓取问题：The read operation timed out",
+            "format": "plain",
+            "level": "warning",
+        },
+        session_event_seq=2,
+    )
+
+    part = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert part["id"] == "output-2"
+    assert part["type"] == "notice"
+    assert part["level"] == "warning"
+    assert part["text"] == "资料抓取问题：The read operation timed out"
+    assert part["format"] == "plain"
+    assert part["sessionEventSeq"] == 2
+
+
 def test_live_session_run_events_reduce_into_canonical_transcript_blocks() -> None:
     document = _session_run_start(None, "运行测试", 1)
     events = [

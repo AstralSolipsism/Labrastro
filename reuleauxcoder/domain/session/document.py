@@ -520,7 +520,7 @@ def _apply_tool_or_output_event(
             }))
         else:
             _append_part(doc, _part("output", "notice", meta, {
-                "level": "info",
+                "level": _notice_level(payload),
                 "text": content,
                 "format": "markdown" if str(payload.get("format") or "") == "markdown" else "plain",
             }))
@@ -1072,6 +1072,11 @@ def _append_notice_part(
         "text": content,
         "format": fmt,
     }))
+
+
+def _notice_level(payload: dict[str, Any]) -> str:
+    level = str(payload.get("level") or "").strip().lower()
+    return level if level in {"info", "warning", "error"} else "info"
 
 
 def _has_notice_level(doc: dict[str, Any], level: str) -> bool:
