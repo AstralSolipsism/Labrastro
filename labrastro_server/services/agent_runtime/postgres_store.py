@@ -77,6 +77,19 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+def _default_executor_session_id(task_id: str) -> str:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "._-" else "-"
+        for ch in str(task_id or "").strip()
+    ).strip("-")
+    return f"labrastro-agent-run-{safe or _new_id('session')}"
+
+
+def _ensure_reuleauxcoder_executor_session(request: Any, task_id: str) -> None:
+    if request.executor == ExecutorType.REULEAUXCODER and not request.executor_session_id:
+        request.executor_session_id = _default_executor_session_id(task_id)
+
+
 def _dict_from(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -191,6 +204,8 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
         "workspace_ref": task.workspace_ref,
         "delegated_by_run_id": task.delegated_by_run_id,
         "parent_run_id": task.parent_run_id,
+        "failure_reason": task.failure_reason,
+        "cancel_reason": task.cancel_reason,
         "metadata": dict(task.metadata),
     }
 
@@ -250,7 +265,9 @@ class PostgresAgentRunStore:
             self.runtime_snapshot = dict(runtime_snapshot)
 
     def submit_agent_run(self, request: Any, *, task_id: str | None = None) -> AgentRunRecord:
+        task_id = task_id or _new_id("task")
         request = self._resolve_request(request)
+        _ensure_reuleauxcoder_executor_session(request, task_id)
         metadata = dict(request.metadata)
         metadata.setdefault("agent_run_source", request.source.value)
         if request.sandbox_id:
@@ -273,7 +290,7 @@ class PostgresAgentRunStore:
                 request.model_request_origin.value,
             )
         task = AgentRunRecord(
-            id=task_id or _new_id("task"),
+            id=task_id,
             issue_id=request.issue_id,
             agent_id=request.agent_id,
             source=request.source,
@@ -703,12 +720,15 @@ class PostgresAgentRunStore:
                     text(
                         """
                         UPDATE labrastro_agent_runs
-                        SET status='blocked', metadata=CAST(:metadata AS JSONB), updated_at=now()
+                        SET status='blocked', failure_reason=:failure_reason,
+                            cancel_reason=NULL, metadata=CAST(:metadata AS JSONB),
+                            updated_at=now()
                         WHERE id=:task_id
                         """
                     ),
                     {
                         "task_id": task_id,
+                        "failure_reason": expansion.policy_error,
                         "metadata": _json(metadata),
                     },
                 )
@@ -731,11 +751,19 @@ class PostgresAgentRunStore:
                         text(
                             """
                             UPDATE labrastro_agent_runs
-                            SET status='blocked', updated_at=now()
+                            SET status='blocked', failure_reason=:failure_reason,
+                                cancel_reason=NULL, updated_at=now()
                             WHERE id=:task_id
                             """
                         ),
-                        {"task_id": task_id},
+                        {
+                            "task_id": task_id,
+                            "failure_reason": str(
+                                event.data.get("reason")
+                                or event.data.get("message")
+                                or "approval_required"
+                            ),
+                        },
                     )
                     return True, ""
                 mapped = {
@@ -744,15 +772,37 @@ class PostgresAgentRunStore:
                     "blocked": "blocked",
                 }.get(status)
                 if mapped:
+                    failure_reason = (
+                        str(
+                            event.data.get("reason")
+                            or event.data.get("message")
+                            or "blocked"
+                        )
+                        if mapped == "blocked"
+                        else None
+                    )
                     conn.execute(
                         text(
                             """
                             UPDATE labrastro_agent_runs
-                            SET status=:status, updated_at=now()
+                            SET status=:status,
+                                failure_reason=CASE
+                                    WHEN :failure_reason IS NULL THEN failure_reason
+                                    ELSE :failure_reason
+                                END,
+                                cancel_reason=CASE
+                                    WHEN :failure_reason IS NULL THEN cancel_reason
+                                    ELSE NULL
+                                END,
+                                updated_at=now()
                             WHERE id=:task_id
                             """
                         ),
-                        {"task_id": task_id, "status": mapped},
+                        {
+                            "task_id": task_id,
+                            "status": mapped,
+                            "failure_reason": failure_reason,
+                        },
                     )
             return True, ""
 
@@ -799,26 +849,36 @@ class PostgresAgentRunStore:
                 issue_status = "in_review" if self._has_open_pr(conn, task_id) else "done"
                 output = result.output
                 failure_reason = None
+                cancel_reason = None
             elif policy_error:
                 status = "blocked"
                 issue_status = "blocked"
                 output = policy_error
-                failure_reason = "blocked"
+                failure_reason = policy_error
+                cancel_reason = None
             elif result.status == "cancelled":
                 status = "cancelled"
                 issue_status = "blocked"
-                output = result.output
+                cancel_reason = (
+                    result.output
+                    or self._cancel_reason(conn, task_id)
+                    or result.error
+                    or "cancelled"
+                )
+                output = result.output or cancel_reason
                 failure_reason = "cancelled"
             elif result.status == "blocked":
                 status = "blocked"
                 issue_status = "blocked"
                 output = result.output or result.error
-                failure_reason = "blocked"
+                failure_reason = result.error or result.output or "blocked"
+                cancel_reason = None
             else:
                 status = "failed"
                 issue_status = "blocked"
                 output = result.output
                 failure_reason = result.error or "agent_error"
+                cancel_reason = None
             metadata = dict(task.metadata)
             if policy_error:
                 metadata["environment_policy_violation"] = policy_error
@@ -829,7 +889,8 @@ class PostgresAgentRunStore:
                     SET status=:status, output=:output,
                         executor_session_id=COALESCE(:executor_session_id, executor_session_id),
                         issue_status=:issue_status,
-                        failure_reason=COALESCE(:failure_reason, failure_reason),
+                        failure_reason=:failure_reason,
+                        cancel_reason=:cancel_reason,
                         metadata=CAST(:metadata AS JSONB),
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
@@ -842,6 +903,7 @@ class PostgresAgentRunStore:
                     "executor_session_id": result.executor_session_id,
                     "issue_status": issue_status,
                     "failure_reason": failure_reason,
+                    "cancel_reason": cancel_reason,
                     "metadata": _json(metadata),
                 },
             )
@@ -938,7 +1000,8 @@ class PostgresAgentRunStore:
                 text(
                     """
                     UPDATE labrastro_agent_runs
-                    SET status='failed', output=:error, failure_reason='manual',
+                    SET status='failed', output=:error,
+                        failure_reason=:error, cancel_reason=NULL,
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
                     """
@@ -960,7 +1023,8 @@ class PostgresAgentRunStore:
                     text(
                         """
                         UPDATE labrastro_agent_runs
-                        SET status='cancelled', cancel_reason=:reason,
+                        SET status='cancelled', output=:reason,
+                            failure_reason='cancelled', cancel_reason=:reason,
                             completed_at=now(), updated_at=now()
                         WHERE id=:task_id
                         """
@@ -998,7 +1062,8 @@ class PostgresAgentRunStore:
                 text(
                     """
                     UPDATE labrastro_agent_runs
-                    SET status='cancelled', cancel_reason=:reason,
+                    SET status='cancelled', output=:reason,
+                        failure_reason='cancelled', cancel_reason=:reason,
                         completed_at=now(), updated_at=now()
                     WHERE id=:task_id
                     """
@@ -1323,6 +1388,8 @@ class PostgresAgentRunStore:
             workspace_ref=metadata.get("workspace_ref"),
             delegated_by_run_id=metadata.get("delegated_by_run_id"),
             parent_run_id=metadata.get("parent_run_id") or row["parent_task_id"],
+            failure_reason=row["failure_reason"],
+            cancel_reason=row["cancel_reason"],
             metadata=metadata,
         )
 

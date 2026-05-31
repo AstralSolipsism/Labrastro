@@ -216,6 +216,28 @@ def test_agent_run_snapshots_agent_model_binding_for_server_origin() -> None:
     assert claim.executor_request.metadata["model_binding"]["provider"] == "deepseek"
 
 
+def test_reuleauxcoder_agent_run_gets_stable_executor_session_before_claim() -> None:
+    control = AgentRunControlPlane()
+
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="agent-run-session",
+            agent_id="capability_packager",
+            prompt="package repo",
+            executor=ExecutorType.REULEAUXCODER,
+        ),
+        task_id="task-reuleaux",
+    )
+    claim = control.claim_agent_run(
+        worker_id="worker-1",
+        executors=["reuleauxcoder"],
+    )
+
+    assert run.executor_session_id == "labrastro-agent-run-task-reuleaux"
+    assert claim is not None
+    assert claim.executor_request.executor_session_id == run.executor_session_id
+
+
 def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
@@ -237,6 +259,35 @@ def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
 
     detail = control.load_agent_run_detail(task.id, event_limit=2)
     assert [event["seq"] for event in detail["events"]] == [5, 6]
+
+
+def test_failed_agent_run_exposes_terminal_reason_when_output_is_empty() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="issue-failed",
+            agent_id="coder",
+            prompt="run",
+        ),
+        task_id="task-failed",
+    )
+
+    completed = control.complete_agent_run(
+        task.id,
+        ExecutorRunResult(
+            task_id=task.id,
+            status="failed",
+            output="",
+            error="real model failure",
+        ),
+    )
+
+    assert completed.status.value == "failed"
+    assert completed.output == ""
+    assert completed.failure_reason == "real model failure"
+    detail = control.agent_run_to_dict(task.id)
+    assert detail["failure_reason"] == "real model failure"
+    assert detail["cancel_reason"] is None
 
 
 def test_complete_without_session_id_preserves_stream_pinned_session() -> None:
@@ -308,6 +359,35 @@ def test_followup_task_inherits_parent_session_when_scope_matches() -> None:
     assert followup.branch_name == parent.branch_name
     assert followup.pr_url == parent.pr_url
     assert followup.executor_session_id == "claude-session-1"
+
+
+def test_reuleauxcoder_followup_reuses_parent_executor_session() -> None:
+    control = AgentRunControlPlane()
+    parent = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="capability-followup",
+            agent_id="capability_packager",
+            prompt="draft",
+            executor=ExecutorType.REULEAUXCODER,
+            execution_location=ExecutionLocation.REMOTE_SERVER,
+            workdir="/tmp/capability",
+            branch_name="agent/capability/task-parent",
+        ),
+        task_id="task-capability-parent",
+    )
+
+    followup = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="capability-followup",
+            agent_id="capability_packager",
+            prompt="revise draft",
+            parent_task_id=parent.id,
+        ),
+        task_id="task-capability-followup",
+    )
+
+    assert parent.executor_session_id == "labrastro-agent-run-task-capability-parent"
+    assert followup.executor_session_id == parent.executor_session_id
 
 
 def test_followup_task_does_not_inherit_session_for_different_agent() -> None:
@@ -1345,6 +1425,8 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
         ),
     )
     assert completed.status.value == "cancelled"
+    assert completed.cancel_reason == "stop"
+    assert control.agent_run_to_dict(task.id)["cancel_reason"] == "stop"
 
     missing = control.heartbeat_agent_run(
         request_id="missing-claim",

@@ -64,6 +64,22 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+def _default_executor_session_id(task_id: str) -> str:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "._-" else "-"
+        for ch in str(task_id or "").strip()
+    ).strip("-")
+    return f"labrastro-agent-run-{safe or uuid.uuid4().hex}"
+
+
+def _ensure_reuleauxcoder_executor_session(
+    request: "AgentRunRequest",
+    task_id: str,
+) -> None:
+    if request.executor == ExecutorType.REULEAUXCODER and not request.executor_session_id:
+        request.executor_session_id = _default_executor_session_id(task_id)
+
+
 def _coerce_executor(value: ExecutorType | str | None) -> ExecutorType:
     if isinstance(value, ExecutorType):
         return value
@@ -126,6 +142,8 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
         "workspace_ref": task.workspace_ref,
         "delegated_by_run_id": task.delegated_by_run_id,
         "parent_run_id": task.parent_run_id,
+        "failure_reason": task.failure_reason,
+        "cancel_reason": task.cancel_reason,
         "metadata": dict(task.metadata),
     }
 
@@ -370,7 +388,14 @@ class AgentRunControlPlane:
     ) -> AgentRunRecord:
         task_id = task_id or _new_id("task")
         if self._store is not None:
-            request = self._resolve_request_against_snapshot(request)
+            parent = None
+            if request.parent_task_id:
+                try:
+                    parent = self._store.get_agent_run(request.parent_task_id)
+                except KeyError:
+                    parent = None
+            request = self._resolve_request_against_snapshot(request, parent=parent)
+            _ensure_reuleauxcoder_executor_session(request, task_id)
             request.metadata = self._metadata_with_snapshot_capabilities(
                 dict(request.metadata),
                 agent_id=request.agent_id,
@@ -385,6 +410,7 @@ class AgentRunControlPlane:
             return task
         with self._lock:
             request = self._resolve_request_locked(request)
+            _ensure_reuleauxcoder_executor_session(request, task_id)
         sandbox_error = self._prepare_sandbox_session(request, task_id)
         with self._lock:
             metadata = dict(request.metadata)
@@ -455,6 +481,8 @@ class AgentRunControlPlane:
             if sandbox_error:
                 task.status = TaskStatus.FAILED
                 task.output = sandbox_error
+                task.failure_reason = sandbox_error
+                task.cancel_reason = None
                 self._append_event_locked(task.id, "failed", {"error": sandbox_error})
         self.notify_task_available()
         return task
@@ -1219,6 +1247,8 @@ class AgentRunControlPlane:
             if expansion.policy_error:
                 task.metadata["environment_policy_violation"] = expansion.policy_error
                 task.status = TaskStatus.BLOCKED
+                task.failure_reason = expansion.policy_error
+                task.cancel_reason = None
                 self._append_event_locked(
                     task_id,
                     "blocked",
@@ -1229,6 +1259,12 @@ class AgentRunControlPlane:
                 if status == "waiting_approval":
                     if should_block_waiting_approval(task.source):
                         task.status = TaskStatus.BLOCKED
+                        task.failure_reason = str(
+                            event.data.get("reason")
+                            or event.data.get("message")
+                            or "approval_required"
+                        )
+                        task.cancel_reason = None
                         self._append_event_locked(
                             task_id,
                             "permission.blocked_review",
@@ -1240,6 +1276,12 @@ class AgentRunControlPlane:
                     task.status = TaskStatus.RUNNING
                 elif status == "blocked":
                     task.status = TaskStatus.BLOCKED
+                    task.failure_reason = str(
+                        event.data.get("reason")
+                        or event.data.get("message")
+                        or "blocked"
+                    )
+                    task.cancel_reason = None
             return True, ""
 
     def complete_claimed_agent_run(
@@ -1293,20 +1335,39 @@ class AgentRunControlPlane:
             policy_error = str(
                 task.metadata.get("environment_policy_violation") or ""
             ).strip()
+            requested_cancel_reason = str(
+                self._cancel_requests.get(task_id) or ""
+            ).strip()
             if result.succeeded and not policy_error:
                 self._states[task_id].complete_agent_run(output=result.output)
+                task.failure_reason = None
+                task.cancel_reason = None
             elif policy_error:
                 task.status = TaskStatus.BLOCKED
                 task.output = policy_error
+                task.failure_reason = policy_error
+                task.cancel_reason = None
             elif result.status == "cancelled":
+                cancel_reason = (
+                    result.output
+                    or requested_cancel_reason
+                    or result.error
+                    or "cancelled"
+                )
                 task.status = TaskStatus.CANCELLED
-                task.output = result.output
+                task.output = result.output or cancel_reason
+                task.failure_reason = "cancelled"
+                task.cancel_reason = cancel_reason
             elif result.status == "blocked":
                 task.status = TaskStatus.BLOCKED
                 task.output = result.output or result.error
+                task.failure_reason = result.error or result.output or "blocked"
+                task.cancel_reason = None
             else:
                 task.status = TaskStatus.FAILED
                 task.output = result.output
+                task.failure_reason = result.error or "agent_error"
+                task.cancel_reason = None
             if result.executor_session_id:
                 task.executor_session_id = result.executor_session_id
                 self._sessions[task_id] = TaskSessionRef(
@@ -1332,6 +1393,8 @@ class AgentRunControlPlane:
                     task.metadata["environment_policy_violation"] = policy_error
                     task.status = TaskStatus.BLOCKED
                     task.output = policy_error
+                    task.failure_reason = policy_error
+                    task.cancel_reason = None
                     self._append_event_locked(
                         task_id,
                         "blocked",
@@ -1419,6 +1482,8 @@ class AgentRunControlPlane:
             task = self._task_locked(task_id)
             task.status = TaskStatus.FAILED
             task.output = error
+            task.failure_reason = error
+            task.cancel_reason = None
             self._append_event_locked(task_id, "failed", {"error": error})
             self._clear_task_claims_locked(task_id)
             self._cancel_requests.pop(task_id, None)
@@ -1441,6 +1506,8 @@ class AgentRunControlPlane:
                 self._stop_sandbox_for_task(task, cancel=True)
                 task.status = TaskStatus.CANCELLED
                 task.output = reason
+                task.failure_reason = "cancelled"
+                task.cancel_reason = reason
                 self._append_event_locked(task_id, "cancelled", {"reason": reason})
                 self._clear_task_claims_locked(task_id)
                 self._cancel_requests.pop(task_id, None)
@@ -1458,6 +1525,9 @@ class AgentRunControlPlane:
                 )
                 return True
             task.status = TaskStatus.CANCELLED
+            task.output = reason
+            task.failure_reason = "cancelled"
+            task.cancel_reason = reason
             self._append_event_locked(task_id, "cancelled", {"reason": reason})
             self._clear_task_claims_locked(task_id)
             return True

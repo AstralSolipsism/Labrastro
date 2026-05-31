@@ -1389,6 +1389,8 @@ class AgentRunRecord:
     workspace_ref: str | None = None
     delegated_by_run_id: str | None = None
     parent_run_id: str | None = None
+    failure_reason: str | None = None
+    cancel_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

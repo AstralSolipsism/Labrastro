@@ -116,8 +116,87 @@ def test_postgres_runtime_store_host_restart_fails_running_task() -> None:
     )["ok"]
 
     reloaded = _control()
-    assert reloaded.agent_run_to_dict(task.id)["status"] == "failed"
+    task_detail = reloaded.agent_run_to_dict(task.id)
+    assert task_detail["status"] == "failed"
+    assert task_detail["failure_reason"] == "host_restarted"
     assert any(
         event.type == "host_recovered_task_failed"
         for event in reloaded.list_events(task.id, after_seq=0)
     )
+
+
+def test_postgres_runtime_store_terminal_reasons_round_trip() -> None:
+    control = _control()
+    failed = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-failed",
+            agent_id="pg-agent",
+            prompt="fail smoke",
+        )
+    )
+    control.complete_agent_run(
+        failed.id,
+        ExecutorRunResult(
+            task_id=failed.id,
+            status="failed",
+            output="",
+            error="real postgres failure",
+        ),
+    )
+
+    cancelled = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-cancelled",
+            agent_id="pg-agent",
+            prompt="cancel smoke",
+        )
+    )
+    assert control.cancel_agent_run(cancelled.id, reason="user stopped") is True
+
+    reloaded = _control()
+    failed_detail = reloaded.agent_run_to_dict(failed.id)
+    cancelled_detail = reloaded.agent_run_to_dict(cancelled.id)
+    assert failed_detail["status"] == "failed"
+    assert failed_detail["output"] == ""
+    assert failed_detail["failure_reason"] == "real postgres failure"
+    assert failed_detail["cancel_reason"] is None
+    assert cancelled_detail["status"] == "cancelled"
+    assert cancelled_detail["failure_reason"] == "cancelled"
+    assert cancelled_detail["cancel_reason"] == "user stopped"
+
+
+def test_postgres_runtime_store_assigns_reuleauxcoder_executor_session() -> None:
+    database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
+    run_migrations(database_url)
+    engine = create_postgres_engine(database_url)
+    store = PostgresAgentRunStore(
+        engine,
+        runtime_snapshot={
+            "runtime_profiles": {
+                "packager": {
+                    "executor": "reuleauxcoder",
+                    "execution_location": "remote_server",
+                    "worker_kind": "sandbox_worker",
+                }
+            },
+            "agents": {
+                "capability_packager": {
+                    "runtime_profile": "packager",
+                }
+            },
+        },
+    )
+    control = AgentRunControlPlane(store=store)
+
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-reuleaux",
+            agent_id="capability_packager",
+            prompt="draft",
+            source="capability_ingest",
+        )
+    )
+
+    assert task.executor_session_id
+    assert task.executor_session_id == f"labrastro-agent-run-{task.id}"
+    assert control.agent_run_to_dict(task.id)["executor_session_id"] == task.executor_session_id
