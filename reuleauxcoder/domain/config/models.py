@@ -102,6 +102,8 @@ DEFAULT_ENVIRONMENT_RUNTIME_PROFILE: dict[str, Any] = {
     "execution_location": "local_workspace",
     "worker_kind": "local_peer",
     "model_request_origin": "server",
+    "worktree_role": "target",
+    "publish_policy": "never",
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
 }
@@ -110,6 +112,8 @@ DEFAULT_USER_RUNTIME_PROFILE: dict[str, Any] = {
     "execution_location": "remote_server",
     "worker_kind": "server_worker",
     "model_request_origin": "server",
+    "worktree_role": "target",
+    "publish_policy": "never",
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
 }
@@ -118,8 +122,12 @@ DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE: dict[str, Any] = {
     "execution_location": "remote_server",
     "worker_kind": "sandbox_worker",
     "model_request_origin": "server",
+    "worktree_role": "source",
+    "publish_policy": "never",
     "runtime_home_policy": "per_task",
     "approval_mode": "full",
+    "timeout_sec": 86_400,
+    "step_timeout_sec": 3_600,
     "sandbox": {},
 }
 DEFAULT_MAIN_CHAT_AGENT: dict[str, Any] = {
@@ -415,6 +423,8 @@ def ensure_default_environment_agent_registry(
             "execution_location",
             "worker_kind",
             "model_request_origin",
+            "worktree_role",
+            "publish_policy",
             "runtime_home_policy",
             "approval_mode",
             "sandbox",

@@ -139,7 +139,11 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     assert "capability_packager_remote" in config.runtime_profiles.profiles
     packager_profile = config.runtime_profiles.profiles["capability_packager_remote"]
     assert packager_profile.worker_kind.value == "sandbox_worker"
+    assert packager_profile.worktree_role.value == "source"
+    assert packager_profile.publish_policy.value == "never"
     assert packager_profile.sandbox == {}
+    assert packager_profile.timeout_sec == 86400
+    assert packager_profile.step_timeout_sec == 3600
     assert "capability_packager" in config.agent_registry.agents
 
 
@@ -163,7 +167,11 @@ def test_parse_config_forces_capability_packager_sandbox_worker_profile() -> Non
     assert profile.execution_location.value == "remote_server"
     assert profile.worker_kind.value == "sandbox_worker"
     assert profile.model_request_origin.value == "server"
+    assert profile.worktree_role.value == "source"
+    assert profile.publish_policy.value == "never"
     assert profile.sandbox == {}
+    assert profile.timeout_sec == 86400
+    assert profile.step_timeout_sec == 3600
 
 
 def test_parse_config_injects_environment_configurator_by_default() -> None:

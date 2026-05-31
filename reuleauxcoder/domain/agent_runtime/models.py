@@ -46,6 +46,21 @@ class ModelRequestOrigin(str, Enum):
     LOCAL_CLI = "local_cli"
 
 
+class WorktreeRole(str, Enum):
+    """How an AgentRun is allowed to treat a prepared worktree."""
+
+    SOURCE = "source"
+    TARGET = "target"
+
+
+class PublishPolicy(str, Enum):
+    """Post-run publication behavior for a worktree-backed AgentRun."""
+
+    NEVER = "never"
+    BRANCH = "branch"
+    PR = "pr"
+
+
 class TriggerMode(str, Enum):
     """How an Agent execution was triggered."""
 
@@ -146,6 +161,16 @@ def _string_dict(value: Any) -> dict[str, str]:
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _dedupe_strings(values: list[str]) -> list[str]:
@@ -1098,6 +1123,8 @@ class RuntimeProfileConfig:
     execution_location: ExecutionLocation = ExecutionLocation.REMOTE_SERVER
     worker_kind: WorkerKind = WorkerKind.SERVER_WORKER
     model_request_origin: ModelRequestOrigin = ModelRequestOrigin.SERVER
+    worktree_role: WorktreeRole = WorktreeRole.TARGET
+    publish_policy: PublishPolicy = PublishPolicy.NEVER
     model: str = ""
     command: str | None = None
     args: list[str] = field(default_factory=list)
@@ -1105,6 +1132,8 @@ class RuntimeProfileConfig:
     runtime_home_policy: str = ""
     approval_mode: str = ""
     config_isolation: str = ""
+    timeout_sec: int | None = None
+    step_timeout_sec: int | None = None
     credential_refs: dict[str, str] = field(default_factory=dict)
     mcp: dict[str, Any] = field(default_factory=dict)
     sandbox: dict[str, Any] = field(default_factory=dict)
@@ -1137,6 +1166,8 @@ class RuntimeProfileConfig:
             execution_location=execution_location,
             worker_kind=worker_kind,
             model_request_origin=model_request_origin,
+            worktree_role=WorktreeRole(str(data.get("worktree_role", "target"))),
+            publish_policy=PublishPolicy(str(data.get("publish_policy", "never"))),
             model=str(data.get("model", "") or ""),
             command=str(data["command"]) if data.get("command") is not None else None,
             args=_string_list(data.get("args", [])),
@@ -1144,6 +1175,8 @@ class RuntimeProfileConfig:
             runtime_home_policy=str(data.get("runtime_home_policy", "") or ""),
             approval_mode=str(data.get("approval_mode", "") or ""),
             config_isolation=str(data.get("config_isolation", "") or ""),
+            timeout_sec=_positive_int_or_none(data.get("timeout_sec")),
+            step_timeout_sec=_positive_int_or_none(data.get("step_timeout_sec")),
             credential_refs=_string_dict(data.get("credential_refs", {})),
             mcp=_dict_value(data.get("mcp", {})),
             sandbox=sandbox,
@@ -1155,6 +1188,8 @@ class RuntimeProfileConfig:
             "execution_location": self.execution_location.value,
             "worker_kind": self.worker_kind.value,
             "model_request_origin": self.model_request_origin.value,
+            "worktree_role": self.worktree_role.value,
+            "publish_policy": self.publish_policy.value,
         }
         if self.command is not None:
             result["command"] = self.command
@@ -1170,6 +1205,10 @@ class RuntimeProfileConfig:
             result["approval_mode"] = self.approval_mode
         if self.config_isolation:
             result["config_isolation"] = self.config_isolation
+        if self.timeout_sec is not None:
+            result["timeout_sec"] = self.timeout_sec
+        if self.step_timeout_sec is not None:
+            result["step_timeout_sec"] = self.step_timeout_sec
         if self.credential_refs:
             result["credential_refs"] = dict(self.credential_refs)
         if self.mcp:
@@ -1376,6 +1415,8 @@ class AgentRunRecord:
     runtime_profile_id: str | None = None
     executor: ExecutorType | None = None
     execution_location: ExecutionLocation | None = None
+    worktree_role: WorktreeRole | None = None
+    publish_policy: PublishPolicy | None = None
     output: str | None = None
     parent_task_id: str | None = None
     trigger_comment_id: str | None = None
@@ -1403,6 +1444,10 @@ class AgentRunRecord:
             self.execution_location = ExecutionLocation(
                 _enum_value(self.execution_location)
             )
+        if self.worktree_role is not None:
+            self.worktree_role = WorktreeRole(_enum_value(self.worktree_role))
+        if self.publish_policy is not None:
+            self.publish_policy = PublishPolicy(_enum_value(self.publish_policy))
 
     @property
     def is_terminal(self) -> bool:

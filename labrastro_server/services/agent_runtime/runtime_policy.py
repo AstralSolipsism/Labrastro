@@ -16,7 +16,9 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ExecutionLocation,
     ExecutorType,
     ModelRequestOrigin,
+    PublishPolicy,
     WorkerKind,
+    WorktreeRole,
 )
 
 
@@ -40,6 +42,22 @@ def optional_model_request_origin(
     if value is None or str(value).strip() == "":
         return None
     return ModelRequestOrigin(str(value))
+
+
+def optional_worktree_role(value: WorktreeRole | str | None) -> WorktreeRole | None:
+    if isinstance(value, WorktreeRole):
+        return value
+    if value is None or str(value).strip() == "":
+        return None
+    return WorktreeRole(str(value))
+
+
+def optional_publish_policy(value: PublishPolicy | str | None) -> PublishPolicy | None:
+    if isinstance(value, PublishPolicy):
+        return value
+    if value is None or str(value).strip() == "":
+        return None
+    return PublishPolicy(str(value))
 
 
 def worker_kind_for_runtime(

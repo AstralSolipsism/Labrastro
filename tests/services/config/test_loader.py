@@ -1128,7 +1128,11 @@ def test_generate_example_config_creates_valid_yaml(tmp_path: Path) -> None:
         == "remote_server"
     )
     assert runtime_profiles["capability_packager_remote"]["worker_kind"] == "sandbox_worker"
+    assert runtime_profiles["capability_packager_remote"]["worktree_role"] == "source"
+    assert runtime_profiles["capability_packager_remote"]["publish_policy"] == "never"
     assert runtime_profiles["capability_packager_remote"]["sandbox"] == {}
+    assert runtime_profiles["capability_packager_remote"]["timeout_sec"] == 86400
+    assert runtime_profiles["capability_packager_remote"]["step_timeout_sec"] == 3600
     assert "capability_packager" in agent_registry["agents"]
     assert (
         agent_registry["agents"]["capability_packager"]["runtime_profile"]
