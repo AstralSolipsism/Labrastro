@@ -24,6 +24,8 @@ from reuleauxcoder.services.providers.adapters.openai_responses import (
     convert_chat_tools_to_responses_tools,
     convert_messages_to_responses_input,
 )
+from reuleauxcoder.services.llm.client import LLM, llm_is_configured
+from reuleauxcoder.services.llm.factory import ResolvedModelRuntime
 from reuleauxcoder.extensions.provider.manifest import (
     ProviderManifestManager,
     run_provider_list_cli,
@@ -184,6 +186,86 @@ def test_labrastro_server_provider_streams_through_agent_run_bridge(monkeypatch)
     assert call["json"]["request_id"] == "claim-1"
     assert call["json"]["worker_id"] == "worker-1"
     assert call["json"]["parameters"]["max_tokens"] == 384000
+
+
+def test_labrastro_server_provider_does_not_apply_idle_read_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("LABRASTRO_REMOTE_BASE_URL", "http://127.0.0.1:8765/")
+    monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
+
+    provider = LabrastroServerProvider(
+        ProviderConfig(
+            id="labrastro-server",
+            type="labrastro_server",
+            timeout_sec=9,
+        )
+    )
+    try:
+        assert provider.client.timeout.connect == 9
+        assert provider.client.timeout.write == 9
+        assert provider.client.timeout.pool == 9
+        assert provider.client.timeout.read is None
+    finally:
+        provider.client.close()
+
+
+def test_labrastro_server_llm_is_configured_without_local_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("LABRASTRO_REMOTE_BASE_URL", "http://127.0.0.1:8765/")
+    monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
+
+    llm = LLM(
+        model="agent-run",
+        provider_config=ProviderConfig(id="labrastro-server", type="labrastro_server"),
+    )
+
+    assert llm.api_key == ""
+    assert llm.configured is True
+    assert llm_is_configured(llm) is True
+
+
+def test_labrastro_server_llm_reports_missing_worker_environment(monkeypatch) -> None:
+    for key in (
+        "LABRASTRO_REMOTE_BASE_URL",
+        "LABRASTRO_PEER_TOKEN",
+        "LABRASTRO_AGENT_RUN_ID",
+        "LABRASTRO_AGENT_RUN_REQUEST_ID",
+        "LABRASTRO_AGENT_RUN_WORKER_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    llm = LLM(
+        model="agent-run",
+        provider_config=ProviderConfig(id="labrastro-server", type="labrastro_server"),
+    )
+
+    assert llm.configured is False
+    assert llm_is_configured(llm) is False
+    assert "LABRASTRO_REMOTE_BASE_URL" in llm.unavailable_reason
+    assert "LABRASTRO_AGENT_RUN_WORKER_ID" in llm.unavailable_reason
+
+
+def test_regular_llm_provider_still_requires_api_key() -> None:
+    llm = LLM(
+        model="gpt-test",
+        provider_config=ProviderConfig(id="chat", type="openai_chat"),
+    )
+
+    assert llm.configured is False
+    assert llm.unavailable_reason.startswith("No model provider API key is configured")
+
+
+def test_resolved_model_runtime_treats_labrastro_server_as_server_origin() -> None:
+    runtime = ResolvedModelRuntime(
+        model="agent-run",
+        provider_config=ProviderConfig(id="labrastro-server", type="labrastro_server"),
+    )
+
+    assert runtime.configured is True
 
 
 def test_debug_http_transport_uses_incoming_request_when_wrapping_response(

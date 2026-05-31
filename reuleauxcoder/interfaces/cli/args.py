@@ -23,6 +23,26 @@ def parse_args():
         "-v", "--version", action="version", version=f"%(prog)s {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command")
+    agent_run = subparsers.add_parser(
+        "agent-run",
+        help="Run a headless AgentRun turn and emit JSONL executor events",
+    )
+    agent_run.add_argument("--prompt", required=True)
+    agent_run.add_argument("--session", required=True, dest="agent_run_session")
+    agent_run.add_argument("--events", choices=["jsonl"], default="jsonl")
+    agent_run.add_argument(
+        "-c",
+        "--config",
+        dest="config",
+        default=argparse.SUPPRESS,
+    )
+    agent_run.add_argument(
+        "-m",
+        "--model",
+        dest="model",
+        default=argparse.SUPPRESS,
+    )
+
     db_parser = subparsers.add_parser("db", help="Manage optional Postgres persistence")
     db_subparsers = db_parser.add_subparsers(dest="db_command")
     db_subparsers.add_parser("migrate", help="Run database migrations")

@@ -11,6 +11,7 @@ import time
 
 from reuleauxcoder.domain.approval import SharedApprovalProvider
 from reuleauxcoder.extensions.config_target import resolve_cli_config_path
+from reuleauxcoder.interfaces.cli.agent_run import run_agent_run_cli
 from reuleauxcoder.interfaces.cli.approval_handler import make_cli_handler
 from reuleauxcoder.interfaces.cli.args import parse_args
 from reuleauxcoder.interfaces.cli.registration import create_cli_registration
@@ -19,6 +20,7 @@ from reuleauxcoder.interfaces.cli.repl import run_repl
 from reuleauxcoder.interfaces.entrypoint import AppRunner, AppOptions
 from reuleauxcoder.interfaces.events import AgentEventBridge
 from reuleauxcoder.interfaces.ui_registry import UIRegistry
+from reuleauxcoder.services.llm.client import llm_is_configured, llm_unavailable_reason
 from reuleauxcoder.extensions.environment.manifest import run_env_record_cli
 from reuleauxcoder.extensions.auth.cli import run_auth_cli
 from reuleauxcoder.extensions.db.cli import run_db_cli
@@ -48,6 +50,8 @@ def _run_once(agent, prompt: str):
 def main():
     """CLI main entry point."""
     args = parse_args()
+    if getattr(args, "command", None) == "agent-run":
+        sys.exit(run_agent_run_cli(args))
     if getattr(args, "command", None) == "db":
         sys.exit(run_db_cli(args))
     if getattr(args, "command", None) == "auth":
@@ -141,11 +145,8 @@ def main():
     bridge = AgentEventBridge(ctx.ui_bus)
     ctx.agent.add_event_handler(bridge.on_agent_event)
 
-    if not getattr(ctx.agent.llm, "model", "") or not getattr(ctx.agent.llm, "api_key", ""):
-        ctx.ui_bus.error(
-            "No model provider/profile is configured. "
-            "Configure providers.items and models.profiles."
-        )
+    if not llm_is_configured(ctx.agent.llm):
+        ctx.ui_bus.error(llm_unavailable_reason(ctx.agent.llm))
         renderer.close()
         sys.exit(1)
 

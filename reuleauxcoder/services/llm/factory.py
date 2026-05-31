@@ -10,7 +10,7 @@ from reuleauxcoder.domain.config.models import (
     ProviderConfig,
     ProvidersConfig,
 )
-from reuleauxcoder.services.llm.client import LLM
+from reuleauxcoder.services.llm.client import LLM, provider_requires_api_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +41,11 @@ class ResolvedModelRuntime:
 
     @property
     def configured(self) -> bool:
-        return bool(self.model and self.provider_config is not None and self.api_key)
+        if not self.model or self.provider_config is None:
+            return False
+        return bool(
+            self.api_key or not provider_requires_api_key(self.provider_config.type)
+        )
 
 
 def _profile_to_runtime(

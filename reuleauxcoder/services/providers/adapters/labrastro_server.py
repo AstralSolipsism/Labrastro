@@ -30,7 +30,7 @@ class LabrastroServerProvider:
         self.agent_run_id = _required_env("LABRASTRO_AGENT_RUN_ID")
         self.request_id = _required_env("LABRASTRO_AGENT_RUN_REQUEST_ID")
         self.worker_id = _required_env("LABRASTRO_AGENT_RUN_WORKER_ID")
-        self.client = httpx.Client(timeout=config.timeout_sec or 120)
+        self.client = httpx.Client(timeout=_server_origin_timeout(config.timeout_sec))
 
     def build_request_params(self, request: ProviderRequest) -> dict[str, Any]:
         return {
@@ -106,6 +106,11 @@ def _required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required for labrastro_server provider")
     return value
+
+
+def _server_origin_timeout(timeout_sec: int | float | None) -> httpx.Timeout:
+    timeout = float(timeout_sec or 120)
+    return httpx.Timeout(connect=timeout, read=None, write=timeout, pool=timeout)
 
 
 def _iter_sse_events(response: httpx.Response) -> Iterable[tuple[str, str]]:

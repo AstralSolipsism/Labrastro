@@ -37,6 +37,78 @@ def test_parse_args_all_supported_options(monkeypatch: pytest.MonkeyPatch) -> No
     assert args.resume == "session-1"
 
 
+def test_parse_agent_run_headless_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rcoder",
+            "agent-run",
+            "--prompt",
+            "package repo",
+            "--session",
+            "labrastro-agent-run-task-1",
+            "--events",
+            "jsonl",
+        ],
+    )
+    args = parse_args()
+    assert args.command == "agent-run"
+    assert args.prompt == "package repo"
+    assert args.agent_run_session == "labrastro-agent-run-task-1"
+    assert args.events == "jsonl"
+
+
+def test_parse_agent_run_preserves_root_config_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rcoder",
+            "--config",
+            "server-origin.yaml",
+            "--model",
+            "agent-run",
+            "agent-run",
+            "--prompt",
+            "package repo",
+            "--session",
+            "labrastro-agent-run-task-1",
+        ],
+    )
+    args = parse_args()
+    assert args.command == "agent-run"
+    assert args.config == "server-origin.yaml"
+    assert args.model == "agent-run"
+
+
+def test_parse_agent_run_accepts_subcommand_config_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rcoder",
+            "agent-run",
+            "--prompt",
+            "package repo",
+            "--session",
+            "labrastro-agent-run-task-1",
+            "--config",
+            "server-origin.yaml",
+            "--model",
+            "agent-run",
+        ],
+    )
+    args = parse_args()
+    assert args.command == "agent-run"
+    assert args.config == "server-origin.yaml"
+    assert args.model == "agent-run"
+
+
 def test_parse_mcp_artifact_build_node(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,

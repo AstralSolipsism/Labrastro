@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -51,6 +52,78 @@ _PROVIDER_PAYLOAD_KEYS_BY_TYPE: dict[str, set[str]] = {
     "anthropic_messages": {"system", "messages", "tools"},
     "openai_responses": {"input", "tools"},
 }
+_SERVER_ORIGIN_PROVIDER_TYPES = {"labrastro_server"}
+_SERVER_ORIGIN_REQUIRED_ENV_BY_TYPE = {
+    "labrastro_server": (
+        "LABRASTRO_REMOTE_BASE_URL",
+        "LABRASTRO_PEER_TOKEN",
+        "LABRASTRO_AGENT_RUN_ID",
+        "LABRASTRO_AGENT_RUN_REQUEST_ID",
+        "LABRASTRO_AGENT_RUN_WORKER_ID",
+    )
+}
+
+
+def provider_requires_api_key(provider_type: str | None) -> bool:
+    """Return whether a provider must carry its own API key in this process."""
+    return str(provider_type or "").strip() not in _SERVER_ORIGIN_PROVIDER_TYPES
+
+
+def provider_runtime_unavailable_reason(provider_type: str | None) -> str:
+    normalized = str(provider_type or "").strip()
+    required = _SERVER_ORIGIN_REQUIRED_ENV_BY_TYPE.get(normalized, ())
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    if not missing:
+        return ""
+    return (
+        f"{', '.join(missing)} "
+        f"{'is' if len(missing) == 1 else 'are'} required for {normalized} provider."
+    )
+
+
+def llm_is_configured(llm: Any) -> bool:
+    """Validate the active model binding without assuming all providers hold keys."""
+    model = str(getattr(llm, "model", "") or "").strip()
+    if not model:
+        return False
+    provider_type = str(getattr(llm, "provider_type", "") or "").strip()
+    provider_config = getattr(llm, "provider_config", None)
+    if not provider_type:
+        provider_type = str(getattr(provider_config, "type", "") or "").strip()
+    api_key = str(getattr(llm, "api_key", "") or "").strip()
+    if provider_requires_api_key(provider_type) and not api_key:
+        return False
+    if provider_runtime_unavailable_reason(provider_type):
+        return False
+    unavailable = str(getattr(llm, "_provider_unavailable_reason", "") or "").strip()
+    return not unavailable
+
+
+def llm_unavailable_reason(llm: Any) -> str:
+    """Return a user-facing reason for a failed model binding check."""
+    reason = str(getattr(llm, "_provider_unavailable_reason", "") or "").strip()
+    if reason:
+        return reason
+    model = str(getattr(llm, "model", "") or "").strip()
+    if not model:
+        return "No chat model is selected. Choose a provider and model before starting chat."
+    provider_type = str(getattr(llm, "provider_type", "") or "").strip()
+    provider_config = getattr(llm, "provider_config", None)
+    if not provider_type:
+        provider_type = str(getattr(provider_config, "type", "") or "").strip()
+    api_key = str(getattr(llm, "api_key", "") or "").strip()
+    if provider_requires_api_key(provider_type) and not api_key:
+        return (
+            "No model provider API key is configured. Configure a provider "
+            "and model profile before starting chat."
+        )
+    runtime_reason = provider_runtime_unavailable_reason(provider_type)
+    if runtime_reason:
+        return runtime_reason
+    return (
+        "No model provider/profile is configured. "
+        "Configure providers.items and models.profiles."
+    )
 
 
 def _provider_diagnostic_key(item: Any) -> tuple[str, str, str] | None:
@@ -208,7 +281,7 @@ class LLM:
                 "No chat model is selected. Choose a provider and model before starting chat."
             )
             return
-        if not self.api_key and self.provider_type != "labrastro_server":
+        if not self.api_key and provider_requires_api_key(self.provider_type):
             self._provider = None
             self.client = None
             self._provider_unavailable_reason = (
@@ -216,8 +289,30 @@ class LLM:
                 "and model profile before starting chat."
             )
             return
-        self._provider = self._provider_manager.create(self.provider_config)
+        runtime_reason = provider_runtime_unavailable_reason(self.provider_type)
+        if runtime_reason:
+            self._provider = None
+            self.client = None
+            self._provider_unavailable_reason = runtime_reason
+            return
+        try:
+            self._provider = self._provider_manager.create(self.provider_config)
+        except Exception as exc:
+            self._provider = None
+            self.client = None
+            self._provider_unavailable_reason = str(exc) or (
+                "Model provider could not be initialized."
+            )
+            return
         self.client = getattr(self._provider, "client", None)
+
+    @property
+    def configured(self) -> bool:
+        return llm_is_configured(self)
+
+    @property
+    def unavailable_reason(self) -> str:
+        return llm_unavailable_reason(self)
 
     def reconfigure(
         self,
