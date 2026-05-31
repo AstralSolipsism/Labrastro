@@ -10,8 +10,14 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ExecutionLocation,
     ExecutorType,
     ModelRequestOrigin,
+    PublishPolicy,
     TaskSessionRef,
     WorkerKind,
+    WorktreeRole,
+)
+from labrastro_server.services.agent_runtime.runtime_policy import (
+    optional_publish_policy,
+    optional_worktree_role,
 )
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 
@@ -64,6 +70,8 @@ class ExecutorRunRequest:
     runtime_profile_id: str | None = None
     worker_kind: WorkerKind | str | None = None
     model_request_origin: ModelRequestOrigin | str | None = None
+    worktree_role: WorktreeRole | str | None = None
+    publish_policy: PublishPolicy | str | None = None
     workdir: str | None = None
     branch: str | None = None
     model: str | None = None
@@ -80,6 +88,8 @@ class ExecutorRunRequest:
             ModelRequestOrigin,
         ):
             self.model_request_origin = ModelRequestOrigin(str(self.model_request_origin))
+        self.worktree_role = optional_worktree_role(self.worktree_role)
+        self.publish_policy = optional_publish_policy(self.publish_policy)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +104,8 @@ class ExecutorRunRequest:
             "model_request_origin": (
                 self.model_request_origin.value if self.model_request_origin else None
             ),
+            "worktree_role": self.worktree_role.value if self.worktree_role else None,
+            "publish_policy": self.publish_policy.value if self.publish_policy else None,
             "workdir": self.workdir,
             "branch": self.branch,
             "model": self.model,
@@ -123,6 +135,16 @@ class ExecutorRunRequest:
             model_request_origin=(
                 str(data["model_request_origin"])
                 if data.get("model_request_origin") is not None
+                else None
+            ),
+            worktree_role=(
+                str(data["worktree_role"])
+                if data.get("worktree_role") is not None
+                else None
+            ),
+            publish_policy=(
+                str(data["publish_policy"])
+                if data.get("publish_policy") is not None
                 else None
             ),
             workdir=str(data["workdir"]) if data.get("workdir") is not None else None,
@@ -312,6 +334,8 @@ class ReuleauxCoderExecutorBackend:
             workdir=session.workdir,
             branch=session.branch,
             executor_session_id=session.executor_session_id,
+            worktree_role=optional_worktree_role(session.metadata.get("worktree_role")),
+            publish_policy=optional_publish_policy(session.metadata.get("publish_policy")),
             prompt=prompt,
             metadata=dict(session.metadata),
         )

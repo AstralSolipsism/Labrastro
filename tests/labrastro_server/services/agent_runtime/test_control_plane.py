@@ -10,8 +10,10 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentConfig,
     ExecutionLocation,
     ExecutorType,
+    PublishPolicy,
     TaskSessionRef,
     TriggerMode,
+    WorktreeRole,
 )
 from reuleauxcoder.domain.config.models import build_agent_run_snapshot
 from reuleauxcoder.services.config.loader import ConfigLoader
@@ -92,6 +94,10 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     assert claim.executor_request.executor == ExecutorType.CODEX
     assert claim.executor_request.model == "gpt-5.2"
     assert claim.executor_request.execution_location == ExecutionLocation.DAEMON_WORKTREE
+    assert claim.executor_request.worktree_role == WorktreeRole.TARGET
+    assert claim.executor_request.publish_policy == PublishPolicy.NEVER
+    assert claim.executor_request.metadata["worktree_role"] == "target"
+    assert claim.executor_request.metadata["publish_policy"] == "never"
     assert control.claim_agent_run(worker_id="worker-2", executors=["codex"]) is None
 
     control.pin_session(
@@ -1708,6 +1714,8 @@ def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> 
                     "executor": "fake",
                     "execution_location": "remote_server",
                     "worker_kind": "sandbox_worker",
+                    "worktree_role": "source",
+                    "publish_policy": "never",
                     "sandbox": {},
                 }
             },
@@ -1742,6 +1750,8 @@ def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
                     "executor": "fake",
                     "execution_location": "remote_server",
                     "worker_kind": "sandbox_worker",
+                    "worktree_role": "source",
+                    "publish_policy": "never",
                     "sandbox": {},
                 }
             },
@@ -1768,4 +1778,8 @@ def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
 
     assert task.agent_id == "capability_packager"
     assert task.source.value == "capability_ingest"
+    assert task.worktree_role == WorktreeRole.SOURCE
+    assert task.publish_policy == PublishPolicy.NEVER
     assert task.metadata["worker_kind"] == "sandbox_worker"
+    assert task.metadata["worktree_role"] == "source"
+    assert task.metadata["publish_policy"] == "never"

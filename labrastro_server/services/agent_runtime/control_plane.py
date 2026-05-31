@@ -15,6 +15,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ArtifactType,
     ExecutionLocation,
     ExecutorType,
+    PublishPolicy,
     TaskArtifact,
     AgentRunRecord,
     TaskSessionRef,
@@ -22,6 +23,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     TriggerMode,
     ModelRequestOrigin,
     WorkerKind,
+    WorktreeRole,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
@@ -50,7 +52,9 @@ from labrastro_server.services.agent_runtime.runtime_store import (
 from labrastro_server.services.agent_runtime.runtime_policy import (
     model_request_origin_for_runtime,
     optional_model_request_origin,
+    optional_publish_policy,
     optional_worker_kind,
+    optional_worktree_role,
     system_flow_for_source,
     validate_agent_run_runtime_policy,
     worker_kind_for_runtime,
@@ -129,6 +133,8 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
         "execution_location": (
             task.execution_location.value if task.execution_location else None
         ),
+        "worktree_role": task.worktree_role.value if task.worktree_role else None,
+        "publish_policy": task.publish_policy.value if task.publish_policy else None,
         "output": task.output,
         "parent_task_id": task.parent_task_id,
         "trigger_comment_id": task.trigger_comment_id,
@@ -224,6 +230,8 @@ class AgentRunRequest:
     execution_location: ExecutionLocation | str | None = None
     worker_kind: WorkerKind | str | None = None
     model_request_origin: ModelRequestOrigin | str | None = None
+    worktree_role: WorktreeRole | str | None = None
+    publish_policy: PublishPolicy | str | None = None
     trigger_mode: TriggerMode | str = TriggerMode.ISSUE_TASK
     runtime_profile_id: str | None = None
     parent_task_id: str | None = None
@@ -248,6 +256,8 @@ class AgentRunRequest:
         self.model_request_origin = optional_model_request_origin(
             self.model_request_origin
         )
+        self.worktree_role = optional_worktree_role(self.worktree_role)
+        self.publish_policy = optional_publish_policy(self.publish_policy)
         if not isinstance(self.trigger_mode, TriggerMode):
             self.trigger_mode = TriggerMode(str(self.trigger_mode))
 
@@ -396,8 +406,13 @@ class AgentRunControlPlane:
                     parent = None
             request = self._resolve_request_against_snapshot(request, parent=parent)
             _ensure_reuleauxcoder_executor_session(request, task_id)
+            metadata = dict(request.metadata)
+            if request.worktree_role is not None:
+                metadata.setdefault("worktree_role", request.worktree_role.value)
+            if request.publish_policy is not None:
+                metadata.setdefault("publish_policy", request.publish_policy.value)
             request.metadata = self._metadata_with_snapshot_capabilities(
-                dict(request.metadata),
+                metadata,
                 agent_id=request.agent_id,
                 source=request.source,
                 runtime_profile_id=request.runtime_profile_id,
@@ -434,6 +449,10 @@ class AgentRunControlPlane:
                     "model_request_origin",
                     request.model_request_origin.value,
                 )
+            if request.worktree_role is not None:
+                metadata.setdefault("worktree_role", request.worktree_role.value)
+            if request.publish_policy is not None:
+                metadata.setdefault("publish_policy", request.publish_policy.value)
             metadata = self._metadata_with_snapshot_capabilities(
                 metadata,
                 agent_id=request.agent_id,
@@ -451,6 +470,8 @@ class AgentRunControlPlane:
                 runtime_profile_id=request.runtime_profile_id,
                 executor=request.executor,
                 execution_location=request.execution_location,
+                worktree_role=request.worktree_role,
+                publish_policy=request.publish_policy,
                 parent_task_id=request.parent_task_id,
                 trigger_comment_id=request.trigger_comment_id,
                 branch_name=request.branch_name,
@@ -559,6 +580,16 @@ class AgentRunControlPlane:
                 executor=request.executor,
                 worker_kind=request.worker_kind,
             )
+        )
+        request.worktree_role = (
+            request.worktree_role
+            or optional_worktree_role(raw_profile.get("worktree_role"))
+            or WorktreeRole.TARGET
+        )
+        request.publish_policy = (
+            request.publish_policy
+            or optional_publish_policy(raw_profile.get("publish_policy"))
+            or PublishPolicy.NEVER
         )
         model_binding = _agent_model_binding(raw_agent)
         if model_binding:
@@ -829,6 +860,8 @@ class AgentRunControlPlane:
                         runtime_profile_id=task.runtime_profile_id,
                         worker_kind=metadata.get("worker_kind"),
                         model_request_origin=metadata.get("model_request_origin"),
+                        worktree_role=task.worktree_role,
+                        publish_policy=task.publish_policy,
                         workdir=task.workdir,
                         branch=task.branch_name,
                         model=str(task.metadata.get("model"))
@@ -998,12 +1031,22 @@ class AgentRunControlPlane:
     def _executor_metadata(self, task: AgentRunRecord) -> dict[str, Any]:
         metadata = dict(task.metadata)
         executor = task.executor or ExecutorType.REULEAUXCODER
+        if task.worktree_role is not None:
+            metadata.setdefault("worktree_role", task.worktree_role.value)
+        if task.publish_policy is not None:
+            metadata.setdefault("publish_policy", task.publish_policy.value)
         worker_kind = str(metadata.get("worker_kind") or "").strip()
         model_request_origin = str(metadata.get("model_request_origin") or "").strip()
+        worktree_role = str(metadata.get("worktree_role") or "").strip()
+        publish_policy = str(metadata.get("publish_policy") or "").strip()
         if worker_kind:
             metadata.setdefault("worker_kind", worker_kind)
         if model_request_origin:
             metadata.setdefault("model_request_origin", model_request_origin)
+        if worktree_role:
+            metadata.setdefault("worktree_role", worktree_role)
+        if publish_policy:
+            metadata.setdefault("publish_policy", publish_policy)
         rendered = self._render_prompt_for_task(task, executor)
         if rendered is not None:
             metadata.setdefault("prompt_files", rendered.files)
@@ -1456,6 +1499,8 @@ class AgentRunControlPlane:
                 trigger_comment_id=task.trigger_comment_id,
                 branch_name=task.branch_name,
                 pr_url=task.pr_url,
+                worktree_role=task.worktree_role,
+                publish_policy=task.publish_policy,
                 workdir=task.workdir,
                 sandbox_id=task.sandbox_id,
                 sandbox_session_id=task.sandbox_session_id,

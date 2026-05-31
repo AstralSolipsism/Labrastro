@@ -63,6 +63,10 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     assert claim is not None
     assert claim.task.id == task.id
     assert claim.executor_request.executor.value == "fake"
+    assert claim.executor_request.worktree_role.value == "target"
+    assert claim.executor_request.publish_policy.value == "never"
+    assert claim.executor_request.metadata["worktree_role"] == "target"
+    assert claim.executor_request.metadata["publish_policy"] == "never"
 
     ok, reason = control.pin_claimed_session(
         request_id=claim.request_id,
@@ -87,6 +91,8 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     assert [event.type for event in events][0] == "queued"
     assert len(reloaded.list_events(task.id, after_seq=0, limit=1)) == 1
     assert reloaded.agent_run_to_dict(task.id)["status"] == "completed"
+    assert reloaded.agent_run_to_dict(task.id)["worktree_role"] == "target"
+    assert reloaded.agent_run_to_dict(task.id)["publish_policy"] == "never"
     detail = reloaded.load_agent_run_detail(task.id, event_limit=1)
     json.dumps(detail)
     assert detail["session"]["workdir"] == "/tmp/pg-worktree"

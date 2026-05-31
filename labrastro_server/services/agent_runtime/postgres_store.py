@@ -15,12 +15,14 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ExecutorType,
     ModelRequestOrigin,
     MergeStatus,
+    PublishPolicy,
     TaskArtifact,
     AgentRunRecord,
     TaskSessionRef,
     TaskStatus,
     TriggerMode,
     WorkerKind,
+    WorktreeRole,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
@@ -48,7 +50,9 @@ from labrastro_server.services.agent_runtime.runtime_store import (
 from labrastro_server.services.agent_runtime.runtime_policy import (
     model_request_origin_for_runtime,
     optional_model_request_origin,
+    optional_publish_policy,
     optional_worker_kind,
+    optional_worktree_role,
     system_flow_for_source,
     validate_agent_run_runtime_policy,
     worker_kind_for_runtime,
@@ -191,6 +195,8 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
         "execution_location": (
             task.execution_location.value if task.execution_location else None
         ),
+        "worktree_role": task.worktree_role.value if task.worktree_role else None,
+        "publish_policy": task.publish_policy.value if task.publish_policy else None,
         "output": task.output,
         "parent_task_id": task.parent_task_id,
         "trigger_comment_id": task.trigger_comment_id,
@@ -289,6 +295,10 @@ class PostgresAgentRunStore:
                 "model_request_origin",
                 request.model_request_origin.value,
             )
+        if getattr(request, "worktree_role", None) is not None:
+            metadata.setdefault("worktree_role", request.worktree_role.value)
+        if getattr(request, "publish_policy", None) is not None:
+            metadata.setdefault("publish_policy", request.publish_policy.value)
         task = AgentRunRecord(
             id=task_id,
             issue_id=request.issue_id,
@@ -300,6 +310,8 @@ class PostgresAgentRunStore:
             runtime_profile_id=request.runtime_profile_id,
             executor=request.executor,
             execution_location=request.execution_location,
+            worktree_role=request.worktree_role,
+            publish_policy=request.publish_policy,
             parent_task_id=request.parent_task_id,
             trigger_comment_id=request.trigger_comment_id,
             branch_name=request.branch_name,
@@ -493,6 +505,8 @@ class PostgresAgentRunStore:
                         runtime_profile_id=task.runtime_profile_id,
                         worker_kind=metadata.get("worker_kind"),
                         model_request_origin=metadata.get("model_request_origin"),
+                        worktree_role=task.worktree_role,
+                        publish_policy=task.publish_policy,
                         workdir=task.workdir,
                         branch=task.branch_name,
                         model=str(task.metadata.get("model"))
@@ -977,6 +991,8 @@ class PostgresAgentRunStore:
                 trigger_comment_id=task.trigger_comment_id,
                 branch_name=task.branch_name,
                 pr_url=task.pr_url,
+                worktree_role=task.worktree_role,
+                publish_policy=task.publish_policy,
                 workdir=task.workdir,
                 sandbox_id=task.sandbox_id,
                 sandbox_session_id=task.sandbox_session_id,
@@ -1300,6 +1316,16 @@ class PostgresAgentRunStore:
                 worker_kind=request.worker_kind,
             )
         )
+        request.worktree_role = (
+            request.worktree_role
+            or optional_worktree_role(raw_profile.get("worktree_role"))
+            or WorktreeRole.TARGET
+        )
+        request.publish_policy = (
+            request.publish_policy
+            or optional_publish_policy(raw_profile.get("publish_policy"))
+            or PublishPolicy.NEVER
+        )
         model_binding = _agent_model_binding(raw_agent)
         if model_binding:
             request.metadata.setdefault("model_binding", model_binding)
@@ -1375,6 +1401,8 @@ class PostgresAgentRunStore:
             runtime_profile_id=row["runtime_profile_id"],
             executor=_optional_executor(row["executor"]),
             execution_location=_optional_location(row["execution_location"]),
+            worktree_role=optional_worktree_role(metadata.get("worktree_role")),
+            publish_policy=optional_publish_policy(metadata.get("publish_policy")),
             output=row["output"],
             parent_task_id=row["parent_task_id"],
             trigger_comment_id=row["trigger_comment_id"],
@@ -1450,6 +1478,10 @@ class PostgresAgentRunStore:
 
     def _executor_metadata(self, task: AgentRunRecord) -> dict[str, Any]:
         metadata = dict(task.metadata)
+        if task.worktree_role is not None:
+            metadata.setdefault("worktree_role", task.worktree_role.value)
+        if task.publish_policy is not None:
+            metadata.setdefault("publish_policy", task.publish_policy.value)
         rendered = self._render_prompt_for_task(
             task, task.executor or ExecutorType.REULEAUXCODER
         )
