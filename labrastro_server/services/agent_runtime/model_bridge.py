@@ -11,6 +11,10 @@ from reuleauxcoder.domain.agent_runtime.models import ModelRequestOrigin, TaskSt
 from reuleauxcoder.domain.config.models import ProviderConfig
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.providers.models import ProviderRequest, ProviderResponse
+from reuleauxcoder.domain.session.locale import (
+    normalize_session_locale,
+    session_locale_prompt_append,
+)
 from reuleauxcoder.services.providers.manager import ProviderManager
 
 
@@ -122,6 +126,17 @@ class AgentRunModelBridge:
                 "messages must be a list.",
                 HTTPStatus.BAD_REQUEST,
             )
+        locale = str(metadata.get("locale") or "").strip()
+        normalized_locale = normalize_session_locale(locale) if locale else ""
+        prepared_messages = [
+            dict(item) for item in messages if isinstance(item, dict)
+        ]
+        locale_instruction = session_locale_prompt_append(normalized_locale)
+        if locale_instruction:
+            prepared_messages.insert(
+                0,
+                {"role": "system", "content": locale_instruction},
+            )
         tools = payload.get("tools", [])
         parameters = {
             **_dict_value(payload.get("parameters")),
@@ -134,11 +149,12 @@ class AgentRunModelBridge:
             "request_id": request_id,
             "worker_id": worker_id,
             "model_request_origin": ModelRequestOrigin.SERVER.value,
+            **({"locale": normalized_locale} if normalized_locale else {}),
         }
         return PreparedAgentRunModelRequest(
             provider_config=provider,
             provider_model=model,
-            messages=[dict(item) for item in messages if isinstance(item, dict)],
+            messages=prepared_messages,
             tools=[dict(item) for item in tools if isinstance(item, dict)]
             if isinstance(tools, list)
             else [],

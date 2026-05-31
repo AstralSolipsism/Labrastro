@@ -37,6 +37,10 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     resolve_environment_requirement_kind,
 )
+from reuleauxcoder.domain.session.locale import (
+    normalize_session_locale,
+    session_locale_prompt_append,
+)
 from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import FetchCapabilitiesTool
 
 
@@ -278,8 +282,10 @@ class CapabilityPackagerRunner:
         revision_instruction: str = "",
     ) -> AgentRunRecord:
         bundle = evidence_bundle.to_dict()
+        locale = _metadata_locale(agent_run_metadata)
         prompt = _render_packager_prompt(
             bundle=bundle,
+            locale=locale,
             revision_draft=revision_draft,
             revision_instruction=revision_instruction,
         )
@@ -296,10 +302,13 @@ class CapabilityPackagerRunner:
             "workflow_mode",
             "revision_of_agent_run_id",
             "revision_followup_id",
+            "locale",
         ):
             value = (agent_run_metadata or {}).get(key)
             if value is not None and str(value).strip():
-                metadata[key] = str(value)
+                metadata[key] = (
+                    normalize_session_locale(value) if key == "locale" else str(value)
+                )
         revision_text = str(
             (agent_run_metadata or {}).get("revision_instruction")
             or revision_instruction
@@ -320,6 +329,8 @@ class CapabilityPackagerRunner:
                 source="capability_ingest",
                 trigger_mode=TriggerMode.ENVIRONMENT_CONFIG,
                 workdir=workspace_root or None,
+                parent_task_id=str(metadata.get("revision_of_agent_run_id") or "") or None,
+                parent_run_id=str(metadata.get("revision_of_agent_run_id") or "") or None,
                 metadata=metadata,
             )
         )
@@ -885,6 +896,7 @@ class CapabilityPackageSessionRunService:
                 payload,
                 agent_run_metadata=self._agent_run_metadata(session),
             )
+            _append_source_bundle_notices(session, result.source_bundle)
             while True:
                 if getattr(session, "cancel_requested", False):
                     return
@@ -951,8 +963,13 @@ class CapabilityPackageSessionRunService:
             "client_request_id": getattr(session, "client_request_id", None),
             "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
         }
+        locale = str(getattr(session, "locale", "") or "").strip()
+        if locale:
+            metadata["locale"] = normalize_session_locale(locale)
         if extra:
             metadata.update(extra)
+        if metadata.get("locale"):
+            metadata["locale"] = normalize_session_locale(metadata["locale"])
         return metadata
 
     def _bind_agent_run(self, session: Any, agent_run: AgentRunRecord) -> None:
@@ -1003,7 +1020,8 @@ class CapabilityPackageSessionRunService:
         task = status.get("agent_run") if isinstance(status.get("agent_run"), dict) else {}
         task_status = str(task.get("status") or "").strip()
         if task_status in {"failed", "blocked", "cancelled"}:
-            message = str(task.get("output") or task_status or "capability package ingest failed")
+            events = status.get("events") if isinstance(status.get("events"), list) else []
+            message = _agent_run_terminal_message(task, events, task_status)
             session.append_event("error", {"message": message, "code": task_status})
             session.append_event(
                 "session_run_failed",
@@ -1424,6 +1442,127 @@ def _set_session_runtime_state(session: Any, runtime_state: dict[str, Any]) -> N
         session.runtime_state = dict(runtime_state)
 
 
+def _append_source_bundle_notices(session: Any, source_bundle: dict[str, Any]) -> None:
+    if not isinstance(source_bundle, dict):
+        return
+    source = source_bundle.get("source") if isinstance(source_bundle.get("source"), dict) else {}
+    errors = _dict_list(source_bundle.get("errors"))
+    documents = _dict_list(source_bundle.get("documents"))
+    evidence = _dict_list(source_bundle.get("evidence"))
+    has_document_content = any(str(item.get("content") or "").strip() for item in documents)
+    if (
+        not errors
+        and not evidence
+        and not has_document_content
+        and str(source.get("type") or "") in {"github_repo", "docs_url"}
+    ):
+        errors = [
+            {
+                "code": "source_evidence_empty",
+                "message": "未能从仓库或文档中抓取到可用于能力包生成的资料。",
+            }
+        ]
+    if not errors:
+        return
+    first_error = dict(errors[0])
+    code = str(first_error.get("code") or "source_fetch_warning").strip()
+    has_usable_source = bool(evidence or has_document_content)
+    detail = (
+        "部分在线资料读取失败，已继续使用可读取内容生成草案。"
+        if has_usable_source
+        else "未能从仓库或文档中抓取到可用于能力包生成的资料。"
+    )
+    session.append_event(
+        "output",
+        {
+            "content": detail,
+            "format": "plain",
+            "level": "warning",
+            "code": code,
+            "source": dict(source),
+            "source_error": first_error,
+            "source_errors": [dict(error) for error in errors],
+            "workflow": CAPABILITY_INGEST_WORKFLOW,
+        },
+    )
+
+
+def _agent_run_terminal_message(
+    task: dict[str, Any],
+    events: list[Any],
+    status: str,
+) -> str:
+    normalized_status = " ".join(str(status or "").split()).lower()
+    generic_values = {
+        value
+        for value in {
+            normalized_status,
+            "failed",
+            "blocked",
+            "cancelled",
+            "agent_error",
+        }
+        if value
+    }
+
+    def normalize(value: object) -> str:
+        return " ".join(str(value or "").split())
+
+    def first_meaningful(candidates: list[object]) -> str:
+        fallback = ""
+        for candidate in candidates:
+            text = normalize(candidate)
+            if not text:
+                continue
+            if not fallback:
+                fallback = text
+            if text.lower() not in generic_values:
+                return text
+        return fallback
+
+    task_candidates = [
+        task.get("failure_reason"),
+        task.get("cancel_reason"),
+        task.get("output"),
+    ]
+    message = first_meaningful(task_candidates)
+    if message and message.lower() not in generic_values:
+        return message
+
+    event_candidates: list[object] = []
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload")
+        data = payload if isinstance(payload, dict) else {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        event_task = (
+            data.get("agent_run")
+            if isinstance(data.get("agent_run"), dict)
+            else {}
+        )
+        event_candidates.extend(
+            [
+                result.get("error"),
+                data.get("error"),
+                data.get("message"),
+                event_task.get("failure_reason"),
+                event_task.get("cancel_reason"),
+                result.get("output"),
+                event_task.get("output"),
+            ]
+        )
+    event_message = first_meaningful(event_candidates)
+    if event_message and event_message.lower() not in generic_values:
+        return event_message
+    if message:
+        return message
+    if event_message:
+        return event_message
+    status_message = normalize(status)
+    return status_message or "capability package ingest failed"
+
+
 def _capability_context_event(
     title: str,
     phase: str,
@@ -1468,6 +1607,43 @@ def _agent_event_to_session_events(
                     {
                         **base,
                         "agent_run_status": str(task.get("status") or "queued"),
+                    },
+                ),
+            )
+        ]
+    if event_type == "claimed":
+        return [
+            (
+                "context_event",
+                _capability_context_event(
+                    "能力包生成任务已被 sandbox worker 接收",
+                    "agent_run_claimed",
+                    {
+                        **base,
+                        "agent_run_status": "claimed",
+                        "worker_id": str(data.get("worker_id") or ""),
+                        "peer_id": str(data.get("peer_id") or ""),
+                        "worker_kind": str(data.get("worker_kind") or ""),
+                        "request_id": str(data.get("request_id") or ""),
+                    },
+                ),
+            )
+        ]
+    if event_type in {"session_metadata", "session_pinned"}:
+        title = "能力包执行环境已就绪"
+        workdir = str(data.get("workdir") or "")
+        if workdir:
+            title = f"能力包执行环境已就绪：{workdir}"
+        return [
+            (
+                "context_event",
+                _capability_context_event(
+                    title,
+                    "agent_run_session_ready",
+                    {
+                        **base,
+                        "agent_run_status": "session_ready",
+                        **data,
                     },
                 ),
             )
@@ -1572,6 +1748,7 @@ def _agent_event_to_session_events(
             "blocked": "能力包草案生成被阻断",
         }.get(event_type, event_type)
         task = data.get("agent_run") if isinstance(data.get("agent_run"), dict) else {}
+        message = _agent_run_terminal_message(task, [event], event_type)
         return [
             (
                 "context_event",
@@ -1582,6 +1759,7 @@ def _agent_event_to_session_events(
                         **base,
                         "agent_run_status": event_type,
                         "output": str(task.get("output") or ""),
+                        "message": message,
                     },
                 ),
             )
@@ -1654,10 +1832,13 @@ def _capability_install_approval_payload(
 def _render_packager_prompt(
     *,
     bundle: dict[str, Any],
+    locale: str = "",
     revision_draft: dict[str, Any] | None = None,
     revision_instruction: str = "",
 ) -> str:
     bundle_json = json.dumps(bundle, ensure_ascii=False, indent=2)
+    language_instruction = session_locale_prompt_append(locale)
+    language_block = f"{language_instruction}\n" if language_instruction else ""
     revision_text = str(revision_instruction or "").strip()
     revision_block = ""
     if revision_text or isinstance(revision_draft, dict):
@@ -1674,6 +1855,7 @@ def _render_packager_prompt(
     return (
         "You are capability_packager. Analyze the provided repository/docs bundle "
         "and produce one capability package draft.\n"
+        f"{language_block}"
         "Discovery is read-only: do not run install commands and do not mutate files.\n"
         "Extract only instructions supported by the supplied evidence. Prefer exact "
         "install/check/launch commands from docs.\n"
@@ -1703,6 +1885,11 @@ def _render_packager_prompt(
         f"```json\n{bundle_json}\n```\n"
         f"{revision_block}"
     )
+
+
+def _metadata_locale(metadata: dict[str, Any] | None) -> str:
+    locale = str((metadata or {}).get("locale") or "").strip()
+    return normalize_session_locale(locale) if locale else ""
 
 
 def _extract_draft(value: Any) -> dict[str, Any] | None:

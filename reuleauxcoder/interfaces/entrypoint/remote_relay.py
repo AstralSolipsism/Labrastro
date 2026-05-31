@@ -30,6 +30,7 @@ from reuleauxcoder.domain.memory.runtime import (
     bind_main_chat_memory_scope_to_agent,
     bind_memory_scope_to_agent,
 )
+from reuleauxcoder.domain.session.locale import session_locale_prompt_append
 from reuleauxcoder.domain.agent.events import (
     AgentEvent,
     AgentEventType,
@@ -230,22 +231,7 @@ def active_model_payload(
 
 
 def _chat_locale_prompt_append(locale: str | None) -> str:
-    value = str(locale or "").strip().lower()
-    if not value:
-        return ""
-    if value.startswith("zh"):
-        return (
-            "Language: Use Simplified Chinese for all user-visible generated content, "
-            "including assistant replies, progress narration, and publicly displayed "
-            "reasoning/thinking summaries. "
-            "Keep code, commands, paths, API names, and quoted errors unchanged."
-        )
-    return (
-        "Language: Use English for all user-visible generated content, "
-        "including assistant replies, progress narration, and publicly displayed "
-        "reasoning/thinking summaries. "
-        "Keep code, commands, paths, API names, and quoted errors unchanged."
-    )
+    return session_locale_prompt_append(locale)
 
 
 def _runtime_config_with_chat_locale(

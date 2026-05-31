@@ -79,18 +79,20 @@ def _free_port() -> int:
 def test_chat_locale_prompt_append_maps_supported_locales() -> None:
     assert _chat_locale_prompt_append("zh-CN") == (
         "Language: Use Simplified Chinese for all user-visible generated content, "
-        "including assistant replies, progress narration, and publicly displayed "
-        "reasoning/thinking summaries. "
-        "Keep code, commands, paths, API names, and quoted errors unchanged."
+        "including assistant replies, progress narration, publicly displayed "
+        "reasoning/thinking summaries, and natural-language fields in generated drafts. "
+        "Keep JSON keys, identifiers, code, commands, paths, URLs, API names, "
+        "and quoted errors unchanged."
     )
     assert _chat_locale_prompt_append("zh-Hans").startswith(
         "Language: Use Simplified Chinese"
     )
     assert _chat_locale_prompt_append("en") == (
         "Language: Use English for all user-visible generated content, "
-        "including assistant replies, progress narration, and publicly displayed "
-        "reasoning/thinking summaries. "
-        "Keep code, commands, paths, API names, and quoted errors unchanged."
+        "including assistant replies, progress narration, publicly displayed "
+        "reasoning/thinking summaries, and natural-language fields in generated drafts. "
+        "Keep JSON keys, identifiers, code, commands, paths, URLs, API names, "
+        "and quoted errors unchanged."
     )
     assert _chat_locale_prompt_append("ja").startswith("Language: Use English")
     assert _chat_locale_prompt_append(None) == ""
@@ -107,9 +109,10 @@ def test_runtime_config_with_chat_locale_merges_prompt_without_mutating_source()
     assert localized.prompt.system_append == (
         "Use repo conventions.\n\n"
         "Language: Use Simplified Chinese for all user-visible generated content, "
-        "including assistant replies, progress narration, and publicly displayed "
-        "reasoning/thinking summaries. "
-        "Keep code, commands, paths, API names, and quoted errors unchanged."
+        "including assistant replies, progress narration, publicly displayed "
+        "reasoning/thinking summaries, and natural-language fields in generated drafts. "
+        "Keep JSON keys, identifiers, code, commands, paths, URLs, API names, "
+        "and quoted errors unchanged."
     )
 
 

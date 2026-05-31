@@ -58,6 +58,7 @@ from labrastro_server.services.environment_run import (
     EnvironmentRunError,
     EnvironmentRunService,
 )
+from reuleauxcoder.domain.session.locale import normalize_session_locale
 from reuleauxcoder.interfaces.events import UIEventKind
 
 
@@ -447,6 +448,8 @@ class RemoteAdminRoutes:
                 runtime_state = runner.initial_runtime_state()
                 source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
                 prompt = _capability_ingest_prompt(source)
+                raw_locale = str(payload.get("locale") or "").strip()
+                locale = normalize_session_locale(raw_locale) if raw_locale else None
                 session = self.service._create_session_run(
                     peer_id,
                     session_id,
@@ -457,6 +460,7 @@ class RemoteAdminRoutes:
                     else None,
                     client_request_id=client_request_id,
                     runtime_state=runtime_state,
+                    locale=locale,
                     initial_prompt=prompt,
                 )
                 if session_id:
@@ -469,6 +473,7 @@ class RemoteAdminRoutes:
                         "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
                         "agent_id": runtime_state.get("agent_id"),
                         "session_id": session_id,
+                        "locale": locale,
                     },
                 )
                 session.mark_running()

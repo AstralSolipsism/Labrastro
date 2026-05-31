@@ -12,7 +12,10 @@ from labrastro_server.interfaces.http.remote.service import (
     _RemoteSessionRun,
 )
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
-from labrastro_server.services.agent_runtime.executor_backend import ExecutorRunResult
+from labrastro_server.services.agent_runtime.executor_backend import (
+    ExecutorEvent,
+    ExecutorRunResult,
+)
 from labrastro_server.services.capability_packages import (
     CapabilityDraftValidator,
     CapabilityPackagerRunner,
@@ -22,6 +25,7 @@ from labrastro_server.services.capability_packages import (
     CapabilityPackageSessionRunService,
     CapabilitySourceCollector,
     EvidenceBundle,
+    _agent_event_to_session_events,
 )
 from reuleauxcoder.domain.agent_runtime.models import CapabilityComponentConfig
 from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord
@@ -79,6 +83,68 @@ def _review_draft(*, command: str = "gh") -> dict[str, object]:
         "credentials": ["GITHUB_TOKEN"],
         "risk_level": "low",
     }
+
+
+def test_agent_run_log_event_projects_as_process_context() -> None:
+    session_events = _agent_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 1,
+            "type": "log",
+            "payload": {
+                "type": "log",
+                "text": "loading source bundle",
+                "data": {"level": "info"},
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["context_event"]
+    payload = session_events[0][1]
+    assert payload["phase"] == "agent_run_log"
+    assert payload["log"] == "loading source bundle"
+    assert payload["level"] == "info"
+
+
+def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
+    start_events = _agent_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 2,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "fetch_capabilities",
+                    "tool_call_id": "call-1",
+                    "input": {"url": "https://example.test/repo"},
+                },
+            },
+        }
+    )
+    end_events = _agent_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 3,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "text": "ok",
+                "data": {
+                    "tool_name": "fetch_capabilities",
+                    "tool_call_id": "call-1",
+                    "output": "ok",
+                },
+            },
+        }
+    )
+
+    assert start_events[0][0] == "tool_call_start"
+    assert end_events[0][0] == "tool_call_end"
+    assert start_events[0][1]["tool_name"] == "fetch_capabilities"
+    assert end_events[0][1]["tool_name"] == "fetch_capabilities"
+    assert start_events[0][1]["tool_call_id"] == "call-1"
+    assert end_events[0][1]["tool_call_id"] == "call-1"
 
 
 def test_project_notes_input_creates_read_only_ingest_run() -> None:
@@ -701,6 +767,7 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         session_run_id="session-run-revise",
         peer_id="peer-1",
         session_hint="session-1",
+        locale="zh-CN",
         artifact_root=tmp_path,
     )
     service = CapabilityPackageSessionRunService(control, admin, poll_timeout_sec=0.05)
@@ -724,6 +791,10 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
             "",
         )
     )
+    first_agent_run = control.agent_run_to_dict(str(first_agent_run_id))
+    assert first_agent_run["metadata"]["locale"] == "zh-CN"
+    assert "Use Simplified Chinese" in first_agent_run["prompt"]
+    assert "natural-language fields in generated drafts" in first_agent_run["prompt"]
     first_draft = _review_draft(command="hub")
     control.complete_agent_run(
         str(first_agent_run_id),
@@ -761,9 +832,11 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     )
     second_agent_run = control.agent_run_to_dict(str(second_agent_run_id))
     assert second_agent_run["metadata"]["session_run_id"] == "session-run-revise"
+    assert second_agent_run["metadata"]["locale"] == "zh-CN"
     assert second_agent_run["metadata"]["revision_of_agent_run_id"] == first_agent_run_id
     assert second_agent_run["metadata"]["revision_followup_id"] == "follow-revise"
     assert second_agent_run["metadata"]["revision_instruction"] == "把依赖改成 gh，不要用 hub"
+    assert second_agent_run["parent_task_id"] == first_agent_run_id
     assert "User instruction:" in second_agent_run["prompt"]
     assert "把依赖改成 gh，不要用 hub" in second_agent_run["prompt"]
     assert '"command": "hub"' in second_agent_run["prompt"]
@@ -1101,3 +1174,488 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
         and event["payload"].get("tool_name") == service.INSTALL_TOOL_NAME
         for event in events
     )
+
+
+def test_capability_package_session_persists_agent_run_progress_and_failure(
+    tmp_path: Path,
+) -> None:
+    class FakeAdminManager:
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            raise AssertionError("failed draft generation must not install")
+
+    persisted: list[dict[str, object]] = []
+
+    def trace_sink(
+        session_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        persisted.append(
+            {
+                "session_id": session_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return len(persisted)
+
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-trace",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        trace_event_sink=trace_sink,
+    )
+    session.enable_trace_persistence("session-1")
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install gh, then use gh pr view for review.",
+            }
+        },
+    )
+    agent_run_id = _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "context_event"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    claim = control.claim_agent_run(
+        worker_id="worker-1",
+        worker_kind="sandbox_worker",
+        executors=["fake"],
+        peer_id="peer-1",
+    )
+    assert claim is not None
+    assert claim.task.id == agent_run_id
+    control.append_executor_event(
+        str(agent_run_id),
+        ExecutorEvent.status("preparing_worktree"),
+        request_id=claim.request_id,
+        worker_id="worker-1",
+        peer_id="peer-1",
+    )
+    control.append_executor_event(
+        str(agent_run_id),
+        ExecutorEvent.status("worktree_ready", workdir="/tmp/work"),
+        request_id=claim.request_id,
+        worker_id="worker-1",
+        peer_id="peer-1",
+    )
+    for idx in range(250):
+        control.append_executor_event(
+            str(agent_run_id),
+            ExecutorEvent.text_event(f"progress line {idx}"),
+            request_id=claim.request_id,
+            worker_id="worker-1",
+            peer_id="peer-1",
+        )
+    control.complete_claimed_agent_run(
+        str(agent_run_id),
+        ExecutorRunResult(
+            task_id=str(agent_run_id),
+            status="failed",
+            output="",
+            error="No model provider/profile is configured.",
+        ),
+        request_id=claim.request_id,
+        worker_id="worker-1",
+        peer_id="peer-1",
+    )
+
+    _wait_for(lambda: session.done)
+
+    phases = [
+        event["payload"].get("phase")
+        for event in persisted
+        if event["event_type"] == "context_event"
+    ]
+    assert "agent_run_queued" in phases
+    assert "agent_run_claimed" in phases
+    assert "agent_run_worktree_ready" in phases
+    assert "agent_run_failed" in phases
+    assert any(
+        event["event_type"] == "error"
+        and "No model provider/profile is configured."
+        in str(event["payload"].get("message") or "")
+        for event in persisted
+    )
+
+
+def test_remote_session_run_replays_pending_trace_events_when_sink_is_attached(
+    tmp_path: Path,
+) -> None:
+    http_service = object.__new__(RemoteRelayHTTPService)
+    http_service._session_runs_lock = threading.Lock()
+    http_service._session_runs = {}
+    http_service.session_trace_event_sink = None
+    session = _RemoteSessionRun(
+        session_run_id="session-run-late-sink",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+    )
+    http_service._session_runs[session.session_run_id] = session
+    session.enable_trace_persistence("session-1")
+    session.append_event(
+        "context_event",
+        {"message": "sink not attached yet", "phase": "late_sink"},
+    )
+    persisted: list[dict[str, object]] = []
+
+    def trace_sink(
+        session_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        persisted.append(
+            {
+                "session_id": session_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return len(persisted)
+
+    http_service.set_session_trace_event_sink(trace_sink)
+
+    assert persisted == [
+        {
+            "session_id": "session-1",
+            "event_type": "context_event",
+            "payload": {"message": "sink not attached yet", "phase": "late_sink"},
+            "session_run_id": "session-run-late-sink",
+            "session_run_seq": 1,
+            "source": "remote_session_run",
+            "replayable": True,
+        }
+    ]
+
+
+def test_remote_session_run_does_not_persist_when_sink_is_attached_without_trace_enable(
+    tmp_path: Path,
+) -> None:
+    http_service = object.__new__(RemoteRelayHTTPService)
+    http_service._session_runs_lock = threading.Lock()
+    http_service._session_runs = {}
+    http_service.session_trace_event_sink = None
+    session = _RemoteSessionRun(
+        session_run_id="session-run-memory-only",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+    )
+    http_service._session_runs[session.session_run_id] = session
+    session.append_event(
+        "context_event",
+        {"message": "memory only", "phase": "memory_only"},
+    )
+    persisted: list[dict[str, object]] = []
+
+    def trace_sink(
+        session_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        persisted.append(
+            {
+                "session_id": session_id,
+                "event_type": event_type,
+                "payload": dict(payload),
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return len(persisted)
+
+    http_service.set_session_trace_event_sink(trace_sink)
+
+    assert persisted == []
+
+    session.enable_trace_persistence("session-1")
+
+    assert persisted == [
+        {
+            "session_id": "session-1",
+            "event_type": "context_event",
+            "payload": {"message": "memory only", "phase": "memory_only"},
+            "session_run_id": "session-run-memory-only",
+            "session_run_seq": 1,
+            "source": "remote_session_run",
+            "replayable": True,
+        }
+    ]
+
+
+def test_capability_package_session_surfaces_source_bundle_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAdminManager:
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            raise AssertionError("source warning test should not install")
+
+    def fake_fetch(self, **kwargs: object) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "url": kwargs["url"],
+                "title": "",
+                "sections": [],
+                "links": [],
+                "evidence": [],
+                "errors": [
+                    {
+                        "code": "fetch_failed",
+                        "message": "The read operation timed out",
+                        "url": kwargs["url"],
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(
+        "labrastro_server.services.capability_packages.FetchCapabilitiesTool.execute",
+        fake_fetch,
+    )
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-source-warning",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(
+        session,
+        {"repoUrl": "https://github.com/acme/example-tool"},
+    )
+
+    warning = _wait_for(
+        lambda: next(
+            (
+                event["payload"]
+                for event in session.events
+                if event["type"] == "output"
+                and event["payload"].get("level") == "warning"
+            ),
+            None,
+        )
+    )
+    assert warning["code"] == "fetch_failed"
+    assert warning["content"] == "未能从仓库或文档中抓取到可用于能力包生成的资料。"
+    assert "The read operation timed out" not in warning["content"]
+    assert warning["source_error"]["message"] == "The read operation timed out"
+    assert warning["source_errors"][0]["message"] == "The read operation timed out"
+
+    _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "context_event"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    session.request_cancel("test_cleanup")
+    _wait_for(lambda: session.done)
+
+
+def test_capability_package_session_softens_partial_source_fetch_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAdminManager:
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            raise AssertionError("partial source warning test should not install")
+
+    def fake_fetch(self, **kwargs: object) -> str:
+        return json.dumps(
+            {
+                "ok": True,
+                "url": kwargs["url"],
+                "title": "Example Tool",
+                "sections": [
+                    {
+                        "heading": "Install",
+                        "source_url": f"{kwargs['url']}#install",
+                        "text": "Install with npm.",
+                    }
+                ],
+                "links": [],
+                "evidence": [
+                    {
+                        "title": "Install",
+                        "source_url": f"{kwargs['url']}#install",
+                        "excerpt": "Install with npm.",
+                    }
+                ],
+                "errors": [
+                    {
+                        "code": "network_error",
+                        "message": "Remote end closed connection without response",
+                        "url": kwargs["url"],
+                        "attempts": 3,
+                        "retryable": True,
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(
+        "labrastro_server.services.capability_packages.FetchCapabilitiesTool.execute",
+        fake_fetch,
+    )
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-partial-source-warning",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(session, {"repoUrl": "https://github.com/acme/example-tool"})
+
+    warning = _wait_for(
+        lambda: next(
+            (
+                event["payload"]
+                for event in session.events
+                if event["type"] == "output"
+                and event["payload"].get("level") == "warning"
+            ),
+            None,
+        )
+    )
+    assert warning["code"] == "network_error"
+    assert warning["content"] == "部分在线资料读取失败，已继续使用可读取内容生成草案。"
+    assert "Remote end closed" not in warning["content"]
+    assert warning["source_error"]["message"] == "Remote end closed connection without response"
+    assert warning["source_errors"][0]["attempts"] == 3
+
+    _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "context_event"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    session.request_cancel("test_cleanup")
+    _wait_for(lambda: session.done)
+
+
+def test_capability_package_session_surfaces_empty_source_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAdminManager:
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            raise AssertionError("empty evidence test should not install")
+
+    def fake_fetch(self, **kwargs: object) -> str:
+        return json.dumps(
+            {
+                "ok": True,
+                "url": kwargs["url"],
+                "title": "Empty docs",
+                "sections": [],
+                "links": [],
+                "evidence": [],
+                "errors": [],
+            }
+        )
+
+    monkeypatch.setattr(
+        "labrastro_server.services.capability_packages.FetchCapabilitiesTool.execute",
+        fake_fetch,
+    )
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-empty-evidence",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(session, {"repoUrl": "https://github.com/acme/empty-tool"})
+
+    warning = _wait_for(
+        lambda: next(
+            (
+                event["payload"]
+                for event in session.events
+                if event["type"] == "output"
+                and event["payload"].get("level") == "warning"
+            ),
+            None,
+        )
+    )
+    assert warning["code"] == "source_evidence_empty"
+    assert "未能从仓库或文档中抓取到可用于能力包生成的资料" in warning["content"]
+
+    _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "context_event"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    session.request_cancel("test_cleanup")
+    _wait_for(lambda: session.done)

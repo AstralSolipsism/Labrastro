@@ -36,7 +36,7 @@ class _Provider:
         return ProviderResponse(content="hello", reasoning_content="plan")
 
 
-def _control_plane() -> AgentRunControlPlane:
+def _control_plane(*, locale: str = "") -> AgentRunControlPlane:
     control = AgentRunControlPlane(
         runtime_snapshot={
             "runtime_profiles": {
@@ -67,6 +67,7 @@ def _control_plane() -> AgentRunControlPlane:
             agent_id="capability_packager",
             prompt="package",
             source="capability_ingest",
+            metadata={"locale": locale} if locale else {},
         ),
         task_id="run-1",
     )
@@ -117,6 +118,7 @@ def test_model_bridge_validates_claim_and_uses_run_model_binding(monkeypatch, ca
     assert reasoning == ["plan"]
     request = provider.requests[0]
     assert request.model == "deepseek-v4-pro"
+    assert request.messages == [{"role": "user", "content": "hi"}]
     assert request.max_tokens == 384000
     assert request.temperature == 0.2
     log_text = caplog.text
@@ -127,6 +129,37 @@ def test_model_bridge_validates_claim_and_uses_run_model_binding(monkeypatch, ca
     assert "provider=deepseek" in log_text
     assert "model=deepseek-v4-pro" in log_text
     assert "sk-test" not in log_text
+
+
+def test_model_bridge_injects_locale_instruction_from_agent_run_metadata(monkeypatch) -> None:
+    control = _control_plane(locale="zh-CN")
+    provider = _Provider()
+    monkeypatch.setattr(
+        "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+        lambda _self, _config: provider,
+    )
+    bridge = AgentRunModelBridge(
+        runtime_control_plane=control,
+        admin_manager=_AdminManager(),
+    )
+
+    prepared = bridge.prepare(
+        {
+            "agent_run_id": "run-1",
+            "request_id": next(iter(control._claims)),
+            "worker_id": "worker-1",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        peer_id="peer-1",
+    )
+    bridge.execute(prepared)
+
+    request = provider.requests[0]
+    assert request.messages[0]["role"] == "system"
+    assert "Use Simplified Chinese" in request.messages[0]["content"]
+    assert "natural-language fields in generated drafts" in request.messages[0]["content"]
+    assert request.messages[1:] == [{"role": "user", "content": "hi"}]
+    assert request.metadata["locale"] == "zh-CN"
 
 
 def test_model_bridge_rejects_claim_mismatch() -> None:
