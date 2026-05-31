@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-const defaultRunTimeout = 20 * time.Minute
-
 type ResolvedRun struct {
 	Request RunRequest
 	Options RunOptions
@@ -124,7 +122,7 @@ func ResolveRun(req RunRequest, runtimeSnapshot map[string]any, plan ExecEnvPlan
 		env["EZCODE_SKILL_ROOTS"] = strings.Join(skillRoots, string(os.PathListSeparator))
 	}
 	opts := RunOptions{
-		Timeout:          durationValue(firstAny(req.Metadata["timeout_sec"], profile["timeout_sec"]), defaultRunTimeout),
+		Timeout:          durationValue(firstAny(req.Metadata["timeout_sec"], profile["timeout_sec"]), 0),
 		Command:          stringValue(profile["command"]),
 		SystemPrompt:     systemPromptValue(req.Metadata),
 		ExtraArgs:        stringSliceValue(profile["args"]),

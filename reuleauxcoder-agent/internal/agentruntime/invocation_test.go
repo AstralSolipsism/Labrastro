@@ -257,6 +257,7 @@ func TestNormalizeStreamLineMapsCommonCLIEvents(t *testing.T) {
 		{`{"type":"tool_use","name":"read_file"}`, EventToolUse},
 		{`{"type":"tool-result","content":"ok"}`, EventToolResult},
 		{`{"type":"error","message":"bad"}`, EventError},
+		{`{"type":"usage","data":{"input_tokens":1}}`, EventUsage},
 		{`{"type":"result","usage":{"input_tokens":1}}`, EventResult},
 		{`{"type":"thinking","message":"plan"}`, EventThinking},
 		{`{"text":"hello"}`, EventText},
@@ -721,6 +722,65 @@ func TestResolveAndPrepareRunUsesRuntimeSnapshotAndPromptFiles(t *testing.T) {
 	}
 	if string(content) != "Use project conventions.\n" {
 		t.Fatalf("prompt file content = %q", string(content))
+	}
+}
+
+func TestResolveAndPrepareRunDoesNotApplyImplicitTimeout(t *testing.T) {
+	resolved, err := ResolveAndPrepareRun(
+		RunRequest{
+			TaskID:  "task-1",
+			AgentID: "coder",
+			Prompt:  "run a long task",
+		},
+		map[string]any{
+			"runtime_profiles": map[string]any{
+				"long_remote": map[string]any{
+					"executor":    "reuleauxcoder",
+					"worker_kind": "sandbox_worker",
+				},
+			},
+			"agents": map[string]any{
+				"coder": map[string]any{"runtime_profile": "long_remote"},
+			},
+		},
+		t.TempDir(),
+		"workspace/one",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Options.Timeout != 0 {
+		t.Fatalf("expected no implicit business timeout, got %s", resolved.Options.Timeout)
+	}
+}
+
+func TestResolveAndPrepareRunUsesExplicitProfileTimeout(t *testing.T) {
+	resolved, err := ResolveAndPrepareRun(
+		RunRequest{
+			TaskID:  "task-1",
+			AgentID: "coder",
+			Prompt:  "run a bounded task",
+		},
+		map[string]any{
+			"runtime_profiles": map[string]any{
+				"bounded_remote": map[string]any{
+					"executor":    "reuleauxcoder",
+					"worker_kind": "sandbox_worker",
+					"timeout_sec": 45,
+				},
+			},
+			"agents": map[string]any{
+				"coder": map[string]any{"runtime_profile": "bounded_remote"},
+			},
+		},
+		t.TempDir(),
+		"workspace/one",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Options.Timeout != 45*time.Second {
+		t.Fatalf("profile timeout = %s", resolved.Options.Timeout)
 	}
 }
 

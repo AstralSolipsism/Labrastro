@@ -361,6 +361,8 @@ func normalizeGenericStreamLine(provider, line string) Event {
 			return Event{Type: EventToolResult, Text: firstNonEmpty(eventStringValue(raw, "text", "output", "content"), eventStringValue(data, "output", "text", "content")), Data: data}
 		case "error":
 			return Event{Type: EventError, Text: eventStringValue(raw, "text", "message", "error"), Data: raw}
+		case "usage":
+			return Event{Type: EventUsage, Data: eventPayloadData(raw)}
 		case "result":
 			return Event{Type: EventResult, Text: eventStringValue(raw, "output", "result", "text"), Data: raw}
 		}
