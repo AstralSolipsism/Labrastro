@@ -41,6 +41,31 @@ def test_later_session_run_start_keeps_existing_title_summary_and_preview() -> N
     ]
 
 
+def test_capability_package_draft_event_persists_structured_card() -> None:
+    document = _session_run_start(None, "生成能力包", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="capability_package_draft",
+        payload={
+            "title": "能力包草案 review 已生成",
+            "package_id": "review",
+            "draft": {"id": "review", "description": "Review package"},
+            "validation": {"ok": True},
+            "raw_event_refs": [{"agent_run_id": "agent-run-1", "seq": 20, "type": "result"}],
+        },
+        session_event_seq=2,
+        created_at="2026-05-21T00:00:02+00:00",
+    )
+
+    part = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert part["type"] == "capability_package_draft"
+    assert part["packageId"] == "review"
+    assert part["draft"]["id"] == "review"
+    assert part["validation"]["ok"] is True
+    assert part["rawEventRefs"] == [{"agent_run_id": "agent-run-1", "seq": 20, "type": "result"}]
+
+
 def test_session_run_start_can_initialize_blank_or_default_title() -> None:
     blank_title_document = empty_session_document("session-1")
     blank_title_document["session"]["title"] = " "
@@ -285,6 +310,42 @@ def test_output_event_preserves_warning_notice_level() -> None:
     assert part["sessionEventSeq"] == 2
 
 
+def test_tool_events_preserve_raw_agent_run_event_refs_in_history_document() -> None:
+    document = _session_run_start(None, "生成能力包", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="tool_call_start",
+        payload={
+            "tool_call_id": "call-1",
+            "tool_name": "fetch_capabilities",
+            "tool_args": {"repo": "repo"},
+            "raw_event_refs": [{"agent_run_id": "agent-run-1", "seq": 10, "type": "tool_use"}],
+        },
+        session_event_seq=2,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="tool_call_end",
+        payload={
+            "tool_call_id": "call-1",
+            "tool_name": "fetch_capabilities",
+            "tool_result": "ok",
+            "raw_event_refs": [{"agent_run_id": "agent-run-1", "seq": 11, "type": "tool_result"}],
+        },
+        session_event_seq=3,
+    )
+
+    part = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert part["type"] == "tool"
+    assert part["toolCallId"] == "call-1"
+    assert part["rawEventRefs"] == [
+        {"agent_run_id": "agent-run-1", "seq": 10, "type": "tool_use"},
+        {"agent_run_id": "agent-run-1", "seq": 11, "type": "tool_result"},
+    ]
+
+
 def test_live_session_run_events_reduce_into_canonical_transcript_blocks() -> None:
     document = _session_run_start(None, "运行测试", 1)
     events = [
@@ -423,6 +484,59 @@ def test_provider_stream_interrupted_reduces_to_replayable_warning_notice() -> N
             "sessionEventSeq": 2,
         }
     ]
+
+
+def test_provider_stream_interrupted_falls_back_to_session_locale_message_key() -> None:
+    document = apply_session_event(
+        None,
+        session_id="session-1",
+        event_type="session_run_start",
+        payload={"prompt": "运行测试", "locale": "en"},
+        session_event_seq=1,
+        session_run_id="run-1",
+        session_run_seq=1,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="provider_stream_interrupted",
+        payload={"message_key": "provider_stream_interrupted.recovering"},
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts[0]["text"] == "The model output stream was interrupted. Trying to recover."
+
+
+def test_session_run_failed_falls_back_to_localized_capability_message() -> None:
+    document = apply_session_event(
+        None,
+        session_id="session-1",
+        event_type="session_run_start",
+        payload={"prompt": "生成能力包", "locale": "zh-CN"},
+        session_event_seq=1,
+        session_run_id="run-1",
+        session_run_seq=1,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="session_run_failed",
+        payload={
+            "code": "capability_package_session_failed",
+            "message_key": "capability_package.session_failed",
+            "diagnostic_message": "boom",
+        },
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts[0]["text"] == "错误：能力包流程执行失败。"
+    assert document["run_state"]["error"] == "能力包流程执行失败。"
 
 
 def test_shell_tool_stream_truncates_like_frontend_and_preserves_visible_output_on_end() -> None:

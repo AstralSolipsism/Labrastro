@@ -7,6 +7,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+from reuleauxcoder.domain.session.locale import session_notice_text
+
 _DEFAULT_SESSION_TITLES = frozenset({"", "新会话"})
 _SHELL_OUTPUT_MAX_CHARS = 20000
 _SHELL_OUTPUT_TRUNCATION_MARKER = "\n... 输出过长，已截断早期内容，保留最近输出 ...\n"
@@ -90,6 +92,9 @@ def apply_session_event(
         "eventKey": f"session:{session_id}:{event_seq}",
         "sessionEventSeq": event_seq,
     }
+    raw_event_refs = _raw_event_refs_from_payload(payload)
+    if raw_event_refs:
+        meta["rawEventRefs"] = raw_event_refs
     if session_run_id:
         meta["sessionRunId"] = session_run_id
         payload.setdefault("session_run_id", session_run_id)
@@ -170,6 +175,14 @@ def apply_session_event(
             "title": _string(payload, "message") or _string(payload, "phase") or "上下文事件",
             "payload": payload,
         }))
+    elif event_type == "capability_package_draft":
+        _append_part(doc, _part("capability-draft", "capability_package_draft", meta, {
+            "title": _string(payload, "title") or "能力包草案",
+            "packageId": _string(payload, "package_id"),
+            "draft": payload.get("draft") if isinstance(payload.get("draft"), dict) else {},
+            "validation": payload.get("validation") if isinstance(payload.get("validation"), dict) else {},
+            "payload": payload,
+        }))
     elif event_type == "view":
         _append_view_part(doc, payload, meta)
     elif event_type in {
@@ -195,13 +208,18 @@ def apply_session_event(
         _append_notice_part(
             doc,
             "warning",
-            str(payload.get("message") or "模型输出流中断，正在尝试恢复。"),
+            _session_event_message(
+                doc,
+                payload,
+                "provider_stream_interrupted.recovering",
+                "模型输出流中断，正在尝试恢复。",
+            ),
             "stream-recovery",
             "plain",
             meta,
         )
     elif event_type in {"error", "session_run_failed"}:
-        message = str(payload.get("message") or "unknown error")
+        message = _session_event_message(doc, payload, "", "unknown error")
         _settle_stale_pending_approvals(
             doc,
             status="denied",
@@ -382,6 +400,9 @@ def _sync_compatible_trace_fields(doc: dict[str, Any]) -> None:
 
 def _apply_session_run_start(doc: dict[str, Any], payload: dict[str, Any], timestamp: str, meta: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
+    locale = _string(payload, "locale")
+    if locale:
+        _dict(doc, "metadata")["locale"] = locale
     user_id = f"user-{meta['sessionEventSeq']}"
     turn = {
         "userMessage": {
@@ -416,6 +437,22 @@ def _should_initialize_session_title(doc: dict[str, Any], turns_before: int) -> 
         return True
     title = str(_dict(doc, "session").get("title") or "").strip()
     return title in _DEFAULT_SESSION_TITLES
+
+
+def _session_event_message(
+    doc: dict[str, Any],
+    payload: dict[str, Any],
+    default_key: str,
+    default: str,
+) -> str:
+    message = str(payload.get("message") or "").strip()
+    if message:
+        return message
+    message_key = _string(payload, "message_key") or default_key
+    if message_key:
+        locale = _string(payload, "locale") or _string(_dict(doc, "metadata"), "locale")
+        return session_notice_text(locale, message_key, default)
+    return default
 
 
 def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
@@ -661,6 +698,9 @@ def _append_text_part(
             next_part["format"] = str(current.get("format", current.get("textFormat")) or fmt)
             next_part["streaming"] = streaming
             next_part["streamKey"] = stream_key
+            raw_event_refs = _merge_raw_event_refs(current.get("rawEventRefs"), meta.get("rawEventRefs"))
+            if raw_event_refs:
+                next_part["rawEventRefs"] = raw_event_refs
             next_part.pop("text", None)
             next_part.pop("textFormat", None)
             next_part.pop("textStreamKey", None)
@@ -694,6 +734,9 @@ def _upsert_thinking_part(doc: dict[str, Any], content: str, meta: dict[str, Any
             part["active"] = True
             part["raw"] = f"{current}{content}"
             part["streamKey"] = "reasoning-stream"
+            raw_event_refs = _merge_raw_event_refs(part.get("rawEventRefs"), meta.get("rawEventRefs"))
+            if raw_event_refs:
+                part["rawEventRefs"] = raw_event_refs
             parts[index] = part
             assistant["parts"] = parts
             return
@@ -802,7 +845,14 @@ def _upsert_tool_part(
         "status": "running",
         "output": "",
     }
+    raw_event_refs = _merge_raw_event_refs(
+        current.get("rawEventRefs"),
+        patch.get("rawEventRefs"),
+        meta.get("rawEventRefs"),
+    )
     next_part = {**current, **_defined(patch), **_public_meta(meta), "type": "tool", "tool": tool_name, "toolCallId": tool_call_id}
+    if raw_event_refs:
+        next_part["rawEventRefs"] = raw_event_refs
     if index >= 0:
         parts[index] = next_part
     else:
@@ -829,7 +879,11 @@ def _patch_tool_part(
         if not tool_call_id and approval_id and part.get("approvalId") != approval_id:
             parts.append(part)
             continue
-        parts.append({**part, **_defined(patch), **_public_meta(meta)})
+        next_part = {**part, **_defined(patch), **_public_meta(meta)}
+        raw_event_refs = _merge_raw_event_refs(part.get("rawEventRefs"), patch.get("rawEventRefs"), meta.get("rawEventRefs"))
+        if raw_event_refs:
+            next_part["rawEventRefs"] = raw_event_refs
+        parts.append(next_part)
     assistant["parts"] = parts
 
 
@@ -985,12 +1039,16 @@ def _part_from_existing(
     meta: dict[str, Any],
     extra: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    part = {
         "id": str(current.get("id") or f"{kind}-{meta.get('sessionEventSeq')}"),
         "type": kind,
         **_defined(extra),
         **_public_meta(meta),
     }
+    raw_event_refs = _merge_raw_event_refs(current.get("rawEventRefs"), meta.get("rawEventRefs"))
+    if raw_event_refs:
+        part["rawEventRefs"] = raw_event_refs
+    return part
 
 
 def _refresh_assistant_text(assistant: dict[str, Any]) -> None:
@@ -1257,6 +1315,36 @@ def _number(value: dict[str, Any] | None, key: str) -> int | float | None:
 
 def _defined(value: dict[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if item is not None}
+
+
+def _raw_event_refs_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = payload.get("raw_event_refs") or payload.get("rawEventRefs")
+    if not isinstance(refs, list):
+        return []
+    return [dict(item) for item in refs if isinstance(item, dict)]
+
+
+def _merge_raw_event_refs(*values: Any) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        refs = value if isinstance(value, list) else []
+        for item in refs:
+            if not isinstance(item, dict):
+                continue
+            key = ":".join(
+                [
+                    str(item.get("agent_run_id") or ""),
+                    str(item.get("seq") if item.get("seq") is not None else ""),
+                    str(item.get("type") or ""),
+                    str(item.get("id") or ""),
+                ]
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(item))
+    return merged
 
 
 def _timestamp_ms(value: str) -> int:

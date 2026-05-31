@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
+import subprocess
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
@@ -16,13 +19,20 @@ from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
     AgentRunRequest,
 )
+from labrastro_server.services.agent_runtime.session_projection import (
+    AgentRunSessionProjectionLabels,
+    agent_run_events_to_session_events,
+    agent_run_event_to_session_events,
+)
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRecord,
     CAPABILITY_COMPONENT_KINDS,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
     CapabilityPackageDraft,
+    PublishPolicy,
     TriggerMode,
+    WorktreeRole,
 )
 from reuleauxcoder.domain.config.models import (
     DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
@@ -44,7 +54,78 @@ from reuleauxcoder.domain.session.locale import (
 from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import FetchCapabilitiesTool
 
 
+LOGGER = logging.getLogger(__name__)
 CAPABILITY_INGEST_WORKFLOW = "capability_package_ingest"
+_CAPABILITY_TEXT: dict[str, dict[str, str]] = {
+    "zh-CN": {
+        "queued_title": "能力包生成任务已排队",
+        "claimed_title": "能力包生成任务已被 sandbox worker 接收",
+        "session_ready_title": "能力包执行环境已就绪",
+        "session_ready_with_workdir_title": "能力包执行环境已就绪：{workdir}",
+        "completed_title": "能力包草案生成完成",
+        "failed_title": "能力包草案生成失败",
+        "cancelled_title": "能力包草案生成已取消",
+        "blocked_title": "能力包草案生成被阻断",
+        "start_draft": "开始生成能力包草案",
+        "ingest_bound": "能力包生成任务已进入 capability_packager",
+        "revision_bound": "能力包修改任务已进入 capability_packager",
+        "draft_ready": "能力包草案 {package_id} 已生成",
+        "revision_approval_reason": "收到修改意见，重新生成草案。",
+        "install_title": "安装能力包 {package_id}",
+        "revision_ack": "已收到修改意见，重新生成能力包草案。",
+        "revision_requested": "收到修改意见，重新生成能力包草案",
+        "revision_requested_with_text": "收到修改意见：{instruction}",
+        "install_cancelled": "已取消安装能力包 {package_id}。",
+        "install_completed": "能力包 {package_id} 已安装完成。",
+        "source_empty": "未能从仓库或文档中抓取到可用于能力包生成的资料。",
+        "source_partial": "部分在线资料读取失败，已继续使用可读取内容生成草案。",
+        "approval_package_title": "能力包",
+        "approval_name": "名称",
+        "approval_risk": "风险",
+        "approval_components_title": "组件摘要",
+        "approval_capabilities": "能力",
+        "approval_dependencies": "依赖",
+        "approval_none": "无",
+        "approval_install_plan": "安装计划",
+        "approval_intent": "确认安装能力包 {package_id}",
+        "approval_content": "准备安装能力包 {package_id}。",
+        "output_truncated_marker": "\n... 内容已从主时间线省略，请打开原始事件查看完整内容 ...\n",
+    },
+    "en": {
+        "queued_title": "Capability package generation task queued",
+        "claimed_title": "Capability package generation task accepted by sandbox worker",
+        "session_ready_title": "Capability package execution environment ready",
+        "session_ready_with_workdir_title": "Capability package execution environment ready: {workdir}",
+        "completed_title": "Capability package draft generation completed",
+        "failed_title": "Capability package draft generation failed",
+        "cancelled_title": "Capability package draft generation cancelled",
+        "blocked_title": "Capability package draft generation blocked",
+        "start_draft": "Starting capability package draft generation",
+        "ingest_bound": "Capability package generation task entered capability_packager",
+        "revision_bound": "Capability package revision task entered capability_packager",
+        "draft_ready": "Capability package draft {package_id} is ready",
+        "revision_approval_reason": "Received revision feedback; regenerating draft.",
+        "install_title": "Install capability package {package_id}",
+        "revision_ack": "Received revision feedback; regenerating the capability package draft.",
+        "revision_requested": "Revision feedback received; regenerating capability package draft",
+        "revision_requested_with_text": "Revision feedback received: {instruction}",
+        "install_cancelled": "Cancelled installing capability package {package_id}.",
+        "install_completed": "Capability package {package_id} installed.",
+        "source_empty": "No usable material could be fetched from the repository or documentation for capability package generation.",
+        "source_partial": "Some online material could not be read; continuing with the readable content to generate the draft.",
+        "approval_package_title": "Capability package",
+        "approval_name": "Name",
+        "approval_risk": "Risk",
+        "approval_components_title": "Component summary",
+        "approval_capabilities": "Capabilities",
+        "approval_dependencies": "Dependencies",
+        "approval_none": "None",
+        "approval_install_plan": "Install plan",
+        "approval_intent": "Confirm installing capability package {package_id}",
+        "approval_content": "Preparing to install capability package {package_id}.",
+        "output_truncated_marker": "\n... output omitted from the main timeline; open raw events for the complete content ...\n",
+    },
+}
 MAX_SNIPPET_CHARS = 36_000
 DEFAULT_CAPABILITY_FOCUS = "install setup configure authentication requirements runtime sdk executable mcp skill"
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
@@ -81,6 +162,46 @@ _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
     "path",
     "value",
 }
+
+
+def _capability_locale(value: object) -> str:
+    text = str(value or "").strip()
+    return normalize_session_locale(text) if text else "zh-CN"
+
+
+def _session_locale(session: Any) -> str:
+    return _capability_locale(getattr(session, "locale", "") or "")
+
+
+def _capability_text(locale: object, key: str, **values: object) -> str:
+    normalized = _capability_locale(locale)
+    labels = _CAPABILITY_TEXT.get(normalized) or _CAPABILITY_TEXT["en"]
+    template = labels.get(key) or _CAPABILITY_TEXT["en"].get(key) or key
+    return template.format(**{name: str(value) for name, value in values.items()})
+
+
+def _capability_agent_run_projection_labels(locale: object) -> AgentRunSessionProjectionLabels:
+    return AgentRunSessionProjectionLabels(
+        agent_id=DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+        workflow=CAPABILITY_INGEST_WORKFLOW,
+        queued_title=_capability_text(locale, "queued_title"),
+        claimed_title=_capability_text(locale, "claimed_title"),
+        session_ready_title=_capability_text(locale, "session_ready_title"),
+        session_ready_with_workdir_title=_capability_text(
+            locale,
+            "session_ready_with_workdir_title",
+            workdir="{workdir}",
+        ),
+        log_fallback_title="capability_packager log",
+        error_fallback_message="capability_packager error",
+        output_truncation_marker=_capability_text(locale, "output_truncated_marker"),
+        terminal_titles={
+            "completed": _capability_text(locale, "completed_title"),
+            "failed": _capability_text(locale, "failed_title"),
+            "cancelled": _capability_text(locale, "cancelled_title"),
+            "blocked": _capability_text(locale, "blocked_title"),
+        },
+    )
 
 
 class CapabilityPackageIngestError(Exception):
@@ -328,6 +449,8 @@ class CapabilityPackagerRunner:
                 prompt=prompt,
                 source="capability_ingest",
                 trigger_mode=TriggerMode.ENVIRONMENT_CONFIG,
+                worktree_role=WorktreeRole.SOURCE,
+                publish_policy=PublishPolicy.NEVER,
                 workdir=workspace_root or None,
                 parent_task_id=str(metadata.get("revision_of_agent_run_id") or "") or None,
                 parent_run_id=str(metadata.get("revision_of_agent_run_id") or "") or None,
@@ -342,7 +465,7 @@ class CapabilityPackagerRunner:
             for event in self.runtime_control_plane.list_events(
                 agent_run_id,
                 after_seq=0,
-                limit=200,
+                limit=1000,
             )
         ]
         return agent_run, events
@@ -811,6 +934,18 @@ class CapabilityPackageIngestService:
             if isinstance(metadata, dict) and isinstance(metadata.get("source_bundle"), dict)
             else {}
         )
+        if draft is not None:
+            workspace_root = _agent_run_materialization_workdir(agent_run, metadata)
+            materialization_bundle = _source_bundle_with_agent_run_documents(
+                source_bundle,
+                events,
+            )
+            draft = _canonical_capability_draft_from_decision(
+                draft,
+                materialization_bundle,
+                workspace_root=workspace_root,
+                sandbox_container_id=str(metadata.get("sandbox_container_id") or ""),
+            )
         validation: dict[str, Any] | None = None
         if draft is not None:
             validation = self.draft_validator.validate(
@@ -832,7 +967,6 @@ class CapabilityPackageSessionRunService:
 
     TERMINAL_AGENT_STATUSES = {"completed", "failed", "cancelled", "blocked"}
     INSTALL_TOOL_NAME = "install_capability_package"
-    REVISION_APPROVAL_REASON = "收到修改意见，重新生成草案。"
 
     def __init__(
         self,
@@ -863,6 +997,10 @@ class CapabilityPackageSessionRunService:
 
         def on_follow_up(ticket: dict[str, Any]) -> None:
             approval_id = ""
+            revision_reason = _capability_text(
+                _session_locale(session),
+                "revision_approval_reason",
+            )
             followup_id = str(ticket.get("followup_id") or "").strip()
             with follow_up_lock:
                 if followup_id and any(
@@ -876,7 +1014,7 @@ class CapabilityPackageSessionRunService:
                 session.resolve_approval(
                     approval_id,
                     "deny_once",
-                    self.REVISION_APPROVAL_REASON,
+                    revision_reason,
                 )
 
         session.set_follow_up_callback(on_follow_up)
@@ -887,7 +1025,7 @@ class CapabilityPackageSessionRunService:
             session.append_event(
                 "context_event",
                 _capability_context_event(
-                    "开始生成能力包草案",
+                    _capability_text(_session_locale(session), "start_draft"),
                     "capability_package_ingest",
                     {"agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID},
                 ),
@@ -936,15 +1074,24 @@ class CapabilityPackageSessionRunService:
                 {"message": exc.message, "code": exc.error, "recoverable": False},
             )
         except Exception as exc:
+            LOGGER.exception(
+                "Capability package SessionRun failed session_run_id=%s",
+                getattr(session, "session_run_id", ""),
+            )
             session.append_event(
                 "error",
-                {"message": str(exc), "code": "capability_package_session_failed"},
+                {
+                    "code": "capability_package_session_failed",
+                    "message_key": "capability_package.session_failed",
+                    "diagnostic_error_type": type(exc).__name__,
+                    "diagnostic_message": str(exc),
+                },
             )
             session.append_event(
                 "session_run_failed",
                 {
-                    "message": str(exc),
                     "code": "capability_package_session_failed",
+                    "message_key": "capability_package.session_failed",
                     "recoverable": False,
                 },
             )
@@ -989,12 +1136,11 @@ class CapabilityPackageSessionRunService:
         )
         metadata = dict(agent_run.metadata or {})
         is_revision = bool(metadata.get("revision_of_agent_run_id"))
+        locale = _session_locale(session)
         session.append_event(
             "context_event",
             _capability_context_event(
-                "能力包修改任务已进入 capability_packager"
-                if is_revision
-                else "能力包生成任务已进入 capability_packager",
+                _capability_text(locale, "revision_bound" if is_revision else "ingest_bound"),
                 "capability_package_revision" if is_revision else "capability_package_ingest",
                 {
                     "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
@@ -1048,6 +1194,16 @@ class CapabilityPackageSessionRunService:
             )
             return None
         source_bundle = status.get("source_bundle") if isinstance(status.get("source_bundle"), dict) else {}
+        session.append_event(
+            "capability_package_draft",
+            _capability_package_draft_event_payload(
+                draft,
+                source_bundle,
+                agent_run_id,
+                validation,
+                locale=_session_locale(session),
+            ),
+        )
         return draft, source_bundle
 
     def _start_revision_ingest(
@@ -1091,25 +1247,47 @@ class CapabilityPackageSessionRunService:
                 timeout_sec=self.poll_timeout_sec,
                 limit=100,
             )
+            event_dicts: list[dict[str, Any]] = []
             for event in events:
                 cursor = max(cursor, int(event.seq))
-                for session_event_type, payload in _agent_event_to_session_events(event.to_dict()):
-                    session.append_event(session_event_type, payload)
+                event_dicts.append(event.to_dict())
+            if event_dicts and len(event_dicts) < 100:
+                time.sleep(min(0.05, self.poll_timeout_sec))
+                extra_events = self.runtime_control_plane.list_events(
+                    agent_run_id,
+                    after_seq=cursor,
+                    limit=100 - len(event_dicts),
+                )
+                for event in extra_events:
+                    cursor = max(cursor, int(event.seq))
+                    event_dicts.append(event.to_dict())
+            for session_event_type, payload in agent_run_events_to_session_events(
+                event_dicts,
+                labels=_capability_agent_run_projection_labels(_session_locale(session)),
+                terminal_message=_agent_run_terminal_message,
+            ):
+                session.append_event(session_event_type, payload)
             try:
                 task = self.runtime_control_plane.agent_run_to_dict(agent_run_id)
             except KeyError:
                 return
             status = str(task.get("status") or "").strip()
-            if status in self.TERMINAL_AGENT_STATUSES and not events:
-                return
             if status in self.TERMINAL_AGENT_STATUSES:
-                tail = self.runtime_control_plane.list_events(
-                    agent_run_id,
-                    after_seq=cursor,
-                    limit=100,
-                )
-                if not tail:
-                    return
+                if not any(str(event.get("type") or "") in self.TERMINAL_AGENT_STATUSES for event in event_dicts):
+                    session.append_event(
+                        "context_event",
+                        _capability_context_event(
+                            _agent_run_terminal_message(task, event_dicts, status),
+                            f"agent_run_{status}",
+                            {
+                                "agent_run_id": agent_run_id,
+                                "agent_run_status": status,
+                                "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+                                "terminal_reason": _agent_run_terminal_reason(task, status),
+                            },
+                        ),
+                    )
+                return
             if getattr(session, "cancel_requested", False):
                 return
 
@@ -1127,11 +1305,13 @@ class CapabilityPackageSessionRunService:
         package_id = str(draft.get("id") or "capability-package").strip()
         approval_id = f"capability-package-install:{session.session_run_id}:{agent_run_id}:{package_id}"
         tool_call_id = f"capability-package-install:{agent_run_id or session.session_run_id}"
+        locale = _session_locale(session)
         approval_payload = _capability_install_approval_payload(
             approval_id,
             tool_call_id,
             draft,
             agent_run_id,
+            locale=locale,
         )
         session.append_event(
             "tool_call_start",
@@ -1142,7 +1322,7 @@ class CapabilityPackageSessionRunService:
                     "package_id": package_id,
                     "agent_run_id": agent_run_id,
                 },
-                "title": f"安装能力包 {package_id}",
+                "title": _capability_text(locale, "install_title", package_id=package_id),
             },
         )
         session.register_approval(approval_id, approval_payload)
@@ -1154,7 +1334,7 @@ class CapabilityPackageSessionRunService:
             session.resolve_approval(
                 approval_id,
                 "deny_once",
-                self.REVISION_APPROVAL_REASON,
+                _capability_text(locale, "revision_approval_reason"),
             )
         try:
             decision, reason = session.wait_approval(approval_id)
@@ -1172,10 +1352,10 @@ class CapabilityPackageSessionRunService:
                     "approval_id": approval_id,
                     "tool_call_id": tool_call_id,
                     "decision": "deny_once",
-                    "reason": self.REVISION_APPROVAL_REASON,
+                    "reason": _capability_text(locale, "revision_approval_reason"),
                 },
             )
-            response = "已收到修改意见，重新生成能力包草案。"
+            response = _capability_text(locale, "revision_ack")
             session.append_event(
                 "tool_call_end",
                 {
@@ -1190,9 +1370,13 @@ class CapabilityPackageSessionRunService:
                 session.mark_follow_up_consumed(followup_id)
             instruction = str(revision_ticket.get("text") or "").strip()
             instruction_title = (
-                f"收到修改意见：{_truncate_single_line(instruction, 80)}"
+                _capability_text(
+                    locale,
+                    "revision_requested_with_text",
+                    instruction=_truncate_single_line(instruction, 80),
+                )
                 if instruction
-                else "收到修改意见，重新生成能力包草案"
+                else _capability_text(locale, "revision_requested")
             )
             session.append_event(
                 "context_event",
@@ -1218,7 +1402,7 @@ class CapabilityPackageSessionRunService:
             },
         )
         if decision != "allow_once":
-            response = f"已取消安装能力包 {package_id}。"
+            response = _capability_text(locale, "install_cancelled", package_id=package_id)
             session.append_event(
                 "tool_call_end",
                 {
@@ -1261,7 +1445,7 @@ class CapabilityPackageSessionRunService:
                 },
             )
             return None
-        response = f"能力包 {package_id} 已安装完成。"
+        response = _capability_text(locale, "install_completed", package_id=package_id)
         session.append_event(
             "tool_call_end",
             {
@@ -1450,6 +1634,7 @@ def _append_source_bundle_notices(session: Any, source_bundle: dict[str, Any]) -
     documents = _dict_list(source_bundle.get("documents"))
     evidence = _dict_list(source_bundle.get("evidence"))
     has_document_content = any(str(item.get("content") or "").strip() for item in documents)
+    locale = _session_locale(session)
     if (
         not errors
         and not evidence
@@ -1459,7 +1644,7 @@ def _append_source_bundle_notices(session: Any, source_bundle: dict[str, Any]) -
         errors = [
             {
                 "code": "source_evidence_empty",
-                "message": "未能从仓库或文档中抓取到可用于能力包生成的资料。",
+                "message": _capability_text(locale, "source_empty"),
             }
         ]
     if not errors:
@@ -1468,9 +1653,9 @@ def _append_source_bundle_notices(session: Any, source_bundle: dict[str, Any]) -
     code = str(first_error.get("code") or "source_fetch_warning").strip()
     has_usable_source = bool(evidence or has_document_content)
     detail = (
-        "部分在线资料读取失败，已继续使用可读取内容生成草案。"
+        _capability_text(locale, "source_partial")
         if has_usable_source
-        else "未能从仓库或文档中抓取到可用于能力包生成的资料。"
+        else _capability_text(locale, "source_empty")
     )
     session.append_event(
         "output",
@@ -1563,6 +1748,21 @@ def _agent_run_terminal_message(
     return status_message or "capability package ingest failed"
 
 
+def _agent_run_terminal_reason(task: dict[str, Any], status: str) -> str:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    for value in (
+        task.get("failure_reason"),
+        task.get("cancel_reason"),
+        metadata.get("terminal_reason"),
+        metadata.get("failure_kind"),
+        status,
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return status
+
+
 def _capability_context_event(
     title: str,
     phase: str,
@@ -1584,187 +1784,68 @@ def _truncate_single_line(value: str, max_chars: int) -> str:
     return f"{text[:max_chars - 1]}…"
 
 
-def _agent_event_to_session_events(
-    event: dict[str, Any],
-) -> list[tuple[str, dict[str, Any]]]:
-    event_type = str(event.get("type") or "")
-    payload = event.get("payload")
-    data = payload if isinstance(payload, dict) else {}
-    agent_run_id = str(event.get("agent_run_id") or "")
-    base = {
+def _capability_package_draft_event_payload(
+    draft: dict[str, Any],
+    source_bundle: dict[str, Any],
+    agent_run_id: str,
+    validation: dict[str, Any] | None,
+    *,
+    locale: str,
+) -> dict[str, Any]:
+    public_draft = _public_capability_package_draft(draft)
+    package_id = str(public_draft.get("id") or "capability-package").strip()
+    title = _capability_text(locale, "draft_ready", package_id=package_id)
+    return {
+        "title": title,
+        "message": title,
+        "package_id": package_id,
         "agent_run_id": agent_run_id,
-        "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
-        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        "draft": public_draft,
+        "validation": validation if isinstance(validation, dict) else {},
+        "source": source_bundle.get("source") if isinstance(source_bundle.get("source"), dict) else {},
+        "source_summary": {
+            "documents": len(_dict_list(source_bundle.get("documents"))),
+            "evidence": len(_dict_list(source_bundle.get("evidence"))),
+            "errors": len(_dict_list(source_bundle.get("errors"))),
+        },
     }
-    if event_type == "queued":
-        task = data.get("agent_run") if isinstance(data.get("agent_run"), dict) else {}
-        return [
-            (
-                "context_event",
-                _capability_context_event(
-                    "能力包生成任务已排队",
-                    "agent_run_queued",
-                    {
-                        **base,
-                        "agent_run_status": str(task.get("status") or "queued"),
-                    },
-                ),
-            )
-        ]
-    if event_type == "claimed":
-        return [
-            (
-                "context_event",
-                _capability_context_event(
-                    "能力包生成任务已被 sandbox worker 接收",
-                    "agent_run_claimed",
-                    {
-                        **base,
-                        "agent_run_status": "claimed",
-                        "worker_id": str(data.get("worker_id") or ""),
-                        "peer_id": str(data.get("peer_id") or ""),
-                        "worker_kind": str(data.get("worker_kind") or ""),
-                        "request_id": str(data.get("request_id") or ""),
-                    },
-                ),
-            )
-        ]
-    if event_type in {"session_metadata", "session_pinned"}:
-        title = "能力包执行环境已就绪"
-        workdir = str(data.get("workdir") or "")
-        if workdir:
-            title = f"能力包执行环境已就绪：{workdir}"
-        return [
-            (
-                "context_event",
-                _capability_context_event(
-                    title,
-                    "agent_run_session_ready",
-                    {
-                        **base,
-                        "agent_run_status": "session_ready",
-                        **data,
-                    },
-                ),
-            )
-        ]
-    if event_type == "status":
-        status_data = data.get("data") if isinstance(data.get("data"), dict) else {}
-        status = str(status_data.get("status") or "").strip()
-        if not status:
-            return []
-        return [
-            (
-                "context_event",
-                _capability_context_event(
-                    f"capability_packager {status}",
-                    f"agent_run_{status}",
-                    {**base, "agent_run_status": status, **status_data},
-                ),
-            )
-        ]
-    if event_type == "text":
-        text = str(data.get("text") or "")
-        return [("assistant_delta", {**base, "content": text})] if text else []
-    if event_type == "thinking":
-        text = str(data.get("text") or "")
-        return [("reasoning_delta", {**base, "content": text})] if text else []
-    if event_type == "log":
-        text = str(data.get("text") or data.get("message") or "")
-        level_data = data.get("data") if isinstance(data.get("data"), dict) else {}
-        level = str(level_data.get("level") or "info")
-        return [
-            (
-                "context_event",
-                _capability_context_event(
-                    text or "capability_packager log",
-                    "agent_run_log",
-                    {**base, "level": level, "log": text},
-                ),
-            )
-        ]
-    if event_type == "error":
-        message = str(data.get("text") or data.get("message") or "capability_packager error")
-        return [("error", {**base, "message": message, "code": "agent_run_error"})]
-    if event_type == "tool_use":
-        tool_data = data.get("data") if isinstance(data.get("data"), dict) else {}
-        tool_name = str(
-            tool_data.get("tool_name")
-            or tool_data.get("name")
-            or tool_data.get("tool")
-            or "tool"
-        )
-        tool_call_id = str(
-            tool_data.get("tool_call_id")
-            or tool_data.get("id")
-            or f"{agent_run_id}:tool:{event.get('seq') or 0}"
-        )
-        return [
-            (
-                "tool_call_start",
-                {
-                    **base,
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "tool_args": tool_data.get("input")
-                    if isinstance(tool_data.get("input"), dict)
-                    else tool_data,
-                },
-            )
-        ]
-    if event_type == "tool_result":
-        tool_data = data.get("data") if isinstance(data.get("data"), dict) else {}
-        tool_name = str(
-            tool_data.get("tool_name")
-            or tool_data.get("name")
-            or tool_data.get("tool")
-            or "tool"
-        )
-        tool_call_id = str(
-            tool_data.get("tool_call_id")
-            or tool_data.get("id")
-            or f"{agent_run_id}:tool:{event.get('seq') or 0}"
-        )
-        output = tool_data.get("output")
-        if not isinstance(output, str):
-            output = str(data.get("text") or "")
-        return [
-            (
-                "tool_call_end",
-                {
-                    **base,
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "tool_result": output,
-                    "meta": tool_data,
-                },
-            )
-        ]
-    if event_type in {"completed", "failed", "cancelled", "blocked"}:
-        title = {
-            "completed": "能力包草案生成完成",
-            "failed": "能力包草案生成失败",
-            "cancelled": "能力包草案生成已取消",
-            "blocked": "能力包草案生成被阻断",
-        }.get(event_type, event_type)
-        task = data.get("agent_run") if isinstance(data.get("agent_run"), dict) else {}
-        message = _agent_run_terminal_message(task, [event], event_type)
-        return [
-            (
-                "context_event",
-                _capability_context_event(
-                    title,
-                    f"agent_run_{event_type}",
-                    {
-                        **base,
-                        "agent_run_status": event_type,
-                        "output": str(task.get("output") or ""),
-                        "message": message,
-                    },
-                ),
-            )
-        ]
-    return []
+
+
+def _public_capability_package_draft(draft: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(draft)
+
+    def scrub(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        result = dict(item)
+        content = _component_skill_content_value(result)
+        for field_name in ("skill_content", "content"):
+            result.pop(field_name, None)
+        config = dict(result.get("config")) if isinstance(result.get("config"), dict) else {}
+        for field_name in ("skill_content", "content"):
+            config.pop(field_name, None)
+        if content:
+            result["has_skill_content"] = True
+            result["skill_content_chars"] = len(content)
+        elif str(result.get("kind") or result.get("type") or "").strip().lower() == "skill":
+            result["has_skill_content"] = False
+        if config:
+            result["config"] = config
+        elif "config" in result:
+            result.pop("config", None)
+        return result
+
+    components = public.get("components")
+    if isinstance(components, list):
+        public["components"] = [scrub(item) for item in components]
+    contributions = public.get("contributions")
+    if isinstance(contributions, dict):
+        next_contributions = dict(contributions)
+        skills = next_contributions.get("skills")
+        if isinstance(skills, list):
+            next_contributions["skills"] = [scrub(item) for item in skills]
+        public["contributions"] = next_contributions
+    return public
 
 
 def _capability_install_approval_payload(
@@ -1772,6 +1853,8 @@ def _capability_install_approval_payload(
     tool_call_id: str,
     draft: dict[str, Any],
     agent_run_id: str,
+    *,
+    locale: str,
 ) -> dict[str, Any]:
     package_id = str(draft.get("id") or "capability-package").strip()
     components = [
@@ -1791,18 +1874,32 @@ def _capability_install_approval_payload(
     ]
     sections = [
         {
-            "title": "能力包",
+            "title": _capability_text(locale, "approval_package_title"),
             "items": [
                 {"label": "ID", "value": package_id},
-                {"label": "名称", "value": str(draft.get("name") or package_id)},
-                {"label": "风险", "value": str(draft.get("risk_level") or "unrated")},
+                {
+                    "label": _capability_text(locale, "approval_name"),
+                    "value": str(draft.get("name") or package_id),
+                },
+                {
+                    "label": _capability_text(locale, "approval_risk"),
+                    "value": str(draft.get("risk_level") or "unrated"),
+                },
             ],
         },
         {
-            "title": "组件摘要",
+            "title": _capability_text(locale, "approval_components_title"),
             "items": [
-                {"label": "能力", "value": ", ".join(_unique_strings(capabilities)) or "无"},
-                {"label": "依赖", "value": ", ".join(_unique_strings(dependencies)) or "无"},
+                {
+                    "label": _capability_text(locale, "approval_capabilities"),
+                    "value": ", ".join(_unique_strings(capabilities))
+                    or _capability_text(locale, "approval_none"),
+                },
+                {
+                    "label": _capability_text(locale, "approval_dependencies"),
+                    "value": ", ".join(_unique_strings(dependencies))
+                    or _capability_text(locale, "approval_none"),
+                },
             ],
         },
     ]
@@ -1814,8 +1911,11 @@ def _capability_install_approval_payload(
     if install_plan:
         sections.append(
             {
-                "title": "安装计划",
-                "items": [{"label": str(index + 1), "value": item} for index, item in enumerate(install_plan)],
+                "title": _capability_text(locale, "approval_install_plan"),
+                "items": [
+                    {"label": str(index + 1), "value": item}
+                    for index, item in enumerate(install_plan)
+                ],
             }
         )
     return {
@@ -1823,8 +1923,11 @@ def _capability_install_approval_payload(
         "tool_call_id": tool_call_id,
         "tool_name": CapabilityPackageSessionRunService.INSTALL_TOOL_NAME,
         "tool_args": {"package_id": package_id, "agent_run_id": agent_run_id},
-        "intent": f"确认安装能力包 {package_id}",
-        "content": str(draft.get("description") or f"准备安装能力包 {package_id}。"),
+        "intent": _capability_text(locale, "approval_intent", package_id=package_id),
+        "content": str(
+            draft.get("description")
+            or _capability_text(locale, "approval_content", package_id=package_id)
+        ),
         "sections": sections,
     }
 
@@ -1839,34 +1942,87 @@ def _render_packager_prompt(
     bundle_json = json.dumps(bundle, ensure_ascii=False, indent=2)
     language_instruction = session_locale_prompt_append(locale)
     language_block = f"{language_instruction}\n" if language_instruction else ""
+    use_zh = bool(locale) and normalize_session_locale(locale) == "zh-CN"
     revision_text = str(revision_instruction or "").strip()
     revision_block = ""
     if revision_text or isinstance(revision_draft, dict):
-        current_draft_json = json.dumps(revision_draft or {}, ensure_ascii=False, indent=2)
-        revision_block = (
-            "\nRevision request:\n"
-            "The user has reviewed the previous draft. Produce a complete revised draft, "
-            "not a patch. Keep every field that remains valid, and apply the user's "
-            "requested changes when they are supported by the evidence bundle.\n"
-            f"User instruction:\n{revision_text or '(no extra text)'}\n"
-            "Previous draft:\n"
-            f"```json\n{current_draft_json}\n```\n"
+        current_draft_json = json.dumps(
+            _public_capability_package_draft(revision_draft or {}),
+            ensure_ascii=False,
+            indent=2,
+        )
+        if use_zh:
+            revision_block = (
+                "\n修改请求：\n"
+                "用户已经审阅上一版草案。请输出一份完整的新结构决策，不要输出补丁。"
+                "保留仍然有效的字段，并在证据包支持时应用用户的修改意见。\n"
+                f"用户意见：\n{revision_text or '（没有额外文字）'}\n"
+                "上一版草案：\n"
+                f"```json\n{current_draft_json}\n```\n"
+            )
+        else:
+            revision_block = (
+                "\nRevision request:\n"
+                "The user has reviewed the previous draft. Produce a complete revised structure decision, "
+                "not a patch. Keep every field that remains valid, and apply the user's "
+                "requested changes when they are supported by the evidence bundle.\n"
+                f"User instruction:\n{revision_text or '(no extra text)'}\n"
+                "Previous draft:\n"
+                f"```json\n{current_draft_json}\n```\n"
+            )
+    if use_zh:
+        return (
+            "你是 capability_packager。请分析给定的仓库/文档证据包，生成一个能力包结构决策。\n"
+            f"{language_block}"
+            "发现阶段只允许读取信息：不要运行安装命令，不要修改文件。\n"
+            "只能提取证据包支持的说明；优先使用文档中明确给出的安装、检查、启动命令。\n"
+            "最终只输出一个紧凑 JSON 对象，不要使用 markdown fence，不要输出完整文件正文。\n"
+            "JSON 结构如下：\n"
+            "{\n"
+            '  "id": "package-id", "name": "Package Name", "description": "...",\n'
+            '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
+            '  "contributions": {\n'
+            '    "skills": [\n'
+            '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
+            '"source_path": "skills/code-review/SKILL.md", '
+            '"summary": "what this skill does"}\n'
+            '    ], "mcp_servers": [], "builtin_tools": [],\n'
+            '    "prompt_fragments": [], "credential_refs": [],\n'
+            '    "environment_requirements": [\n'
+            '      {"id": "envreq:executable:gh", "kind": "executable", '
+            '"name": "gh", "command": "gh", "check": "gh --version", '
+            '"install": "winget install GitHub.cli", "placement": "peer"}\n'
+            "    ]\n"
+            "  },\n"
+            '  "effective_capabilities": ["Plain language capability added to an Agent"],\n'
+            '  "install_plan": [], "usage": [], "evidence": [], "credentials": [], '
+            '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
+            "}\n\n"
+            "由能力包管理的 Skills 必须可以安装到服务端标准 Skill 目录；"
+            "每个 Skill 组件必须给出可由证据包或 worktree 定位的 source_path/content_ref，"
+            "完整 skill_content 由后端读取并组装，不要在模型输出中搬运大文件。\n"
+            "证据包：\n"
+            f"```json\n{bundle_json}\n```\n"
+            f"{revision_block}"
         )
     return (
         "You are capability_packager. Analyze the provided repository/docs bundle "
-        "and produce one capability package draft.\n"
+        "and produce one capability package structure decision.\n"
         f"{language_block}"
         "Discovery is read-only: do not run install commands and do not mutate files.\n"
         "Extract only instructions supported by the supplied evidence. Prefer exact "
         "install/check/launch commands from docs.\n"
-        "Return final output as a single fenced JSON object with this shape:\n"
+        "Return final output as one compact JSON object. Do not wrap it in a markdown fence, "
+        "and do not output complete file bodies.\n"
+        "Use this shape:\n"
         "{\n"
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
         '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
         '  "contributions": {\n'
         '    "skills": [\n'
         '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
-        '"skill_content": "---\\nname: code-review\\ndescription: ...\\n---\\n..."}\n'
+        '"source_path": "skills/code-review/SKILL.md", '
+        '"summary": "what this skill does"}\n'
         '    ], "mcp_servers": [], "builtin_tools": [],\n'
         '    "prompt_fragments": [], "credential_refs": [],\n'
         '    "environment_requirements": [\n'
@@ -1880,7 +2036,8 @@ def _render_packager_prompt(
         '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
         "}\n\n"
         "package-managed Skills must be installable into the server canonical Skill directory; "
-        'include "skill_content" for every Skill component or omit the Skill.\n'
+        "include source_path/content_ref for every Skill component so the backend can read "
+        "and assemble canonical skill_content. Do not copy large Skill files into the model output.\n"
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
         f"{revision_block}"
@@ -1915,6 +2072,496 @@ def _extract_draft(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _canonical_capability_draft_from_decision(
+    raw_draft: dict[str, Any],
+    source_bundle: dict[str, Any] | None,
+    *,
+    workspace_root: str = "",
+    sandbox_container_id: str = "",
+) -> dict[str, Any]:
+    draft = deepcopy(raw_draft)
+    bundle = source_bundle if isinstance(source_bundle, dict) else {}
+
+    def enrich(item: dict[str, Any]) -> dict[str, Any]:
+        kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+        if kind != "skill" or _component_skill_content_value(item):
+            return item
+        content, source_ref = _resolve_skill_content_from_source_bundle(
+            item,
+            bundle,
+            workspace_root=workspace_root,
+            sandbox_container_id=sandbox_container_id,
+        )
+        if not content:
+            reason = _skill_content_resolution_error(
+                item,
+                bundle,
+                workspace_root=workspace_root,
+                sandbox_container_id=sandbox_container_id,
+            )
+            if reason:
+                item = dict(item)
+                config = dict(item.get("config")) if isinstance(item.get("config"), dict) else {}
+                item["skill_content_resolution_error"] = reason
+                config["skill_content_resolution_error"] = reason
+                item["config"] = config
+            return item
+        item = dict(item)
+        item["skill_content"] = content
+        config = dict(item.get("config")) if isinstance(item.get("config"), dict) else {}
+        config.setdefault("skill_content", content)
+        if source_ref:
+            item["source_path"] = source_ref
+            config["source_path"] = source_ref
+            config["content_source"] = source_ref
+        item["config"] = config
+        return item
+
+    components = draft.get("components")
+    if isinstance(components, list):
+        draft["components"] = [
+            enrich(dict(item)) if isinstance(item, dict) else item
+            for item in components
+        ]
+
+    contributions = draft.get("contributions")
+    if isinstance(contributions, dict):
+        next_contributions = dict(contributions)
+        skills = contributions.get("skills")
+        if isinstance(skills, list):
+            next_contributions["skills"] = [
+                enrich(dict(item)) if isinstance(item, dict) else item
+                for item in skills
+            ]
+        draft["contributions"] = next_contributions
+    return draft
+
+
+def _agent_run_materialization_workdir(
+    agent_run: dict[str, Any],
+    metadata: dict[str, Any],
+) -> str:
+    for value in (
+        agent_run.get("workdir"),
+        metadata.get("workdir"),
+        metadata.get("pinned_session_workdir"),
+        metadata.get("session_workdir"),
+        metadata.get("workspace_mount"),
+        metadata.get("workspace_root"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _source_bundle_with_agent_run_documents(
+    source_bundle: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    documents = _documents_from_agent_run_events(events)
+    if not documents:
+        return source_bundle
+    bundle = deepcopy(source_bundle) if isinstance(source_bundle, dict) else {}
+    existing = _dict_list(bundle.get("documents"))
+    seen = {
+        str(item.get("source_path") or item.get("path") or item.get("title") or "").strip()
+        for item in existing
+        if isinstance(item, dict)
+    }
+    for document in documents:
+        key = str(document.get("source_path") or document.get("title") or "").strip()
+        if key and key in seen:
+            continue
+        existing.append(document)
+        if key:
+            seen.add(key)
+    bundle["documents"] = existing
+    return bundle
+
+
+def _documents_from_agent_run_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tool_inputs: dict[str, dict[str, Any]] = {}
+    documents: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        payload = event.get("payload")
+        data = payload if isinstance(payload, dict) else {}
+        tool_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        tool_call_id = str(
+            tool_data.get("tool_call_id")
+            or tool_data.get("id")
+            or data.get("tool_call_id")
+            or ""
+        ).strip()
+        if event_type == "tool_use" and tool_call_id:
+            tool_inputs[tool_call_id] = dict(tool_data)
+            continue
+        if event_type != "tool_result":
+            continue
+        tool_name = str(tool_data.get("tool_name") or tool_data.get("name") or "").strip()
+        if tool_name not in {"read_file", "read_files", "list_file"}:
+            continue
+        input_data = tool_inputs.get(tool_call_id, {})
+        path = _tool_result_source_path(tool_data, input_data)
+        output = tool_data.get("output")
+        if not isinstance(output, str) or not output.strip() or not path:
+            continue
+        documents.append(
+            {
+                "title": path,
+                "source_path": path,
+                "content": output.replace("\r\n", "\n").strip(),
+                "source_kind": "agent_run_tool_result",
+                "tool_call_id": tool_call_id,
+            }
+        )
+    return documents
+
+
+def _tool_result_source_path(
+    tool_data: dict[str, Any],
+    input_data: dict[str, Any],
+) -> str:
+    input_payload = input_data.get("input") if isinstance(input_data.get("input"), dict) else {}
+    for container in (tool_data, input_data, input_payload):
+        for field_name in ("source_path", "path", "file", "file_path", "relative_path"):
+            value = str(container.get(field_name) or "").strip()
+            if value:
+                return value.replace("\\", "/")
+    return ""
+
+
+def _resolve_skill_content_from_source_bundle(
+    component: dict[str, Any],
+    source_bundle: dict[str, Any],
+    *,
+    workspace_root: str = "",
+    sandbox_container_id: str = "",
+) -> tuple[str, str]:
+    candidates = _skill_content_source_candidates(component)
+    documents = _dict_list(source_bundle.get("documents"))
+    if documents:
+        for document in documents:
+            content = str(document.get("content") or "").replace("\r\n", "\n").strip()
+            if not content:
+                continue
+            identity = _source_document_identity(document)
+            if candidates and candidates.intersection(identity):
+                return content, _best_source_ref(document)
+        component_name = str(component.get("name") or component.get("id") or "").strip().lower()
+        if component_name:
+            for document in documents:
+                content = str(document.get("content") or "").replace("\r\n", "\n").strip()
+                if not content:
+                    continue
+                identity_text = " ".join(sorted(_source_document_identity(document))).lower()
+                if component_name in identity_text and "skill.md" in identity_text:
+                    return content, _best_source_ref(document)
+    if workspace_root:
+        content, source_ref = _resolve_skill_content_from_worktree(
+            candidates,
+            workspace_root,
+            sandbox_container_id=sandbox_container_id,
+        )
+        if content:
+            return content, source_ref
+    return "", ""
+
+
+def _skill_content_resolution_error(
+    component: dict[str, Any],
+    source_bundle: dict[str, Any],
+    *,
+    workspace_root: str = "",
+    sandbox_container_id: str = "",
+) -> str:
+    del source_bundle
+    if not workspace_root:
+        return ""
+    matches = _worktree_skill_file_refs(
+        workspace_root,
+        sandbox_container_id=sandbox_container_id,
+    )
+    if len(matches) <= 1:
+        return ""
+    candidates = _skill_content_source_candidates(component)
+    relative_matches = {path.replace("\\", "/").strip().strip("/").lower() for path in matches}
+    if candidates and any(
+        candidate.replace("\\", "/").strip().strip("/").lower() in relative_matches
+        for candidate in candidates
+    ):
+        return ""
+    return (
+        "multiple SKILL.md files found in AgentRun workdir; "
+        "draft must provide an exact source_path or content_ref"
+    )
+
+
+def _resolve_skill_content_from_worktree(
+    candidates: set[str],
+    workspace_root: str,
+    *,
+    sandbox_container_id: str = "",
+) -> tuple[str, str]:
+    root = Path(workspace_root).expanduser()
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = None
+    if root_resolved is not None and root_resolved.is_dir():
+        content, source_ref = _resolve_skill_content_from_local_worktree(candidates, root_resolved)
+        if content:
+            return content, source_ref
+    if sandbox_container_id:
+        content, source_ref = _resolve_skill_content_from_container_worktree(
+            candidates,
+            workspace_root,
+            sandbox_container_id,
+        )
+        if content:
+            return content, source_ref
+    return "", ""
+
+
+def _resolve_skill_content_from_local_worktree(
+    candidates: set[str],
+    root_resolved: Path,
+) -> tuple[str, str]:
+    for candidate in sorted(candidates):
+        if not candidate or candidate.lower() in {"skill.md", "readme.md"}:
+            continue
+        path = Path(candidate)
+        target = path if path.is_absolute() else root_resolved / path
+        try:
+            target_resolved = target.resolve()
+        except OSError:
+            continue
+        try:
+            target_resolved.relative_to(root_resolved)
+        except ValueError:
+            continue
+        if not target_resolved.is_file():
+            continue
+        try:
+            content = target_resolved.read_text(encoding="utf-8").replace("\r\n", "\n").strip()
+        except OSError:
+            continue
+        if content:
+            return content, str(target_resolved.relative_to(root_resolved)).replace("\\", "/")
+    matches = _unique_skill_files(root_resolved)
+    if len(matches) != 1:
+        return "", ""
+    target_resolved = matches[0]
+    try:
+        content = target_resolved.read_text(encoding="utf-8").replace("\r\n", "\n").strip()
+    except OSError:
+        return "", ""
+    if content:
+        return content, str(target_resolved.relative_to(root_resolved)).replace("\\", "/")
+    return "", ""
+
+
+def _unique_skill_files(root_resolved: Path) -> list[Path]:
+    if not root_resolved.is_dir():
+        return []
+    matches: list[Path] = []
+    for path in root_resolved.rglob("SKILL.md"):
+        try:
+            relative = path.relative_to(root_resolved)
+        except ValueError:
+            continue
+        parts = {part.lower() for part in relative.parts[:-1]}
+        if ".git" in parts or ".rcoder" in parts:
+            continue
+        if path.is_file():
+            matches.append(path)
+    return sorted(matches, key=lambda item: str(item.relative_to(root_resolved)).replace("\\", "/"))
+
+
+def _worktree_skill_file_refs(
+    workspace_root: str,
+    *,
+    sandbox_container_id: str = "",
+) -> list[str]:
+    root = Path(workspace_root).expanduser()
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = None
+    if root_resolved is not None and root_resolved.is_dir():
+        return [
+            str(path.relative_to(root_resolved)).replace("\\", "/")
+            for path in _unique_skill_files(root_resolved)
+        ]
+    if sandbox_container_id:
+        return _container_skill_file_refs(sandbox_container_id, workspace_root)
+    return []
+
+
+def _resolve_skill_content_from_container_worktree(
+    candidates: set[str],
+    workspace_root: str,
+    sandbox_container_id: str,
+) -> tuple[str, str]:
+    for candidate in sorted(candidates):
+        relative = _safe_container_relative_path(candidate)
+        if not relative or relative.lower() in {"skill.md", "readme.md"}:
+            continue
+        content = _read_container_text(
+            sandbox_container_id,
+            workspace_root,
+            relative,
+        )
+        if content:
+            return content, relative
+    matches = _container_skill_file_refs(sandbox_container_id, workspace_root)
+    if len(matches) != 1:
+        return "", ""
+    content = _read_container_text(sandbox_container_id, workspace_root, matches[0])
+    if content:
+        return content, matches[0]
+    return "", ""
+
+
+def _container_skill_file_refs(container_id: str, workspace_root: str) -> list[str]:
+    script = r'''
+root="$1"
+[ -d "$root" ] || exit 0
+cd "$root" || exit 0
+find . -type f -name SKILL.md ! -path '*/.git/*' ! -path '*/.rcoder/*' | sed 's#^\./##' | sort
+'''
+    completed = _run_docker_exec(container_id, script, workspace_root)
+    if completed.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if _safe_container_relative_path(line.strip())
+    ]
+
+
+def _read_container_text(
+    container_id: str,
+    workspace_root: str,
+    relative_path: str,
+) -> str:
+    relative = _safe_container_relative_path(relative_path)
+    if not relative:
+        return ""
+    script = r'''
+root="$1"
+rel="$2"
+target="$root/$rel"
+[ -f "$target" ] || exit 1
+cat "$target"
+'''
+    completed = _run_docker_exec(container_id, script, workspace_root, relative)
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.replace("\r\n", "\n").strip()
+
+
+def _run_docker_exec(
+    container_id: str,
+    script: str,
+    *args: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["docker", "exec", container_id, "sh", "-lc", script, "sh", *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(
+            args=["docker", "exec", container_id],
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+
+
+def _safe_container_relative_path(value: str) -> str:
+    normalized = value.replace("\\", "/").strip().strip("/")
+    if not normalized or normalized == ".":
+        return ""
+    if normalized.startswith("../") or "/../" in normalized or normalized.endswith("/.."):
+        return ""
+    if normalized.startswith("/") or re.match(r"^[a-zA-Z]:", normalized):
+        return ""
+    return normalized
+
+
+def _skill_content_source_candidates(component: dict[str, Any]) -> set[str]:
+    raw_config = component.get("config")
+    config: dict[str, Any] = dict(raw_config) if isinstance(raw_config, dict) else {}
+    fields = (
+        "source_path",
+        "content_ref",
+        "content_path",
+        "path",
+        "path_hint",
+        "registry_path",
+    )
+    values: set[str] = set()
+    for container in (component, config):
+        for field_name in fields:
+            value = str(container.get(field_name) or "").strip()
+            if value:
+                values.update(_path_identity_values(value))
+    return values
+
+
+def _source_document_identity(document: dict[str, Any]) -> set[str]:
+    fields = (
+        "source_path",
+        "path",
+        "url",
+        "final_url",
+        "title",
+        "content_hash",
+    )
+    values: set[str] = set()
+    for field_name in fields:
+        value = str(document.get(field_name) or "").strip()
+        if value:
+            values.update(_path_identity_values(value))
+    metadata = document.get("metadata")
+    if isinstance(metadata, dict):
+        for field_name in fields:
+            value = str(metadata.get(field_name) or "").strip()
+            if value:
+                values.update(_path_identity_values(value))
+    return values
+
+
+def _path_identity_values(value: str) -> set[str]:
+    normalized = value.replace("\\", "/").strip().strip("/")
+    if not normalized:
+        return set()
+    lowered = normalized.lower()
+    result = {normalized, lowered}
+    if "/" in lowered:
+        result.add(lowered.rsplit("/", 1)[-1])
+    if "/" in normalized:
+        result.add(normalized.rsplit("/", 1)[-1])
+    return result
+
+
+def _best_source_ref(document: dict[str, Any]) -> str:
+    for field_name in ("source_path", "path", "url", "final_url", "title"):
+        value = str(document.get(field_name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _document_from_fetch_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     sections = _dict_list(payload.get("sections"))
     content_parts: list[str] = []
@@ -1940,6 +2587,7 @@ def _document_from_fetch_payload(payload: dict[str, Any]) -> dict[str, Any] | No
     return {
         "title": str(payload.get("title") or payload.get("url") or "Documentation"),
         "url": str(payload.get("final_url") or payload.get("url") or ""),
+        "source_path": str(payload.get("source_path") or payload.get("path") or ""),
         "content": content[:MAX_SNIPPET_CHARS],
         "source_kind": str(payload.get("source_kind") or ""),
         "content_hash": str(payload.get("content_hash") or ""),
@@ -1965,7 +2613,16 @@ def _component_validation_messages(component: dict[str, Any]) -> list[str]:
         messages.append("component.name is required")
     if validation_kind == "skill" and not _component_skill_content_value(component):
         component_name = name or str(component.get("id") or "skill")
-        messages.append(f"skill component '{component_name}' requires skill_content")
+        config = dict(component.get("config")) if isinstance(component.get("config"), dict) else {}
+        resolution_error = str(
+            component.get("skill_content_resolution_error")
+            or config.get("skill_content_resolution_error")
+            or ""
+        ).strip()
+        if resolution_error:
+            messages.append(f"skill component '{component_name}' requires skill_content: {resolution_error}")
+        else:
+            messages.append(f"skill component '{component_name}' requires skill_content")
     access = str(component.get("access") or "").strip().lower()
     if access and access not in {"read", "write", "both"}:
         messages.append("component.access must be read, write, or both")

@@ -45,6 +45,7 @@ from reuleauxcoder.domain.config.models import (
     MCPServerConfig,
 )
 from reuleauxcoder.domain.providers.models import ProviderResponse
+from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
     AgentRunRequest,
@@ -388,6 +389,53 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
     assert event_by_type["remote_peer_ready"]["session_event_seq"] == 4
     assert event_by_type["assistant_message"]["session_event_seq"] == 5
     assert event_by_type["session_run_end"]["session_event_seq"] == 6
+
+
+def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: Path) -> None:
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        locale="zh-CN",
+    )
+
+    session.append_event(
+        "provider_stream_interrupted",
+        {
+            "message_key": "provider_stream_interrupted.recovering",
+            "diagnostic_message": "peer closed connection without sending complete message body",
+        },
+    )
+
+    event = session.events[-1]
+    assert event["payload"]["message"] == "模型输出流中断，正在尝试恢复。"
+    assert event["payload"]["message_key"] == "provider_stream_interrupted.recovering"
+    assert (
+        event["payload"]["diagnostic_message"]
+        == "peer closed connection without sending complete message body"
+    )
+
+
+def test_remote_session_run_uses_english_notice_for_english_locale(tmp_path: Path) -> None:
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        locale="en",
+    )
+
+    session.append_event(
+        "error",
+        {
+            "code": "capability_package_session_failed",
+            "message_key": "capability_package.session_failed",
+            "diagnostic_message": "boom",
+        },
+    )
+
+    event = session.events[-1]
+    assert event["payload"]["message"] == "Capability package workflow failed."
+    assert event["payload"]["diagnostic_message"] == "boom"
 
 
 def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -> None:
@@ -3223,7 +3271,7 @@ class TestRemoteRelayHTTPService:
             request = seen_requests[0]
             assert request.model == "deepseek-v4-pro"
             assert request.messages[0]["role"] == "system"
-            assert "Use Simplified Chinese" in request.messages[0]["content"]
+            assert "所有用户可见的生成内容都必须使用简体中文" in request.messages[0]["content"]
             assert request.messages[1:] == [{"role": "user", "content": "hello"}]
             assert request.max_tokens == 384000
             assert request.temperature == 0.2
@@ -3236,6 +3284,128 @@ class TestRemoteRelayHTTPService:
                 and event.payload.get("data", {}).get("status") == "model_request_started"
                 for event in control.list_events(agent_run_id)
             )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_agent_run_model_request_non_stream_reports_provider_interruption_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeProvider:
+            def chat(self, provider_request):
+                partial = ProviderResponse(content="hel")
+                interruption = {
+                    "phase": "stream_iterate",
+                    "classification": "text_interrupted",
+                    "recoverable": True,
+                    "partial_kind": "text",
+                    "retry_action": "continue",
+                    "error_type": "RemoteProtocolError",
+                    "message": "incomplete chunked read",
+                }
+                partial.stream_status = "interrupted"
+                partial.interruption = interruption
+                raise ProviderStreamInterruptedError(
+                    "incomplete chunked read",
+                    original_error=RuntimeError("incomplete chunked read"),
+                    partial_response=partial,
+                    interruption=interruption,
+                )
+
+        monkeypatch.setattr(
+            "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+            lambda _self, _config: FakeProvider(),
+        )
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            control.submit_agent_run(
+                AgentRunRequest(
+                    issue_id="issue-1",
+                    agent_id="capability_packager",
+                    prompt="package repo",
+                    executor="reuleauxcoder",
+                    execution_location="remote_server",
+                    worker_kind="sandbox_worker",
+                    model_request_origin="server",
+                    metadata={
+                        "model_binding": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                        }
+                    },
+                ),
+                task_id="task-model-interrupted",
+            )
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "worker_kind": "sandbox_worker",
+                    "executors": ["reuleauxcoder"],
+                },
+            )
+            claim = claim_body["claim"]
+
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/model-request",
+                {
+                    "peer_token": peer_token,
+                    "agent_run_id": "task-model-interrupted",
+                    "request_id": claim["request_id"],
+                    "worker_id": "worker-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            )
+
+            assert status == 200
+            assert body["ok"] is False
+            assert body["error"] == "provider_stream_interrupted"
+            assert body["message"] == "Provider stream interrupted."
+            assert body["message_key"] == "provider_stream_interrupted.recovering"
+            assert body["stream_status"] == "interrupted"
+            assert body["content"] == "hel"
+            assert body["response"]["content"] == "hel"
+            assert body["interruption"]["classification"] == "text_interrupted"
+            assert body["diagnostic_message"] == "incomplete chunked read"
         finally:
             service.stop()
             relay.stop()
@@ -3348,15 +3518,142 @@ class TestRemoteRelayHTTPService:
 
             assert status == 200
             assert content_type.startswith("text/event-stream")
-            assert ": ping" in raw_body
-            assert [frame["event"] for frame in frames] == ["token", "done"]
-            assert frames[0]["data"] == {"text": "hel"}
-            assert frames[1]["data"]["content"] == "hello"
+            assert "event: heartbeat" in raw_body
+            assert "heartbeat" in [frame["event"] for frame in frames]
+            assert [frame["event"] for frame in frames][-2:] == ["token", "done"]
+            assert frames[-2]["data"] == {"text": "hel"}
+            assert frames[-1]["data"]["content"] == "hello"
             assert any(
                 event.type == "status"
                 and event.payload.get("data", {}).get("status") == "model_request_started"
                 for event in control.list_events("task-model-stream")
             )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_agent_run_model_request_stream_reports_provider_interruption_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeProvider:
+            def chat(self, provider_request):
+                assert provider_request.on_token is not None
+                provider_request.on_token("hel")
+                partial = ProviderResponse(content="hel")
+                interruption = {
+                    "phase": "stream_iterate",
+                    "classification": "text_interrupted",
+                    "recoverable": True,
+                    "partial_kind": "text",
+                    "retry_action": "continue",
+                    "error_type": "RemoteProtocolError",
+                    "message": "incomplete chunked read",
+                }
+                partial.stream_status = "interrupted"
+                partial.interruption = interruption
+                raise ProviderStreamInterruptedError(
+                    "incomplete chunked read",
+                    original_error=RuntimeError("incomplete chunked read"),
+                    partial_response=partial,
+                    interruption=interruption,
+                )
+
+        monkeypatch.setattr(
+            "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+            lambda _self, _config: FakeProvider(),
+        )
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            control.submit_agent_run(
+                AgentRunRequest(
+                    issue_id="issue-1",
+                    agent_id="capability_packager",
+                    prompt="package repo",
+                    executor="reuleauxcoder",
+                    execution_location="remote_server",
+                    worker_kind="sandbox_worker",
+                    model_request_origin="server",
+                    metadata={
+                        "model_binding": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                        }
+                    },
+                ),
+                task_id="task-model-interrupted",
+            )
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "worker_kind": "sandbox_worker",
+                    "executors": ["reuleauxcoder"],
+                },
+            )
+            claim = claim_body["claim"]
+
+            status, content_type, _raw_body, frames = _sse_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/model-request",
+                {
+                    "peer_token": peer_token,
+                    "agent_run_id": "task-model-interrupted",
+                    "request_id": claim["request_id"],
+                    "worker_id": "worker-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+            assert status == 200
+            assert content_type.startswith("text/event-stream")
+            assert [frame["event"] for frame in frames] == ["token", "interrupted"]
+            assert frames[0]["data"] == {"text": "hel"}
+            interrupted = frames[1]["data"]
+            assert interrupted["content"] == "hel"
+            assert interrupted["stream_status"] == "interrupted"
+            assert interrupted["message"] == "Provider stream interrupted."
+            assert interrupted["message_key"] == "provider_stream_interrupted.recovering"
+            assert interrupted["error"] == "provider_stream_interrupted"
+            assert interrupted["interruption"]["classification"] == "text_interrupted"
+            assert interrupted["diagnostic_message"] == "incomplete chunked read"
         finally:
             service.stop()
             relay.stop()

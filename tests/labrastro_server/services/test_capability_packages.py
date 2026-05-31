@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+import labrastro_server.services.capability_packages as capability_packages_module
 from labrastro_server.interfaces.http.remote.service import (
     RemoteRelayHTTPService,
     _RemoteSessionRun,
@@ -15,6 +17,10 @@ from labrastro_server.services.agent_runtime.control_plane import AgentRunContro
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
+)
+from labrastro_server.services.agent_runtime.session_projection import (
+    agent_run_events_to_session_events,
+    agent_run_event_to_session_events,
 )
 from labrastro_server.services.capability_packages import (
     CapabilityDraftValidator,
@@ -25,7 +31,6 @@ from labrastro_server.services.capability_packages import (
     CapabilityPackageSessionRunService,
     CapabilitySourceCollector,
     EvidenceBundle,
-    _agent_event_to_session_events,
 )
 from reuleauxcoder.domain.agent_runtime.models import CapabilityComponentConfig
 from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord
@@ -86,7 +91,7 @@ def _review_draft(*, command: str = "gh") -> dict[str, object]:
 
 
 def test_agent_run_log_event_projects_as_process_context() -> None:
-    session_events = _agent_event_to_session_events(
+    session_events = agent_run_event_to_session_events(
         {
             "agent_run_id": "run-1",
             "seq": 1,
@@ -107,7 +112,7 @@ def test_agent_run_log_event_projects_as_process_context() -> None:
 
 
 def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
-    start_events = _agent_event_to_session_events(
+    start_events = agent_run_event_to_session_events(
         {
             "agent_run_id": "run-1",
             "seq": 2,
@@ -122,7 +127,7 @@ def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
             },
         }
     )
-    end_events = _agent_event_to_session_events(
+    end_events = agent_run_event_to_session_events(
         {
             "agent_run_id": "run-1",
             "seq": 3,
@@ -145,6 +150,196 @@ def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
     assert end_events[0][1]["tool_name"] == "fetch_capabilities"
     assert start_events[0][1]["tool_call_id"] == "call-1"
     assert end_events[0][1]["tool_call_id"] == "call-1"
+
+
+def test_agent_run_tool_result_projects_large_output_as_raw_audit_summary() -> None:
+    large_output = "A" * 5000 + "TAIL"
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 3,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "data": {
+                    "tool_name": "read_file",
+                    "tool_call_id": "call-1",
+                    "output": large_output,
+                    "path": "SKILL.md",
+                },
+            },
+        }
+    )
+
+    assert session_events[0][0] == "tool_call_end"
+    payload = session_events[0][1]
+    assert len(payload["tool_result"]) < len(large_output)
+    assert "open raw events for the complete content" in payload["tool_result"]
+    assert payload["tool_result"].endswith("TAIL")
+    assert payload["meta"]["path"] == "SKILL.md"
+    assert payload["meta"]["output_truncated"] is True
+    assert payload["meta"]["output_chars"] == len(large_output)
+    assert payload["meta"]["output_source"] == "raw_event"
+    assert "output" not in payload["meta"]
+    assert payload["raw_event_refs"] == [{"agent_run_id": "run-1", "seq": 3, "type": "tool_result"}]
+
+
+def test_agent_run_tool_use_projects_large_arguments_as_raw_audit_summary() -> None:
+    large_content = "C" * 5000 + "END"
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 2,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "write_file",
+                    "tool_call_id": "call-1",
+                    "input": {"path": "SKILL.md", "content": large_content},
+                },
+            },
+        }
+    )
+
+    payload = session_events[0][1]
+    assert payload["tool_args"]["path"] == "SKILL.md"
+    assert len(payload["tool_args"]["content"]) < len(large_content)
+    assert payload["tool_args"]["content"].endswith("END")
+    assert payload["tool_args"]["truncated_fields"] == ["content"]
+    assert payload["tool_args"]["full_payload_source"] == "raw_event"
+    assert payload["raw_event_refs"] == [{"agent_run_id": "run-1", "seq": 2, "type": "tool_use"}]
+
+
+def test_agent_run_result_event_projects_as_structured_process_context() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 4,
+            "type": "result",
+            "payload": {
+                "type": "result",
+                "text": "draft complete",
+                "data": {"status": "completed", "output": "draft complete"},
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["context_event"]
+    payload = session_events[0][1]
+    assert payload["phase"] == "agent_run_result"
+    assert payload["agent_run_status"] == "completed"
+    assert payload["output"] == "draft complete"
+
+
+def test_agent_run_result_event_omits_large_output_from_structured_context() -> None:
+    large_output = "B" * 5000 + "DONE"
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 4,
+            "type": "result",
+            "payload": {
+                "type": "result",
+                "data": {"status": "completed", "output": large_output},
+            },
+        }
+    )
+
+    payload = session_events[0][1]
+    assert len(payload["output"]) < len(large_output)
+    assert payload["output"].endswith("DONE")
+    assert payload["result"]["output_truncated"] is True
+    assert payload["result"]["output_chars"] == len(large_output)
+    assert "output" not in payload["result"]
+
+
+def test_agent_run_terminal_event_omits_large_output_from_process_context() -> None:
+    large_output = "D" * 5000 + "DONE"
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 5,
+            "type": "completed",
+            "payload": {
+                "result": {"status": "completed", "output": large_output},
+                "agent_run": {
+                    "id": "run-1",
+                    "status": "completed",
+                    "output": large_output,
+                },
+            },
+        }
+    )
+
+    payload = session_events[0][1]
+    assert payload["phase"] == "agent_run_completed"
+    assert len(payload["output"]) < len(large_output)
+    assert payload["output"].endswith("DONE")
+    assert len(payload["message"]) < len(large_output)
+    assert payload["message"].endswith("DONE")
+    assert payload["terminal"]["output_truncated"] is True
+    assert payload["terminal"]["message_truncated"] is True
+    assert payload["raw_event_refs"] == [{"agent_run_id": "run-1", "seq": 5, "type": "completed"}]
+
+
+def test_agent_run_projection_batches_consecutive_text_and_thinking() -> None:
+    session_events = agent_run_events_to_session_events(
+        [
+            {
+                "agent_run_id": "run-1",
+                "seq": 1,
+                "type": "thinking",
+                "payload": {"type": "thinking", "text": "a"},
+            },
+            {
+                "agent_run_id": "run-1",
+                "seq": 2,
+                "type": "thinking",
+                "payload": {"type": "thinking", "text": "b"},
+            },
+            {
+                "agent_run_id": "run-1",
+                "seq": 3,
+                "type": "text",
+                "payload": {"type": "text", "text": "c"},
+            },
+            {
+                "agent_run_id": "run-1",
+                "seq": 4,
+                "type": "text",
+                "payload": {"type": "text", "text": "d"},
+            },
+        ]
+    )
+
+    assert [event_type for event_type, _ in session_events] == [
+        "reasoning_delta",
+        "assistant_delta",
+    ]
+    assert session_events[0][1]["content"] == "ab"
+    assert session_events[1][1]["content"] == "cd"
+    assert [item["seq"] for item in session_events[0][1]["raw_event_refs"]] == [1, 2]
+
+
+def test_agent_run_projection_summarizes_large_batched_text() -> None:
+    events = [
+        {
+            "agent_run_id": "run-1",
+            "seq": seq,
+            "type": "text",
+            "payload": {"type": "text", "text": "E" * 1000},
+        }
+        for seq in range(1, 12)
+    ]
+    session_events = agent_run_events_to_session_events(events)
+
+    assert [event_type for event_type, _ in session_events] == ["assistant_delta"]
+    payload = session_events[0][1]
+    assert len(payload["content"]) < 11_000
+    assert "open raw events for the complete content" in payload["content"]
+    assert payload["content_projection"]["content_truncated"] is True
+    assert [item["seq"] for item in payload["raw_event_refs"]] == list(range(1, 12))
 
 
 def test_project_notes_input_creates_read_only_ingest_run() -> None:
@@ -170,8 +365,38 @@ def test_project_notes_input_creates_read_only_ingest_run() -> None:
     assert result.source_bundle["documents"][0]["title"] == "Project notes"
     assert "capability_packages" not in control.runtime_snapshot
     assert "capability_components" not in control.runtime_snapshot
-    assert '"skill_content"' in result.agent_run.prompt
-    assert "package-managed Skills must be installable into the server canonical Skill directory" in result.agent_run.prompt
+    assert '"skill_content"' not in result.agent_run.prompt
+    assert "source_path" in result.agent_run.prompt
+    assert "Do not copy large Skill files into the model output." in result.agent_run.prompt
+
+
+def test_revision_prompt_uses_public_draft_without_skill_content() -> None:
+    control = _control_plane()
+    runner = CapabilityPackagerRunner(control)
+    task = runner.start(
+        evidence_bundle=EvidenceBundle(
+            source={"type": "project_notes"},
+            documents=[{"title": "Project notes", "content": "Review code changes."}],
+            evidence=[{"title": "Project notes", "excerpt": "Review code changes."}],
+        ),
+        revision_instruction="rename the package",
+        revision_draft={
+            "id": "review",
+            "name": "Review",
+            "contributions": {
+                "skills": [
+                    {
+                        "id": "skill:code-review",
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": "---\nname: code-review\n---\nlarge body",
+                    }
+                ]
+            },
+        },
+    )
+    assert '"skill_content":' not in task.prompt
+    assert "skill_content_chars" in task.prompt
 
 
 def test_github_repo_ingest_sets_repo_url_for_sandbox_worktree() -> None:
@@ -654,6 +879,410 @@ def test_ingest_status_extracts_completed_draft_json() -> None:
     assert status["validation"]["ok"] is True
 
 
+def test_ingest_status_builds_skill_content_from_source_bundle() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this review skill.",
+            }
+        }
+    )
+    skill_content = "---\nname: code-review\ndescription: Review code changes.\n---\n\nReview code changes.\n"
+    source_bundle = {
+        "source": {"type": "github_repo", "url": "https://github.com/acme/review"},
+        "documents": [
+            {
+                "title": "skills/code-review/SKILL.md",
+                "source_path": "skills/code-review/SKILL.md",
+                "content": skill_content,
+            }
+        ],
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "errors": [],
+    }
+    control.get_agent_run(result.agent_run.id).metadata["source_bundle"] = source_bundle
+    draft_decision = {
+        "id": "review",
+        "name": "Review",
+        "source": {"type": "github_repo", "url": "https://github.com/acme/review"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                    "source_path": "skills/code-review/SKILL.md",
+                    "summary": "Review code changes.",
+                }
+            ]
+        },
+        "install_plan": ["Install the packaged skill."],
+        "usage": ["Use the review skill."],
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    assert skill["config"]["skill_content"] == skill_content.strip()
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_builds_skill_content_from_workspace_root(tmp_path: Path) -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    skill_path = tmp_path / "skills" / "code-review" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: code-review\ndescription: Review code changes.\n---\n\nReview code changes.\n",
+        encoding="utf-8",
+    )
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this review skill.",
+            },
+            "workspace_root": str(tmp_path),
+        }
+    )
+    control.get_agent_run(result.agent_run.id).metadata["source_bundle"] = {
+        "source": {"type": "project_notes"},
+        "documents": [],
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "errors": [],
+    }
+    draft_decision = {
+        "id": "review",
+        "name": "Review",
+        "source": {"type": "project_notes"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                    "source_path": "skills/code-review/SKILL.md",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["draft"]["contributions"]["skills"][0]["skill_content"].startswith("---\nname: code-review")
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_uses_agent_run_workdir_and_unique_skill_fallback(tmp_path: Path) -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    skill_path = tmp_path / "SKILL.md"
+    skill_content = (
+        "---\n"
+        "name: stop-slop\n"
+        "description: Detect vague AI writing.\n"
+        "---\n\n"
+        "Detect vague AI writing.\n"
+    )
+    skill_path.write_text(skill_content, encoding="utf-8")
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install the stop-slop skill from the checked out worktree.",
+            }
+        }
+    )
+    task = control.get_agent_run(result.agent_run.id)
+    task.workdir = str(tmp_path)
+    task.metadata["source_bundle"] = {
+        "source": {"type": "github_repo", "url": "https://github.com/hardikpandya/stop-slop"},
+        "documents": [],
+        "evidence": [{"title": "Skill", "excerpt": "Detect vague AI writing."}],
+        "errors": [],
+    }
+    draft_decision = {
+        "id": "stop-slop",
+        "name": "Stop Slop",
+        "source": {"type": "github_repo", "url": "https://github.com/hardikpandya/stop-slop"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:stop-slop",
+                    "kind": "skill",
+                    "name": "stop-slop",
+                    "source_path": "skills/stop-slop/SKILL.md",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Detect vague AI writing."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    assert skill["source_path"] == "SKILL.md"
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_reads_skill_content_from_sandbox_container_workdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    skill_content = (
+        "---\n"
+        "name: stop-slop\n"
+        "description: Detect vague AI writing.\n"
+        "---\n\n"
+        "Detect vague AI writing.\n"
+    )
+
+    def fake_docker_exec(
+        container_id: str,
+        script: str,
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        assert container_id == "sandbox-container-1"
+        if "find ." in script:
+            return subprocess.CompletedProcess(
+                args=["docker", "exec"],
+                returncode=0,
+                stdout="SKILL.md\n",
+                stderr="",
+            )
+        if "cat" in script:
+            assert args[0] == "/workspace/.rcoder/agent-runs/workspace/task/workdir/stop-slop"
+            if args[1] != "SKILL.md":
+                return subprocess.CompletedProcess(
+                    args=["docker", "exec"],
+                    returncode=1,
+                    stdout="",
+                    stderr="missing",
+                )
+            return subprocess.CompletedProcess(
+                args=["docker", "exec"],
+                returncode=0,
+                stdout=skill_content,
+                stderr="",
+            )
+        raise AssertionError(f"unexpected docker script: {script}")
+
+    monkeypatch.setattr(
+        capability_packages_module,
+        "_run_docker_exec",
+        fake_docker_exec,
+    )
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install the stop-slop skill from the checked out sandbox worktree.",
+            }
+        }
+    )
+    task = control.get_agent_run(result.agent_run.id)
+    task.workdir = "/workspace/.rcoder/agent-runs/workspace/task/workdir/stop-slop"
+    task.metadata["sandbox_container_id"] = "sandbox-container-1"
+    task.metadata["source_bundle"] = {
+        "source": {"type": "github_repo", "url": "https://github.com/hardikpandya/stop-slop"},
+        "documents": [],
+        "evidence": [{"title": "Skill", "excerpt": "Detect vague AI writing."}],
+        "errors": [],
+    }
+    draft_decision = {
+        "id": "stop-slop",
+        "name": "Stop Slop",
+        "source": {"type": "github_repo", "url": "https://github.com/hardikpandya/stop-slop"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:stop-slop",
+                    "kind": "skill",
+                    "name": "stop-slop",
+                    "source_path": "skills/stop-slop/SKILL.md",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Detect vague AI writing."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    assert skill["source_path"] == "SKILL.md"
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_reports_ambiguous_workdir_skill_content(tmp_path: Path) -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    for name in ("one", "two"):
+        path = tmp_path / "skills" / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"---\nname: {name}\n---\n\n{name}\n", encoding="utf-8")
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install one generated skill.",
+            }
+        }
+    )
+    task = control.get_agent_run(result.agent_run.id)
+    task.workdir = str(tmp_path)
+    task.metadata["source_bundle"] = {
+        "source": {"type": "project_notes"},
+        "documents": [],
+        "evidence": [{"title": "Skill", "excerpt": "Generated skill."}],
+        "errors": [],
+    }
+    draft_decision = {
+        "id": "ambiguous-skill",
+        "name": "Ambiguous Skill",
+        "source": {"type": "project_notes"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:ambiguous",
+                    "kind": "skill",
+                    "name": "ambiguous",
+                    "source_path": "SKILL.md",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Generated skill."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["validation"]["ok"] is False
+    assert any(
+        "multiple SKILL.md files found" in message
+        and "exact source_path or content_ref" in message
+        for message in status["validation"]["messages"]
+    )
+
+
+def test_ingest_status_builds_skill_content_from_agent_run_read_file_event() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this review skill.",
+            }
+        }
+    )
+    skill_content = "---\nname: code-review\ndescription: Review code changes.\n---\n\nReview code changes.\n"
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-skill",
+                "input": {"path": "skills/code-review/SKILL.md"},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-skill",
+                "output": skill_content,
+            },
+        ),
+    )
+    draft_decision = {
+        "id": "review",
+        "name": "Review",
+        "source": {"type": "project_notes"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                    "source_path": "skills/code-review/SKILL.md",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["draft"]["contributions"]["skills"][0]["skill_content"] == skill_content.strip()
+    assert status["validation"]["ok"] is True
+
+
 def test_capability_package_session_run_requests_install_approval_and_installs(tmp_path: Path) -> None:
     class FakeAdminManager:
         def __init__(self) -> None:
@@ -676,6 +1305,7 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        locale="en",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -741,8 +1371,19 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
             None,
         )
     )
+    draft_event = next(event for event in session.events if event["type"] == "capability_package_draft")
+    assert draft_event["payload"]["package_id"] == "review"
+    assert draft_event["payload"]["draft"]["id"] == "review"
     assert approval["tool_name"] == "install_capability_package"
     assert approval["tool_call_id"]
+    assert approval["intent"] == "Confirm installing capability package review"
+    assert approval["sections"][0]["title"] == "Capability package"
+    assert approval["sections"][1]["title"] == "Component summary"
+    assert any(
+        event["type"] == "tool_call_start"
+        and event["payload"].get("title") == "Install capability package review"
+        for event in session.events
+    )
     session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
     _wait_for(lambda: session.done)
 
@@ -750,6 +1391,119 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     assert admin.payloads[0]["draft"]["id"] == "review"  # type: ignore[index]
     assert any(event["type"] == "tool_call_end" for event in session.events)
     assert session.events[-1]["type"] in {"session_run_end", "approval_resolved", "tool_call_end"}
+    assert any(
+        event["type"] == "session_run_end"
+        and event["payload"].get("response") == "Capability package review installed."
+        for event in session.events
+    )
+
+
+def test_capability_package_session_process_text_follows_english_locale(tmp_path: Path) -> None:
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-1",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        locale="en",
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        object(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install gh, then use gh pr view for review.",
+            }
+        },
+    )
+    agent_run_id = _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "context_event"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    claim = control.claim_agent_run(
+        worker_id="worker-1",
+        worker_kind="sandbox_worker",
+        executors=["fake"],
+        peer_id="peer-1",
+    )
+    assert claim is not None
+    control.complete_claimed_agent_run(
+        str(agent_run_id),
+        ExecutorRunResult(
+            task_id=str(agent_run_id),
+            status="failed",
+            output="",
+            error="No model provider/profile is configured.",
+        ),
+        request_id=claim.request_id,
+        worker_id="worker-1",
+        peer_id="peer-1",
+    )
+    _wait_for(lambda: session.done)
+
+    messages = [
+        str(event["payload"].get("message") or "")
+        for event in session.events
+        if event["type"] == "context_event"
+    ]
+    assert "Starting capability package draft generation" in messages
+    assert "Capability package generation task entered capability_packager" in messages
+    assert "Capability package generation task queued" in messages
+    assert "Capability package generation task accepted by sandbox worker" in messages
+    assert not any("能力包" in message for message in messages)
+
+
+def test_capability_package_session_unknown_failure_uses_session_locale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_start(self, payload, *, agent_run_metadata=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(CapabilityPackageIngestService, "start", fail_start)
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-1",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        locale="zh-CN",
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        object(),
+        poll_timeout_sec=0.05,
+    )
+
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install gh, then use gh pr view for review.",
+            }
+        },
+    )
+    _wait_for(lambda: session.done)
+
+    error_event = next(event for event in session.events if event["type"] == "error")
+    failed_event = next(event for event in session.events if event["type"] == "session_run_failed")
+    assert error_event["payload"]["message"] == "能力包流程执行失败。"
+    assert error_event["payload"]["message_key"] == "capability_package.session_failed"
+    assert error_event["payload"]["diagnostic_message"] == "boom"
+    assert failed_event["payload"]["message"] == "能力包流程执行失败。"
 
 
 def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Path) -> None:
@@ -793,8 +1547,9 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     )
     first_agent_run = control.agent_run_to_dict(str(first_agent_run_id))
     assert first_agent_run["metadata"]["locale"] == "zh-CN"
-    assert "Use Simplified Chinese" in first_agent_run["prompt"]
-    assert "natural-language fields in generated drafts" in first_agent_run["prompt"]
+    assert "所有用户可见的生成内容都必须使用简体中文" in first_agent_run["prompt"]
+    assert "生成草案中的自然语言字段" in first_agent_run["prompt"]
+    assert "你是 capability_packager" in first_agent_run["prompt"]
     first_draft = _review_draft(command="hub")
     control.complete_agent_run(
         str(first_agent_run_id),
@@ -837,13 +1592,13 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     assert second_agent_run["metadata"]["revision_followup_id"] == "follow-revise"
     assert second_agent_run["metadata"]["revision_instruction"] == "把依赖改成 gh，不要用 hub"
     assert second_agent_run["parent_task_id"] == first_agent_run_id
-    assert "User instruction:" in second_agent_run["prompt"]
+    assert "用户意见：" in second_agent_run["prompt"]
     assert "把依赖改成 gh，不要用 hub" in second_agent_run["prompt"]
     assert '"command": "hub"' in second_agent_run["prompt"]
     assert any(
         event["type"] == "approval_resolved"
         and event["payload"].get("approval_id") == first_approval["approval_id"]
-        and event["payload"].get("reason") == service.REVISION_APPROVAL_REASON
+        and event["payload"].get("reason") == "收到修改意见，重新生成草案。"
         for event in session.events
     )
     assert any(
@@ -1295,6 +2050,10 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
     assert "agent_run_claimed" in phases
     assert "agent_run_worktree_ready" in phases
     assert "agent_run_failed" in phases
+    assistant_deltas = [
+        event for event in persisted if event["event_type"] == "assistant_delta"
+    ]
+    assert len(assistant_deltas) < 250
     assert any(
         event["event_type"] == "error"
         and "No model provider/profile is configured."
