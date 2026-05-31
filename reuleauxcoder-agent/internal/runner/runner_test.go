@@ -616,8 +616,8 @@ func TestAgentRunLoopCompletesFailedPrepareEvents(t *testing.T) {
 						ModelRequestOrigin: "local_cli",
 						ExecutorSessionID:  "labrastro-agent-run-run-1",
 						Metadata: map[string]any{
-							"repo_url":   repoURL,
-							"pr_enabled": false,
+							"repo_url":       repoURL,
+							"publish_policy": "never",
 							"prompt_files": map[string]any{
 								"AGENTS.md": "Use test conventions.\n",
 							},
@@ -731,8 +731,8 @@ func TestAgentRunLoopCompletesFailedPublishEvents(t *testing.T) {
 						ModelRequestOrigin: "local_cli",
 						ExecutorSessionID:  "labrastro-agent-run-run-1",
 						Metadata: map[string]any{
-							"repo_url":   repoURL,
-							"pr_enabled": false,
+							"repo_url":       repoURL,
+							"publish_policy": "branch",
 							"prompt_files": map[string]any{
 								"AGENTS.md": "Use test conventions.\n",
 							},

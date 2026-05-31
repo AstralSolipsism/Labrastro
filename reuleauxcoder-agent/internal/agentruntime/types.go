@@ -20,6 +20,7 @@ const (
 	EventStatus     EventType = "status"
 	EventError      EventType = "error"
 	EventLog        EventType = "log"
+	EventUsage      EventType = "usage"
 	EventResult     EventType = "result"
 )
 
@@ -46,6 +47,8 @@ type RunRequest struct {
 	RuntimeProfileID   string         `json:"runtime_profile_id,omitempty"`
 	WorkerKind         string         `json:"worker_kind,omitempty"`
 	ModelRequestOrigin string         `json:"model_request_origin,omitempty"`
+	WorktreeRole       string         `json:"worktree_role,omitempty"`
+	PublishPolicy      string         `json:"publish_policy,omitempty"`
 	Workdir            string         `json:"workdir,omitempty"`
 	Branch             string         `json:"branch,omitempty"`
 	Model              string         `json:"model,omitempty"`

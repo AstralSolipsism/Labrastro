@@ -3,6 +3,8 @@ package agentruntime
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 )
 
@@ -28,6 +30,29 @@ type worktreePublisher struct {
 }
 
 func (p *worktreePublisher) run() PublishResult {
+	role := worktreeRole(p.req)
+	if role != "target" {
+		p.emit(Event{
+			Type: EventStatus,
+			Data: map[string]any{
+				"status":        "publish_skipped",
+				"reason":        "worktree_role_not_target",
+				"worktree_role": role,
+			},
+		})
+		return p.result
+	}
+	policy := publishPolicy(p.req)
+	if policy == "never" {
+		p.emit(Event{
+			Type: EventStatus,
+			Data: map[string]any{
+				"status": "publish_skipped",
+				"reason": "publish_policy_never",
+			},
+		})
+		return p.result
+	}
 	workdir := strings.TrimSpace(p.req.Workdir)
 	branch := strings.TrimSpace(p.req.Branch)
 	if workdir == "" {
@@ -122,7 +147,6 @@ func (p *worktreePublisher) run() PublishResult {
 			baseRef = resolved
 		}
 	}
-	prEnabled := metadataBoolDefault(p.req.Metadata, "pr_enabled", true)
 	prTitle := metadataString(p.req.Metadata, "pr_title")
 	if prTitle == "" {
 		prTitle = "Agent task " + p.req.TaskID
@@ -151,23 +175,55 @@ func (p *worktreePublisher) run() PublishResult {
 			"head_sha":       headSHA,
 			"base_ref":       baseRef,
 			"commit_message": message,
-			"pr_enabled":     prEnabled,
+			"publish_policy": policy,
 			"pr_title":       prTitle,
 			"pr_body":        prBody,
 			"pr_base":        baseRef,
 		},
 	})
 
-	if !prEnabled {
+	if policy == "branch" {
 		p.emit(Event{
 			Type: EventStatus,
 			Data: map[string]any{
-				"status":     "pr_skipped",
-				"branch":     branch,
-				"pr_enabled": false,
+				"status":         "pr_skipped",
+				"branch":         branch,
+				"publish_policy": "branch",
 			},
 		})
+		return p.result
 	}
+
+	prURL, err := ensurePullRequest(p.ctx, workdir, branch, baseRef, prTitle, prBody)
+	if err != nil {
+		p.fail("pr", err.Error())
+		return p.result
+	}
+	p.emit(Event{
+		Type: EventStatus,
+		Data: map[string]any{
+			"status": "pr_created",
+			"branch": branch,
+			"pr_url": prURL,
+		},
+	})
+	p.result.Artifacts = append(p.result.Artifacts, map[string]any{
+		"type":    "pull_request",
+		"status":  "opened",
+		"pr_url":  prURL,
+		"content": prBody,
+		"metadata": map[string]any{
+			"repo_url":       repoURL,
+			"workdir":        workdir,
+			"branch":         branch,
+			"head_sha":       headSHA,
+			"base_ref":       baseRef,
+			"publish_policy": policy,
+			"pr_title":       prTitle,
+			"pr_body":        prBody,
+			"pr_base":        baseRef,
+		},
+	})
 	return p.result
 }
 
@@ -210,6 +266,69 @@ func defaultPRBody(req RunRequest, workdir, branch string) string {
 	return strings.Join(lines, "\n")
 }
 
+func worktreeRole(req RunRequest) string {
+	role := strings.TrimSpace(strings.ToLower(req.WorktreeRole))
+	if role == "" {
+		role = strings.TrimSpace(strings.ToLower(metadataString(req.Metadata, "worktree_role")))
+	}
+	if role == "" {
+		return "target"
+	}
+	return role
+}
+
+func publishPolicy(req RunRequest) string {
+	policy := strings.TrimSpace(strings.ToLower(req.PublishPolicy))
+	if policy == "" {
+		policy = strings.TrimSpace(strings.ToLower(metadataString(req.Metadata, "publish_policy")))
+	}
+	switch policy {
+	case "branch", "pr":
+		return policy
+	default:
+		return "never"
+	}
+}
+
+func ensurePullRequest(ctx context.Context, workdir, branch, baseRef, title, body string) (string, error) {
+	viewArgs := []string{"pr", "view", branch, "--json", "url", "--jq", ".url"}
+	if existing, err := ghOutput(ctx, workdir, viewArgs...); err == nil {
+		if url := strings.TrimSpace(existing); url != "" {
+			return url, nil
+		}
+	}
+	args := []string{"pr", "create", "--head", branch, "--title", title, "--body", body}
+	if baseRef != "" {
+		args = append(args, "--base", baseRef)
+	}
+	out, err := ghOutput(ctx, workdir, args...)
+	if err != nil {
+		return "", err
+	}
+	url := strings.TrimSpace(out)
+	if url == "" {
+		return "", fmt.Errorf("gh pr create returned empty url")
+	}
+	return url, nil
+}
+
+func ghOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(out))
+		if text != "" {
+			return string(out), fmt.Errorf("gh %s failed: %w: %s", strings.Join(args, " "), err, text)
+		}
+		return string(out), fmt.Errorf("gh %s failed: %w", strings.Join(args, " "), err)
+	}
+	return string(out), nil
+}
+
 func remoteDefaultBranchFromWorktree(ctx context.Context, workdir string) (string, error) {
 	out, err := gitOutput(ctx, workdir, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err == nil {
@@ -239,30 +358,4 @@ func metadataString(metadata map[string]any, key string) string {
 		return strings.TrimSpace(fmt.Sprint(value))
 	}
 	return ""
-}
-
-func metadataBoolDefault(metadata map[string]any, key string, fallback bool) bool {
-	if len(metadata) == 0 {
-		return fallback
-	}
-	value, ok := metadata[key]
-	if !ok || value == nil {
-		return fallback
-	}
-	switch typed := value.(type) {
-	case bool:
-		return typed
-	case string:
-		text := strings.TrimSpace(strings.ToLower(typed))
-		if text == "" {
-			return fallback
-		}
-		return !(text == "0" || text == "false" || text == "no" || text == "off")
-	default:
-		text := strings.TrimSpace(strings.ToLower(fmt.Sprint(value)))
-		if text == "" {
-			return fallback
-		}
-		return !(text == "0" || text == "false" || text == "no" || text == "off")
-	}
 }

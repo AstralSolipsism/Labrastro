@@ -15,12 +15,13 @@ func TestPublishWorktreeCommitsPushesAndReportsBranchArtifact(t *testing.T) {
 	writeWorktreeFile(t, worktree.Path, "feature.txt", "created by agent\n")
 
 	result := PublishWorktree(context.Background(), RunRequest{
-		TaskID:   "task-publish-create",
-		AgentID:  "coder",
-		IssueID:  "issue-1",
-		Workdir:  worktree.Path,
-		Branch:   worktree.BranchName,
-		Metadata: map[string]any{"repo_url": origin, "pr_body": "body"},
+		TaskID:        "task-publish-create",
+		AgentID:       "coder",
+		IssueID:       "issue-1",
+		PublishPolicy: "branch",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata:      map[string]any{"repo_url": origin, "pr_body": "body"},
 	}, PublishOptions{})
 
 	branchArtifact := assertArtifact(t, result.Artifacts, "branch", "pushed")
@@ -28,7 +29,7 @@ func TestPublishWorktreeCommitsPushesAndReportsBranchArtifact(t *testing.T) {
 		t.Fatalf("worker must not create pull_request artifacts: %#v", result.Artifacts)
 	}
 	metadata, _ := branchArtifact["metadata"].(map[string]any)
-	for _, key := range []string{"repo_url", "branch", "head_sha", "base_ref", "commit_message", "pr_enabled", "pr_title", "pr_body", "pr_base"} {
+	for _, key := range []string{"repo_url", "branch", "head_sha", "base_ref", "commit_message", "publish_policy", "pr_title", "pr_body", "pr_base"} {
 		if _, ok := metadata[key]; !ok {
 			t.Fatalf("branch metadata missing %s: %#v", key, metadata)
 		}
@@ -49,11 +50,12 @@ func TestPublishWorktreeReportsNoChanges(t *testing.T) {
 	worktree := createPublishWorktree(t, origin, "task-publish-clean")
 
 	result := PublishWorktree(context.Background(), RunRequest{
-		TaskID:   "task-publish-clean",
-		AgentID:  "coder",
-		Workdir:  worktree.Path,
-		Branch:   worktree.BranchName,
-		Metadata: map[string]any{"repo_url": origin, "pr_body": "body"},
+		TaskID:        "task-publish-clean",
+		AgentID:       "coder",
+		PublishPolicy: "branch",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata:      map[string]any{"repo_url": origin, "pr_body": "body"},
 	}, PublishOptions{})
 
 	artifact := assertArtifact(t, result.Artifacts, "report", "generated")
@@ -74,11 +76,12 @@ func TestPublishWorktreeDoesNotCallGH(t *testing.T) {
 	logPath := installFakeGH(t)
 
 	result := PublishWorktree(context.Background(), RunRequest{
-		TaskID:   "task-publish-existing",
-		AgentID:  "coder",
-		Workdir:  worktree.Path,
-		Branch:   worktree.BranchName,
-		Metadata: map[string]any{"repo_url": origin, "pr_body": "body"},
+		TaskID:        "task-publish-existing",
+		AgentID:       "coder",
+		PublishPolicy: "branch",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata:      map[string]any{"repo_url": origin, "pr_body": "body"},
 	}, PublishOptions{})
 
 	assertArtifact(t, result.Artifacts, "branch", "pushed")
@@ -87,7 +90,7 @@ func TestPublishWorktreeDoesNotCallGH(t *testing.T) {
 	}
 }
 
-func TestPublishWorktreeCanDisablePR(t *testing.T) {
+func TestPublishWorktreeBranchPolicyDoesNotCreatePR(t *testing.T) {
 	requireGit(t)
 	origin := createGitRepo(t)
 	worktree := createPublishWorktree(t, origin, "task-publish-no-pr")
@@ -95,14 +98,12 @@ func TestPublishWorktreeCanDisablePR(t *testing.T) {
 	logPath := installFakeGH(t)
 
 	result := PublishWorktree(context.Background(), RunRequest{
-		TaskID:  "task-publish-no-pr",
-		AgentID: "coder",
-		Workdir: worktree.Path,
-		Branch:  worktree.BranchName,
-		Metadata: map[string]any{
-			"repo_url":   origin,
-			"pr_enabled": false,
-		},
+		TaskID:        "task-publish-no-pr",
+		AgentID:       "coder",
+		PublishPolicy: "branch",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata:      map[string]any{"repo_url": origin},
 	}, PublishOptions{})
 
 	assertArtifact(t, result.Artifacts, "branch", "pushed")
@@ -110,7 +111,74 @@ func TestPublishWorktreeCanDisablePR(t *testing.T) {
 		t.Fatalf("PR artifact should not be created: %#v", result.Artifacts)
 	}
 	if content, _ := os.ReadFile(logPath); len(content) > 0 {
-		t.Fatalf("gh should not be called when pr_enabled=false: %s", content)
+		t.Fatalf("gh should not be called when publish_policy=branch: %s", content)
+	}
+}
+
+func TestPublishWorktreeNeverPolicySkipsBeforeGitStatus(t *testing.T) {
+	result := PublishWorktree(context.Background(), RunRequest{
+		TaskID:        "task-publish-never",
+		AgentID:       "coder",
+		PublishPolicy: "never",
+		Workdir:       filepath.Join(t.TempDir(), "missing-workdir"),
+	}, PublishOptions{})
+
+	if len(result.Artifacts) != 0 {
+		t.Fatalf("publish_policy=never must not create artifacts: %#v", result.Artifacts)
+	}
+	if !hasPublishStatus(result.Events, "publish_skipped") || hasPublishStatus(result.Events, "publish_failed") {
+		t.Fatalf("publish_policy=never should only skip: %#v", result.Events)
+	}
+}
+
+func TestPublishWorktreeSourceRoleSkipsEvenWithPublishPolicy(t *testing.T) {
+	result := PublishWorktree(context.Background(), RunRequest{
+		TaskID:        "task-publish-source",
+		AgentID:       "coder",
+		WorktreeRole:  "source",
+		PublishPolicy: "pr",
+		Workdir:       filepath.Join(t.TempDir(), "missing-workdir"),
+	}, PublishOptions{})
+
+	if len(result.Artifacts) != 0 {
+		t.Fatalf("worktree_role=source must not create artifacts: %#v", result.Artifacts)
+	}
+	if !hasPublishStatus(result.Events, "publish_skipped") || hasPublishStatus(result.Events, "publish_failed") {
+		t.Fatalf("worktree_role=source should only skip: %#v", result.Events)
+	}
+}
+
+func TestPublishWorktreePRPolicyCreatesPRArtifact(t *testing.T) {
+	requireGit(t)
+	origin := createGitRepo(t)
+	worktree := createPublishWorktree(t, origin, "task-publish-pr")
+	writeWorktreeFile(t, worktree.Path, "pr.txt", "change\n")
+	logPath := installFakeGH(t)
+
+	result := PublishWorktree(context.Background(), RunRequest{
+		TaskID:        "task-publish-pr",
+		AgentID:       "coder",
+		PublishPolicy: "pr",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata: map[string]any{
+			"repo_url": origin,
+			"pr_title": "Capability update",
+			"pr_body":  "body",
+		},
+	}, PublishOptions{})
+
+	assertArtifact(t, result.Artifacts, "branch", "pushed")
+	pr := assertArtifact(t, result.Artifacts, "pull_request", "opened")
+	if pr["pr_url"] == "" {
+		t.Fatalf("PR artifact missing url: %#v", pr)
+	}
+	if !hasPublishStatus(result.Events, "pr_created") {
+		t.Fatalf("PR policy should emit pr_created: %#v", result.Events)
+	}
+	content, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(content), "pr create") {
+		t.Fatalf("gh pr create was not called: %s", content)
 	}
 }
 
@@ -122,11 +190,12 @@ func TestPublishWorktreePushFailuresBecomeArtifacts(t *testing.T) {
 	runGit(t, worktree.Path, "remote", "set-url", "origin", localRepoURL(filepath.Join(t.TempDir(), "missing-origin")))
 
 	pushFailed := PublishWorktree(context.Background(), RunRequest{
-		TaskID:   "task-publish-push-fail",
-		AgentID:  "coder",
-		Workdir:  worktree.Path,
-		Branch:   worktree.BranchName,
-		Metadata: map[string]any{"repo_url": origin, "pr_body": "body"},
+		TaskID:        "task-publish-push-fail",
+		AgentID:       "coder",
+		PublishPolicy: "branch",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata:      map[string]any{"repo_url": origin, "pr_body": "body"},
 	}, PublishOptions{})
 
 	failed := assertArtifact(t, pushFailed.Artifacts, "log", "failed")
@@ -145,11 +214,12 @@ func TestPublishWorktreeHonorsCancelledContext(t *testing.T) {
 	cancel()
 
 	result := PublishWorktree(ctx, RunRequest{
-		TaskID:   "task-publish-cancel",
-		AgentID:  "coder",
-		Workdir:  worktree.Path,
-		Branch:   worktree.BranchName,
-		Metadata: map[string]any{"repo_url": origin},
+		TaskID:        "task-publish-cancel",
+		AgentID:       "coder",
+		PublishPolicy: "branch",
+		Workdir:       worktree.Path,
+		Branch:        worktree.BranchName,
+		Metadata:      map[string]any{"repo_url": origin},
 	}, PublishOptions{})
 
 	assertArtifact(t, result.Artifacts, "log", "failed")

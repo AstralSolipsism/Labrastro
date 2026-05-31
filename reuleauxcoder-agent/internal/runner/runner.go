@@ -335,7 +335,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 			}
 		}
 		publishArtifacts := []map[string]any{}
-		if taskCtx.Err() == nil && result.Status == "completed" && runtimeNeedsWorktree(req.ExecutionLocation) {
+		if taskCtx.Err() == nil && result.Status == "completed" && shouldPublishWorktree(req) {
 			publish := agentruntime.PublishWorktree(taskCtx, req, agentruntime.PublishOptions{
 				EventSink: func(event agentruntime.Event) {
 					sendLiveRuntimeEvent("publish", event)
@@ -500,6 +500,43 @@ func runtimeNeedsWorktree(location string) bool {
 	return strings.EqualFold(location, "daemon_worktree") || strings.EqualFold(location, "remote_server")
 }
 
+func publishPolicy(req agentruntime.RunRequest) string {
+	policy := strings.TrimSpace(strings.ToLower(req.PublishPolicy))
+	if policy == "" {
+		policy = strings.TrimSpace(strings.ToLower(metadataString(req.Metadata, "publish_policy")))
+	}
+	if policy == "" {
+		return "never"
+	}
+	return policy
+}
+
+func shouldPublishWorktree(req agentruntime.RunRequest) bool {
+	if !runtimeNeedsWorktree(req.ExecutionLocation) {
+		return false
+	}
+	if worktreeRole(req) != "target" {
+		return false
+	}
+	switch publishPolicy(req) {
+	case "branch", "pr":
+		return true
+	default:
+		return false
+	}
+}
+
+func worktreeRole(req agentruntime.RunRequest) string {
+	role := strings.TrimSpace(strings.ToLower(req.WorktreeRole))
+	if role == "" {
+		role = strings.TrimSpace(strings.ToLower(metadataString(req.Metadata, "worktree_role")))
+	}
+	if role == "" {
+		return "target"
+	}
+	return role
+}
+
 func (r *Runner) resolveRepoURL(ctx context.Context, req agentruntime.RunRequest, workspaceRoot string) (string, error) {
 	if repoURL := metadataString(req.Metadata, "repo_url"); repoURL != "" {
 		return repoURL, nil
@@ -602,6 +639,8 @@ func runtimeRunRequest(req protocol.ExecutorRequest) agentruntime.RunRequest {
 		RuntimeProfileID:   req.RuntimeProfileID,
 		WorkerKind:         req.WorkerKind,
 		ModelRequestOrigin: req.ModelRequestOrigin,
+		WorktreeRole:       req.WorktreeRole,
+		PublishPolicy:      req.PublishPolicy,
 		Workdir:            req.Workdir,
 		Branch:             req.Branch,
 		Model:              req.Model,
