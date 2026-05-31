@@ -5,7 +5,8 @@ from __future__ import annotations
 import io
 import json
 import socket
-from urllib.error import HTTPError
+from http.client import RemoteDisconnected
+from urllib.error import HTTPError, URLError
 
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.relay.server import RelayServer
@@ -54,16 +55,31 @@ class FakeResponse:
 class FakeOpener:
     def __init__(
         self,
-        routes: dict[str, FakeResponse | HTTPError | Exception],
+        routes: dict[
+            str,
+            FakeResponse
+            | HTTPError
+            | Exception
+            | list[FakeResponse | HTTPError | Exception],
+        ],
     ) -> None:
         self.routes = routes
         self.calls: list[str] = []
+        self.timeouts: list[int | None] = []
 
     def open(self, req: object, timeout: int | None = None) -> FakeResponse:
-        del timeout
         url = req.get_full_url()  # type: ignore[attr-defined]
         self.calls.append(url)
+        self.timeouts.append(timeout)
         response = self.routes.get(url)
+        if isinstance(response, list):
+            if response:
+                next_response = response.pop(0)
+                if not response:
+                    self.routes[url] = next_response
+                response = next_response
+            else:
+                response = None
         if isinstance(response, Exception):
             raise response
         if isinstance(response, HTTPError):
@@ -81,7 +97,13 @@ class FakeOpener:
 
 def _install_fake_network(
     monkeypatch,
-    routes: dict[str, FakeResponse | HTTPError | Exception],
+    routes: dict[
+        str,
+        FakeResponse
+        | HTTPError
+        | Exception
+        | list[FakeResponse | HTTPError | Exception],
+    ],
 ) -> FakeOpener:
     opener = FakeOpener(routes)
     monkeypatch.setattr(fetch_module.socket, "getaddrinfo", lambda *_args: PUBLIC_ADDRINFO)
@@ -277,12 +299,95 @@ def test_reports_content_too_large(monkeypatch) -> None:
 
 def test_reports_network_error(monkeypatch) -> None:
     url = "https://docs.example.com/timeout"
+    monkeypatch.setattr(fetch_module, "REQUEST_RETRY_BACKOFF_SEC", 0)
     _install_fake_network(monkeypatch, {url: fetch_module.urllib_error.URLError("timed out")})
 
     payload = json.loads(FetchCapabilitiesTool().execute(url=url))
 
     assert payload["ok"] is False
     assert payload["errors"][0]["code"] == "network_error"
+
+
+def test_retries_timeout_before_reporting_network_error(monkeypatch) -> None:
+    url = "https://docs.example.com/retry-timeout"
+    monkeypatch.setattr(fetch_module, "REQUEST_RETRY_BACKOFF_SEC", 0)
+    opener = _install_fake_network(monkeypatch, {url: URLError("timed out")})
+
+    payload = json.loads(FetchCapabilitiesTool().execute(url=url))
+
+    assert payload["ok"] is False
+    assert payload["errors"][0]["code"] == "network_error"
+    assert opener.calls == [url, url, url]
+    assert opener.timeouts == [fetch_module.REQUEST_TIMEOUT_SEC] * 3
+
+
+def test_retries_timeout_and_returns_success(monkeypatch) -> None:
+    url = "https://docs.example.com/retry-success.md"
+    monkeypatch.setattr(fetch_module, "REQUEST_RETRY_BACKOFF_SEC", 0)
+    opener = _install_fake_network(
+        monkeypatch,
+        {
+            url: [
+                URLError("timed out"),
+                FakeResponse(
+                    url,
+                    "# Retry Success\n\n## Install\nRun it.",
+                    content_type="text/markdown",
+                ),
+            ]
+        },
+    )
+
+    payload = json.loads(FetchCapabilitiesTool().execute(url=url))
+
+    assert payload["ok"] is True
+    assert payload["title"] == "Install"
+    assert opener.calls == [url, url]
+    assert opener.timeouts == [fetch_module.REQUEST_TIMEOUT_SEC] * 2
+
+
+def test_retries_remote_disconnected_and_returns_success(monkeypatch) -> None:
+    url = "https://docs.example.com/retry-remote-disconnected.md"
+    monkeypatch.setattr(fetch_module, "REQUEST_RETRY_BACKOFF_SEC", 0)
+    opener = _install_fake_network(
+        monkeypatch,
+        {
+            url: [
+                RemoteDisconnected("Remote end closed connection without response"),
+                RemoteDisconnected("Remote end closed connection without response"),
+                FakeResponse(
+                    url,
+                    "# Retry Success\n\n## Install\nRun it.",
+                    content_type="text/markdown",
+                ),
+            ]
+        },
+    )
+
+    payload = json.loads(FetchCapabilitiesTool().execute(url=url))
+
+    assert payload["ok"] is True
+    assert payload["title"] == "Install"
+    assert opener.calls == [url, url, url]
+    assert opener.timeouts == [fetch_module.REQUEST_TIMEOUT_SEC] * 3
+
+
+def test_retries_remote_disconnected_before_reporting_network_error(monkeypatch) -> None:
+    url = "https://docs.example.com/retry-remote-disconnected-fail"
+    monkeypatch.setattr(fetch_module, "REQUEST_RETRY_BACKOFF_SEC", 0)
+    opener = _install_fake_network(
+        monkeypatch,
+        {url: RemoteDisconnected("Remote end closed connection without response")},
+    )
+
+    payload = json.loads(FetchCapabilitiesTool().execute(url=url))
+
+    assert payload["ok"] is False
+    assert payload["errors"][0]["code"] == "network_error"
+    assert payload["errors"][0]["attempts"] == 3
+    assert payload["errors"][0]["retryable"] is True
+    assert payload["errors"][0]["url"] == url
+    assert opener.calls == [url, url, url]
 
 
 def test_remote_backend_uses_server_side_local_fallback(monkeypatch) -> None:

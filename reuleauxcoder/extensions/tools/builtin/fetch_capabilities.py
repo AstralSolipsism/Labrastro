@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from http import client as http_client
 import hashlib
 import ipaddress
 import json
 import re
 import socket
+import time
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -24,7 +26,9 @@ DEFAULT_MAX_CHARS = 50_000
 MAX_OUTPUT_CHARS = 100_000
 MIN_OUTPUT_CHARS = 4_000
 MAX_DOWNLOAD_BYTES = 2_000_000
-REQUEST_TIMEOUT_SEC = 12
+REQUEST_TIMEOUT_SEC = 30
+REQUEST_MAX_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF_SEC = 0.5
 MAX_REDIRECTS = 5
 REDIRECT_CODES = {301, 302, 303, 307, 308}
 TEXT_EXTENSIONS = {
@@ -210,7 +214,7 @@ class _FetchResponse:
     status: int
     content_type: str
     body: bytes
-    error: dict[str, str] | None = None
+    error: dict[str, Any] | None = None
 
 
 class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
@@ -344,58 +348,87 @@ def _fetch_http(url: str) -> _FetchResponse:
                 "Accept": "text/html,text/markdown,text/plain,application/json,application/yaml,*/*;q=0.1",
             },
         )
-        try:
-            with opener.open(req, timeout=REQUEST_TIMEOUT_SEC) as response:
-                status = int(getattr(response, "status", response.getcode() or 0))
-                final_url = str(response.geturl() or current_url)
-                content_type = str(response.headers.get("Content-Type", ""))
-                body = response.read(MAX_DOWNLOAD_BYTES + 1)
-                if len(body) > MAX_DOWNLOAD_BYTES:
+        redirect_to = ""
+        last_network_error: _FetchResponse | None = None
+        for attempt in range(1, REQUEST_MAX_ATTEMPTS + 1):
+            try:
+                with opener.open(req, timeout=REQUEST_TIMEOUT_SEC) as response:
+                    status = int(getattr(response, "status", response.getcode() or 0))
+                    final_url = str(response.geturl() or current_url)
+                    content_type = str(response.headers.get("Content-Type", ""))
+                    body = response.read(MAX_DOWNLOAD_BYTES + 1)
+                    if len(body) > MAX_DOWNLOAD_BYTES:
+                        return _FetchResponse(
+                            final_url=final_url,
+                            status=status,
+                            content_type=content_type,
+                            body=body[:MAX_DOWNLOAD_BYTES],
+                            error=_error(
+                                "content_too_large",
+                                f"response exceeded {MAX_DOWNLOAD_BYTES} bytes",
+                            ),
+                        )
                     return _FetchResponse(
                         final_url=final_url,
                         status=status,
                         content_type=content_type,
-                        body=body[:MAX_DOWNLOAD_BYTES],
-                        error=_error(
-                            "content_too_large",
-                            f"response exceeded {MAX_DOWNLOAD_BYTES} bytes",
-                        ),
+                        body=body,
                     )
+            except urllib_error.HTTPError as exc:
+                location = exc.headers.get("Location", "")
+                if exc.code in REDIRECT_CODES and location:
+                    if redirect_count >= MAX_REDIRECTS:
+                        return _FetchResponse(
+                            final_url=current_url,
+                            status=exc.code,
+                            content_type=str(exc.headers.get("Content-Type", "")),
+                            body=b"",
+                            error=_error(
+                                "too_many_redirects",
+                                "maximum redirect count exceeded",
+                            ),
+                        )
+                    redirect_to = urljoin(current_url, location)
+                    break
+                body = exc.read(MAX_DOWNLOAD_BYTES + 1)
                 return _FetchResponse(
-                    final_url=final_url,
-                    status=status,
-                    content_type=content_type,
-                    body=body,
+                    final_url=current_url,
+                    status=exc.code,
+                    content_type=str(exc.headers.get("Content-Type", "")),
+                    body=body[:MAX_DOWNLOAD_BYTES],
+                    error=_error("http_error", f"HTTP {exc.code}"),
                 )
-        except urllib_error.HTTPError as exc:
-            location = exc.headers.get("Location", "")
-            if exc.code in REDIRECT_CODES and location:
-                if redirect_count >= MAX_REDIRECTS:
-                    return _FetchResponse(
-                        final_url=current_url,
-                        status=exc.code,
-                        content_type=str(exc.headers.get("Content-Type", "")),
-                        body=b"",
-                        error=_error("too_many_redirects", "maximum redirect count exceeded"),
-                    )
-                current_url = urljoin(current_url, location)
-                continue
-            body = exc.read(MAX_DOWNLOAD_BYTES + 1)
-            return _FetchResponse(
-                final_url=current_url,
-                status=exc.code,
-                content_type=str(exc.headers.get("Content-Type", "")),
-                body=body[:MAX_DOWNLOAD_BYTES],
-                error=_error("http_error", f"HTTP {exc.code}"),
-            )
-        except urllib_error.URLError as exc:
-            return _FetchResponse(
-                final_url=current_url,
-                status=0,
-                content_type="",
-                body=b"",
-                error=_error("network_error", str(exc.reason)),
-            )
+            except (
+                urllib_error.URLError,
+                TimeoutError,
+                socket.timeout,
+                http_client.RemoteDisconnected,
+                ConnectionResetError,
+                ConnectionAbortedError,
+            ) as exc:
+                retryable = _is_retryable_network_error(exc)
+                last_network_error = _FetchResponse(
+                    final_url=current_url,
+                    status=0,
+                    content_type="",
+                    body=b"",
+                    error=_error(
+                        "network_error",
+                        _network_error_message(exc),
+                        url=current_url,
+                        attempts=attempt,
+                        retryable=retryable,
+                    ),
+                )
+                if attempt < REQUEST_MAX_ATTEMPTS and retryable:
+                    time.sleep(_retry_backoff_delay(attempt))
+                    continue
+                return last_network_error
+        if redirect_to:
+            current_url = redirect_to
+            continue
+        if last_network_error is not None:
+            return last_network_error
     return _FetchResponse(
         final_url=current_url,
         status=0,
@@ -403,6 +436,58 @@ def _fetch_http(url: str) -> _FetchResponse:
         body=b"",
         error=_error("too_many_redirects", "maximum redirect count exceeded"),
     )
+
+
+def _network_error_message(exc: BaseException) -> str:
+    if isinstance(exc, urllib_error.URLError):
+        return str(exc.reason)
+    return str(exc)
+
+
+def _is_retryable_network_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            socket.timeout,
+            http_client.RemoteDisconnected,
+            ConnectionResetError,
+            ConnectionAbortedError,
+        ),
+    ):
+        return True
+    if isinstance(exc, urllib_error.URLError):
+        reason = exc.reason
+        if isinstance(
+            reason,
+            (
+                TimeoutError,
+                socket.timeout,
+                http_client.RemoteDisconnected,
+                OSError,
+            ),
+        ):
+            return True
+        message = str(reason).lower()
+        return any(
+            marker in message
+            for marker in (
+                "remote end closed",
+                "closed connection",
+                "timed out",
+                "timeout",
+                "temporarily",
+                "temporary",
+                "connection reset",
+                "connection aborted",
+                "network is unreachable",
+            )
+        )
+    return False
+
+
+def _retry_backoff_delay(attempt: int) -> float:
+    return min(3.0, REQUEST_RETRY_BACKOFF_SEC * (3 ** max(0, attempt - 1)))
 
 
 def _fetch_github_repo(
@@ -417,7 +502,7 @@ def _fetch_github_repo(
     all_sections: list[dict[str, Any]] = []
     all_links: list[dict[str, str]] = []
     docs: list[dict[str, str]] = []
-    errors: list[dict[str, str]] = []
+    errors: list[dict[str, Any]] = []
     content_parts: list[str] = []
 
     for path in GITHUB_REPO_FILES:
@@ -430,12 +515,10 @@ def _fetch_github_repo(
                 response = candidate
                 break
             if candidate.error and candidate.status != 404:
-                errors.append(
-                    _error(
-                        candidate.error.get("code", "fetch_failed"),
-                        f"{path}: {candidate.error.get('message', '')}",
-                    )
-                )
+                error = dict(candidate.error)
+                error["message"] = f"{path}: {error.get('message', '')}"
+                error.setdefault("url", raw_url)
+                errors.append(error)
                 break
         if response is None:
             continue
@@ -1005,8 +1088,8 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _error(code: str, message: str) -> dict[str, str]:
-    return {"code": code, "message": message}
+def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
+    return {"code": code, "message": message, **extra}
 
 
 def _json_result(
