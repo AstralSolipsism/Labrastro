@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import queue
+import threading
 import time
 from http import HTTPStatus
 from pathlib import Path
@@ -54,6 +56,11 @@ from labrastro_server.services.agent_runtime.model_bridge import (
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
 from reuleauxcoder.domain.agent_runtime.models import WorkerKind
 from reuleauxcoder.interfaces.events import UIEventKind
+
+
+MODEL_REQUEST_SSE_HEARTBEAT_SEC = 5.0
+MODEL_REQUEST_SSE_QUEUE_MAX_SIZE = 256
+
 
 class RemoteAgentRunRoutes:
     def _handle_agent_run_events_get(self, parsed: Any) -> None:
@@ -322,6 +329,17 @@ class RemoteAgentRunRoutes:
         except AgentRunModelBridgeError as exc:
             self._send_error(exc.status, exc.code, exc.message)
             return
+        self.service.runtime_control_plane.append_executor_event(
+            str(prepared.metadata.get("agent_run_id") or ""),
+            ExecutorEvent.status(
+                "model_request_started",
+                provider_id=prepared.provider_config.id,
+                model=prepared.provider_model,
+            ),
+            request_id=str(prepared.metadata.get("request_id") or ""),
+            worker_id=str(prepared.metadata.get("worker_id") or ""),
+            peer_id=peer_id,
+        )
         self.service.relay_server.registry.update_heartbeat(peer_id)
         if payload.get("stream") is False:
             try:
@@ -336,29 +354,86 @@ class RemoteAgentRunRoutes:
             return
         self._send_sse_headers()
 
-        def write_event(event: str, data: dict[str, Any]) -> None:
-            self._write_sse_event(event, data)
+        stop_event = threading.Event()
+        sse_events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(
+            maxsize=MODEL_REQUEST_SSE_QUEUE_MAX_SIZE
+        )
 
+        def enqueue_event(event: str, data: dict[str, Any]) -> None:
+            if stop_event.is_set():
+                raise BrokenPipeError("model request stream disconnected")
+            try:
+                sse_events.put((event, data), timeout=0.1)
+            except queue.Full as exc:
+                stop_event.set()
+                raise BrokenPipeError("model request stream queue full") from exc
+
+        def enqueue_terminal_event(event: str, data: dict[str, Any]) -> None:
+            if stop_event.is_set():
+                return
+            try:
+                enqueue_event(event, data)
+            except (BrokenPipeError, ConnectionResetError):
+                stop_event.set()
+
+        def run_bridge() -> None:
+            try:
+                response = bridge.execute(
+                    prepared,
+                    on_token=lambda text: enqueue_event("token", {"text": text}),
+                    on_reasoning_token=lambda text: enqueue_event(
+                        "reasoning_token", {"text": text}
+                    ),
+                    on_tool_call_delta=lambda delta: enqueue_event(
+                        "tool_call_delta", dict(delta)
+                    ),
+                )
+                enqueue_terminal_event("done", provider_response_to_dict(response))
+            except (BrokenPipeError, ConnectionResetError):
+                stop_event.set()
+            except AgentRunModelBridgeError as exc:
+                enqueue_terminal_event(
+                    "error",
+                    {"error": exc.code, "message": exc.message},
+                )
+            except Exception as exc:  # pragma: no cover - defensive bridge boundary
+                enqueue_terminal_event(
+                    "error",
+                    {
+                        "error": "provider_request_failed",
+                        "message": str(exc) or "Provider request failed.",
+                    },
+                )
+
+        threading.Thread(
+            target=run_bridge,
+            name="agent-run-model-request",
+            daemon=True,
+        ).start()
         try:
-            response = bridge.execute(
-                prepared,
-                on_token=lambda text: write_event("token", {"text": text}),
-                on_reasoning_token=lambda text: write_event(
-                    "reasoning_token", {"text": text}
-                ),
-                on_tool_call_delta=lambda delta: write_event(
-                    "tool_call_delta", dict(delta)
-                ),
-            )
-            self._write_sse_event("done", provider_response_to_dict(response))
-        except (BrokenPipeError, ConnectionResetError):
-            self.close_connection = True
-        except AgentRunModelBridgeError as exc:
-            self._write_sse_event(
-                "error",
-                {"error": exc.code, "message": exc.message},
-            )
-            self.close_connection = True
+            while True:
+                try:
+                    event, data = sse_events.get(timeout=MODEL_REQUEST_SSE_HEARTBEAT_SEC)
+                except queue.Empty:
+                    try:
+                        self._write_sse_comment("ping")
+                    except (BrokenPipeError, ConnectionResetError):
+                        stop_event.set()
+                        self.close_connection = True
+                        break
+                    continue
+                try:
+                    self._write_sse_event(event, data)
+                except (BrokenPipeError, ConnectionResetError):
+                    stop_event.set()
+                    self.close_connection = True
+                    break
+                if event in {"done", "error"}:
+                    stop_event.set()
+                    self.close_connection = True
+                    break
+        finally:
+            stop_event.set()
 
     def _handle_agent_run_complete(self) -> None:
         payload = self._read_json()

@@ -3122,6 +3122,7 @@ class TestRemoteRelayHTTPService:
                 "peer_token": peer_token,
                 "session_id": "session-capability-1",
                 "client_request_id": "capability-ingest-req-1",
+                "locale": "zh-CN",
                 "source": {
                     "type": "github_repo",
                     "url": "https://github.com/acme/example-tool",
@@ -3148,6 +3149,14 @@ class TestRemoteRelayHTTPService:
             assert retry_body["session_run_id"] == ingest_body["session_run_id"]
             assert retry_body["session_id"] == ingest_body["session_id"]
             session_run_id = ingest_body["session_run_id"]
+            session = service._get_session_run(session_run_id)
+            assert session is not None
+            assert session.locale == "zh-CN"
+            assert any(
+                event.get("type") == "session_run_start"
+                and event.get("payload", {}).get("locale") == "zh-CN"
+                for event in session.events
+            )
             agent_run_id = ""
             deadline = time.time() + 3
             while time.time() < deadline and not agent_run_id:
@@ -3169,6 +3178,7 @@ class TestRemoteRelayHTTPService:
             assert agent_run["metadata"]["session_run_id"] == session_run_id
             assert agent_run["metadata"]["client_request_id"] == "capability-ingest-req-1"
             assert agent_run["metadata"]["workflow"] == "capability_package_ingest"
+            assert agent_run["metadata"]["locale"] == "zh-CN"
             assert "source_bundle" in agent_run["metadata"]
             assert agent_run["metadata"]["model_binding"]["provider"] == "deepseek"
             assert agent_run["metadata"]["model_binding"]["model"] == "deepseek-v4-pro"
@@ -3212,13 +3222,280 @@ class TestRemoteRelayHTTPService:
             assert created_configs[0].id == "deepseek"
             request = seen_requests[0]
             assert request.model == "deepseek-v4-pro"
-            assert request.messages == [{"role": "user", "content": "hello"}]
+            assert request.messages[0]["role"] == "system"
+            assert "Use Simplified Chinese" in request.messages[0]["content"]
+            assert request.messages[1:] == [{"role": "user", "content": "hello"}]
             assert request.max_tokens == 384000
             assert request.temperature == 0.2
             assert request.metadata["agent_run_id"] == agent_run_id
             assert request.metadata["worker_id"] == "worker-1"
             assert request.metadata["sandbox_request_id"] == "sandbox-1"
+            assert request.metadata["locale"] == "zh-CN"
+            assert any(
+                event.type == "status"
+                and event.payload.get("data", {}).get("status") == "model_request_started"
+                for event in control.list_events(agent_run_id)
+            )
         finally:
+            service.stop()
+            relay.stop()
+
+    def test_agent_run_model_request_stream_sends_heartbeat_while_provider_is_idle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeProvider:
+            def chat(self, provider_request):
+                time.sleep(0.12)
+                if provider_request.on_token is not None:
+                    provider_request.on_token("hel")
+                return ProviderResponse(
+                    content="hello",
+                    prompt_tokens=1,
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(
+            "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+            lambda _self, _config: FakeProvider(),
+        )
+        monkeypatch.setattr(
+            "labrastro_server.interfaces.http.remote.routes.agent_runs.MODEL_REQUEST_SSE_HEARTBEAT_SEC",
+            0.03,
+        )
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            control.submit_agent_run(
+                AgentRunRequest(
+                    issue_id="issue-1",
+                    agent_id="capability_packager",
+                    prompt="package repo",
+                    executor="reuleauxcoder",
+                    execution_location="remote_server",
+                    worker_kind="sandbox_worker",
+                    model_request_origin="server",
+                    metadata={
+                        "model_binding": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                            "parameters": {
+                                "max_tokens": 384000,
+                                "temperature": 0.2,
+                            },
+                        }
+                    },
+                ),
+                task_id="task-model-stream",
+            )
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "worker_kind": "sandbox_worker",
+                    "executors": ["reuleauxcoder"],
+                },
+            )
+            claim = claim_body["claim"]
+
+            status, content_type, raw_body, frames = _sse_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/model-request",
+                {
+                    "peer_token": peer_token,
+                    "agent_run_id": "task-model-stream",
+                    "request_id": claim["request_id"],
+                    "worker_id": "worker-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+            assert status == 200
+            assert content_type.startswith("text/event-stream")
+            assert ": ping" in raw_body
+            assert [frame["event"] for frame in frames] == ["token", "done"]
+            assert frames[0]["data"] == {"text": "hel"}
+            assert frames[1]["data"]["content"] == "hello"
+            assert any(
+                event.type == "status"
+                and event.payload.get("data", {}).get("status") == "model_request_started"
+                for event in control.list_events("task-model-stream")
+            )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_agent_run_model_request_stream_stops_callbacks_after_client_disconnect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        callback_stopped = threading.Event()
+
+        class FakeProvider:
+            def chat(self, provider_request):
+                assert provider_request.on_token is not None
+                provider_request.on_token("first")
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    try:
+                        provider_request.on_token("late")
+                    except (BrokenPipeError, ConnectionResetError):
+                        callback_stopped.set()
+                        raise
+                    time.sleep(0.02)
+                return ProviderResponse(
+                    content="late",
+                    prompt_tokens=1,
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(
+            "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+            lambda _self, _config: FakeProvider(),
+        )
+        monkeypatch.setattr(
+            "labrastro_server.interfaces.http.remote.routes.agent_runs.MODEL_REQUEST_SSE_HEARTBEAT_SEC",
+            0.03,
+        )
+        monkeypatch.setattr(
+            "labrastro_server.interfaces.http.remote.routes.agent_runs.MODEL_REQUEST_SSE_QUEUE_MAX_SIZE",
+            2,
+        )
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "providers": {
+                    "items": {
+                        "deepseek": {
+                            "type": "openai_chat",
+                            "api_key": "sk-test",
+                        }
+                    }
+                }
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        sock: socket.socket | None = None
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            control.submit_agent_run(
+                AgentRunRequest(
+                    issue_id="issue-1",
+                    agent_id="capability_packager",
+                    prompt="package repo",
+                    executor="reuleauxcoder",
+                    execution_location="remote_server",
+                    worker_kind="sandbox_worker",
+                    model_request_origin="server",
+                    metadata={
+                        "model_binding": {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                        }
+                    },
+                ),
+                task_id="task-model-disconnect",
+            )
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "worker_kind": "sandbox_worker",
+                    "executors": ["reuleauxcoder"],
+                },
+            )
+            claim = claim_body["claim"]
+            payload = json.dumps(
+                {
+                    "peer_token": peer_token,
+                    "agent_run_id": "task-model-disconnect",
+                    "request_id": claim["request_id"],
+                    "worker_id": "worker-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                }
+            ).encode("utf-8")
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            sock.settimeout(5)
+            sock.sendall(
+                b"POST /remote/agent-runs/model-request HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Accept: text/event-stream\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(payload)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + payload
+            )
+            body = b""
+            while b"event: token" not in body:
+                chunk = sock.recv(1024)
+                assert chunk
+                body += chunk
+            sock.close()
+            sock = None
+
+            assert callback_stopped.wait(3)
+        finally:
+            if sock is not None:
+                sock.close()
             service.stop()
             relay.stop()
 
