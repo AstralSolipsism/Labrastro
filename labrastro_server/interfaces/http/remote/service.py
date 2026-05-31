@@ -512,7 +512,11 @@ class _RemoteSessionRun:
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
         if not _is_replayable_session_run_event(str(event.get("type") or "")):
             return
-        if self.session_id and self.trace_persistence_enabled:
+        if (
+            self.session_id
+            and self.trace_persistence_enabled
+            and self.trace_event_sink is not None
+        ):
             self._flush_pending_trace_events()
             self._persist_trace_event(event)
             return
@@ -525,8 +529,18 @@ class _RemoteSessionRun:
             self.trace_persistence_enabled = True
             self._flush_pending_trace_events()
 
+    def set_trace_event_sink(self, sink: SessionTraceEventSink | None) -> None:
+        with self.cond:
+            self.trace_event_sink = sink
+            if sink is not None and self.trace_persistence_enabled:
+                self._flush_pending_trace_events()
+
     def _flush_pending_trace_events(self) -> None:
-        if not self.session_id or not self._pending_trace_events:
+        if (
+            not self.session_id
+            or self.trace_event_sink is None
+            or not self._pending_trace_events
+        ):
             return
         pending = self._pending_trace_events
         self._pending_trace_events = []
@@ -1368,6 +1382,10 @@ class RemoteRelayHTTPService:
         self, sink: SessionTraceEventSink | None
     ) -> None:
         self.session_trace_event_sink = sink
+        with self._session_runs_lock:
+            sessions = list(self._session_runs.values())
+        for session in sessions:
+            session.set_trace_event_sink(sink)
 
     def _gc_session_runs(self) -> None:
         now = time.time()
