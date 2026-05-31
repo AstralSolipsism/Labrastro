@@ -243,6 +243,7 @@ class AgentLoop:
     def _stream_interruption_payload(response: "LLMResponse") -> dict[str, Any]:
         interruption = dict(response.interruption or {})
         recovery = dict(response.recovery or {})
+        raw_message = str(interruption.get("message") or "").strip()
         return {
             "stream_status": response.stream_status,
             "recoverable": bool(interruption.get("recoverable", True)),
@@ -250,7 +251,9 @@ class AgentLoop:
             "classification": interruption.get("classification"),
             "partial_kind": interruption.get("partial_kind"),
             "retry_action": interruption.get("retry_action"),
-            "message": interruption.get("message") or "provider stream interrupted",
+            "notice_code": "provider_stream_interrupted",
+            "message_key": "provider_stream_interrupted.recovering",
+            "diagnostic_message": raw_message,
             "diagnostic_path": interruption.get("diagnostic_path"),
             "recovery": recovery,
             "recovery_actions": ["continue", "retry"],

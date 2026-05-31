@@ -78,14 +78,13 @@ def _free_port() -> int:
 
 def test_chat_locale_prompt_append_maps_supported_locales() -> None:
     assert _chat_locale_prompt_append("zh-CN") == (
-        "Language: Use Simplified Chinese for all user-visible generated content, "
-        "including assistant replies, progress narration, publicly displayed "
-        "reasoning/thinking summaries, and natural-language fields in generated drafts. "
-        "Keep JSON keys, identifiers, code, commands, paths, URLs, API names, "
-        "and quoted errors unchanged."
+        "语言要求：所有用户可见的生成内容都必须使用简体中文，包括助手回复、"
+        "过程叙述、公开展示的思考摘要，以及生成草案中的自然语言字段。"
+        "JSON key、标识符、代码、命令、路径、URL、API 名称和引用的原始错误"
+        "必须保持原文，不要翻译。"
     )
     assert _chat_locale_prompt_append("zh-Hans").startswith(
-        "Language: Use Simplified Chinese"
+        "语言要求：所有用户可见的生成内容都必须使用简体中文"
     )
     assert _chat_locale_prompt_append("en") == (
         "Language: Use English for all user-visible generated content, "
@@ -108,11 +107,10 @@ def test_runtime_config_with_chat_locale_merges_prompt_without_mutating_source()
     assert config.prompt.system_append == "Use repo conventions."
     assert localized.prompt.system_append == (
         "Use repo conventions.\n\n"
-        "Language: Use Simplified Chinese for all user-visible generated content, "
-        "including assistant replies, progress narration, publicly displayed "
-        "reasoning/thinking summaries, and natural-language fields in generated drafts. "
-        "Keep JSON keys, identifiers, code, commands, paths, URLs, API names, "
-        "and quoted errors unchanged."
+        "语言要求：所有用户可见的生成内容都必须使用简体中文，包括助手回复、"
+        "过程叙述、公开展示的思考摘要，以及生成草案中的自然语言字段。"
+        "JSON key、标识符、代码、命令、路径、URL、API 名称和引用的原始错误"
+        "必须保持原文，不要翻译。"
     )
 
 
@@ -1287,8 +1285,8 @@ class TestRunnerRemoteExec:
             )
 
             assert any(event["type"] == "session_run_end" for event in events)
-            assert "Use Simplified Chinese" in captured["system_append"]
-            assert "publicly displayed reasoning/thinking summaries" in captured["system_append"]
+            assert "所有用户可见的生成内容都必须使用简体中文" in captured["system_append"]
+            assert "公开展示的思考摘要" in captured["system_append"]
         finally:
             runner.cleanup(ctx.agent)
 

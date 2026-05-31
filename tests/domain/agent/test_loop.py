@@ -1,6 +1,7 @@
 ﻿from types import SimpleNamespace
 
 from reuleauxcoder.domain.agent.loop import AgentLoop
+from reuleauxcoder.domain.llm.models import LLMResponse
 from reuleauxcoder.services.prompt.builder import system_prompt
 
 
@@ -144,3 +145,27 @@ def test_system_prompt_includes_taskflow_only_when_workflow_is_active() -> None:
     assert "Active Workflow" not in normal
     assert "taskflow" in taskflow
     assert "taskflow-1" in taskflow
+
+
+def test_stream_interruption_payload_keeps_transport_message_diagnostic_only() -> None:
+    payload = AgentLoop._stream_interruption_payload(
+        LLMResponse(
+            content="partial",
+            stream_status="interrupted",
+            interruption={
+                "recoverable": True,
+                "classification": "text_interrupted",
+                "partial_kind": "text",
+                "retry_action": "continue",
+                "message": "peer closed connection without sending complete message body",
+                "diagnostic_path": "logs/llm-error.json",
+            },
+            recovery={"attempted": True, "action": "continue"},
+        )
+    )
+
+    assert payload["notice_code"] == "provider_stream_interrupted"
+    assert payload["message_key"] == "provider_stream_interrupted.recovering"
+    assert "message" not in payload
+    assert payload["diagnostic_message"] == "peer closed connection without sending complete message body"
+    assert payload["diagnostic_path"] == "logs/llm-error.json"

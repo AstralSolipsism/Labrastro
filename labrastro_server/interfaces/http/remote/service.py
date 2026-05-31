@@ -68,6 +68,7 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     normalize_environment_requirement_kind,
 )
+from reuleauxcoder.domain.session.locale import session_notice_text
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from labrastro_server.interfaces.http.remote.routes.admin import RemoteAdminRoutes
 from labrastro_server.interfaces.http.remote.routes.artifacts import RemoteArtifactRoutes
@@ -117,6 +118,34 @@ _LIVE_EVENT_MAX_CONTENT_CHARS = 1024
 
 def _is_replayable_session_run_event(event_type: str) -> bool:
     return bool(event_type)
+
+
+def _session_event_message_key(event_type: str, payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("message_key") or "").strip()
+    if explicit:
+        return explicit
+    if event_type == "provider_stream_interrupted":
+        return "provider_stream_interrupted.recovering"
+    if (
+        event_type in {"error", "session_run_failed"}
+        and str(payload.get("code") or "").strip() == "capability_package_session_failed"
+    ):
+        return "capability_package.session_failed"
+    return ""
+
+
+def _normalize_session_run_payload(
+    event_type: str,
+    payload: dict[str, Any],
+    locale: str | None,
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    message_key = _session_event_message_key(event_type, normalized)
+    if message_key:
+        normalized.setdefault("message_key", message_key)
+        if not str(normalized.get("message") or "").strip():
+            normalized["message"] = session_notice_text(locale, message_key)
+    return normalized
 
 
 @dataclass
@@ -367,7 +396,11 @@ class _RemoteSessionRun:
         self, event_type: str, payload: dict[str, Any] | None = None
     ) -> int:
         with self.cond:
-            normalized_payload = payload if isinstance(payload, dict) else {}
+            normalized_payload = _normalize_session_run_payload(
+                event_type,
+                payload if isinstance(payload, dict) else {},
+                self.locale,
+            )
             now = time.time()
             if event_type in _COALESCED_SESSION_RUN_EVENTS:
                 return self._append_live_event_locked(event_type, normalized_payload, now)
@@ -393,6 +426,9 @@ class _RemoteSessionRun:
         session_id = payload.get("session_id")
         if isinstance(session_id, str) and session_id:
             self.session_id = session_id
+        locale = payload.get("locale")
+        if event_type == "session_run_start" and isinstance(locale, str) and locale:
+            self.locale = locale
         self._persist_or_queue_trace_event(event)
         self._event_buffer.append(event)
         return seq
