@@ -248,6 +248,16 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 		go r.runtimeHeartbeatLoop(taskCtx, peerToken, workerID, claim.RequestID, req.TaskID, taskCancel)
 		var result agentruntime.RunResult
 		var runErr error
+		eventsForComplete := []agentruntime.Event{}
+		sendLiveRuntimeEvent := func(label string, event agentruntime.Event) {
+			if !shouldForwardRuntimeEvent(event) {
+				return
+			}
+			if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, event); err != nil {
+				log.Printf("agent runtime %s event failed: %v", label, err)
+				eventsForComplete = append(eventsForComplete, event)
+			}
+		}
 		manager, resolved, resolveErr := agentruntime.ResolveRunWithExecEnv(req, claim.RuntimeSnapshot, runtimeRoot, workspaceID)
 		if resolveErr == nil {
 			req = resolved.Request
@@ -260,6 +270,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				runtimeRoot,
 				manager,
 				resolved,
+				sendLiveRuntimeEvent,
 			)
 			req = resolved.Request
 		}
@@ -270,7 +281,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				resolved.Options.AgentRunRequestID = claim.RequestID
 				resolved.Options.AgentRunWorkerID = workerID
 			}
-			if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, agentruntime.Event{
+			sendLiveRuntimeEvent("start", agentruntime.Event{
 				Type: agentruntime.EventStatus,
 				Data: map[string]any{
 					"status":     "running",
@@ -278,9 +289,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 					"workdir":    req.Workdir,
 					"branch":     req.Branch,
 				},
-			}); err != nil {
-				log.Printf("agent runtime start event failed: %v", err)
-			}
+			})
 		}
 		if resolveErr != nil {
 			runErr = resolveErr
@@ -296,11 +305,11 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 					"error":  resolveErr.Error(),
 				},
 			}
+			eventsForComplete = append(eventsForComplete, event)
 			result = agentruntime.RunResult{
 				TaskID: req.TaskID,
 				Status: status,
 				Error:  resolveErr.Error(),
-				Events: []agentruntime.Event{event},
 			}
 		} else {
 			session, startErr := backend.Start(taskCtx, resolved.Request, resolved.Options)
@@ -308,27 +317,20 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				runErr = startErr
 				result = agentruntime.RunResult{TaskID: req.TaskID, Status: "failed", Error: startErr.Error()}
 			} else {
-				streamedEvents := []agentruntime.Event{}
 				pinnedExecutorSessionID := ""
 				for event := range session.Events {
-					streamedEvents = append(streamedEvents, event)
 					if threadID := eventThreadID(event); threadID != "" && threadID != pinnedExecutorSessionID {
 						pinnedExecutorSessionID = threadID
 						if err := r.pinRuntimeSession(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, "", "", "", "", threadID); err != nil {
 							log.Printf("agent runtime executor session pin failed: %v", err)
 						}
 					}
-					if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, event); err != nil {
-						log.Printf("agent runtime event failed: %v", err)
-					}
+					sendLiveRuntimeEvent("stream", event)
 				}
 				select {
 				case result = <-session.Result:
 				default:
 					result = agentruntime.RunResult{TaskID: req.TaskID, Status: "failed", Error: "executor session ended without result"}
-				}
-				if len(result.Events) == 0 && len(streamedEvents) > 0 {
-					result.Events = streamedEvents
 				}
 			}
 		}
@@ -336,13 +338,10 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 		if taskCtx.Err() == nil && result.Status == "completed" && runtimeNeedsWorktree(req.ExecutionLocation) {
 			publish := agentruntime.PublishWorktree(taskCtx, req, agentruntime.PublishOptions{
 				EventSink: func(event agentruntime.Event) {
-					if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, event); err != nil {
-						log.Printf("agent runtime publish event failed: %v", err)
-					}
+					sendLiveRuntimeEvent("publish", event)
 				},
 			})
 			publishArtifacts = append(publishArtifacts, publish.Artifacts...)
-			result.Events = append(result.Events, publish.Events...)
 		}
 		cancelledBeforeStop := taskCtx.Err() == context.Canceled
 		taskCancel()
@@ -353,6 +352,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				result.Error = "execution cancelled"
 			}
 		}
+		result.Events = eventsForComplete
 		completeReq := protocol.AgentRunCompleteRequest{
 			PeerToken: peerToken,
 			RequestID: claim.RequestID,
@@ -442,15 +442,14 @@ func (r *Runner) prepareAgentRunRun(
 	runtimeRoot string,
 	manager *agentruntime.ExecEnvManager,
 	resolved agentruntime.ResolvedRun,
+	sendLiveRuntimeEvent func(string, agentruntime.Event),
 ) (agentruntime.ResolvedRun, error) {
 	req := resolved.Request
 	if runtimeNeedsWorktree(req.ExecutionLocation) {
-		if err := r.sendRuntimeEvent(context.Background(), peerToken, requestID, workerID, req.TaskID, agentruntime.Event{
+		sendLiveRuntimeEvent("preparing", agentruntime.Event{
 			Type: agentruntime.EventStatus,
 			Data: map[string]any{"status": "preparing_worktree"},
-		}); err != nil {
-			log.Printf("agent runtime preparing event failed: %v", err)
-		}
+		})
 		repoURL, err := r.resolveRepoURL(ctx, req, workspaceRoot)
 		if err != nil {
 			return resolved, err
@@ -482,7 +481,7 @@ func (r *Runner) prepareAgentRunRun(
 		if err := r.pinRuntimeSession(context.Background(), peerToken, requestID, workerID, req.TaskID, worktree.Path, worktree.BranchName, worktree.RepoURL, worktree.CachePath, ""); err != nil {
 			log.Printf("agent runtime worktree session pin failed: %v", err)
 		}
-		if err := r.sendRuntimeEvent(context.Background(), peerToken, requestID, workerID, req.TaskID, agentruntime.Event{
+		sendLiveRuntimeEvent("worktree", agentruntime.Event{
 			Type: agentruntime.EventStatus,
 			Data: map[string]any{
 				"status":     "worktree_ready",
@@ -491,9 +490,7 @@ func (r *Runner) prepareAgentRunRun(
 				"repo_url":   worktree.RepoURL,
 				"cache_path": worktree.CachePath,
 			},
-		}); err != nil {
-			log.Printf("agent runtime worktree event failed: %v", err)
-		}
+		})
 		return prepared, nil
 	}
 	return agentruntime.PrepareResolvedRun(manager, resolved, agentruntime.PromptFilesFromMetadata(resolved.Request.Metadata))
@@ -553,6 +550,14 @@ func eventThreadID(event agentruntime.Event) string {
 		}
 	}
 	return ""
+}
+
+func shouldForwardRuntimeEvent(event agentruntime.Event) bool {
+	if event.Type != agentruntime.EventStatus || event.Data == nil {
+		return true
+	}
+	status := strings.TrimSpace(fmt.Sprint(event.Data["status"]))
+	return !strings.EqualFold(status, "session_pinned")
 }
 
 func (r *Runner) pinRuntimeSession(ctx context.Context, peerToken, requestID, workerID, taskID, workdir, branch, repoURL, cachePath, executorSessionID string) error {

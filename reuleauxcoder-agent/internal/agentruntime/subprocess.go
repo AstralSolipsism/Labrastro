@@ -93,15 +93,22 @@ func (b SubprocessBackend) Execute(ctx context.Context, req RunRequest, opts Run
 				Events:            events,
 			}, waitErr
 		}
-		errText := strings.TrimSpace(stderr.Tail())
+		status := "failed"
+		if parser.StatusOverride() != "" {
+			status = parser.StatusOverride()
+		}
+		errText := strings.TrimSpace(parser.ErrorText())
 		if errText == "" {
-			errText = waitErr.Error()
-		} else {
-			errText = withAgentStderr(waitErr.Error(), req.Executor, errText)
+			errText = strings.TrimSpace(stderr.Tail())
+			if errText == "" {
+				errText = waitErr.Error()
+			} else {
+				errText = withAgentStderr(waitErr.Error(), req.Executor, errText)
+			}
 		}
 		return RunResult{
 			TaskID:            req.TaskID,
-			Status:            "failed",
+			Status:            status,
 			Output:            parser.Output(),
 			Error:             errText,
 			ExecutorSessionID: parser.SessionID(),

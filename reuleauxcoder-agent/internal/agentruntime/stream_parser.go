@@ -2,6 +2,7 @@ package agentruntime
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -34,10 +35,47 @@ func (p *streamParser) ParseLine(line string) []Event {
 		return p.parseGemini(line)
 	default:
 		event := normalizeGenericStreamLine(p.provider, line)
+		p.applyGenericEvent(event)
 		if event.Type == EventText {
 			p.output.WriteString(event.Text)
 		}
 		return []Event{event}
+	}
+}
+
+func (p *streamParser) applyGenericEvent(event Event) {
+	if len(event.Data) == 0 {
+		if event.Type == EventError && p.errorText == "" {
+			p.statusOverride = "failed"
+			p.errorText = event.Text
+		}
+		return
+	}
+	if sid := eventStringValue(event.Data, "executor_session_id", "session_id", "thread_id", "threadId"); sid != "" {
+		p.sessionID = sid
+	}
+	switch event.Type {
+	case EventResult:
+		if output := eventStringValue(event.Data, "output", "result"); output != "" {
+			p.output.Reset()
+			p.output.WriteString(output)
+		}
+		status := strings.ToLower(strings.TrimSpace(eventStringValue(event.Data, "status")))
+		if status == "failed" || status == "cancelled" || status == "blocked" || status == "timeout" {
+			p.statusOverride = status
+			p.errorText = eventStringValue(event.Data, "error", "message")
+		}
+	case EventError:
+		p.statusOverride = "failed"
+		if p.errorText == "" {
+			p.errorText = firstNonEmpty(event.Text, eventStringValue(event.Data, "message", "error"))
+		}
+	case EventStatus:
+		status := strings.ToLower(strings.TrimSpace(eventStringValue(event.Data, "status")))
+		if status == "failed" || status == "cancelled" || status == "blocked" || status == "timeout" {
+			p.statusOverride = status
+			p.errorText = eventStringValue(event.Data, "error", "message")
+		}
 	}
 }
 
@@ -299,9 +337,6 @@ func normalizeStreamLine(provider, line string) Event {
 func normalizeGenericStreamLine(provider, line string) Event {
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		if strings.EqualFold(provider, "reuleauxcoder") {
-			return Event{Type: EventText, Text: line, Data: map[string]any{"provider": provider}}
-		}
 		return Event{Type: EventLog, Text: line, Data: map[string]any{"provider": provider}}
 	}
 	if typ, ok := raw["type"].(string); ok {
@@ -315,15 +350,19 @@ func normalizeGenericStreamLine(provider, line string) Event {
 			}
 			return Event{Type: EventText, Data: raw}
 		case "thinking":
-			return Event{Type: EventThinking, Data: raw}
+			return Event{Type: EventThinking, Text: eventStringValue(raw, "text", "message", "content"), Data: raw}
+		case "log":
+			data := eventPayloadData(raw)
+			return Event{Type: EventLog, Text: firstNonEmpty(eventStringValue(raw, "text", "message", "content"), eventStringValue(data, "text", "message", "content")), Data: data}
 		case "tool_use":
-			return Event{Type: EventToolUse, Data: raw}
+			return Event{Type: EventToolUse, Data: eventPayloadData(raw)}
 		case "tool_result":
-			return Event{Type: EventToolResult, Data: raw}
+			data := eventPayloadData(raw)
+			return Event{Type: EventToolResult, Text: firstNonEmpty(eventStringValue(raw, "text", "output", "content"), eventStringValue(data, "output", "text", "content")), Data: data}
 		case "error":
-			return Event{Type: EventError, Data: raw}
+			return Event{Type: EventError, Text: eventStringValue(raw, "text", "message", "error"), Data: raw}
 		case "result":
-			return Event{Type: EventResult, Data: raw}
+			return Event{Type: EventResult, Text: eventStringValue(raw, "output", "result", "text"), Data: raw}
 		}
 	}
 	if text, ok := raw["content"].(string); ok && text != "" {
@@ -333,6 +372,13 @@ func normalizeGenericStreamLine(provider, line string) Event {
 		return Event{Type: EventText, Text: text, Data: raw}
 	}
 	return Event{Type: EventStatus, Data: raw}
+}
+
+func eventPayloadData(raw map[string]any) map[string]any {
+	if data, ok := raw["data"].(map[string]any); ok {
+		return data
+	}
+	return raw
 }
 
 func compactEvents(events []Event) []Event {
@@ -356,6 +402,18 @@ func mustJSONMap(line, provider string) map[string]any {
 	}
 	raw["provider"] = provider
 	return raw
+}
+
+func eventStringValue(data map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := data[key]; ok && value != nil {
+			text := strings.TrimSpace(fmt.Sprint(value))
+			if text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 type claudeStreamMessage struct {

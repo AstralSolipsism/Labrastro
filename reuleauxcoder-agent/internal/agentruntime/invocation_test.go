@@ -28,6 +28,12 @@ func TestMain(m *testing.M) {
 		fmt.Println(`{"type":"text","text":"hello"}`)
 		os.Exit(0)
 	}
+	if os.Getenv("AGENTRUNTIME_HELPER_FAIL_JSONL") == "1" {
+		fmt.Println(`{"type":"status","status":"session_pinned","executor_session_id":"labrastro-agent-run-failed"}`)
+		fmt.Println(`{"type":"error","message":"real structured failure"}`)
+		fmt.Println(`{"type":"result","status":"failed","error":"real structured failure","executor_session_id":"labrastro-agent-run-failed"}`)
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 
@@ -118,15 +124,16 @@ func TestBuildCodexInvocationUsesAppServerTransport(t *testing.T) {
 	}
 }
 
-func TestBuildReuleauxCoderInvocationUsesOneShotPrompt(t *testing.T) {
+func TestBuildReuleauxCoderInvocationUsesHeadlessAgentRun(t *testing.T) {
 	inv, err := BuildInvocation(RunRequest{
-		Executor: "reuleauxcoder",
-		Prompt:   "check environment",
-		Model:    "gpt-5.2",
-		Workdir:  "/tmp/work",
+		Executor:          "reuleauxcoder",
+		Prompt:            "check environment",
+		Model:             "gpt-5.2",
+		Workdir:           "/tmp/work",
+		ExecutorSessionID: "labrastro-agent-run-task-1",
 	}, RunOptions{
 		Command:    "rcoder-dev",
-		CustomArgs: []string{"--prompt", "override", "--config", "/tmp/config.yaml"},
+		CustomArgs: []string{"--prompt", "override", "--config", "/tmp/config.yaml", "--session", "hijack"},
 	})
 	if err != nil {
 		t.Fatalf("BuildInvocation error: %v", err)
@@ -138,11 +145,32 @@ func TestBuildReuleauxCoderInvocationUsesOneShotPrompt(t *testing.T) {
 	if strings.Contains(joined, "override") {
 		t.Fatalf("blocked prompt override leaked: %v", inv.Args)
 	}
-	if !strings.Contains(joined, "--prompt check environment") || !strings.Contains(joined, "--model gpt-5.2") {
-		t.Fatalf("missing rcoder prompt/model args: %v", inv.Args)
+	for _, want := range []string{
+		"--model gpt-5.2",
+		"agent-run",
+		"--prompt check environment",
+		"--session labrastro-agent-run-task-1",
+		"--events jsonl",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s in rcoder args: %v", want, inv.Args)
+		}
 	}
 	if !strings.Contains(joined, "--config /tmp/config.yaml") {
 		t.Fatalf("custom config arg missing: %v", inv.Args)
+	}
+	if strings.Contains(joined, "hijack") {
+		t.Fatalf("blocked session override leaked: %v", inv.Args)
+	}
+}
+
+func TestBuildReuleauxCoderInvocationRequiresExecutorSession(t *testing.T) {
+	_, err := BuildInvocation(RunRequest{
+		Executor: "reuleauxcoder",
+		Prompt:   "check environment",
+	}, RunOptions{})
+	if err == nil || !strings.Contains(err.Error(), "executor_session_id is required") {
+		t.Fatalf("expected executor_session_id error, got %v", err)
 	}
 }
 
@@ -152,6 +180,7 @@ func TestBuildReuleauxCoderInvocationUsesServerOriginConfig(t *testing.T) {
 		Executor:           "reuleauxcoder",
 		Prompt:             "package repo",
 		Model:              "deepseek-v4-pro",
+		ExecutorSessionID:  "labrastro-agent-run-run-1",
 		ModelRequestOrigin: "server",
 		Metadata: map[string]any{
 			"model_binding": map[string]any{
@@ -205,7 +234,7 @@ func TestBuildReuleauxCoderInvocationUsesServerOriginConfig(t *testing.T) {
 		t.Fatalf("generated config leaked secret material:\n%s", config)
 	}
 	joined := strings.Join(inv.Args, " ")
-	if strings.Contains(joined, "/tmp/hijack.yaml") || !strings.Contains(joined, "--debug") {
+	if strings.Contains(joined, "/tmp/hijack.yaml") || strings.Contains(joined, "--debug") {
 		t.Fatalf("server-origin args not filtered as expected: %v", inv.Args)
 	}
 	if !strings.Contains(joined, "--model agent-run") || strings.Contains(joined, "deepseek-v4-pro") {
@@ -236,6 +265,69 @@ func TestNormalizeStreamLineMapsCommonCLIEvents(t *testing.T) {
 		if got := normalizeStreamLine("claude", tc.line); got.Type != tc.want {
 			t.Fatalf("line %s event type = %s want %s", tc.line, got.Type, tc.want)
 		}
+	}
+}
+
+func TestReuleauxCoderStrictParserTreatsPlainStdoutAsLog(t *testing.T) {
+	got := normalizeStreamLine("reuleauxcoder", "ReuleauxCoder banner")
+	if got.Type != EventLog {
+		t.Fatalf("plain rcoder stdout must be log, got %#v", got)
+	}
+}
+
+func TestReuleauxCoderJSONLLogStaysProcessLog(t *testing.T) {
+	got := normalizeStreamLine("reuleauxcoder", `{"type":"log","text":"loading","data":{"level":"info"}}`)
+	if got.Type != EventLog {
+		t.Fatalf("jsonl log must stay log, got %#v", got)
+	}
+	if got.Text != "loading" {
+		t.Fatalf("log text = %q", got.Text)
+	}
+	if got.Data["level"] != "info" {
+		t.Fatalf("log data = %#v", got.Data)
+	}
+}
+
+func TestReuleauxCoderJSONLToolEventsFlattenPayloadData(t *testing.T) {
+	use := normalizeStreamLine("reuleauxcoder", `{"type":"tool_use","data":{"tool_name":"fetch_capabilities","tool_call_id":"call-1","input":{"url":"https://example.test/repo"}}}`)
+	if use.Type != EventToolUse {
+		t.Fatalf("tool_use type = %s", use.Type)
+	}
+	if use.Data["tool_name"] != "fetch_capabilities" || use.Data["tool_call_id"] != "call-1" {
+		t.Fatalf("tool_use data was not flattened: %#v", use.Data)
+	}
+	if _, nested := use.Data["data"]; nested {
+		t.Fatalf("tool_use data still contains nested data wrapper: %#v", use.Data)
+	}
+
+	result := normalizeStreamLine("reuleauxcoder", `{"type":"tool_result","text":"ok","data":{"tool_name":"fetch_capabilities","tool_call_id":"call-1","output":"ok"}}`)
+	if result.Type != EventToolResult {
+		t.Fatalf("tool_result type = %s", result.Type)
+	}
+	if result.Text != "ok" {
+		t.Fatalf("tool_result text = %q", result.Text)
+	}
+	if result.Data["tool_name"] != "fetch_capabilities" || result.Data["tool_call_id"] != "call-1" {
+		t.Fatalf("tool_result data was not flattened: %#v", result.Data)
+	}
+	if _, nested := result.Data["data"]; nested {
+		t.Fatalf("tool_result data still contains nested data wrapper: %#v", result.Data)
+	}
+}
+
+func TestReuleauxCoderParserExtractsExecutorSessionFromJSONL(t *testing.T) {
+	parser := newStreamParser("reuleauxcoder")
+	events := parser.ParseLine(`{"type":"status","status":"session_pinned","executor_session_id":"labrastro-agent-run-task-1"}`)
+	if parser.SessionID() != "labrastro-agent-run-task-1" {
+		t.Fatalf("session id = %q", parser.SessionID())
+	}
+	if len(events) != 1 || events[0].Type != EventStatus {
+		t.Fatalf("events = %#v", events)
+	}
+	parser.ParseLine(`{"type":"text","text":"hello"}`)
+	parser.ParseLine(`{"type":"result","status":"completed","output":"hello","executor_session_id":"labrastro-agent-run-task-1"}`)
+	if parser.Output() != "hello" {
+		t.Fatalf("output = %q", parser.Output())
 	}
 }
 
@@ -382,7 +474,7 @@ func TestSubprocessBackendStreamsEventsToSink(t *testing.T) {
 	sinkEvents := []Event{}
 	result, err := SubprocessBackend{}.Execute(
 		context.Background(),
-		RunRequest{TaskID: "task-stream", Executor: "reuleauxcoder", Prompt: "ignored"},
+		RunRequest{TaskID: "task-stream", Executor: "reuleauxcoder", Prompt: "ignored", ExecutorSessionID: "labrastro-agent-run-task-stream"},
 		RunOptions{
 			Command: executable,
 			Env:     map[string]string{"AGENTRUNTIME_HELPER_STREAM": "1"},
@@ -402,6 +494,33 @@ func TestSubprocessBackendStreamsEventsToSink(t *testing.T) {
 	}
 	if sinkEvents[0].Type != EventThinking || sinkEvents[1].Type != EventText || sinkEvents[2].Type != EventStatus {
 		t.Fatalf("unexpected sink event order: %#v", sinkEvents)
+	}
+}
+
+func TestSubprocessBackendPrefersStructuredFailureOnNonZeroExit(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := SubprocessBackend{}.Execute(
+		context.Background(),
+		RunRequest{TaskID: "task-failed", Executor: "reuleauxcoder", Prompt: "ignored", ExecutorSessionID: "labrastro-agent-run-failed"},
+		RunOptions{
+			Command: executable,
+			Env:     map[string]string{"AGENTRUNTIME_HELPER_FAIL_JSONL": "1"},
+		},
+	)
+	if err == nil {
+		t.Fatal("expected subprocess exit error")
+	}
+	if result.Status != "failed" || result.Error != "real structured failure" {
+		t.Fatalf("unexpected structured failure result: %#v", result)
+	}
+	if result.ExecutorSessionID != "labrastro-agent-run-failed" {
+		t.Fatalf("executor session id = %q", result.ExecutorSessionID)
+	}
+	if strings.Contains(result.Error, "exit status") {
+		t.Fatalf("exit status leaked over structured error: %q", result.Error)
 	}
 }
 

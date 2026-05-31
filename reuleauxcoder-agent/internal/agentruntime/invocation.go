@@ -56,11 +56,13 @@ var geminiBlockedArgs = map[string]blockedArgMode{
 }
 
 var reuleauxcoderBlockedArgs = map[string]blockedArgMode{
-	"-p":       blockedWithValue,
-	"--prompt": blockedWithValue,
-	"-m":       blockedWithValue,
-	"--model":  blockedWithValue,
-	"--server": blockedStandalone,
+	"-p":        blockedWithValue,
+	"--prompt":  blockedWithValue,
+	"--session": blockedWithValue,
+	"--events":  blockedWithValue,
+	"-m":        blockedWithValue,
+	"--model":   blockedWithValue,
+	"--server":  blockedStandalone,
 }
 
 var reuleauxcoderServerOriginBlockedArgs = withBlockedArgs(
@@ -93,7 +95,11 @@ func BuildInvocation(req RunRequest, opts RunOptions) (Invocation, error) {
 func buildReuleauxCoderInvocation(req RunRequest, opts RunOptions) (Invocation, error) {
 	command := firstNonEmpty(opts.Command, "rcoder")
 	serverOrigin := strings.EqualFold(strings.TrimSpace(req.ModelRequestOrigin), "server")
-	args := []string{"--prompt", req.Prompt}
+	sessionID := strings.TrimSpace(req.ExecutorSessionID)
+	if sessionID == "" {
+		return Invocation{}, fmt.Errorf("executor_session_id is required for ReuleauxCoder AgentRun invocation")
+	}
+	args := []string{}
 	if serverOrigin {
 		args = append(args, "--model", reuleauxcoderServerOriginModelProfile)
 	} else if req.Model != "" {
@@ -103,8 +109,9 @@ func buildReuleauxCoderInvocation(req RunRequest, opts RunOptions) (Invocation, 
 	if serverOrigin {
 		blockedArgs = reuleauxcoderServerOriginBlockedArgs
 	}
-	args = append(args, filterCustomArgs(opts.ExtraArgs, blockedArgs)...)
-	args = append(args, filterCustomArgs(opts.CustomArgs, blockedArgs)...)
+	args = append(args, filterReuleauxCoderAgentRunRootArgs(opts.ExtraArgs, blockedArgs)...)
+	args = append(args, filterReuleauxCoderAgentRunRootArgs(opts.CustomArgs, blockedArgs)...)
+	args = append(args, "agent-run", "--prompt", req.Prompt, "--session", sessionID, "--events", "jsonl")
 	env := cloneEnv(opts.Env)
 	var cleanup func()
 	if serverOrigin {
@@ -142,6 +149,23 @@ func buildReuleauxCoderInvocation(req RunRequest, opts RunOptions) (Invocation, 
 		Transport: "plain_stdout",
 		Cleanup:   cleanup,
 	}, nil
+}
+
+func filterReuleauxCoderAgentRunRootArgs(args []string, blocked map[string]blockedArgMode) []string {
+	filtered := filterCustomArgs(args, blocked)
+	out := make([]string, 0, len(filtered))
+	for i := 0; i < len(filtered); i++ {
+		arg := filtered[i]
+		if arg != "-c" && arg != "--config" {
+			continue
+		}
+		if i+1 >= len(filtered) {
+			continue
+		}
+		out = append(out, arg, filtered[i+1])
+		i++
+	}
+	return out
 }
 
 func withBlockedArgs(base map[string]blockedArgMode, extra map[string]blockedArgMode) map[string]blockedArgMode {

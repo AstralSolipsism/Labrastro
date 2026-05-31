@@ -49,7 +49,15 @@ func TestMain(m *testing.M) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
+		if target := strings.TrimSpace(os.Getenv("RUNNER_HELPER_WRITE_FILE")); target != "" {
+			if err := os.WriteFile(target, []byte("created by helper\n"), 0o644); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+		}
+		fmt.Println(`{"type":"status","status":"session_pinned","executor_session_id":"labrastro-agent-run-run-1"}`)
 		fmt.Println(`{"type":"text","text":"helper ok"}`)
+		fmt.Println(`{"type":"result","status":"completed","output":"helper ok","executor_session_id":"labrastro-agent-run-run-1"}`)
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -334,6 +342,7 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 						WorkerKind:         "sandbox_worker",
 						ModelRequestOrigin: "server",
 						Model:              "deepseek-v4-pro",
+						ExecutorSessionID:  "labrastro-agent-run-run-1",
 						Metadata: map[string]any{
 							"repo_url": repoURL,
 							"model_binding": map[string]any{
@@ -398,6 +407,9 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 	if completeReq.Status != "completed" {
 		t.Fatalf("complete status = %q error = %q", completeReq.Status, completeReq.Error)
 	}
+	if len(completeReq.Events) != 0 {
+		t.Fatalf("streamed runtime events must not be replayed on complete: %#v", completeReq.Events)
+	}
 	if completeReq.TaskID != "run-1" || completeReq.RequestID != "claim-1" || completeReq.WorkerID != "worker-1" {
 		t.Fatalf("complete request identifiers not preserved: %#v", completeReq)
 	}
@@ -433,8 +445,368 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 	if !strings.Contains(joinedArgs, "--model agent-run") || strings.Contains(joinedArgs, "deepseek-v4-pro") {
 		t.Fatalf("server-origin runner args must select generated profile, got: %v", capture.Args)
 	}
+	for _, want := range []string{"agent-run", "--session labrastro-agent-run-run-1", "--events jsonl"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("server-origin runner args missing %s, got: %v", want, capture.Args)
+		}
+	}
 	if strings.Contains(capture.Config, "peer-token") || strings.Contains(capture.Config, "api_key") {
 		t.Fatalf("generated config leaked server credentials:\n%s", capture.Config)
+	}
+}
+
+func TestAgentRunLoopCompletesOnlyFailedLiveEvents(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "helper-capture.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var completed atomic.Bool
+	var failedTextEvents atomic.Int32
+	var forwardedSessionPinned atomic.Bool
+	var sessionPins atomic.Int32
+	var completeReq protocol.AgentRunCompleteRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/remote/agent-runs/claim":
+			if completed.Load() {
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
+				Claim: &protocol.AgentRunClaim{
+					RequestID: "claim-1",
+					WorkerID:  "worker-1",
+					AgentRun:  map[string]any{"id": "run-1"},
+					ExecutorRequest: protocol.ExecutorRequest{
+						TaskID:            "run-1",
+						AgentID:           "capability_packager",
+						Executor:          "reuleauxcoder",
+						Prompt:            "package repo",
+						ExecutionLocation: "local_workspace",
+						RuntimeProfileID:  "capability_packager_local",
+						WorkerKind:        "local_peer",
+						ExecutorSessionID: "labrastro-agent-run-run-1",
+						Metadata: map[string]any{
+							"prompt_files": map[string]any{
+								"AGENTS.md": "Use test conventions.\n",
+							},
+						},
+					},
+					RuntimeSnapshot: map[string]any{
+						"runtime_profiles": map[string]any{
+							"capability_packager_local": map[string]any{
+								"executor":           "reuleauxcoder",
+								"execution_location": "local_workspace",
+								"worker_kind":        "local_peer",
+								"command":            executable,
+								"env": map[string]any{
+									"RUNNER_HELPER_CAPTURE_PATH": capturePath,
+								},
+							},
+						},
+						"agents": map[string]any{
+							"capability_packager": map[string]any{
+								"runtime_profile": "capability_packager_local",
+							},
+						},
+					},
+				},
+			})
+		case "/remote/agent-runs/event":
+			var event protocol.AgentRunEventReport
+			if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
+				t.Errorf("decode event request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if event.Type == "status" && event.Data["status"] == "session_pinned" {
+				forwardedSessionPinned.Store(true)
+			}
+			if event.Type == "text" && event.Text == "helper ok" && failedTextEvents.Add(1) == 1 {
+				http.Error(w, "temporary event failure", http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/remote/agent-runs/session":
+			sessionPins.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
+		case "/remote/agent-runs/heartbeat":
+			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
+		case "/remote/agent-runs/complete":
+			defer cancel()
+			completed.Store(true)
+			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
+				t.Errorf("decode complete request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	runner := New(Config{
+		Host:            server.URL,
+		AgentRun:        true,
+		WorkerKind:      "local_peer",
+		WorkerSessionID: "worker-1",
+	})
+	if err := runner.runAgentRunLoop(ctx, "peer-token", time.Millisecond, root); err != nil {
+		t.Fatalf("runAgentRunLoop error: %v", err)
+	}
+	if completeReq.Status != "completed" {
+		t.Fatalf("complete status = %q error = %q", completeReq.Status, completeReq.Error)
+	}
+	if len(completeReq.Events) != 1 {
+		t.Fatalf("complete events = %#v, want only failed live event", completeReq.Events)
+	}
+	if completeReq.Events[0].Type != "text" || completeReq.Events[0].Text != "helper ok" {
+		t.Fatalf("failed live event not preserved: %#v", completeReq.Events[0])
+	}
+	if forwardedSessionPinned.Load() {
+		t.Fatal("session_pinned status must not be forwarded as a visible runtime event")
+	}
+	if sessionPins.Load() == 0 {
+		t.Fatal("session_pinned status should still pin the executor session")
+	}
+}
+
+func TestAgentRunLoopCompletesFailedPrepareEvents(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "helper-capture.json")
+	repoURL := createRunnerSourceRepo(t, root)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var completed atomic.Bool
+	var failedPrepareEvents atomic.Int32
+	var completeReq protocol.AgentRunCompleteRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/remote/agent-runs/claim":
+			if completed.Load() {
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
+				Claim: &protocol.AgentRunClaim{
+					RequestID: "claim-1",
+					WorkerID:  "worker-1",
+					AgentRun:  map[string]any{"id": "run-1"},
+					ExecutorRequest: protocol.ExecutorRequest{
+						TaskID:             "run-1",
+						AgentID:            "capability_packager",
+						Executor:           "reuleauxcoder",
+						Prompt:             "package repo",
+						ExecutionLocation:  "remote_server",
+						RuntimeProfileID:   "capability_packager_remote",
+						WorkerKind:         "sandbox_worker",
+						ModelRequestOrigin: "local_cli",
+						ExecutorSessionID:  "labrastro-agent-run-run-1",
+						Metadata: map[string]any{
+							"repo_url":   repoURL,
+							"pr_enabled": false,
+							"prompt_files": map[string]any{
+								"AGENTS.md": "Use test conventions.\n",
+							},
+						},
+					},
+					RuntimeSnapshot: map[string]any{
+						"runtime_profiles": map[string]any{
+							"capability_packager_remote": map[string]any{
+								"executor":             "reuleauxcoder",
+								"execution_location":   "remote_server",
+								"worker_kind":          "sandbox_worker",
+								"model_request_origin": "local_cli",
+								"command":              executable,
+								"env": map[string]any{
+									"RUNNER_HELPER_CAPTURE_PATH": capturePath,
+								},
+							},
+						},
+						"agents": map[string]any{
+							"capability_packager": map[string]any{
+								"runtime_profile": "capability_packager_remote",
+							},
+						},
+					},
+				},
+			})
+		case "/remote/agent-runs/event":
+			var event protocol.AgentRunEventReport
+			if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
+				t.Errorf("decode event request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if event.Type == "status" && event.Data["status"] == "preparing_worktree" && failedPrepareEvents.Add(1) == 1 {
+				http.Error(w, "temporary prepare event failure", http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/remote/agent-runs/heartbeat", "/remote/agent-runs/session":
+			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
+		case "/remote/agent-runs/complete":
+			defer cancel()
+			completed.Store(true)
+			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
+				t.Errorf("decode complete request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	runner := New(Config{
+		Host:            server.URL,
+		AgentRun:        true,
+		WorkerKind:      "sandbox_worker",
+		WorkerSessionID: "worker-1",
+	})
+	if err := runner.runAgentRunLoop(ctx, "peer-token", time.Millisecond, root); err != nil {
+		t.Fatalf("runAgentRunLoop error: %v", err)
+	}
+	if completeReq.Status != "completed" {
+		t.Fatalf("complete status = %q error = %q", completeReq.Status, completeReq.Error)
+	}
+	if len(completeReq.Events) != 1 {
+		t.Fatalf("complete events = %#v, want failed prepare event only", completeReq.Events)
+	}
+	if completeReq.Events[0].Type != "status" || completeReq.Events[0].Data["status"] != "preparing_worktree" {
+		t.Fatalf("failed prepare event not preserved: %#v", completeReq.Events[0])
+	}
+}
+
+func TestAgentRunLoopCompletesFailedPublishEvents(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "helper-capture.json")
+	repoURL := createRunnerSourceRepo(t, root)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var completed atomic.Bool
+	var failedPublishEvents atomic.Int32
+	var completeReq protocol.AgentRunCompleteRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/remote/agent-runs/claim":
+			if completed.Load() {
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
+				Claim: &protocol.AgentRunClaim{
+					RequestID: "claim-1",
+					WorkerID:  "worker-1",
+					AgentRun:  map[string]any{"id": "run-1"},
+					ExecutorRequest: protocol.ExecutorRequest{
+						TaskID:             "run-1",
+						AgentID:            "capability_packager",
+						Executor:           "reuleauxcoder",
+						Prompt:             "package repo",
+						ExecutionLocation:  "remote_server",
+						RuntimeProfileID:   "capability_packager_remote",
+						WorkerKind:         "sandbox_worker",
+						ModelRequestOrigin: "local_cli",
+						ExecutorSessionID:  "labrastro-agent-run-run-1",
+						Metadata: map[string]any{
+							"repo_url":   repoURL,
+							"pr_enabled": false,
+							"prompt_files": map[string]any{
+								"AGENTS.md": "Use test conventions.\n",
+							},
+						},
+					},
+					RuntimeSnapshot: map[string]any{
+						"runtime_profiles": map[string]any{
+							"capability_packager_remote": map[string]any{
+								"executor":             "reuleauxcoder",
+								"execution_location":   "remote_server",
+								"worker_kind":          "sandbox_worker",
+								"model_request_origin": "local_cli",
+								"command":              executable,
+								"env": map[string]any{
+									"RUNNER_HELPER_CAPTURE_PATH": capturePath,
+									"RUNNER_HELPER_WRITE_FILE":   "agent-output.txt",
+								},
+							},
+						},
+						"agents": map[string]any{
+							"capability_packager": map[string]any{
+								"runtime_profile": "capability_packager_remote",
+							},
+						},
+					},
+				},
+			})
+		case "/remote/agent-runs/event":
+			var event protocol.AgentRunEventReport
+			if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
+				t.Errorf("decode event request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if event.Type == "status" && event.Data["status"] == "branch_pushed" && failedPublishEvents.Add(1) == 1 {
+				http.Error(w, "temporary publish event failure", http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/remote/agent-runs/heartbeat", "/remote/agent-runs/session":
+			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
+		case "/remote/agent-runs/complete":
+			defer cancel()
+			completed.Store(true)
+			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
+				t.Errorf("decode complete request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	runner := New(Config{
+		Host:            server.URL,
+		AgentRun:        true,
+		WorkerKind:      "sandbox_worker",
+		WorkerSessionID: "worker-1",
+	})
+	if err := runner.runAgentRunLoop(ctx, "peer-token", time.Millisecond, root); err != nil {
+		t.Fatalf("runAgentRunLoop error: %v", err)
+	}
+	if completeReq.Status != "completed" {
+		t.Fatalf("complete status = %q error = %q", completeReq.Status, completeReq.Error)
+	}
+	if len(completeReq.Events) != 1 {
+		t.Fatalf("complete events = %#v, want failed publish event only", completeReq.Events)
+	}
+	if completeReq.Events[0].Type != "status" || completeReq.Events[0].Data["status"] != "branch_pushed" {
+		t.Fatalf("failed publish event not preserved: %#v", completeReq.Events[0])
 	}
 }
 
