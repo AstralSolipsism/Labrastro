@@ -156,8 +156,8 @@ def test_model_bridge_injects_locale_instruction_from_agent_run_metadata(monkeyp
 
     request = provider.requests[0]
     assert request.messages[0]["role"] == "system"
-    assert "Use Simplified Chinese" in request.messages[0]["content"]
-    assert "natural-language fields in generated drafts" in request.messages[0]["content"]
+    assert "所有用户可见的生成内容都必须使用简体中文" in request.messages[0]["content"]
+    assert "生成草案中的自然语言字段" in request.messages[0]["content"]
     assert request.messages[1:] == [{"role": "user", "content": "hi"}]
     assert request.metadata["locale"] == "zh-CN"
 

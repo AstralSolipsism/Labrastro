@@ -56,13 +56,54 @@ from labrastro_server.services.agent_runtime.model_bridge import (
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
 from reuleauxcoder.domain.agent_runtime.models import WorkerKind
 from reuleauxcoder.interfaces.events import UIEventKind
+from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 
 
 MODEL_REQUEST_SSE_HEARTBEAT_SEC = 5.0
 MODEL_REQUEST_SSE_QUEUE_MAX_SIZE = 256
 
 
+def _agent_run_model_interrupted_payload(
+    exc: ProviderStreamInterruptedError,
+) -> dict[str, Any]:
+    diagnostic = exc.original_error if exc.original_error is not None else exc
+    partial = provider_response_to_dict(exc.partial_response)
+    return {
+        **partial,
+        "error": "provider_stream_interrupted",
+        "message": "Provider stream interrupted.",
+        "message_key": "provider_stream_interrupted.recovering",
+        "notice_code": "provider_stream_interrupted",
+        "interruption": dict(exc.interruption),
+        "stream_status": "interrupted",
+        "diagnostic_error_type": type(diagnostic).__name__,
+        "diagnostic_message": str(diagnostic),
+    }
+
+
+def _agent_run_model_error_payload(exc: AgentRunModelBridgeError) -> dict[str, Any]:
+    return {"error": exc.code, "message": exc.message}
+
+
+def _agent_run_model_unhandled_error_payload(exc: Exception) -> dict[str, Any]:
+    return {
+        "error": "provider_request_failed",
+        "message": "Provider request failed.",
+        "diagnostic_error_type": type(exc).__name__,
+        "diagnostic_message": str(exc),
+    }
+
+
 class RemoteAgentRunRoutes:
+    def _send_agent_run_model_sse_headers(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Request-ID", self._request_id())
+        self.end_headers()
+
     def _handle_agent_run_events_get(self, parsed: Any) -> None:
         peer_id = self._verify_query_peer(parsed)
         if peer_id is None:
@@ -344,6 +385,17 @@ class RemoteAgentRunRoutes:
         if payload.get("stream") is False:
             try:
                 response = bridge.execute(prepared)
+            except ProviderStreamInterruptedError as exc:
+                interrupted = _agent_run_model_interrupted_payload(exc)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": False,
+                        **interrupted,
+                        "response": provider_response_to_dict(exc.partial_response),
+                    },
+                )
+                return
             except AgentRunModelBridgeError as exc:
                 self._send_error(exc.status, exc.code, exc.message)
                 return
@@ -352,7 +404,7 @@ class RemoteAgentRunRoutes:
                 {"ok": True, "response": provider_response_to_dict(response)},
             )
             return
-        self._send_sse_headers()
+        self._send_agent_run_model_sse_headers()
 
         stop_event = threading.Event()
         sse_events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(
@@ -391,18 +443,20 @@ class RemoteAgentRunRoutes:
                 enqueue_terminal_event("done", provider_response_to_dict(response))
             except (BrokenPipeError, ConnectionResetError):
                 stop_event.set()
+            except ProviderStreamInterruptedError as exc:
+                enqueue_terminal_event(
+                    "interrupted",
+                    _agent_run_model_interrupted_payload(exc),
+                )
             except AgentRunModelBridgeError as exc:
                 enqueue_terminal_event(
                     "error",
-                    {"error": exc.code, "message": exc.message},
+                    _agent_run_model_error_payload(exc),
                 )
             except Exception as exc:  # pragma: no cover - defensive bridge boundary
                 enqueue_terminal_event(
                     "error",
-                    {
-                        "error": "provider_request_failed",
-                        "message": str(exc) or "Provider request failed.",
-                    },
+                    _agent_run_model_unhandled_error_payload(exc),
                 )
 
         threading.Thread(
@@ -416,7 +470,7 @@ class RemoteAgentRunRoutes:
                     event, data = sse_events.get(timeout=MODEL_REQUEST_SSE_HEARTBEAT_SEC)
                 except queue.Empty:
                     try:
-                        self._write_sse_comment("ping")
+                        self._write_sse_event("heartbeat", {"status": "alive"})
                     except (BrokenPipeError, ConnectionResetError):
                         stop_event.set()
                         self.close_connection = True
@@ -428,7 +482,7 @@ class RemoteAgentRunRoutes:
                     stop_event.set()
                     self.close_connection = True
                     break
-                if event in {"done", "error"}:
+                if event in {"done", "error", "interrupted"}:
                     stop_event.set()
                     self.close_connection = True
                     break

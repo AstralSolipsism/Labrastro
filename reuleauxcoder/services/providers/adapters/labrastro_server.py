@@ -15,6 +15,10 @@ from reuleauxcoder.domain.providers.models import (
     ProviderRequest,
     ProviderResponse,
 )
+from reuleauxcoder.services.providers.stream_supervisor import (
+    ProviderStreamInterruptedError,
+    StreamSupervisor,
+)
 
 
 class LabrastroServerProvider:
@@ -43,6 +47,7 @@ class LabrastroServerProvider:
         }
 
     def chat(self, request: ProviderRequest) -> ProviderResponse:
+        request_params = self.build_request_params(request)
         payload = {
             "peer_token": self.peer_token,
             "agent_run_id": self.agent_run_id,
@@ -62,34 +67,101 @@ class LabrastroServerProvider:
             "stream": True,
         }
         url = f"{self.base_url}/remote/agent-runs/model-request"
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_delta_seen = False
+
+        def partial_response() -> ProviderResponse:
+            extra: dict[str, Any] = {}
+            if tool_delta_seen:
+                extra["stream_partial"] = {"has_tool_delta": True}
+            return ProviderResponse(
+                content="".join(content_parts),
+                reasoning_content="".join(reasoning_parts) or None,
+                tokens=list(content_parts),
+                provider_extra=extra,
+            )
+
         with self.client.stream("POST", url, json=payload) as response:
             if response.status_code >= 400:
                 raise RuntimeError(_response_error(response))
             final: ProviderResponse | None = None
-            for event, data in _iter_sse_events(response):
+            server_error: RuntimeError | None = None
+            supervisor = StreamSupervisor(
+                provider_id=self.config.id,
+                provider_type=self.config.type,
+                params=request_params,
+                partial_response_factory=partial_response,
+            )
+
+            def decode_event(_index: int, item: tuple[str, str]) -> None:
+                nonlocal final, server_error, tool_delta_seen
+                event, data = item
+                if event == "heartbeat":
+                    return
                 if event == "token":
                     text = str(_json_data(data).get("text") or "")
+                    if text:
+                        content_parts.append(text)
                     if text and request.on_token is not None:
                         request.on_token(text)
-                    continue
+                    return
                 if event == "reasoning_token":
                     text = str(_json_data(data).get("text") or "")
+                    if text:
+                        reasoning_parts.append(text)
                     if text and request.on_reasoning_token is not None:
                         request.on_reasoning_token(text)
-                    continue
+                    return
                 if event == "tool_call_delta":
                     delta = _json_data(data)
+                    tool_delta_seen = True
                     if request.on_tool_call_delta is not None:
                         request.on_tool_call_delta(delta)
-                    continue
+                    return
                 if event == "done":
                     final = _provider_response_from_dict(_json_data(data))
-                    continue
+                    return
+                if event == "interrupted":
+                    interrupted = _json_data(data)
+                    raise _provider_stream_interrupted(interrupted, partial_response())
                 if event == "error":
                     error = _json_data(data)
-                    raise RuntimeError(str(error.get("message") or error.get("error") or "provider_request_failed"))
+                    server_error = RuntimeError(
+                        str(error.get("message") or error.get("error") or "provider_request_failed")
+                    )
+                    return
+                server_error = RuntimeError(f"unexpected labrastro_server model event: {event}")
+
+            supervisor.consume(_iter_sse_events(response), decode_event)
+            if server_error is not None:
+                raise server_error
             if final is None:
-                raise RuntimeError("labrastro_server provider stream ended without final response")
+                message = "labrastro_server provider stream ended without final response"
+                partial = partial_response()
+                interruption = {
+                    "phase": "stream_complete",
+                    "classification": "empty_interrupted" if not partial.content and not partial.reasoning_content else "text_interrupted",
+                    "recoverable": True,
+                    "partial_kind": "text" if partial.content else ("reasoning" if partial.reasoning_content else "empty"),
+                    "retry_action": "continue" if partial.content or partial.reasoning_content else "retry",
+                    "error_type": "StreamEndedWithoutFinalResponse",
+                    "message": message,
+                }
+                partial.stream_status = "interrupted"
+                partial.interruption = interruption
+                partial.recovery = {
+                    "attempted": False,
+                    "action": interruption["retry_action"],
+                    "attempt": 0,
+                    "max_attempts": 1,
+                }
+                raise ProviderStreamInterruptedError(
+                    message,
+                    original_error=RuntimeError(message),
+                    partial_response=partial,
+                    interruption=interruption,
+                )
             return final
 
     def test(self, *, model: str, prompt: str = "ping") -> ProviderResponse:
@@ -224,6 +296,66 @@ def _provider_response_from_dict(data: dict[str, Any]) -> ProviderResponse:
         recovery=dict(data.get("recovery"))
         if isinstance(data.get("recovery"), dict)
         else None,
+    )
+
+
+def _provider_stream_interrupted(
+    data: dict[str, Any],
+    fallback_partial: ProviderResponse,
+) -> ProviderStreamInterruptedError:
+    partial_data = data.get("partial_response")
+    partial = (
+        _provider_response_from_dict(partial_data)
+        if isinstance(partial_data, dict)
+        else _provider_response_from_dict(data)
+    )
+    if not (
+        partial.content
+        or partial.reasoning_content
+        or partial.tool_calls
+        or partial.prompt_tokens
+        or partial.completion_tokens
+        or partial.provider_extra
+    ):
+        partial = fallback_partial
+    interruption = (
+        dict(data.get("interruption"))
+        if isinstance(data.get("interruption"), dict)
+        else dict(partial.interruption or {})
+    )
+    message = str(
+        data.get("message")
+        or data.get("error")
+        or interruption.get("message")
+        or "Provider stream interrupted."
+    )
+    if not interruption:
+        interruption = {
+            "phase": "stream_iterate",
+            "classification": "text_interrupted" if partial.content else "empty_interrupted",
+            "recoverable": True,
+            "partial_kind": "text" if partial.content else "empty",
+            "retry_action": "continue" if partial.content else "retry",
+            "error_type": "RemoteStreamInterrupted",
+            "message": message,
+        }
+    partial.stream_status = "interrupted"
+    partial.interruption = interruption
+    partial.recovery = (
+        dict(data.get("recovery"))
+        if isinstance(data.get("recovery"), dict)
+        else {
+            "attempted": False,
+            "action": interruption.get("retry_action") or "retry",
+            "attempt": 0,
+            "max_attempts": 1,
+        }
+    )
+    return ProviderStreamInterruptedError(
+        message,
+        original_error=RuntimeError(message),
+        partial_response=partial,
+        interruption=interruption,
     )
 
 

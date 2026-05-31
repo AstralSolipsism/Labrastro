@@ -16,6 +16,7 @@ from reuleauxcoder.domain.session.locale import (
     session_locale_prompt_append,
 )
 from reuleauxcoder.services.providers.manager import ProviderManager
+from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 
 
 TERMINAL_STATUSES = {
@@ -197,12 +198,21 @@ class AgentRunModelBridge:
                     metadata=prepared.metadata,
                 )
             )
+        except ProviderStreamInterruptedError:
+            raise
         except (BrokenPipeError, ConnectionResetError):
             raise
         except Exception as exc:
+            LOGGER.exception(
+                "agent_run_model_request provider failed agent_run_id=%s request_id=%s provider=%s model=%s",
+                prepared.metadata.get("agent_run_id"),
+                prepared.metadata.get("request_id"),
+                prepared.provider_config.id,
+                prepared.provider_model,
+            )
             raise AgentRunModelBridgeError(
                 "provider_request_failed",
-                str(exc) or "Provider request failed.",
+                "Provider request failed.",
                 HTTPStatus.BAD_GATEWAY,
             ) from exc
 

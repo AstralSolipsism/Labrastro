@@ -188,6 +188,106 @@ def test_labrastro_server_provider_streams_through_agent_run_bridge(monkeypatch)
     assert call["json"]["parameters"]["max_tokens"] == 384000
 
 
+def test_labrastro_server_provider_converts_transport_drop_to_stream_interruption(monkeypatch) -> None:
+    monkeypatch.setenv("LABRASTRO_REMOTE_BASE_URL", "http://127.0.0.1:8765/")
+    monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
+
+    class BrokenStream:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_lines(self):
+            yield "event: token"
+            yield 'data: {"text": "hel"}'
+            yield ""
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+
+    class FakeClient:
+        def stream(self, method, url, json):
+            return BrokenStream()
+
+    provider = LabrastroServerProvider(
+        ProviderConfig(id="labrastro-server", type="labrastro_server")
+    )
+    provider.client = FakeClient()
+    tokens: list[str] = []
+
+    with pytest.raises(ProviderStreamInterruptedError) as exc_info:
+        provider.chat(
+            ProviderRequest(
+                model="agent-run",
+                messages=[{"role": "user", "content": "hi"}],
+                on_token=tokens.append,
+            )
+        )
+
+    assert tokens == ["hel"]
+    interrupted = exc_info.value
+    assert interrupted.partial_response.content == "hel"
+    assert interrupted.partial_response.stream_status == "interrupted"
+    assert interrupted.interruption["recoverable"] is True
+    assert interrupted.interruption["error_type"] == "RemoteProtocolError"
+
+
+def test_labrastro_server_provider_uses_interrupted_sse_terminal_as_stream_interruption(monkeypatch) -> None:
+    monkeypatch.setenv("LABRASTRO_REMOTE_BASE_URL", "http://127.0.0.1:8765/")
+    monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
+
+    class InterruptedStream:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_lines(self):
+            yield "event: token"
+            yield 'data: {"text": "hel"}'
+            yield ""
+            yield "event: interrupted"
+            yield (
+                'data: {"content": "hel", "message": "Provider stream interrupted.", '
+                '"interruption": {"recoverable": true, "retry_action": "continue", '
+                '"partial_kind": "text", "classification": "text_interrupted"}}'
+            )
+            yield ""
+
+    class FakeClient:
+        def stream(self, method, url, json):
+            return InterruptedStream()
+
+    provider = LabrastroServerProvider(
+        ProviderConfig(id="labrastro-server", type="labrastro_server")
+    )
+    provider.client = FakeClient()
+
+    with pytest.raises(ProviderStreamInterruptedError) as exc_info:
+        provider.chat(
+            ProviderRequest(
+                model="agent-run",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+    assert exc_info.value.partial_response.content == "hel"
+    assert exc_info.value.interruption["classification"] == "text_interrupted"
+
+
 def test_labrastro_server_provider_does_not_apply_idle_read_timeout(monkeypatch) -> None:
     monkeypatch.setenv("LABRASTRO_REMOTE_BASE_URL", "http://127.0.0.1:8765/")
     monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
