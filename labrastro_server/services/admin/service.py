@@ -64,6 +64,11 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry, MemorySourceRegistry
+from reuleauxcoder.domain.runtime_footprint import (
+    normalize_runtime_footprint,
+    runtime_footprint_for_skill,
+)
+from reuleauxcoder.extensions.skills.parser import parse_skill_content
 from reuleauxcoder.domain.permission_gateway import (
     PermissionGateway,
     PermissionRequest,
@@ -1856,6 +1861,44 @@ class RemoteAdminConfigManager:
 
     def record_mcp_server(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _mcp_server_payload(payload)
+        mcp_config_payload = _mcp_config_from_payload(item_payload)
+        if mcp_config_payload is not None:
+            try:
+                drafts = parse_mcp_servers_config(mcp_config_payload)
+            except ValueError as exc:
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_mcp_config", "message": str(exc)},
+                    400,
+                )
+            requested_name = str(item_payload.get("name") or payload.get("name") or "").strip()
+            if requested_name:
+                matches = [item for item in drafts if item["name"] == requested_name]
+                if not matches:
+                    return AdminConfigResult(
+                        False,
+                        {
+                            "error": "invalid_mcp_config",
+                            "message": f"mcpServers does not contain '{requested_name}'.",
+                        },
+                        400,
+                    )
+                draft = matches[0]
+            elif len(drafts) == 1:
+                draft = drafts[0]
+            else:
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "mcp_server_name_required",
+                        "message": "mcpServers contains multiple servers; provide name to choose one.",
+                    },
+                    400,
+                )
+            cleaned_payload = _strip_mcp_config_fields(item_payload)
+            if not str(cleaned_payload.get("name") or "").strip():
+                cleaned_payload.pop("name", None)
+            item_payload = {**draft, **cleaned_payload}
         name = str(item_payload.get("name") or payload.get("name") or "").strip()
         if not name:
             return AdminConfigResult(False, {"error": "mcp_server_name_required"}, 400)
@@ -1872,6 +1915,8 @@ class RemoteAdminConfigManager:
                 return locked_error
             merged = {**previous, **item_payload}
             merged.pop("name", None)
+            for raw_field in ("mcp_config", "mcp_json", "mcpServers"):
+                merged.pop(raw_field, None)
             merged["managed_by"] = "user"
             normalized = MCPServerConfig.from_dict(name, merged)
             items[normalized.name] = normalized.to_dict()
@@ -1895,9 +1940,40 @@ class RemoteAdminConfigManager:
 
     def record_skill(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _skill_payload(payload)
-        name = str(item_payload.get("name") or payload.get("name") or "").strip()
+        skill_content = _skill_content_from_payload(item_payload)
+        parsed_skill = None
+        diagnostics = ()
+        if skill_content:
+            parsed_skill, diagnostics = parse_skill_content(
+                skill_content,
+                skill_md_path=Path("__pending__") / "SKILL.md",
+                scope="user",
+                enabled=_bool_field(item_payload, "enabled", True),
+            )
+            if parsed_skill is None:
+                message = "; ".join(item.message for item in diagnostics) or "Invalid SKILL.md content."
+                return AdminConfigResult(
+                    False,
+                    {"error": "invalid_skill_content", "message": message},
+                    400,
+                )
+        name = str(
+            item_payload.get("name")
+            or payload.get("name")
+            or (parsed_skill.name if parsed_skill is not None else "")
+            or ""
+        ).strip()
         if not name:
             return AdminConfigResult(False, {"error": "skill_name_required"}, 400)
+        if parsed_skill is not None and parsed_skill.name != name:
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "invalid_skill_content",
+                    "message": f"SKILL.md name '{parsed_skill.name}' does not match requested skill name '{name}'.",
+                },
+                400,
+            )
 
         with self._lock:
             previous_data = self._load_data()
@@ -1910,11 +1986,58 @@ class RemoteAdminConfigManager:
             if locked_error is not None:
                 return locked_error
             merged = {**previous, **item_payload}
+            merged.pop("skill_content", None)
+            merged.pop("content", None)
             merged["managed_by"] = "user"
+            if parsed_skill is not None:
+                installed_path = self._standalone_skill_install_path(parsed_skill.name)
+                merged["name"] = parsed_skill.name
+                merged["path_hint"] = str(installed_path)
+                if not str(merged.get("source_path") or "").strip():
+                    merged["source_path"] = "pasted SKILL.md"
+                if not str(merged.get("description") or "").strip():
+                    merged["description"] = parsed_skill.description
+                if not str(merged.get("display_name") or "").strip():
+                    merged["display_name"] = parsed_skill.name
+                if not str(merged.get("summary") or "").strip():
+                    merged["summary"] = parsed_skill.description
+            if parsed_skill is not None:
+                try:
+                    previous_skill_file_exists = installed_path.exists()
+                    previous_skill_content = (
+                        installed_path.read_text(encoding="utf-8")
+                        if previous_skill_file_exists
+                        else None
+                    )
+                    installed_path.parent.mkdir(parents=True, exist_ok=True)
+                    installed_path.write_text(skill_content, encoding="utf-8")
+                except OSError as exc:
+                    return AdminConfigResult(
+                        False,
+                        {"error": "skill_content_install_failed", "message": str(exc)},
+                        500,
+                    )
             normalized = SkillRegistrationConfig.from_dict(name, merged)
             items[normalized.name] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
             if reload_error:
+                if parsed_skill is not None:
+                    rollback_error = self._rollback_standalone_skill_write(
+                        installed_path,
+                        existed=previous_skill_file_exists,
+                        previous_content=previous_skill_content,
+                    )
+                    if rollback_error is not None:
+                        return AdminConfigResult(
+                            False,
+                            {
+                                "error": "skill_content_rollback_failed",
+                                "message": rollback_error,
+                                "config_error": reload_error.payload,
+                                "config_status": reload_error.status,
+                            },
+                            500,
+                        )
                 return reload_error
             return AdminConfigResult(
                 True,
@@ -1930,6 +2053,28 @@ class RemoteAdminConfigManager:
                     ),
                 },
             )
+
+    def _standalone_skill_install_path(self, skill_name: str) -> Path:
+        return self.config_path.parent / "skills" / "user" / _slug_path_segment(skill_name) / "SKILL.md"
+
+    def _rollback_standalone_skill_write(
+        self,
+        path: Path,
+        *,
+        existed: bool,
+        previous_content: str | None,
+    ) -> str | None:
+        try:
+            if existed:
+                path.write_text(previous_content or "", encoding="utf-8")
+            else:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError as exc:
+            return str(exc)
+        return None
 
     def delete_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _environment_requirement_payload(payload)
@@ -2890,8 +3035,50 @@ class RemoteAdminConfigManager:
             item = items.get(name)
             if not isinstance(item, dict):
                 continue
-            views.append(self._admin_resource_view(kind, str(name), item))
+            view = self._admin_resource_view(kind, str(name), item)
+            if kind == "skill":
+                view["runtime_footprint"] = self._skill_runtime_footprint(
+                    data,
+                    view,
+                )
+            views.append(view)
         return views
+
+    def _skill_runtime_footprint(
+        self,
+        data: dict[str, Any],
+        view: dict[str, Any],
+    ) -> dict[str, Any]:
+        refs = (
+            [str(item) for item in view.get("environment_requirement_refs") or []]
+            if isinstance(view.get("environment_requirement_refs"), list)
+            else []
+        )
+        if not refs:
+            return (
+                dict(view.get("runtime_footprint"))
+                if isinstance(view.get("runtime_footprint"), dict)
+                else normalize_runtime_footprint({}, default_runs_on="agent_only")
+            )
+        environment = data.get("environment", {})
+        requirement_items = (
+            environment.get("requirements", {})
+            if isinstance(environment, dict)
+            else {}
+        )
+        related_requirements: list[EnvironmentRequirementConfig] = []
+        if isinstance(requirement_items, dict):
+            for ref in refs:
+                raw = requirement_items.get(ref)
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    related_requirements.append(
+                        EnvironmentRequirementConfig.from_dict(ref, raw)
+                    )
+                except ValueError:
+                    continue
+        return runtime_footprint_for_skill(view, related_requirements)
 
     def _normalize_admin_resource_item(
         self, kind: str, name: str, item: dict[str, Any]
@@ -2943,6 +3130,13 @@ class RemoteAdminConfigManager:
             "kind": str(view.get("kind") or kind),
             "entry_type": kind,
             "name": name,
+            "display_name": str(view.get("display_name") or ""),
+            "summary": str(view.get("summary") or view.get("description") or ""),
+            "runtime_footprint": (
+                dict(view.get("runtime_footprint"))
+                if isinstance(view.get("runtime_footprint"), dict)
+                else normalize_runtime_footprint({}, default_runs_on="agent_only")
+            ),
             "alias": str(view.get("alias") or view.get("command") or view.get("path_hint") or name),
             "source": str(view.get("source") or ""),
             "repo_url": repo_url,
@@ -3627,11 +3821,101 @@ def _mcp_server_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
 
 
+def parse_mcp_servers_config(raw: str | dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid MCP JSON: {exc.msg}") from exc
+    elif isinstance(raw, dict):
+        data = raw
+    else:
+        raise ValueError("MCP config must be a JSON object.")
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict) or not servers:
+        raise ValueError("MCP config must contain a non-empty mcpServers object.")
+    drafts: list[dict[str, Any]] = []
+    for name, raw_server in servers.items():
+        if not isinstance(raw_server, dict):
+            raise ValueError(f"mcpServers.{name} must be an object.")
+        command = str(raw_server.get("command") or "").strip()
+        if not command:
+            raise ValueError(f"mcpServers.{name}.command is required.")
+        raw_args = raw_server.get("args", [])
+        raw_env = raw_server.get("env", {})
+        if raw_args is None:
+            raw_args = []
+        if raw_env is None:
+            raw_env = {}
+        if not isinstance(raw_args, list):
+            raise ValueError(f"mcpServers.{name}.args must be an array.")
+        if not isinstance(raw_env, dict):
+            raise ValueError(f"mcpServers.{name}.env must be an object.")
+        draft: dict[str, Any] = {
+            "name": str(name).strip(),
+            "command": command,
+            "args": [str(item) for item in raw_args],
+            "env": {str(key): str(value) for key, value in raw_env.items()},
+        }
+        if raw_server.get("cwd"):
+            draft["cwd"] = str(raw_server["cwd"])
+        if raw_server.get("description"):
+            draft["description"] = str(raw_server["description"])
+        if raw_server.get("display_name"):
+            draft["display_name"] = str(raw_server["display_name"])
+        if raw_server.get("summary"):
+            draft["summary"] = str(raw_server["summary"])
+        if isinstance(raw_server.get("runtime_footprint"), dict):
+            draft["runtime_footprint"] = normalize_runtime_footprint(
+                raw_server["runtime_footprint"],
+                default_runs_on="server",
+            )
+        drafts.append(draft)
+    return drafts
+
+
+def _mcp_config_from_payload(payload: dict[str, Any]) -> str | dict[str, Any] | None:
+    for field_name in ("mcp_config", "mcp_json"):
+        value = payload.get(field_name)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            return value
+    if isinstance(payload.get("mcpServers"), dict):
+        return {"mcpServers": payload["mcpServers"]}
+    return None
+
+
+def _strip_mcp_config_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(payload)
+    for field_name in ("mcp_config", "mcp_json", "mcpServers"):
+        cleaned.pop(field_name, None)
+    return cleaned
+
+
 def _skill_payload(payload: dict[str, Any]) -> dict[str, Any]:
     raw_payload = payload.get("skill")
     if not isinstance(raw_payload, dict):
         raw_payload = payload.get("payload")
     return dict(raw_payload) if isinstance(raw_payload, dict) else dict(payload)
+
+
+def _skill_content_from_payload(payload: dict[str, Any]) -> str:
+    for field_name in ("skill_content", "content"):
+        value = payload.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.replace("\r\n", "\n")
+    return ""
+
+
+def _slug_path_segment(value: str) -> str:
+    cleaned = "".join(
+        char.lower() if char.isalnum() else "-"
+        for char in value.strip()
+    ).strip("-")
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned or "skill"
 
 
 def _payload_string_list(value: Any) -> list[str]:

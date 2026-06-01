@@ -31,6 +31,24 @@ def parse_skill_file(
         )
         return None, tuple(diagnostics)
 
+    return parse_skill_content(
+        raw,
+        skill_md_path=skill_md_path,
+        scope=scope,
+        enabled=enabled,
+    )
+
+
+def parse_skill_content(
+    raw: str,
+    *,
+    skill_md_path: Path,
+    scope: str,
+    enabled: bool = True,
+) -> tuple[Skill | None, tuple[SkillDiagnostic, ...]]:
+    """Parse SKILL.md content into a Skill model."""
+    diagnostics: list[SkillDiagnostic] = []
+
     if not raw.startswith("---"):
         diagnostics.append(
             SkillDiagnostic(
