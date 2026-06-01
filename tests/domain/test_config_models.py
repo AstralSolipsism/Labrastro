@@ -20,6 +20,7 @@
     ProviderConfig,
     ProvidersConfig,
     RemoteExecConfig,
+    SkillRegistrationConfig,
     TOOL_DIAGNOSTICS_CONFIG_FIELDS,
     ToolDiagnosticsConfig,
     infer_provider_compat,
@@ -27,12 +28,22 @@
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentConfig,
     AgentModelConfig,
+    CapabilityComponentConfig,
+    CapabilityPackageConfig,
+)
+from reuleauxcoder.domain.runtime_footprint import (
+    aggregate_runtime_footprint,
+    runtime_footprint_for_environment_requirement,
+    runtime_footprint_for_mcp,
+    runtime_footprint_for_skill,
 )
 
 
 def test_mcp_server_config_roundtrip() -> None:
     config = MCPServerConfig(
         name="demo",
+        display_name="Demo MCP",
+        summary="Search demo resources.",
         command="npx",
         args=["-y", "server"],
         env={"FOO": "bar"},
@@ -41,6 +52,128 @@ def test_mcp_server_config_roundtrip() -> None:
     )
     restored = MCPServerConfig.from_dict("demo", config.to_dict())
     assert restored == config
+    assert restored.runtime_footprint["runs_on"] == "server"
+    assert restored.runtime_footprint["user_message"] == "服务端运行，无需本机安装"
+
+
+def test_runtime_footprint_for_mcp_uses_local_peer_runtime() -> None:
+    config = MCPServerConfig(
+        name="edgeone-pages-mcp-server",
+        command="npx",
+        args=["edgeone-pages-mcp"],
+        runtime_footprint={
+            "runs_on": "local_peer",
+            "install_required_on": ["local_peer"],
+            "config_required_on": ["local_peer"],
+        },
+    )
+
+    footprint = runtime_footprint_for_mcp(config)
+
+    assert footprint == {
+        "runs_on": "local_peer",
+        "install_required_on": ["local_peer"],
+        "config_required_on": ["local_peer"],
+        "user_message": "需要在本机安装/配置",
+    }
+
+
+def test_skill_registration_config_roundtrip_preserves_display_fields() -> None:
+    config = SkillRegistrationConfig(
+        name="code-review",
+        display_name="Code review",
+        summary="Review repository changes before merging.",
+        path_hint="/srv/skills/code-review/SKILL.md",
+        description="Review code changes.",
+        environment_requirement_refs=["envreq:executable:gh"],
+    )
+
+    restored = SkillRegistrationConfig.from_dict("code-review", config.to_dict())
+
+    assert restored == config
+    assert restored.environment_requirement_refs == ["envreq:executable:gh"]
+    assert restored.runtime_footprint == {
+        "runs_on": "agent_only",
+        "install_required_on": [],
+        "config_required_on": [],
+        "user_message": "仅 Agent 指令能力，无需外部进程",
+    }
+
+
+def test_runtime_footprint_aggregates_components() -> None:
+    server_mcp = CapabilityComponentConfig(
+        id="mcp:github",
+        kind="mcp_server",
+        name="github",
+        config={"command": "github-mcp-server"},
+    )
+    local_dependency = CapabilityComponentConfig(
+        id="envreq:executable:gh",
+        kind="environment_requirement",
+        name="gh",
+        config={"kind": "executable", "command": "gh", "placement": "peer"},
+    )
+    skill = CapabilityComponentConfig(
+        id="skill:code-review",
+        kind="skill",
+        name="code-review",
+    )
+
+    aggregate = aggregate_runtime_footprint([
+        server_mcp.runtime_footprint,
+        local_dependency.runtime_footprint,
+        skill.runtime_footprint,
+    ])
+
+    assert runtime_footprint_for_mcp(server_mcp)["runs_on"] == "server"
+    assert runtime_footprint_for_environment_requirement(local_dependency)["runs_on"] == "local_peer"
+    assert runtime_footprint_for_skill(skill)["runs_on"] == "agent_only"
+    assert aggregate == {
+        "runs_on": "both",
+        "install_required_on": ["server", "local_peer"],
+        "config_required_on": ["server", "local_peer"],
+        "user_message": "服务端和本地端都需要配置",
+    }
+
+
+def test_runtime_footprint_for_skill_aggregates_related_requirements() -> None:
+    skill = SkillRegistrationConfig(
+        name="review-with-gh",
+        environment_requirement_refs=["envreq:executable:gh"],
+    )
+    local_dependency = EnvironmentRequirementConfig(
+        id="envreq:executable:gh",
+        kind="executable",
+        name="gh",
+        command="gh",
+        placement="peer",
+    )
+
+    footprint = runtime_footprint_for_skill(skill, [local_dependency])
+
+    assert footprint == {
+        "runs_on": "local_peer",
+        "install_required_on": ["local_peer"],
+        "config_required_on": ["local_peer"],
+        "user_message": "需要在本机安装/配置",
+    }
+
+
+def test_capability_package_config_roundtrip_preserves_runtime_footprint() -> None:
+    package = CapabilityPackageConfig(
+        id="review",
+        components=["mcp:github", "envreq:executable:gh"],
+        runtime_footprint={
+            "runs_on": "both",
+            "install_required_on": ["server", "local_peer"],
+            "config_required_on": ["server", "local_peer"],
+            "user_message": "服务端和本地端都需要配置",
+        },
+    )
+
+    restored = CapabilityPackageConfig.from_dict("review", package.to_dict())
+
+    assert restored == package
 
 
 def test_environment_requirement_config_roundtrip() -> None:
@@ -63,6 +196,12 @@ def test_environment_requirement_config_roundtrip() -> None:
     )
 
     assert restored == config
+    assert restored.runtime_footprint == {
+        "runs_on": "local_peer",
+        "install_required_on": ["local_peer"],
+        "config_required_on": ["local_peer"],
+        "user_message": "需要在本机安装/配置",
+    }
 
 
 def test_environment_requirement_config_defaults_missing_kind_to_runtime() -> None:

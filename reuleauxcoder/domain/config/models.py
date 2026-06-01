@@ -24,6 +24,14 @@ from reuleauxcoder.domain.memory.registry import (
     MemoryProviderRegistry,
     MemorySourceRegistry,
 )
+from reuleauxcoder.domain.runtime_footprint import (
+    normalize_runtime_footprint,
+    runtime_footprint_for_environment_requirement,
+    runtime_footprint_for_mcp,
+    runtime_footprint_for_skill,
+    runs_on_to_environment_placement,
+    runs_on_to_mcp_placement,
+)
 
 
 MCPPlacement = Literal["server", "peer", "both"]
@@ -836,6 +844,9 @@ class MCPServerConfig:
 
     name: str
     command: str
+    display_name: str = ""
+    summary: str = ""
+    runtime_footprint: dict[str, Any] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: Optional[str] = None
@@ -866,10 +877,19 @@ class MCPServerConfig:
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = ""
 
+    def __post_init__(self) -> None:
+        self.runtime_footprint = runtime_footprint_for_mcp(self)
+        self.placement = runs_on_to_mcp_placement(
+            str(self.runtime_footprint.get("runs_on") or "server")
+        )  # type: ignore[assignment]
+
     def to_dict(self) -> dict:
         """Convert to dictionary format for serialization."""
         return {
             "command": self.command,
+            "display_name": self.display_name,
+            "summary": self.summary,
+            "runtime_footprint": dict(self.runtime_footprint),
             "args": self.args,
             "env": self.env,
             "cwd": self.cwd,
@@ -907,7 +927,16 @@ class MCPServerConfig:
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "MCPServerConfig":
         """Create from dictionary format."""
-        raw_placement = str(d.get("placement", "server")).lower()
+        raw_runtime_footprint = d.get("runtime_footprint")
+        if isinstance(raw_runtime_footprint, dict):
+            footprint = normalize_runtime_footprint(
+                raw_runtime_footprint,
+                default_runs_on="server",
+            )
+            raw_placement = runs_on_to_mcp_placement(str(footprint["runs_on"]))
+        else:
+            footprint = {}
+            raw_placement = str(d.get("placement", "server")).lower()
         placement: MCPPlacement
         if raw_placement in {"peer", "both"}:
             placement = raw_placement  # type: ignore[assignment]
@@ -945,6 +974,9 @@ class MCPServerConfig:
         return cls(
             name=name,
             command=str(d.get("command", "")),
+            display_name=str(d.get("display_name", "") or ""),
+            summary=str(d.get("summary", "") or ""),
+            runtime_footprint=footprint,
             args=[str(arg) for arg in raw_args] if isinstance(raw_args, list) else [],
             env=(
                 {str(k): str(v) for k, v in raw_env.items()}
@@ -1106,6 +1138,9 @@ class SkillRegistrationConfig:
 
     name: str
     enabled: bool = True
+    display_name: str = ""
+    summary: str = ""
+    runtime_footprint: dict[str, Any] = field(default_factory=dict)
     path_hint: str = ""
     source_path: str = ""
     description: str = ""
@@ -1116,6 +1151,7 @@ class SkillRegistrationConfig:
     install_prompt: str = ""
     verify_prompt: str = ""
     notes: list[str] = field(default_factory=list)
+    environment_requirement_refs: list[str] = field(default_factory=list)
     credentials: list[str] = field(default_factory=list)
     risk_level: str = ""
     last_action: str = ""
@@ -1123,6 +1159,9 @@ class SkillRegistrationConfig:
     component_id: str = ""
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = "user"
+
+    def __post_init__(self) -> None:
+        self.runtime_footprint = runtime_footprint_for_skill(self)
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any] | None) -> "SkillRegistrationConfig":
@@ -1134,6 +1173,12 @@ class SkillRegistrationConfig:
         return cls(
             name=resolved_name,
             enabled=_bool_config_value(data.get("enabled", True)),
+            display_name=str(data.get("display_name") or ""),
+            summary=str(data.get("summary") or ""),
+            runtime_footprint=normalize_runtime_footprint(
+                data.get("runtime_footprint", {}),
+                default_runs_on="agent_only",
+            ),
             path_hint=str(data.get("path_hint") or data.get("path") or ""),
             source_path=str(data.get("source_path") or ""),
             description=str(data.get("description") or ""),
@@ -1144,6 +1189,9 @@ class SkillRegistrationConfig:
             install_prompt=str(data.get("install_prompt") or ""),
             verify_prompt=str(data.get("verify_prompt") or ""),
             notes=_string_list_config_value(data.get("notes", [])),
+            environment_requirement_refs=_string_list_config_value(
+                data.get("environment_requirement_refs", [])
+            ),
             credentials=_string_list_config_value(data.get("credentials", [])),
             risk_level=str(data.get("risk_level") or ""),
             last_action=str(data.get("last_action") or ""),
@@ -1157,6 +1205,9 @@ class SkillRegistrationConfig:
         return {
             "name": self.name,
             "enabled": self.enabled,
+            "display_name": self.display_name,
+            "summary": self.summary,
+            "runtime_footprint": dict(self.runtime_footprint),
             "path_hint": self.path_hint,
             "source_path": self.source_path,
             "description": self.description,
@@ -1167,6 +1218,7 @@ class SkillRegistrationConfig:
             "install_prompt": self.install_prompt,
             "verify_prompt": self.verify_prompt,
             "notes": list(self.notes),
+            "environment_requirement_refs": list(self.environment_requirement_refs),
             "credentials": list(self.credentials),
             "risk_level": self.risk_level,
             "last_action": self.last_action,
@@ -1986,6 +2038,7 @@ class EnvironmentRequirementConfig:
     name: str
     enabled: bool = True
     placement: EnvironmentPlacement = "peer"
+    runtime_footprint: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     requirements: dict[str, str] = field(default_factory=dict)
     command: str = ""
@@ -2016,6 +2069,12 @@ class EnvironmentRequirementConfig:
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = ""
 
+    def __post_init__(self) -> None:
+        self.runtime_footprint = runtime_footprint_for_environment_requirement(self)
+        self.placement = runs_on_to_environment_placement(
+            str(self.runtime_footprint.get("runs_on") or "local_peer")
+        )  # type: ignore[assignment]
+
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "id": self.id,
@@ -2023,6 +2082,7 @@ class EnvironmentRequirementConfig:
             "name": self.name,
             "enabled": self.enabled,
             "placement": self.placement,
+            "runtime_footprint": dict(self.runtime_footprint),
         }
         if self.tags:
             data["tags"] = list(self.tags)
@@ -2091,7 +2151,18 @@ class EnvironmentRequirementConfig:
         raw_args = d.get("args", [])
         raw_env = d.get("env", {})
         raw_requirement_id = str(d.get("id") or requirement_id)
-        placement = normalize_environment_placement(d.get("placement", "peer"))
+        raw_runtime_footprint = d.get("runtime_footprint")
+        if isinstance(raw_runtime_footprint, dict):
+            footprint = normalize_runtime_footprint(
+                raw_runtime_footprint,
+                default_runs_on="local_peer",
+            )
+            placement = normalize_environment_placement(
+                runs_on_to_environment_placement(str(footprint["runs_on"]))
+            )
+        else:
+            footprint = {}
+            placement = normalize_environment_placement(d.get("placement", "peer"))
         kind = resolve_environment_requirement_kind(
             raw_requirement_id,
             candidates=(
@@ -2117,6 +2188,7 @@ class EnvironmentRequirementConfig:
             name=name,
             enabled=_bool_config_value(d.get("enabled", True)),
             placement=placement,
+            runtime_footprint=footprint,
             tags=(
                 [str(item) for item in raw_tags]
                 if isinstance(raw_tags, list)

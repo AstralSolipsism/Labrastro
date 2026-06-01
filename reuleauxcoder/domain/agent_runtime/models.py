@@ -10,6 +10,11 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     resolve_environment_requirement_kind,
 )
+from reuleauxcoder.domain.runtime_footprint import (
+    aggregate_runtime_footprint,
+    normalize_runtime_footprint,
+    runtime_footprint_for_component,
+)
 
 
 class ExecutorType(str, Enum):
@@ -300,6 +305,9 @@ class CapabilityComponentConfig:
     id: str
     kind: str
     name: str
+    display_name: str = ""
+    summary: str = ""
+    runtime_footprint: dict[str, Any] = field(default_factory=dict)
     description: str = ""
     enabled: bool = True
     package_ids: list[str] = field(default_factory=list)
@@ -312,6 +320,9 @@ class CapabilityComponentConfig:
     execution_policy: str = "inherit"
     registry_path: str = ""
     source_path: str = ""
+
+    def __post_init__(self) -> None:
+        self.runtime_footprint = runtime_footprint_for_component(self)
 
     @classmethod
     def from_dict(
@@ -333,6 +344,13 @@ class CapabilityComponentConfig:
             id=str(component_id),
             kind=kind,
             name=name,
+            display_name=str(data.get("display_name", "") or ""),
+            summary=str(data.get("summary", "") or ""),
+            runtime_footprint=(
+                normalize_runtime_footprint(data.get("runtime_footprint"))
+                if isinstance(data.get("runtime_footprint"), dict)
+                else raw_config.get("runtime_footprint", {})
+            ),
             description=str(data.get("description", "") or ""),
             enabled=bool(data.get("enabled", True)),
             package_ids=_string_list(data.get("package_ids", [])),
@@ -355,6 +373,9 @@ class CapabilityComponentConfig:
         result: dict[str, Any] = {
             "kind": self.kind,
             "name": self.name,
+            "display_name": self.display_name,
+            "summary": self.summary,
+            "runtime_footprint": dict(self.runtime_footprint),
             "description": self.description,
             "enabled": self.enabled,
             "package_ids": list(self.package_ids),
@@ -456,6 +477,17 @@ class CapabilityPackageConfig:
     execution_policy: str = "inherit"
     generated_by: str = "capability_packager"
     notes: list[str] = field(default_factory=list)
+    runtime_footprint: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.runtime_footprint = normalize_runtime_footprint(
+            self.runtime_footprint,
+            default_runs_on=(
+                str(self.runtime_footprint.get("runs_on"))
+                if isinstance(self.runtime_footprint, dict) and self.runtime_footprint.get("runs_on")
+                else "agent_only"
+            ),
+        )
 
     @classmethod
     def from_dict(
@@ -486,6 +518,9 @@ class CapabilityPackageConfig:
             ),
             generated_by=str(data.get("generated_by", "capability_packager") or "capability_packager"),
             notes=_string_list(data.get("notes", [])),
+            runtime_footprint=normalize_runtime_footprint(
+                data.get("runtime_footprint", {}),
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -516,6 +551,7 @@ class CapabilityPackageConfig:
             result["execution_policy"] = self.execution_policy
         if self.notes:
             result["notes"] = list(self.notes)
+        result["runtime_footprint"] = dict(self.runtime_footprint)
         return result
 
 
