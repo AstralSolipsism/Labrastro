@@ -1464,12 +1464,16 @@ class RemoteRelayHTTPService:
                 or runtime_state.get("workflow_mode") == "capability_package_ingest"
             ):
                 session.append_event(
-                    "context_event",
+                    "workflow_step",
                     {
+                        "lane": "process",
+                        "workflow": "capability_package_ingest",
+                        "stage": "prepare",
+                        "status": "warning",
                         "title": "前端连接已断开，能力包任务继续在服务端运行",
                         "message": "前端连接已断开，能力包任务继续在服务端运行",
-                        "phase": "peer_disconnected",
-                        "workflow": "capability_package_ingest",
+                        "summary": "peer_disconnected",
+                        "details": {"phase": "peer_disconnected", "reason": reason},
                         "reason": reason,
                     },
                 )
