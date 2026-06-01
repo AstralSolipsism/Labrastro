@@ -64,17 +64,21 @@ def test_later_session_run_start_keeps_existing_title_summary_and_preview() -> N
     ]
 
 
-def test_capability_package_draft_event_persists_structured_card() -> None:
+def test_workflow_artifact_event_persists_primary_artifact() -> None:
     document = _session_run_start(None, "生成能力包", 1)
     document = apply_session_event(
         document,
         session_id="session-1",
-        event_type="capability_package_draft",
+        event_type="workflow_artifact",
         payload={
+            "workflow": "capability_package_ingest",
+            "artifact_type": "capability_package_draft",
             "title": "能力包草案 review 已生成",
-            "package_id": "review",
-            "draft": {"id": "review", "description": "Review package"},
-            "validation": {"ok": True},
+            "artifact": {
+                "package_id": "review",
+                "description": "Review package",
+                "validation": {"ok": True},
+            },
             "raw_event_refs": [{"agent_run_id": "agent-run-1", "seq": 20, "type": "result"}],
         },
         session_event_seq=2,
@@ -82,10 +86,12 @@ def test_capability_package_draft_event_persists_structured_card() -> None:
     )
 
     part = document["turns"][0]["assistantMessages"][0]["parts"][0]
-    assert part["type"] == "capability_package_draft"
-    assert part["packageId"] == "review"
-    assert part["draft"]["id"] == "review"
-    assert part["validation"]["ok"] is True
+    assert part["type"] == "workflow_artifact"
+    assert part["lane"] == "primary"
+    assert part["workflow"] == "capability_package_ingest"
+    assert part["artifactType"] == "capability_package_draft"
+    assert part["artifact"]["package_id"] == "review"
+    assert part["artifact"]["validation"]["ok"] is True
     assert part["rawEventRefs"] == [{"agent_run_id": "agent-run-1", "seq": 20, "type": "result"}]
 
 

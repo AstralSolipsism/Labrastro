@@ -175,12 +175,50 @@ def apply_session_event(
             "title": _string(payload, "message") or _string(payload, "phase") or "上下文事件",
             "payload": payload,
         }))
-    elif event_type == "capability_package_draft":
-        _append_part(doc, _part("capability-draft", "capability_package_draft", meta, {
-            "title": _string(payload, "title") or "能力包草案",
-            "packageId": _string(payload, "package_id"),
-            "draft": payload.get("draft") if isinstance(payload.get("draft"), dict) else {},
-            "validation": payload.get("validation") if isinstance(payload.get("validation"), dict) else {},
+    elif event_type == "workflow_step":
+        _append_part(doc, _part("workflow-step", "workflow_step", meta, {
+            "lane": "process",
+            "workflow": _string(payload, "workflow") or "workflow",
+            "stage": _string(payload, "stage") or _string(payload, "phase") or "step",
+            "status": _string(payload, "status") or "running",
+            "title": _string(payload, "title") or _string(payload, "message"),
+            "summary": _string(payload, "summary"),
+            "details": payload.get("details") if isinstance(payload.get("details"), dict) else {},
+            "payload": payload,
+        }))
+    elif event_type == "workflow_artifact":
+        _append_part(doc, _part("workflow-artifact", "workflow_artifact", meta, {
+            "lane": "primary",
+            "workflow": _string(payload, "workflow") or "workflow",
+            "artifactType": _string(payload, "artifact_type") or _string(payload, "artifactType") or "artifact",
+            "title": _string(payload, "title") or _string(payload, "message"),
+            "summary": _string(payload, "summary"),
+            "artifact": payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {},
+            "payload": payload,
+        }))
+    elif event_type == "workflow_decision":
+        _append_part(doc, _part("workflow-decision", "workflow_decision", meta, {
+            "lane": "primary",
+            "workflow": _string(payload, "workflow") or "workflow",
+            "decisionType": _string(payload, "decision_type") or _string(payload, "decisionType") or "decision",
+            "status": _string(payload, "status") or "pending",
+            "title": _string(payload, "title") or _string(payload, "intent") or _string(payload, "message"),
+            "summary": _string(payload, "summary") or _string(payload, "content"),
+            "review": payload.get("review") if isinstance(payload.get("review"), dict) else {},
+            "actions": payload.get("actions") if isinstance(payload.get("actions"), list) else [],
+            "approvalId": _string(payload, "approval_id"),
+            "toolCallId": _string(payload, "tool_call_id"),
+            "payload": payload,
+        }))
+    elif event_type == "workflow_result":
+        _append_part(doc, _part("workflow-result", "workflow_result", meta, {
+            "lane": "primary",
+            "workflow": _string(payload, "workflow") or "workflow",
+            "resultType": _string(payload, "result_type") or _string(payload, "resultType"),
+            "status": _string(payload, "status") or "done",
+            "title": _string(payload, "title") or _string(payload, "message"),
+            "summary": _string(payload, "summary"),
+            "result": payload.get("result") if isinstance(payload.get("result"), dict) else {},
             "payload": payload,
         }))
     elif event_type == "view":
@@ -726,6 +764,11 @@ def _apply_tool_or_output_event(
             "approvalResultReason": _string(payload, "reason"),
             "status": "approved" if _string(payload, "decision") == "allow_once" else "denied",
         }, meta)
+        _patch_workflow_decision_part(doc, _tool_call_id(payload), _string(payload, "approval_id"), {
+            "decision": _string(payload, "decision"),
+            "resultReason": _string(payload, "reason"),
+            "status": "approved" if _string(payload, "decision") == "allow_once" else "denied",
+        }, meta)
 
 
 def _append_text_part(
@@ -930,6 +973,33 @@ def _patch_tool_part(
     parts = []
     for part in _list_value(assistant.get("parts")):
         if not isinstance(part, dict) or part.get("type") != "tool":
+            parts.append(part)
+            continue
+        if tool_call_id and part.get("toolCallId") != tool_call_id:
+            parts.append(part)
+            continue
+        if not tool_call_id and approval_id and part.get("approvalId") != approval_id:
+            parts.append(part)
+            continue
+        next_part = {**part, **_defined(patch), **_public_meta(meta)}
+        raw_event_refs = _merge_raw_event_refs(part.get("rawEventRefs"), patch.get("rawEventRefs"), meta.get("rawEventRefs"))
+        if raw_event_refs:
+            next_part["rawEventRefs"] = raw_event_refs
+        parts.append(next_part)
+    assistant["parts"] = parts
+
+
+def _patch_workflow_decision_part(
+    doc: dict[str, Any],
+    tool_call_id: str,
+    approval_id: str,
+    patch: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    assistant = _ensure_assistant_message(doc)
+    parts = []
+    for part in _list_value(assistant.get("parts")):
+        if not isinstance(part, dict) or part.get("type") != "workflow_decision":
             parts.append(part)
             continue
         if tool_call_id and part.get("toolCallId") != tool_call_id:
