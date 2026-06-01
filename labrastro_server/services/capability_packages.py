@@ -47,6 +47,12 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     resolve_environment_requirement_kind,
 )
+from reuleauxcoder.domain.runtime_footprint import (
+    aggregate_runtime_footprint,
+    normalize_runtime_footprint,
+    runtime_footprint_for_skill,
+)
+from reuleauxcoder.extensions.skills.parser import parse_skill_content
 from reuleauxcoder.domain.session.locale import (
     normalize_session_locale,
     session_locale_prompt_append,
@@ -85,6 +91,10 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "approval_components_title": "组件摘要",
         "approval_capabilities": "能力",
         "approval_dependencies": "依赖",
+        "approval_runtime_title": "运行责任",
+        "approval_runtime_summary": "运行责任",
+        "approval_install_required_on": "安装位置",
+        "approval_config_required_on": "配置位置",
         "approval_none": "无",
         "approval_install_plan": "安装计划",
         "approval_intent": "确认安装能力包 {package_id}",
@@ -119,6 +129,10 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "approval_components_title": "Component summary",
         "approval_capabilities": "Capabilities",
         "approval_dependencies": "Dependencies",
+        "approval_runtime_title": "Runtime footprint",
+        "approval_runtime_summary": "Runtime responsibility",
+        "approval_install_required_on": "Install required on",
+        "approval_config_required_on": "Config required on",
         "approval_none": "None",
         "approval_install_plan": "Install plan",
         "approval_intent": "Confirm installing capability package {package_id}",
@@ -135,6 +149,7 @@ _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
     "env",
     "cwd",
     "placement",
+    "runtime_footprint",
     "distribution",
     "environment_requirement_refs",
     "scope",
@@ -546,6 +561,7 @@ class CapabilityPackageInstaller:
             self.component_from_draft(resolved_package_id, item, draft.source.to_dict())
             for item in draft.components
         ]
+        _apply_skill_related_requirement_footprints(component_specs)
         if not component_specs:
             raise CapabilityPackageIngestError(
                 "capability_package_components_required",
@@ -562,6 +578,7 @@ class CapabilityPackageInstaller:
             else {}
         )
         component_ids: list[str] = []
+        installed_component_footprints: list[dict[str, Any]] = []
         for component in component_specs:
             existing_raw = components.get(component.id)
             if isinstance(existing_raw, dict):
@@ -589,6 +606,7 @@ class CapabilityPackageInstaller:
                 )
             components[component.id] = component.to_dict()
             component_ids.append(component.id)
+            installed_component_footprints.append(component.runtime_footprint)
             self.materialize_component(data, component)
 
         package = CapabilityPackageConfig(
@@ -606,6 +624,7 @@ class CapabilityPackageInstaller:
             credentials=draft.credentials,
             risk_level=draft.risk_level,
             notes=draft.notes,
+            runtime_footprint=aggregate_runtime_footprint(installed_component_footprints),
         )
         packages[resolved_package_id] = package.to_dict()
         data["capability_packages"] = packages
@@ -641,6 +660,11 @@ class CapabilityPackageInstaller:
             raise ValueError("component.name is required")
         raw_config = item.get("config")
         config = dict(raw_config) if isinstance(raw_config, dict) else {}
+        skill_metadata = (
+            _skill_metadata_from_content(str(config.get("skill_content") or item.get("skill_content") or item.get("content") or ""))
+            if kind == "skill"
+            else {}
+        )
         if (
             kind == "environment_requirement"
             and "requirements" in item
@@ -692,10 +716,25 @@ class CapabilityPackageInstaller:
         execution_policy = str(item.get("execution_policy") or "inherit").strip().lower()
         if execution_policy not in {"allow", "deny", "require_user", "escalate", "inherit"}:
             execution_policy = "inherit"
+        raw_runtime_footprint = item.get("runtime_footprint")
+        if not isinstance(raw_runtime_footprint, dict):
+            raw_runtime_footprint = config.get("runtime_footprint")
         return CapabilityComponentConfig(
             id=component_id,
             kind=kind,
             name=name,
+            display_name=str(
+                item.get("display_name")
+                or config.get("display_name")
+                or skill_metadata.get("name")
+                or ""
+            ),
+            summary=str(
+                item.get("summary")
+                or config.get("summary")
+                or skill_metadata.get("description")
+                or ""
+            ),
             enabled=_bool_field(item, "enabled", True),
             package_ids=[package_id],
             source=CapabilityPackageConfig.from_dict(
@@ -710,6 +749,11 @@ class CapabilityPackageInstaller:
             execution_policy=execution_policy,
             registry_path=str(item.get("registry_path") or "").strip(),
             source_path=str(item.get("source_path") or "").strip(),
+            runtime_footprint=(
+                normalize_runtime_footprint(raw_runtime_footprint)
+                if isinstance(raw_runtime_footprint, dict) and raw_runtime_footprint
+                else {}
+            ),
         )
 
     def materialize_component(
@@ -722,6 +766,11 @@ class CapabilityPackageInstaller:
         payload["component_id"] = component.id
         payload["package_ids"] = list(component.package_ids)
         payload["managed_by"] = "capability_package"
+        if component.display_name:
+            payload["display_name"] = component.display_name
+        if component.summary:
+            payload["summary"] = component.summary
+        payload["runtime_footprint"] = dict(component.runtime_footprint)
         payload.setdefault("source", component.source.url or component.source.type)
         if component.source.url:
             payload.setdefault("repo_url", component.source.url)
@@ -1848,6 +1897,79 @@ def _public_capability_package_draft(draft: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _apply_skill_related_requirement_footprints(
+    components: list[CapabilityComponentConfig],
+) -> None:
+    requirement_by_id = {
+        component.id: component
+        for component in components
+        if component.kind == "environment_requirement"
+    }
+    for component in components:
+        if component.kind != "skill":
+            continue
+        requirement_refs = _string_values(
+            component.config.get("environment_requirement_refs")
+        )
+        related_requirements = [
+            requirement_by_id[requirement_id]
+            for requirement_id in requirement_refs
+            if requirement_id in requirement_by_id
+        ]
+        if related_requirements:
+            component.runtime_footprint = runtime_footprint_for_skill(
+                component,
+                related_requirements,
+            )
+
+
+def _runtime_footprints_from_draft(
+    package_id: str,
+    draft: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        parsed = CapabilityPackageDraft.from_dict(package_id, draft)
+        installer = CapabilityPackageInstaller()
+        components = [
+            installer.component_from_draft(package_id, item, parsed.source.to_dict())
+            for item in parsed.components
+        ]
+        _apply_skill_related_requirement_footprints(components)
+        return [component.runtime_footprint for component in components]
+    except (CapabilityPackageIngestError, ValueError, TypeError):
+        return [
+            normalize_runtime_footprint(
+                item.get("runtime_footprint")
+                if isinstance(item, dict)
+                else {},
+            )
+            for item in draft.get("components", [])
+            if isinstance(item, dict)
+        ]
+
+
+def _runtime_targets_text(locale: str, targets: Any) -> str:
+    values = _string_values(targets)
+    if not values:
+        return _capability_text(locale, "approval_none")
+    labels = {
+        "server": "Server" if _capability_locale(locale) == "en" else "服务端",
+        "local_peer": "Local client" if _capability_locale(locale) == "en" else "本地端",
+        "peer": "Local client" if _capability_locale(locale) == "en" else "本地端",
+    }
+    return ", ".join(
+        _unique_strings([labels.get(value, value) for value in values])
+    )
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None or value == "":
+        return []
+    return [str(value).strip()]
+
+
 def _capability_install_approval_payload(
     approval_id: str,
     tool_call_id: str,
@@ -1872,6 +1994,9 @@ def _capability_install_approval_payload(
         for item in components
         if str(item.get("kind") or "") not in CAPABILITY_COMPONENT_KINDS
     ]
+    runtime_footprint = aggregate_runtime_footprint(
+        _runtime_footprints_from_draft(package_id, draft)
+    )
     sections = [
         {
             "title": _capability_text(locale, "approval_package_title"),
@@ -1899,6 +2024,32 @@ def _capability_install_approval_payload(
                     "label": _capability_text(locale, "approval_dependencies"),
                     "value": ", ".join(_unique_strings(dependencies))
                     or _capability_text(locale, "approval_none"),
+                },
+            ],
+        },
+        {
+            "title": _capability_text(locale, "approval_runtime_title"),
+            "items": [
+                {
+                    "label": _capability_text(locale, "approval_runtime_summary"),
+                    "value": str(
+                        runtime_footprint.get("user_message")
+                        or _capability_text(locale, "approval_none")
+                    ),
+                },
+                {
+                    "label": _capability_text(locale, "approval_install_required_on"),
+                    "value": _runtime_targets_text(
+                        locale,
+                        runtime_footprint.get("install_required_on"),
+                    ),
+                },
+                {
+                    "label": _capability_text(locale, "approval_config_required_on"),
+                    "value": _runtime_targets_text(
+                        locale,
+                        runtime_footprint.get("config_required_on"),
+                    ),
                 },
             ],
         },
@@ -1984,6 +2135,7 @@ def _render_packager_prompt(
             '  "contributions": {\n'
             '    "skills": [\n'
             '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
+            '"display_name": "Code review", '
             '"source_path": "skills/code-review/SKILL.md", '
             '"summary": "what this skill does"}\n'
             '    ], "mcp_servers": [], "builtin_tools": [],\n'
@@ -2021,6 +2173,7 @@ def _render_packager_prompt(
         '  "contributions": {\n'
         '    "skills": [\n'
         '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
+        '"display_name": "Code review", '
         '"source_path": "skills/code-review/SKILL.md", '
         '"summary": "what this skill does"}\n'
         '    ], "mcp_servers": [], "builtin_tools": [],\n'
@@ -2795,6 +2948,22 @@ def _skill_content_from_payload(payload: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.replace("\r\n", "\n")
     return ""
+
+
+def _skill_metadata_from_content(content: str) -> dict[str, str]:
+    if not content.strip():
+        return {}
+    skill, _diagnostics = parse_skill_content(
+        content.replace("\r\n", "\n"),
+        skill_md_path=Path("SKILL.md"),
+        scope="package",
+    )
+    if skill is None:
+        return {}
+    return {
+        "name": skill.name,
+        "description": skill.description,
+    }
 
 
 def _slug_path_segment(value: str) -> str:

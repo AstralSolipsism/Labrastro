@@ -34,6 +34,7 @@ from labrastro_server.services.capability_packages import (
 )
 from reuleauxcoder.domain.agent_runtime.models import CapabilityComponentConfig
 from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord
+from reuleauxcoder.domain.session.document import apply_session_event
 
 
 def _control_plane() -> AgentRunControlPlane:
@@ -672,6 +673,82 @@ def test_package_installer_infers_executable_requirement_from_command() -> None:
     requirement = data["environment"]["requirements"]["envreq:executable:gh"]
     assert requirement["kind"] == "executable"
     assert requirement["command"] == "gh"
+    assert requirement["runtime_footprint"]["runs_on"] == "local_peer"
+
+
+def test_package_installer_writes_component_and_package_runtime_footprint() -> None:
+    data: dict[str, object] = {}
+    result = CapabilityPackageInstaller().install_draft(
+        data,
+        {
+            "id": "review",
+            "components": [
+                {
+                    "kind": "mcp_server",
+                    "name": "github",
+                    "command": "github-mcp-server",
+                    "runtime_footprint": {
+                        "runs_on": "server",
+                        "install_required_on": ["server"],
+                        "config_required_on": ["server"],
+                    },
+                },
+                {
+                    "kind": "environment_requirement",
+                    "name": "gh",
+                    "command": "gh",
+                    "placement": "peer",
+                },
+            ],
+        },
+    )
+
+    assert result.component_ids == ["mcp_server:github", "envreq:executable:gh"]
+    mcp_component = data["capability_components"]["mcp_server:github"]
+    env_component = data["capability_components"]["envreq:executable:gh"]
+    package = data["capability_packages"]["review"]
+    assert mcp_component["runtime_footprint"]["runs_on"] == "server"
+    assert env_component["runtime_footprint"]["runs_on"] == "local_peer"
+    assert package["runtime_footprint"] == {
+        "runs_on": "both",
+        "install_required_on": ["server", "local_peer"],
+        "config_required_on": ["server", "local_peer"],
+        "user_message": "服务端和本地端都需要配置",
+    }
+
+
+def test_package_installer_aggregates_skill_runtime_from_environment_refs() -> None:
+    data: dict[str, object] = {}
+
+    CapabilityPackageInstaller().install_draft(
+        data,
+        {
+            "id": "review",
+            "components": [
+                {
+                    "kind": "skill",
+                    "name": "code-review",
+                    "skill_content": "---\nname: code-review\ndescription: Review code.\n---\nReview code.\n",
+                    "environment_requirement_refs": ["envreq:executable:gh"],
+                },
+                {
+                    "kind": "environment_requirement",
+                    "name": "gh",
+                    "command": "gh",
+                    "placement": "peer",
+                },
+            ],
+        },
+    )
+
+    component = data["capability_components"]["skill:code-review"]
+    skill = data["skills"]["items"]["code-review"]
+    package = data["capability_packages"]["review"]
+    assert component["runtime_footprint"]["runs_on"] == "local_peer"
+    assert component["config"]["environment_requirement_refs"] == ["envreq:executable:gh"]
+    assert skill["environment_requirement_refs"] == ["envreq:executable:gh"]
+    assert skill["runtime_footprint"]["runs_on"] == "local_peer"
+    assert package["runtime_footprint"]["runs_on"] == "local_peer"
 
 
 def test_package_installer_materializes_skill_to_canonical_server_path(tmp_path) -> None:
@@ -694,6 +771,8 @@ def test_package_installer_materializes_skill_to_canonical_server_path(tmp_path)
                 {
                     "kind": "skill",
                     "name": "code-review",
+                    "display_name": "Code review",
+                    "summary": "Review repository changes before merging.",
                     "description": "Review code changes.",
                     "source_path": "skills/code-review/SKILL.md",
                     "skill_content": skill_content,
@@ -708,9 +787,15 @@ def test_package_installer_materializes_skill_to_canonical_server_path(tmp_path)
     installer.apply_skill_file_operations(result.skill_file_operations)
     assert installed_path.read_text(encoding="utf-8") == skill_content
     skill = data["skills"]["items"]["code-review"]
+    component = data["capability_components"]["skill:code-review"]
+    assert component["display_name"] == "Code review"
+    assert component["summary"] == "Review repository changes before merging."
+    assert skill["display_name"] == "Code review"
+    assert skill["summary"] == "Review repository changes before merging."
     assert skill["path_hint"] == str(installed_path)
     assert skill["source_path"] == "skills/code-review/SKILL.md"
     assert skill["managed_by"] == "capability_package"
+    assert "skill_content" not in skill
 
 
 def test_package_installer_rejects_package_skill_without_installable_content(tmp_path) -> None:
@@ -1300,13 +1385,50 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
 
     control = _control_plane()
     admin = FakeAdminManager()
+    document: dict[str, object] | None = None
+
+    def trace_sink(
+        session_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        nonlocal document
+        document = apply_session_event(
+            document,
+            session_id=session_id,
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=(int(document.get("last_event_seq") or 0) + 1)
+            if isinstance(document, dict)
+            else 1,
+            session_run_id=session_run_id,
+            session_run_seq=session_run_seq,
+        )
+        return int(document.get("last_event_seq") or 0)
+
     session = _RemoteSessionRun(
         session_run_id="session-run-1",
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
         locale="en",
+        trace_event_sink=trace_sink,
     )
+    session.enable_trace_persistence("session-1")
+    session.append_event(
+        "session_run_start",
+        {
+            "prompt": "Create capability package",
+            "mode": "capability_package",
+            "workflow_mode": "capability_package_ingest",
+            "locale": "en",
+        },
+    )
+    session.mark_running()
     service = CapabilityPackageSessionRunService(
         control,
         admin,
@@ -1379,11 +1501,15 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     assert approval["intent"] == "Confirm installing capability package review"
     assert approval["sections"][0]["title"] == "Capability package"
     assert approval["sections"][1]["title"] == "Component summary"
+    assert approval["sections"][2]["title"] == "Runtime footprint"
+    assert approval["sections"][2]["items"][0]["value"] == "需要在本机安装/配置"
+    assert approval["sections"][2]["items"][1]["value"] == "Local client"
     assert any(
         event["type"] == "tool_call_start"
         and event["payload"].get("title") == "Install capability package review"
         for event in session.events
     )
+    session.append_event("reasoning_delta", {"content": "Installing package."})
     session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
     _wait_for(lambda: session.done)
 
@@ -1395,6 +1521,13 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
         event["type"] == "session_run_end"
         and event["payload"].get("response") == "Capability package review installed."
         for event in session.events
+    )
+    assert isinstance(document, dict)
+    assert document["stats"]["runStatus"] == "done"  # type: ignore[index]
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]  # type: ignore[index]
+    assert not any(
+        part.get("type") == "thinking" and part.get("active") is True
+        for part in parts
     )
 
 
