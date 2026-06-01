@@ -26,6 +26,10 @@ _SESSION_NOTICE_TEXT: dict[str, dict[SessionLocale, str]] = {
         "zh-CN": "模型输出流中断，可继续生成。",
         "en": "The model output stream was interrupted. You can continue generation.",
     },
+    "provider_stream.interrupted_prefix": {
+        "zh-CN": "输出中断：",
+        "en": "Output interrupted: ",
+    },
     "capability_package.session_failed": {
         "zh-CN": "能力包流程执行失败。",
         "en": "Capability package workflow failed.",

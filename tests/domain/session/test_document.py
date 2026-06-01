@@ -17,6 +17,29 @@ def _session_run_start(document: dict | None, prompt: str, seq: int) -> dict:
     )
 
 
+def _session_run_event(
+    document: dict,
+    event_type: str,
+    payload: dict,
+    seq: int,
+    *,
+    run_id: str = "run-1",
+) -> dict:
+    return apply_session_event(
+        document,
+        session_id="session-1",
+        event_type=event_type,
+        payload=payload,
+        session_event_seq=seq,
+        session_run_id=run_id,
+        session_run_seq=seq,
+    )
+
+
+def _assistant_parts(document: dict) -> list[dict]:
+    return document["turns"][-1]["assistantMessages"][-1]["parts"]
+
+
 def test_session_run_start_initializes_session_title_summary_and_preview() -> None:
     document = _session_run_start(None, "分析项目会话历史问题", 1)
 
@@ -287,6 +310,96 @@ def test_runtime_projection_contract_keeps_transcript_business_visible() -> None
     assert document["stats"]["runStatus"] == "done"
 
 
+def test_session_run_end_with_response_finalizes_active_transcript_items() -> None:
+    document = _session_run_start(None, "生成能力包", 1)
+    document = _session_run_event(
+        document,
+        "reasoning_delta",
+        {"content": "正在分析能力包。"},
+        2,
+    )
+    document = _session_run_event(
+        document,
+        "assistant_delta",
+        {"content": "安装中"},
+        3,
+    )
+
+    document = _session_run_event(
+        document,
+        "session_run_end",
+        {"response": "能力包已安装。", "response_rendered": False},
+        4,
+    )
+
+    parts = _assistant_parts(document)
+    assert parts[0]["type"] == "thinking"
+    assert parts[0]["active"] is False
+    assert parts[0]["traceNodeStatus"] == "success"
+    assert parts[1]["type"] == "assistant_text"
+    assert parts[1]["markdown"] == "能力包已安装。"
+    assert parts[1]["streaming"] is False
+    assert parts[1]["streamKey"] == "assistant-message"
+    assert document["stats"]["runStatus"] == "done"
+    assert document["run_state"]["status"] == "done"
+    assert document["session"]["state"] == "success"
+
+
+def test_session_run_end_with_only_final_response_marks_text_success() -> None:
+    document = _session_run_start(None, "生成能力包", 1)
+
+    document = _session_run_event(
+        document,
+        "session_run_end",
+        {"response": "能力包已安装。", "response_rendered": False},
+        2,
+    )
+
+    parts = _assistant_parts(document)
+    assert len(parts) == 1
+    assert parts[0]["type"] == "assistant_text"
+    assert parts[0]["markdown"] == "能力包已安装。"
+    assert parts[0]["streaming"] is False
+    assert parts[0]["streamKey"] == "assistant-message"
+    assert parts[0].get("traceNodeStatus") == "success"
+    assert document["stats"]["runStatus"] == "done"
+    assert document["run_state"]["status"] == "done"
+    assert document["session"]["state"] == "success"
+
+
+def test_session_run_end_with_rendered_response_finalizes_active_thinking() -> None:
+    document = _session_run_start(None, "生成能力包", 1)
+    document = _session_run_event(
+        document,
+        "reasoning_delta",
+        {"content": "正在分析能力包。"},
+        2,
+    )
+    document = _session_run_event(
+        document,
+        "assistant_delta",
+        {"content": "能力包已安装。"},
+        3,
+    )
+
+    document = _session_run_event(
+        document,
+        "session_run_end",
+        {"response": "能力包已安装。", "response_rendered": True},
+        4,
+    )
+
+    parts = _assistant_parts(document)
+    assert parts[0]["type"] == "thinking"
+    assert parts[0]["active"] is False
+    assert parts[1]["type"] == "assistant_text"
+    assert parts[1]["markdown"] == "能力包已安装。"
+    assert parts[1]["streaming"] is False
+    assert parts[1]["streamKey"] == "assistant-message"
+    assert document["stats"]["runStatus"] == "done"
+    assert document["session"]["state"] == "success"
+
+
 def test_output_event_preserves_warning_notice_level() -> None:
     document = _session_run_start(None, "生成能力包", 1)
     document = apply_session_event(
@@ -456,6 +569,7 @@ def test_session_run_end_finalizes_existing_stream_without_duplicate_when_respon
             "streamKey": "assistant-message",
             "eventKey": "session:session-1:3",
             "sessionEventSeq": 3,
+            "traceNodeStatus": "success",
         }
     ]
 
@@ -539,6 +653,54 @@ def test_session_run_failed_falls_back_to_localized_capability_message() -> None
     assert document["run_state"]["error"] == "能力包流程执行失败。"
 
 
+def test_session_run_failed_finalizes_active_streams_and_running_tools() -> None:
+    document = _session_run_start(None, "运行测试", 1)
+    document = _session_run_event(document, "reasoning_delta", {"content": "plan"}, 2)
+    document = _session_run_event(document, "assistant_delta", {"content": "partial"}, 3)
+    document = _session_run_event(
+        document,
+        "tool_call_start",
+        {
+            "tool_call_id": "call-running",
+            "tool_name": "shell",
+            "tool_args": {"command": "npm test"},
+        },
+        4,
+    )
+    document = _session_run_event(
+        document,
+        "approval_request",
+        {
+            "approval_id": "approval-1",
+            "tool_call_id": "call-approval",
+            "tool_name": "shell",
+            "reason": "need approval",
+            "tool_args": {"command": "npm publish"},
+        },
+        5,
+    )
+
+    document = _session_run_event(document, "session_run_failed", {"message": "boom"}, 6)
+
+    parts = _assistant_parts(document)
+    thinking = next(part for part in parts if part["type"] == "thinking")
+    assistant_text = next(part for part in parts if part["type"] == "assistant_text")
+    running_tool = next(part for part in parts if part.get("toolCallId") == "call-running")
+    approval_tool = next(part for part in parts if part.get("toolCallId") == "call-approval")
+    assert thinking["active"] is False
+    assert thinking["traceNodeStatus"] == "error"
+    assert assistant_text["streaming"] is False
+    assert assistant_text["streamKey"] == "assistant-message"
+    assert assistant_text["traceNodeStatus"] == "error"
+    assert running_tool["status"] == "error"
+    assert running_tool["traceNodeStatus"] == "error"
+    assert approval_tool["status"] == "denied"
+    assert approval_tool["approvalDecision"] == "deny_once"
+    assert document["stats"]["runStatus"] == "error"
+    assert document["run_state"]["status"] == "error"
+    assert document["session"]["state"] == "error"
+
+
 def test_shell_tool_stream_truncates_like_frontend_and_preserves_visible_output_on_end() -> None:
     document = _session_run_start(None, "运行测试", 1)
     document = apply_session_event(
@@ -596,6 +758,8 @@ def test_shell_tool_stream_truncates_like_frontend_and_preserves_visible_output_
 
 def test_session_run_cancelled_settles_running_tool_and_appends_notice() -> None:
     document = _session_run_start(None, "运行测试", 1)
+    document = _session_run_event(document, "reasoning_delta", {"content": "plan"}, 2)
+    document = _session_run_event(document, "assistant_delta", {"content": "partial"}, 3)
     document = apply_session_event(
         document,
         session_id="session-1",
@@ -605,35 +769,104 @@ def test_session_run_cancelled_settles_running_tool_and_appends_notice() -> None
             "tool_name": "shell",
             "tool_args": {"command": "npm test"},
         },
-        session_event_seq=2,
+        session_event_seq=4,
         session_run_id="run-1",
-        session_run_seq=2,
+        session_run_seq=4,
     )
     document = apply_session_event(
         document,
         session_id="session-1",
         event_type="session_run_cancelled",
         payload={"reason": "user_cancelled"},
-        session_event_seq=3,
+        session_event_seq=5,
         session_run_id="run-1",
-        session_run_seq=3,
+        session_run_seq=5,
     )
 
     parts = document["turns"][0]["assistantMessages"][0]["parts"]
-    assert parts[0]["type"] == "tool"
-    assert parts[0]["status"] == "cancelled"
-    assert parts[0]["traceNodeStatus"] == "cancelled"
-    assert parts[1] == {
-        "id": "cancelled-3",
+    assert parts[0]["type"] == "thinking"
+    assert parts[0]["active"] is False
+    assert parts[1]["type"] == "assistant_text"
+    assert parts[1]["streaming"] is False
+    assert parts[1]["streamKey"] == "assistant-message"
+    assert parts[2]["type"] == "tool"
+    assert parts[2]["status"] == "cancelled"
+    assert parts[2]["traceNodeStatus"] == "cancelled"
+    assert parts[3] == {
+        "id": "cancelled-5",
         "type": "notice",
         "level": "info",
         "text": "已取消当前请求。",
         "format": "plain",
-        "eventKey": "session:session-1:3",
-        "sessionEventSeq": 3,
+        "eventKey": "session:session-1:5",
+        "sessionEventSeq": 5,
         "traceNodeStatus": "cancelled",
     }
     assert document["stats"]["runStatus"] == "cancelled"
+    assert document["run_state"]["status"] == "cancelled"
+    assert document["session"]["state"] == "cancelled"
+
+
+def test_session_run_interrupted_finalizes_active_items_without_failing_session() -> None:
+    document = _session_run_start(None, "继续生成", 1)
+    document = _session_run_event(document, "reasoning_delta", {"content": "plan"}, 2)
+    document = _session_run_event(document, "assistant_delta", {"content": "partial"}, 3)
+    document = _session_run_event(
+        document,
+        "tool_call_start",
+        {
+            "tool_call_id": "call-1",
+            "tool_name": "shell",
+            "tool_args": {"command": "npm test"},
+        },
+        4,
+    )
+
+    document = _session_run_event(
+        document,
+        "session_run_interrupted",
+        {"message_key": "provider_stream.interrupted_can_continue", "locale": "zh-CN"},
+        5,
+    )
+
+    parts = _assistant_parts(document)
+    thinking = next(part for part in parts if part["type"] == "thinking")
+    assistant_text = next(part for part in parts if part["type"] == "assistant_text")
+    tool = next(part for part in parts if part["type"] == "tool")
+    notice = next(part for part in parts if part["type"] == "notice")
+    assert thinking["active"] is False
+    assert assistant_text["streaming"] is False
+    assert assistant_text["streamKey"] == "assistant-message"
+    assert tool["status"] == "cancelled"
+    assert notice["level"] == "warning"
+    assert "模型输出流中断" in notice["text"]
+    assert document["stats"]["runStatus"] == "interrupted"
+    assert document["run_state"]["status"] == "interrupted"
+    assert document["session"]["state"] == "active"
+
+
+def test_session_run_interrupted_uses_english_prefix_for_english_locale() -> None:
+    document = apply_session_event(
+        None,
+        session_id="session-1",
+        event_type="session_run_start",
+        payload={"prompt": "Continue generation", "locale": "en"},
+        session_event_seq=1,
+        session_run_id="run-1",
+        session_run_seq=1,
+    )
+
+    document = _session_run_event(
+        document,
+        "session_run_interrupted",
+        {"message_key": "provider_stream.interrupted_can_continue"},
+        2,
+    )
+
+    notice = next(part for part in _assistant_parts(document) if part["type"] == "notice")
+    assert notice["text"].startswith("Output interrupted: ")
+    assert "The model output stream was interrupted." in notice["text"]
+    assert "输出中断" not in notice["text"]
 
 
 def test_error_then_session_run_failed_keeps_single_error_notice() -> None:

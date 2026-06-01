@@ -218,6 +218,34 @@ def apply_session_event(
             "plain",
             meta,
         )
+    elif event_type == "session_run_interrupted":
+        message = _session_event_message(
+            doc,
+            payload,
+            "provider_stream.interrupted_can_continue",
+            "模型输出流中断，可继续生成。",
+        )
+        prefix = _session_event_message(
+            doc,
+            {"locale": payload.get("locale")} if "locale" in payload else {},
+            "provider_stream.interrupted_prefix",
+            "输出中断：",
+        )
+        _append_notice_part(
+            doc,
+            "warning",
+            f"{prefix}{message}",
+            "stream-interrupted",
+            "plain",
+            meta,
+        )
+        _apply_terminal_session_run_event(
+            doc,
+            status="interrupted",
+            session_state="active",
+            error=message,
+            meta=meta,
+        )
     elif event_type in {"error", "session_run_failed"}:
         message = _session_event_message(doc, payload, "", "unknown error")
         _settle_stale_pending_approvals(
@@ -228,19 +256,35 @@ def apply_session_event(
         )
         if event_type == "error" or not _has_notice_level(doc, "error"):
             _append_notice_part(doc, "error", f"错误：{message}", "error", "plain", meta)
-        _finalize_run_transcript_items(doc, "error")
-        _patch_run_state(doc, status="error", error=message)
-    elif event_type in {"session_run_cancel_requested", "session_run_cancelled"}:
-        _patch_run_state(doc, status="cancelled", error=str(payload.get("reason") or "session_run_cancelled"))
-        if event_type == "session_run_cancelled":
-            _settle_stale_pending_approvals(
-                doc,
-                status="cancelled",
-                reason=str(payload.get("reason") or "session_run_cancelled"),
-                meta=meta,
-            )
-            _append_notice_part(doc, "info", "已取消当前请求。", "cancelled", "plain", meta)
-            _finalize_run_transcript_items(doc, "cancelled")
+        _apply_terminal_session_run_event(
+            doc,
+            status="error",
+            session_state="error",
+            error=message,
+            meta=meta,
+        )
+    elif event_type == "session_run_cancel_requested":
+        _patch_run_state(
+            doc,
+            status="stopping",
+            error=str(payload.get("reason") or "session_run_cancel_requested"),
+        )
+    elif event_type == "session_run_cancelled":
+        reason = str(payload.get("reason") or "session_run_cancelled")
+        _settle_stale_pending_approvals(
+            doc,
+            status="cancelled",
+            reason=reason,
+            meta=meta,
+        )
+        _append_notice_part(doc, "info", "已取消当前请求。", "cancelled", "plain", meta)
+        _apply_terminal_session_run_event(
+            doc,
+            status="cancelled",
+            session_state="cancelled",
+            error=reason,
+            meta=meta,
+        )
 
     _sync_compatible_trace_fields(doc)
     return doc
@@ -458,6 +502,7 @@ def _session_event_message(
 def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
     response = str(payload.get("response") or "")
     rendered = bool(payload.get("response_rendered"))
+    _settle_stale_pending_approvals(doc, status="denied", reason="session_run_closed", meta=meta)
     if response and not rendered:
         _append_text_part(
             doc,
@@ -468,12 +513,26 @@ def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: d
             replace_stream_key="assistant-stream",
             append=False,
         )
-    else:
-        _finalize_active_streams(doc, meta)
-    _settle_stale_pending_approvals(doc, status="denied", reason="session_run_closed", meta=meta)
-    _patch_stats(doc, {"runStatus": "done"})
-    _patch_run_state(doc, status="done", error=None)
-    _dict(doc, "session")["state"] = "success"
+    _apply_terminal_session_run_event(
+        doc,
+        status="done",
+        session_state="success",
+        error=None,
+        meta=meta,
+    )
+
+
+def _apply_terminal_session_run_event(
+    doc: dict[str, Any],
+    *,
+    status: str,
+    session_state: str,
+    error: str | None,
+    meta: dict[str, Any],
+) -> None:
+    _finalize_run_transcript_items(doc, status)
+    _patch_run_state(doc, status=status, error=error)
+    _dict(doc, "session")["state"] = session_state
 
 
 def _apply_remote_peer_ready(doc: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -1059,31 +1118,11 @@ def _refresh_assistant_text(assistant: dict[str, Any]) -> None:
     assistant["text"] = "".join(text_parts)
 
 
-def _finalize_active_streams(doc: dict[str, Any], meta: dict[str, Any]) -> None:
-    assistant = _ensure_assistant_message(doc)
-    parts = []
-    changed = False
-    for part in _list_value(assistant.get("parts")):
-        if not isinstance(part, dict):
-            parts.append(part)
-            continue
-        if part.get("type") == "assistant_text" and part.get("streamKey") == "assistant-stream":
-            parts.append({**part, "streaming": False, "streamKey": "assistant-message"})
-            changed = True
-            continue
-        if part.get("type") == "thinking" and part.get("streamKey") == "reasoning-stream":
-            parts.append({**part, "active": False})
-            changed = True
-            continue
-        parts.append(part)
-    if changed:
-        assistant["parts"] = parts
-        _refresh_assistant_text(assistant)
-
-
 def _finalize_run_transcript_items(doc: dict[str, Any], status: str) -> None:
     assistant = _ensure_assistant_message(doc)
     trace_node_status = "error" if status == "error" else "cancelled" if status == "cancelled" else "success"
+    active_tool_statuses = {"running", "pending", "preparing", "awaiting_approval", "approved"}
+    terminal_tool_status = "error" if status == "error" else "cancelled"
     parts = []
     changed = False
     for part in _list_value(assistant.get("parts")):
@@ -1100,10 +1139,9 @@ def _finalize_run_transcript_items(doc: dict[str, Any], status: str) -> None:
             changed = True
         if (
             next_part.get("type") == "tool"
-            and status == "cancelled"
-            and next_part.get("status") in {"running", "pending", "preparing", "awaiting_approval"}
+            and str(next_part.get("status") or "") in active_tool_statuses
         ):
-            next_part["status"] = "cancelled"
+            next_part["status"] = terminal_tool_status
             changed = True
         if next_part.get("traceNodeStatus") != trace_node_status:
             next_part["traceNodeStatus"] = trace_node_status
