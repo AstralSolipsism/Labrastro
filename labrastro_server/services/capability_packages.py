@@ -62,6 +62,28 @@ from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import FetchCapab
 
 LOGGER = logging.getLogger(__name__)
 CAPABILITY_INGEST_WORKFLOW = "capability_package_ingest"
+_CAPABILITY_AGENT_TOOL_EVENTS = {
+    "tool_call_start",
+    "tool_call_end",
+    "tool_call_delta",
+    "tool_call_stream",
+    "tool_call_protocol_error",
+}
+_CAPABILITY_READ_SOURCE_TOOL_NAMES = {
+    "cat",
+    "glob",
+    "grep",
+    "list",
+    "list_directory",
+    "list_file",
+    "list_files",
+    "read",
+    "read_file",
+    "read_files",
+    "search",
+    "search_file",
+    "search_files",
+}
 _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
     "zh-CN": {
         "queued_title": "能力包生成任务已排队",
@@ -99,6 +121,10 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "approval_install_plan": "安装计划",
         "approval_intent": "确认安装能力包 {package_id}",
         "approval_content": "准备安装能力包 {package_id}。",
+        "approval_allow": "安装",
+        "approval_deny": "取消",
+        "tool_read_source": "读取能力包来源",
+        "tool_extract_evidence": "提取能力包证据",
         "output_truncated_marker": "\n... 内容已从主时间线省略，请打开原始事件查看完整内容 ...\n",
     },
     "en": {
@@ -137,6 +163,10 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "approval_install_plan": "Install plan",
         "approval_intent": "Confirm installing capability package {package_id}",
         "approval_content": "Preparing to install capability package {package_id}.",
+        "approval_allow": "Install",
+        "approval_deny": "Cancel",
+        "tool_read_source": "Reading capability package source",
+        "tool_extract_evidence": "Extracting capability package evidence",
         "output_truncated_marker": "\n... output omitted from the main timeline; open raw events for the complete content ...\n",
     },
 }
@@ -1072,11 +1102,12 @@ class CapabilityPackageSessionRunService:
                 return
             session.mark_running()
             session.append_event(
-                "context_event",
-                _capability_context_event(
+                "workflow_step",
+                _capability_workflow_step_event(
                     _capability_text(_session_locale(session), "start_draft"),
-                    "capability_package_ingest",
+                    "prepare",
                     {"agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID},
+                    status="running",
                 ),
             )
             result = CapabilityPackageIngestService(self.runtime_control_plane).start(
@@ -1187,11 +1218,14 @@ class CapabilityPackageSessionRunService:
         is_revision = bool(metadata.get("revision_of_agent_run_id"))
         locale = _session_locale(session)
         session.append_event(
-            "context_event",
-            _capability_context_event(
+            "workflow_step",
+            _capability_workflow_step_event(
                 _capability_text(locale, "revision_bound" if is_revision else "ingest_bound"),
-                "capability_package_revision" if is_revision else "capability_package_ingest",
-                {
+                "read_source" if not is_revision else "extract_evidence",
+                status="running",
+                summary="capability_package_revision" if is_revision else "capability_package_ingest",
+                extra={
+                    "phase": "capability_package_revision" if is_revision else "capability_package_ingest",
                     "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
                     "agent_run_id": agent_run_id,
                     **(
@@ -1244,8 +1278,8 @@ class CapabilityPackageSessionRunService:
             return None
         source_bundle = status.get("source_bundle") if isinstance(status.get("source_bundle"), dict) else {}
         session.append_event(
-            "capability_package_draft",
-            _capability_package_draft_event_payload(
+            "workflow_artifact",
+            _capability_package_artifact_event_payload(
                 draft,
                 source_bundle,
                 agent_run_id,
@@ -1315,7 +1349,13 @@ class CapabilityPackageSessionRunService:
                 labels=_capability_agent_run_projection_labels(_session_locale(session)),
                 terminal_message=_agent_run_terminal_message,
             ):
-                session.append_event(session_event_type, payload)
+                projected = _capability_projected_session_event(
+                    session_event_type,
+                    payload,
+                    locale=_session_locale(session),
+                )
+                if projected is not None:
+                    session.append_event(projected[0], projected[1])
             try:
                 task = self.runtime_control_plane.agent_run_to_dict(agent_run_id)
             except KeyError:
@@ -1324,11 +1364,14 @@ class CapabilityPackageSessionRunService:
             if status in self.TERMINAL_AGENT_STATUSES:
                 if not any(str(event.get("type") or "") in self.TERMINAL_AGENT_STATUSES for event in event_dicts):
                     session.append_event(
-                        "context_event",
-                        _capability_context_event(
+                        "workflow_step",
+                        _capability_workflow_step_event(
                             _agent_run_terminal_message(task, event_dicts, status),
-                            f"agent_run_{status}",
-                            {
+                            "compose_draft",
+                            status=_workflow_status_from_agent_run_status(status),
+                            summary=f"agent_run_{status}",
+                            extra={
+                                "phase": f"agent_run_{status}",
                                 "agent_run_id": agent_run_id,
                                 "agent_run_status": status,
                                 "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
@@ -1355,27 +1398,15 @@ class CapabilityPackageSessionRunService:
         approval_id = f"capability-package-install:{session.session_run_id}:{agent_run_id}:{package_id}"
         tool_call_id = f"capability-package-install:{agent_run_id or session.session_run_id}"
         locale = _session_locale(session)
-        approval_payload = _capability_install_approval_payload(
+        approval_payload = _capability_install_decision_payload(
             approval_id,
             tool_call_id,
             draft,
             agent_run_id,
             locale=locale,
         )
-        session.append_event(
-            "tool_call_start",
-            {
-                "tool_call_id": tool_call_id,
-                "tool_name": self.INSTALL_TOOL_NAME,
-                "tool_args": {
-                    "package_id": package_id,
-                    "agent_run_id": agent_run_id,
-                },
-                "title": _capability_text(locale, "install_title", package_id=package_id),
-            },
-        )
         session.register_approval(approval_id, approval_payload)
-        session.append_event("approval_request", approval_payload)
+        session.append_event("workflow_decision", approval_payload)
         with follow_up_lock:
             active_approval_id["value"] = approval_id
             has_pending_revision = bool(follow_up_queue)
@@ -1406,13 +1437,13 @@ class CapabilityPackageSessionRunService:
             )
             response = _capability_text(locale, "revision_ack")
             session.append_event(
-                "tool_call_end",
-                {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": self.INSTALL_TOOL_NAME,
-                    "status": "cancelled",
-                    "output": response,
-                },
+                "workflow_result",
+                _capability_workflow_result_event(
+                    response,
+                    "cancelled",
+                    "capability_package_install",
+                    {"package_id": package_id, "agent_run_id": agent_run_id},
+                ),
             )
             followup_id = str(revision_ticket.get("followup_id") or "")
             if followup_id:
@@ -1428,11 +1459,14 @@ class CapabilityPackageSessionRunService:
                 else _capability_text(locale, "revision_requested")
             )
             session.append_event(
-                "context_event",
-                _capability_context_event(
+                "workflow_step",
+                _capability_workflow_step_event(
                     instruction_title,
-                    "capability_package_revision_requested",
-                    {
+                    "compose_draft",
+                    status="running",
+                    summary="capability_package_revision_requested",
+                    extra={
+                        "phase": "capability_package_revision_requested",
                         "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
                         "agent_run_id": agent_run_id,
                         "followup_id": followup_id,
@@ -1453,16 +1487,25 @@ class CapabilityPackageSessionRunService:
         if decision != "allow_once":
             response = _capability_text(locale, "install_cancelled", package_id=package_id)
             session.append_event(
-                "tool_call_end",
-                {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": self.INSTALL_TOOL_NAME,
-                    "status": "cancelled",
-                    "output": response,
-                },
+                "workflow_result",
+                _capability_workflow_result_event(
+                    response,
+                    "cancelled",
+                    "capability_package_install",
+                    {"package_id": package_id, "agent_run_id": agent_run_id},
+                ),
             )
-            session.append_event("session_run_end", {"response": response})
+            session.append_event("session_run_end", {"response": response, "response_rendered": True})
             return None
+        session.append_event(
+            "workflow_step",
+            _capability_workflow_step_event(
+                _capability_text(locale, "install_title", package_id=package_id),
+                "install",
+                status="running",
+                extra={"package_id": package_id, "agent_run_id": agent_run_id},
+            ),
+        )
         install_payload = {
             "draft": draft,
             "source_bundle": source_bundle if isinstance(source_bundle, dict) else {},
@@ -1477,13 +1520,13 @@ class CapabilityPackageSessionRunService:
             ).strip() or "capability package install failed"
             session.append_event("error", {"message": message, "code": "capability_package_install_failed"})
             session.append_event(
-                "tool_call_end",
-                {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": self.INSTALL_TOOL_NAME,
-                    "status": "failed",
-                    "output": message,
-                },
+                "workflow_result",
+                _capability_workflow_result_event(
+                    message,
+                    "error",
+                    "capability_package_install",
+                    {"package_id": package_id, "agent_run_id": agent_run_id, "result": payload if isinstance(payload, dict) else {}},
+                ),
             )
             session.append_event(
                 "session_run_failed",
@@ -1496,16 +1539,19 @@ class CapabilityPackageSessionRunService:
             return None
         response = _capability_text(locale, "install_completed", package_id=package_id)
         session.append_event(
-            "tool_call_end",
-            {
-                "tool_call_id": tool_call_id,
-                "tool_name": self.INSTALL_TOOL_NAME,
-                "status": "completed",
-                "output": response,
-                "meta": getattr(result, "payload", {}),
-            },
+            "workflow_result",
+            _capability_workflow_result_event(
+                response,
+                "done",
+                "capability_package_install",
+                {
+                    "package_id": package_id,
+                    "agent_run_id": agent_run_id,
+                    "result": getattr(result, "payload", {}),
+                },
+            ),
         )
-        session.append_event("session_run_end", {"response": response})
+        session.append_event("session_run_end", {"response": response, "response_rendered": True})
         return None
 
     def _pop_revision_ticket(
@@ -1812,17 +1858,186 @@ def _agent_run_terminal_reason(task: dict[str, Any], status: str) -> str:
     return status
 
 
-def _capability_context_event(
+def _capability_workflow_step_event(
     title: str,
-    phase: str,
+    stage: str,
     extra: dict[str, Any] | None = None,
+    *,
+    status: str = "running",
+    summary: str = "",
 ) -> dict[str, Any]:
+    details = dict(extra or {})
+    details.setdefault("phase", details.get("phase") or stage)
     return {
+        "lane": "process",
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        "stage": stage,
+        "status": _workflow_status(status),
         "title": title,
         "message": title,
-        "phase": phase,
+        **({"summary": summary} if summary else {}),
+        "details": details,
+        **details,
+    }
+
+
+def _capability_projected_session_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    locale: str,
+) -> tuple[str, dict[str, Any]] | None:
+    if event_type == "assistant_delta":
+        return None
+    if event_type == "context_event":
+        return "workflow_step", _capability_workflow_step_from_context(payload)
+    if event_type in _CAPABILITY_AGENT_TOOL_EVENTS:
+        return "workflow_step", _capability_workflow_step_from_tool_event(
+            event_type,
+            payload,
+            locale=locale,
+        )
+    return event_type, payload
+
+
+def _capability_workflow_step_from_tool_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    locale: str,
+) -> dict[str, Any]:
+    tool_name = str(payload.get("tool_name") or "").strip()
+    tool_call_id = str(payload.get("tool_call_id") or "").strip()
+    stage = _workflow_stage_from_tool_name(tool_name)
+    title_key = "tool_read_source" if stage == "read_source" else "tool_extract_evidence"
+    title = _capability_text(locale, title_key)
+    if tool_name:
+        title = f"{title}: {tool_name}"
+    details: dict[str, Any] = {
+        "phase": f"agent_run_{event_type}",
+        "event_type": event_type,
+    }
+    if tool_name:
+        details["tool_name"] = tool_name
+    if tool_call_id:
+        details["tool_call_id"] = tool_call_id
+    tool_args = payload.get("tool_args")
+    if isinstance(tool_args, dict) and tool_args:
+        details["tool_args"] = tool_args
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and meta:
+        details["meta"] = meta
+    raw_event_refs = payload.get("raw_event_refs")
+    if isinstance(raw_event_refs, list) and raw_event_refs:
+        details["raw_event_refs"] = raw_event_refs
+    return _capability_workflow_step_event(
+        title,
+        stage,
+        details,
+        status=_workflow_status_from_tool_event(event_type, payload),
+    )
+
+
+def _capability_workflow_step_from_context(payload: dict[str, Any]) -> dict[str, Any]:
+    phase = str(payload.get("phase") or "").strip()
+    status = str(payload.get("agent_run_status") or "").strip()
+    stage = _workflow_stage_from_phase(phase)
+    title = str(payload.get("title") or payload.get("message") or stage).strip()
+    details = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"title", "message", "workflow", "stage", "status", "lane"}
+    }
+    return _capability_workflow_step_event(
+        title,
+        stage,
+        details,
+        status=_workflow_status_from_agent_run_status(status),
+        summary=phase,
+    )
+
+
+def _workflow_stage_from_tool_name(tool_name: str) -> str:
+    normalized = str(tool_name or "").strip().lower().replace("-", "_")
+    if normalized in _CAPABILITY_READ_SOURCE_TOOL_NAMES:
+        return "read_source"
+    return "extract_evidence"
+
+
+def _workflow_stage_from_phase(phase: str) -> str:
+    if phase in {"agent_run_queued", "agent_run_claimed"}:
+        return "prepare"
+    if phase == "agent_run_session_ready":
+        return "read_source"
+    if phase in {"agent_run_log", "agent_run_usage"}:
+        return "extract_evidence"
+    if phase.startswith("agent_run_") or phase.startswith("capability_package_revision"):
+        return "compose_draft"
+    return "prepare"
+
+
+def _workflow_status_from_agent_run_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"failed", "blocked"}:
+        return "error"
+    if normalized == "cancelled":
+        return "cancelled"
+    if normalized in {"completed", "done", "success"}:
+        return "done"
+    return "running"
+
+
+def _workflow_status_from_tool_event(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type == "tool_call_protocol_error":
+        return "error"
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    status_values = [
+        payload.get("status"),
+        payload.get("tool_status"),
+        payload.get("result_status"),
+        meta.get("status"),
+        meta.get("error"),
+        meta.get("is_error"),
+    ]
+    for value in status_values:
+        if value is True:
+            return "error"
+        normalized = str(value or "").strip().lower()
+        if normalized in {"error", "failed", "failure", "blocked", "denied", "protocol_error"}:
+            return "error"
+        if normalized in {"done", "completed", "success", "succeeded"}:
+            return "done"
+    if event_type == "tool_call_end":
+        return "done"
+    return "running"
+
+
+def _workflow_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"running", "done", "warning", "error", "cancelled"}:
+        return normalized
+    if normalized in {"completed", "success", "approved"}:
+        return "done"
+    if normalized in {"failed", "blocked", "denied"}:
+        return "error"
+    return "running"
+
+
+def _capability_workflow_result_event(
+    title: str,
+    status: str,
+    result_type: str,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "lane": "primary",
         "workflow": CAPABILITY_INGEST_WORKFLOW,
-        **(extra or {}),
+        "result_type": result_type,
+        "status": _workflow_status(status),
+        "title": title,
+        "message": title,
+        "summary": title,
+        "result": dict(result or {}),
     }
 
 
@@ -1833,7 +2048,7 @@ def _truncate_single_line(value: str, max_chars: int) -> str:
     return f"{text[:max_chars - 1]}…"
 
 
-def _capability_package_draft_event_payload(
+def _capability_package_artifact_event_payload(
     draft: dict[str, Any],
     source_bundle: dict[str, Any],
     agent_run_id: str,
@@ -1841,23 +2056,147 @@ def _capability_package_draft_event_payload(
     *,
     locale: str,
 ) -> dict[str, Any]:
-    public_draft = _public_capability_package_draft(draft)
-    package_id = str(public_draft.get("id") or "capability-package").strip()
+    artifact = _capability_package_review(
+        draft,
+        source_bundle,
+        agent_run_id,
+        validation if isinstance(validation, dict) else {},
+    )
+    package_id = str(artifact.get("package_id") or "capability-package").strip()
     title = _capability_text(locale, "draft_ready", package_id=package_id)
     return {
+        "lane": "primary",
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        "artifact_type": "capability_package_draft",
         "title": title,
         "message": title,
+        "summary": str(artifact.get("description") or ""),
+        "artifact": artifact,
+        "raw_event_refs": [{"agent_run_id": agent_run_id, "type": "result"}],
+    }
+
+
+def _capability_package_review(
+    draft: dict[str, Any],
+    source_bundle: dict[str, Any],
+    agent_run_id: str,
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    public_draft = _public_capability_package_draft(draft)
+    package_id = str(public_draft.get("id") or "capability-package").strip()
+    components = _capability_review_components(public_draft)
+    capabilities = [
+        _capability_component_review_item(item)
+        for item in components
+        if str(item.get("kind") or item.get("type") or "").strip() in CAPABILITY_COMPONENT_KINDS
+    ]
+    dependencies = [
+        _capability_component_review_item(item)
+        for item in components
+        if str(item.get("kind") or item.get("type") or "").strip() not in CAPABILITY_COMPONENT_KINDS
+    ]
+    source = source_bundle.get("source") if isinstance(source_bundle.get("source"), dict) else {}
+    install_plan = _string_values(public_draft.get("install_plan"))
+    usage = _string_values(public_draft.get("usage"))
+    evidence = [
+        {
+            key: value
+            for key, value in item.items()
+            if key in {"title", "source", "url", "path", "excerpt", "summary"}
+        }
+        for item in _dict_list(public_draft.get("evidence"))
+    ]
+    credentials = _string_values(public_draft.get("credentials"))
+    risks = _capability_review_risks(public_draft, validation)
+    return {
         "package_id": package_id,
-        "agent_run_id": agent_run_id,
-        "draft": public_draft,
-        "validation": validation if isinstance(validation, dict) else {},
-        "source": source_bundle.get("source") if isinstance(source_bundle.get("source"), dict) else {},
+        "id": package_id,
+        "name": str(public_draft.get("name") or package_id),
+        "description": str(public_draft.get("description") or ""),
+        "source": source,
         "source_summary": {
             "documents": len(_dict_list(source_bundle.get("documents"))),
             "evidence": len(_dict_list(source_bundle.get("evidence"))),
             "errors": len(_dict_list(source_bundle.get("errors"))),
         },
+        "components": components,
+        "capabilities": capabilities,
+        "dependencies": dependencies,
+        "runtime_footprint": aggregate_runtime_footprint(
+            _runtime_footprints_from_draft(package_id, public_draft)
+        ),
+        "install_plan": install_plan,
+        "usage": usage,
+        "evidence": evidence,
+        "credentials": credentials,
+        "risks": risks,
+        "validation": validation,
+        "diagnostic_ref": f"agent-run:{agent_run_id}",
     }
+
+
+def _capability_component_review_item(component: dict[str, Any]) -> dict[str, Any]:
+    config = component.get("config") if isinstance(component.get("config"), dict) else {}
+    component_id = str(component.get("id") or component.get("name") or "").strip()
+    name = str(component.get("name") or config.get("name") or component_id).strip()
+    return {
+        "id": component_id,
+        "name": name,
+        "display_name": str(component.get("display_name") or config.get("display_name") or name).strip(),
+        "kind": str(component.get("kind") or component.get("type") or "").strip(),
+        "summary": str(
+            component.get("summary")
+            or config.get("summary")
+            or component.get("description")
+            or config.get("description")
+            or ""
+        ).strip(),
+    }
+
+
+def _capability_review_components(public_draft: dict[str, Any]) -> list[dict[str, Any]]:
+    direct = [
+        dict(item)
+        for item in public_draft.get("components", [])
+        if isinstance(item, dict)
+    ]
+    contributions = public_draft.get("contributions")
+    if not isinstance(contributions, dict):
+        return direct
+    sections = [
+        "skills",
+        "mcp_servers",
+        "builtin_tools",
+        "prompt_fragments",
+        "credential_refs",
+        "environment_requirements",
+    ]
+    contributed: list[dict[str, Any]] = []
+    for section in sections:
+        value = contributions.get(section)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict):
+                contributed.append(dict(item))
+    return [*direct, *contributed]
+
+
+def _capability_review_risks(
+    public_draft: dict[str, Any],
+    validation: dict[str, Any],
+) -> list[str]:
+    risks: list[str] = []
+    risk_level = str(public_draft.get("risk_level") or "").strip()
+    if risk_level:
+        risks.append(f"risk_level: {risk_level}")
+    messages = validation.get("messages")
+    if isinstance(messages, list):
+        risks.extend(str(item).strip() for item in messages if str(item).strip())
+    warnings = validation.get("warnings")
+    if isinstance(warnings, list):
+        risks.extend(str(item).strip() for item in warnings if str(item).strip())
+    return _unique_strings(risks)
 
 
 def _public_capability_package_draft(draft: dict[str, Any]) -> dict[str, Any]:
@@ -1970,7 +2309,7 @@ def _string_values(value: Any) -> list[str]:
     return [str(value).strip()]
 
 
-def _capability_install_approval_payload(
+def _capability_install_decision_payload(
     approval_id: str,
     tool_call_id: str,
     draft: dict[str, Any],
@@ -2069,16 +2408,43 @@ def _capability_install_approval_payload(
                 ],
             }
         )
+    review = _capability_package_review(
+        draft,
+        {"source": draft.get("source") if isinstance(draft.get("source"), dict) else {}},
+        agent_run_id,
+        {},
+    )
+    intent = _capability_text(locale, "approval_intent", package_id=package_id)
+    content = str(
+        draft.get("description")
+        or _capability_text(locale, "approval_content", package_id=package_id)
+    )
     return {
+        "lane": "primary",
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        "decision_type": "capability_package_install",
+        "status": "pending",
+        "title": intent,
+        "summary": content,
+        "review": review,
+        "actions": [
+            {
+                "id": "allow_once",
+                "label": _capability_text(locale, "approval_allow"),
+                "tone": "primary",
+            },
+            {
+                "id": "deny_once",
+                "label": _capability_text(locale, "approval_deny"),
+                "tone": "secondary",
+            },
+        ],
         "approval_id": approval_id,
         "tool_call_id": tool_call_id,
         "tool_name": CapabilityPackageSessionRunService.INSTALL_TOOL_NAME,
         "tool_args": {"package_id": package_id, "agent_run_id": agent_run_id},
-        "intent": _capability_text(locale, "approval_intent", package_id=package_id),
-        "content": str(
-            draft.get("description")
-            or _capability_text(locale, "approval_content", package_id=package_id)
-        ),
+        "intent": intent,
+        "content": content,
         "sections": sections,
     }
 

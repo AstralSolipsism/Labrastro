@@ -1448,11 +1448,34 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
         )
+    )
+    control.append_executor_event(
+        str(agent_run_id),
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-skill",
+                "input": {"path": "skills/review/SKILL.md"},
+            },
+        ),
+    )
+    control.append_executor_event(
+        str(agent_run_id),
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-skill",
+                "output": "Review package skill content.",
+                "path": "skills/review/SKILL.md",
+            },
+        ),
     )
     draft = {
         "id": "review",
@@ -1488,14 +1511,14 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
             (
                 event["payload"]
                 for event in session.events
-                if event["type"] == "approval_request"
+                if event["type"] == "workflow_decision"
             ),
             None,
         )
     )
-    draft_event = next(event for event in session.events if event["type"] == "capability_package_draft")
-    assert draft_event["payload"]["package_id"] == "review"
-    assert draft_event["payload"]["draft"]["id"] == "review"
+    draft_event = next(event for event in session.events if event["type"] == "workflow_artifact")
+    assert draft_event["payload"]["artifact_type"] == "capability_package_draft"
+    assert draft_event["payload"]["artifact"]["package_id"] == "review"
     assert approval["tool_name"] == "install_capability_package"
     assert approval["tool_call_id"]
     assert approval["intent"] == "Confirm installing capability package review"
@@ -1504,22 +1527,35 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     assert approval["sections"][2]["title"] == "Runtime footprint"
     assert approval["sections"][2]["items"][0]["value"] == "需要在本机安装/配置"
     assert approval["sections"][2]["items"][1]["value"] == "Local client"
-    assert any(
-        event["type"] == "tool_call_start"
-        and event["payload"].get("title") == "Install capability package review"
-        for event in session.events
-    )
+    assert approval["decision_type"] == "capability_package_install"
+    assert approval["review"]["package_id"] == "review"
     session.append_event("reasoning_delta", {"content": "Installing package."})
     session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
     _wait_for(lambda: session.done)
 
     assert admin.payloads
     assert admin.payloads[0]["draft"]["id"] == "review"  # type: ignore[index]
-    assert any(event["type"] == "tool_call_end" for event in session.events)
-    assert session.events[-1]["type"] in {"session_run_end", "approval_resolved", "tool_call_end"}
+    assert not any(event["type"] in {"tool_call_start", "tool_call_end"} for event in session.events)
+    tool_steps = [
+        event["payload"]
+        for event in session.events
+        if event["type"] == "workflow_step"
+        and event["payload"].get("details", {}).get("tool_call_id") == "read-skill"
+    ]
+    assert {step["status"] for step in tool_steps} == {"running", "done"}
+    assert all(step["stage"] == "read_source" for step in tool_steps)
+    done_tool_step = next(step for step in tool_steps if step["status"] == "done")
+    assert done_tool_step["details"]["tool_name"] == "read_file"
+    assert done_tool_step["details"]["tool_call_id"] == "read-skill"
+    assert done_tool_step["details"]["raw_event_refs"][0]["type"] == "tool_result"
+    assert "tool_result" not in done_tool_step
+    assert "tool_result" not in done_tool_step["details"]
+    assert any(event["type"] == "workflow_result" for event in session.events)
+    assert session.events[-1]["type"] in {"session_run_end", "approval_resolved", "workflow_result"}
     assert any(
         event["type"] == "session_run_end"
         and event["payload"].get("response") == "Capability package review installed."
+        and event["payload"].get("response_rendered") is True
         for event in session.events
     )
     assert isinstance(document, dict)
@@ -1559,7 +1595,7 @@ def test_capability_package_session_process_text_follows_english_locale(tmp_path
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -1589,7 +1625,7 @@ def test_capability_package_session_process_text_follows_english_locale(tmp_path
     messages = [
         str(event["payload"].get("message") or "")
         for event in session.events
-        if event["type"] == "context_event"
+        if event["type"] == "workflow_step"
     ]
     assert "Starting capability package draft generation" in messages
     assert "Capability package generation task entered capability_packager" in messages
@@ -1672,7 +1708,7 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -1697,7 +1733,7 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
             (
                 event["payload"]
                 for event in session.events
-                if event["type"] == "approval_request"
+                if event["type"] == "workflow_decision"
             ),
             None,
         )
@@ -1740,10 +1776,10 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         for event in session.events
     )
     assert any(
-        event["type"] == "context_event"
-        and event["payload"].get("phase") == "capability_package_revision_requested"
+        event["type"] == "workflow_step"
+        and event["payload"].get("details", {}).get("phase") == "capability_package_revision_requested"
         and "把依赖改成 gh，不要用 hub" in event["payload"].get("message", "")
-        and event["payload"].get("instruction") == "把依赖改成 gh，不要用 hub"
+        and event["payload"].get("details", {}).get("instruction") == "把依赖改成 gh，不要用 hub"
         for event in session.events
     )
 
@@ -1760,8 +1796,8 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         lambda: [
             event["payload"]
             for event in session.events
-            if event["type"] == "approval_request"
-        ] if len([event for event in session.events if event["type"] == "approval_request"]) >= 2 else []
+            if event["type"] == "workflow_decision"
+        ] if len([event for event in session.events if event["type"] == "workflow_decision"]) >= 2 else []
     )
     second_approval = approvals[-1]
     assert second_approval["approval_id"] != first_approval["approval_id"]
@@ -1811,7 +1847,7 @@ def test_peer_shutdown_keeps_capability_package_session_run_active(tmp_path: Pat
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -1868,7 +1904,7 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -1902,7 +1938,7 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
             (
                 event["payload"]
                 for event in session.events
-                if event["type"] == "approval_request"
+                if event["type"] == "workflow_decision"
             ),
             None,
         )
@@ -1946,7 +1982,7 @@ def test_capability_package_session_cancel_cancels_agent_run(tmp_path: Path) -> 
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -1997,7 +2033,7 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -2037,7 +2073,7 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
             (
                 event["payload"]
                 for event in session.events
-                if event["type"] == "approval_request"
+                if event["type"] == "workflow_decision"
             ),
             None,
         )
@@ -2058,8 +2094,8 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
     assert any(event["type"] == "session_run_cancelled" for event in events)
     assert not any(event["type"] == "session_run_end" for event in events)
     assert not any(
-        event["type"] == "tool_call_end"
-        and event["payload"].get("tool_name") == service.INSTALL_TOOL_NAME
+        event["type"] == "workflow_result"
+        and event["payload"].get("result_type") == "capability_package_install"
         for event in events
     )
 
@@ -2123,7 +2159,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -2175,9 +2211,9 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
     _wait_for(lambda: session.done)
 
     phases = [
-        event["payload"].get("phase")
+        event["payload"].get("details", {}).get("phase")
         for event in persisted
-        if event["event_type"] == "context_event"
+        if event["event_type"] == "workflow_step"
     ]
     assert "agent_run_queued" in phases
     assert "agent_run_claimed" in phases
@@ -2384,7 +2420,7 @@ def test_capability_package_session_surfaces_source_bundle_errors(
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -2475,7 +2511,7 @@ def test_capability_package_session_softens_partial_source_fetch_errors(
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
@@ -2543,7 +2579,7 @@ def test_capability_package_session_surfaces_empty_source_evidence(
             (
                 event["payload"].get("agent_run_id")
                 for event in session.events
-                if event["type"] == "context_event"
+                if event["type"] == "workflow_step"
                 and event["payload"].get("agent_run_id")
             ),
             "",
