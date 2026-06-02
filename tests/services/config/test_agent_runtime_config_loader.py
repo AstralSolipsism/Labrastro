@@ -11,7 +11,7 @@ from reuleauxcoder.domain.config.models import (
     build_agent_run_snapshot,
     resolve_agent_effective_capability_scope,
 )
-from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry
+from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry, MemorySourceRegistry
 from reuleauxcoder.interfaces.entrypoint.runner import build_capability_catalog
 from reuleauxcoder.services.config.loader import ConfigLoader
 
@@ -909,6 +909,116 @@ def test_admin_server_settings_rejects_unregistered_memory_provider_adapter() ->
     assert result.payload["error"] == "invalid_memory"
     assert "adapter is not registered" in result.payload["message"]
     assert manager.data == {}
+
+
+def test_admin_status_explains_memory_provider_agent_and_source_state() -> None:
+    class MemoryAdminManager(RemoteAdminConfigManager):
+        def __init__(self) -> None:
+            super().__init__(config_path=None)
+            self.data = {
+                "memory": {
+                    "enabled": True,
+                    "default_provider": "agentmemory",
+                    "default_agent_id": "core",
+                    "runtime": {
+                        "inject_default": True,
+                        "capture_default": False,
+                        "token_budget_default": 640,
+                    },
+                    "providers": {
+                        "agentmemory": {
+                            "adapter": "fake_memory",
+                        },
+                        "archived": {
+                            "adapter": "missing_memory",
+                        },
+                    },
+                    "sources": {
+                        "github_project": {
+                            "adapter": "fake_source",
+                            "target_provider": "agentmemory",
+                            "sync_mode": "manual",
+                        },
+                        "archived_project": {
+                            "adapter": "fake_source",
+                            "target_provider": "archived",
+                            "sync_mode": "manual",
+                        }
+                    },
+                    "tools": {
+                        "enabled": True,
+                        "provider": "agentmemory",
+                        "allowed_agents": ["reviewer"],
+                        "remember": True,
+                        "list": True,
+                    },
+                },
+                "agent_registry": {
+                    "agents": {
+                        "reviewer": {
+                            "name": "Reviewer",
+                            "memory": {
+                                "primary_provider": "agentmemory",
+                                "capture": True,
+                                "token_budget": 320,
+                            },
+                        },
+                        "researcher": {
+                            "name": "Researcher",
+                        },
+                    }
+                },
+            }
+
+        def _load_data(self) -> dict:
+            return deepcopy(self.data)
+
+    MemoryProviderRegistry.clear_registered_adapters()
+    MemorySourceRegistry.clear_registered_adapters()
+    MemoryProviderRegistry.register_adapter("fake_memory", lambda provider_id, config: None)
+    MemorySourceRegistry.register_adapter("fake_source", lambda source_id, config: None)
+    try:
+        memory_status = MemoryAdminManager().read_server_settings()["settings"][
+            "memory_status"
+        ]
+
+        providers = {item["id"]: item for item in memory_status["providers"]}
+        assert memory_status["default_provider_available"] is True
+        assert providers["agentmemory"]["status"] == "available"
+        assert providers["agentmemory"]["adapter_registered"] is True
+        assert providers["archived"]["status"] == "adapter_missing"
+        assert providers["archived"]["adapter_registered"] is False
+
+        policies = {
+            item["agent_id"]: item for item in memory_status["agent_policies"]
+        }
+        assert policies["reviewer"]["policy_source"] == "overridden"
+        assert policies["reviewer"]["capture"] is True
+        assert policies["reviewer"]["token_budget"] == 320
+        assert policies["researcher"]["policy_source"] == "default"
+        assert policies["researcher"]["capture"] is False
+        assert policies["researcher"]["token_budget"] == 640
+
+        sources = {item["id"]: item for item in memory_status["sources"]}
+        assert sources["github_project"]["role"] == "external_source_connector"
+        assert sources["github_project"]["status"] == "configured"
+        assert sources["github_project"]["target_provider_configured"] is True
+        assert sources["github_project"]["target_provider_available"] is True
+        assert sources["github_project"]["target_provider_status"] == "available"
+        assert sources["archived_project"]["status"] == "target_unavailable"
+        assert sources["archived_project"]["target_provider_configured"] is True
+        assert sources["archived_project"]["target_provider_enabled"] is True
+        assert sources["archived_project"]["target_provider_available"] is False
+        assert sources["archived_project"]["target_provider_status"] == "adapter_missing"
+
+        tools = memory_status["tools"]
+        assert tools["status"] == "policy_only"
+        assert tools["provider_available"] is True
+        assert tools["configured_operations"]["remember"] is True
+        assert tools["configured_operations"]["list"] is True
+    finally:
+        MemoryProviderRegistry.clear_registered_adapters()
+        MemorySourceRegistry.clear_registered_adapters()
 
 
 def test_admin_status_exposes_provider_model_catalog_and_agent_default() -> None:
