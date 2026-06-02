@@ -49,6 +49,7 @@ from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInt
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
     AgentRunRequest,
+    ExecutorRunResult,
 )
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
@@ -3146,12 +3147,38 @@ class TestRemoteRelayHTTPService:
                 },
             }
         )
+        persisted_trace_events = []
+
+        def trace_sink(
+            session_id,
+            event_type,
+            payload,
+            session_run_id,
+            session_run_seq,
+            source,
+            replayable,
+        ):
+            seq = len(persisted_trace_events) + 1
+            persisted_trace_events.append(
+                {
+                    "session_id": session_id,
+                    "type": event_type,
+                    "payload": payload,
+                    "session_run_id": session_run_id,
+                    "session_run_seq": session_run_seq,
+                    "source": source,
+                    "replayable": replayable,
+                }
+            )
+            return seq
+
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
             runtime_control_plane=control,
             admin_config_path=config_path,
         )
+        service.set_session_trace_event_sink(trace_sink)
         service.start()
         try:
             bootstrap_token = relay.issue_bootstrap_token(ttl_sec=60)
@@ -3187,6 +3214,13 @@ class TestRemoteRelayHTTPService:
             assert ingest_body["session_id"] == "session-capability-1"
             assert ingest_body["runtime_state"]["agent_id"] == "capability_packager"
             assert ingest_body["runtime_state"]["active_model_provider"] == "deepseek"
+            assert any(
+                event["type"] == "session_run_start"
+                and event["session_id"] == "session-capability-1"
+                and event["session_run_id"] == ingest_body["session_run_id"]
+                and event["payload"]["workflow_mode"] == "capability_package_ingest"
+                for event in persisted_trace_events
+            )
             retry_status, retry_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
@@ -3284,6 +3318,205 @@ class TestRemoteRelayHTTPService:
                 and event.payload.get("data", {}).get("status") == "model_request_started"
                 for event in control.list_events(agent_run_id)
             )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_session_installs_through_http_approval_reply(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.host.yaml"
+        save_yaml_config(config_path, {})
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane(
+            runtime_snapshot={
+                "runtime_profiles": {
+                    "packager": {
+                        "executor": "reuleauxcoder",
+                        "execution_location": "remote_server",
+                        "worker_kind": "sandbox_worker",
+                    }
+                },
+                "agents": {
+                    "capability_packager": {
+                        "visibility": "system",
+                        "system_flow_only": ["capability_ingest"],
+                        "runtime_profile": "packager",
+                    }
+                },
+            }
+        )
+        persisted_trace_events = []
+
+        def trace_sink(
+            session_id,
+            event_type,
+            payload,
+            session_run_id,
+            session_run_seq,
+            source,
+            replayable,
+        ):
+            seq = len(persisted_trace_events) + 1
+            persisted_trace_events.append(
+                {
+                    "session_id": session_id,
+                    "type": event_type,
+                    "payload": payload,
+                    "session_run_id": session_run_id,
+                    "session_run_seq": session_run_seq,
+                    "source": source,
+                    "replayable": replayable,
+                }
+            )
+            return seq
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.set_session_trace_event_sink(trace_sink)
+        service.start()
+
+        def wait_for(predicate, *, timeout_sec: float = 3.0):
+            deadline = time.time() + timeout_sec
+            while time.time() < deadline:
+                value = predicate()
+                if value:
+                    return value
+                time.sleep(0.02)
+            raise AssertionError("timed out waiting for condition")
+
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _, ingest_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
+                {
+                    "peer_token": peer_token,
+                    "session_id": "session-capability-install",
+                    "client_request_id": "capability-install-req",
+                    "source": {
+                        "type": "project_notes",
+                        "notes": "Install gh, then use gh pr view for review.",
+                    },
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+            session_run_id = ingest_body["session_run_id"]
+            agent_run_id = wait_for(
+                lambda: next(
+                    (
+                        event["payload"].get("agent_run_id")
+                        for event in service._get_session_run(session_run_id).events
+                        if event["type"] == "workflow_step"
+                        and isinstance(event.get("payload"), dict)
+                        and event["payload"].get("agent_run_id")
+                    ),
+                    "",
+                )
+            )
+            draft = {
+                "id": "review",
+                "name": "Review",
+                "source": {"type": "project_notes"},
+                "contributions": {
+                    "environment_requirements": [
+                        {
+                            "id": "envreq:executable:gh",
+                            "kind": "executable",
+                            "name": "gh",
+                            "command": "gh",
+                            "check": "gh --version",
+                        }
+                    ]
+                },
+                "install_plan": ["Install gh."],
+                "usage": ["Use gh pr view."],
+                "evidence": [
+                    {
+                        "title": "Project notes",
+                        "excerpt": "Install gh and run gh --version",
+                    }
+                ],
+                "credentials": ["GITHUB_TOKEN"],
+                "risk_level": "low",
+            }
+            control.complete_agent_run(
+                str(agent_run_id),
+                ExecutorRunResult(
+                    task_id=str(agent_run_id),
+                    status="completed",
+                    output=f"```json\n{json.dumps(draft)}\n```",
+                ),
+            )
+            approval = wait_for(
+                lambda: next(
+                    (
+                        item
+                        for item in service._get_session_run(session_run_id).status_payload().get("approvals", [])
+                        if item.get("decision_type") == "capability_package_install"
+                    ),
+                    None,
+                )
+            )
+            assert approval["tool_name"] == "install_capability_package"
+            assert approval["review"]["package_id"] == "review"
+
+            status, reply_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/approval/reply",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "approval_id": approval["approval_id"],
+                    "decision": "allow_once",
+                    "reason": "ok",
+                },
+            )
+            assert status == 200
+            assert reply_body["ok"] is True
+
+            session = wait_for(
+                lambda: service._get_session_run(session_run_id)
+                if service._get_session_run(session_run_id).done
+                else None
+            )
+            event_types = [event["type"] for event in session.events]
+            assert "approval_resolved" in event_types
+            assert any(
+                event["type"] == "workflow_result"
+                and event["payload"].get("result_type") == "capability_package_install"
+                and event["payload"].get("status") == "done"
+                for event in session.events
+            )
+            assert any(event["type"] == "session_run_end" for event in session.events)
+
+            config = load_yaml_config(config_path)
+            assert config["capability_packages"]["review"]["status"] == "installed"
+            assert "envreq:executable:gh" in config["capability_components"]
+            assert any(event["type"] == "workflow_decision" for event in persisted_trace_events)
+            assert any(event["type"] == "approval_resolved" for event in persisted_trace_events)
+            assert any(
+                event["type"] == "workflow_result"
+                and event["payload"].get("status") == "done"
+                for event in persisted_trace_events
+            )
+            assert any(event["type"] == "session_run_end" for event in persisted_trace_events)
         finally:
             service.stop()
             relay.stop()
