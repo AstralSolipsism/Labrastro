@@ -483,6 +483,205 @@ class RemoteAdminConfigManager:
         raw = data.get("memory", {})
         return MemoryConfig.from_dict(raw if isinstance(raw, dict) else {}).to_dict()
 
+    def _memory_provider_resolution(
+        self,
+        memory: MemoryConfig,
+        provider_id: str,
+    ) -> dict[str, Any]:
+        provider_key = str(provider_id or "").strip()
+        if not provider_key:
+            return {
+                "provider": "",
+                "configured": False,
+                "enabled": False,
+                "adapter_registered": False,
+                "available": False,
+                "status": "not_configured",
+            }
+        provider = memory.providers.get(provider_key)
+        if provider is None:
+            return {
+                "provider": provider_key,
+                "configured": False,
+                "enabled": False,
+                "adapter_registered": False,
+                "available": False,
+                "status": "missing",
+            }
+        adapter_registered = MemoryProviderRegistry.is_adapter_registered(provider.adapter)
+        if not provider.enabled:
+            status = "disabled"
+        elif not adapter_registered:
+            status = "adapter_missing"
+        else:
+            status = "available"
+        return {
+            "provider": provider_key,
+            "adapter": provider.adapter,
+            "configured": True,
+            "enabled": provider.enabled,
+            "adapter_registered": adapter_registered,
+            "available": status == "available",
+            "status": status,
+        }
+
+    def _memory_provider_statuses(self, memory: MemoryConfig) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": provider_id,
+                "is_default": provider_id == memory.default_provider,
+                **self._memory_provider_resolution(memory, provider_id),
+            }
+            for provider_id in sorted(memory.providers)
+        ]
+
+    def _memory_source_statuses(self, memory: MemoryConfig) -> list[dict[str, Any]]:
+        statuses: list[dict[str, Any]] = []
+        for source_id, source in sorted(memory.sources.items()):
+            adapter_registered = MemorySourceRegistry.is_adapter_registered(source.adapter)
+            target = self._memory_provider_resolution(memory, source.target_provider)
+            if not source.enabled:
+                status = "disabled"
+            elif not adapter_registered:
+                status = "adapter_missing"
+            elif not target["configured"]:
+                status = "target_missing"
+            elif not target["enabled"]:
+                status = "target_disabled"
+            elif not target["available"]:
+                status = "target_unavailable"
+            else:
+                status = "configured"
+            statuses.append(
+                {
+                    "id": source_id,
+                    "adapter": source.adapter,
+                    "enabled": source.enabled,
+                    "sync_mode": source.sync_mode,
+                    "target_provider": source.target_provider,
+                    "adapter_registered": adapter_registered,
+                    "target_provider_configured": target["configured"],
+                    "target_provider_enabled": target["enabled"],
+                    "target_provider_available": target["available"],
+                    "target_provider_status": target["status"],
+                    "status": status,
+                    "role": "external_source_connector",
+                }
+            )
+        return statuses
+
+    def _memory_agent_policy_statuses(
+        self,
+        memory: MemoryConfig,
+        agent_registry: AgentRegistryConfig,
+    ) -> list[dict[str, Any]]:
+        statuses: list[dict[str, Any]] = []
+        for agent_id, agent in sorted(agent_registry.agents.items()):
+            agent_memory = agent.memory
+            overridden = bool(agent_memory.to_dict())
+            primary_provider = agent_memory.primary_provider or memory.default_provider
+            read_providers = (
+                list(agent_memory.read_providers)
+                if agent_memory.read_providers
+                else ([primary_provider] if primary_provider else [])
+            )
+            provider = self._memory_provider_resolution(memory, primary_provider)
+            enabled = bool(memory.enabled and agent_memory.enabled)
+            inject = bool(
+                enabled
+                and (
+                    agent_memory.inject
+                    if overridden
+                    else memory.runtime.inject_default
+                )
+            )
+            capture = bool(
+                enabled
+                and (
+                    agent_memory.capture
+                    if overridden
+                    else memory.runtime.capture_default
+                )
+            )
+            statuses.append(
+                {
+                    "agent_id": agent_id,
+                    "agent_name": agent.name or agent_id,
+                    "visibility": agent.visibility,
+                    "policy_source": "overridden" if overridden else "default",
+                    "enabled": enabled,
+                    "primary_provider": primary_provider,
+                    "read_providers": read_providers,
+                    "inject": inject,
+                    "capture": capture,
+                    "token_budget": (
+                        agent_memory.token_budget
+                        if agent_memory.token_budget is not None
+                        else memory.runtime.token_budget_default
+                    ),
+                    "scope_mode": agent_memory.scope_mode,
+                    "expose_tools": bool(enabled and agent_memory.expose_tools),
+                    "provider_configured": provider["configured"],
+                    "provider_available": provider["available"],
+                    "provider_status": provider["status"],
+                }
+            )
+        return statuses
+
+    def _memory_tools_status(self, memory: MemoryConfig) -> dict[str, Any]:
+        provider = self._memory_provider_resolution(memory, memory.tools.provider)
+        configured_operations = {
+            "recall": memory.tools.recall,
+            "remember": memory.tools.remember,
+            "forget": memory.tools.forget,
+            "list": memory.tools.list,
+        }
+        return {
+            "enabled": memory.tools.enabled,
+            "provider": memory.tools.provider,
+            "allowed_agents": list(memory.tools.allowed_agents),
+            "provider_configured": provider["configured"],
+            "provider_available": provider["available"],
+            "provider_status": provider["status"],
+            "configured_operations": configured_operations,
+            "status": "policy_only" if memory.tools.enabled else "disabled",
+            "message": (
+                "Agent-visible memory tool policy is stored, while the current "
+                "runtime injects and captures memory through hooks."
+            ),
+        }
+
+    def _memory_status(
+        self,
+        data: dict[str, Any],
+        agent_registry: AgentRegistryConfig,
+    ) -> dict[str, Any]:
+        raw = data.get("memory", {})
+        memory = MemoryConfig.from_dict(raw if isinstance(raw, dict) else {})
+        default_provider = self._memory_provider_resolution(
+            memory,
+            memory.default_provider,
+        )
+        provider_statuses = self._memory_provider_statuses(memory)
+        return {
+            "enabled": memory.enabled,
+            "default_provider": memory.default_provider,
+            "default_provider_configured": default_provider["configured"],
+            "default_provider_available": default_provider["available"],
+            "default_provider_status": default_provider["status"],
+            "provider_count": len(provider_statuses),
+            "available_provider_count": sum(
+                1 for item in provider_statuses if item["available"]
+            ),
+            "providers": provider_statuses,
+            "agent_policies": self._memory_agent_policy_statuses(
+                memory,
+                agent_registry,
+            ),
+            "sources": self._memory_source_statuses(memory),
+            "tools": self._memory_tools_status(memory),
+        }
+
     def _persistence_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         raw = data.get("persistence", {})
         return PersistenceConfig.from_dict(raw if isinstance(raw, dict) else {}).to_dict()
@@ -535,6 +734,7 @@ class RemoteAdminConfigManager:
                 "tool_output": self._tool_output_settings(data),
                 "context": self._context_settings(data),
                 "memory": self._memory_settings(data),
+                "memory_status": self._memory_status(data, agent_registry),
                 "approval": self._approval_settings(data),
                 "modes": self._modes_settings(data),
                 "skills": self._skills_settings(data),
