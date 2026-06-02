@@ -881,6 +881,43 @@ class TestRunnerRemoteExec:
         runner.cleanup(ctx.agent)
         assert runner._relay_server is None
 
+    def test_remote_host_service_binds_session_trace_sink_before_chat_handler(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        session_store = MemorySessionStore()
+        runner = _build_runner_with_fake_agent(
+            relay_bind=f"127.0.0.1:{_free_port()}",
+            session_store=session_store,
+        )
+
+        ctx = runner.initialize()
+        try:
+            service = runner._relay_http_service
+            assert service is not None
+            session = service._create_session_run(
+                "peer-1",
+                "session-admin",
+                mode="capability_package",
+                workflow_mode="capability_package_ingest",
+            )
+            session.enable_trace_persistence("session-admin")
+            session.append_event(
+                "workflow_decision",
+                {
+                    "approval_id": "approval-1",
+                    "tool_name": "install_capability_package",
+                    "tool_call_id": "install-1",
+                    "decision_type": "capability_package_install",
+                },
+            )
+
+            events = session_store.list_trace_events("session-admin")
+            assert [event["type"] for event in events] == ["workflow_decision"]
+            assert events[0]["session_run_id"] == session.session_run_id
+        finally:
+            runner.cleanup(ctx.agent)
+
     def test_remote_relay_uses_configured_peer_token_ttl(
         self, tmp_path: Path
     ) -> None:
