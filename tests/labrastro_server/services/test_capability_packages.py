@@ -1878,6 +1878,13 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     assert approval["sections"][2]["items"][1]["value"] == "Local client"
     assert approval["decision_type"] == "capability_package_install"
     assert approval["review"]["package_id"] == "review"
+    status_approvals = session.status_payload()["approvals"]
+    assert len(status_approvals) == 1
+    assert status_approvals[0]["approval_id"] == approval["approval_id"]
+    assert status_approvals[0]["decision_type"] == "capability_package_install"
+    assert status_approvals[0]["tool_name"] == "install_capability_package"
+    assert status_approvals[0]["review"]["package_id"] == "review"
+    assert status_approvals[0]["state"] == "requested"
     session.append_event("reasoning_delta", {"content": "Installing package."})
     session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
     _wait_for(lambda: session.done)
