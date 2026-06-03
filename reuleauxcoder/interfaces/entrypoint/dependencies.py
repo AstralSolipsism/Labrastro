@@ -20,6 +20,11 @@ from reuleauxcoder.domain.config.models import (
     resolve_agent_environment_requirement_scope_ids,
     resolve_agent_effective_capability_scope,
 )
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDispatcher,
+    default_lifecycle_hook_handlers,
+    lifecycle_registry_from_config,
+)
 from reuleauxcoder.extensions.mcp.manager import MCPManager
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
 from labrastro_server.relay.server import RelayServer
@@ -73,6 +78,7 @@ def _default_load_tools(tool_backend: ToolBackend) -> list[Any]:
 
 def _default_create_agent(llm: LLM, tools: list[Any], config: Config) -> Agent:
     context_tokens = int(resolve_model_runtime(config).max_context_tokens or 0)
+    lifecycle_registry = lifecycle_registry_from_config(config)
     return Agent(
         llm=llm,
         tools=tools,
@@ -80,6 +86,10 @@ def _default_create_agent(llm: LLM, tools: list[Any], config: Config) -> Agent:
         max_context_tokens=max(1, context_tokens),
         available_modes=getattr(config, "modes", {}) or {},
         active_mode=getattr(config, "active_mode", None),
+        lifecycle_dispatcher=LifecycleHookDispatcher(
+            lifecycle_registry,
+            handlers=default_lifecycle_hook_handlers(),
+        ),
     )
 
 
