@@ -56,6 +56,28 @@ def test_mcp_server_config_roundtrip() -> None:
     assert restored.runtime_footprint["user_message"] == "服务端运行，无需本机安装"
 
 
+def test_mcp_server_config_roundtrip_preserves_lifecycle_hooks() -> None:
+    config = MCPServerConfig(
+        name="audit",
+        command="npx",
+        args=["audit-mcp"],
+        hooks=[
+            {
+                "event": "PostToolUse",
+                "handler_type": "mcp_tool",
+                "handler_ref": "audit.record",
+                "display_name": "Audit tool result",
+                "summary": "Record MCP tool results for review.",
+                "permissions": ["audit.write"],
+            }
+        ],
+    )
+
+    restored = MCPServerConfig.from_dict("audit", config.to_dict())
+
+    assert restored.hooks == config.hooks
+
+
 def test_runtime_footprint_for_mcp_uses_local_peer_runtime() -> None:
     config = MCPServerConfig(
         name="edgeone-pages-mcp-server",
@@ -98,6 +120,26 @@ def test_skill_registration_config_roundtrip_preserves_display_fields() -> None:
         "config_required_on": [],
         "user_message": "仅 Agent 指令能力，无需外部进程",
     }
+
+
+def test_skill_registration_config_roundtrip_preserves_lifecycle_hooks() -> None:
+    config = SkillRegistrationConfig(
+        name="code-review",
+        hooks=[
+            {
+                "event": "UserPromptSubmit",
+                "handler_type": "prompt",
+                "handler_ref": "skills/code-review/SKILL.md",
+                "display_name": "Code review prompt context",
+                "summary": "Adds code-review skill context to matching prompts.",
+                "permissions": [],
+            }
+        ],
+    )
+
+    restored = SkillRegistrationConfig.from_dict("code-review", config.to_dict())
+
+    assert restored.hooks == config.hooks
 
 
 def test_runtime_footprint_aggregates_components() -> None:
@@ -174,6 +216,50 @@ def test_capability_package_config_roundtrip_preserves_runtime_footprint() -> No
     restored = CapabilityPackageConfig.from_dict("review", package.to_dict())
 
     assert restored == package
+
+
+def test_capability_component_and_package_config_roundtrip_preserve_lifecycle_hooks() -> None:
+    component = CapabilityComponentConfig(
+        id="skill:review",
+        kind="skill",
+        name="review",
+        hooks=[
+            {
+                "event": "PreToolUse",
+                "handler_type": "agent",
+                "handler_ref": "agent:review-policy",
+                "display_name": "Review tool policy",
+                "summary": "Checks tool use against review policy.",
+                "permissions": [],
+            }
+        ],
+    )
+    package = CapabilityPackageConfig(
+        id="review-pack",
+        components=["skill:review"],
+        hooks=[
+            {
+                "event": "SessionStart",
+                "handler_type": "prompt",
+                "handler_ref": "package:review-pack/session-start",
+                "display_name": "Review package startup",
+                "summary": "Adds review package startup context.",
+                "permissions": [],
+            }
+        ],
+    )
+
+    restored_component = CapabilityComponentConfig.from_dict(
+        "skill:review",
+        component.to_dict(),
+    )
+    restored_package = CapabilityPackageConfig.from_dict(
+        "review-pack",
+        package.to_dict(),
+    )
+
+    assert restored_component.hooks == component.hooks
+    assert restored_package.hooks == package.hooks
 
 
 def test_environment_requirement_config_roundtrip() -> None:
@@ -277,6 +363,13 @@ def test_peer_mcp_server_config_roundtrip() -> None:
     restored = MCPServerConfig.from_dict("filesystem", config.to_dict())
 
     assert restored == config
+    assert restored.placement == "peer"
+    assert restored.runtime_footprint == {
+        "runs_on": "local_peer",
+        "install_required_on": ["local_peer"],
+        "config_required_on": ["local_peer"],
+        "user_message": "需要在本机安装/配置",
+    }
 
 
 def test_legacy_peer_mcp_with_artifacts_defaults_to_artifact_distribution() -> None:
@@ -340,6 +433,12 @@ def test_mcp_server_config_accepts_both_placement() -> None:
     )
 
     assert config.placement == "both"
+    assert config.runtime_footprint == {
+        "runs_on": "both",
+        "install_required_on": ["server", "local_peer"],
+        "config_required_on": ["server", "local_peer"],
+        "user_message": "服务端和本地端都需要配置",
+    }
 
 
 def test_model_profile_config_from_dict_uses_defaults() -> None:

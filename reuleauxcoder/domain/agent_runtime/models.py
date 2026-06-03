@@ -168,6 +168,12 @@ def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
 def _positive_int_or_none(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -320,6 +326,7 @@ class CapabilityComponentConfig:
     execution_policy: str = "inherit"
     registry_path: str = ""
     source_path: str = ""
+    hooks: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.runtime_footprint = runtime_footprint_for_component(self)
@@ -367,6 +374,7 @@ class CapabilityComponentConfig:
             ),
             registry_path=str(data.get("registry_path", "") or ""),
             source_path=str(data.get("source_path", "") or ""),
+            hooks=_dict_list(data.get("hooks", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -394,6 +402,8 @@ class CapabilityComponentConfig:
             result["registry_path"] = self.registry_path
         if self.source_path:
             result["source_path"] = self.source_path
+        if self.hooks:
+            result["hooks"] = [dict(item) for item in self.hooks]
         return result
 
 
@@ -414,6 +424,7 @@ class CapabilityPackageDraft:
     credentials: list[str] = field(default_factory=list)
     risk_level: str = ""
     notes: list[str] = field(default_factory=list)
+    hooks: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, package_id: str, data: dict[str, Any] | None) -> "CapabilityPackageDraft":
@@ -436,6 +447,7 @@ class CapabilityPackageDraft:
             credentials=_string_list(data.get("credentials", [])),
             risk_level=str(data.get("risk_level", "") or ""),
             notes=_string_list(data.get("notes", [])),
+            hooks=_dict_list(data.get("hooks", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -454,6 +466,7 @@ class CapabilityPackageDraft:
             "credentials": list(self.credentials),
             "risk_level": self.risk_level,
             "notes": list(self.notes),
+            "hooks": [dict(item) for item in self.hooks],
         }
 
 
@@ -478,6 +491,7 @@ class CapabilityPackageConfig:
     generated_by: str = "capability_packager"
     notes: list[str] = field(default_factory=list)
     runtime_footprint: dict[str, Any] = field(default_factory=dict)
+    hooks: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.runtime_footprint = normalize_runtime_footprint(
@@ -521,6 +535,7 @@ class CapabilityPackageConfig:
             runtime_footprint=normalize_runtime_footprint(
                 data.get("runtime_footprint", {}),
             ),
+            hooks=_dict_list(data.get("hooks", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -552,6 +567,8 @@ class CapabilityPackageConfig:
         if self.notes:
             result["notes"] = list(self.notes)
         result["runtime_footprint"] = dict(self.runtime_footprint)
+        if self.hooks:
+            result["hooks"] = [dict(item) for item in self.hooks]
         return result
 
 

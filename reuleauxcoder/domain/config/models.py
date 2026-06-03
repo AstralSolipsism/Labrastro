@@ -24,6 +24,7 @@ from reuleauxcoder.domain.memory.registry import (
     MemoryProviderRegistry,
     MemorySourceRegistry,
 )
+from reuleauxcoder.domain.hooks.lifecycle import lifecycle_declarations_from_config_hooks
 from reuleauxcoder.domain.runtime_footprint import (
     normalize_runtime_footprint,
     runtime_footprint_for_environment_requirement,
@@ -876,6 +877,7 @@ class MCPServerConfig:
     component_id: str = ""
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = ""
+    hooks: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.runtime_footprint = runtime_footprint_for_mcp(self)
@@ -922,6 +924,7 @@ class MCPServerConfig:
             "component_id": self.component_id,
             "package_ids": list(self.package_ids),
             "managed_by": self.managed_by,
+            "hooks": [dict(item) for item in self.hooks],
         }
 
     @classmethod
@@ -1014,6 +1017,7 @@ class MCPServerConfig:
             component_id=str(d.get("component_id", "")),
             package_ids=_string_list_config_value(d.get("package_ids", [])),
             managed_by=str(d.get("managed_by", "")),
+            hooks=_dict_list_config_value(d.get("hooks", [])),
         )
 
 
@@ -1159,6 +1163,7 @@ class SkillRegistrationConfig:
     component_id: str = ""
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = "user"
+    hooks: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.runtime_footprint = runtime_footprint_for_skill(self)
@@ -1199,6 +1204,7 @@ class SkillRegistrationConfig:
             component_id=str(data.get("component_id") or ""),
             package_ids=_string_list_config_value(data.get("package_ids", [])),
             managed_by=str(data.get("managed_by") or "user"),
+            hooks=_dict_list_config_value(data.get("hooks", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1226,6 +1232,7 @@ class SkillRegistrationConfig:
             "component_id": self.component_id,
             "package_ids": list(self.package_ids),
             "managed_by": self.managed_by,
+            "hooks": [dict(item) for item in self.hooks],
         }
 
 
@@ -2298,6 +2305,12 @@ def _string_dict_list_config_value(value: Any) -> list[dict[str, str]]:
     return items
 
 
+def _dict_list_config_value(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
 @dataclass
 class Config:
     """Main configuration model for ReuleauxCoder."""
@@ -2396,6 +2409,7 @@ class Config:
             errors.append("tool_output_max_chars must be positive")
         if self.tool_output_max_lines < 1:
             errors.append("tool_output_max_lines must be positive")
+        errors.extend(_validate_lifecycle_hooks_for_config(self))
         if self.memory.runtime.fail_mode not in {"open", "closed"}:
             errors.append("memory.runtime.fail_mode must be one of open, closed")
         if self.memory.runtime.token_budget_default < 1:
@@ -2690,6 +2704,90 @@ class Config:
     def is_valid(self) -> bool:
         """Check if configuration is valid."""
         return len(self.validate()) == 0
+
+
+def _validate_lifecycle_hooks_for_config(config: Config) -> list[str]:
+    errors: list[str] = []
+
+    for name, skill in config.skills.items.items():
+        errors.extend(
+            _validate_owner_lifecycle_hooks(
+                prefix=f"skills.{name}.hooks",
+                owner_id=skill.name or name,
+                source="skill",
+                hooks=skill.hooks,
+                owner_enabled=skill.enabled,
+                owner_status=getattr(skill, "status", "installed"),
+            )
+        )
+
+    for server in config.mcp_servers:
+        errors.extend(
+            _validate_owner_lifecycle_hooks(
+                prefix=f"mcp.servers.{server.name}.hooks",
+                owner_id=server.name,
+                source="mcp_server",
+                hooks=server.hooks,
+                owner_enabled=server.enabled,
+                owner_status=getattr(server, "status", "installed"),
+            )
+        )
+
+    for package_id, package in config.capability_packages.items():
+        errors.extend(
+            _validate_owner_lifecycle_hooks(
+                prefix=f"capability_packages.{package_id}.hooks",
+                owner_id=package.id or package_id,
+                source="capability_package",
+                hooks=package.hooks,
+                owner_enabled=package.enabled,
+                owner_status=package.status,
+            )
+        )
+
+    for component_id, component in config.capability_components.items():
+        errors.extend(
+            _validate_owner_lifecycle_hooks(
+                prefix=f"capability_components.{component_id}.hooks",
+                owner_id=component.id or component_id,
+                source=_component_lifecycle_source(component),
+                hooks=component.hooks,
+                owner_enabled=component.enabled,
+                owner_status=component.status,
+            )
+        )
+
+    return errors
+
+
+def _validate_owner_lifecycle_hooks(
+    *,
+    prefix: str,
+    owner_id: str,
+    source: str,
+    hooks: list[dict[str, Any]],
+    owner_enabled: bool,
+    owner_status: str,
+) -> list[str]:
+    try:
+        lifecycle_declarations_from_config_hooks(
+            owner_id=owner_id,
+            source=source,
+            hooks=hooks,
+            owner_enabled=owner_enabled,
+            owner_status=owner_status,
+        )
+    except Exception as exc:
+        return [f"{prefix}: {exc}"]
+    return []
+
+
+def _component_lifecycle_source(component: CapabilityComponentConfig) -> str:
+    if component.kind == "skill":
+        return "skill"
+    if component.kind in {"mcp", "mcp_server", "mcp_tool"}:
+        return "mcp_server"
+    return "capability_package"
 
 
 @dataclass(frozen=True)
