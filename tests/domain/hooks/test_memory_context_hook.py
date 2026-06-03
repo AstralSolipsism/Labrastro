@@ -33,12 +33,14 @@ class RecordingRuntime:
     def __init__(self) -> None:
         self.scopes: list[MemoryScope] = []
         self.requests: list[MemoryProvideRequest] = []
+        self.policies: list[dict | None] = []
 
     def provide_for_llm_request(
         self, scope: MemoryScope, request: MemoryProvideRequest, *, policy=None
     ) -> MemoryBundle:
         self.scopes.append(scope)
         self.requests.append(request)
+        self.policies.append(policy)
         return MemoryBundle(
             scope=scope,
             fragments=[
@@ -102,6 +104,28 @@ def test_memory_context_hook_injects_after_existing_system_messages() -> None:
     assert runtime.requests[0].query == "What should I remember?"
     assert result.metadata["memory"]["provided_items"] == 1
     assert result.metadata["memory"]["scope_version"] == 7
+
+
+def test_memory_context_hook_delegates_policy_to_runtime() -> None:
+    runtime = RecordingRuntime()
+    hook = MemoryContextHook(runtime=runtime)
+
+    result = hook.run(_context({
+        "owner_agent_id": "agent-a",
+        "memory_namespace": "agent-a",
+        "memory_policy": {
+            "primary_provider": "project-index",
+            "read_providers": ["project-index"],
+            "capture": False,
+        },
+    }))
+
+    assert result.metadata["memory"]["status"] == "provided"
+    assert runtime.policies == [{
+        "primary_provider": "project-index",
+        "read_providers": ["project-index"],
+        "capture": False,
+    }]
 
 
 def test_memory_context_hook_emits_memory_context_event_with_rendered_prompt() -> None:
