@@ -184,6 +184,34 @@ def test_agent_queue_runtime_status_updates_runtime_metadata_without_transcript_
     assert document["parts"] == []
 
 
+def test_lifecycle_hook_event_is_projected_into_transcript_process_items() -> None:
+    document = _session_run_start(None, "运行 hook", 1)
+
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="lifecycle_hook",
+        payload={
+            "phase": "result",
+            "event_name": "PreToolUse",
+            "hook_id": "hook:admin:PreToolUse:0",
+            "display_name": "Tool guard",
+            "decision": "allow",
+            "level": "info",
+        },
+        session_event_seq=2,
+        session_run_id="run-1",
+        session_run_seq=2,
+    )
+
+    part = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert part["type"] == "ui_event"
+    assert part["kind"] == "lifecycle_hook"
+    assert part["title"] == "Tool guard"
+    assert part["payload"]["hook_id"] == "hook:admin:PreToolUse:0"
+    assert part["payload"]["decision"] == "allow"
+
+
 def test_shell_queue_runtime_status_updates_existing_shell_tool_without_view_card() -> None:
     document = _session_run_start(None, "运行命令", 1)
     document = apply_session_event(

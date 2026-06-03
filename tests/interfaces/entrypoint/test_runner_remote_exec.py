@@ -473,9 +473,13 @@ class FakeAgent:
         self._event_handlers.append(handler)
 
     def set_mode(self, mode_name: str) -> None:
+        if mode_name not in self.available_modes:
+            raise ValueError(f"Unknown mode: {mode_name}")
         self.active_mode = mode_name
 
     def chat(self, user_input: str) -> str:
+        for handler in list(self._event_handlers):
+            handler(AgentEvent.session_run_start(user_input))
         self.messages.append({"role": "user", "content": user_input})
         response = self._chat_behavior(self, user_input)
         self.messages.append({"role": "assistant", "content": response})
@@ -1279,6 +1283,44 @@ class TestRunnerRemoteExec:
                 and "REMOTE PEER READY" in event["payload"].get("content", "")
                 for event in events
             )
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_stream_chat_invalid_mode_emits_start_before_error(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(f"127.0.0.1:{port}")
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "hello", "mode": "unknown-mode"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["session_run_id"],
+            )
+
+            assert [event["type"] for event in events[:3]] == [
+                "session_run_start",
+                "error",
+                "session_run_end",
+            ]
+            assert events[0]["payload"]["prompt"] == "hello"
+            assert events[0]["payload"]["mode"] == "unknown-mode"
+            assert events[1]["payload"]["message"] == "Unknown mode: unknown-mode"
         finally:
             runner.cleanup(ctx.agent)
 

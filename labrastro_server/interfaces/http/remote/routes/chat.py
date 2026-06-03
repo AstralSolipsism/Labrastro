@@ -207,19 +207,6 @@ class RemoteChatRoutes:
             mentions=req.mentions,
             initial_prompt=req.prompt,
         )
-        session.append_event(
-            "session_run_start",
-            {
-                "prompt": req.prompt,
-                "mode": req.mode,
-                "workflow_mode": workflow_mode,
-                "taskflow_id": req.taskflow_id,
-                "provider_id": req.provider_id,
-                "model_id": req.model_id,
-                "locale": req.locale,
-                "mentions": req.mentions,
-            },
-        )
         session.mark_running()
 
         def _run_chat() -> None:
@@ -231,6 +218,9 @@ class RemoteChatRoutes:
                         "Remote session run handler failed",
                         extra={"peer_id": peer_id, "session_run_id": session.session_run_id},
                     )
+                    ensure_start = getattr(session, "ensure_session_run_start", None)
+                    if callable(ensure_start):
+                        ensure_start(req.prompt)
                     payload = _session_run_events_handler_error_payload(exc)
                     session.append_event("error", payload)
                     session.append_event(

@@ -163,6 +163,23 @@ def apply_session_event(
         _apply_tool_or_output_event(doc, event_type, payload, meta)
     elif event_type == "runtime_status":
         _apply_runtime_status(doc, payload, meta)
+    elif event_type == "lifecycle_hook":
+        phase = _string(payload, "phase") or "result"
+        event_name = _string(payload, "event_name") or "LifecycleHook"
+        display_name = _string(payload, "display_name")
+        title = display_name or event_name
+        if phase == "dispatch_start":
+            title = f"{title} started"
+        elif phase == "dispatch_failed":
+            title = f"{title} failed"
+        _append_part(doc, _part("lifecycle-hook", "ui_event", meta, {
+            "kind": "lifecycle_hook",
+            "level": _string(payload, "level") or (
+                "error" if _string(payload, "error") else "info"
+            ),
+            "title": title,
+            "payload": payload,
+        }))
     elif event_type == "memory_context" or (
         event_type == "context_event" and _is_memory_payload(payload)
     ):

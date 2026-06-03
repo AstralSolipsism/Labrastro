@@ -4553,6 +4553,7 @@ class TestRemoteRelayHTTPService:
         port = _free_port()
 
         def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            session.append_event("session_run_start", {"prompt": _prompt})
             # Wait long enough so test can force disconnect first.
             session.wait_approval("hold", timeout_sec=2)
 
@@ -4680,6 +4681,15 @@ class TestRemoteRelayHTTPService:
             seen["mode"] = session.mode
             seen["locale"] = session.locale
             seen["mentions"] = session.mentions
+            session.append_event(
+                "session_run_start",
+                {
+                    "prompt": _prompt,
+                    "mode": session.mode,
+                    "locale": session.locale,
+                    "mentions": session.mentions,
+                },
+            )
             session.append_event("session_run_end", {"response": "ok"})
 
         service = RemoteRelayHTTPService(
@@ -4932,6 +4942,7 @@ class TestRemoteRelayHTTPService:
         release_running = threading.Event()
 
         def session_run_events_handler(_peer_id: str, prompt: str, session) -> None:
+            session.append_event("session_run_start", {"prompt": prompt})
             if prompt == "boom":
                 session.append_event("error", {"message": "intentional_failure"})
                 return
@@ -5165,6 +5176,7 @@ class TestRemoteRelayHTTPService:
 
         def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
+                session.append_event("session_run_start", {"prompt": _prompt})
                 session.append_event("delta", {"text": "first"})
                 first_delta_sent.set()
                 release_second_delta.wait(timeout=2)
@@ -5240,6 +5252,7 @@ class TestRemoteRelayHTTPService:
 
         def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
+                session.append_event("session_run_start", {"prompt": _prompt})
                 session.append_event("delta", {"text": "first"})
                 first_delta_sent.set()
                 release_second_delta.wait(timeout=2)
@@ -5408,6 +5421,7 @@ class TestRemoteRelayHTTPService:
 
         def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
             try:
+                session.append_event("session_run_start", {"prompt": _prompt})
                 session.append_event("delta", {"text": "after-reconnect"})
                 session.append_event("session_run_end", {"response": "done"})
             finally:
@@ -7944,6 +7958,7 @@ class TestRemoteRelayHTTPService:
                     "prompt": "hello from fake runtime",
                     "executor": "fake",
                     "execution_location": "daemon_worktree",
+                    "publish_policy": "branch",
                     "metadata": {
                         "repo_url": repo.resolve().as_uri(),
                         "workspace_id": "test-workspace",

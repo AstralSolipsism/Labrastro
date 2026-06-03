@@ -1202,7 +1202,13 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         peer_agent: Agent,
         peer_id: str,
         remote_session: Any,
+        *,
+        ensure_session_run_start: Callable[[], None] | None = None,
     ) -> bool:
+        def _ensure_start() -> None:
+            if callable(ensure_session_run_start):
+                ensure_session_run_start()
+
         provider_id = str(getattr(remote_session, "provider_id", "") or "").strip()
         model_id = str(getattr(remote_session, "model_id", "") or "").strip()
         parameters = getattr(remote_session, "model_parameters", None)
@@ -1211,6 +1217,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         if not provider_id and not model_id:
             return True
         if not provider_id or not model_id:
+            _ensure_start()
             remote_session.append_event(
                 "error",
                 {
@@ -1223,6 +1230,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             return False
         current_config = _current_config()
         if current_config is None:
+            _ensure_start()
             remote_session.append_event("error", {"message": "config_unavailable"})
             remote_session.append_event("session_run_end", {"response": ""})
             return False
@@ -1243,6 +1251,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             },
         )
         if not result.get("ok"):
+            _ensure_start()
             remote_session.append_event(
                 "error",
                 {
@@ -1268,6 +1277,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 parameters=parameters,
             )
         except Exception as exc:
+            _ensure_start()
             remote_session.append_event(
                 "error",
                 {
@@ -1458,6 +1468,28 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         )
 
     def _stream_session_run(peer_id: str, prompt: str, remote_session) -> None:
+        def _ensure_session_run_start() -> None:
+            ensure_start = getattr(remote_session, "ensure_session_run_start", None)
+            if callable(ensure_start):
+                ensure_start(prompt)
+                return
+            events = getattr(remote_session, "events", [])
+            if any(event.get("type") == "session_run_start" for event in events):
+                return
+            remote_session.append_event(
+                "session_run_start",
+                {
+                    "prompt": prompt,
+                    "mode": getattr(remote_session, "mode", None),
+                    "workflow_mode": getattr(remote_session, "workflow_mode", None),
+                    "taskflow_id": getattr(remote_session, "taskflow_id", None),
+                    "provider_id": getattr(remote_session, "provider_id", None),
+                    "model_id": getattr(remote_session, "model_id", None),
+                    "locale": getattr(remote_session, "locale", None),
+                    "mentions": getattr(remote_session, "mentions", []),
+                },
+            )
+
         peer_agent = _create_peer_agent(
             peer_id,
             session_hint=getattr(remote_session, "session_hint", None),
@@ -1473,6 +1505,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     if current_config is not None:
                         apply_agent_default_model(current_config, peer_agent)
             except ValueError as exc:
+                _ensure_session_run_start()
                 remote_session.append_event(
                     "error",
                     {
@@ -1508,7 +1541,12 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             )
         else:
             _bind_main_chat_account_memory_scope(peer_agent, peer_id)
-        if not _apply_remote_session_run_model_override(peer_agent, peer_id, remote_session):
+        if not _apply_remote_session_run_model_override(
+            peer_agent,
+            peer_id,
+            remote_session,
+            ensure_session_run_start=_ensure_session_run_start,
+        ):
             return
         remote_session.set_cancel_callback(
             lambda reason: (
@@ -1562,6 +1600,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 on_wait=_emit_runtime_status,
             )
         except AgentRunCancelled:
+            _ensure_session_run_start()
             remote_session.append_event(
                 "session_run_cancelled",
                 {"reason": getattr(remote_session, "cancel_reason", "user_cancelled")},
@@ -1603,6 +1642,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             command_response = _dispatch_vscode_command(
                 peer_agent, peer_id, prompt
             )
+            _ensure_session_run_start()
             for event in command_response.events:
                 remote_session.append_event(
                     str(event.get("type") or "output"),
@@ -2026,6 +2066,21 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             backend.context.remote_stream_handler = _on_remote_stream
 
         def _on_agent_event(event: AgentEvent) -> None:
+            if event.event_type == AgentEventType.SESSION_RUN_START:
+                remote_session.append_event(
+                    "session_run_start",
+                    {
+                        "prompt": event.data.get("user_input") or prompt,
+                        "mode": getattr(remote_session, "mode", None),
+                        "workflow_mode": getattr(remote_session, "workflow_mode", None),
+                        "taskflow_id": getattr(remote_session, "taskflow_id", None),
+                        "provider_id": getattr(remote_session, "provider_id", None),
+                        "model_id": getattr(remote_session, "model_id", None),
+                        "locale": getattr(remote_session, "locale", None),
+                        "mentions": getattr(remote_session, "mentions", []),
+                    },
+                )
+                return
             if event.event_type == AgentEventType.STREAM_TOKEN:
                 content = event.data.get("token", "")
                 if content:
@@ -2049,6 +2104,9 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 return
             if event.event_type == AgentEventType.RUNTIME_STATUS:
                 remote_session.append_event("runtime_status", event.data)
+                return
+            if event.event_type == AgentEventType.LIFECYCLE_HOOK:
+                remote_session.append_event("lifecycle_hook", event.data)
                 return
             if event.event_type == AgentEventType.SESSION_RUN_END:
                 response = event.data.get("response", "")

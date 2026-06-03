@@ -414,6 +414,28 @@ class _RemoteSessionRun:
             self.cond.notify_all()
             return seq
 
+    def has_event_type(self, event_type: str) -> bool:
+        with self.cond:
+            self._flush_live_events_locked(time.time(), force=True)
+            return any(event.get("type") == event_type for event in self._event_buffer.snapshot())
+
+    def ensure_session_run_start(self, prompt: str | None = None) -> int | None:
+        if self.has_event_type("session_run_start"):
+            return None
+        return self.append_event(
+            "session_run_start",
+            {
+                "prompt": prompt if prompt is not None else self.initial_prompt or "",
+                "mode": self.mode,
+                "workflow_mode": self.workflow_mode,
+                "taskflow_id": self.taskflow_id,
+                "provider_id": self.provider_id,
+                "model_id": self.model_id,
+                "locale": self.locale,
+                "mentions": list(self.mentions),
+            },
+        )
+
     def _append_event_locked(self, event_type: str, payload: dict[str, Any]) -> int:
         seq = self.seq_next
         self.seq_next += 1
