@@ -10,7 +10,7 @@ def load_yaml_config(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     return data or {}
@@ -20,7 +20,7 @@ def save_yaml_config(path: Path, data: dict) -> None:
     """Save data to a YAML configuration file."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
 
