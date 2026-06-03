@@ -3,7 +3,14 @@
 from types import SimpleNamespace
 
 from reuleauxcoder.domain.approval import ApprovalDecision
+from reuleauxcoder.domain.agent.events import AgentEventType
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDeclaration,
+    LifecycleHookDispatchResult,
+    LifecycleHookEventContext,
+    LifecycleHookOutput,
+)
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
@@ -78,6 +85,22 @@ class _CaptureTool:
 
     def preflight_validate(self, **kwargs) -> str | None:  # noqa: ARG002
         return None
+
+
+def _lifecycle_declaration(event_name: str) -> LifecycleHookDeclaration:
+    return LifecycleHookDeclaration.from_dict(
+        f"hook:{event_name}",
+        {
+            "event": event_name,
+            "source": "admin_managed",
+            "placement": "server",
+            "handler_type": "command",
+            "display_name": f"{event_name} hook",
+            "summary": f"Test hook for {event_name}.",
+            "permissions": [],
+            "trust": "trusted",
+        },
+    )
 
 
 def test_shell_cwd_syncs_to_runtime_working_directory() -> None:
@@ -287,6 +310,365 @@ def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
     )
 
 
+def test_tool_executor_applies_pre_tool_lifecycle_update_then_reevaluates_permission() -> None:
+    class CaptureTool:
+        description = "Capture"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+            self.declaration = _lifecycle_declaration("PreToolUse")
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            if context.event_name != "PreToolUse":
+                return []
+            updated_input = dict(context.payload)
+            updated_input["tool_call"] = {
+                "id": "call-transformed",
+                "name": "write_file",
+                "arguments": {},
+            }
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(updated_input=updated_input),
+                )
+            ]
+
+    class LifecycleAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.permission_tool_call_ids: list[str] = []
+            self.lifecycle_dispatcher = LifecycleDispatcher()
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            self.permission_tool_call_ids.append(getattr(tool_call, "id", ""))
+            if getattr(tool, "name", "") == "write_file":
+                return PermissionDecision(
+                    action=PermissionAction.DENY,
+                    authorized=False,
+                    reason="write_file denied after lifecycle update",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = LifecycleAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == (
+        "Error: tool 'write_file' denied by permission gateway: "
+        "write_file denied after lifecycle update"
+    )
+    assert agent.lifecycle_dispatcher.contexts[0].event_name == "PreToolUse"
+    assert (
+        agent.lifecycle_dispatcher.contexts[0].payload["technical"]["tool_call"]["name"]
+        == "read_file"
+    )
+    assert agent.lifecycle_dispatcher.contexts[0].payload["tool_names"] == ["read_file"]
+    assert agent.lifecycle_dispatcher.contexts[0].payload["tool_call_ids"] == ["call-original"]
+    assert agent.lifecycle_dispatcher.contexts[0].payload["tool_sources"] == ["builtin"]
+    assert agent.lifecycle_dispatcher.contexts[0].payload["mcp_servers"] == []
+    assert agent.permission_tool_call_ids == ["call-original"]
+    for legacy_field in (
+        "tool_" + "name",
+        "tool_" + "call_id",
+        "tool_" + "source",
+        "mcp_" + "server",
+    ):
+        assert legacy_field not in agent.lifecycle_dispatcher.contexts[0].payload
+
+
+def test_tool_executor_does_not_apply_permission_before_pre_tool_lifecycle_update() -> None:
+    class CaptureTool:
+        description = "Capture"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return f"executed:{self.name}"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.declaration = _lifecycle_declaration("PreToolUse")
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            if context.event_name != "PreToolUse":
+                return []
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(
+                        updated_input={
+                            "tool_call": {
+                                "id": "call-transformed",
+                                "name": "read_file",
+                                "arguments": {},
+                            }
+                        }
+                    ),
+                )
+            ]
+
+    class LifecycleAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("write_file"))
+            self._tools = {
+                "write_file": CaptureTool("write_file"),
+                "read_file": CaptureTool("read_file"),
+            }
+            self.permission_checks = []
+            self.lifecycle_dispatcher = LifecycleDispatcher()
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            tool_name = getattr(tool, "name", "")
+            self.permission_checks.append(tool_name)
+            if tool_name == "write_file":
+                return PermissionDecision(
+                    action=PermissionAction.DENY,
+                    authorized=False,
+                    reason="write_file denied before lifecycle update",
+                )
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = LifecycleAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="write_file", arguments={})
+    )
+
+    assert result == "executed:read_file"
+    assert agent.permission_checks == ["read_file"]
+    assert agent._tools["write_file"].executed is False
+    assert agent._tools["read_file"].executed is True
+
+
+def test_tool_executor_emits_lifecycle_hook_observation_events() -> None:
+    class CaptureTool:
+        name = "read_file"
+        description = "Read a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "ok"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.declaration = _lifecycle_declaration("PreToolUse")
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            if context.event_name != "PreToolUse":
+                return []
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(decision="allow"),
+                )
+            ]
+
+    class LifecycleAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool())
+            self.events = []
+            self.lifecycle_dispatcher = LifecycleDispatcher()
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = LifecycleAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-read", name="read_file", arguments={})
+    )
+
+    assert result == "ok"
+    lifecycle_events = [
+        event for event in agent.events
+        if event.event_type == AgentEventType.LIFECYCLE_HOOK
+    ]
+    assert [event.data["phase"] for event in lifecycle_events[:2]] == [
+        "dispatch_start",
+        "result",
+    ]
+    assert lifecycle_events[0].data["event_name"] == "PreToolUse"
+    assert lifecycle_events[1].data["hook_id"] == "hook:PreToolUse"
+    assert lifecycle_events[1].data["decision"] == "allow"
+
+
+def test_tool_executor_dispatches_post_tool_lifecycle_with_result_payload() -> None:
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            return []
+
+    tool = SimpleNamespace(
+        name="read_file",
+        parameters={},
+        tool_source="builtin",
+        execute=lambda **kwargs: "file content",
+        preflight_validate=lambda **kwargs: None,
+    )
+    agent = _AgentStub(tool)
+    agent.lifecycle_dispatcher = LifecycleDispatcher()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-read", name="read_file", arguments={})
+    )
+
+    assert result == "file content"
+    assert [context.event_name for context in agent.lifecycle_dispatcher.contexts] == [
+        "PreToolUse",
+        "PostToolUse",
+    ]
+    post_context = agent.lifecycle_dispatcher.contexts[1]
+    assert post_context.payload["technical"]["tool_call"]["name"] == "read_file"
+    assert post_context.payload["tool_names"] == ["read_file"]
+    assert post_context.payload["tool_call_ids"] == ["call-read"]
+    assert post_context.payload["tool_sources"] == ["builtin"]
+    assert post_context.payload["mcp_servers"] == []
+    assert post_context.payload["technical"]["result"] == "file content"
+
+
+def test_tool_executor_dispatches_post_tool_failure_lifecycle_on_execution_error() -> None:
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            return []
+
+    def _raise_error(**kwargs) -> str:  # noqa: ARG001
+        raise RuntimeError("boom")
+
+    tool = SimpleNamespace(
+        name="read_file",
+        parameters={},
+        tool_source="builtin",
+        execute=_raise_error,
+        preflight_validate=lambda **kwargs: None,
+    )
+    agent = _AgentStub(tool)
+    agent.lifecycle_dispatcher = LifecycleDispatcher()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-read", name="read_file", arguments={})
+    )
+
+    assert result == "Error executing read_file: boom"
+    assert [context.event_name for context in agent.lifecycle_dispatcher.contexts] == [
+        "PreToolUse",
+        "PostToolUseFailure",
+    ]
+    failure_context = agent.lifecycle_dispatcher.contexts[1]
+    assert failure_context.payload["technical"]["tool_call"]["name"] == "read_file"
+    assert failure_context.payload["tool_names"] == ["read_file"]
+    assert failure_context.payload["tool_call_ids"] == ["call-read"]
+    assert failure_context.payload["tool_sources"] == ["builtin"]
+    assert failure_context.payload["mcp_servers"] == []
+    assert failure_context.payload["technical"]["error"]["message"] == "boom"
+    assert failure_context.payload["technical"]["error"]["type"] == "RuntimeError"
+
+
+def test_tool_executor_dispatches_post_tool_batch_lifecycle_after_parallel_execution() -> None:
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            return []
+
+    tool = SimpleNamespace(
+        name="read_file",
+        parameters={},
+        tool_source="builtin",
+        execute=lambda **kwargs: f"file {kwargs.get('file_path', '')}",
+        preflight_validate=lambda **kwargs: None,
+    )
+    agent = _AgentStub(tool)
+    agent.lifecycle_dispatcher = LifecycleDispatcher()
+
+    results = ToolExecutor(agent).execute_parallel(
+        [
+            ToolCall(id="call-a", name="read_file", arguments={"file_path": "a.txt"}),
+            ToolCall(id="call-b", name="read_file", arguments={"file_path": "b.txt"}),
+        ]
+    )
+
+    assert results == ["file a.txt", "file b.txt"]
+    assert agent.lifecycle_dispatcher.contexts[-1].event_name == "PostToolBatch"
+    batch_payload = agent.lifecycle_dispatcher.contexts[-1].payload
+    assert [item["id"] for item in batch_payload["technical"]["tool_calls"]] == ["call-a", "call-b"]
+    assert batch_payload["technical"]["results"] == ["file a.txt", "file b.txt"]
+    assert batch_payload["event_name"] == "PostToolBatch"
+    assert batch_payload["placement"] == "server"
+    assert batch_payload["tool_names"] == ["read_file", "read_file"]
+    assert batch_payload["tool_call_ids"] == ["call-a", "call-b"]
+    assert batch_payload["tool_sources"] == ["builtin", "builtin"]
+    assert batch_payload["mcp_servers"] == []
+    assert batch_payload["trigger_source"] == "chat"
+
+
 def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> None:
     class CaptureTool:
         description = "Write a file"
@@ -309,6 +691,7 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
                 "read_file": CaptureTool("read_file"),
                 "write_file": CaptureTool("write_file"),
             }
+            self.permission_tool_call_ids: list[str] = []
             self.hook_registry = SimpleNamespace(
                 run_guards=lambda point, ctx: [],
                 run_transforms=self._transform,
@@ -323,6 +706,7 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            self.permission_tool_call_ids.append(getattr(tool_call, "id", ""))
             if getattr(tool, "name", "") == "write_file":
                 return PermissionDecision(
                     action=PermissionAction.DENY,
@@ -341,7 +725,63 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
     )
 
 
-def test_tool_executor_reevaluates_permission_after_in_place_argument_transform() -> None:
+def test_legacy_tool_transform_cannot_rewrite_provider_tool_call_id() -> None:
+    class CaptureTool:
+        description = "Capture"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "executed"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.permission_tool_call_ids: list[str] = []
+            self.end_tool_call_ids: list[str] = []
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            self.permission_tool_call_ids.append(getattr(tool_call, "id", ""))
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+        def _emit_event(self, event) -> None:
+            if event.event_type == AgentEventType.TOOL_CALL_END:
+                self.end_tool_call_ids.append(event.tool_call_id or "")
+
+    agent = TransformingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result == "executed"
+    assert agent.permission_tool_call_ids == ["call-original"]
+    assert agent.end_tool_call_ids == ["call-original"]
+
+
+def test_tool_executor_evaluates_permission_after_in_place_argument_transform() -> None:
     class CaptureTool:
         name = "read_file"
         description = "Read a file"
@@ -397,7 +837,7 @@ def test_tool_executor_reevaluates_permission_after_in_place_argument_transform(
         "Error: tool 'read_file' denied by permission gateway: "
         "private path denied after transform"
     )
-    assert agent.permission_checks == ["/tmp/ok.txt", "/private/secret.txt"]
+    assert agent.permission_checks == ["/private/secret.txt"]
     assert agent.tool.executed is False
 
 
@@ -551,7 +991,7 @@ def test_tool_executor_rejects_shell_without_intent_before_approval() -> None:
     assert agent.approval_provider.requests == []
 
 
-def test_tool_executor_reapproves_when_transform_changes_arguments_after_approval() -> None:
+def test_tool_executor_requests_approval_for_final_arguments_after_transform() -> None:
     class CaptureTool:
         name = "write_file"
         description = "Write a file"
@@ -609,13 +1049,12 @@ def test_tool_executor_reapproves_when_transform_changes_arguments_after_approva
 
     assert result == "executed:/tmp/after.txt"
     assert [request.tool_args for request in agent.approval_provider.requests] == [
-        {"file_path": "/tmp/before.txt"},
         {"file_path": "/tmp/after.txt"},
     ]
     assert agent.tool.received == {"file_path": "/tmp/after.txt"}
 
 
-def test_tool_executor_reapproves_when_transform_changes_tool_after_approval() -> None:
+def test_tool_executor_requests_approval_for_final_tool_after_transform() -> None:
     class CaptureTool:
         description = "Capture"
         parameters = {}
@@ -675,7 +1114,6 @@ def test_tool_executor_reapproves_when_transform_changes_tool_after_approval() -
 
     assert result == "executed:write_file"
     assert [request.tool_name for request in agent.approval_provider.requests] == [
-        "read_file",
         "write_file",
     ]
     assert agent._tools["read_file"].executed is False
@@ -853,6 +1291,147 @@ def test_tool_executor_executes_transformed_tool_when_permission_allows() -> Non
     )
 
     assert result == "executed:write_file"
-    assert agent.permission_checks == ["read_file", "write_file"]
+    assert agent.permission_checks == ["write_file"]
     assert agent._tools["read_file"].executed is False
     assert agent._tools["write_file"].executed is True
+
+
+def test_tool_executor_revalidates_lifecycle_updated_tool_arguments_before_execution() -> None:
+    class ReadTool:
+        name = "read_file"
+        description = "Read a file"
+        parameters = {}
+        tool_source = "builtin"
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class CaptureTool:
+        description = "Write a file"
+        parameters = {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["file_path", "content"],
+        }
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.declaration = _lifecycle_declaration("PreToolUse")
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            if context.event_name != "PreToolUse":
+                return []
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(
+                        updated_input={
+                            "tool_call": {
+                                "id": "call-transformed",
+                                "name": "write_file",
+                                "arguments": {"file_path": "/tmp/out.txt"},
+                            }
+                        }
+                    ),
+                )
+            ]
+
+    class LifecycleAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(ReadTool())
+            self._tools = {
+                "read_file": ReadTool(),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.lifecycle_dispatcher = LifecycleDispatcher()
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = LifecycleAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={})
+    )
+
+    assert result.startswith("Error: bad arguments for write_file: invalid arguments")
+    assert "$.content: expected string, got missing" in result
+    assert agent._tools["write_file"].executed is False
+
+
+def test_tool_executor_reruns_preflight_after_legacy_tool_call_transform() -> None:
+    class WriteTool:
+        name = "write_file"
+        description = "Write a file"
+        parameters = {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        }
+        tool_source = "builtin"
+
+        def __init__(self) -> None:
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> str | None:
+            if kwargs.get("file_path") == "/blocked.txt":
+                return "blocked path"
+            return None
+
+    class TransformingAgent(_AgentStub):
+        def __init__(self) -> None:
+            self.tool = WriteTool()
+            super().__init__(self.tool)
+            self.hook_registry = SimpleNamespace(
+                run_guards=lambda point, ctx: [],
+                run_transforms=self._transform,
+                run_observers=lambda point, ctx: None,
+            )
+
+        def _transform(self, _point, ctx):
+            ctx.tool_call.arguments["file_path"] = "/blocked.txt"
+            return ctx
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = TransformingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call-original",
+            name="write_file",
+            arguments={"file_path": "/allowed.txt"},
+        )
+    )
+
+    assert result == "blocked path"
+    assert agent.tool.executed is False
