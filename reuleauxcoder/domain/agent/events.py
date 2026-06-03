@@ -23,6 +23,7 @@ class AgentEventType(Enum):
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
+    LIFECYCLE_HOOK = "lifecycle_hook"
     PROVIDER_STREAM_INTERRUPTED = "provider_stream_interrupted"
     PROVIDER_STREAM_RECOVERING = "provider_stream_recovering"
     PROVIDER_STREAM_RECOVERED = "provider_stream_recovered"
@@ -188,6 +189,14 @@ class AgentEvent:
             tool_call_id=tool_call_id,
             data=payload,
             error_message=message,
+        )
+
+    @classmethod
+    def lifecycle_hook(cls, payload: dict[str, Any]) -> "AgentEvent":
+        """Create a canonical lifecycle hook observation event."""
+        return cls(
+            event_type=AgentEventType.LIFECYCLE_HOOK,
+            data=dict(payload),
         )
 
     @classmethod

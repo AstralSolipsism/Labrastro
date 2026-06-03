@@ -139,6 +139,39 @@ def test_mcp_tool_allowed_by_server_or_tool_capability() -> None:
     assert tool_decision.capability_matched == "mcp_tool:search"
 
 
+def test_mcp_tool_user_review_policy_blocks_background_runs() -> None:
+    request = _request(
+        subject=_subject(
+            agent_id="capability_packager",
+            trigger_source="capability_ingest",
+            interactive=False,
+        ),
+        target=PermissionTarget(
+            kind="mcp_tool",
+            name="search",
+            tool_source="mcp",
+            mcp_server="github",
+        ),
+        tool_call=ToolCall(id="call-mcp", name="search", arguments={}),
+        effective_capabilities={
+            "mcp_servers": ["github"],
+            "tools": ["mcp:github"],
+            "execution_policies": [
+                {"target": "mcp:github", "policy": "require_user"},
+            ],
+        },
+        approval=ApprovalConfig(default_mode="allow"),
+    )
+
+    decision = PermissionGateway().evaluate(request)
+
+    assert decision.action == PermissionAction.BLOCKED_REVIEW
+    assert decision.authorized is False
+    assert decision.capability_matched == "mcp:github"
+    assert decision.policy_matched == "execution_policy:require_user"
+    assert decision.audit["mcp_server"] == "github"
+
+
 def test_execution_policy_deny_overrides_approval_allow() -> None:
     decision = PermissionGateway().evaluate(
         _request(
@@ -161,6 +194,80 @@ def test_execution_policy_deny_overrides_approval_allow() -> None:
 
     assert decision.action == PermissionAction.DENY
     assert decision.policy_matched == "execution_policy:deny"
+
+
+def test_lifecycle_allow_cannot_override_gateway_deny() -> None:
+    decision = PermissionGateway().evaluate(
+        _request(
+            effective_capabilities={"tools": ["builtin:grep"]},
+            lifecycle_outputs=[
+                {
+                    "hook_id": "hook:allow-read",
+                    "display_name": "Allow read",
+                    "decision": "allow",
+                    "reason": "lifecycle wants to allow",
+                }
+            ],
+        )
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert "effective_capabilities" in decision.reason
+
+
+def test_lifecycle_deny_is_resolved_by_permission_gateway() -> None:
+    decision = PermissionGateway().evaluate(
+        _request(
+            lifecycle_outputs=[
+                {
+                    "hook_id": "hook:block-sensitive-read",
+                    "display_name": "Sensitive read guard",
+                    "decision": "deny",
+                    "reason": "blocked by lifecycle policy",
+                }
+            ],
+        )
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert decision.reason == "blocked by lifecycle policy"
+    assert decision.policy_matched == "lifecycle_hook:deny"
+    assert decision.audit["lifecycle_hooks"][0]["hook_id"] == "hook:block-sensitive-read"
+
+
+def test_lifecycle_ask_uses_existing_interactive_and_background_review_boundary() -> None:
+    request = _request(
+        lifecycle_outputs=[
+            {
+                "hook_id": "hook:ask-before-shell",
+                "display_name": "Shell review",
+                "decision": "ask",
+                "reason": "shell requires lifecycle review",
+            }
+        ],
+        effective_capabilities={"tools": ["builtin:shell"]},
+        target=_target(name="shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    interactive = PermissionGateway().evaluate(request)
+    background = PermissionGateway().evaluate(
+        replace(
+            request,
+            subject=_subject(
+                agent_id="worker",
+                trigger_source="taskflow",
+                interactive=False,
+            ),
+        )
+    )
+
+    assert interactive.action == PermissionAction.REQUIRE_APPROVAL
+    assert interactive.policy_matched == "lifecycle_hook:ask"
+    assert background.action == PermissionAction.BLOCKED_REVIEW
+    assert background.policy_matched == "lifecycle_hook:ask"
 
 
 def test_require_user_policy_becomes_approval_for_chat_and_blocked_review_for_background() -> None:

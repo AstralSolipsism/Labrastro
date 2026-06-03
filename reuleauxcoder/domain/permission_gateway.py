@@ -71,6 +71,7 @@ class PermissionRequest:
     target_agent_config: AgentConfig | None = None
     enforce_effective_capabilities: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    lifecycle_outputs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -138,29 +139,39 @@ class PermissionGateway:
             if hard_decision.action == PermissionAction.WARN:
                 warnings.append(hard_decision.warning or hard_decision.reason)
             elif hard_decision.action != PermissionAction.ALLOW:
-                return hard_decision
+                return self._with_lifecycle_audit(request, hard_decision)
 
         agent_decision = self._evaluate_agent_boundary(request)
         if agent_decision.action != PermissionAction.ALLOW:
-            return agent_decision
+            return self._with_lifecycle_audit(request, agent_decision)
 
         mode_decision = self._evaluate_mode_policy(request)
         if mode_decision is not None:
-            return mode_decision
+            return self._with_lifecycle_audit(request, mode_decision)
 
         capability_matched = ""
         if request.enforce_effective_capabilities:
             capability_matched = self._capability_match(request)
             if not capability_matched:
-                return PermissionDecision(
-                    action=PermissionAction.DENY,
-                    authorized=False,
-                    reason=(
-                        f"{request.target.kind} '{request.target.name}' is not "
-                        "authorized by this Agent's effective_capabilities"
+                return self._with_lifecycle_audit(
+                    request,
+                    PermissionDecision(
+                        action=PermissionAction.DENY,
+                        authorized=False,
+                        reason=(
+                            f"{request.target.kind} '{request.target.name}' is not "
+                            "authorized by this Agent's effective_capabilities"
+                        ),
+                        audit=self._audit(request),
                     ),
-                    audit=self._audit(request),
                 )
+
+        lifecycle_decision = self._evaluate_lifecycle_outputs(
+            request,
+            capability_matched=capability_matched,
+        )
+        if lifecycle_decision is not None:
+            return self._with_lifecycle_audit(request, lifecycle_decision)
 
         policy_decision = self._evaluate_execution_policy(
             request,
@@ -168,7 +179,7 @@ class PermissionGateway:
             warnings=warnings,
         )
         if policy_decision is not None:
-            return policy_decision
+            return self._with_lifecycle_audit(request, policy_decision)
 
         approval_decision = self._evaluate_approval(
             request,
@@ -176,7 +187,7 @@ class PermissionGateway:
             warnings=warnings,
         )
         if approval_decision is not None:
-            return approval_decision
+            return self._with_lifecycle_audit(request, approval_decision)
 
         runtime_decision = self._evaluate_runtime_profile_default(
             request,
@@ -184,21 +195,27 @@ class PermissionGateway:
             warnings=warnings,
         )
         if runtime_decision is not None:
-            return runtime_decision
+            return self._with_lifecycle_audit(request, runtime_decision)
 
         if warnings:
-            return PermissionDecision(
-                action=PermissionAction.WARN,
+            return self._with_lifecycle_audit(
+                request,
+                PermissionDecision(
+                    action=PermissionAction.WARN,
+                    authorized=True,
+                    warning="; ".join(item for item in warnings if item),
+                    capability_matched=capability_matched,
+                    audit=self._audit(request),
+                ),
+            )
+        return self._with_lifecycle_audit(
+            request,
+            PermissionDecision(
+                action=PermissionAction.ALLOW,
                 authorized=True,
-                warning="; ".join(item for item in warnings if item),
                 capability_matched=capability_matched,
                 audit=self._audit(request),
-            )
-        return PermissionDecision(
-            action=PermissionAction.ALLOW,
-            authorized=True,
-            capability_matched=capability_matched,
-            audit=self._audit(request),
+            ),
         )
 
     def evaluate_agent_invocation(
@@ -542,6 +559,49 @@ class PermissionGateway:
                 return policy
         return None
 
+    def _evaluate_lifecycle_outputs(
+        self,
+        request: PermissionRequest,
+        *,
+        capability_matched: str,
+    ) -> PermissionDecision | None:
+        for output in request.lifecycle_outputs:
+            if not isinstance(output, dict):
+                continue
+            decision = str(output.get("decision") or "none").strip().lower()
+            if bool(output.get("continue_flow", True)) is False and decision in {
+                "",
+                "allow",
+                "defer",
+                "none",
+            }:
+                decision = "deny"
+            if decision == "deny":
+                reason = _lifecycle_reason(
+                    output,
+                    fallback=f"{request.target.name} denied by lifecycle hook",
+                )
+                return PermissionDecision(
+                    action=PermissionAction.DENY,
+                    authorized=False,
+                    reason=reason,
+                    capability_matched=capability_matched,
+                    policy_matched="lifecycle_hook:deny",
+                    audit=self._audit(request),
+                )
+            if decision == "ask":
+                reason = _lifecycle_reason(
+                    output,
+                    fallback=f"{request.target.name} requires lifecycle review",
+                )
+                return self._approval_or_background_block(
+                    request,
+                    reason=reason,
+                    capability_matched=capability_matched,
+                    policy_matched="lifecycle_hook:ask",
+                )
+        return None
+
     def _approval_or_background_block(
         self,
         request: PermissionRequest,
@@ -592,7 +652,23 @@ class PermissionGateway:
             audit["mcp_server"] = request.target.mcp_server
         if policy:
             audit["execution_policy"] = dict(policy)
+        lifecycle_audit = _lifecycle_audit(request.lifecycle_outputs)
+        if lifecycle_audit:
+            audit["lifecycle_hooks"] = lifecycle_audit
         return audit
+
+    @staticmethod
+    def _with_lifecycle_audit(
+        request: PermissionRequest,
+        decision: PermissionDecision,
+    ) -> PermissionDecision:
+        lifecycle_audit = _lifecycle_audit(request.lifecycle_outputs)
+        if not lifecycle_audit:
+            return decision
+        audit = dict(decision.audit or {})
+        audit.setdefault("lifecycle_hooks", lifecycle_audit)
+        decision.audit = audit
+        return decision
 
 
 def _string_set(value: Any) -> set[str]:
@@ -659,6 +735,35 @@ def _target_candidates(target: PermissionTarget) -> set[str]:
     if target.mcp_tool:
         values.add(f"mcp_tool:{target.mcp_tool}")
     return {value for value in values if value}
+
+
+def _lifecycle_reason(output: dict[str, Any], *, fallback: str) -> str:
+    for key in ("reason", "user_message"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
+
+
+def _lifecycle_audit(outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    audit: list[dict[str, Any]] = []
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
+        item = {
+            "hook_id": str(output.get("hook_id") or "").strip(),
+            "display_name": str(output.get("display_name") or "").strip(),
+            "source": str(output.get("source") or "").strip(),
+            "decision": str(output.get("decision") or "none").strip(),
+        }
+        reason = output.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            item["reason"] = reason.strip()
+        diagnostics = output.get("diagnostics")
+        if isinstance(diagnostics, list) and diagnostics:
+            item["diagnostics"] = list(diagnostics)
+        audit.append(item)
+    return audit
 
 
 def _executable_requirement_match(value: object, name: str) -> str:

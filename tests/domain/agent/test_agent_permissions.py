@@ -10,6 +10,13 @@ from reuleauxcoder.domain.config.models import (
     Config,
     ModeConfig,
 )
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDeclaration,
+    LifecycleHookDispatchResult,
+    LifecycleHookEventContext,
+    LifecycleHookOutput,
+)
+from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction
 
 
@@ -110,3 +117,173 @@ def test_manual_agent_requires_approval_by_default() -> None:
     decision = agent.evaluate_tool_permission(_Tool("shell"))
 
     assert decision.action == PermissionAction.REQUIRE_APPROVAL
+
+
+def test_agent_dispatches_permission_request_lifecycle_before_gateway_decision() -> None:
+    class _LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+            self.declaration = LifecycleHookDeclaration.from_dict(
+                "hook:block-shell",
+                {
+                    "event": "PermissionRequest",
+                    "source": "admin_managed",
+                    "placement": "server",
+                    "handler_type": "command",
+                    "display_name": "Shell guard",
+                    "summary": "Require lifecycle review before shell tools run.",
+                    "permissions": [],
+                    "trust": "trusted",
+                },
+            )
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(
+                        decision="deny",
+                        reason="shell blocked by lifecycle",
+                    ),
+                )
+            ]
+
+    dispatcher = _LifecycleDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+    setattr(agent, "current_session_id", "session-1")
+    setattr(agent, "effective_capabilities", {"tools": ["builtin:shell"]})
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "lifecycle_hook:deny"
+    assert dispatcher.contexts[0].event_name == "PermissionRequest"
+    assert dispatcher.contexts[0].placement == "server"
+    assert dispatcher.contexts[0].session_run_id == "session-1"
+    technical = dispatcher.contexts[0].payload["technical"]
+    assert technical["subject"]["trigger_source"] == "chat"
+    assert technical["target"]["name"] == "shell"
+    assert technical["tool_call"]["name"] == "shell"
+
+
+def test_permission_request_lifecycle_exposes_standard_tool_matcher_fields() -> None:
+    class _LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+            self.declaration = LifecycleHookDeclaration.from_dict(
+                "hook:admin:shell-permission:PermissionRequest:0",
+                {
+                    "event": "PermissionRequest",
+                    "source": "admin_managed",
+                    "placement": "server",
+                    "handler_type": "command",
+                    "display_name": "Shell guard",
+                    "summary": "Blocks shell permission requests.",
+                    "permissions": [],
+                    "trust": "trusted",
+                    "matcher": {"tool_names": "shell"},
+                },
+            )
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            assert context.payload["event_name"] == "PermissionRequest"
+            assert context.payload["placement"] == "server"
+            assert context.payload["tool_names"] == ["shell"]
+            assert context.payload["tool_call_ids"] == ["call-shell"]
+            assert context.payload["tool_sources"] == ["builtin"]
+            assert context.payload["mcp_servers"] == []
+            assert context.payload["trigger_source"] == "chat"
+            assert context.payload["session_run_id"] == "session-1"
+            assert context.payload["agent_run_id"] == "agent-run-1"
+            assert context.payload["turn_id"] == "turn-1"
+            if "shell" not in context.payload["tool_names"]:
+                return []
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(
+                        decision="deny",
+                        reason="shell blocked by standard matcher",
+                    ),
+                )
+            ]
+
+    dispatcher = _LifecycleDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+    setattr(agent, "current_session_id", "session-1")
+    setattr(agent, "runtime_agent_run_id", "agent-run-1")
+    setattr(agent, "runtime_turn_id", "turn-1")
+    setattr(agent, "effective_capabilities", {"tools": ["builtin:shell"]})
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.reason == "shell blocked by standard matcher"
+    assert dispatcher.contexts[0].payload["technical"]["tool_call"]["name"] == "shell"
+    for legacy_field in (
+        "tool_" + "name",
+        "tool_" + "call_id",
+        "tool_" + "source",
+        "mcp_" + "server",
+    ):
+        assert legacy_field not in dispatcher.contexts[0].payload
+
+
+def test_agent_fails_closed_when_permission_request_lifecycle_dispatch_fails() -> None:
+    class _FailingLifecycleDispatcher:
+        def dispatch(self, context: LifecycleHookEventContext):  # noqa: ARG002
+            raise RuntimeError("hook runtime crashed")
+
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=_FailingLifecycleDispatcher(),
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+    setattr(agent, "effective_capabilities", {"tools": ["builtin:shell"]})
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert decision.policy_matched == "lifecycle_hook:deny"
+    assert "PermissionRequest lifecycle dispatch failed" in decision.reason
+    assert decision.audit["lifecycle_hooks"][0]["diagnostics"][0]["code"] == (
+        "lifecycle_dispatch_failed"
+    )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import threading
 
 if TYPE_CHECKING:
@@ -15,9 +15,18 @@ if TYPE_CHECKING:
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 from reuleauxcoder.domain.agent.loop import AgentLoop
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
+from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.config.models import ApprovalConfig, ApprovalRuleConfig, ModeConfig
 from reuleauxcoder.domain.context.manager import ContextManager
 from reuleauxcoder.domain.hooks import HookBase, HookPoint, HookRegistry
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDeclaration,
+    LifecycleHookDispatchResult,
+    LifecycleHookDispatcher,
+    LifecycleHookOutput,
+    build_lifecycle_event_context,
+    build_permission_lifecycle_payload,
+)
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import (
     PermissionDecision,
@@ -40,6 +49,14 @@ def _same_approval_target(left: ApprovalRuleConfig, right: ApprovalRuleConfig) -
     )
 
 
+def _lifecycle_reason_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
 @dataclass
 class FollowUpMessage:
     followup_id: str
@@ -60,6 +77,16 @@ class AgentState:
     current_round: int = 0
 
 
+@dataclass
+class UserPromptLifecycleResolution:
+    user_input: str
+    blocked: bool = False
+    message: str = ""
+    additional_context: list[object] = field(default_factory=list)
+    diagnostics: list[object] = field(default_factory=list)
+    lifecycle_events: list[AgentEvent] = field(default_factory=list)
+
+
 class Agent:
     """The main agent class - orchestrates LLM and tools."""
 
@@ -76,6 +103,7 @@ class Agent:
         active_mode: str | None = None,
         loop: AgentLoop | None = None,
         executor: ToolExecutor | None = None,
+        lifecycle_dispatcher: LifecycleHookDispatcher | None = None,
     ):
         self.llm = llm
         self.tools = tools if tools is not None else []
@@ -112,6 +140,7 @@ class Agent:
 
         # Hook runtime
         self.hook_registry = hook_registry or HookRegistry()
+        self.lifecycle_dispatcher = lifecycle_dispatcher
 
         # Execution components
         self.approval_provider = approval_provider
@@ -407,6 +436,353 @@ class Agent:
             ),
         }
 
+    def _dispatch_agent_lifecycle_event(
+        self,
+        event_name: str,
+        *,
+        payload: dict,
+        metadata: dict | None = None,
+        fail_closed_message: str | None = None,
+        defer_observations: bool = False,
+    ) -> list[LifecycleHookDispatchResult]:
+        dispatcher = getattr(self, "lifecycle_dispatcher", None)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return []
+        context = build_lifecycle_event_context(
+            event_name,
+            placement="server",
+            session_run_id=str(getattr(self, "current_session_id", "") or ""),
+            agent_run_id=str(getattr(self, "runtime_agent_run_id", "") or ""),
+            turn_id=str(getattr(self, "runtime_turn_id", "") or ""),
+            trigger_source=str(getattr(self, "permission_trigger_source", "") or "chat"),
+            origin="agent",
+            locale=str(getattr(self, "locale", "") or ""),
+            metadata=dict(metadata or {}),
+            payload=dict(payload),
+        )
+        try:
+            self._emit_lifecycle_observation(
+                "dispatch_start",
+                event_name,
+                context,
+                defer=defer_observations,
+            )
+            results = list(dispatch(context) or [])
+            for result in results:
+                self._emit_lifecycle_observation(
+                    "result",
+                    event_name,
+                    context,
+                    result=result,
+                    defer=defer_observations,
+                )
+            return results
+        except Exception as exc:
+            self._emit_lifecycle_observation(
+                "dispatch_failed",
+                event_name,
+                context,
+                error=str(exc),
+                defer=defer_observations,
+            )
+            if fail_closed_message:
+                return [
+                    LifecycleHookDispatchResult(
+                        LifecycleHookDeclaration.from_dict(
+                            f"hook:system_builtin:{event_name}:dispatch_failed",
+                            {
+                                "event": event_name,
+                                "source": "system_builtin",
+                                "placement": "server",
+                                "handler_type": "internal",
+                                "display_name": "Lifecycle dispatch failure",
+                                "summary": fail_closed_message,
+                                "permissions": [],
+                                "trust": "trusted",
+                            },
+                        ),
+                        LifecycleHookOutput.from_dict(
+                            {
+                                "continue_flow": False,
+                                "decision": "deny",
+                                "reason": f"{fail_closed_message}: {exc}",
+                                "user_message": fail_closed_message,
+                                "diagnostics": [
+                                    {
+                                        "code": "lifecycle_dispatch_failed",
+                                        "message": str(exc),
+                                    }
+                                ],
+                            }
+                        ),
+                    )
+                ]
+            return []
+
+    def _emit_lifecycle_observation(
+        self,
+        phase: str,
+        event_name: str,
+        context: object,
+        *,
+        result: object | None = None,
+        error: str = "",
+        defer: bool = False,
+    ) -> None:
+        try:
+            declaration = getattr(result, "declaration", None)
+            output = getattr(result, "output", None)
+            output_dict = output.to_dict() if hasattr(output, "to_dict") else {}
+            diagnostics = (
+                list(output_dict.get("diagnostics") or [])
+                if isinstance(output_dict, dict)
+                else []
+            )
+            decision = (
+                str(output_dict.get("decision") or "none")
+                if isinstance(output_dict, dict)
+                else "none"
+            )
+            continue_flow = (
+                bool(output_dict.get("continue_flow", True))
+                if isinstance(output_dict, dict)
+                else True
+            )
+            level = (
+                "error"
+                if error or decision == "deny" or continue_flow is False
+                else "warning"
+                if diagnostics
+                else "info"
+            )
+            payload = {
+                "phase": phase,
+                "event_name": event_name,
+                "placement": str(getattr(context, "placement", "") or "server"),
+                "session_run_id": str(getattr(context, "session_run_id", "") or ""),
+                "agent_run_id": str(getattr(context, "agent_run_id", "") or ""),
+                "turn_id": str(getattr(context, "turn_id", "") or ""),
+                "trigger_source": str(getattr(context, "source", "") or ""),
+                "hook_id": str(getattr(declaration, "id", "") or ""),
+                "display_name": str(getattr(declaration, "display_name", "") or ""),
+                "source": str(getattr(declaration, "source", "") or ""),
+                "decision": decision,
+                "continue_flow": continue_flow,
+                "diagnostics": diagnostics,
+                "error": error,
+                "level": level,
+                "title": str(getattr(declaration, "display_name", "") or event_name),
+                "payload": dict(getattr(context, "payload", {}) or {}),
+            }
+            if isinstance(output_dict, dict):
+                payload["output"] = output_dict
+            event = AgentEvent.lifecycle_hook(payload)
+            if defer:
+                deferred = getattr(self, "_deferred_user_prompt_lifecycle_events", None)
+                if isinstance(deferred, list):
+                    deferred.append(event)
+                    return
+            self._emit_event(event)
+        except Exception:
+            return
+
+    def _apply_user_prompt_lifecycle(
+        self, user_input: str
+    ) -> UserPromptLifecycleResolution:
+        self._deferred_user_prompt_lifecycle_events = []
+        results = self._dispatch_agent_lifecycle_event(
+            "UserPromptSubmit",
+            payload={"user_input": user_input},
+            fail_closed_message="UserPromptSubmit lifecycle dispatch failed",
+            defer_observations=True,
+        )
+        lifecycle_events = list(getattr(self, "_deferred_user_prompt_lifecycle_events", []) or [])
+        self._deferred_user_prompt_lifecycle_events = []
+        resolved_input = user_input
+        additional_context: list[object] = []
+        diagnostics: list[object] = []
+        ask_reasons: list[str] = []
+        ask_hooks: list[dict[str, str]] = []
+        blocked_message = ""
+        for result in results:
+            declaration = getattr(result, "declaration", None)
+            output = getattr(result, "output", None)
+            if output is None:
+                continue
+            diagnostics.extend(list(getattr(output, "diagnostics", []) or []))
+            additional_context.extend(list(getattr(output, "additional_context", []) or []))
+            decision = str(getattr(output, "decision", "") or "none")
+            reason = _lifecycle_reason_text(getattr(output, "reason", None))
+            user_message = str(getattr(output, "user_message", "") or "").strip()
+            if decision == "deny" or getattr(output, "continue_flow", True) is False:
+                blocked_message = (
+                    user_message
+                    or reason
+                    or "UserPromptSubmit lifecycle blocked this request."
+                )
+                break
+            if decision == "defer":
+                blocked_message = (
+                    user_message
+                    or reason
+                    or "UserPromptSubmit lifecycle deferred this request."
+                )
+                break
+            if decision == "ask":
+                ask_reasons.append(
+                    user_message
+                    or reason
+                    or "UserPromptSubmit lifecycle requires approval."
+                )
+                ask_hooks.append(
+                    {
+                        "hook_id": str(getattr(declaration, "id", "") or ""),
+                        "display_name": str(
+                            getattr(declaration, "display_name", "") or ""
+                        ),
+                    }
+                )
+            updated_input = getattr(output, "updated_input", None)
+            if not isinstance(updated_input, dict):
+                continue
+            candidate = updated_input.get("user_input")
+            if isinstance(candidate, str):
+                resolved_input = candidate
+        if not blocked_message and ask_reasons:
+            approval_message = self._request_user_prompt_lifecycle_approval(
+                resolved_input,
+                reasons=ask_reasons,
+                hooks=ask_hooks,
+            )
+            if approval_message:
+                blocked_message = approval_message
+        return UserPromptLifecycleResolution(
+            user_input=resolved_input,
+            blocked=bool(blocked_message),
+            message=blocked_message,
+            additional_context=additional_context,
+            diagnostics=diagnostics,
+            lifecycle_events=lifecycle_events,
+        )
+
+    def _request_user_prompt_lifecycle_approval(
+        self,
+        user_input: str,
+        *,
+        reasons: list[str],
+        hooks: list[dict[str, str]],
+    ) -> str:
+        provider = self.approval_provider
+        if provider is None:
+            return "UserPromptSubmit lifecycle requires approval, but no approval provider is configured."
+        reason = "\n".join(item for item in reasons if item).strip()
+        try:
+            decision = provider.request_approval(
+                ApprovalRequest(
+                    tool_name="lifecycle:UserPromptSubmit",
+                    tool_args={"user_input": user_input},
+                    tool_source="lifecycle_hook",
+                    reason=reason or "UserPromptSubmit lifecycle requires approval.",
+                    intent="Review whether this user prompt lifecycle hook may continue the turn.",
+                    metadata={
+                        "lifecycle_event": "UserPromptSubmit",
+                        "lifecycle_hooks": hooks,
+                    },
+                )
+            )
+        except (KeyboardInterrupt, EOFError):
+            return "UserPromptSubmit lifecycle approval was interrupted."
+        return "" if decision.approved else (
+            decision.reason
+            or "UserPromptSubmit lifecycle approval was denied."
+        )
+
+    def _permission_lifecycle_outputs(
+        self,
+        request: PermissionRequest,
+    ) -> list[dict]:
+        dispatcher = getattr(self, "lifecycle_dispatcher", None)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return []
+        context = build_lifecycle_event_context(
+            "PermissionRequest",
+            placement="server",
+            session_run_id=request.subject.session_id or "",
+            agent_run_id=str(getattr(self, "runtime_agent_run_id", "") or ""),
+            turn_id=str(getattr(self, "runtime_turn_id", "") or ""),
+            trigger_source=request.subject.trigger_source,
+            origin="agent",
+            locale=str(getattr(self, "locale", "") or ""),
+            metadata=dict(request.metadata or {}),
+            payload=build_permission_lifecycle_payload(request),
+        )
+        try:
+            self._emit_lifecycle_observation("dispatch_start", "PermissionRequest", context)
+            results = dispatch(context)
+        except Exception as exc:
+            self._emit_lifecycle_observation(
+                "dispatch_failed",
+                "PermissionRequest",
+                context,
+                error=str(exc),
+            )
+            return [
+                {
+                    "hook_id": "lifecycle:PermissionRequest",
+                    "display_name": "Permission lifecycle dispatch",
+                    "source": "system_builtin",
+                    "decision": "deny",
+                    "continue_flow": False,
+                    "reason": f"PermissionRequest lifecycle dispatch failed: {exc}",
+                    "diagnostics": [
+                        {
+                            "code": "lifecycle_dispatch_failed",
+                            "message": str(exc),
+                        }
+                    ],
+                }
+            ]
+        output_items = []
+        for result in list(results or []):
+            if result is None:
+                continue
+            self._emit_lifecycle_observation(
+                "result",
+                "PermissionRequest",
+                context,
+                result=result,
+            )
+            output_items.append(self._permission_lifecycle_output_item(result))
+        return output_items
+
+    @staticmethod
+    def _permission_lifecycle_payload(request: PermissionRequest) -> dict:
+        return build_permission_lifecycle_payload(request)
+
+    @staticmethod
+    def _permission_lifecycle_output_item(
+        result: LifecycleHookDispatchResult,
+    ) -> dict:
+        declaration = getattr(result, "declaration", None)
+        output = getattr(result, "output", None)
+        to_dict = getattr(output, "to_dict", None)
+        output_data = to_dict() if callable(to_dict) else {}
+        if not isinstance(output_data, dict):
+            output_data = {}
+        return {
+            "hook_id": str(getattr(declaration, "id", "") or ""),
+            "display_name": str(getattr(declaration, "display_name", "") or ""),
+            "source": str(getattr(declaration, "source", "") or ""),
+            "decision": str(output_data.get("decision") or "none"),
+            "continue_flow": bool(output_data.get("continue_flow", True)),
+            "reason": output_data.get("reason"),
+            "user_message": str(output_data.get("user_message") or ""),
+            "diagnostics": list(output_data.get("diagnostics") or []),
+            "additional_context": list(output_data.get("additional_context") or []),
+        }
+
     def evaluate_tool_permission(
         self,
         tool: "Tool",
@@ -417,20 +793,22 @@ class Agent:
         """Evaluate runtime permission for a tool through the unified gateway."""
 
         agent_config = self._current_agent_config()
-        return PermissionGateway().evaluate(
-            PermissionRequest(
-                subject=self._permission_subject(),
-                target=self._permission_target_for_tool(tool),
-                action=action,
-                tool_call=tool_call,
-                effective_capabilities=self._effective_capabilities(),
-                approval=self._runtime_approval_config(),
-                runtime_profile=self._runtime_profile_for_agent(agent_config),
-                agent_config=agent_config,
-                enforce_effective_capabilities=self.capability_tool_policy_enabled(),
-                metadata=self._permission_metadata_for_tool(tool),
-            )
+        request = PermissionRequest(
+            subject=self._permission_subject(),
+            target=self._permission_target_for_tool(tool),
+            action=action,
+            tool_call=tool_call,
+            effective_capabilities=self._effective_capabilities(),
+            approval=self._runtime_approval_config(),
+            runtime_profile=self._runtime_profile_for_agent(agent_config),
+            agent_config=agent_config,
+            enforce_effective_capabilities=self.capability_tool_policy_enabled(),
+            metadata=self._permission_metadata_for_tool(tool),
         )
+        lifecycle_outputs = self._permission_lifecycle_outputs(request)
+        if lifecycle_outputs:
+            request = replace(request, lifecycle_outputs=lifecycle_outputs)
+        return PermissionGateway().evaluate(request)
 
     def is_tool_authorized(self, tool: "Tool") -> bool:
         """Return whether the unified permission gateway allows tool visibility."""
@@ -495,10 +873,32 @@ class Agent:
             reason="Recovered from previous interrupted turn."
         )
 
+        prompt_lifecycle = self._apply_user_prompt_lifecycle(user_input)
+        user_input = prompt_lifecycle.user_input
+
         self._emit_event(AgentEvent.session_run_start(user_input))
+        for lifecycle_event in prompt_lifecycle.lifecycle_events:
+            self._emit_event(lifecycle_event)
 
         # Add user message
         self.state.messages.append({"role": "user", "content": user_input})
+        if prompt_lifecycle.additional_context:
+            self.state.messages.append(
+                {
+                    "role": "system",
+                    "content": "Lifecycle additional context:\n"
+                    + "\n".join(
+                        _lifecycle_reason_text(item)
+                        for item in prompt_lifecycle.additional_context
+                    ),
+                }
+            )
+        if prompt_lifecycle.blocked:
+            message = prompt_lifecycle.message or "UserPromptSubmit lifecycle blocked this request."
+            self._emit_event(AgentEvent.error(message))
+            self._emit_usage_event("blocked")
+            self._emit_event(AgentEvent.session_run_end(message))
+            return message
 
         # Run the loop
         try:
@@ -507,6 +907,16 @@ class Agent:
             # Ensure tool-call/response parity before bubbling the failure upward.
             self.reconcile_pending_tool_calls(
                 reason=f"Interrupted due to {type(e).__name__}."
+            )
+            self._dispatch_agent_lifecycle_event(
+                "StopFailure",
+                payload={
+                    "error": {
+                        "type": type(e).__name__,
+                        "message": str(e),
+                    },
+                    "interrupted": False,
+                },
             )
             self._emit_usage_event("error")
             raise
@@ -521,6 +931,10 @@ class Agent:
             payload = getattr(self._loop, "last_interruption_payload", None) or {}
             self._emit_event(AgentEvent.session_run_interrupted(result, payload))
             return result
+        self._dispatch_agent_lifecycle_event(
+            "Stop",
+            payload={"result": result, "interrupted": False},
+        )
         self._emit_event(
             AgentEvent.session_run_end(
                 result,
