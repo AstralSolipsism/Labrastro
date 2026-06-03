@@ -64,6 +64,12 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
 from reuleauxcoder.domain.config.schema import BUILTIN_MODES, DEFAULTS, DEFAULT_ACTIVE_MODE
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry, MemorySourceRegistry
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LIFECYCLE_HOOK_TRUST_STATES,
+    LifecycleHookRegistry,
+    lifecycle_declarations_from_config_hooks,
+    sanitize_lifecycle_hooks_for_config,
+)
 from reuleauxcoder.domain.runtime_footprint import (
     normalize_runtime_footprint,
     runtime_footprint_for_skill,
@@ -713,6 +719,20 @@ class RemoteAdminConfigManager:
             ).items()
             if isinstance(component_data, dict)
         }
+        for package_id, package_view in capability_packages.items():
+            if isinstance(package_view.get("hooks"), list):
+                package_view["hook_views"] = self._admin_resource_lifecycle_hooks(
+                    "capability_package",
+                    package_id,
+                    package_view,
+                )
+        for component_id, component_view in capability_components.items():
+            if isinstance(component_view.get("hooks"), list):
+                component_view["hook_views"] = self._admin_resource_lifecycle_hooks(
+                    str(component_view.get("kind") or "capability_package"),
+                    component_id,
+                    component_view,
+                )
         raw_github = data.get("github", {})
         github = GitHubConfig.from_dict(raw_github if isinstance(raw_github, dict) else {})
         raw_sandbox = data.get("sandbox_provider", {})
@@ -855,6 +875,14 @@ class RemoteAdminConfigManager:
                 else previous_components
             )
             try:
+                raw_components_for_parse = _sanitize_lifecycle_hooks_in_mapping(
+                    raw_components_for_parse,
+                    default_source="capability_package",
+                    component_source=True,
+                )
+            except ValueError as exc:
+                return _invalid_lifecycle_hook_result(exc)
+            try:
                 capability_components = {
                     str(component_id): CapabilityComponentConfig.from_dict(
                         str(component_id), component_data
@@ -873,6 +901,13 @@ class RemoteAdminConfigManager:
                 if isinstance(raw_capability_packages, dict)
                 else previous_packages
             )
+            try:
+                raw_packages_for_parse = _sanitize_lifecycle_hooks_in_mapping(
+                    raw_packages_for_parse,
+                    default_source="capability_package",
+                )
+            except ValueError as exc:
+                return _invalid_lifecycle_hook_result(exc)
             try:
                 capability_packages = {
                     str(package_id): CapabilityPackageConfig.from_dict(
@@ -2118,6 +2153,15 @@ class RemoteAdminConfigManager:
             for raw_field in ("mcp_config", "mcp_json", "mcpServers"):
                 merged.pop(raw_field, None)
             merged["managed_by"] = "user"
+            if "hooks" in item_payload:
+                try:
+                    merged["hooks"] = _pending_lifecycle_hooks(
+                        item_payload.get("hooks"),
+                        owner_id=name,
+                        source="mcp_server",
+                    )
+                except ValueError as exc:
+                    return _invalid_lifecycle_hook_result(exc)
             normalized = MCPServerConfig.from_dict(name, merged)
             items[normalized.name] = normalized.to_dict()
             reload_error = self._commit_config(data, previous_data)
@@ -2189,6 +2233,15 @@ class RemoteAdminConfigManager:
             merged.pop("skill_content", None)
             merged.pop("content", None)
             merged["managed_by"] = "user"
+            if "hooks" in item_payload:
+                try:
+                    merged["hooks"] = _pending_lifecycle_hooks(
+                        item_payload.get("hooks"),
+                        owner_id=name,
+                        source="skill",
+                    )
+                except ValueError as exc:
+                    return _invalid_lifecycle_hook_result(exc)
             if parsed_skill is not None:
                 installed_path = self._standalone_skill_install_path(parsed_skill.name)
                 merged["name"] = parsed_skill.name
@@ -2275,6 +2328,43 @@ class RemoteAdminConfigManager:
         except OSError as exc:
             return str(exc)
         return None
+
+    def update_lifecycle_hook_trust(self, payload: dict[str, Any]) -> AdminConfigResult:
+        hook_id = str(payload.get("hook_id") or payload.get("id") or "").strip()
+        trust = str(payload.get("trust") or "").strip()
+        if not hook_id:
+            return AdminConfigResult(False, {"error": "lifecycle_hook_id_required"}, 400)
+        if trust not in LIFECYCLE_HOOK_TRUST_STATES:
+            return AdminConfigResult(
+                False,
+                {
+                    "error": "invalid_lifecycle_hook_trust",
+                    "allowed": sorted(LIFECYCLE_HOOK_TRUST_STATES),
+                },
+                400,
+            )
+
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            if not _set_lifecycle_hook_trust(data, hook_id, trust):
+                return AdminConfigResult(
+                    False,
+                    {"error": "lifecycle_hook_not_found", "hook_id": hook_id},
+                    404,
+                )
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "kind": "lifecycle_hook",
+                    "hook_id": hook_id,
+                    "trust": trust,
+                },
+            )
 
     def delete_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
         item_payload = _environment_requirement_payload(payload)
@@ -3378,7 +3468,46 @@ class RemoteAdminConfigManager:
                 else []
             ),
             "managed_by": str(view.get("managed_by") or ""),
+            "hook_views": self._admin_resource_lifecycle_hooks(kind, name, view),
         }
+
+    def _admin_resource_lifecycle_hooks(
+        self,
+        kind: str,
+        name: str,
+        view: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        raw_hooks = view.get("hooks")
+        if not isinstance(raw_hooks, list):
+            return []
+        source = "skill" if kind == "skill" else "mcp_server" if kind == "mcp" else kind
+        try:
+            registry = LifecycleHookRegistry(
+                lifecycle_declarations_from_config_hooks(
+                    owner_id=name,
+                    source=source,
+                    hooks=[item for item in raw_hooks if isinstance(item, dict)],
+                    owner_enabled=_bool_field(view, "enabled", True),
+                    owner_status=str(view.get("status") or "installed"),
+                )
+            )
+        except ValueError as exc:
+            return [{
+                "id": f"hook:{source}:{name}:parse_failed",
+                "event": "",
+                "source": source,
+                "placement": "",
+                "handler_type": "",
+                "display_name": "Invalid lifecycle hook",
+                "summary": str(exc),
+                "trust": "blocked",
+                "enabled": False,
+                "executable": False,
+                "permissions": [],
+                "risk_level": "",
+                "technical": {"error": str(exc)},
+            }]
+        return registry.dashboard_items()
 
     def _chat_command_catalog(self) -> list[dict[str, Any]]:
         registry = create_builtin_action_registry()
@@ -4065,6 +4194,12 @@ def parse_mcp_servers_config(raw: str | dict[str, Any]) -> list[dict[str, Any]]:
             draft["display_name"] = str(raw_server["display_name"])
         if raw_server.get("summary"):
             draft["summary"] = str(raw_server["summary"])
+        if isinstance(raw_server.get("hooks"), list):
+            draft["hooks"] = [
+                dict(item)
+                for item in raw_server["hooks"]
+                if isinstance(item, dict)
+            ]
         if isinstance(raw_server.get("runtime_footprint"), dict):
             draft["runtime_footprint"] = normalize_runtime_footprint(
                 raw_server["runtime_footprint"],
@@ -4106,6 +4241,139 @@ def _skill_content_from_payload(payload: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.replace("\r\n", "\n")
     return ""
+
+
+def _set_lifecycle_hook_trust(
+    data: dict[str, Any],
+    hook_id: str,
+    trust: str,
+) -> bool:
+    for owner_id, source, hooks in _iter_config_hook_lists(data):
+        if _set_lifecycle_hook_trust_in_list(
+            owner_id=owner_id,
+            source=source,
+            hooks=hooks,
+            hook_id=hook_id,
+            trust=trust,
+        ):
+            return True
+    return False
+
+
+def _iter_config_hook_lists(data: dict[str, Any]):
+    skills = ((data.get("skills") or {}).get("items") or {})
+    if isinstance(skills, dict):
+        for name, item in skills.items():
+            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                yield str(item.get("name") or name), "skill", item["hooks"]
+
+    servers = ((data.get("mcp") or {}).get("servers") or {})
+    if isinstance(servers, dict):
+        for name, item in servers.items():
+            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                yield str(item.get("name") or name), "mcp_server", item["hooks"]
+
+    packages = data.get("capability_packages") or {}
+    if isinstance(packages, dict):
+        for package_id, item in packages.items():
+            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                yield str(item.get("id") or package_id), "capability_package", item["hooks"]
+
+    components = data.get("capability_components") or {}
+    if isinstance(components, dict):
+        for component_id, item in components.items():
+            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                yield (
+                    str(item.get("id") or component_id),
+                    _component_lifecycle_source(item),
+                    item["hooks"],
+                )
+
+
+def _set_lifecycle_hook_trust_in_list(
+    *,
+    owner_id: str,
+    source: str,
+    hooks: list[Any],
+    hook_id: str,
+    trust: str,
+) -> bool:
+    try:
+        declarations = lifecycle_declarations_from_config_hooks(
+            owner_id=owner_id,
+            source=source,
+            hooks=[item for item in hooks if isinstance(item, dict)],
+        )
+    except ValueError:
+        declarations = []
+    declaration_ids = [item.id for item in declarations]
+    dict_index = 0
+    for raw_hook in hooks:
+        if not isinstance(raw_hook, dict):
+            continue
+        declared_id = declaration_ids[dict_index] if dict_index < len(declaration_ids) else ""
+        dict_index += 1
+        if hook_id != declared_id:
+            continue
+        raw_hook["trust"] = trust
+        return True
+    return False
+
+
+def _component_lifecycle_source(item: dict[str, Any]) -> str:
+    kind = str(item.get("kind") or item.get("type") or "").strip()
+    if kind == "skill":
+        return "skill"
+    if kind in {"mcp", "mcp_server", "mcp_tool"}:
+        return "mcp_server"
+    return "capability_package"
+
+
+def _sanitize_lifecycle_hooks_in_mapping(
+    values: dict[str, Any],
+    *,
+    default_source: str,
+    component_source: bool = False,
+) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for owner_id, raw_item in values.items():
+        if not isinstance(raw_item, dict):
+            continue
+        item = deepcopy(raw_item)
+        if "hook_views" in item:
+            raise ValueError("lifecycle hook config field 'hook_views' is not supported")
+        if isinstance(item.get("hooks"), list):
+            source = _component_lifecycle_source(item) if component_source else default_source
+            item["hooks"] = sanitize_lifecycle_hooks_for_config(
+                item.get("hooks"),
+                owner_id=str(item.get("id") or owner_id),
+                source=source,
+                default_trust=None,
+            )
+        sanitized[str(owner_id)] = item
+    return sanitized
+
+
+def _pending_lifecycle_hooks(
+    value: Any,
+    *,
+    owner_id: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    return sanitize_lifecycle_hooks_for_config(
+        value,
+        owner_id=owner_id,
+        source=source,
+        default_trust="pending_review",
+    )
+
+
+def _invalid_lifecycle_hook_result(exc: Exception) -> AdminConfigResult:
+    return AdminConfigResult(
+        False,
+        {"error": "invalid_lifecycle_hook", "message": str(exc)},
+        400,
+    )
 
 
 def _slug_path_segment(value: str) -> str:

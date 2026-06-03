@@ -34,6 +34,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     TriggerMode,
     WorktreeRole,
 )
+from reuleauxcoder.domain.hooks.lifecycle import sanitize_lifecycle_hooks_for_config
 from reuleauxcoder.domain.config.models import (
     DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
     EnvironmentRequirementConfig,
@@ -645,6 +646,11 @@ class CapabilityPackageInstaller:
                 "capability package id is required",
             )
         draft = CapabilityPackageDraft.from_dict(resolved_package_id, raw_draft)
+        package_hooks = _pending_lifecycle_hooks(
+            draft.hooks,
+            owner_id=resolved_package_id,
+            source="capability_package",
+        )
         component_specs = [
             self.component_from_draft(resolved_package_id, item, draft.source.to_dict())
             for item in draft.components
@@ -713,6 +719,7 @@ class CapabilityPackageInstaller:
             risk_level=draft.risk_level,
             notes=draft.notes,
             runtime_footprint=aggregate_runtime_footprint(installed_component_footprints),
+            hooks=package_hooks,
         )
         packages[resolved_package_id] = package.to_dict()
         data["capability_packages"] = packages
@@ -807,6 +814,9 @@ class CapabilityPackageInstaller:
         raw_runtime_footprint = item.get("runtime_footprint")
         if not isinstance(raw_runtime_footprint, dict):
             raw_runtime_footprint = config.get("runtime_footprint")
+        raw_hooks = item.get("hooks")
+        if not isinstance(raw_hooks, list):
+            raw_hooks = config.get("hooks")
         return CapabilityComponentConfig(
             id=component_id,
             kind=kind,
@@ -837,6 +847,11 @@ class CapabilityPackageInstaller:
             execution_policy=execution_policy,
             registry_path=str(item.get("registry_path") or "").strip(),
             source_path=str(item.get("source_path") or "").strip(),
+            hooks=_pending_lifecycle_hooks(
+                raw_hooks,
+                owner_id=component_id,
+                source=_component_lifecycle_source(kind),
+            ),
             runtime_footprint=(
                 normalize_runtime_footprint(raw_runtime_footprint)
                 if isinstance(raw_runtime_footprint, dict) and raw_runtime_footprint
@@ -859,6 +874,8 @@ class CapabilityPackageInstaller:
         if component.summary:
             payload["summary"] = component.summary
         payload["runtime_footprint"] = dict(component.runtime_footprint)
+        if component.hooks:
+            payload["hooks"] = [dict(item) for item in component.hooks]
         payload.setdefault("source", component.source.url or component.source.type)
         if component.source.url:
             payload.setdefault("repo_url", component.source.url)
@@ -2637,6 +2654,8 @@ def _render_packager_prompt(
             "{\n"
             '  "id": "package-id", "name": "Package Name", "description": "...",\n'
             '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
+            '  "runtime_footprint": {"runs_on": "server|local_peer|both|agent_only", '
+            '"install_required_on": [], "config_required_on": [], "user_message": "..."},\n'
             '  "source_inventory": {"files": [], "skill_files": [], "docs": []},\n'
             '  "materialization_plan": [\n'
             '    {"component_id": "skill:code-review", "source_path": "skills/code-review/SKILL.md", '
@@ -2647,7 +2666,13 @@ def _render_packager_prompt(
             '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
             '"display_name": "Code review", '
             '"source_path": "skills/code-review/SKILL.md", '
-            '"summary": "what this skill does"}\n'
+            '"summary": "what this skill does", '
+            '"runtime_footprint": {"runs_on": "server|local_peer|both|agent_only"}, '
+            '"hooks": [{"event": "PreToolUse", "placement": "server|peer|both", '
+            '"handler_type": "command|http|mcp_tool|prompt|agent|internal", '
+            '"handler_ref": "...", "matcher": {"tool_names": ["read_file"]}, '
+            '"permissions": [], "display_name": "...", "summary": "...", '
+            '"risk_level": "low|medium|high"}]}\n'
             '    ], "mcp_servers": [], "builtin_tools": [],\n'
             '    "prompt_fragments": [], "credential_refs": [],\n'
             '    "environment_requirements": [\n'
@@ -2663,6 +2688,10 @@ def _render_packager_prompt(
             "由能力包管理的 Skills 必须可以安装到服务端标准 Skill 目录；"
             "每个 Skill 组件必须给出可由证据包或 worktree 定位的 source_path/content_ref，"
             "完整 skill_content 由后端读取并组装，不要在模型输出中搬运大文件。\n"
+            "运行端必须明确：server runs in Labrastro backend；peer means the user's local VS Code side；"
+            "both 表示两端都需要安装/配置证据。hooks 必须使用标准 matcher 列表字段 "
+            "tool_names/tool_call_ids/tool_sources/mcp_servers；不要输出 trust，trust defaults to pending_review，"
+            "由用户在 Settings/ChatView 审查后决定。\n"
             "证据包：\n"
             f"```json\n{bundle_json}\n```\n"
             f"{revision_block}"
@@ -2690,6 +2719,8 @@ def _render_packager_prompt(
         "{\n"
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
         '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
+        '  "runtime_footprint": {"runs_on": "server|local_peer|both|agent_only", '
+        '"install_required_on": [], "config_required_on": [], "user_message": "..."},\n'
         '  "source_inventory": {"files": [], "skill_files": [], "docs": []},\n'
         '  "materialization_plan": [\n'
         '    {"component_id": "skill:code-review", "source_path": "skills/code-review/SKILL.md", '
@@ -2700,7 +2731,13 @@ def _render_packager_prompt(
         '      {"id": "skill:code-review", "kind": "skill", "name": "code-review", '
         '"display_name": "Code review", '
         '"source_path": "skills/code-review/SKILL.md", '
-        '"summary": "what this skill does"}\n'
+        '"summary": "what this skill does", '
+        '"runtime_footprint": {"runs_on": "server|local_peer|both|agent_only"}, '
+        '"hooks": [{"event": "PreToolUse", "placement": "server|peer|both", '
+        '"handler_type": "command|http|mcp_tool|prompt|agent|internal", '
+        '"handler_ref": "...", "matcher": {"tool_names": ["read_file"]}, '
+        '"permissions": [], "display_name": "...", "summary": "...", '
+        '"risk_level": "low|medium|high"}]}\n'
         '    ], "mcp_servers": [], "builtin_tools": [],\n'
         '    "prompt_fragments": [], "credential_refs": [],\n'
         '    "environment_requirements": [\n'
@@ -2716,6 +2753,11 @@ def _render_packager_prompt(
         "package-managed Skills must be installable into the server canonical Skill directory; "
         "include source_path/content_ref for every Skill component so the backend can read "
         "and assemble canonical skill_content. Do not copy large Skill files into the model output.\n"
+        "Runtime placement must be explicit: server runs in Labrastro backend; "
+        "peer means the user's local VS Code side; both means both sides require evidence-backed "
+        "installation/configuration. hooks must use the standard matcher list fields "
+        "tool_names/tool_call_ids/tool_sources/mcp_servers. Do not output trust; "
+        "trust defaults to pending_review and is granted later by the user through Settings/ChatView.\n"
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
         f"{revision_block}"
@@ -4100,6 +4142,32 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _pending_lifecycle_hooks(
+    value: Any,
+    *,
+    owner_id: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    try:
+        return sanitize_lifecycle_hooks_for_config(
+            value,
+            owner_id=owner_id,
+            source=source,
+            default_trust="pending_review",
+        )
+    except ValueError as exc:
+        raise CapabilityPackageIngestError("invalid_lifecycle_hook", str(exc)) from exc
+
+
+def _component_lifecycle_source(kind: str) -> str:
+    normalized = str(kind or "").strip()
+    if normalized == "skill":
+        return "skill"
+    if normalized in {"mcp", "mcp_server", "mcp_tool"}:
+        return "mcp_server"
+    return "capability_package"
 
 
 def _dedupe_links(values: list[dict[str, Any]]) -> list[dict[str, Any]]:

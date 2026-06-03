@@ -144,6 +144,9 @@ class RemoteAdminRoutes:
                             execution_location=optional_payload_str(
                                 payload, "execution_location"
                             ),
+                            publish_policy=optional_payload_str(
+                                payload, "publish_policy"
+                            ),
                             trigger_mode=optional_payload_str(
                                 payload, "trigger_mode"
                             )
@@ -773,6 +776,13 @@ class RemoteAdminRoutes:
                     payload,
                     lambda: self.service.admin_manager.enable_skill(payload),
                 )
+            elif path == "/remote/admin/lifecycle-hooks/trust":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.update_lifecycle_hook_trust(payload),
+                )
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found")
                 return
@@ -866,6 +876,7 @@ class RemoteAdminRoutes:
             "/remote/admin/skills/record",
             "/remote/admin/skills/delete",
             "/remote/admin/skills/enable",
+            "/remote/admin/lifecycle-hooks/trust",
         }
 
     def _admin_config_operation(
@@ -900,7 +911,7 @@ class RemoteAdminRoutes:
             if isinstance(payload.get("github"), dict):
                 targets.append("github")
             return operation, ",".join(sorted(set(targets))) or "server_settings"
-        for key in ("provider_id", "profile_id", "package_id", "name", "id", "target_id"):
+        for key in ("provider_id", "profile_id", "package_id", "hook_id", "name", "id", "target_id"):
             if payload.get(key) is not None:
                 return operation, str(payload.get(key) or "")
         draft = payload.get("draft")

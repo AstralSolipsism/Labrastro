@@ -371,6 +371,23 @@ def test_project_notes_input_creates_read_only_ingest_run() -> None:
     assert "Do not copy large Skill files into the model output." in result.agent_run.prompt
 
 
+def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -> None:
+    prompt = capability_packages_module._render_packager_prompt(
+        bundle={"source": {"type": "project_notes"}, "items": []},
+        locale="en-US",
+    )
+
+    assert '"hooks"' in prompt
+    assert '"runtime_footprint"' in prompt
+    assert '"placement": "server|peer|both"' in prompt
+    assert '"handler_type": "command|http|mcp_tool|prompt|agent|internal"' in prompt
+    assert '"matcher": {"tool_names": ["read_file"]}' in prompt
+    assert '"permissions": []' in prompt
+    assert "trust defaults to pending_review" in prompt
+    assert "server runs in Labrastro backend" in prompt
+    assert "peer means the user's local VS Code side" in prompt
+
+
 def test_revision_prompt_uses_public_draft_without_skill_content() -> None:
     control = _control_plane()
     runner = CapabilityPackagerRunner(control)
@@ -796,6 +813,180 @@ def test_package_installer_materializes_skill_to_canonical_server_path(tmp_path)
     assert skill["source_path"] == "skills/code-review/SKILL.md"
     assert skill["managed_by"] == "capability_package"
     assert "skill_content" not in skill
+
+
+def test_package_installer_preserves_lifecycle_hooks_for_package_components_and_resources(tmp_path) -> None:
+    skill_content = (
+        "---\n"
+        "name: code-review\n"
+        "description: Review code changes.\n"
+        "---\n"
+        "Use the repository review checklist.\n"
+    )
+    package_hooks = [
+        {
+            "event": "SessionStart",
+            "handler_type": "prompt",
+            "handler_ref": "package:review/session-start",
+            "display_name": "Review package startup",
+            "summary": "Adds review startup context.",
+            "permissions": [],
+            "trust": "trusted",
+        }
+    ]
+    skill_hooks = [
+        {
+            "event": "UserPromptSubmit",
+            "handler_type": "prompt",
+            "handler_ref": "skills/code-review/SKILL.md",
+            "display_name": "Code review prompt context",
+            "summary": "Adds code review context.",
+            "permissions": [],
+            "trust": "trusted",
+        }
+    ]
+    mcp_hooks = [
+        {
+            "event": "PostToolUse",
+            "handler_type": "mcp_tool",
+            "handler_ref": "github.audit",
+            "display_name": "GitHub audit",
+            "summary": "Records GitHub MCP tool results.",
+            "permissions": ["audit.write"],
+            "trust": "trusted",
+        }
+    ]
+    data: dict[str, object] = {}
+
+    CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        data,
+        {
+            "id": "review",
+            "hooks": package_hooks,
+            "components": [
+                {
+                    "kind": "skill",
+                    "name": "code-review",
+                    "skill_content": skill_content,
+                    "hooks": skill_hooks,
+                },
+                {
+                    "kind": "mcp_server",
+                    "name": "github",
+                    "command": "github-mcp-server",
+                    "hooks": mcp_hooks,
+                },
+            ],
+        },
+    )
+
+    expected_package_hooks = [dict(package_hooks[0], placement="server", trust="pending_review")]
+    expected_skill_hooks = [dict(skill_hooks[0], placement="server", trust="pending_review")]
+    expected_mcp_hooks = [dict(mcp_hooks[0], placement="server", trust="pending_review")]
+    assert data["capability_packages"]["review"]["hooks"] == expected_package_hooks
+    assert data["capability_components"]["skill:code-review"]["hooks"] == expected_skill_hooks
+    assert data["capability_components"]["mcp_server:github"]["hooks"] == expected_mcp_hooks
+    assert data["skills"]["items"]["code-review"]["hooks"] == expected_skill_hooks
+    assert data["mcp"]["servers"]["github"]["hooks"] == expected_mcp_hooks
+
+
+def test_package_installer_rejects_invalid_lifecycle_hook_before_config_write(tmp_path) -> None:
+    data: dict[str, object] = {}
+
+    with pytest.raises(CapabilityPackageIngestError) as exc_info:
+        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+            data,
+            {
+                "id": "review",
+                "hooks": [
+                    {
+                        "event": "SessionStart",
+                        "placement": "local_peer",
+                        "handler_type": "prompt",
+                        "display_name": "Review package startup",
+                        "summary": "Adds review startup context.",
+                        "permissions": [],
+                    }
+                ],
+                "components": [
+                    {
+                        "kind": "mcp_server",
+                        "name": "github",
+                        "command": "github-mcp-server",
+                    }
+                ],
+            },
+        )
+
+    assert exc_info.value.error == "invalid_lifecycle_hook"
+    assert "placement" in exc_info.value.message
+    assert data == {}
+
+
+def test_package_installer_rejects_legacy_lifecycle_tool_matcher_before_config_write(tmp_path) -> None:
+    data: dict[str, object] = {}
+    legacy_field = "mcp_" + "server"
+
+    with pytest.raises(CapabilityPackageIngestError) as exc_info:
+        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+            data,
+            {
+                "id": "review",
+                "hooks": [
+                    {
+                        "event": "PostToolUse",
+                        "handler_type": "prompt",
+                        "display_name": "Review package tool hook",
+                        "summary": "Adds review context for matching tools.",
+                        "permissions": [],
+                        "matcher": {legacy_field: "github"},
+                    }
+                ],
+                "components": [
+                    {
+                        "kind": "mcp_server",
+                        "name": "github",
+                        "command": "github-mcp-server",
+                    }
+                ],
+            },
+        )
+
+    assert exc_info.value.error == "invalid_lifecycle_hook"
+    assert legacy_field in exc_info.value.message
+    assert data == {}
+
+
+def test_package_installer_accepts_lifecycle_tool_names_matcher(tmp_path) -> None:
+    data: dict[str, object] = {}
+
+    CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        data,
+        {
+            "id": "review",
+            "hooks": [
+                {
+                    "event": "PostToolUse",
+                    "handler_type": "prompt",
+                    "display_name": "Review package tool hook",
+                    "summary": "Adds review context for matching tools.",
+                    "permissions": [],
+                    "matcher": {"tool_names": "read_file"},
+                }
+            ],
+            "components": [
+                {
+                    "kind": "mcp_server",
+                    "name": "github",
+                    "command": "github-mcp-server",
+                }
+            ],
+        },
+    )
+
+    assert data["capability_packages"]["review"]["hooks"][0]["matcher"] == {
+        "tool_names": "read_file"
+    }
 
 
 def test_package_installer_rejects_package_skill_without_installable_content(tmp_path) -> None:
