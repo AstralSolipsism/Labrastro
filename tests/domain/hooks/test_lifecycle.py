@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from reuleauxcoder.domain.approval import ApprovalDecision
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentConfig,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
 )
@@ -15,6 +22,7 @@ from reuleauxcoder.domain.config.models import (
     SkillsConfig,
 )
 from reuleauxcoder.domain.hooks.lifecycle import (
+    FunctionLifecycleHookRuntimeAdapter,
     LIFECYCLE_HOOK_EVENTS,
     LIFECYCLE_HOOK_HANDLER_TYPES,
     LIFECYCLE_HOOK_MATCHER_FIELDS,
@@ -26,14 +34,22 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookEventContext,
     LifecycleHookOutput,
     LifecycleHookRegistry,
+    LifecycleHookRuntimeAdapterRegistry,
+    annotate_lifecycle_output_diagnostics,
+    bind_lifecycle_runtime_adapters_to_agent,
     build_lifecycle_event_context,
     build_permission_lifecycle_payload,
     build_tool_batch_lifecycle_payload,
     build_tool_lifecycle_payload,
+    default_lifecycle_hook_catalog_runtime_adapters,
     lifecycle_declarations_from_config_hooks,
     lifecycle_registry_from_config,
+    default_lifecycle_hook_runtime_adapters,
+    system_builtin_lifecycle_declarations_from_hook_registry,
     system_builtin_lifecycle_declarations_from_hook_specs,
 )
+from reuleauxcoder.domain.hooks.registry import HookRegistry
+from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 
 
 def _declaration_payload(**overrides):
@@ -53,6 +69,18 @@ def _declaration_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _runtime_adapters(**handlers):
+    registry = LifecycleHookRuntimeAdapterRegistry()
+    for handler_type, handler in handlers.items():
+        registry.register(
+            FunctionLifecycleHookRuntimeAdapter(
+                handler_type=handler_type,
+                handler=handler,
+            )
+        )
+    return registry
 
 
 def test_lifecycle_hook_declaration_roundtrip_preserves_public_contract() -> None:
@@ -256,6 +284,102 @@ def test_lifecycle_hook_output_roundtrip_keeps_full_updated_input() -> None:
     assert output.to_dict()["updated_input"] == {"target": "staging", "force": False}
 
 
+def test_lifecycle_output_diagnostics_mark_unsupported_event_fields() -> None:
+    output = LifecycleHookOutput.from_dict({
+        "continue_flow": False,
+        "decision": "deny",
+        "reason": "stop",
+        "user_message": "Stop",
+        "additional_context": [{"role": "system", "content": "ignored"}],
+        "updated_input": {"result": "rewritten", "extra": True},
+        "artifacts": [{"artifact_id": "artifact-1"}],
+    })
+
+    annotate_lifecycle_output_diagnostics("PostToolUse", output)
+
+    diagnostics = output.to_dict()["diagnostics"]
+    ignored_fields = {
+        item["field"]
+        for item in diagnostics
+        if item["code"] == "lifecycle_output_field_ignored"
+    }
+    assert ignored_fields == {
+        "continue_flow",
+        "decision",
+        "reason",
+        "user_message",
+        "additional_context",
+        "artifacts",
+    }
+    assert {
+        item["field"]
+        for item in diagnostics
+        if item["code"] == "lifecycle_updated_input_field_ignored"
+    } == {"extra"}
+
+
+def test_diagnostics_only_lifecycle_events_ignore_control_fields() -> None:
+    output = LifecycleHookOutput.from_dict({
+        "continue_flow": False,
+        "decision": "deny",
+        "reason": "try another round",
+        "user_message": "Retry",
+        "additional_context": [{"role": "system", "content": "ignored"}],
+        "updated_input": {"result": "rewritten"},
+        "artifacts": [{"artifact_id": "artifact-1"}],
+        "diagnostics": [{"code": "observed"}],
+    })
+
+    annotate_lifecycle_output_diagnostics("PostToolBatch", output)
+
+    diagnostics = output.to_dict()["diagnostics"]
+    ignored_fields = {
+        item["field"]
+        for item in diagnostics
+        if item["code"] == "lifecycle_output_field_ignored"
+    }
+    assert ignored_fields == {
+        "continue_flow",
+        "decision",
+        "reason",
+        "user_message",
+        "additional_context",
+        "updated_input",
+        "artifacts",
+    }
+    assert {"code": "observed"} in diagnostics
+
+
+def test_terminal_lifecycle_events_support_messages_and_artifacts_without_flow_control() -> None:
+    for event_name in ("Stop", "StopFailure"):
+        output = LifecycleHookOutput.from_dict({
+            "continue_flow": False,
+            "decision": "deny",
+            "reason": "try another round",
+            "user_message": "Retry",
+            "additional_context": [{"role": "system", "content": "ignored"}],
+            "updated_input": {"result": "rewritten"},
+            "artifacts": [{"artifact_id": "artifact-1"}],
+            "diagnostics": [{"code": "observed"}],
+        })
+
+        annotate_lifecycle_output_diagnostics(event_name, output)
+
+        diagnostics = output.to_dict()["diagnostics"]
+        ignored_fields = {
+            item["field"]
+            for item in diagnostics
+            if item["code"] == "lifecycle_output_field_ignored"
+        }
+        assert ignored_fields == {
+            "continue_flow",
+            "decision",
+            "additional_context",
+            "updated_input",
+        }
+        assert {"code": "observed"} in diagnostics
+
+
 def test_lifecycle_hook_output_rejects_partial_updated_input_patch() -> None:
     with pytest.raises(ValueError, match="updated_input"):
         LifecycleHookOutput.from_dict({"updated_input": [{"op": "replace", "path": "/target"}]})
@@ -435,13 +559,14 @@ def test_lifecycle_hook_registry_dashboard_items_separate_technical_details() ->
         "enabled": False,
         "executable": False,
         "can_manage": True,
-        "unavailable_reason": "handler_unavailable:mcp_tool",
+        "unavailable_reason": "runtime_unavailable:agent_context",
         "placement_runtime": {
             "server": {
                 "executable": False,
-                "unavailable_reason": "handler_unavailable:mcp_tool",
+                "unavailable_reason": "runtime_unavailable:agent_context",
             },
         },
+        "runtime_context_required": ["agent"],
         "permissions": ["audit.write"],
         "risk_level": "medium",
         "technical": {
@@ -484,13 +609,633 @@ def test_lifecycle_hook_dashboard_executable_requires_handler_runtime() -> None:
     ]
     assert items["hook:prompt"]["trust"] == "trusted"
     assert items["hook:prompt"]["executable"] is False
-    assert items["hook:prompt"]["unavailable_reason"] == "handler_unavailable:prompt"
+    assert items["hook:prompt"]["unavailable_reason"] == "runtime_unavailable:prompt_model"
     assert items["hook:internal"]["executable"] is True
     assert items["hook:internal"]["unavailable_reason"] == ""
 
 
+def test_lifecycle_hook_catalog_dashboard_marks_context_bound_handlers_available() -> None:
+    registry = LifecycleHookRegistry([
+        LifecycleHookDeclaration.from_dict(
+            "hook:prompt",
+            _declaration_payload(
+                event="UserPromptSubmit",
+                handler_type="prompt",
+                handler_ref="Rewrite prompts.",
+                trust="trusted",
+                matcher="*",
+            ),
+        ),
+        LifecycleHookDeclaration.from_dict(
+            "hook:mcp",
+            _declaration_payload(
+                handler_type="mcp_tool",
+                handler_ref="mcp__audit__record",
+                trust="trusted",
+                matcher="*",
+            ),
+        ),
+    ])
+
+    items = {
+        item["id"]: item
+        for item in registry.dashboard_items(
+            runtime_adapters=default_lifecycle_hook_catalog_runtime_adapters()
+        )
+    }
+
+    assert items["hook:prompt"]["executable"] is True
+    assert items["hook:prompt"]["runtime_context_required"] == ["prompt_model"]
+    assert items["hook:mcp"]["executable"] is True
+    assert items["hook:mcp"]["runtime_context_required"] == ["agent"]
+
+
+def test_external_config_cannot_declare_internal_lifecycle_handler() -> None:
+    with pytest.raises(ValueError, match="internal handlers"):
+        lifecycle_declarations_from_config_hooks(
+            owner_id="unsafe-package",
+            source="capability_package",
+            hooks=[
+                {
+                    "event": "PreToolUse",
+                    "placement": "server",
+                    "handler_type": "internal",
+                    "handler_ref": "memory_context",
+                    "display_name": "Unsafe internal hook",
+                    "summary": "Attempts to use a core-only runtime adapter.",
+                    "permissions": [],
+                    "trust": "trusted",
+                }
+            ],
+        )
+
+
+def test_external_config_cannot_declare_unwired_lifecycle_event() -> None:
+    with pytest.raises(ValueError, match="SessionStart"):
+        lifecycle_declarations_from_config_hooks(
+            owner_id="review",
+            source="capability_package",
+            hooks=[
+                {
+                    "event": "SessionStart",
+                    "placement": "server",
+                    "handler_type": "prompt",
+                    "handler_ref": "package:review/session-start",
+                    "display_name": "Review package startup",
+                    "summary": "SessionStart is internal-only until wired.",
+                    "permissions": [],
+                }
+            ],
+        )
+
+
+def test_internal_runtime_adapter_refuses_external_internal_declaration() -> None:
+    declaration = LifecycleHookDeclaration(
+        id="hook:unsafe-internal",
+        event="PreToolUse",
+        source="capability_package",
+        placement="server",
+        handler_type="internal",
+        display_name="Unsafe internal hook",
+        summary="Simulates a declaration that bypassed config validation.",
+        permissions=[],
+        matcher="*",
+        handler_ref="memory_context",
+        trust="trusted",
+    )
+    registry = LifecycleHookRegistry([declaration])
+
+    items = {item["id"]: item for item in registry.dashboard_items()}
+    results = LifecycleHookDispatcher(
+        registry,
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(),
+    ).dispatch(build_lifecycle_event_context("PreToolUse"))
+
+    assert results == []
+    assert registry.executable(event="PreToolUse") == []
+    assert items["hook:unsafe-internal"]["executable"] is False
+    assert items["hook:unsafe-internal"]["unavailable_reason"] == (
+        "handler_source_unavailable:internal"
+    )
+
+
+def test_admin_managed_internal_lifecycle_handler_can_use_internal_adapter_output() -> None:
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:admin-internal",
+        _declaration_payload(
+            source="admin_managed",
+            handler_type="internal",
+            handler_ref="admin_policy",
+            matcher="*",
+            trust="trusted",
+            permissions=[],
+            technical={"output": {"diagnostics": [{"code": "admin_policy"}]}},
+        ),
+    )
+    registry = LifecycleHookRegistry([declaration])
+    dispatcher = LifecycleHookDispatcher(
+        registry,
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(),
+    )
+
+    results = dispatcher.dispatch(build_lifecycle_event_context("PreToolUse"))
+
+    assert len(results) == 1
+    assert results[0].output.diagnostics == [{"code": "admin_policy"}]
+
+
+def test_prompt_lifecycle_runtime_adapter_uses_model_json_output() -> None:
+    class PromptLLM:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def chat(self, messages, **kwargs):  # noqa: ARG002
+            self.messages = messages
+            return type(
+                "_Response",
+                (),
+                {
+                    "content": (
+                        '{"updated_input":{"user_input":"rewritten by prompt"},'
+                        '"additional_context":[{"role":"system","content":"extra"}]}'
+                    )
+                },
+            )()
+
+    prompt_llm = PromptLLM()
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:prompt",
+        _declaration_payload(
+            event="UserPromptSubmit",
+            handler_type="prompt",
+            handler_ref="Rewrite prompts when useful.",
+            trust="trusted",
+            matcher="*",
+        ),
+    )
+    dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry([declaration]),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(
+            prompt_llm=prompt_llm,
+        ),
+    )
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context(
+            "UserPromptSubmit",
+            payload={"user_input": "original"},
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].output.updated_input == {"user_input": "rewritten by prompt"}
+    assert results[0].output.additional_context == [
+        {"role": "system", "content": "extra"}
+    ]
+    assert "LifecycleHookOutput" in prompt_llm.messages[0]["content"]
+    assert "original" in prompt_llm.messages[1]["content"]
+
+
+def test_prompt_lifecycle_runtime_adapter_fail_closes_invalid_model_output() -> None:
+    class PromptLLM:
+        def chat(self, messages, **kwargs):  # noqa: ARG002
+            return type("_Response", (), {"content": "not json"})()
+
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:prompt",
+        _declaration_payload(
+            event="UserPromptSubmit",
+            handler_type="prompt",
+            handler_ref="Decide whether the prompt may continue.",
+            trust="trusted",
+            matcher="*",
+        ),
+    )
+    dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry([declaration]),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(
+            prompt_llm=PromptLLM(),
+        ),
+    )
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context(
+            "UserPromptSubmit",
+            payload={"user_input": "original"},
+        )
+    )
+
+    assert results[0].output.continue_flow is False
+    assert results[0].output.decision == "deny"
+    assert results[0].output.diagnostics[0]["code"] == "prompt_output_invalid"
+
+
+def _agent_bound_dispatcher(
+    agent,
+    declarations: list[LifecycleHookDeclaration],
+) -> LifecycleHookDispatcher:
+    dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry(declarations),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(),
+    )
+    agent.lifecycle_dispatcher = dispatcher
+    bind_lifecycle_runtime_adapters_to_agent(agent)
+    return dispatcher
+
+
+class _AllowingAdapterAgent:
+    runtime_working_directory = ""
+
+    def __init__(self) -> None:
+        self.permission_checks = []
+
+    def evaluate_tool_permission(self, tool, *, tool_call=None):
+        self.permission_checks.append((getattr(tool, "name", ""), tool_call))
+        return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+
+class _ApprovalProvider:
+    def __init__(self, decision: ApprovalDecision) -> None:
+        self.decision = decision
+        self.requests = []
+
+    def request_approval(self, request):
+        self.requests.append(request)
+        return self.decision
+
+
+class _ApprovalRequiredAdapterAgent(_AllowingAdapterAgent):
+    def __init__(
+        self,
+        *,
+        approval_provider: object | None,
+        runtime_working_directory: str = "",
+    ) -> None:
+        super().__init__()
+        self.approval_provider = approval_provider
+        self.runtime_working_directory = runtime_working_directory
+
+    def evaluate_tool_permission(self, tool, *, tool_call=None):
+        self.permission_checks.append((getattr(tool, "name", ""), tool_call))
+        return PermissionDecision(
+            action=PermissionAction.REQUIRE_APPROVAL,
+            authorized=True,
+            reason="lifecycle command requires review",
+        )
+
+
+def test_command_lifecycle_runtime_adapter_runs_permission_gated_json_command() -> None:
+    agent = _AllowingAdapterAgent()
+    command = (
+        f'"{sys.executable}" -c "import json; '
+        "print(json.dumps({"
+        "'diagnostics': [{'code': 'command_ok'}], "
+        "'updated_input': {'user_input': 'from command'}"
+        '}))"'
+    )
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:command",
+        _declaration_payload(
+            event="UserPromptSubmit",
+            handler_type="command",
+            handler_ref=command,
+            trust="trusted",
+            matcher="*",
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context(
+            "UserPromptSubmit",
+            payload={"user_input": "original"},
+        )
+    )
+
+    assert results[0].output.updated_input == {"user_input": "from command"}
+    assert results[0].output.diagnostics == [{"code": "command_ok"}]
+    assert agent.permission_checks[0][0] == "shell"
+
+
+def test_command_lifecycle_runtime_adapter_requests_approval_before_execution(tmp_path: Path) -> None:
+    approval = _ApprovalProvider(ApprovalDecision.allow_once("approved"))
+    agent = _ApprovalRequiredAdapterAgent(
+        approval_provider=approval,
+        runtime_working_directory=str(tmp_path),
+    )
+    command = (
+        f'"{sys.executable}" -c "import json, pathlib; '
+        "pathlib.Path('marker.txt').write_text('ran'); "
+        "print(json.dumps({'diagnostics': [{'code': 'approved_command'}]}))"
+        '"'
+    )
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:command",
+        _declaration_payload(
+            event="UserPromptSubmit",
+            handler_type="command",
+            handler_ref=command,
+            trust="trusted",
+            matcher="*",
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context("UserPromptSubmit", payload={"user_input": "original"})
+    )
+
+    assert results[0].output.diagnostics == [{"code": "approved_command"}]
+    assert (tmp_path / "marker.txt").read_text() == "ran"
+    assert approval.requests[0].tool_name == "shell"
+    assert approval.requests[0].tool_args["command"] == command
+    assert approval.requests[0].metadata["lifecycle_hook_id"] == "hook:command"
+
+
+def test_command_lifecycle_runtime_adapter_stops_when_approval_is_denied(tmp_path: Path) -> None:
+    approval = _ApprovalProvider(ApprovalDecision.deny_once("denied"))
+    agent = _ApprovalRequiredAdapterAgent(
+        approval_provider=approval,
+        runtime_working_directory=str(tmp_path),
+    )
+    command = (
+        f'"{sys.executable}" -c "import pathlib; '
+        "pathlib.Path('marker.txt').write_text('ran')"
+        '"'
+    )
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:command",
+        _declaration_payload(
+            event="UserPromptSubmit",
+            handler_type="command",
+            handler_ref=command,
+            trust="trusted",
+            matcher="*",
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context("UserPromptSubmit", payload={"user_input": "original"})
+    )
+
+    assert results[0].output.continue_flow is False
+    assert results[0].output.decision == "deny"
+    assert results[0].output.diagnostics[0]["code"] == "approval_denied"
+    assert not (tmp_path / "marker.txt").exists()
+    assert len(approval.requests) == 1
+
+
+def test_command_lifecycle_runtime_adapter_fails_closed_without_approval_provider() -> None:
+    agent = _ApprovalRequiredAdapterAgent(approval_provider=None)
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:command",
+        _declaration_payload(
+            event="UserPromptSubmit",
+            handler_type="command",
+            handler_ref=f'"{sys.executable}" -c "print(1)"',
+            trust="trusted",
+            matcher="*",
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context("UserPromptSubmit", payload={"user_input": "original"})
+    )
+
+    assert results[0].output.continue_flow is False
+    assert results[0].output.decision == "deny"
+    assert results[0].output.diagnostics[0]["code"] == "approval_provider_missing"
+
+
+def test_http_lifecycle_runtime_adapter_posts_context_and_reads_json_output() -> None:
+    seen = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length") or "0")
+            seen["body"] = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.dumps({"diagnostics": [{"code": "http_ok"}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):  # noqa: D401
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = _AllowingAdapterAgent()
+        declaration = LifecycleHookDeclaration.from_dict(
+            "hook:http",
+            _declaration_payload(
+                event="UserPromptSubmit",
+                handler_type="http",
+                handler_ref=f"http://127.0.0.1:{server.server_port}/hook",
+                trust="trusted",
+                matcher="*",
+            ),
+        )
+        dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+        results = dispatcher.dispatch(
+            build_lifecycle_event_context(
+                "UserPromptSubmit",
+                payload={"user_input": "original"},
+            )
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    assert results[0].output.diagnostics == [{"code": "http_ok"}]
+    assert seen["body"]["context"]["payload"]["user_input"] == "original"
+    assert agent.permission_checks[0][0] == "http_request"
+
+
+def test_mcp_tool_lifecycle_runtime_adapter_invokes_agent_visible_tool() -> None:
+    class Tool:
+        name = "mcp__audit__record"
+        tool_source = "mcp"
+        server_name = "audit"
+
+        def __init__(self) -> None:
+            self.arguments = None
+
+        def execute(self, **kwargs):
+            self.arguments = kwargs
+            return '{"diagnostics":[{"code":"mcp_ok"}]}'
+
+        def preflight_validate(self, **_kwargs):
+            return None
+
+    class Agent(_AllowingAdapterAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tool = Tool()
+            self.state = SimpleNamespace(current_round=0)
+            self.active_mode = "coder"
+            self.approval_provider = None
+            self.events = []
+
+        def get_tool(self, name):
+            return self.tool if name == self.tool.name else None
+
+        def is_tool_allowed_in_mode(self, _name):
+            return True
+
+        def suggest_modes_for_tool(self, _name):
+            return []
+
+        def get_active_mode_config(self):
+            return SimpleNamespace(prompt_append="")
+
+        def _emit_event(self, event):
+            self.events.append(event)
+
+    agent = Agent()
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:mcp",
+        _declaration_payload(
+            event="PostToolUse",
+            handler_type="mcp_tool",
+            handler_ref="mcp__audit__record",
+            trust="trusted",
+            matcher="*",
+            technical={"arguments": {"status": "done"}},
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context("PostToolUse", payload={"tool_names": ["shell"]})
+    )
+
+    assert results[0].output.diagnostics == [{"code": "mcp_ok"}]
+    assert agent.tool.arguments == {"status": "done"}
+    assert agent.permission_checks[0][0] == "mcp__audit__record"
+    assert [event.event_type.value for event in agent.events] == [
+        "tool_call_start",
+        "tool_call_end",
+    ]
+
+
+def test_agent_lifecycle_runtime_adapter_submits_agent_run_reference() -> None:
+    class Run:
+        id = "run-1"
+        agent_id = "reviewer"
+
+    class ControlPlane:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def submit_agent_run(self, request):
+            self.requests.append(request)
+            return Run()
+
+    class Agent(_AllowingAdapterAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.agent_run_control_plane = ControlPlane()
+            self.runtime_config = type(
+                "_Config",
+                (),
+                {
+                    "agent_registry": type(
+                        "_Registry",
+                        (),
+                        {"agents": {"reviewer": AgentConfig(id="reviewer")}},
+                    )()
+                },
+            )()
+
+    agent = Agent()
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:agent",
+        _declaration_payload(
+            event="Stop",
+            handler_type="agent",
+            handler_ref="reviewer",
+            trust="trusted",
+            matcher="*",
+            technical={
+                "prompt": "review lifecycle output",
+                "budget": {"token_budget": "5000", "max_turns": 2},
+            },
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context(
+            "Stop",
+            agent_run_id="parent-run",
+            session_run_id="session-1",
+            turn_id="turn-1",
+        )
+    )
+
+    assert results[0].output.diagnostics[0]["code"] == "agent_run_submitted"
+    assert results[0].output.artifacts == [{"kind": "agent_run", "id": "run-1"}]
+    request = agent.agent_run_control_plane.requests[0]
+    assert request.agent_id == "reviewer"
+    assert request.source.value == "delegation"
+    assert request.parent_run_id == "parent-run"
+    assert request.delegated_by_run_id == "parent-run"
+    assert request.budget == {"token_budget": 5000, "max_turns": 2}
+    assert "budget" not in request.metadata
+    assert request.metadata["parent_session_id"] == "session-1"
+    assert request.metadata["parent_turn_id"] == "turn-1"
+
+
+def test_agent_lifecycle_runtime_adapter_rejects_unknown_target_agent() -> None:
+    class ControlPlane:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def submit_agent_run(self, request):  # noqa: ARG002
+            self.requests.append(request)
+            raise AssertionError("unknown agent should not be submitted")
+
+    class Agent(_AllowingAdapterAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.agent_run_control_plane = ControlPlane()
+            self.runtime_config = type(
+                "_Config",
+                (),
+                {"agent_registry": type("_Registry", (), {"agents": {}})()},
+            )()
+
+    agent = Agent()
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:agent",
+        _declaration_payload(
+            event="Stop",
+            handler_type="agent",
+            handler_ref="missing-agent",
+            trust="trusted",
+            matcher="*",
+            technical={"prompt": "review lifecycle output"},
+        ),
+    )
+    dispatcher = _agent_bound_dispatcher(agent, [declaration])
+
+    results = dispatcher.dispatch(build_lifecycle_event_context("Stop"))
+
+    assert results[0].output.continue_flow is False
+    assert results[0].output.decision == "deny"
+    assert results[0].output.diagnostics[0]["code"] == "agent_not_found"
+    assert agent.agent_run_control_plane.requests == []
+
+
 def test_system_builtin_lifecycle_declarations_wrap_existing_hook_specs() -> None:
-    from reuleauxcoder.domain.hooks.discovery import discover_hook_specs
+    from reuleauxcoder.domain.hooks.discovery import discover_hook_specs, instantiate_hooks
 
     declarations = system_builtin_lifecycle_declarations_from_hook_specs(
         discover_hook_specs()
@@ -507,9 +1252,22 @@ def test_system_builtin_lifecycle_declarations_wrap_existing_hook_specs() -> Non
     assert all(declaration.placement == "server" for declaration in declarations)
 
     registry = LifecycleHookRegistry(declarations)
-    assert "MemoryContextHook" in {
+    assert registry.executable(event="UserPromptSubmit") == []
+
+    hook_registry = HookRegistry()
+    for hook_point, hook in instantiate_hooks(discover_hook_specs(), Config()):
+        hook_registry.register(hook_point, hook)
+    runtime_registry = LifecycleHookRegistry(
+        system_builtin_lifecycle_declarations_from_hook_registry(hook_registry)
+    )
+    assert "memory_context" in {
         declaration.handler_ref
-        for declaration in registry.executable(event="UserPromptSubmit")
+        for declaration in runtime_registry.executable(
+            event="UserPromptSubmit",
+            runtime_adapters=default_lifecycle_hook_runtime_adapters(
+                hook_registry=hook_registry,
+            ),
+        )
     }
 
 
@@ -532,12 +1290,12 @@ def test_lifecycle_dispatcher_runs_only_trusted_matching_hooks() -> None:
     ])
     dispatcher = LifecycleHookDispatcher(
         registry,
-        handlers={
-            "mcp_tool": lambda declaration, _context: (
+        runtime_adapters=_runtime_adapters(
+            mcp_tool=lambda declaration, _context: (
                 calls.append(declaration.id)
                 or LifecycleHookOutput.from_dict({"decision": "allow"})
             )
-        },
+        ),
     )
 
     results = dispatcher.dispatch(
@@ -579,11 +1337,11 @@ def test_lifecycle_dispatcher_matches_standard_context_fields_only() -> None:
     ])
     dispatcher = LifecycleHookDispatcher(
         registry,
-        handlers={
-            "mcp_tool": lambda declaration, _context: (
+        runtime_adapters=_runtime_adapters(
+            mcp_tool=lambda declaration, _context: (
                 calls.append(declaration.id) or LifecycleHookOutput()
             )
-        },
+        ),
     )
 
     dispatcher.dispatch(
@@ -618,11 +1376,11 @@ def test_lifecycle_dispatcher_runs_both_on_server_and_reports_peer_side_separate
     ])
     dispatcher = LifecycleHookDispatcher(
         registry,
-        handlers={
-            "internal": lambda declaration, _context: (
+        runtime_adapters=_runtime_adapters(
+            internal=lambda declaration, _context: (
                 calls.append(declaration.id) or LifecycleHookOutput()
             )
-        },
+        ),
     )
 
     dashboard = registry.dashboard_items()[0]
@@ -657,11 +1415,14 @@ def test_lifecycle_dispatcher_runs_both_on_server_and_reports_peer_side_separate
     assert calls == ["hook:both"]
 
 
-def test_lifecycle_dispatcher_reports_missing_handler_as_diagnostic_output() -> None:
+def test_lifecycle_dispatcher_skips_unavailable_runtime_adapters() -> None:
     registry = LifecycleHookRegistry([
         LifecycleHookDeclaration.from_dict("hook:trusted", _declaration_payload(trust="trusted"))
     ])
-    dispatcher = LifecycleHookDispatcher(registry, handlers={})
+    dispatcher = LifecycleHookDispatcher(
+        registry,
+        runtime_adapters=LifecycleHookRuntimeAdapterRegistry(),
+    )
 
     results = dispatcher.dispatch(
         LifecycleHookEventContext(
@@ -671,13 +1432,12 @@ def test_lifecycle_dispatcher_reports_missing_handler_as_diagnostic_output() -> 
         )
     )
 
-    assert len(results) == 1
-    assert results[0].declaration.id == "hook:trusted"
-    assert results[0].output.continue_flow is True
-    assert results[0].output.diagnostics == [{
-        "code": "handler_unavailable",
-        "handler_type": "mcp_tool",
-    }]
+    assert results == []
+    dashboard = registry.dashboard_items(
+        runtime_adapters=LifecycleHookRuntimeAdapterRegistry(),
+    )[0]
+    assert dashboard["executable"] is False
+    assert dashboard["unavailable_reason"] == "handler_unavailable:mcp_tool"
 
 
 def test_lifecycle_builders_emit_list_tool_fields_only() -> None:
@@ -831,11 +1591,11 @@ def test_lifecycle_matcher_ignores_technical_details_even_when_names_match() -> 
     ])
     dispatcher = LifecycleHookDispatcher(
         registry,
-        handlers={
-            "mcp_tool": lambda declaration, _context: (
+        runtime_adapters=_runtime_adapters(
+            mcp_tool=lambda declaration, _context: (
                 calls.append(declaration.id) or LifecycleHookOutput()
             )
-        },
+        ),
     )
 
     dispatcher.dispatch(
@@ -887,11 +1647,11 @@ def test_lifecycle_batch_tool_matcher_uses_same_list_semantics() -> None:
     ])
     dispatcher = LifecycleHookDispatcher(
         registry,
-        handlers={
-            "mcp_tool": lambda declaration, _context: (
+        runtime_adapters=_runtime_adapters(
+            mcp_tool=lambda declaration, _context: (
                 calls.append(declaration.id) or LifecycleHookOutput()
             )
-        },
+        ),
     )
 
     dispatcher.dispatch(
@@ -1094,11 +1854,11 @@ def test_lifecycle_registry_from_config_collects_skill_mcp_package_and_component
                     id="review",
                     hooks=[
                         {
-                            "event": "SessionStart",
+                            "event": "UserPromptSubmit",
                             "handler_type": "prompt",
-                            "handler_ref": "package:review/session-start",
-                            "display_name": "Review package startup",
-                            "summary": "Adds review startup context.",
+                            "handler_ref": "package:review/prompt",
+                            "display_name": "Review package prompt",
+                            "summary": "Adds review prompt context.",
                             "permissions": [],
                         }
                     ],
@@ -1129,7 +1889,7 @@ def test_lifecycle_registry_from_config_collects_skill_mcp_package_and_component
 
     assert items["hook:skill:code-review:UserPromptSubmit:0"]["source"] == "skill"
     assert items["hook:mcp_server:github:PostToolUse:0"]["source"] == "mcp_server"
-    assert items["hook:capability_package:review:SessionStart:0"]["source"] == (
+    assert items["hook:capability_package:review:UserPromptSubmit:0"]["source"] == (
         "capability_package"
     )
     assert items["hook:skill:skill:package-review:PreToolUse:0"]["source"] == "skill"

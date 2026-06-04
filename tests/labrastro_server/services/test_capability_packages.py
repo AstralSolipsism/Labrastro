@@ -112,6 +112,65 @@ def test_agent_run_log_event_projects_as_process_context() -> None:
     assert payload["level"] == "info"
 
 
+def test_delegated_agent_run_completion_projects_as_process_context() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "parent-run",
+            "seq": 2,
+            "type": "delegated_run_completed",
+            "payload": {
+                "agent_run_id": "child-run",
+                "agent_id": "reviewer",
+                "status": "completed",
+                "result": "review passed",
+                "source": "delegation",
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["context_event"]
+    payload = session_events[0][1]
+    assert payload["phase"] == "delegated_run_completed"
+    assert payload["title"] == "reviewer completed"
+    assert payload["agent_run_id"] == "parent-run"
+    assert payload["child_agent_run_id"] == "child-run"
+    assert payload["agent_run_status"] == "completed"
+    assert payload["result"] == "review passed"
+    assert payload["meta"]["source"] == "delegation"
+
+
+def test_agent_run_lifecycle_hook_event_projects_as_lifecycle_hook_session_event() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 3,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": "Stop",
+                    "hook_id": "hook:stop",
+                    "display_name": "Stop review",
+                    "level": "info",
+                    "message": "review passed",
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    assert payload["phase"] == "result"
+    assert payload["event_name"] == "Stop"
+    assert payload["hook_id"] == "hook:stop"
+    assert payload["agent_run_id"] == "run-1"
+    assert payload["workflow"] == "agent_run"
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 3, "type": "lifecycle_hook"}
+    ]
+
+
 def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
     start_events = agent_run_event_to_session_events(
         {
@@ -380,7 +439,9 @@ def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -
     assert '"hooks"' in prompt
     assert '"runtime_footprint"' in prompt
     assert '"placement": "server|peer|both"' in prompt
-    assert '"handler_type": "command|http|mcp_tool|prompt|agent|internal"' in prompt
+    assert '"handler_type": "command|http|mcp_tool|prompt|agent"' in prompt
+    assert "must not declare internal handlers" in prompt
+    assert "do not output SessionStart/SessionEnd" in prompt
     assert '"matcher": {"tool_names": ["read_file"]}' in prompt
     assert '"permissions": []' in prompt
     assert "trust defaults to pending_review" in prompt
@@ -825,11 +886,11 @@ def test_package_installer_preserves_lifecycle_hooks_for_package_components_and_
     )
     package_hooks = [
         {
-            "event": "SessionStart",
+            "event": "UserPromptSubmit",
             "handler_type": "prompt",
-            "handler_ref": "package:review/session-start",
-            "display_name": "Review package startup",
-            "summary": "Adds review startup context.",
+            "handler_ref": "package:review/prompt",
+            "display_name": "Review package prompt",
+            "summary": "Adds review prompt context.",
             "permissions": [],
             "trust": "trusted",
         }
@@ -900,7 +961,7 @@ def test_package_installer_rejects_invalid_lifecycle_hook_before_config_write(tm
                 "id": "review",
                 "hooks": [
                     {
-                        "event": "SessionStart",
+                        "event": "PreToolUse",
                         "placement": "local_peer",
                         "handler_type": "prompt",
                         "display_name": "Review package startup",

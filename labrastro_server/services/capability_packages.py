@@ -2668,8 +2668,9 @@ def _render_packager_prompt(
             '"source_path": "skills/code-review/SKILL.md", '
             '"summary": "what this skill does", '
             '"runtime_footprint": {"runs_on": "server|local_peer|both|agent_only"}, '
-            '"hooks": [{"event": "PreToolUse", "placement": "server|peer|both", '
-            '"handler_type": "command|http|mcp_tool|prompt|agent|internal", '
+            '"hooks": [{"event": "UserPromptSubmit|PermissionRequest|PreToolUse|PostToolUse|PostToolUseFailure|PostToolBatch|Stop|StopFailure", '
+            '"placement": "server|peer|both", '
+            '"handler_type": "command|http|mcp_tool|prompt|agent", '
             '"handler_ref": "...", "matcher": {"tool_names": ["read_file"]}, '
             '"permissions": [], "display_name": "...", "summary": "...", '
             '"risk_level": "low|medium|high"}]}\n'
@@ -2691,7 +2692,8 @@ def _render_packager_prompt(
             "运行端必须明确：server runs in Labrastro backend；peer means the user's local VS Code side；"
             "both 表示两端都需要安装/配置证据。hooks 必须使用标准 matcher 列表字段 "
             "tool_names/tool_call_ids/tool_sources/mcp_servers；不要输出 trust，trust defaults to pending_review，"
-            "由用户在 Settings/ChatView 审查后决定。\n"
+            "由用户在 Settings/ChatView 审查后决定。能力包不能声明 internal handler；"
+            "SessionStart/SessionEnd 等未接入外部配置运行线的事件不能输出到草案。\n"
             "证据包：\n"
             f"```json\n{bundle_json}\n```\n"
             f"{revision_block}"
@@ -2733,8 +2735,9 @@ def _render_packager_prompt(
         '"source_path": "skills/code-review/SKILL.md", '
         '"summary": "what this skill does", '
         '"runtime_footprint": {"runs_on": "server|local_peer|both|agent_only"}, '
-        '"hooks": [{"event": "PreToolUse", "placement": "server|peer|both", '
-        '"handler_type": "command|http|mcp_tool|prompt|agent|internal", '
+        '"hooks": [{"event": "UserPromptSubmit|PermissionRequest|PreToolUse|PostToolUse|PostToolUseFailure|PostToolBatch|Stop|StopFailure", '
+        '"placement": "server|peer|both", '
+        '"handler_type": "command|http|mcp_tool|prompt|agent", '
         '"handler_ref": "...", "matcher": {"tool_names": ["read_file"]}, '
         '"permissions": [], "display_name": "...", "summary": "...", '
         '"risk_level": "low|medium|high"}]}\n'
@@ -2757,7 +2760,9 @@ def _render_packager_prompt(
         "peer means the user's local VS Code side; both means both sides require evidence-backed "
         "installation/configuration. hooks must use the standard matcher list fields "
         "tool_names/tool_call_ids/tool_sources/mcp_servers. Do not output trust; "
-        "trust defaults to pending_review and is granted later by the user through Settings/ChatView.\n"
+        "trust defaults to pending_review and is granted later by the user through Settings/ChatView. "
+        "Capability packages must not declare internal handlers; do not output SessionStart/SessionEnd "
+        "or other events that are not wired for external configuration.\n"
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
         f"{revision_block}"

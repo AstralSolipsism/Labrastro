@@ -576,6 +576,7 @@ def test_skill_dashboard_returns_lifecycle_hook_summary_with_technical_details(t
                     "unavailable_reason": "trust:pending_review",
                 },
             },
+            "runtime_context_required": ["prompt_model"],
             "permissions": ["prompt.read"],
             "risk_level": "low",
             "technical": {
@@ -622,7 +623,40 @@ def test_lifecycle_hook_trust_update_changes_config_and_dashboard_execution_stat
     after = manager.skills_dashboard()["items"][0]["hook_views"][0]
     assert after["trust"] == "trusted"
     assert after["executable"] is False
-    assert after["unavailable_reason"] == "handler_unavailable:prompt"
+    assert after["unavailable_reason"] == "handler_ref_unavailable:prompt"
+
+
+def test_lifecycle_hook_dashboard_marks_trusted_prompt_with_handler_ref_executable(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.record_skill(
+        {
+            "name": "code-review",
+            "hooks": [
+                {
+                    "event": "UserPromptSubmit",
+                    "placement": "server",
+                    "handler_type": "prompt",
+                    "handler_ref": "skills/code-review/SKILL.md",
+                    "display_name": "Review prompt guard",
+                    "summary": "Checks review prompts before the model sees them.",
+                    "permissions": ["prompt.read"],
+                }
+            ],
+        }
+    )
+    hook_id = "hook:skill:code-review:UserPromptSubmit:0"
+
+    result = manager.update_lifecycle_hook_trust(
+        {"hook_id": hook_id, "trust": "trusted"}
+    )
+
+    assert result.ok is True
+    hook = manager.skills_dashboard()["items"][0]["hook_views"][0]
+    assert hook["trust"] == "trusted"
+    assert hook["executable"] is True
+    assert hook["unavailable_reason"] == ""
+    assert hook["runtime_context_required"] == ["prompt_model"]
+    assert hook["placement_runtime"]["server"]["executable"] is True
 
 
 def test_record_skill_rejects_raw_lifecycle_hook_id(tmp_path: Path) -> None:
@@ -662,11 +696,11 @@ def test_server_settings_returns_canonical_package_and_component_hook_views(tmp_
                         "status": "installed",
                         "hooks": [
                             {
-                                "event": "SessionStart",
+                                "event": "UserPromptSubmit",
                                 "placement": "server",
                                 "handler_type": "prompt",
-                                "display_name": "Review package startup",
-                                "summary": "Adds review startup context.",
+                                "display_name": "Review package prompt",
+                                "summary": "Adds review prompt context.",
                                 "permissions": [],
                                 "trust": "trusted",
                             }
@@ -704,13 +738,13 @@ def test_server_settings_returns_canonical_package_and_component_hook_views(tmp_
 
     assert "id" not in package_config_hook
     assert "owner_id" not in package_config_hook
-    assert package_config_hook["event"] == "SessionStart"
+    assert package_config_hook["event"] == "UserPromptSubmit"
     assert component_config_hook["event"] == "PreToolUse"
-    assert package_hook["id"] == "hook:capability_package:review:SessionStart:0"
+    assert package_hook["id"] == "hook:capability_package:review:UserPromptSubmit:0"
     assert package_hook["owner_id"] == "review"
     assert package_hook["trust"] == "trusted"
     assert package_hook["executable"] is False
-    assert package_hook["unavailable_reason"] == "handler_unavailable:prompt"
+    assert package_hook["unavailable_reason"] == "handler_ref_unavailable:prompt"
     assert component_hook["id"] == "hook:skill:skill:review:PreToolUse:0"
     assert component_hook["owner_id"] == "skill:review"
     assert component_hook["owner_enabled"] is False
@@ -834,11 +868,11 @@ def test_server_settings_rejects_invalid_lifecycle_hook_before_config_write(tmp_
                 "capability_packages": {
                     "review": {
                         "hooks": [
-                            {
-                                "event": "SessionStart",
-                                "placement": "server",
-                                "handler_type": "python_class",
-                                "display_name": "Review package startup",
+                        {
+                            "event": "UserPromptSubmit",
+                            "placement": "server",
+                            "handler_type": "python_class",
+                            "display_name": "Review package startup",
                                 "summary": "Adds review startup context.",
                                 "permissions": [],
                             }

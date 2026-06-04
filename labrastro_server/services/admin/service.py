@@ -67,6 +67,7 @@ from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry, MemoryS
 from reuleauxcoder.domain.hooks.lifecycle import (
     LIFECYCLE_HOOK_TRUST_STATES,
     LifecycleHookRegistry,
+    default_lifecycle_hook_catalog_runtime_adapters,
     lifecycle_declarations_from_config_hooks,
     sanitize_lifecycle_hooks_for_config,
 )
@@ -3507,7 +3508,9 @@ class RemoteAdminConfigManager:
                 "risk_level": "",
                 "technical": {"error": str(exc)},
             }]
-        return registry.dashboard_items()
+        return registry.dashboard_items(
+            runtime_adapters=default_lifecycle_hook_catalog_runtime_adapters()
+        )
 
     def _chat_command_catalog(self) -> list[dict[str, Any]]:
         registry = create_builtin_action_registry()
