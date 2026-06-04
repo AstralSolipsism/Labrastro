@@ -22,9 +22,11 @@ from reuleauxcoder.domain.config.models import (
 )
 from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookDispatcher,
-    default_lifecycle_hook_handlers,
+    bind_lifecycle_runtime_adapters_to_agent,
+    default_lifecycle_hook_runtime_adapters,
     lifecycle_registry_from_config,
 )
+from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.extensions.mcp.manager import MCPManager
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
 from labrastro_server.relay.server import RelayServer
@@ -79,18 +81,25 @@ def _default_load_tools(tool_backend: ToolBackend) -> list[Any]:
 def _default_create_agent(llm: LLM, tools: list[Any], config: Config) -> Agent:
     context_tokens = int(resolve_model_runtime(config).max_context_tokens or 0)
     lifecycle_registry = lifecycle_registry_from_config(config)
-    return Agent(
+    hook_registry = HookRegistry()
+    agent = Agent(
         llm=llm,
         tools=tools,
         config=config,
         max_context_tokens=max(1, context_tokens),
         available_modes=getattr(config, "modes", {}) or {},
         active_mode=getattr(config, "active_mode", None),
+        hook_registry=hook_registry,
         lifecycle_dispatcher=LifecycleHookDispatcher(
             lifecycle_registry,
-            handlers=default_lifecycle_hook_handlers(),
+            runtime_adapters=default_lifecycle_hook_runtime_adapters(
+                hook_registry=hook_registry,
+                prompt_llm=llm,
+            ),
         ),
     )
+    bind_lifecycle_runtime_adapters_to_agent(agent)
+    return agent
 
 
 def _default_create_session_store(sessions_dir: Path | None) -> SessionStore:

@@ -14,7 +14,7 @@ from reuleauxcoder.domain.config.models import (
     ProviderConfig,
     infer_provider_compat,
 )
-from reuleauxcoder.domain.hooks.registry import HookRegistry
+from reuleauxcoder.domain.hooks.lifecycle import dispatch_internal_lifecycle_hook_point
 from reuleauxcoder.domain.hooks.types import (
     AfterLLMResponseContext,
     BeforeLLMRequestContext,
@@ -675,7 +675,7 @@ class LLM:
         on_token: Optional[Callable[[str], None]] = None,
         on_reasoning_token: Optional[Callable[[str], None]] = None,
         on_tool_call_delta: Optional[Callable[[dict[str, Any]], None]] = None,
-        hook_registry: HookRegistry | None = None,
+        lifecycle_dispatcher: Any | None = None,
         session_id: str | None = None,
         trace_id: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -745,21 +745,19 @@ class LLM:
                 ui_bus=active_ui_bus,
             )
 
-            if hook_registry is not None:
-                guard_decisions = hook_registry.run_guards(
-                    HookPoint.BEFORE_LLM_REQUEST, before_context
+            internal_lifecycle = dispatch_internal_lifecycle_hook_point(
+                lifecycle_dispatcher,
+                HookPoint.BEFORE_LLM_REQUEST,
+                before_context,
+                trigger_source="llm",
+                origin="llm",
+            )
+            if internal_lifecycle.blocked:
+                raise RuntimeError(
+                    internal_lifecycle.message or "LLM request blocked by guard hook"
                 )
-                denied = next((d for d in guard_decisions if not d.allowed), None)
-                if denied is not None:
-                    raise RuntimeError(
-                        denied.reason or "LLM request blocked by guard hook"
-                    )
-                before_context = hook_registry.run_transforms(
-                    HookPoint.BEFORE_LLM_REQUEST, before_context
-                )
-                hook_registry.run_observers(
-                    HookPoint.BEFORE_LLM_REQUEST, before_context
-                )
+            if isinstance(internal_lifecycle.context, BeforeLLMRequestContext):
+                before_context = internal_lifecycle.context
 
             request.metadata = dict(before_context.metadata)
             request.messages = list(before_context.messages)
@@ -935,11 +933,15 @@ class LLM:
                 metadata=dict(before_context.metadata),
             )
 
-            if hook_registry is not None:
-                after_context = hook_registry.run_transforms(
-                    HookPoint.AFTER_LLM_RESPONSE, after_context
-                )
-                hook_registry.run_observers(HookPoint.AFTER_LLM_RESPONSE, after_context)
+            internal_lifecycle = dispatch_internal_lifecycle_hook_point(
+                lifecycle_dispatcher,
+                HookPoint.AFTER_LLM_RESPONSE,
+                after_context,
+                trigger_source="llm",
+                origin="llm",
+            )
+            if isinstance(internal_lifecycle.context, AfterLLMResponseContext):
+                after_context = internal_lifecycle.context
 
             return after_context.response or response
         except Exception as e:

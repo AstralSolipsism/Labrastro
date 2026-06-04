@@ -18,8 +18,17 @@ class FakeLLM:
 
     def __init__(self) -> None:
         self.messages = []
+        self.lifecycle_messages = []
 
     def chat(self, messages, **kwargs):  # noqa: ARG002
+        if (
+            messages
+            and "LifecycleHookOutput" in str(messages[0].get("content") or "")
+        ):
+            self.lifecycle_messages = messages
+            return LLMResponse(
+                content='{"updated_input":{"user_input":"rewritten prompt"}}'
+            )
         self.messages = messages
         return LLMResponse(content="done")
 
@@ -89,11 +98,7 @@ def test_default_create_agent_wires_config_lifecycle_hooks_into_real_chat_path()
                             "permissions": [],
                             "trust": "trusted",
                             "technical": {
-                                "output": {
-                                    "updated_input": {
-                                        "user_input": "rewritten prompt"
-                                    }
-                                }
+                                "prompt": "Rewrite the user prompt when appropriate."
                             },
                         }
                     ],
@@ -110,6 +115,7 @@ def test_default_create_agent_wires_config_lifecycle_hooks_into_real_chat_path()
 
     assert result == "done"
     assert agent.lifecycle_dispatcher is not None
+    assert llm.lifecycle_messages
     assert events[0].data["user_input"] == "rewritten prompt"
     user_messages = [
         message for message in llm.messages if message.get("role") == "user"

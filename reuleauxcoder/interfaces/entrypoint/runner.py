@@ -36,6 +36,10 @@ from reuleauxcoder.domain.hooks import (
     discover_hook_specs,
     instantiate_hooks,
 )
+from reuleauxcoder.domain.hooks.lifecycle import (
+    dispatch_internal_lifecycle_hook_point,
+    system_builtin_lifecycle_declarations_from_hook_registry,
+)
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 from reuleauxcoder.extensions.mcp.manager import MCPManager
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
@@ -241,6 +245,20 @@ class AppRunner:
         hooks = instantiate_hooks(specs, config)
         for hook_point, hook in hooks:
             agent.register_hook(hook_point, hook)
+        dispatcher = getattr(agent, "lifecycle_dispatcher", None)
+        registry = getattr(dispatcher, "registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            existing_ids = {
+                str(getattr(item, "id", "") or "")
+                for item in getattr(registry, "query", lambda: [])()
+            }
+            for declaration in system_builtin_lifecycle_declarations_from_hook_registry(
+                agent.hook_registry
+            ):
+                if declaration.id not in existing_ids:
+                    register(declaration)
+                    existing_ids.add(declaration.id)
 
     def _init_lsp(self, config: Config, agent: Agent, ui_bus: UIEventBus) -> None:
         """Initialize host-side LSP for local execution."""
@@ -441,11 +459,13 @@ class AppRunner:
         | SessionSaveContext,
     ) -> None:
         """Run hooks for a lifecycle event without mutating control flow."""
-        for decision in agent.hook_registry.run_guards(hook_point, context):
-            if not decision.allowed:
-                break
-        agent.hook_registry.run_transforms(hook_point, context)
-        agent.hook_registry.run_observers(hook_point, context)
+        dispatch_internal_lifecycle_hook_point(
+            getattr(agent, "lifecycle_dispatcher", None),
+            hook_point,
+            context,
+            trigger_source="runner",
+            origin="runner",
+        )
 
     def _init_mcp(
         self, mcp_servers: list[Any], agent: Agent, ui_bus: UIEventBus

@@ -4,6 +4,12 @@ import pytest
 
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.base import TransformHook
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDispatcher,
+    LifecycleHookRegistry,
+    default_lifecycle_hook_runtime_adapters,
+    system_builtin_lifecycle_declarations_from_hook_registry,
+)
 from reuleauxcoder.domain.hooks.types import BeforeLLMRequestContext, HookPoint
 from reuleauxcoder.domain.hooks.builtin.project_context import ProjectContextHook
 from reuleauxcoder.domain.llm.models import (
@@ -14,6 +20,19 @@ from reuleauxcoder.domain.llm.models import (
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventLevel
 from reuleauxcoder.services.llm.client import LLM, _merge_hook_request_overrides
 from reuleauxcoder.services.llm.sanitizer import sanitize_messages_for_llm
+
+
+def _lifecycle_dispatcher_from_hook_registry(
+    hook_registry: HookRegistry,
+) -> LifecycleHookDispatcher:
+    return LifecycleHookDispatcher(
+        LifecycleHookRegistry(
+            system_builtin_lifecycle_declarations_from_hook_registry(hook_registry)
+        ),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(
+            hook_registry=hook_registry,
+        ),
+    )
 
 
 def test_llm_response_message_uses_placeholder_for_reasoning_only_assistant() -> None:
@@ -409,7 +428,7 @@ def test_llm_chat_applies_project_context_hook_to_provider_request(
 
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
-        hook_registry=registry,
+        lifecycle_dispatcher=_lifecycle_dispatcher_from_hook_registry(registry),
     )
 
     assert response.content == "Hello"
@@ -791,7 +810,7 @@ def test_llm_chat_passes_ui_bus_to_hook_context_without_metadata_leak(
     _set_fake_call_with_retry(llm, _fake_call_with_retry)
     response = llm.chat(
         [{"role": "user", "content": "Hi"}],
-        hook_registry=registry,
+        lifecycle_dispatcher=_lifecycle_dispatcher_from_hook_registry(registry),
         session_id="session_test",
         metadata={"request_id": "request-1"},
         ui_bus=ui_bus,

@@ -26,6 +26,7 @@ from reuleauxcoder.app.runtime.session_state import (
     restore_config_runtime_defaults,
 )
 from reuleauxcoder.domain.hooks import HookPoint, SessionSaveContext
+from reuleauxcoder.domain.hooks.lifecycle import dispatch_internal_lifecycle_hook_point
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from labrastro_server.infrastructure.persistence.factory import (
     create_session_store as create_configured_session_store,
@@ -412,8 +413,10 @@ def _emit_session_save_hooks(
         session_data=dict(session_data or {}),
         metadata=dict(metadata or {}),
     )
-    for decision in agent.hook_registry.run_guards(HookPoint.SESSION_SAVE, context):
-        if not decision.allowed:
-            break
-    agent.hook_registry.run_transforms(HookPoint.SESSION_SAVE, context)
-    agent.hook_registry.run_observers(HookPoint.SESSION_SAVE, context)
+    dispatch_internal_lifecycle_hook_point(
+        getattr(agent, "lifecycle_dispatcher", None),
+        HookPoint.SESSION_SAVE,
+        context,
+        trigger_source="session",
+        origin="session",
+    )
