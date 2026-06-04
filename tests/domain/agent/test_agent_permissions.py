@@ -29,6 +29,31 @@ class _Tool:
         self.name = name
 
 
+class _RecordingPermissionDispatcher:
+    def __init__(self) -> None:
+        self.contexts: list[LifecycleHookEventContext] = []
+        self.declaration = LifecycleHookDeclaration.from_dict(
+            "hook:observe-permission",
+            {
+                "event": "PermissionRequest",
+                "source": "admin_managed",
+                "placement": "server",
+                "handler_type": "command",
+                "display_name": "Permission observer",
+                "summary": "Observe permission requests.",
+                "permissions": [],
+                "trust": "trusted",
+            },
+        )
+
+    def dispatch(
+        self,
+        context: LifecycleHookEventContext,
+    ) -> list[LifecycleHookDispatchResult]:
+        self.contexts.append(context)
+        return []
+
+
 def test_agent_tool_visibility_uses_permission_gateway_for_mode_and_capabilities() -> None:
     config = Config(
         approval=ApprovalConfig(default_mode="allow"),
@@ -57,6 +82,23 @@ def test_agent_tool_visibility_uses_permission_gateway_for_mode_and_capabilities
 
     assert [tool.name for tool in agent.get_active_tools()] == ["read_file"]
     assert [tool.name for tool in agent.get_blocked_tools()] == ["shell"]
+
+
+def test_agent_tool_visibility_does_not_dispatch_permission_request_lifecycle() -> None:
+    dispatcher = _RecordingPermissionDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("read_file"), _Tool("shell")],
+        config=config,
+        available_modes={"review": ModeConfig(name="review", tools=["read_file"])},
+        active_mode="review",
+        lifecycle_dispatcher=dispatcher,
+    )
+
+    assert [tool.name for tool in agent.get_active_tools()] == ["read_file"]
+    assert [tool.name for tool in agent.get_blocked_tools()] == ["shell"]
+    assert dispatcher.contexts == []
 
 
 def test_background_agent_with_approval_provider_returns_blocked_review() -> None:
@@ -119,7 +161,7 @@ def test_manual_agent_requires_approval_by_default() -> None:
     assert decision.action == PermissionAction.REQUIRE_APPROVAL
 
 
-def test_agent_dispatches_permission_request_lifecycle_before_gateway_decision() -> None:
+def test_agent_dispatches_permission_request_lifecycle_for_candidate_tool_call() -> None:
     class _LifecycleDispatcher:
         def __init__(self) -> None:
             self.contexts: list[LifecycleHookEventContext] = []
@@ -179,6 +221,116 @@ def test_agent_dispatches_permission_request_lifecycle_before_gateway_decision()
     assert technical["subject"]["trigger_source"] == "chat"
     assert technical["target"]["name"] == "shell"
     assert technical["tool_call"]["name"] == "shell"
+
+
+def test_agent_does_not_dispatch_permission_request_for_hard_denied_tool_call() -> None:
+    dispatcher = _RecordingPermissionDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "rm -rf /"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "system_hard_deny"
+    assert dispatcher.contexts == []
+
+
+def test_agent_does_not_dispatch_permission_request_for_effective_capability_boundary() -> None:
+    dispatcher = _RecordingPermissionDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+    setattr(agent, "effective_capabilities", {"tools": ["builtin:read_file"]})
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "effective_capabilities"
+    assert dispatcher.contexts == []
+
+
+def test_agent_does_not_dispatch_permission_request_for_execution_policy_deny() -> None:
+    dispatcher = _RecordingPermissionDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+    setattr(
+        agent,
+        "effective_capabilities",
+        {
+            "tools": ["builtin:shell"],
+            "execution_policies": [
+                {"target": "builtin_tool:shell", "policy": "deny"},
+            ],
+        },
+    )
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "execution_policy:deny"
+    assert dispatcher.contexts == []
+
+
+def test_agent_dispatches_permission_request_for_background_review_candidate() -> None:
+    dispatcher = _RecordingPermissionDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "taskflow")
+    setattr(agent, "permission_interactive", False)
+    setattr(
+        agent,
+        "effective_capabilities",
+        {
+            "tools": ["builtin:shell"],
+            "execution_policies": [
+                {"target": "builtin_tool:shell", "policy": "require_user"},
+            ],
+        },
+    )
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.BLOCKED_REVIEW
+    assert decision.policy_matched == "execution_policy:require_user"
+    assert len(dispatcher.contexts) == 1
+    assert dispatcher.contexts[0].event_name == "PermissionRequest"
 
 
 def test_permission_request_lifecycle_exposes_standard_tool_matcher_fields() -> None:

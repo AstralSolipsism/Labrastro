@@ -162,6 +162,7 @@ class PermissionGateway:
                             f"{request.target.kind} '{request.target.name}' is not "
                             "authorized by this Agent's effective_capabilities"
                         ),
+                        policy_matched="effective_capabilities",
                         audit=self._audit(request),
                     ),
                 )

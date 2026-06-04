@@ -24,6 +24,7 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookDispatchResult,
     LifecycleHookDispatcher,
     LifecycleHookOutput,
+    annotate_lifecycle_output_diagnostics,
     build_lifecycle_event_context,
     build_permission_lifecycle_payload,
 )
@@ -57,10 +58,87 @@ def _lifecycle_reason_text(value: object) -> str:
     return str(value).strip()
 
 
+def _lifecycle_additional_context_messages(items: list[object]) -> list[dict]:
+    messages: list[dict] = []
+    text_items: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                role = str(item.get("role") or "system").strip().lower()
+                if role in {"system", "developer"}:
+                    messages.append({"role": "system", "content": content.strip()})
+                else:
+                    text_items.append(content.strip())
+                continue
+        text = _lifecycle_reason_text(item)
+        if text:
+            text_items.append(text)
+    if text_items:
+        messages.append(
+            {
+                "role": "system",
+                "content": "Lifecycle additional context:\n"
+                + "\n".join(text_items),
+            }
+        )
+    return messages
+
+
+def _lifecycle_terminal_message(output_dict: dict) -> str:
+    user_message = _lifecycle_reason_text(output_dict.get("user_message"))
+    if user_message:
+        return user_message
+    return _lifecycle_reason_text(output_dict.get("reason"))
+
+
+def _terminal_lifecycle_resolution(
+    results: list[LifecycleHookDispatchResult],
+) -> TerminalLifecycleResolution:
+    resolution = TerminalLifecycleResolution()
+    for result in list(results or []):
+        output = getattr(result, "output", None)
+        to_dict = getattr(output, "to_dict", None)
+        output_dict = to_dict() if callable(to_dict) else {}
+        if not isinstance(output_dict, dict):
+            continue
+        message = _lifecycle_terminal_message(output_dict)
+        if message and not resolution.user_message:
+            resolution.user_message = message
+        diagnostics = output_dict.get("diagnostics")
+        if isinstance(diagnostics, list):
+            resolution.diagnostics.extend(diagnostics)
+        artifacts = output_dict.get("artifacts")
+        if isinstance(artifacts, list):
+            resolution.artifacts.extend(artifacts)
+    return resolution
+
+
+_PERMISSION_LIFECYCLE_STATIC_POLICY_MATCHES = {
+    "system_hard_deny",
+    "system_hard_policy",
+    "mode.tool_whitelist",
+    "effective_capabilities",
+    "execution_policy:deny",
+    "approval_policy:deny",
+}
+
+_PERMISSION_LIFECYCLE_STATIC_POLICY_PREFIXES = (
+    "agent.",
+)
+
+
 @dataclass
 class FollowUpMessage:
     followup_id: str
     text: str
+
+
+@dataclass
+class TerminalLifecycleResolution:
+    user_message: str = ""
+    diagnostics: list[object] = field(default_factory=list)
+    artifacts: list[object] = field(default_factory=list)
 
 
 @dataclass
@@ -470,6 +548,9 @@ class Agent:
             )
             results = list(dispatch(context) or [])
             for result in results:
+                output = getattr(result, "output", None)
+                if isinstance(output, LifecycleHookOutput):
+                    annotate_lifecycle_output_diagnostics(event_name, output)
                 self._emit_lifecycle_observation(
                     "result",
                     event_name,
@@ -577,6 +658,11 @@ class Agent:
             }
             if isinstance(output_dict, dict):
                 payload["output"] = output_dict
+                message = _lifecycle_terminal_message(output_dict)
+                if message:
+                    payload["message"] = message
+                if output_dict.get("artifacts"):
+                    payload["artifacts"] = list(output_dict.get("artifacts") or [])
             event = AgentEvent.lifecycle_hook(payload)
             if defer:
                 deferred = getattr(self, "_deferred_user_prompt_lifecycle_events", None)
@@ -666,6 +752,15 @@ class Agent:
             lifecycle_events=lifecycle_events,
         )
 
+    def _apply_terminal_lifecycle_event(
+        self,
+        event_name: str,
+        *,
+        payload: dict,
+    ) -> TerminalLifecycleResolution:
+        results = self._dispatch_agent_lifecycle_event(event_name, payload=payload)
+        return _terminal_lifecycle_resolution(results)
+
     def _request_user_prompt_lifecycle_approval(
         self,
         user_input: str,
@@ -748,6 +843,9 @@ class Agent:
         for result in list(results or []):
             if result is None:
                 continue
+            output = getattr(result, "output", None)
+            if isinstance(output, LifecycleHookOutput):
+                annotate_lifecycle_output_diagnostics("PermissionRequest", output)
             self._emit_lifecycle_observation(
                 "result",
                 "PermissionRequest",
@@ -771,7 +869,7 @@ class Agent:
         output_data = to_dict() if callable(to_dict) else {}
         if not isinstance(output_data, dict):
             output_data = {}
-        return {
+        item = {
             "hook_id": str(getattr(declaration, "id", "") or ""),
             "display_name": str(getattr(declaration, "display_name", "") or ""),
             "source": str(getattr(declaration, "source", "") or ""),
@@ -782,6 +880,11 @@ class Agent:
             "diagnostics": list(output_data.get("diagnostics") or []),
             "additional_context": list(output_data.get("additional_context") or []),
         }
+        if output_data.get("updated_input") is not None:
+            item["updated_input"] = output_data.get("updated_input")
+        if output_data.get("artifacts"):
+            item["artifacts"] = list(output_data.get("artifacts") or [])
+        return item
 
     def evaluate_tool_permission(
         self,
@@ -792,8 +895,33 @@ class Agent:
     ) -> PermissionDecision:
         """Evaluate runtime permission for a tool through the unified gateway."""
 
+        request = self._tool_permission_request(
+            tool,
+            tool_call=tool_call,
+            action=action,
+        )
+        gateway = PermissionGateway()
+        initial_decision = gateway.evaluate(request)
+        if not self._should_dispatch_permission_lifecycle(
+            request,
+            initial_decision,
+        ):
+            return initial_decision
+
+        lifecycle_outputs = self._permission_lifecycle_outputs(request)
+        if not lifecycle_outputs:
+            return initial_decision
+        return gateway.evaluate(replace(request, lifecycle_outputs=lifecycle_outputs))
+
+    def _tool_permission_request(
+        self,
+        tool: "Tool",
+        *,
+        tool_call: ToolCall | None,
+        action: str,
+    ) -> PermissionRequest:
         agent_config = self._current_agent_config()
-        request = PermissionRequest(
+        return PermissionRequest(
             subject=self._permission_subject(),
             target=self._permission_target_for_tool(tool),
             action=action,
@@ -805,10 +933,21 @@ class Agent:
             enforce_effective_capabilities=self.capability_tool_policy_enabled(),
             metadata=self._permission_metadata_for_tool(tool),
         )
-        lifecycle_outputs = self._permission_lifecycle_outputs(request)
-        if lifecycle_outputs:
-            request = replace(request, lifecycle_outputs=lifecycle_outputs)
-        return PermissionGateway().evaluate(request)
+
+    @staticmethod
+    def _should_dispatch_permission_lifecycle(
+        request: PermissionRequest,
+        initial_decision: PermissionDecision,
+    ) -> bool:
+        if request.tool_call is None:
+            return False
+        policy = str(initial_decision.policy_matched or "").strip()
+        if policy in _PERMISSION_LIFECYCLE_STATIC_POLICY_MATCHES:
+            return False
+        return not any(
+            policy.startswith(prefix)
+            for prefix in _PERMISSION_LIFECYCLE_STATIC_POLICY_PREFIXES
+        )
 
     def is_tool_authorized(self, tool: "Tool") -> bool:
         """Return whether the unified permission gateway allows tool visibility."""
@@ -880,25 +1019,18 @@ class Agent:
         for lifecycle_event in prompt_lifecycle.lifecycle_events:
             self._emit_event(lifecycle_event)
 
-        # Add user message
-        self.state.messages.append({"role": "user", "content": user_input})
-        if prompt_lifecycle.additional_context:
-            self.state.messages.append(
-                {
-                    "role": "system",
-                    "content": "Lifecycle additional context:\n"
-                    + "\n".join(
-                        _lifecycle_reason_text(item)
-                        for item in prompt_lifecycle.additional_context
-                    ),
-                }
-            )
         if prompt_lifecycle.blocked:
             message = prompt_lifecycle.message or "UserPromptSubmit lifecycle blocked this request."
             self._emit_event(AgentEvent.error(message))
             self._emit_usage_event("blocked")
             self._emit_event(AgentEvent.session_run_end(message))
             return message
+
+        # Add model-facing messages only after lifecycle guards allow the turn.
+        self.state.messages.extend(
+            _lifecycle_additional_context_messages(prompt_lifecycle.additional_context)
+        )
+        self.state.messages.append({"role": "user", "content": user_input})
 
         # Run the loop
         try:
@@ -908,7 +1040,7 @@ class Agent:
             self.reconcile_pending_tool_calls(
                 reason=f"Interrupted due to {type(e).__name__}."
             )
-            self._dispatch_agent_lifecycle_event(
+            terminal_lifecycle = self._apply_terminal_lifecycle_event(
                 "StopFailure",
                 payload={
                     "error": {
@@ -918,6 +1050,8 @@ class Agent:
                     "interrupted": False,
                 },
             )
+            if terminal_lifecycle.user_message:
+                self._emit_event(AgentEvent.error(terminal_lifecycle.user_message))
             self._emit_usage_event("error")
             raise
 
@@ -931,7 +1065,7 @@ class Agent:
             payload = getattr(self._loop, "last_interruption_payload", None) or {}
             self._emit_event(AgentEvent.session_run_interrupted(result, payload))
             return result
-        self._dispatch_agent_lifecycle_event(
+        self._apply_terminal_lifecycle_event(
             "Stop",
             payload={"result": result, "interrupted": False},
         )
