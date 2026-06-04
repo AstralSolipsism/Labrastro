@@ -326,7 +326,7 @@ class AgentLoop:
                 on_token=_on_token,
                 on_reasoning_token=_on_reasoning_token,
                 on_tool_call_delta=_on_tool_call_delta,
-                hook_registry=self.agent.hook_registry,
+                lifecycle_dispatcher=self.agent.lifecycle_dispatcher,
                 session_id=getattr(self.agent, "current_session_id", None),
                 ui_bus=self._ui_bus(),
                 metadata={
@@ -364,16 +364,7 @@ class AgentLoop:
 
             if len(resp.tool_calls) == 1:
                 tc = resp.tool_calls[0]
-                self.agent._emit_event(
-                    AgentEvent.tool_call_start(
-                        tc.name,
-                        tc.arguments,
-                        tool_call_id=tc.id,
-                        tool_source=self._tool_source(tc.name),
-                        index=0,
-                    )
-                )
-                result = self.agent._executor.execute(tc)
+                result = self.agent._executor.execute(tc, index=0)
                 self.agent.state.messages.append(
                     {
                         "role": "tool",
@@ -388,16 +379,7 @@ class AgentLoop:
                     for tool_index, tc in enumerate(resp.tool_calls):
                         if self.agent.stop_requested():
                             return "(stopped by cancellation request)"
-                        self.agent._emit_event(
-                            AgentEvent.tool_call_start(
-                                tc.name,
-                                tc.arguments,
-                                tool_call_id=tc.id,
-                                tool_source=self._tool_source(tc.name),
-                                index=tool_index,
-                            )
-                        )
-                        result = self.agent._executor.execute(tc)
+                        result = self.agent._executor.execute(tc, index=tool_index)
                         self.agent.state.messages.append(
                             {
                                 "role": "tool",
@@ -410,16 +392,6 @@ class AgentLoop:
                     # No interactive approval needed: keep parallel execution.
                     if self.agent.stop_requested():
                         return "(stopped by cancellation request)"
-                    for tool_index, tc in enumerate(resp.tool_calls):
-                        self.agent._emit_event(
-                            AgentEvent.tool_call_start(
-                                tc.name,
-                                tc.arguments,
-                                tool_call_id=tc.id,
-                                tool_source=self._tool_source(tc.name),
-                                index=tool_index,
-                            )
-                        )
                     results = self.agent._executor.execute_parallel(resp.tool_calls)
                     for tc, result in zip(resp.tool_calls, results):
                         self.agent.state.messages.append(
@@ -465,7 +437,7 @@ class AgentLoop:
             tools=None,
             on_token=_on_summary_token,
             on_reasoning_token=_on_summary_reasoning_token,
-            hook_registry=self.agent.hook_registry,
+            lifecycle_dispatcher=self.agent.lifecycle_dispatcher,
             session_id=getattr(self.agent, "current_session_id", None),
             ui_bus=self._ui_bus(),
             metadata={

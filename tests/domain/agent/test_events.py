@@ -51,12 +51,13 @@ def test_agent_event_tool_call_delta_contains_preview() -> None:
 
 def test_agent_event_tool_call_end_keeps_full_long_result_with_preview() -> None:
     result = "x" * 600
-    event = AgentEvent.tool_call_end("read_file", result)
+    event = AgentEvent.tool_call_end("read_file", result, index=3)
     assert event.event_type is AgentEventType.TOOL_CALL_END
     assert event.tool_name == "read_file"
     removed_field = "tool_" + "success"
     assert not hasattr(event, removed_field)
     assert event.tool_result == result
+    assert event.data["index"] == 3
     assert event.data["tool_result_preview"] == "x" * 500
 
 

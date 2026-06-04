@@ -138,6 +138,7 @@ class AgentEvent:
         *,
         tool_call_id: str | None = None,
         tool_source: str | None = None,
+        index: int | None = None,
         meta: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         """Create a tool call end event."""
@@ -148,6 +149,7 @@ class AgentEvent:
             tool_result=result,
             data={
                 **({"tool_source": tool_source} if tool_source else {}),
+                **({"index": index} if index is not None else {}),
                 **(
                     {"tool_result_preview": result[:500]}
                     if len(result) > 500

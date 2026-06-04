@@ -172,12 +172,16 @@ def apply_session_event(
             title = f"{title} started"
         elif phase == "dispatch_failed":
             title = f"{title} failed"
+        message = _string(payload, "message")
+        artifacts = payload.get("artifacts")
         _append_part(doc, _part("lifecycle-hook", "ui_event", meta, {
             "kind": "lifecycle_hook",
             "level": _string(payload, "level") or (
                 "error" if _string(payload, "error") else "info"
             ),
             "title": title,
+            **({"message": message} if message else {}),
+            **({"artifacts": list(artifacts)} if isinstance(artifacts, list) else {}),
             "payload": payload,
         }))
     elif event_type == "memory_context" or (
@@ -752,8 +756,9 @@ def _apply_tool_or_output_event(
         )
         if is_shell and not output_chunks:
             output_chunks = _shell_chunks_from_text(output)
+        result_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         _upsert_tool_part(doc, tool_name, {
-            "status": "returned",
+            "status": _tool_end_status(result_meta),
             "toolCallId": tool_call_id,
             "source": source or None,
             "endedAt": payload.get("ended_at"),
@@ -761,7 +766,8 @@ def _apply_tool_or_output_event(
             "outputFormat": _tool_output_format(payload, tool_name, source),
             "outputChunks": output_chunks if is_shell else None,
             "finalOutput": final_output if is_shell else None,
-            "resultMeta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+            "preparingIndex": _number(payload, "index"),
+            "resultMeta": result_meta,
         }, meta)
     elif event_type == "approval_request":
         _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
@@ -975,8 +981,49 @@ def _upsert_tool_part(
     if index >= 0:
         parts[index] = next_part
     else:
-        parts.append(next_part)
+        insert_index = _tool_part_insert_index(parts, preparing_index)
+        if insert_index is None:
+            parts.append(next_part)
+        else:
+            parts.insert(insert_index, next_part)
     assistant["parts"] = parts
+
+
+def _tool_end_status(result_meta: dict[str, Any]) -> str:
+    failure_kind = str(result_meta.get("failure_kind") or "").strip()
+    if failure_kind:
+        return "error"
+    diagnostics = result_meta.get("tool_diagnostics")
+    if isinstance(diagnostics, list):
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, dict):
+                continue
+            if str(diagnostic.get("severity") or "").lower() == "error":
+                return "error"
+            kind = str(diagnostic.get("kind") or "").strip()
+            if kind in {
+                "tool_result_error",
+                "approval_denied",
+                "tool_protocol_error",
+                "chat_terminal_error",
+            }:
+                return "error"
+    return "returned"
+
+
+def _tool_part_insert_index(
+    parts: list[Any],
+    preparing_index: Any,
+) -> int | None:
+    if not isinstance(preparing_index, (int, float)):
+        return None
+    for idx, part in enumerate(parts):
+        if not isinstance(part, dict) or part.get("type") != "tool":
+            continue
+        existing = part.get("preparingIndex")
+        if isinstance(existing, (int, float)) and existing > preparing_index:
+            return idx
+    return None
 
 
 def _patch_tool_part(

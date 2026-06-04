@@ -54,6 +54,35 @@ def test_agent_run_emitter_outputs_jsonl_for_agent_events() -> None:
     assert events[4]["data"]["output"] == "ok"
 
 
+def test_agent_run_emitter_preserves_end_only_tool_result_index_and_meta() -> None:
+    buffer = io.StringIO()
+    emitter = AgentRunJSONLEmitter(buffer)
+
+    emitter.on_agent_event(
+        AgentEvent.tool_call_end(
+            "shell",
+            "Error: tool 'shell' denied by permission gateway: blocked",
+            tool_call_id="call-shell",
+            index=5,
+            meta={
+                "failure_kind": "permission_denied",
+                "tool_diagnostics": [
+                    {
+                        "code": "permission_deny",
+                        "severity": "error",
+                    }
+                ],
+            },
+        )
+    )
+
+    events = _events(buffer)
+    assert [event["type"] for event in events] == ["tool_result"]
+    assert events[0]["data"]["tool_call_id"] == "call-shell"
+    assert events[0]["data"]["index"] == 5
+    assert events[0]["data"]["meta"]["tool_diagnostics"][0]["code"] == "permission_deny"
+
+
 def test_agent_run_main_bypasses_terminal_renderer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

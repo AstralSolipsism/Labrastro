@@ -64,6 +64,68 @@ def test_later_session_run_start_keeps_existing_title_summary_and_preview() -> N
     ]
 
 
+def test_tool_parts_insert_by_model_index_when_start_events_arrive_out_of_order() -> None:
+    document = _session_run_start(None, "并发读取文件", 1)
+    document = _session_run_event(
+        document,
+        "tool_call_start",
+        {
+            "tool_call_id": "call-fast",
+            "tool_name": "grep",
+            "tool_args": {"pattern": "TODO"},
+            "index": 1,
+        },
+        2,
+    )
+    document = _session_run_event(
+        document,
+        "tool_call_start",
+        {
+            "tool_call_id": "call-slow",
+            "tool_name": "read_file",
+            "tool_args": {"path": "src/a.ts"},
+            "index": 0,
+        },
+        3,
+    )
+
+    parts = _assistant_parts(document)
+    assert [part["toolCallId"] for part in parts] == ["call-slow", "call-fast"]
+    assert [part["preparingIndex"] for part in parts] == [0, 1]
+
+
+def test_tool_call_end_without_start_keeps_unexecuted_failure_as_error_part() -> None:
+    document = _session_run_start(None, "运行受限工具", 1)
+    document = _session_run_event(
+        document,
+        "tool_call_end",
+        {
+            "tool_call_id": "call-denied",
+            "tool_name": "shell",
+            "tool_result": "Error: tool 'shell' denied by permission gateway: blocked",
+            "index": 0,
+            "meta": {
+                "tool_diagnostics": [
+                    {
+                        "stage": "preflight",
+                        "kind": "tool_result_error",
+                        "severity": "error",
+                        "code": "permission_deny",
+                        "message": "blocked",
+                    }
+                ]
+            },
+        },
+        2,
+    )
+
+    tool = _assistant_parts(document)[0]
+    assert tool["toolCallId"] == "call-denied"
+    assert tool["status"] == "error"
+    assert tool["preparingIndex"] == 0
+    assert tool["resultMeta"]["tool_diagnostics"][0]["code"] == "permission_deny"
+
+
 def test_workflow_artifact_event_persists_primary_artifact() -> None:
     document = _session_run_start(None, "生成能力包", 1)
     document = apply_session_event(

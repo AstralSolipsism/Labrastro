@@ -36,9 +36,11 @@ from reuleauxcoder.domain.hooks.types import (
 )
 from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookOutput,
+    annotate_lifecycle_output_diagnostics,
     build_lifecycle_event_context,
     build_tool_batch_lifecycle_payload,
     build_tool_lifecycle_payload,
+    dispatch_internal_lifecycle_hook_point,
 )
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
@@ -63,6 +65,7 @@ class ToolExecutor:
         result: str,
         *,
         tool: object | None = None,
+        index: int | None = None,
         meta: dict | None = None,
     ) -> None:
         self.agent._emit_event(
@@ -71,7 +74,25 @@ class ToolExecutor:
                 result,
                 tool_call_id=tc.id,
                 tool_source=self._tool_source(tool),
+                index=index,
                 meta=meta,
+            )
+        )
+
+    def _emit_tool_start(
+        self,
+        tc: "ToolCall",
+        *,
+        tool: object | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.agent._emit_event(
+            AgentEvent.tool_call_start(
+                tc.name,
+                dict(tc.arguments or {}),
+                tool_call_id=tc.id,
+                tool_source=self._tool_source(tool),
+                index=index,
             )
         )
 
@@ -189,6 +210,7 @@ class ToolExecutor:
         tool: object | None,
         decision: PermissionDecision,
         *,
+        index: int | None = None,
         validation_meta: dict | None = None,
     ) -> str:
         message = self._permission_block_message(decision, tc.name)
@@ -207,6 +229,7 @@ class ToolExecutor:
             tc,
             message,
             tool=tool,
+            index=index,
             meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
         )
         return message
@@ -218,6 +241,8 @@ class ToolExecutor:
         decision: PermissionDecision,
         validation_context: dict,
         validation_meta: dict | None,
+        *,
+        index: int | None = None,
     ) -> str | None:
         provider = self.agent.approval_provider
         if provider is None:
@@ -238,6 +263,7 @@ class ToolExecutor:
                 tc,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
@@ -273,6 +299,7 @@ class ToolExecutor:
                 tc,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
@@ -307,6 +334,7 @@ class ToolExecutor:
             tc,
             message,
             tool=tool,
+            index=index,
             meta=self._merge_meta(validation_meta, failure_meta),
         )
         return message
@@ -404,6 +432,7 @@ class ToolExecutor:
         for result_item in list(results or []):
             output = getattr(result_item, "output", None)
             if isinstance(output, LifecycleHookOutput):
+                annotate_lifecycle_output_diagnostics(event_name, output)
                 outputs.append(output)
             self._emit_lifecycle_observation(
                 "result",
@@ -628,7 +657,18 @@ class ToolExecutor:
             ),
         )
         try:
-            dispatch(context)
+            self._emit_lifecycle_observation("dispatch_start", "PostToolBatch", context)
+            results = dispatch(context)
+            for result_item in list(results or []):
+                output = getattr(result_item, "output", None)
+                if isinstance(output, LifecycleHookOutput):
+                    annotate_lifecycle_output_diagnostics("PostToolBatch", output)
+                self._emit_lifecycle_observation(
+                    "result",
+                    "PostToolBatch",
+                    context,
+                    result=result_item,
+                )
         except Exception:
             return
 
@@ -661,11 +701,14 @@ class ToolExecutor:
             repairable=True,
         )
 
-    def execute(self, tc: "ToolCall") -> str:
+    def execute(self, tc: "ToolCall", *, index: int | None = None) -> str:
         """Execute a single tool call."""
         tool = self.agent.get_tool(tc.name)
         if tool is None:
             tool = get_tool(tc.name)
+        suppress_lifecycle = bool(
+            getattr(self.agent, "_suppress_tool_lifecycle", False)
+        )
 
         before_context = BeforeToolExecuteContext(
             hook_point=HookPoint.BEFORE_TOOL_EXECUTE,
@@ -683,7 +726,11 @@ class ToolExecutor:
             },
         )
 
-        lifecycle_error = self._apply_pre_tool_lifecycle(before_context, tool=tool)
+        lifecycle_error = (
+            None
+            if suppress_lifecycle
+            else self._apply_pre_tool_lifecycle(before_context, tool=tool)
+        )
         if lifecycle_error is not None:
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.PREFLIGHT,
@@ -699,17 +746,42 @@ class ToolExecutor:
                 tc,
                 lifecycle_error,
                 tool=tool,
+                index=index,
                 meta=self._diagnostics_meta([diagnostic]),
             )
             return lifecycle_error
 
-        before_context = self.agent.hook_registry.run_transforms(
-            HookPoint.BEFORE_TOOL_EXECUTE,
-            before_context,
-        )
-        self.agent.hook_registry.run_observers(
-            HookPoint.BEFORE_TOOL_EXECUTE, before_context
-        )
+        if not suppress_lifecycle:
+            internal_lifecycle = dispatch_internal_lifecycle_hook_point(
+                getattr(self.agent, "lifecycle_dispatcher", None),
+                HookPoint.BEFORE_TOOL_EXECUTE,
+                before_context,
+                trigger_source=str(
+                    getattr(self.agent, "permission_trigger_source", "") or "chat"
+                ),
+                origin="agent",
+            )
+            if internal_lifecycle.blocked:
+                diagnostic = tool_diagnostic_from_failure(
+                    stage=ToolDiagnosticStage.PREFLIGHT,
+                    kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                    code="legacy_lifecycle_pre_tool_denied",
+                    message=internal_lifecycle.message,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                )
+                lifecycle_context = self._tool_argument_context(tc, tool)
+                self._record_lifecycle_diagnostics([diagnostic], lifecycle_context)
+                self._emit_tool_end(
+                    tc,
+                    internal_lifecycle.message,
+                    tool=tool,
+                    index=index,
+                    meta=self._diagnostics_meta([diagnostic]),
+                )
+                return internal_lifecycle.message
+            if isinstance(internal_lifecycle.context, BeforeToolExecuteContext):
+                before_context = internal_lifecycle.context
 
         tool_call = self._preserve_provider_tool_call_id(
             before_context.tool_call or tc,
@@ -738,6 +810,7 @@ class ToolExecutor:
                 tool_call,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._diagnostics_meta([diagnostic]),
             )
             return message
@@ -782,6 +855,7 @@ class ToolExecutor:
                 tool_call,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._diagnostics_meta(parse_diagnostics),
             )
             return message
@@ -813,7 +887,13 @@ class ToolExecutor:
                     final_validation.final_issues,
                 ),
             )
-            self._emit_tool_end(tool_call, message, tool=tool, meta=validation_meta)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                index=index,
+                meta=validation_meta,
+            )
             return message
         tool_call.arguments = final_validation.arguments
 
@@ -837,6 +917,7 @@ class ToolExecutor:
                 tool_call,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
@@ -855,6 +936,7 @@ class ToolExecutor:
                 tool_call,
                 preflight_error,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return preflight_error
@@ -868,6 +950,7 @@ class ToolExecutor:
                 tool_call,
                 tool,
                 permission_decision,
+                index=index,
                 validation_meta=validation_meta,
             )
         if (
@@ -884,10 +967,12 @@ class ToolExecutor:
                 permission_decision,
                 transformed_validation_context,
                 validation_meta,
+                index=index,
             )
             if approval_message is not None:
                 return approval_message
         execution_context = self._tool_argument_context(tool_call, tool)
+        self._emit_tool_start(tool_call, tool=tool, index=index)
         backend = getattr(tool, "backend", None)
         context = getattr(backend, "context", None)
         backend_id = getattr(backend, "backend_id", None)
@@ -949,14 +1034,19 @@ class ToolExecutor:
                     "execution_target": execution_target,
                 },
             )
-            after_context = self.agent.hook_registry.run_transforms(
-                HookPoint.AFTER_TOOL_EXECUTE,
-                after_context,
-            )
-            self.agent.hook_registry.run_observers(
-                HookPoint.AFTER_TOOL_EXECUTE, after_context
-            )
-            self._apply_post_tool_lifecycle(after_context, tool=tool)
+            if not suppress_lifecycle:
+                internal_lifecycle = dispatch_internal_lifecycle_hook_point(
+                    getattr(self.agent, "lifecycle_dispatcher", None),
+                    HookPoint.AFTER_TOOL_EXECUTE,
+                    after_context,
+                    trigger_source=str(
+                        getattr(self.agent, "permission_trigger_source", "") or "chat"
+                    ),
+                    origin="agent",
+                )
+                if isinstance(internal_lifecycle.context, AfterToolExecuteContext):
+                    after_context = internal_lifecycle.context
+                self._apply_post_tool_lifecycle(after_context, tool=tool)
             result_diagnostic = self._tool_result_error_diagnostic(
                 after_context.result,
                 tool_name=tool_call.name,
@@ -972,6 +1062,7 @@ class ToolExecutor:
                 tool_call,
                 after_context.result,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, result_meta),
             )
             return after_context.result
@@ -999,6 +1090,7 @@ class ToolExecutor:
                 tool_call,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
@@ -1025,6 +1117,7 @@ class ToolExecutor:
                 tool_call,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
@@ -1052,6 +1145,7 @@ class ToolExecutor:
                 tool_call,
                 message,
                 tool=tool,
+                index=index,
                 meta=self._merge_meta(
                     validation_meta,
                     {
@@ -1075,7 +1169,10 @@ class ToolExecutor:
     def execute_parallel(self, tool_calls: List["ToolCall"]) -> List[str]:
         """Execute multiple tool calls in parallel."""
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(self.execute, tc) for tc in tool_calls]
+            futures = [
+                pool.submit(self.execute, tc, index=index)
+                for index, tc in enumerate(tool_calls)
+            ]
             results = [f.result() for f in futures]
         self._dispatch_post_tool_batch_lifecycle(
             tool_calls=list(tool_calls),

@@ -79,6 +79,35 @@ def test_cli_renderer_tracks_completed_content_and_tool_blocks() -> None:
     assert renderer._completed_blocks[2].result == "ok"
 
 
+def test_cli_renderer_tracks_end_only_tool_result_block() -> None:
+    renderer = _renderer()
+    renderer.render_content_markdown = Mock()
+    renderer.render_plain_text = Mock()
+
+    renderer.on_event(
+        AgentEvent.tool_call_end(
+            "shell",
+            "Error: tool 'shell' denied by permission gateway: blocked",
+            tool_call_id="call-shell",
+            index=0,
+            meta={
+                "tool_diagnostics": [
+                    {
+                        "code": "permission_deny",
+                        "severity": "error",
+                    }
+                ]
+            },
+        )
+    )
+
+    assert renderer._active_content_block is None
+    assert len(renderer._completed_blocks) == 1
+    assert renderer._completed_blocks[0].name == "shell"
+    assert renderer._completed_blocks[0].args is None
+    assert "permission gateway" in renderer._completed_blocks[0].result
+
+
 def test_cli_renderer_tracks_notification_block_after_stream() -> None:
     renderer = _renderer()
     renderer.render_content_markdown = Mock()

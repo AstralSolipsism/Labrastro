@@ -5,12 +5,19 @@ from types import SimpleNamespace
 from reuleauxcoder.domain.approval import ApprovalDecision
 from reuleauxcoder.domain.agent.events import AgentEventType
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
+from reuleauxcoder.domain.hooks.base import TransformHook
 from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookDeclaration,
     LifecycleHookDispatchResult,
     LifecycleHookEventContext,
     LifecycleHookOutput,
+    LifecycleHookDispatcher,
+    LifecycleHookRegistry,
+    default_lifecycle_hook_runtime_adapters,
+    system_builtin_lifecycle_declarations_from_hook_registry,
 )
+from reuleauxcoder.domain.hooks.registry import HookRegistry
+from reuleauxcoder.domain.hooks.types import BeforeToolExecuteContext, HookPoint
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
@@ -45,10 +52,12 @@ class _AgentStub:
         self.active_mode = "coder"
         self.state = SimpleNamespace(current_round=0)
         self.approval_provider = None
-        self.hook_registry = SimpleNamespace(
-            run_guards=lambda point, ctx: [],
-            run_transforms=lambda point, ctx: ctx,
-            run_observers=lambda point, ctx: None,
+        self.hook_registry = HookRegistry()
+        self.lifecycle_dispatcher = LifecycleHookDispatcher(
+            LifecycleHookRegistry(),
+            runtime_adapters=default_lifecycle_hook_runtime_adapters(
+                hook_registry=self.hook_registry,
+            ),
         )
 
     def get_tool(self, name: str):  # noqa: ARG002
@@ -100,6 +109,35 @@ def _lifecycle_declaration(event_name: str) -> LifecycleHookDeclaration:
             "permissions": [],
             "trust": "trusted",
         },
+    )
+
+
+class _BeforeToolTransformHook(TransformHook[BeforeToolExecuteContext]):
+    def __init__(self, transform) -> None:
+        super().__init__(name="test_before_tool_transform")
+        self._transform = transform
+
+    def run(self, context: BeforeToolExecuteContext) -> BeforeToolExecuteContext:
+        try:
+            return self._transform(HookPoint.BEFORE_TOOL_EXECUTE, context)
+        except TypeError:
+            return self._transform(context)
+
+
+def _install_legacy_before_tool_transform(agent, transform) -> None:
+    hook_registry = HookRegistry()
+    hook_registry.register(
+        HookPoint.BEFORE_TOOL_EXECUTE,
+        _BeforeToolTransformHook(transform),
+    )
+    agent.hook_registry = hook_registry
+    agent.lifecycle_dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry(
+            system_builtin_lifecycle_declarations_from_hook_registry(hook_registry)
+        ),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(
+            hook_registry=hook_registry,
+        ),
     )
 
 
@@ -310,6 +348,168 @@ def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
     )
 
 
+def test_tool_executor_permission_deny_emits_end_only_with_index_and_diagnostics() -> None:
+    tool = SimpleNamespace(
+        name="write_file",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda **kwargs: "should not execute",
+        preflight_validate=lambda **kwargs: None,
+    )
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(tool)
+            self.events = []
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.DENY,
+                authorized=False,
+                reason="write_file denied by policy",
+                policy_matched="effective_capabilities",
+            )
+
+    agent = RecordingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call_blocked", name="write_file", arguments={}),
+        index=2,
+    )
+
+    assert result == (
+        "Error: tool 'write_file' denied by permission gateway: "
+        "write_file denied by policy"
+    )
+    tool_events = [
+        event
+        for event in agent.events
+        if event.event_type in {
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.TOOL_CALL_END,
+        }
+    ]
+    assert [(event.event_type, event.data.get("index")) for event in tool_events] == [
+        (AgentEventType.TOOL_CALL_END, 2),
+    ]
+    diagnostics = tool_events[0].data["meta"]["tool_diagnostics"]
+    assert diagnostics[0]["code"] == "permission_deny"
+    assert diagnostics[0]["severity"] == "error"
+
+
+def test_tool_executor_preflight_failure_emits_end_only_with_index_and_diagnostics() -> None:
+    class PreflightTool:
+        name = "read_file"
+        description = "Read a file"
+        parameters = {"type": "object", "properties": {}}
+        tool_source = "builtin"
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> str:  # noqa: ARG002
+            return "path must stay inside workspace"
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(PreflightTool())
+            self.events = []
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            raise AssertionError("preflight failures should stop before permission")
+
+    agent = RecordingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call_preflight", name="read_file", arguments={}),
+        index=3,
+    )
+
+    assert result == "path must stay inside workspace"
+    tool_events = [
+        event
+        for event in agent.events
+        if event.event_type in {
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.TOOL_CALL_END,
+        }
+    ]
+    assert [(event.event_type, event.data.get("index")) for event in tool_events] == [
+        (AgentEventType.TOOL_CALL_END, 3),
+    ]
+    diagnostics = tool_events[0].data["meta"]["tool_diagnostics"]
+    assert diagnostics[0]["code"] == "preflight_failed"
+    assert diagnostics[0]["severity"] == "error"
+
+
+def test_tool_executor_approval_deny_emits_end_only_with_index_and_failure_meta() -> None:
+    class CaptureTool:
+        name = "write_file"
+        description = "Write a file"
+        parameters = {"type": "object", "properties": {}}
+        tool_source = "builtin"
+
+        def __init__(self) -> None:
+            self.executed = False
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            self.executed = True
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class ApprovalProvider:
+        def request_approval(self, request):  # noqa: ARG002
+            return ApprovalDecision.deny_once("denied by reviewer")
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            self.tool = CaptureTool()
+            super().__init__(self.tool)
+            self.approval_provider = ApprovalProvider()
+            self.events = []
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason="write_file requires approval",
+            )
+
+    agent = RecordingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call_approval", name="write_file", arguments={}),
+        index=4,
+    )
+
+    assert result == "denied by reviewer"
+    assert agent.tool.executed is False
+    tool_events = [
+        event
+        for event in agent.events
+        if event.event_type in {
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.TOOL_CALL_END,
+        }
+    ]
+    assert [(event.event_type, event.data.get("index")) for event in tool_events] == [
+        (AgentEventType.TOOL_CALL_END, 4),
+    ]
+    meta = tool_events[0].data["meta"]
+    assert meta["failure_kind"] == "approval_denied"
+    assert meta["tool_diagnostics"][0]["code"] == "approval_denied"
+
+
 def test_tool_executor_applies_pre_tool_lifecycle_update_then_reevaluates_permission() -> None:
     class CaptureTool:
         description = "Capture"
@@ -478,6 +678,91 @@ def test_tool_executor_does_not_apply_permission_before_pre_tool_lifecycle_updat
     assert agent.permission_checks == ["read_file"]
     assert agent._tools["write_file"].executed is False
     assert agent._tools["read_file"].executed is True
+
+
+def test_tool_executor_emits_canonical_start_after_pre_tool_lifecycle_update() -> None:
+    class CaptureTool:
+        description = "Capture"
+        parameters = {}
+        tool_source = "builtin"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.executed_arguments = None
+
+        def execute(self, **kwargs) -> str:
+            self.executed_arguments = kwargs
+            return f"executed:{self.name}"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.declaration = _lifecycle_declaration("PreToolUse")
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            if context.event_name != "PreToolUse":
+                return []
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput(
+                        updated_input={
+                            "tool_call": {
+                                "id": "call-transformed",
+                                "name": "write_file",
+                                "arguments": {"path": "after.txt"},
+                            }
+                        }
+                    ),
+                )
+            ]
+
+    class LifecycleAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool("read_file"))
+            self.events = []
+            self._tools = {
+                "read_file": CaptureTool("read_file"),
+                "write_file": CaptureTool("write_file"),
+            }
+            self.lifecycle_dispatcher = LifecycleDispatcher()
+
+        def get_tool(self, name: str):
+            return self._tools.get(name)
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = LifecycleAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call-original", name="read_file", arguments={"path": "before.txt"}),
+        index=7,
+    )
+
+    assert result == "executed:write_file"
+    tool_events = [
+        event for event in agent.events
+        if event.event_type in {
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.TOOL_CALL_END,
+        }
+    ]
+    assert [(event.event_type, event.tool_name, event.tool_call_id) for event in tool_events] == [
+        (AgentEventType.TOOL_CALL_START, "write_file", "call-original"),
+        (AgentEventType.TOOL_CALL_END, "write_file", "call-original"),
+    ]
+    assert tool_events[0].tool_args == {"path": "after.txt"}
+    assert tool_events[0].data["index"] == 7
+    assert agent._tools["write_file"].executed_arguments == {"path": "after.txt"}
 
 
 def test_tool_executor_emits_lifecycle_hook_observation_events() -> None:
@@ -692,11 +977,7 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
                 "write_file": CaptureTool("write_file"),
             }
             self.permission_tool_call_ids: list[str] = []
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -749,11 +1030,7 @@ def test_legacy_tool_transform_cannot_rewrite_provider_tool_call_id() -> None:
             }
             self.permission_tool_call_ids: list[str] = []
             self.end_tool_call_ids: list[str] = []
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -803,11 +1080,7 @@ def test_tool_executor_evaluates_permission_after_in_place_argument_transform() 
             self.tool = CaptureTool()
             super().__init__(self.tool)
             self.permission_checks = []
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def _transform(self, _point, ctx):
             ctx.tool_call.arguments["file_path"] = "/private/secret.txt"
@@ -872,11 +1145,7 @@ def test_tool_executor_requests_approval_after_tool_call_transform() -> None:
                 "read_file": CaptureTool("read_file"),
                 "write_file": CaptureTool("write_file"),
             }
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -1021,11 +1290,7 @@ def test_tool_executor_requests_approval_for_final_arguments_after_transform() -
             self.tool = CaptureTool()
             super().__init__(self.tool)
             self.approval_provider = ApprovalProvider()
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def _transform(self, _point, ctx):
             ctx.tool_call.arguments["file_path"] = "/tmp/after.txt"
@@ -1087,11 +1352,7 @@ def test_tool_executor_requests_approval_for_final_tool_after_transform() -> Non
                 "read_file": CaptureTool("read_file"),
                 "write_file": CaptureTool("write_file"),
             }
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -1149,11 +1410,7 @@ def test_tool_executor_blocks_background_approval_after_transform_without_prompt
                 "read_file": CaptureTool("read_file"),
                 "write_file": CaptureTool("write_file"),
             }
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -1212,11 +1469,7 @@ def test_tool_executor_handles_interrupted_approval_after_transform() -> None:
                 "read_file": CaptureTool("read_file"),
                 "write_file": CaptureTool("write_file"),
             }
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -1268,11 +1521,7 @@ def test_tool_executor_executes_transformed_tool_when_permission_allows() -> Non
                 "write_file": CaptureTool("write_file"),
             }
             self.permission_checks = []
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def get_tool(self, name: str):
             return self._tools.get(name)
@@ -1410,11 +1659,7 @@ def test_tool_executor_reruns_preflight_after_legacy_tool_call_transform() -> No
         def __init__(self) -> None:
             self.tool = WriteTool()
             super().__init__(self.tool)
-            self.hook_registry = SimpleNamespace(
-                run_guards=lambda point, ctx: [],
-                run_transforms=self._transform,
-                run_observers=lambda point, ctx: None,
-            )
+            _install_legacy_before_tool_transform(self, self._transform)
 
         def _transform(self, _point, ctx):
             ctx.tool_call.arguments["file_path"] = "/blocked.txt"

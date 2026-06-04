@@ -2181,6 +2181,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "tool_call_id": event.tool_call_id,
                         "tool_result": event.tool_result or "",
                         "tool_source": event.data.get("tool_source"),
+                        "index": event.data.get("index"),
                         "meta": event.data.get("meta") or {},
                         "ended_at": event.timestamp,
                     },
