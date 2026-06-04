@@ -5,15 +5,20 @@ from pathlib import Path
 from typing import Any
 
 from labrastro_server.taskflow.application.project_service import ProjectService
+from labrastro_server.taskflow.application.runtime_projection_service import (
+    TaskflowRuntimeProjectionService,
+)
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
 from labrastro_server.taskflow.domain.project_state import (
     ProjectState,
     TaskRun,
     TaskRunStatus,
     TraceEntityType,
+    TraceLink,
     TraceRelationType,
 )
 from labrastro_server.taskflow.domain.taskflow_state import (
+    TaskflowState,
     TaskflowStatus,
 )
 from labrastro_server.taskflow.ports.dispatch import TaskflowDispatchResult
@@ -266,3 +271,66 @@ def test_reuleauxcoder_adapter_submits_agent_run_from_task_run_only() -> None:
     assert agent_run.metadata["work_item_id"] == "work-1"
     assert agent_run.metadata["agent_run_source"] == "taskflow"
     assert "taskflow_task_draft_id" not in agent_run.metadata
+
+
+def test_taskflow_runtime_projection_surfaces_agent_run_lifecycle_events() -> None:
+    class FakeRuntimeControlPlane:
+        def load_agent_run_detail(self, agent_run_id: str, *, event_limit: int):
+            assert agent_run_id == "agent-run-1"
+            assert event_limit == 50
+            return {
+                "agent_run": {"id": agent_run_id, "status": "running"},
+                "events": [
+                    {
+                        "agent_run_id": agent_run_id,
+                        "seq": 2,
+                        "type": "lifecycle_hook",
+                        "payload": {
+                            "phase": "result",
+                            "event_name": "Stop",
+                            "hook_id": "hook:stop",
+                        },
+                    }
+                ],
+                "artifacts": [],
+            }
+
+    taskflow = TaskflowState.new(
+        taskflow_id="taskflow-1",
+        project_id="project-1",
+        goal_id="goal-1",
+        goal_statement="Build with runtime visibility.",
+    )
+    taskflow.outputs.task_run_refs.append("task-run-1")
+    project = ProjectState.new(project_id="project-1", name="Taskflow")
+    project.add_task_run(
+        TaskRun(
+            id="task-run-1",
+            project_id="project-1",
+            goal_id="goal-1",
+            work_item_id="work-1",
+            status=TaskRunStatus.DISPATCHED,
+        )
+    )
+    project.add_trace_link(
+        TraceLink(
+            id="trace-task-agent",
+            project_id="project-1",
+            source_type=TraceEntityType.TASK_RUN,
+            source_id="task-run-1",
+            target_type=TraceEntityType.AGENT_RUN,
+            target_id="agent-run-1",
+            relation_type=TraceRelationType.DISPATCHES,
+        )
+    )
+
+    projection = TaskflowRuntimeProjectionService().project(
+        taskflow=taskflow,
+        project=project,
+        runtime_control_plane=FakeRuntimeControlPlane(),
+    )
+
+    item = projection["task_runs"][0]
+    assert item["liveness"]["state"] == "running"
+    assert item["events"][0]["type"] == "lifecycle_hook"
+    assert item["events"][0]["payload"]["event_name"] == "Stop"

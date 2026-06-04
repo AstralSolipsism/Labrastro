@@ -180,6 +180,10 @@ def _jsonable_row(row: Any) -> dict[str, Any]:
     return result
 
 
+_TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "cancelled", "blocked"}
+_CANCEL_REQUEST_AGENT_RUN_STATUSES = {"dispatched", "running", "waiting_approval"}
+
+
 def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -212,7 +216,34 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
         "parent_run_id": task.parent_run_id,
         "failure_reason": task.failure_reason,
         "cancel_reason": task.cancel_reason,
+        "budget": _dict_from(task.metadata.get("budget")),
         "metadata": dict(task.metadata),
+    }
+
+
+def _parent_agent_run_id(task: AgentRunRecord) -> str:
+    return str(
+        task.parent_run_id
+        or task.parent_task_id
+        or task.delegated_by_run_id
+        or ""
+    )
+
+
+def _delegated_run_completed_payload(task: AgentRunRecord) -> dict[str, Any]:
+    status = task.status.value
+    return {
+        "run_id": task.id,
+        "agent_run_id": task.id,
+        "agent_id": task.agent_id,
+        "task": task.prompt,
+        "status": status,
+        "result": task.output or "",
+        "error": "" if status == TaskStatus.COMPLETED.value else task.failure_reason or "",
+        "source": task.source.value,
+        "parent_run_id": task.parent_run_id,
+        "parent_task_id": task.parent_task_id,
+        "delegated_by_run_id": task.delegated_by_run_id,
     }
 
 
@@ -288,6 +319,8 @@ class PostgresAgentRunStore:
             metadata.setdefault("parent_run_id", request.parent_run_id)
         if request.model is not None:
             metadata.setdefault("model", request.model)
+        if getattr(request, "budget", None):
+            metadata.setdefault("budget", dict(request.budget))
         if getattr(request, "worker_kind", None) is not None:
             metadata.setdefault("worker_kind", request.worker_kind.value)
         if getattr(request, "model_request_origin", None) is not None:
@@ -956,6 +989,7 @@ class PostgresAgentRunStore:
                 status,
                 {"result": result.to_dict(), "agent_run": _agent_run_to_dict(task)},
             )
+            self._append_parent_terminal_event(conn, task)
             self._release_claims(conn, task_id, status="completed")
             self._resolve_cancel(conn, task_id)
             return task
@@ -1025,6 +1059,8 @@ class PostgresAgentRunStore:
                 {"task_id": task_id, "error": error},
             )
             self._append_event(conn, task_id, "failed", {"error": error})
+            task = self._task_from_row(self._task_row(conn, task_id))
+            self._append_parent_terminal_event(conn, task)
             self._release_claims(conn, task_id, status="released")
             self._resolve_cancel(conn, task_id)
         return self.get_agent_run(task_id)
@@ -1048,8 +1084,11 @@ class PostgresAgentRunStore:
                     {"task_id": task_id, "reason": reason},
                 )
                 self._append_event(conn, task_id, "cancelled", {"reason": reason})
+                task = self._task_from_row(self._task_row(conn, task_id))
+                self._append_parent_terminal_event(conn, task)
                 self._release_claims(conn, task_id, status="cancelled")
                 self._resolve_cancel(conn, task_id)
+                self._cancel_child_agent_runs(conn, task_id, reason=reason)
                 return True
             if task.status in {
                 TaskStatus.DISPATCHED,
@@ -1073,6 +1112,7 @@ class PostgresAgentRunStore:
                     "cancel_requested",
                     {"reason": reason, "worker_id": task.worker_id},
                 )
+                self._cancel_child_agent_runs(conn, task_id, reason=reason)
                 return True
             conn.execute(
                 text(
@@ -1087,8 +1127,113 @@ class PostgresAgentRunStore:
                 {"task_id": task_id, "reason": reason},
             )
             self._append_event(conn, task_id, "cancelled", {"reason": reason})
+            task = self._task_from_row(self._task_row(conn, task_id))
+            self._append_parent_terminal_event(conn, task)
             self._release_claims(conn, task_id, status="cancelled")
+            self._cancel_child_agent_runs(conn, task_id, reason=reason)
             return True
+
+    def _cancel_child_agent_runs(
+        self,
+        conn: Any,
+        parent_run_id: str,
+        *,
+        reason: str,
+        seen: set[str] | None = None,
+    ) -> None:
+        seen = seen or set()
+        if parent_run_id in seen:
+            return
+        seen.add(parent_run_id)
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, status, worker_id, metadata
+                FROM labrastro_agent_runs
+                WHERE id != :parent_run_id
+                  AND status NOT IN ('completed', 'failed', 'cancelled', 'blocked')
+                  AND (
+                    parent_task_id = :parent_run_id
+                    OR metadata->>'parent_run_id' = :parent_run_id
+                    OR metadata->>'delegated_by_run_id' = :parent_run_id
+                  )
+                ORDER BY created_at ASC
+                """
+            ),
+            {"parent_run_id": parent_run_id},
+        ).fetchall()
+        for row in rows:
+            item = row._mapping if hasattr(row, "_mapping") else row
+            child_id = str(item["id"])
+            child_status = str(item["status"] or "")
+            child_reason = f"parent_cancelled:{reason}"
+            child_metadata = _dict_from(item["metadata"])
+            if child_metadata.get("sandbox_session_id"):
+                conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_agent_runs
+                        SET status='cancelled', output=:reason,
+                            failure_reason='cancelled', cancel_reason=:reason,
+                            completed_at=now(), updated_at=now()
+                        WHERE id=:task_id
+                        """
+                    ),
+                    {"task_id": child_id, "reason": child_reason},
+                )
+                self._release_claims(conn, child_id, status="cancelled")
+                self._resolve_cancel(conn, child_id)
+                self._append_event(conn, child_id, "cancelled", {"reason": child_reason})
+                child = self._task_from_row(self._task_row(conn, child_id))
+                self._append_parent_terminal_event(conn, child)
+            elif child_status in _CANCEL_REQUEST_AGENT_RUN_STATUSES:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO labrastro_agent_run_cancel_requests(task_id, reason)
+                        VALUES (:task_id, :reason)
+                        ON CONFLICT (task_id) DO UPDATE
+                        SET reason=EXCLUDED.reason, requested_at=now(), resolved_at=NULL
+                        """
+                    ),
+                    {"task_id": child_id, "reason": child_reason},
+                )
+                self._append_event(
+                    conn,
+                    child_id,
+                    "cancel_requested",
+                    {"reason": child_reason, "worker_id": item["worker_id"]},
+                )
+            elif child_status not in _TERMINAL_AGENT_RUN_STATUSES:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_agent_runs
+                        SET status='cancelled', output=:reason,
+                            failure_reason='cancelled', cancel_reason=:reason,
+                            completed_at=now(), updated_at=now()
+                        WHERE id=:task_id
+                        """
+                    ),
+                    {"task_id": child_id, "reason": child_reason},
+                )
+                self._release_claims(conn, child_id, status="cancelled")
+                self._resolve_cancel(conn, child_id)
+                self._append_event(conn, child_id, "cancelled", {"reason": child_reason})
+                child = self._task_from_row(self._task_row(conn, child_id))
+                self._append_parent_terminal_event(conn, child)
+            self._append_event(
+                conn,
+                child_id,
+                "parent_cancelled",
+                {"parent_run_id": parent_run_id, "reason": reason},
+            )
+            self._cancel_child_agent_runs(
+                conn,
+                child_id,
+                reason=reason,
+                seen=seen,
+            )
 
     def attach_artifact(self, task_id: str, **kwargs: Any) -> TaskArtifact:
         with self.engine.begin() as conn:
@@ -1193,6 +1338,50 @@ class PostgresAgentRunStore:
                 params,
             ).mappings()
             return [_agent_run_to_dict(self._task_from_row(row)) for row in rows]
+
+    def list_descendant_agent_runs(
+        self,
+        parent_run_id: str,
+        *,
+        include_terminal: bool = True,
+    ) -> list[AgentRunRecord]:
+        status_clause = (
+            ""
+            if include_terminal
+            else "WHERE status NOT IN ('completed', 'failed', 'cancelled', 'blocked')"
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    WITH RECURSIVE descendants AS (
+                        SELECT runs.*, ARRAY[runs.id] AS path
+                        FROM labrastro_agent_runs runs
+                        WHERE runs.id != :parent_run_id
+                          AND (
+                            runs.parent_task_id = :parent_run_id
+                            OR runs.metadata->>'parent_run_id' = :parent_run_id
+                            OR runs.metadata->>'delegated_by_run_id' = :parent_run_id
+                          )
+                        UNION ALL
+                        SELECT child.*, descendants.path || child.id
+                        FROM labrastro_agent_runs child
+                        JOIN descendants ON (
+                            child.parent_task_id = descendants.id
+                            OR child.metadata->>'parent_run_id' = descendants.id
+                            OR child.metadata->>'delegated_by_run_id' = descendants.id
+                        )
+                        WHERE NOT child.id = ANY(descendants.path)
+                    )
+                    SELECT DISTINCT ON (id) *
+                    FROM descendants
+                    {status_clause}
+                    ORDER BY id, created_at ASC
+                    """
+                ),
+                {"parent_run_id": parent_run_id},
+            ).mappings()
+            return [self._task_from_row(row) for row in rows]
 
     def load_agent_run_detail(
         self,
@@ -1349,6 +1538,27 @@ class PostgresAgentRunStore:
         agent_config: AgentConfig | None,
     ) -> None:
         validate_agent_run_runtime_policy(request, agent_config=agent_config)
+
+    def _append_parent_terminal_event(
+        self,
+        conn: Any,
+        task: AgentRunRecord,
+    ) -> None:
+        parent_run_id = _parent_agent_run_id(task)
+        if not parent_run_id or parent_run_id == task.id:
+            return
+        parent = conn.execute(
+            text("SELECT id FROM labrastro_agent_runs WHERE id=:task_id"),
+            {"task_id": parent_run_id},
+        ).mappings().first()
+        if parent is None:
+            return
+        self._append_event(
+            conn,
+            parent_run_id,
+            "delegated_run_completed",
+            _delegated_run_completed_payload(task),
+        )
 
     def _append_event(
         self, conn: Any, task_id: str, event_type: str, payload: dict[str, Any]

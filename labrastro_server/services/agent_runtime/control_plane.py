@@ -150,7 +150,34 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
         "parent_run_id": task.parent_run_id,
         "failure_reason": task.failure_reason,
         "cancel_reason": task.cancel_reason,
+        "budget": _dict_from(task.metadata.get("budget")),
         "metadata": dict(task.metadata),
+    }
+
+
+def _parent_agent_run_id(task: AgentRunRecord) -> str:
+    return str(
+        task.parent_run_id
+        or task.parent_task_id
+        or task.delegated_by_run_id
+        or ""
+    )
+
+
+def _delegated_run_completed_payload(task: AgentRunRecord) -> dict[str, Any]:
+    status = task.status.value
+    return {
+        "run_id": task.id,
+        "agent_run_id": task.id,
+        "agent_id": task.agent_id,
+        "task": task.prompt,
+        "status": status,
+        "result": task.output or "",
+        "error": "" if status == TaskStatus.COMPLETED.value else task.failure_reason or "",
+        "source": task.source.value,
+        "parent_run_id": task.parent_run_id,
+        "parent_task_id": task.parent_task_id,
+        "delegated_by_run_id": task.delegated_by_run_id,
     }
 
 
@@ -172,6 +199,45 @@ def _artifact_to_dict(artifact: TaskArtifact) -> dict[str, Any]:
 
 def _dict_from(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+_AGENT_RUN_BUDGET_FIELDS = {
+    "token_budget",
+    "max_turns",
+    "max_tool_calls",
+    "timeout_sec",
+}
+
+
+def _normalize_agent_run_budget(value: Any) -> dict[str, int]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("AgentRun budget must be an object")
+    result: dict[str, int] = {}
+    for key, raw in value.items():
+        field_name = str(key or "").strip()
+        if not field_name:
+            continue
+        if field_name not in _AGENT_RUN_BUDGET_FIELDS:
+            allowed = ", ".join(sorted(_AGENT_RUN_BUDGET_FIELDS))
+            raise ValueError(
+                f"unsupported AgentRun budget field '{field_name}'; allowed: {allowed}"
+            )
+        if raw in (None, ""):
+            continue
+        try:
+            amount = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"AgentRun budget field '{field_name}' must be a positive integer"
+            ) from exc
+        if amount <= 0:
+            raise ValueError(
+                f"AgentRun budget field '{field_name}' must be a positive integer"
+            )
+        result[field_name] = amount
+    return result
 
 
 def _agent_model_binding(raw_agent: dict[str, Any]) -> dict[str, Any]:
@@ -246,6 +312,7 @@ class AgentRunRequest:
     workspace_ref: str | None = None
     delegated_by_run_id: str | None = None
     parent_run_id: str | None = None
+    budget: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -258,6 +325,7 @@ class AgentRunRequest:
         )
         self.worktree_role = optional_worktree_role(self.worktree_role)
         self.publish_policy = optional_publish_policy(self.publish_policy)
+        self.budget = _normalize_agent_run_budget(self.budget)
         if not isinstance(self.trigger_mode, TriggerMode):
             self.trigger_mode = TriggerMode(str(self.trigger_mode))
 
@@ -442,6 +510,8 @@ class AgentRunControlPlane:
                 metadata.setdefault("parent_run_id", request.parent_run_id)
             if request.model is not None:
                 metadata.setdefault("model", request.model)
+            if request.budget:
+                metadata.setdefault("budget", dict(request.budget))
             if request.worker_kind is not None:
                 metadata.setdefault("worker_kind", request.worker_kind.value)
             if request.model_request_origin is not None:
@@ -1458,6 +1528,7 @@ class AgentRunControlPlane:
                 task.status.value if policy_error else result.status,
                 {"result": result.to_dict(), "agent_run": _agent_run_to_dict(task)},
             )
+            self._append_parent_terminal_event_locked(task)
             self._clear_task_claims_locked(task_id)
             self._cancel_requests.pop(task_id, None)
             self._stop_sandbox_for_task(task)
@@ -1530,6 +1601,7 @@ class AgentRunControlPlane:
             task.failure_reason = error
             task.cancel_reason = None
             self._append_event_locked(task_id, "failed", {"error": error})
+            self._append_parent_terminal_event_locked(task)
             self._clear_task_claims_locked(task_id)
             self._cancel_requests.pop(task_id, None)
             self._stop_sandbox_for_task(task)
@@ -1538,44 +1610,122 @@ class AgentRunControlPlane:
     def cancel_agent_run(self, task_id: str, *, reason: str = "user_cancelled") -> bool:
         if self._store is not None:
             task_before = self._store.get_agent_run(task_id)
+            descendants_before = self._store_descendant_agent_runs(task_id)
             ok = self._store.cancel_agent_run(task_id, reason=reason)
-            if ok and task_before.sandbox_session_id:
-                self._stop_sandbox_for_task(task_before, cancel=True)
+            if ok:
+                stopped: set[str] = set()
+                for task in [task_before, *descendants_before]:
+                    if task.sandbox_session_id and task.sandbox_session_id not in stopped:
+                        self._stop_sandbox_for_task(task, cancel=True)
+                        stopped.add(task.sandbox_session_id)
             self.notify_task_available()
             return ok
         with self._lock:
             task = self._task_locked(task_id)
             if task.is_terminal:
                 return False
-            if task.sandbox_session_id:
-                self._stop_sandbox_for_task(task, cancel=True)
-                task.status = TaskStatus.CANCELLED
-                task.output = reason
-                task.failure_reason = "cancelled"
-                task.cancel_reason = reason
-                self._append_event_locked(task_id, "cancelled", {"reason": reason})
-                self._clear_task_claims_locked(task_id)
-                self._cancel_requests.pop(task_id, None)
-                return True
-            if task.status in {
-                TaskStatus.DISPATCHED,
-                TaskStatus.RUNNING,
-                TaskStatus.WAITING_APPROVAL,
-            }:
-                self._cancel_requests[task_id] = reason
-                self._append_event_locked(
-                    task_id,
-                    "cancel_requested",
-                    {"reason": reason, "worker_id": task.worker_id},
-                )
-                return True
+            changed = self._cancel_task_locked(task, reason=reason)
+            if changed:
+                self._cancel_child_agent_runs_locked(task_id, reason=reason)
+            return changed
+
+    def _cancel_task_locked(
+        self,
+        task: AgentRunRecord,
+        *,
+        reason: str,
+    ) -> bool:
+        if task.is_terminal:
+            return False
+        if task.sandbox_session_id:
+            self._stop_sandbox_for_task(task, cancel=True)
             task.status = TaskStatus.CANCELLED
             task.output = reason
             task.failure_reason = "cancelled"
             task.cancel_reason = reason
-            self._append_event_locked(task_id, "cancelled", {"reason": reason})
-            self._clear_task_claims_locked(task_id)
+            self._append_event_locked(task.id, "cancelled", {"reason": reason})
+            self._append_parent_terminal_event_locked(task)
+            self._clear_task_claims_locked(task.id)
+            self._cancel_requests.pop(task.id, None)
             return True
+        if task.status in {
+            TaskStatus.DISPATCHED,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_APPROVAL,
+        }:
+            self._cancel_requests[task.id] = reason
+            self._append_event_locked(
+                task.id,
+                "cancel_requested",
+                {"reason": reason, "worker_id": task.worker_id},
+            )
+            return True
+        task.status = TaskStatus.CANCELLED
+        task.output = reason
+        task.failure_reason = "cancelled"
+        task.cancel_reason = reason
+        self._append_event_locked(task.id, "cancelled", {"reason": reason})
+        self._append_parent_terminal_event_locked(task)
+        self._clear_task_claims_locked(task.id)
+        self._cancel_requests.pop(task.id, None)
+        return True
+
+    def _cancel_child_agent_runs_locked(self, parent_run_id: str, *, reason: str) -> None:
+        pending = [parent_run_id]
+        seen: set[str] = set()
+        while pending:
+            current_parent_id = pending.pop()
+            if current_parent_id in seen:
+                continue
+            seen.add(current_parent_id)
+            child_ids = [
+                state.task.id
+                for state in self._states.values()
+                if state.task.id not in seen
+                and (
+                    state.task.parent_run_id == current_parent_id
+                    or state.task.parent_task_id == current_parent_id
+                    or state.task.delegated_by_run_id == current_parent_id
+                )
+            ]
+            for child_id in child_ids:
+                child = self._states[child_id].task
+                child_reason = f"parent_cancelled:{reason}"
+                if self._cancel_task_locked(child, reason=child_reason):
+                    self._append_event_locked(
+                        child_id,
+                        "parent_cancelled",
+                        {"parent_run_id": current_parent_id, "reason": reason},
+                    )
+                pending.append(child_id)
+
+    def _store_descendant_agent_runs(self, parent_run_id: str) -> list[AgentRunRecord]:
+        if self._store is None:
+            return []
+        list_descendants = getattr(self._store, "list_descendant_agent_runs", None)
+        if not callable(list_descendants):
+            return []
+        try:
+            descendants = list_descendants(parent_run_id, include_terminal=False)
+        except TypeError:
+            descendants = list_descendants(parent_run_id)
+        return [
+            task
+            for task in descendants
+            if isinstance(task, AgentRunRecord)
+        ]
+
+    def _append_parent_terminal_event_locked(self, task: AgentRunRecord) -> None:
+        parent_run_id = _parent_agent_run_id(task)
+        if not parent_run_id or parent_run_id == task.id:
+            return
+        if parent_run_id not in self._states:
+            return
+        self._append_event_locked(
+            parent_run_id,
+            "delegated_run_completed",
+            _delegated_run_completed_payload(task),
+        )
 
     def attach_artifact(
         self,

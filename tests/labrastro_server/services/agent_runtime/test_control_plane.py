@@ -12,6 +12,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ExecutorType,
     PublishPolicy,
     TaskSessionRef,
+    TaskStatus,
     TriggerMode,
     WorktreeRole,
 )
@@ -20,7 +21,6 @@ from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunRequest,
     AgentRunControlPlane,
-    AgentRunRequest,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
@@ -161,6 +161,141 @@ def test_agent_run_request_projects_source_and_sandbox_fields() -> None:
     assert task["workspace_ref"] == "repo:example"
     assert task["delegated_by_run_id"] == "chat:parent"
     assert task["parent_run_id"] == "chat:parent"
+
+
+def test_agent_run_request_normalizes_budget_into_control_plane_metadata() -> None:
+    control = AgentRunControlPlane()
+
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="manual",
+            agent_id="coder",
+            prompt="run",
+            budget={
+                "token_budget": "1200",
+                "max_turns": 3,
+                "max_tool_calls": "8",
+                "timeout_sec": 60,
+            },
+        ),
+        task_id="run-budget",
+    )
+
+    assert run.metadata["budget"] == {
+        "token_budget": 1200,
+        "max_turns": 3,
+        "max_tool_calls": 8,
+        "timeout_sec": 60,
+    }
+    assert control.agent_run_to_dict(run.id)["budget"] == run.metadata["budget"]
+
+
+def test_agent_run_request_rejects_unknown_budget_fields() -> None:
+    with pytest.raises(ValueError, match="unsupported AgentRun budget field"):
+        AgentRunRequest(
+            issue_id="manual",
+            agent_id="coder",
+            prompt="run",
+            budget={"made_up": 1},
+        )
+
+
+def test_cancel_agent_run_cascades_to_child_agent_runs() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        task_id="parent-run",
+    )
+    running_child = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="child",
+            agent_id="coder",
+            prompt="child",
+            parent_run_id=parent.id,
+            delegated_by_run_id=parent.id,
+        ),
+        task_id="child-run",
+    )
+    queued_grandchild = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="grandchild",
+            agent_id="reviewer",
+            prompt="grandchild",
+            parent_run_id=running_child.id,
+        ),
+        task_id="grandchild-run",
+    )
+    control.append_executor_event(running_child.id, ExecutorEvent.status("running"))
+
+    assert control.cancel_agent_run(parent.id, reason="user_stop") is True
+
+    child = control.get_agent_run(running_child.id)
+    grandchild = control.get_agent_run(queued_grandchild.id)
+    child_events = [event.to_dict() for event in control.list_events(child.id)]
+    grandchild_events = [event.to_dict() for event in control.list_events(grandchild.id)]
+
+    assert child.status == TaskStatus.RUNNING
+    child_cancel_requested = [
+        event for event in child_events if event["type"] == "cancel_requested"
+    ][0]
+    child_parent_cancelled = [
+        event for event in child_events if event["type"] == "parent_cancelled"
+    ][0]
+    child_delegated_completed = [
+        event for event in child_events if event["type"] == "delegated_run_completed"
+    ][0]
+    assert child_cancel_requested["payload"]["reason"] == "parent_cancelled:user_stop"
+    assert child_parent_cancelled["payload"]["parent_run_id"] == parent.id
+    assert child_delegated_completed["payload"]["agent_run_id"] == queued_grandchild.id
+    assert grandchild.status == TaskStatus.CANCELLED
+    assert grandchild.cancel_reason == "parent_cancelled:user_stop"
+    assert grandchild_events[-2]["type"] == "cancelled"
+    assert grandchild_events[-1]["type"] == "parent_cancelled"
+
+
+def test_child_agent_run_terminal_state_is_projected_to_parent_audit() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        task_id="parent-run",
+    )
+    child = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="child",
+            agent_id="reviewer",
+            prompt="review output",
+            parent_run_id=parent.id,
+            delegated_by_run_id=parent.id,
+        ),
+        task_id="child-run",
+    )
+
+    control.complete_agent_run(
+        child.id,
+        ExecutorRunResult(
+            task_id=child.id,
+            status="completed",
+            output="review passed",
+        ),
+    )
+
+    parent_events = [event.to_dict() for event in control.list_events(parent.id)]
+    delegated_event = [
+        event for event in parent_events if event["type"] == "delegated_run_completed"
+    ][0]
+    assert delegated_event["payload"] == {
+        "run_id": child.id,
+        "agent_run_id": child.id,
+        "agent_id": "reviewer",
+        "task": "review output",
+        "status": "completed",
+        "result": "review passed",
+        "error": "",
+        "source": "manual",
+        "parent_run_id": parent.id,
+        "parent_task_id": None,
+        "delegated_by_run_id": parent.id,
+    }
 
 
 def test_agent_run_snapshots_agent_model_binding_for_server_origin() -> None:

@@ -171,6 +171,117 @@ def test_postgres_runtime_store_terminal_reasons_round_trip() -> None:
     assert cancelled_detail["cancel_reason"] == "user stopped"
 
 
+def test_postgres_runtime_store_preserves_agent_run_budget() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-budget",
+            agent_id="pg-agent",
+            prompt="budget smoke",
+            budget={"token_budget": "1200", "max_turns": 2},
+        )
+    )
+
+    detail = control.agent_run_to_dict(task.id)
+    assert detail["budget"] == {"token_budget": 1200, "max_turns": 2}
+    assert detail["metadata"]["budget"] == {"token_budget": 1200, "max_turns": 2}
+
+
+def test_postgres_runtime_store_projects_child_terminal_event_to_parent() -> None:
+    control = _control()
+    parent = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-parent-terminal",
+            agent_id="pg-agent",
+            prompt="parent",
+        )
+    )
+    child = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-child-terminal",
+            agent_id="pg-agent",
+            prompt="child",
+            parent_task_id=parent.id,
+        )
+    )
+
+    control.complete_agent_run(
+        child.id,
+        ExecutorRunResult(task_id=child.id, status="completed", output="child done"),
+    )
+
+    parent_events = control.list_events(parent.id, after_seq=0)
+    delegated = [
+        event for event in parent_events if event.type == "delegated_run_completed"
+    ][0]
+    assert delegated.payload["agent_run_id"] == child.id
+    assert delegated.payload["parent_task_id"] == parent.id
+    assert delegated.payload["status"] == "completed"
+    assert delegated.payload["result"] == "child done"
+
+
+def test_postgres_runtime_store_cascades_cancel_to_child_sandbox_runs() -> None:
+    class FakeSandboxProvider:
+        def __init__(self) -> None:
+            self.cancelled_sessions: list[str] = []
+
+        def cancel(self, session_id: str) -> bool:
+            self.cancelled_sessions.append(session_id)
+            return True
+
+        def stop_session(self, session_id: str) -> bool:  # noqa: ARG002
+            return True
+
+    control = _control()
+    provider = FakeSandboxProvider()
+    control.configure_sandbox_provider(provider)
+    parent = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-parent-cancel",
+            agent_id="pg-agent",
+            prompt="parent",
+        )
+    )
+    child = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-child-cancel",
+            agent_id="pg-agent",
+            prompt="child",
+            parent_task_id=parent.id,
+            sandbox_session_id="ssn-child",
+        )
+    )
+    grandchild = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-grandchild-cancel",
+            agent_id="pg-agent",
+            prompt="grandchild",
+            parent_task_id=child.id,
+            sandbox_session_id="ssn-grandchild",
+        )
+    )
+
+    assert control.cancel_agent_run(parent.id, reason="user stopped") is True
+
+    child_detail = control.agent_run_to_dict(child.id)
+    grandchild_detail = control.agent_run_to_dict(grandchild.id)
+    assert child_detail["status"] == "cancelled"
+    assert child_detail["cancel_reason"] == "parent_cancelled:user stopped"
+    assert grandchild_detail["status"] == "cancelled"
+    assert grandchild_detail["cancel_reason"] == "parent_cancelled:user stopped"
+    assert provider.cancelled_sessions == ["ssn-child", "ssn-grandchild"]
+
+    child_events = control.list_events(child.id, after_seq=0)
+    assert "cancelled" in [event.type for event in child_events]
+    assert "parent_cancelled" in [event.type for event in child_events]
+    parent_events = control.list_events(parent.id, after_seq=0)
+    delegated = [
+        event for event in parent_events if event.type == "delegated_run_completed"
+    ][0]
+    assert delegated.payload["agent_run_id"] == child.id
+    assert delegated.payload["status"] == "cancelled"
+
+
 def test_postgres_runtime_store_assigns_reuleauxcoder_executor_session() -> None:
     database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
     run_migrations(database_url)

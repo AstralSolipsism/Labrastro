@@ -19,6 +19,7 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
     optional_publish_policy,
     optional_worktree_role,
 )
+from reuleauxcoder.domain.agent.events import AgentEventType
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 
 
@@ -34,6 +35,7 @@ class ExecutorEventType(str, Enum):
     LOG = "log"
     USAGE = "usage"
     RESULT = "result"
+    LIFECYCLE_HOOK = "lifecycle_hook"
 
 
 def _coerce_executor(value: ExecutorType | str) -> ExecutorType:
@@ -362,6 +364,7 @@ class ReuleauxCoderExecutorBackend:
 
     def _run_agent(self, request: ExecutorRunRequest, agent: Any) -> ExecutorRunResult:
         events = [ExecutorEvent.status("running", task_id=request.task_id)]
+        lifecycle_handler = self._attach_lifecycle_event_capture(agent, events)
         try:
             output = self._agent_chat(agent, request.prompt)
         except Exception as exc:  # pragma: no cover - defensive adapter boundary
@@ -376,6 +379,9 @@ class ReuleauxCoderExecutorBackend:
                 events=events,
                 error=message,
             )
+        finally:
+            if lifecycle_handler is not None:
+                self._detach_agent_event_handler(agent, lifecycle_handler)
 
         events.append(ExecutorEvent.text_event(output))
         events.append(ExecutorEvent.status("completed", task_id=request.task_id))
@@ -386,6 +392,41 @@ class ReuleauxCoderExecutorBackend:
             executor_session_id=getattr(agent, "current_session_id", None),
             events=events,
         )
+
+    @staticmethod
+    def _attach_lifecycle_event_capture(
+        agent: Any,
+        events: list[ExecutorEvent],
+    ) -> Callable[[Any], None] | None:
+        add_event_handler = getattr(agent, "add_event_handler", None)
+        if not callable(add_event_handler):
+            return None
+
+        def _on_agent_event(event: Any) -> None:
+            event_type = getattr(event, "event_type", None)
+            event_type_value = str(getattr(event_type, "value", event_type) or "")
+            if event_type_value != AgentEventType.LIFECYCLE_HOOK.value:
+                return
+            data = getattr(event, "data", {})
+            events.append(
+                ExecutorEvent(
+                    type=ExecutorEventType.LIFECYCLE_HOOK,
+                    data=dict(data) if isinstance(data, dict) else {},
+                )
+            )
+
+        add_event_handler(_on_agent_event)
+        return _on_agent_event
+
+    @staticmethod
+    def _detach_agent_event_handler(agent: Any, handler: Callable[[Any], None]) -> None:
+        handlers = getattr(agent, "_event_handlers", None)
+        if not isinstance(handlers, list):
+            return
+        try:
+            handlers.remove(handler)
+        except ValueError:
+            return
 
     @staticmethod
     def _bind_memory_scope(request: ExecutorRunRequest, agent: Any) -> None:

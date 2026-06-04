@@ -2,6 +2,8 @@
 
 import importlib
 
+from reuleauxcoder.domain.agent.events import AgentEvent
+
 
 def _executor_backend():
     return importlib.import_module(
@@ -136,6 +138,108 @@ def test_reuleauxcoder_backend_wraps_chat_output_as_executor_events() -> None:
     assert result.events[1].text == "done"
     assert agents[0].prompt == "run"
     assert agents[0].clear_stop_request is True
+
+
+def test_reuleauxcoder_backend_captures_lifecycle_hook_events() -> None:
+    backend_module = _executor_backend()
+
+    class FakeAgent:
+        current_session_id = "session-1"
+
+        def __init__(self) -> None:
+            self._event_handlers = []
+
+        def add_event_handler(self, handler) -> None:
+            self._event_handlers.append(handler)
+
+        def chat(self, prompt: str, *, clear_stop_request: bool = True) -> str:  # noqa: ARG002
+            for handler in list(self._event_handlers):
+                handler(
+                    AgentEvent.lifecycle_hook(
+                        {
+                            "phase": "result",
+                            "event_name": "Stop",
+                            "hook_id": "hook:stop",
+                            "display_name": "Stop review",
+                            "message": "review passed",
+                        }
+                    )
+                )
+            return "done"
+
+    agent = FakeAgent()
+    backend = backend_module.ReuleauxCoderExecutorBackend(
+        create_agent=lambda _request: agent
+    )
+    result = backend.start(
+        backend_module.ExecutorRunRequest(
+            task_id="task-1",
+            agent_id="reviewer",
+            executor="reuleauxcoder",
+            prompt="run",
+        )
+    )
+
+    assert [event.type.value for event in result.events] == [
+        "status",
+        "lifecycle_hook",
+        "text",
+        "status",
+    ]
+    assert result.events[1].data["phase"] == "result"
+    assert result.events[1].data["event_name"] == "Stop"
+    assert result.events[1].data["hook_id"] == "hook:stop"
+    assert agent._event_handlers == []
+
+
+def test_reuleauxcoder_backend_detaches_lifecycle_hook_handler_after_failure() -> None:
+    backend_module = _executor_backend()
+
+    class FakeAgent:
+        current_session_id = "session-1"
+
+        def __init__(self) -> None:
+            self._event_handlers = []
+
+        def add_event_handler(self, handler) -> None:
+            self._event_handlers.append(handler)
+
+        def chat(self, prompt: str, *, clear_stop_request: bool = True) -> str:  # noqa: ARG002
+            for handler in list(self._event_handlers):
+                handler(
+                    AgentEvent.lifecycle_hook(
+                        {
+                            "phase": "dispatch_failed",
+                            "event_name": "UserPromptSubmit",
+                            "hook_id": "hook:prompt",
+                            "error": "failed closed",
+                        }
+                    )
+                )
+            raise RuntimeError("boom")
+
+    agent = FakeAgent()
+    backend = backend_module.ReuleauxCoderExecutorBackend(
+        create_agent=lambda _request: agent
+    )
+    result = backend.start(
+        backend_module.ExecutorRunRequest(
+            task_id="task-1",
+            agent_id="reviewer",
+            executor="reuleauxcoder",
+            prompt="run",
+        )
+    )
+
+    assert result.status == "failed"
+    assert [event.type.value for event in result.events] == [
+        "status",
+        "lifecycle_hook",
+        "error",
+        "status",
+    ]
+    assert result.events[1].data["phase"] == "dispatch_failed"
+    assert agent._event_handlers == []
 
 
 def test_reuleauxcoder_backend_binds_permission_context_to_agent() -> None:

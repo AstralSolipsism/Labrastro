@@ -199,6 +199,55 @@ def agent_run_event_to_session_events(
                 ),
             )
         ]
+    if event_type == "lifecycle_hook":
+        hook_payload = _event_data(data)
+        if not hook_payload:
+            hook_payload = {
+                str(key): value
+                for key, value in data.items()
+                if key not in {"type", "text", "data"}
+            }
+        public_payload = {
+            **base,
+            **_public_payload(hook_payload, marker=labels.output_truncation_marker),
+        }
+        public_payload["raw_event_refs"] = base["raw_event_refs"]
+        return [("lifecycle_hook", public_payload)]
+    if event_type == "delegated_run_completed":
+        child_run_id = str(data.get("agent_run_id") or data.get("run_id") or "")
+        child_agent_id = str(data.get("agent_id") or "")
+        status = str(data.get("status") or "completed")
+        result, result_meta = _project_large_output(
+            str(data.get("result") or ""),
+            max_chars=RESULT_CONTEXT_MAIN_TIMELINE_MAX_CHARS,
+            marker=labels.output_truncation_marker,
+        )
+        error = str(data.get("error") or "")
+        return [
+            (
+                "context_event",
+                _context_event(
+                    labels,
+                    f"{child_agent_id or 'delegated agent'} {status}",
+                    "delegated_run_completed",
+                    {
+                        **base,
+                        "child_agent_run_id": child_run_id,
+                        "child_agent_id": child_agent_id,
+                        "agent_run_status": status,
+                        "result": result,
+                        "error": error,
+                        "meta": {
+                            **_public_payload(
+                                _without_large_output_fields(data),
+                                marker=labels.output_truncation_marker,
+                            ),
+                            **_prefixed_projection_meta("result", result_meta),
+                        },
+                    },
+                ),
+            )
+        ]
     if event_type == "tool_use":
         tool_data = _event_data(data)
         tool_name = _tool_name(tool_data)
