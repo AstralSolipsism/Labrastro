@@ -11,14 +11,19 @@ if TYPE_CHECKING:
     from reuleauxcoder.interfaces.events import UIEventBus
 
 from reuleauxcoder.extensions.mcp.adapter import MCPTool
-from reuleauxcoder.extensions.mcp.client import MCPClient
+from reuleauxcoder.extensions.mcp.client import MCPClient, MCPElicitationHandler
 
 
 class MCPManager:
     """Manages connections to multiple MCP servers and aggregates their tools."""
 
-    def __init__(self, ui_bus: "UIEventBus | None" = None):
+    def __init__(
+        self,
+        ui_bus: "UIEventBus | None" = None,
+        elicitation_handler: MCPElicitationHandler | None = None,
+    ):
         self._ui_bus = ui_bus
+        self._elicitation_handler = elicitation_handler
         self._clients: dict[str, MCPClient] = {}
         self._tools: list[MCPTool] = []
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -71,6 +76,11 @@ class MCPManager:
     def connected_servers(self) -> set[str]:
         return set(self._clients.keys())
 
+    def set_elicitation_handler(
+        self, elicitation_handler: MCPElicitationHandler | None
+    ) -> None:
+        self._elicitation_handler = elicitation_handler
+
     def connect_server(self, config) -> bool:
         if not self._started:
             self.start()
@@ -81,7 +91,11 @@ class MCPManager:
         if config.name in self._clients:
             return True
 
-        client = MCPClient(config, ui_bus=self._ui_bus)
+        client = MCPClient(
+            config,
+            ui_bus=self._ui_bus,
+            elicitation_handler=self._elicitation_handler,
+        )
         future = asyncio.run_coroutine_threadsafe(client.connect(), self._loop)
         try:
             success = future.result(timeout=30.0)
