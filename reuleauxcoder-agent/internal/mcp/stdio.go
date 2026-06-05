@@ -42,6 +42,16 @@ type rpcEnvelope struct {
 	Error   any             `json:"error,omitempty"`
 }
 
+const mcpProtocolVersion = "2025-11-25"
+
+var mcpSupportedProtocolVersions = map[string]struct{}{
+	"2025-11-25": {},
+	"2025-06-18": {},
+	"2025-03-26": {},
+	"2024-11-05": {},
+	"2024-10-07": {},
+}
+
 func startStdioClient(ctx context.Context, name string, launch protocol.MCPLaunchManifest) (*stdioClient, error) {
 	cmd := exec.CommandContext(ctx, launch.Command, launch.Args...)
 	if launch.CWD != "" {
@@ -79,18 +89,29 @@ func startStdioClient(ctx context.Context, name string, launch protocol.MCPLaunc
 }
 
 func (c *stdioClient) initialize(ctx context.Context) ([]protocol.MCPToolInfo, error) {
-	_, err := c.request(ctx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{"tools": map[string]any{}},
+	result, err := c.request(ctx, "initialize", map[string]any{
+		"protocolVersion": mcpProtocolVersion,
+		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "reuleauxcoder-peer", "version": "0.1.0"},
 	})
 	if err != nil {
 		return nil, err
 	}
+	protocolVersion, _ := result["protocolVersion"].(string)
+	protocolVersion = strings.TrimSpace(protocolVersion)
+	if _, ok := mcpSupportedProtocolVersions[protocolVersion]; !ok {
+		if protocolVersion == "" {
+			protocolVersion = "<missing>"
+		}
+		return nil, fmt.Errorf("unsupported MCP protocol version: %s", protocolVersion)
+	}
 	if err := c.notify("notifications/initialized", map[string]any{}); err != nil {
 		return nil, err
 	}
-	result, err := c.request(ctx, "tools/list", map[string]any{})
+	if !serverSupportsTools(result["capabilities"]) {
+		return []protocol.MCPToolInfo{}, nil
+	}
+	result, err = c.request(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +139,15 @@ func (c *stdioClient) initialize(ctx context.Context) ([]protocol.MCPToolInfo, e
 		})
 	}
 	return tools, nil
+}
+
+func serverSupportsTools(capabilities any) bool {
+	values, ok := capabilities.(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = values["tools"].(map[string]any)
+	return ok
 }
 
 func (c *stdioClient) callTool(ctx context.Context, name string, arguments map[string]any) protocol.ExecToolResult {

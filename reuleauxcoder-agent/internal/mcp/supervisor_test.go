@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +44,92 @@ func TestExpandLaunchTemplates(t *testing.T) {
 	}
 	if launch.Env["CACHE"] != "/workspace/.rcoder/mcp-cache/s/1/linux-amd64" {
 		t.Fatalf("CACHE env = %q", launch.Env["CACHE"])
+	}
+}
+
+func TestStdioClientInitializeAdvertisesLatestProtocolWithoutLegacyToolsCapability(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverReader, clientWriter := io.Pipe()
+	clientReader, serverWriter := io.Pipe()
+	client := &stdioClient{
+		name:    "peer-test",
+		stdin:   clientWriter,
+		pending: map[int]chan rpcResponse{},
+	}
+	go client.receiveLoop(clientReader)
+	defer clientWriter.Close()
+	defer serverWriter.Close()
+
+	initParamsCh := make(chan map[string]any, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		decoder := json.NewDecoder(serverReader)
+		encoder := json.NewEncoder(serverWriter)
+		for {
+			var req map[string]any
+			if err := decoder.Decode(&req); err != nil {
+				serverDone <- err
+				return
+			}
+			method, _ := req["method"].(string)
+			id, hasID := req["id"]
+			switch method {
+			case "initialize":
+				params, _ := req["params"].(map[string]any)
+				initParamsCh <- params
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"result": map[string]any{
+						"protocolVersion": "2025-11-25",
+						"capabilities":    map[string]any{"tools": map[string]any{}},
+					},
+				})
+			case "notifications/initialized":
+				continue
+			case "tools/list":
+				if !hasID {
+					serverDone <- nil
+					return
+				}
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"result":  map[string]any{"tools": []map[string]any{}},
+				})
+				serverDone <- nil
+				return
+			default:
+				serverDone <- fmt.Errorf("unexpected method %s", method)
+				return
+			}
+		}
+	}()
+
+	tools, err := client.initialize(ctx)
+	if err != nil {
+		t.Fatalf("initialize failed: %v", err)
+	}
+	if len(tools) != 0 {
+		t.Fatalf("tools = %v", tools)
+	}
+
+	select {
+	case initParams := <-initParamsCh:
+		if initParams["protocolVersion"] != "2025-11-25" {
+			t.Fatalf("protocolVersion = %v", initParams["protocolVersion"])
+		}
+		capabilities, _ := initParams["capabilities"].(map[string]any)
+		if _, ok := capabilities["tools"]; ok {
+			t.Fatalf("legacy tools client capability was advertised: %#v", capabilities)
+		}
+	case <-ctx.Done():
+		t.Fatal("initialize request was not captured")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("fake MCP server failed: %v", err)
 	}
 }
 
@@ -322,7 +409,10 @@ func runFakeMCPServer() {
 			_ = encoder.Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      id,
-				"result":  map[string]any{"capabilities": map[string]any{"tools": map[string]any{}}},
+				"result": map[string]any{
+					"protocolVersion": "2025-11-25",
+					"capabilities":    map[string]any{"tools": map[string]any{}},
+				},
 			})
 		case "tools/list":
 			_ = encoder.Encode(map[string]any{
