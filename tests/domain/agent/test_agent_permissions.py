@@ -241,7 +241,92 @@ def test_agent_does_not_dispatch_permission_request_for_hard_denied_tool_call() 
 
     assert decision.action == PermissionAction.DENY
     assert decision.policy_matched == "system_hard_deny"
-    assert dispatcher.contexts == []
+    assert [context.event_name for context in dispatcher.contexts] == ["PermissionDenied"]
+    assert dispatcher.contexts[0].payload["technical"]["permission_decision"][
+        "policy_matched"
+    ] == "system_hard_deny"
+
+
+def test_agent_dispatches_permission_denied_lifecycle_after_static_denial() -> None:
+    class _LifecycleDispatcher:
+        def __init__(self) -> None:
+            self.contexts: list[LifecycleHookEventContext] = []
+            self.declaration = LifecycleHookDeclaration.from_dict(
+                "hook:permission-denied-feedback",
+                {
+                    "event": "PermissionDenied",
+                    "source": "admin_managed",
+                    "placement": "server",
+                    "handler_type": "internal",
+                    "display_name": "Permission denied feedback",
+                    "summary": "Suggests recoverable next steps after automatic denial.",
+                    "permissions": [],
+                    "trust": "trusted",
+                },
+            )
+
+        def dispatch(
+            self,
+            context: LifecycleHookEventContext,
+        ) -> list[LifecycleHookDispatchResult]:
+            self.contexts.append(context)
+            if context.event_name != "PermissionDenied":
+                return []
+            return [
+                LifecycleHookDispatchResult(
+                    declaration=self.declaration,
+                    output=LifecycleHookOutput.from_dict(
+                        {
+                            "decision": "allow",
+                            "user_message": "Use read_file or ask for shell capability.",
+                            "diagnostics": [{"code": "recoverable_permission_denied"}],
+                        }
+                    ),
+                )
+            ]
+
+    dispatcher = _LifecycleDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "chat")
+    setattr(agent, "current_session_id", "session-1")
+    setattr(agent, "runtime_agent_run_id", "agent-run-1")
+    setattr(agent, "runtime_turn_id", "turn-1")
+    setattr(agent, "effective_capabilities", {"tools": ["builtin:read_file"]})
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert decision.policy_matched == "effective_capabilities"
+    assert [context.event_name for context in dispatcher.contexts] == [
+        "PermissionDenied"
+    ]
+    context = dispatcher.contexts[0]
+    assert context.session_run_id == "session-1"
+    assert context.agent_run_id == "agent-run-1"
+    assert context.turn_id == "turn-1"
+    assert context.source == "chat"
+    assert context.payload["tool_names"] == ["shell"]
+    assert context.payload["tool_call_ids"] == ["call-shell"]
+    assert context.payload["technical"]["permission_decision"]["policy_matched"] == (
+        "effective_capabilities"
+    )
+    assert decision.audit["permission_denied_lifecycle"][0]["hook_id"] == (
+        "hook:permission-denied-feedback"
+    )
+    assert decision.audit["permission_denied_lifecycle"][0]["user_message"] == (
+        "Use read_file or ask for shell capability."
+    )
 
 
 def test_agent_does_not_dispatch_permission_request_for_effective_capability_boundary() -> None:
@@ -264,7 +349,10 @@ def test_agent_does_not_dispatch_permission_request_for_effective_capability_bou
 
     assert decision.action == PermissionAction.DENY
     assert decision.policy_matched == "effective_capabilities"
-    assert dispatcher.contexts == []
+    assert [context.event_name for context in dispatcher.contexts] == ["PermissionDenied"]
+    assert dispatcher.contexts[0].payload["technical"]["permission_decision"][
+        "policy_matched"
+    ] == "effective_capabilities"
 
 
 def test_agent_does_not_dispatch_permission_request_for_execution_policy_deny() -> None:
@@ -296,7 +384,10 @@ def test_agent_does_not_dispatch_permission_request_for_execution_policy_deny() 
 
     assert decision.action == PermissionAction.DENY
     assert decision.policy_matched == "execution_policy:deny"
-    assert dispatcher.contexts == []
+    assert [context.event_name for context in dispatcher.contexts] == ["PermissionDenied"]
+    assert dispatcher.contexts[0].payload["technical"]["permission_decision"][
+        "policy_matched"
+    ] == "execution_policy:deny"
 
 
 def test_agent_dispatches_permission_request_for_background_review_candidate() -> None:
@@ -409,6 +500,49 @@ def test_permission_request_lifecycle_exposes_standard_tool_matcher_fields() -> 
         "mcp_" + "server",
     ):
         assert legacy_field not in dispatcher.contexts[0].payload
+
+
+def test_permission_request_lifecycle_context_populates_authoritative_fields() -> None:
+    dispatcher = _RecordingPermissionDispatcher()
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_Tool("shell")],
+        config=config,
+        lifecycle_dispatcher=dispatcher,
+    )
+    setattr(agent, "permission_trigger_source", "taskflow")
+    setattr(agent, "active_mode", "coder")
+    setattr(agent, "current_session_id", "session-1")
+    setattr(agent, "runtime_agent_run_id", "agent-run-1")
+    setattr(agent, "runtime_turn_id", "turn-1")
+    setattr(agent, "locale", "zh-CN")
+    setattr(agent, "effective_capabilities", {"tools": ["builtin:shell"]})
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _Tool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.ALLOW
+    context = dispatcher.contexts[0]
+    assert context.event_name == "PermissionRequest"
+    assert context.session_run_id == "session-1"
+    assert context.agent_run_id == "agent-run-1"
+    assert context.turn_id == "turn-1"
+    assert context.source == "taskflow"
+    assert context.origin == "agent"
+    assert context.locale == "zh-CN"
+    assert context.placement == "server"
+    assert context.timestamp
+    assert context.metadata["round_index"] == 0
+    assert context.metadata["active_mode"] == agent.active_mode
+    assert context.payload["session_run_id"] == "session-1"
+    assert context.payload["agent_run_id"] == "agent-run-1"
+    assert context.payload["turn_id"] == "turn-1"
+    assert context.payload["trigger_source"] == "taskflow"
+    assert context.payload["timestamp"] == context.timestamp
 
 
 def test_agent_fails_closed_when_permission_request_lifecycle_dispatch_fails() -> None:

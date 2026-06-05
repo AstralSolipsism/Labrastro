@@ -12,6 +12,25 @@ if TYPE_CHECKING:
     from reuleauxcoder.domain.llm.models import LLMResponse
 
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
+from reuleauxcoder.domain.agent.runtime_budget import (
+    runtime_budget_limit,
+    runtime_budget_int,
+)
+from reuleauxcoder.domain.agent.runtime_boundary import (
+    runtime_agent_run_id,
+    runtime_working_directory,
+)
+from reuleauxcoder.domain.approval import ApprovalRequest
+from reuleauxcoder.domain.hooks.lifecycle import (
+    build_lifecycle_event_context,
+    lifecycle_output_audit_fields,
+    lifecycle_runtime_artifacts_for_event,
+)
+from reuleauxcoder.domain.hooks.lifecycle_policy import (
+    lifecycle_gate_output_is_terminal,
+    lifecycle_output_message,
+    lifecycle_output_requests_approval,
+)
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 
 
@@ -25,6 +44,10 @@ class AgentLoop:
         self.last_response_streamed = False
         self.last_run_interrupted = False
         self.last_interruption_payload: dict[str, Any] | None = None
+        self.last_termination_reason: str | None = None
+        self.last_budget_exceeded: dict[str, Any] | None = None
+        self._skills_catalog_lifecycle_cache_key: tuple[Any, ...] | None = None
+        self._skills_catalog_lifecycle_cache_value = ""
 
     def _ui_bus(self) -> Any:
         context = getattr(self.agent, "context", None)
@@ -60,9 +83,7 @@ class AgentLoop:
 
     def _local_runtime_context(self, execution_target: str) -> list[str]:
         uname = platform.uname()
-        runtime_cwd = (
-            getattr(self.agent, "runtime_working_directory", None) or os.getcwd()
-        )
+        runtime_cwd = runtime_working_directory(self.agent) or os.getcwd()
         return [
             f"- Execution target: {execution_target}",
             f"- Working directory: {runtime_cwd}",
@@ -106,6 +127,232 @@ class AgentLoop:
             raise RuntimeError(f"remote peer runtime context is missing {key}")
         return value
 
+    def _skills_catalog_for_prompt(self) -> str:
+        catalog = str(getattr(self.agent, "skills_catalog", "") or "")
+        if not catalog.strip():
+            return ""
+        dispatcher = getattr(self.agent, "lifecycle_dispatcher", None)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return catalog
+        cache_key = (
+            catalog,
+            str(getattr(self.agent, "current_session_id", "") or ""),
+            runtime_agent_run_id(self.agent),
+            str(getattr(self.agent, "runtime_turn_id", "") or ""),
+            id(dispatcher),
+        )
+        if self._skills_catalog_lifecycle_cache_key == cache_key:
+            return self._skills_catalog_lifecycle_cache_value
+
+        context = build_lifecycle_event_context(
+            "UserPromptExpansion",
+            placement="server",
+            session_run_id=str(getattr(self.agent, "current_session_id", "") or ""),
+            agent_run_id=runtime_agent_run_id(self.agent),
+            turn_id=str(getattr(self.agent, "runtime_turn_id", "") or ""),
+            trigger_source="skill",
+            origin="agent",
+            locale=str(getattr(self.agent, "locale", "") or ""),
+            metadata={
+                "round_index": getattr(self.agent.state, "current_round", None),
+                "expansion_surface": "skills_catalog",
+                "parent_trigger_source": str(
+                    getattr(self.agent, "permission_trigger_source", "") or "chat"
+                ),
+            },
+            payload={
+                "user_input": "",
+                "command_text": "",
+                "trigger_kind": "skill_catalog",
+                "skills_catalog": catalog,
+            },
+        )
+        self._emit_lifecycle_observation("dispatch_start", context)
+        try:
+            results = list(dispatch(context) or [])
+        except Exception as exc:
+            self._emit_lifecycle_observation(
+                "dispatch_failed",
+                context,
+                error=f"{type(exc).__name__}: {exc}",
+                message="UserPromptExpansion lifecycle dispatch failed.",
+            )
+            return self._cache_skills_catalog_lifecycle(cache_key, "")
+
+        additional_context: list[Any] = []
+        ask_reasons: list[str] = []
+        ask_hooks: list[dict[str, str]] = []
+        for result in results:
+            self._emit_lifecycle_observation("result", context, result=result)
+            output = getattr(result, "output", None)
+            if output is None:
+                continue
+            additional_context.extend(list(getattr(output, "additional_context", []) or []))
+            if lifecycle_gate_output_is_terminal(output):
+                return self._cache_skills_catalog_lifecycle(cache_key, "")
+            if lifecycle_output_requests_approval(output):
+                ask_reasons.append(
+                    lifecycle_output_message(
+                        output,
+                        fallback="UserPromptExpansion lifecycle requires approval.",
+                    )
+                )
+                declaration = getattr(result, "declaration", None)
+                ask_hooks.append(
+                    {
+                        "hook_id": str(getattr(declaration, "id", "") or ""),
+                        "display_name": str(
+                            getattr(declaration, "display_name", "") or ""
+                        ),
+                    }
+                )
+        if ask_reasons and not self._approve_skill_catalog_expansion(
+            catalog,
+            reasons=ask_reasons,
+            hooks=ask_hooks,
+        ):
+            return self._cache_skills_catalog_lifecycle(cache_key, "")
+        extra = self._skill_expansion_additional_context(additional_context)
+        resolved = f"{catalog}\n\n{extra}" if extra else catalog
+        return self._cache_skills_catalog_lifecycle(cache_key, resolved)
+
+    def _cache_skills_catalog_lifecycle(
+        self,
+        cache_key: tuple[Any, ...],
+        value: str,
+    ) -> str:
+        self._skills_catalog_lifecycle_cache_key = cache_key
+        self._skills_catalog_lifecycle_cache_value = value
+        return value
+
+    def _approve_skill_catalog_expansion(
+        self,
+        catalog: str,
+        *,
+        reasons: list[str],
+        hooks: list[dict[str, str]],
+    ) -> bool:
+        provider = getattr(self.agent, "approval_provider", None)
+        request_approval = getattr(provider, "request_approval", None)
+        if not callable(request_approval):
+            return False
+        reason = "\n".join(item for item in reasons if item).strip()
+        try:
+            decision = request_approval(
+                ApprovalRequest(
+                    tool_name="lifecycle:UserPromptExpansion",
+                    tool_args={"trigger_kind": "skill_catalog"},
+                    tool_source="lifecycle_hook",
+                    reason=reason or "UserPromptExpansion lifecycle requires approval.",
+                    intent="Review whether Skill catalog expansion may enter the model prompt.",
+                    metadata={
+                        "lifecycle_event": "UserPromptExpansion",
+                        "trigger_kind": "skill_catalog",
+                        "catalog_chars": len(catalog),
+                        "lifecycle_hooks": hooks,
+                    },
+                )
+            )
+        except (KeyboardInterrupt, EOFError):
+            return False
+        return bool(getattr(decision, "approved", False))
+
+    def _emit_lifecycle_observation(
+        self,
+        phase: str,
+        context: object,
+        *,
+        result: object | None = None,
+        error: str = "",
+        message: str = "",
+    ) -> None:
+        emit = getattr(self.agent, "_emit_event", None)
+        if not callable(emit):
+            return
+        declaration = getattr(result, "declaration", None)
+        output = getattr(result, "output", None)
+        output_dict = output.to_dict() if hasattr(output, "to_dict") else {}
+        diagnostics = (
+            list(output_dict.get("diagnostics") or [])
+            if isinstance(output_dict, dict)
+            else []
+        )
+        decision = (
+            str(output_dict.get("decision") or "none")
+            if isinstance(output_dict, dict)
+            else "none"
+        )
+        continue_flow = (
+            bool(output_dict.get("continue_flow", True))
+            if isinstance(output_dict, dict)
+            else True
+        )
+        level = (
+            "error"
+            if error or decision == "deny" or continue_flow is False
+            else "warning"
+            if diagnostics
+            else "info"
+        )
+        payload = {
+            "phase": phase,
+            "event_name": str(getattr(context, "event_name", "") or ""),
+            "placement": str(getattr(context, "placement", "") or "server"),
+            "session_run_id": str(getattr(context, "session_run_id", "") or ""),
+            "agent_run_id": str(getattr(context, "agent_run_id", "") or ""),
+            "turn_id": str(getattr(context, "turn_id", "") or ""),
+            "trigger_source": str(getattr(context, "source", "") or ""),
+            "hook_id": str(getattr(declaration, "id", "") or ""),
+            "display_name": str(getattr(declaration, "display_name", "") or ""),
+            "source": str(getattr(declaration, "source", "") or ""),
+            "decision": decision,
+            "continue_flow": continue_flow,
+            "diagnostics": diagnostics,
+            "error": error,
+            "level": level,
+            "title": str(
+                getattr(declaration, "display_name", "")
+                or getattr(context, "event_name", "")
+                or "Lifecycle hook"
+            ),
+            "payload": dict(getattr(context, "payload", {}) or {}),
+        }
+        if isinstance(output_dict, dict):
+            payload.update(lifecycle_output_audit_fields(output))
+            payload["output"] = output_dict
+            output_message = lifecycle_output_message(output, fallback="")
+            if output_message:
+                payload["message"] = output_message
+        if message:
+            payload["message"] = message
+        emit(
+            AgentEvent.lifecycle_hook(
+                payload,
+                runtime_artifacts=lifecycle_runtime_artifacts_for_event(
+                    output,
+                    event_name=str(getattr(context, "event_name", "") or ""),
+                    context=context,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _skill_expansion_additional_context(items: list[Any]) -> str:
+        text_items: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                content = item.get("content")
+                if isinstance(content, str) and content.strip():
+                    text_items.append(content.strip())
+                    continue
+            text = str(item or "").strip()
+            if text:
+                text_items.append(text)
+        if not text_items:
+            return ""
+        return "Lifecycle skill context:\n" + "\n".join(text_items)
+
     def _full_messages(self) -> list[dict]:
         """Get full messages including system prompt and ephemeral runtime tail."""
         mode = self.agent.get_active_mode_config()
@@ -143,7 +390,7 @@ class AgentLoop:
             blocked_tools=blocked_tools,
             mode_switch_hints=suggested_modes,
             available_modes=available_modes,
-            skills_catalog=getattr(self.agent, "skills_catalog", ""),
+            skills_catalog=self._skills_catalog_for_prompt(),
             capability_catalog=getattr(self.agent, "capability_catalog", ""),
             workflow_mode=getattr(self.agent, "workflow_mode", None),
             workflow_prompt_append=getattr(
@@ -239,6 +486,37 @@ class AgentLoop:
             )
         )
 
+    def _clear_terminal_metadata(self) -> None:
+        self.last_termination_reason = None
+        self.last_budget_exceeded = None
+
+    def _record_budget_exceeded(self, limit: dict[str, Any]) -> str:
+        budget = dict(limit)
+        message = str(budget.get("message") or "").strip()
+        self.last_termination_reason = "budget_exceeded"
+        self.last_budget_exceeded = {
+            "field": str(budget.get("field") or ""),
+            "limit": budget.get("limit"),
+            "message": message,
+        }
+        return f"({message})"
+
+    def _budget_stop_result(self) -> str | None:
+        limit = runtime_budget_limit(self.agent)
+        return self._record_budget_exceeded(limit) if limit else None
+
+    def _max_turns_stop_result(self) -> str | None:
+        max_turns = runtime_budget_int(self.agent, "max_turns")
+        if max_turns is None:
+            return None
+        return self._record_budget_exceeded(
+            {
+                "field": "max_turns",
+                "limit": max_turns,
+                "message": f"AgentRun budget exceeded: max_turns={max_turns}",
+            }
+        )
+
     @staticmethod
     def _stream_interruption_payload(response: "LLMResponse") -> dict[str, Any]:
         interruption = dict(response.interruption or {})
@@ -274,6 +552,9 @@ class AgentLoop:
         """Run the conversation loop."""
         self.last_run_interrupted = False
         self.last_interruption_payload = None
+        self._clear_terminal_metadata()
+        self._skills_catalog_lifecycle_cache_key = None
+        self._skills_catalog_lifecycle_cache_value = ""
         # Compress if needed
         self.agent.context.maybe_compress(
             self.agent.state.messages,
@@ -284,6 +565,8 @@ class AgentLoop:
         for round_num in range(self.agent.max_rounds):
             if self.agent.stop_requested():
                 return "(stopped by cancellation request)"
+            if budget_result := self._budget_stop_result():
+                return budget_result
 
             self.agent.state.current_round = round_num
 
@@ -342,6 +625,9 @@ class AgentLoop:
             self._emit_stream_recovery_events(resp)
             if resp.reasoning_content and not streamed_reasoning:
                 self.agent._emit_event(AgentEvent.reasoning_token(resp.reasoning_content))
+            if budget_result := self._budget_stop_result():
+                self.last_response_streamed = streamed_output
+                return budget_result
 
             if resp.stream_status == "interrupted":
                 self.last_response_streamed = streamed_output
@@ -357,14 +643,22 @@ class AgentLoop:
                 return resp.content
 
             # Tool calls -> execute
+            assistant_message_index = len(self.agent.state.messages)
             self.agent.state.messages.append(resp.message)
 
             if self.agent.stop_requested():
                 return "(stopped by cancellation request)"
 
+            def refresh_assistant_tool_call_message() -> None:
+                # PreToolUse lifecycle hooks can rewrite ToolCall objects during
+                # execution; keep the stored assistant message aligned with the
+                # effective calls before tool results enter history.
+                self.agent.state.messages[assistant_message_index] = resp.message
+
             if len(resp.tool_calls) == 1:
                 tc = resp.tool_calls[0]
                 result = self.agent._executor.execute(tc, index=0)
+                refresh_assistant_tool_call_message()
                 self.agent.state.messages.append(
                     {
                         "role": "tool",
@@ -380,6 +674,7 @@ class AgentLoop:
                         if self.agent.stop_requested():
                             return "(stopped by cancellation request)"
                         result = self.agent._executor.execute(tc, index=tool_index)
+                        refresh_assistant_tool_call_message()
                         self.agent.state.messages.append(
                             {
                                 "role": "tool",
@@ -393,6 +688,7 @@ class AgentLoop:
                     if self.agent.stop_requested():
                         return "(stopped by cancellation request)"
                     results = self.agent._executor.execute_parallel(resp.tool_calls)
+                    refresh_assistant_tool_call_message()
                     for tc, result in zip(resp.tool_calls, results):
                         self.agent.state.messages.append(
                             {
@@ -409,6 +705,11 @@ class AgentLoop:
                 self.agent.llm,
             )
             self._emit_usage_update()
+
+        if budget_result := self._budget_stop_result():
+            return budget_result
+        if max_turns_result := self._max_turns_stop_result():
+            return max_turns_result
 
         summary_prompt = (
             "Maximum tool-call rounds reached. Do not call any tools. "

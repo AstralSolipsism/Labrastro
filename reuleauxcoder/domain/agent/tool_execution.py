@@ -4,13 +4,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 import concurrent.futures
 from contextlib import nullcontext
+from dataclasses import dataclass
 import re
+import threading
 
 if TYPE_CHECKING:
     from reuleauxcoder.domain.agent.agent import Agent
     from reuleauxcoder.domain.llm.models import ToolCall
 
 from reuleauxcoder.domain.agent.events import AgentEvent, ToolFailureKind
+from reuleauxcoder.domain.agent.runtime_boundary import (
+    runtime_agent_run_id,
+    runtime_path_space,
+    runtime_workspace_root,
+    runtime_working_directory,
+)
+from reuleauxcoder.domain.agent.runtime_budget import (
+    runtime_budget_int,
+    runtime_budget_limit_message,
+)
 from reuleauxcoder.domain.agent.tool_arguments import (
     format_tool_argument_retry_message,
     policy_for_provider,
@@ -41,6 +53,13 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     build_tool_batch_lifecycle_payload,
     build_tool_lifecycle_payload,
     dispatch_internal_lifecycle_hook_point,
+    lifecycle_output_audit_fields,
+    lifecycle_runtime_artifacts_for_event,
+)
+from reuleauxcoder.domain.hooks.lifecycle_policy import (
+    lifecycle_gate_output_is_terminal,
+    lifecycle_output_message,
+    lifecycle_output_requests_approval,
 )
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
@@ -49,11 +68,96 @@ from reuleauxcoder.extensions.tools.registry import get_tool
 from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
 
 
+_RUNTIME_BUDGET_LOCK_INIT_LOCK = threading.Lock()
+
+
+@dataclass(slots=True)
+class _PreToolLifecycleResult:
+    blocked_message: str | None = None
+    approval_message: str | None = None
+    approval_hooks: list[dict[str, str]] | None = None
+
+
+@dataclass(slots=True)
+class _LifecycleOutputRecord:
+    output: LifecycleHookOutput
+    hook_id: str
+    display_name: str
+    handler_type: str
+
+
 class ToolExecutor:
     """Handles tool execution for the agent."""
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
+        self._budget_lock = self._runtime_budget_lock()
+
+    def _runtime_budget_lock(self) -> threading.Lock:
+        lock = getattr(self.agent, "runtime_budget_lock", None)
+        if lock is not None:
+            return lock
+        with _RUNTIME_BUDGET_LOCK_INIT_LOCK:
+            lock = getattr(self.agent, "runtime_budget_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(self.agent, "runtime_budget_lock", lock)
+            return lock
+
+    def _bind_tool_lifecycle_context(self, tool, tool_call: "ToolCall"):
+        bind = getattr(tool, "bind_lifecycle_context", None)
+        if not callable(bind):
+            return None
+        context = {
+            "session_run_id": str(getattr(self.agent, "current_session_id", "") or ""),
+            "agent_run_id": runtime_agent_run_id(self.agent),
+            "turn_id": str(getattr(self.agent, "runtime_turn_id", "") or ""),
+            "tool_call_id": str(getattr(tool_call, "id", "") or ""),
+            "tool_name": str(getattr(tool_call, "name", "") or ""),
+            "mcp_server": str(getattr(tool, "server_name", "") or ""),
+            "trigger_source": str(
+                getattr(self.agent, "permission_trigger_source", "") or "chat"
+            ),
+        }
+        if self._tool_source(tool) == "mcp":
+            def _emit_bound_lifecycle_event(payload: dict) -> None:
+                if not isinstance(payload, dict):
+                    return
+                event_payload = dict(payload)
+                event_payload.setdefault("session_run_id", context["session_run_id"])
+                event_payload.setdefault("agent_run_id", context["agent_run_id"])
+                event_payload.setdefault("turn_id", context["turn_id"])
+                event_payload.setdefault("tool_call_id", context["tool_call_id"])
+                event_payload.setdefault("tool_name", context["tool_name"])
+                event_payload.setdefault("mcp_server", context["mcp_server"])
+                event_payload.setdefault("trigger_source", context["trigger_source"])
+                self.agent._emit_event(AgentEvent.lifecycle_hook(event_payload))
+
+            context["_agent_lifecycle_event_emitter"] = _emit_bound_lifecycle_event
+        try:
+            restore = bind(context)
+        except Exception:
+            return None
+        return restore if callable(restore) else None
+
+    def _consume_tool_call_budget(self) -> str | None:
+        if limit_message := runtime_budget_limit_message(self.agent):
+            return f"Error: {limit_message}"
+        max_tool_calls = runtime_budget_int(self.agent, "max_tool_calls")
+        if max_tool_calls is None:
+            return None
+        with self._budget_lock:
+            try:
+                current = int(getattr(self.agent, "runtime_tool_call_count", 0) or 0)
+            except (TypeError, ValueError):
+                current = 0
+            if current >= max_tool_calls:
+                return (
+                    "Error: AgentRun budget exceeded: "
+                    f"max_tool_calls={max_tool_calls}"
+                )
+            setattr(self.agent, "runtime_tool_call_count", current + 1)
+        return None
 
     @staticmethod
     def _tool_source(tool: object | None) -> str:
@@ -95,6 +199,45 @@ class ToolExecutor:
                 index=index,
             )
         )
+
+    @staticmethod
+    def _sync_tool_call(target: "ToolCall", source: "ToolCall") -> "ToolCall":
+        target.name = source.name
+        target.arguments = dict(source.arguments or {})
+        target.argument_error = source.argument_error
+        target.argument_diagnostics = list(source.argument_diagnostics)
+        return target
+
+    @staticmethod
+    def _budget_diagnostic(tc: "ToolCall", message: str) -> ToolDiagnostic:
+        return tool_diagnostic_from_failure(
+            stage=ToolDiagnosticStage.EXECUTION,
+            kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+            code="runtime_budget_exceeded",
+            message=message,
+            tool_name=tc.name,
+            tool_call_id=tc.id,
+        )
+
+    def _return_budget_error(
+        self,
+        tc: "ToolCall",
+        message: str,
+        *,
+        tool: object | None = None,
+        index: int | None = None,
+    ) -> str:
+        diagnostic = self._budget_diagnostic(tc, message)
+        context = self._tool_argument_context(tc, tool)
+        self._record_lifecycle_diagnostics([diagnostic], context)
+        self._emit_tool_end(
+            tc,
+            message,
+            tool=tool,
+            index=index,
+            meta=self._diagnostics_meta([diagnostic]),
+        )
+        return message
 
     @staticmethod
     def _bad_arguments_message(tool_name: str, detail: str) -> str:
@@ -195,8 +338,33 @@ class ToolExecutor:
     ) -> str:
         reason = decision.reason or "blocked by permission gateway"
         if decision.action == PermissionAction.BLOCKED_REVIEW:
-            return f"Error: tool '{tool_name}' blocked pending review: {reason}"
-        return f"Error: tool '{tool_name}' denied by permission gateway: {reason}"
+            message = f"Error: tool '{tool_name}' blocked pending review: {reason}"
+        else:
+            message = f"Error: tool '{tool_name}' denied by permission gateway: {reason}"
+        feedback = self._permission_denied_lifecycle_feedback(decision)
+        return f"{message}{feedback}"
+
+    @staticmethod
+    def _permission_denied_lifecycle_feedback(decision: PermissionDecision) -> str:
+        audit = decision.audit if isinstance(decision.audit, dict) else {}
+        outputs = audit.get("permission_denied_lifecycle")
+        if not isinstance(outputs, list):
+            return ""
+        messages: list[str] = []
+        seen: set[str] = set()
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("user_message") or item.get("reason") or "").strip()
+            if not message or message in seen:
+                continue
+            seen.add(message)
+            messages.append(message)
+        if not messages:
+            return ""
+        if len(messages) == 1:
+            return f"\nPermission feedback: {messages[0]}"
+        return "\nPermission feedback:\n" + "\n".join(f"- {message}" for message in messages)
 
     @staticmethod
     def _approval_payload_args(arguments: dict) -> tuple[dict, str | None]:
@@ -339,6 +507,132 @@ class ToolExecutor:
         )
         return message
 
+    def _request_lifecycle_pre_tool_approval(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+        message: str,
+        validation_context: dict,
+        validation_meta: dict | None,
+        *,
+        lifecycle_hooks: list[dict[str, str]] | None = None,
+        index: int | None = None,
+    ) -> str | None:
+        if not bool(getattr(self.agent, "permission_interactive", True)):
+            decision = PermissionDecision(
+                action=PermissionAction.BLOCKED_REVIEW,
+                authorized=False,
+                reason=message,
+                audit={
+                    "lifecycle_event": "PreToolUse",
+                    "lifecycle_hooks": list(lifecycle_hooks or []),
+                },
+            )
+            return self._return_permission_block(
+                tc,
+                tool,
+                decision,
+                index=index,
+                validation_meta=validation_meta,
+            )
+
+        provider = getattr(self.agent, "approval_provider", None)
+        request_approval = getattr(provider, "request_approval", None)
+        if not callable(request_approval):
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.APPROVAL,
+                kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                code="approval_provider_missing",
+                message=(
+                    message
+                    or f"Tool '{tc.name}' requires lifecycle approval, but no approval provider is configured"
+                ),
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                diagnostic.message,
+                tool=tool,
+                index=index,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
+            return diagnostic.message
+
+        try:
+            approval_tool_args, approval_intent = self._approval_payload_args(tc.arguments)
+            decision_result = request_approval(
+                ApprovalRequest(
+                    tool_name=tc.name,
+                    tool_args=approval_tool_args,
+                    tool_source="lifecycle_hook",
+                    reason=message,
+                    intent=approval_intent,
+                    metadata={
+                        "tool_call_id": tc.id,
+                        "lifecycle_event": "PreToolUse",
+                        "lifecycle_hooks": list(lifecycle_hooks or []),
+                    },
+                )
+            )
+        except (KeyboardInterrupt, EOFError):
+            message = f"Tool '{tc.name}' lifecycle approval interrupted by user"
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.APPROVAL,
+                kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                code="approval_interrupted",
+                message=message,
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], validation_context)
+            self._emit_tool_end(
+                tc,
+                message,
+                tool=tool,
+                index=index,
+                meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            )
+            return message
+
+        if decision_result.approved:
+            return None
+
+        message = decision_result.reason or f"Tool '{tc.name}' lifecycle approval was denied"
+        decision_diagnostics = [
+            diagnostic_to_dict(item)
+            for item in decision_result.meta.get("tool_diagnostics", [])
+            if isinstance(item, (ToolDiagnostic, dict))
+        ]
+        if not decision_diagnostics:
+            decision_diagnostics = [
+                tool_diagnostic_from_failure(
+                    stage=ToolDiagnosticStage.APPROVAL,
+                    kind=ToolDiagnosticKind.APPROVAL_DENIED,
+                    code="approval_denied",
+                    message=message,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                ).to_dict()
+            ]
+        self._record_lifecycle_diagnostics(decision_diagnostics, validation_context)
+        failure_meta = {
+            "failure_kind": decision_result.meta.get(
+                "failure_kind", ToolFailureKind.APPROVAL_DENIED.value
+            ),
+            **decision_result.meta,
+            "tool_diagnostics": decision_diagnostics,
+        }
+        self._emit_tool_end(
+            tc,
+            message,
+            tool=tool,
+            index=index,
+            meta=self._merge_meta(validation_meta, failure_meta),
+        )
+        return message
+
     def _persist_tool_diagnostics(
         self,
         diagnostics_payload: list[ToolDiagnostic | dict],
@@ -386,6 +680,28 @@ class ToolExecutor:
         error: dict | None = None,
         metadata: dict | None = None,
     ) -> list[LifecycleHookOutput]:
+        return [
+            record.output
+            for record in self._dispatch_lifecycle_event_records(
+                event_name,
+                tool_call=tool_call,
+                tool=tool,
+                result=result,
+                error=error,
+                metadata=metadata,
+            )
+        ]
+
+    def _dispatch_lifecycle_event_records(
+        self,
+        event_name: str,
+        *,
+        tool_call: "ToolCall",
+        tool: object | None,
+        result: object | None = None,
+        error: dict | None = None,
+        metadata: dict | None = None,
+    ) -> list[_LifecycleOutputRecord]:
         dispatcher = getattr(self.agent, "lifecycle_dispatcher", None)
         dispatch = getattr(dispatcher, "dispatch", None)
         if not callable(dispatch):
@@ -393,7 +709,7 @@ class ToolExecutor:
         tool_source = self._tool_source(tool)
         trigger_source = str(getattr(self.agent, "permission_trigger_source", "") or "chat")
         session_run_id = str(getattr(self.agent, "current_session_id", "") or "")
-        agent_run_id = str(getattr(self.agent, "runtime_agent_run_id", "") or "")
+        agent_run_id = runtime_agent_run_id(self.agent)
         turn_id = str(getattr(self.agent, "runtime_turn_id", "") or "")
         context = build_lifecycle_event_context(
             event_name,
@@ -428,12 +744,20 @@ class ToolExecutor:
                 error=str(exc),
             )
             raise
-        outputs: list[LifecycleHookOutput] = []
+        outputs: list[_LifecycleOutputRecord] = []
         for result_item in list(results or []):
             output = getattr(result_item, "output", None)
             if isinstance(output, LifecycleHookOutput):
+                declaration = getattr(result_item, "declaration", None)
                 annotate_lifecycle_output_diagnostics(event_name, output)
-                outputs.append(output)
+                outputs.append(
+                    _LifecycleOutputRecord(
+                        output=output,
+                        hook_id=str(getattr(declaration, "id", "") or ""),
+                        display_name=str(getattr(declaration, "display_name", "") or ""),
+                        handler_type=str(getattr(declaration, "handler_type", "") or ""),
+                    )
+                )
             self._emit_lifecycle_observation(
                 "result",
                 event_name,
@@ -441,6 +765,72 @@ class ToolExecutor:
                 result=result_item,
             )
         return outputs
+
+    def _dispatch_cwd_changed_lifecycle(
+        self,
+        *,
+        tool_call: "ToolCall",
+        tool: object | None,
+        previous_working_directory: str,
+        current_working_directory: str,
+        execution_target: str,
+    ) -> None:
+        dispatcher = getattr(self.agent, "lifecycle_dispatcher", None)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return
+        workspace_root = str(getattr(self.agent, "runtime_workspace_root", "") or "")
+        agent_run_id = runtime_agent_run_id(self.agent)
+        context = build_lifecycle_event_context(
+            "CwdChanged",
+            placement="server",
+            session_run_id=str(getattr(self.agent, "current_session_id", "") or ""),
+            agent_run_id=agent_run_id,
+            turn_id=str(getattr(self.agent, "runtime_turn_id", "") or ""),
+            trigger_source=str(
+                getattr(self.agent, "permission_trigger_source", "") or "chat"
+            ),
+            origin="agent",
+            locale=str(getattr(self.agent, "locale", "") or ""),
+            metadata={
+                "round_index": getattr(self.agent.state, "current_round", None),
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+            },
+            payload={
+                "previous_working_directory": previous_working_directory,
+                "current_working_directory": current_working_directory,
+                "runtime_working_directory": current_working_directory,
+                "runtime_workspace_root": workspace_root,
+                "execution_target": execution_target,
+                "path_space": runtime_path_space(self.agent),
+                "tool_names": [tool_call.name],
+                "tool_call_ids": [tool_call.id],
+                "tool_sources": [self._tool_source(tool)],
+                "mcp_servers": [],
+            },
+        )
+        self._emit_lifecycle_observation("dispatch_start", "CwdChanged", context)
+        try:
+            results = list(dispatch(context) or [])
+        except Exception as exc:
+            self._emit_lifecycle_observation(
+                "dispatch_failed",
+                "CwdChanged",
+                context,
+                error=str(exc),
+            )
+            return
+        for result in results:
+            output = getattr(result, "output", None)
+            if isinstance(output, LifecycleHookOutput):
+                annotate_lifecycle_output_diagnostics("CwdChanged", output)
+            self._emit_lifecycle_observation(
+                "result",
+                "CwdChanged",
+                context,
+                result=result,
+            )
 
     def _emit_lifecycle_observation(
         self,
@@ -500,8 +890,18 @@ class ToolExecutor:
                 "payload": dict(getattr(context, "payload", {}) or {}),
             }
             if isinstance(output_dict, dict):
+                payload.update(lifecycle_output_audit_fields(output))
                 payload["output"] = output_dict
-            emit(AgentEvent.lifecycle_hook(payload))
+            emit(
+                AgentEvent.lifecycle_hook(
+                    payload,
+                    runtime_artifacts=lifecycle_runtime_artifacts_for_event(
+                        output,
+                        event_name=event_name,
+                        context=context,
+                    ),
+                )
+            )
         except Exception:
             return
 
@@ -551,28 +951,56 @@ class ToolExecutor:
         context: BeforeToolExecuteContext,
         *,
         tool: object | None,
-    ) -> str | None:
+    ) -> _PreToolLifecycleResult | None:
         tool_call = context.tool_call
         if tool_call is None:
             return None
         try:
-            outputs = self._dispatch_lifecycle_event(
+            records = self._dispatch_lifecycle_event_records(
                 "PreToolUse",
                 tool_call=tool_call,
                 tool=tool,
                 metadata=dict(context.metadata or {}),
             )
         except Exception as exc:
-            return f"Error: lifecycle PreToolUse failed for {tool_call.name}: {exc}"
-        for output in outputs:
-            if output.decision == "deny" or output.continue_flow is False:
-                reason = output.reason if isinstance(output.reason, str) else ""
-                return reason or f"lifecycle PreToolUse denied {tool_call.name}"
+            return _PreToolLifecycleResult(
+                blocked_message=f"Error: lifecycle PreToolUse failed for {tool_call.name}: {exc}"
+            )
+        approval_messages: list[str] = []
+        approval_hooks: list[dict[str, str]] = []
+        for record in records:
+            output = record.output
+            if lifecycle_gate_output_is_terminal(output):
+                return _PreToolLifecycleResult(
+                    blocked_message=lifecycle_output_message(
+                        output,
+                        fallback=f"lifecycle PreToolUse blocked {tool_call.name}",
+                    )
+                )
+            if lifecycle_output_requests_approval(output):
+                message = lifecycle_output_message(
+                    output,
+                    fallback=f"lifecycle PreToolUse requires approval for {tool_call.name}",
+                )
+                approval_messages.append(message)
+                approval_hooks.append(
+                    {
+                        "hook_id": record.hook_id,
+                        "display_name": record.display_name,
+                        "handler_type": record.handler_type,
+                        "reason": message,
+                    }
+                )
             if output.updated_input is not None:
                 context.tool_call = self._tool_call_from_lifecycle_input(
                     context.tool_call or tool_call,
                     output.updated_input,
                 )
+        if approval_messages:
+            return _PreToolLifecycleResult(
+                approval_message="\n".join(approval_messages),
+                approval_hooks=approval_hooks,
+            )
         return None
 
     def _apply_post_tool_lifecycle(
@@ -643,7 +1071,7 @@ class ToolExecutor:
             "PostToolBatch",
             placement="server",
             session_run_id=str(getattr(self.agent, "current_session_id", "") or ""),
-            agent_run_id=str(getattr(self.agent, "runtime_agent_run_id", "") or ""),
+            agent_run_id=runtime_agent_run_id(self.agent),
             turn_id=str(getattr(self.agent, "runtime_turn_id", "") or ""),
             trigger_source=str(getattr(self.agent, "permission_trigger_source", "") or "chat"),
             origin="agent",
@@ -706,6 +1134,14 @@ class ToolExecutor:
         tool = self.agent.get_tool(tc.name)
         if tool is None:
             tool = get_tool(tc.name)
+        budget_error = self._consume_tool_call_budget()
+        if budget_error is not None:
+            return self._return_budget_error(
+                tc,
+                budget_error,
+                tool=tool,
+                index=index,
+            )
         suppress_lifecycle = bool(
             getattr(self.agent, "_suppress_tool_lifecycle", False)
         )
@@ -726,17 +1162,17 @@ class ToolExecutor:
             },
         )
 
-        lifecycle_error = (
+        lifecycle_result = (
             None
             if suppress_lifecycle
             else self._apply_pre_tool_lifecycle(before_context, tool=tool)
         )
-        if lifecycle_error is not None:
+        if lifecycle_result is not None and lifecycle_result.blocked_message is not None:
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.PREFLIGHT,
                 kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
                 code="lifecycle_pre_tool_denied",
-                message=lifecycle_error,
+                message=lifecycle_result.blocked_message,
                 tool_name=tc.name,
                 tool_call_id=tc.id,
             )
@@ -744,12 +1180,12 @@ class ToolExecutor:
             self._record_lifecycle_diagnostics([diagnostic], lifecycle_context)
             self._emit_tool_end(
                 tc,
-                lifecycle_error,
+                lifecycle_result.blocked_message,
                 tool=tool,
                 index=index,
                 meta=self._diagnostics_meta([diagnostic]),
             )
-            return lifecycle_error
+            return lifecycle_result.blocked_message
 
         if not suppress_lifecycle:
             internal_lifecycle = dispatch_internal_lifecycle_hook_point(
@@ -787,6 +1223,7 @@ class ToolExecutor:
             before_context.tool_call or tc,
             tc.id,
         )
+        tool_call = self._sync_tool_call(tc, tool_call)
         before_context.tool_call = tool_call
 
         # First check agent's tools, then fall back to global registry
@@ -941,6 +1378,20 @@ class ToolExecutor:
             )
             return preflight_error
 
+        if lifecycle_result is not None and lifecycle_result.approval_message is not None:
+            lifecycle_approval_context = self._tool_argument_context(tool_call, tool)
+            approval_message = self._request_lifecycle_pre_tool_approval(
+                tool_call,
+                tool,
+                lifecycle_result.approval_message,
+                lifecycle_approval_context,
+                validation_meta,
+                lifecycle_hooks=lifecycle_result.approval_hooks,
+                index=index,
+            )
+            if approval_message is not None:
+                return approval_message
+
         permission_decision = self._evaluate_permission(tool_call, tool)
         if permission_decision is not None and permission_decision.action in {
             PermissionAction.DENY,
@@ -996,28 +1447,63 @@ class ToolExecutor:
                 except Exception:
                     pass
         try:
-            shell_context = nullcontext()
-            if tool_call.name == "shell":
-                agent_id = str(
-                    getattr(self.agent, "runtime_agent_id", "")
-                    or f"agent:{id(self.agent)}"
-                )
+            restore_lifecycle_context = self._bind_tool_lifecycle_context(
+                tool,
+                tool_call,
+            )
+            try:
+                shell_context = nullcontext()
+                previous_working_directory = runtime_working_directory(self.agent)
+                if tool_call.name == "shell":
+                    initial_cwd = previous_working_directory
+                    if initial_cwd and getattr(tool, "_cwd", None) is None:
+                        setattr(tool, "_cwd", initial_cwd)
+                    agent_id = runtime_agent_run_id(self.agent) or f"agent:{id(self.agent)}"
 
-                def _emit_shell_runtime(payload: dict) -> None:
-                    self.agent._emit_event(AgentEvent.runtime_status(payload))
+                    def _emit_shell_runtime(payload: dict) -> None:
+                        self.agent._emit_event(AgentEvent.runtime_status(payload))
 
-                shell_context = get_interactive_run_limiter().shell_slot(
-                    agent_id,
-                    tool_call_id=tool_call.id,
-                    is_cancelled=getattr(
-                        self.agent, "stop_requested", lambda: False
-                    ),
-                    on_wait=_emit_shell_runtime,
-                )
-            with shell_context:
-                result = tool.execute(**tool_call.arguments)
+                    shell_context = get_interactive_run_limiter().shell_slot(
+                        agent_id,
+                        tool_call_id=tool_call.id,
+                        is_cancelled=getattr(
+                            self.agent, "stop_requested", lambda: False
+                        ),
+                        on_wait=_emit_shell_runtime,
+                    )
+                with shell_context:
+                    result = tool.execute(**tool_call.arguments)
+            finally:
+                if callable(restore_lifecycle_context):
+                    try:
+                        restore_lifecycle_context()
+                    except Exception:
+                        pass
             if (shell_cwd := getattr(tool, "_cwd", None)) is not None:
                 setattr(self.agent, "runtime_working_directory", str(shell_cwd))
+                if (
+                    tool_call.name == "shell"
+                    and str(shell_cwd) != str(previous_working_directory or "")
+                ):
+                    self._dispatch_cwd_changed_lifecycle(
+                        tool_call=tool_call,
+                        tool=tool,
+                        previous_working_directory=str(previous_working_directory or ""),
+                        current_working_directory=str(shell_cwd),
+                        execution_target=execution_target,
+                    )
+            if limit_message := runtime_budget_limit_message(self.agent):
+                message = f"Error: {limit_message}"
+                return self._return_budget_error(
+                    tool_call,
+                    message,
+                    tool=tool,
+                    index=index,
+                )
+            current_agent_run_id = runtime_agent_run_id(self.agent)
+            current_workspace_root = runtime_workspace_root(self.agent)
+            current_working_directory = runtime_working_directory(self.agent)
+            path_space = runtime_path_space(self.agent)
             after_context = AfterToolExecuteContext(
                 hook_point=HookPoint.AFTER_TOOL_EXECUTE,
                 tool_call=tool_call,
@@ -1032,6 +1518,13 @@ class ToolExecutor:
                     "mcp_server": getattr(tool, "server_name", None),
                     "backend_id": backend_id,
                     "execution_target": execution_target,
+                    "agent_run_id": current_agent_run_id,
+                    "runtime_workspace_root": current_workspace_root,
+                    "runtime_working_directory": current_working_directory,
+                    "path_space": path_space,
+                    "trigger_source": str(
+                        getattr(self.agent, "permission_trigger_source", "") or "chat"
+                    ),
                 },
             )
             if not suppress_lifecycle:

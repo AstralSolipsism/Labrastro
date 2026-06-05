@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 from reuleauxcoder.domain.agent.loop import AgentLoop
+from reuleauxcoder.domain.agent.runtime_boundary import runtime_agent_run_id
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
 from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.config.models import ApprovalConfig, ApprovalRuleConfig, ModeConfig
@@ -27,9 +28,12 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     annotate_lifecycle_output_diagnostics,
     build_lifecycle_event_context,
     build_permission_lifecycle_payload,
+    lifecycle_output_audit_fields,
+    lifecycle_runtime_artifacts_for_event,
 )
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import (
+    PermissionAction,
     PermissionDecision,
     PermissionGateway,
     PermissionRequest,
@@ -219,6 +223,7 @@ class Agent:
         # Hook runtime
         self.hook_registry = hook_registry or HookRegistry()
         self.lifecycle_dispatcher = lifecycle_dispatcher
+        self.context.bind_lifecycle_agent(self)
 
         # Execution components
         self.approval_provider = approval_provider
@@ -531,12 +536,15 @@ class Agent:
             event_name,
             placement="server",
             session_run_id=str(getattr(self, "current_session_id", "") or ""),
-            agent_run_id=str(getattr(self, "runtime_agent_run_id", "") or ""),
+            agent_run_id=runtime_agent_run_id(self),
             turn_id=str(getattr(self, "runtime_turn_id", "") or ""),
             trigger_source=str(getattr(self, "permission_trigger_source", "") or "chat"),
             origin="agent",
             locale=str(getattr(self, "locale", "") or ""),
-            metadata=dict(metadata or {}),
+            metadata={
+                "round_index": getattr(self.state, "current_round", None),
+                **dict(metadata or {}),
+            },
             payload=dict(payload),
         )
         try:
@@ -657,13 +665,19 @@ class Agent:
                 "payload": dict(getattr(context, "payload", {}) or {}),
             }
             if isinstance(output_dict, dict):
+                payload.update(lifecycle_output_audit_fields(output))
                 payload["output"] = output_dict
                 message = _lifecycle_terminal_message(output_dict)
                 if message:
                     payload["message"] = message
-                if output_dict.get("artifacts"):
-                    payload["artifacts"] = list(output_dict.get("artifacts") or [])
-            event = AgentEvent.lifecycle_hook(payload)
+            event = AgentEvent.lifecycle_hook(
+                payload,
+                runtime_artifacts=lifecycle_runtime_artifacts_for_event(
+                    output,
+                    event_name=event_name,
+                    context=context,
+                ),
+            )
             if defer:
                 deferred = getattr(self, "_deferred_user_prompt_lifecycle_events", None)
                 if isinstance(deferred, list):
@@ -805,12 +819,15 @@ class Agent:
             "PermissionRequest",
             placement="server",
             session_run_id=request.subject.session_id or "",
-            agent_run_id=str(getattr(self, "runtime_agent_run_id", "") or ""),
+            agent_run_id=runtime_agent_run_id(self),
             turn_id=str(getattr(self, "runtime_turn_id", "") or ""),
             trigger_source=request.subject.trigger_source,
             origin="agent",
             locale=str(getattr(self, "locale", "") or ""),
-            metadata=dict(request.metadata or {}),
+            metadata={
+                "round_index": getattr(self.state, "current_round", None),
+                **dict(request.metadata or {}),
+            },
             payload=build_permission_lifecycle_payload(request),
         )
         try:
@@ -859,6 +876,102 @@ class Agent:
     def _permission_lifecycle_payload(request: PermissionRequest) -> dict:
         return build_permission_lifecycle_payload(request)
 
+    def _permission_denied_lifecycle_outputs(
+        self,
+        request: PermissionRequest,
+        decision: PermissionDecision,
+    ) -> list[dict]:
+        dispatcher = getattr(self, "lifecycle_dispatcher", None)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return []
+        payload = build_permission_lifecycle_payload(request)
+        technical = dict(payload.get("technical") or {})
+        technical["permission_decision"] = decision.to_dict()
+        payload["technical"] = technical
+        context = build_lifecycle_event_context(
+            "PermissionDenied",
+            placement="server",
+            session_run_id=request.subject.session_id or "",
+            agent_run_id=runtime_agent_run_id(self),
+            turn_id=str(getattr(self, "runtime_turn_id", "") or ""),
+            trigger_source=request.subject.trigger_source,
+            origin="agent",
+            locale=str(getattr(self, "locale", "") or ""),
+            metadata={
+                "round_index": getattr(self.state, "current_round", None),
+                "permission_policy_matched": decision.policy_matched,
+                **dict(request.metadata or {}),
+            },
+            payload=payload,
+        )
+        try:
+            self._emit_lifecycle_observation("dispatch_start", "PermissionDenied", context)
+            results = dispatch(context)
+        except Exception as exc:
+            self._emit_lifecycle_observation(
+                "dispatch_failed",
+                "PermissionDenied",
+                context,
+                error=str(exc),
+            )
+            return [
+                {
+                    "hook_id": "lifecycle:PermissionDenied",
+                    "display_name": "Permission denied lifecycle dispatch",
+                    "source": "system_builtin",
+                    "decision": "none",
+                    "continue_flow": True,
+                    "reason": f"PermissionDenied lifecycle dispatch failed: {exc}",
+                    "diagnostics": [
+                        {
+                            "code": "lifecycle_dispatch_failed",
+                            "message": str(exc),
+                        }
+                    ],
+                }
+            ]
+        output_items = []
+        for result in list(results or []):
+            if result is None:
+                continue
+            output = getattr(result, "output", None)
+            if isinstance(output, LifecycleHookOutput):
+                annotate_lifecycle_output_diagnostics("PermissionDenied", output)
+            self._emit_lifecycle_observation(
+                "result",
+                "PermissionDenied",
+                context,
+                result=result,
+            )
+            output_items.append(self._permission_lifecycle_output_item(result))
+        return output_items
+
+    @staticmethod
+    def _should_dispatch_permission_denied_lifecycle(
+        request: PermissionRequest,
+        decision: PermissionDecision,
+    ) -> bool:
+        return (
+            request.tool_call is not None
+            and decision.action == PermissionAction.DENY
+            and decision.authorized is False
+        )
+
+    def _with_permission_denied_lifecycle_audit(
+        self,
+        request: PermissionRequest,
+        decision: PermissionDecision,
+    ) -> PermissionDecision:
+        if not self._should_dispatch_permission_denied_lifecycle(request, decision):
+            return decision
+        outputs = self._permission_denied_lifecycle_outputs(request, decision)
+        if not outputs:
+            return decision
+        audit = dict(decision.audit or {})
+        audit["permission_denied_lifecycle"] = outputs
+        return replace(decision, audit=audit)
+
     @staticmethod
     def _permission_lifecycle_output_item(
         result: LifecycleHookDispatchResult,
@@ -906,7 +1019,10 @@ class Agent:
             request,
             initial_decision,
         ):
-            return initial_decision
+            return self._with_permission_denied_lifecycle_audit(
+                request,
+                initial_decision,
+            )
 
         lifecycle_outputs = self._permission_lifecycle_outputs(request)
         if not lifecycle_outputs:
@@ -1023,7 +1139,14 @@ class Agent:
             message = prompt_lifecycle.message or "UserPromptSubmit lifecycle blocked this request."
             self._emit_event(AgentEvent.error(message))
             self._emit_usage_event("blocked")
-            self._emit_event(AgentEvent.session_run_end(message))
+            self._emit_event(
+                AgentEvent.session_run_end(
+                    message,
+                    status="blocked",
+                    error=message,
+                    session_state="blocked",
+                )
+            )
             return message
 
         # Add model-facing messages only after lifecycle guards allow the turn.
@@ -1056,18 +1179,40 @@ class Agent:
             raise
 
         interrupted = bool(getattr(self._loop, "last_run_interrupted", False))
-        self._emit_usage_event(
+        cancelled = self.stop_requested()
+        budget_exceeded = (
+            None
+            if interrupted or cancelled
+            else getattr(self._loop, "last_budget_exceeded", None)
+        )
+        terminal_status = (
             "interrupted"
             if interrupted
-            else "cancelled" if self.stop_requested() else "done"
+            else "cancelled" if cancelled else "budget_exceeded" if budget_exceeded else "done"
         )
+        self._emit_usage_event(terminal_status)
         if interrupted:
             payload = getattr(self._loop, "last_interruption_payload", None) or {}
             self._emit_event(AgentEvent.session_run_interrupted(result, payload))
             return result
+        stop_payload = {"result": result, "interrupted": False}
+        session_run_end_kwargs: dict[str, str] = {}
+        if isinstance(budget_exceeded, dict):
+            budget_payload = {
+                "field": str(budget_exceeded.get("field") or ""),
+                "limit": budget_exceeded.get("limit"),
+                "message": str(budget_exceeded.get("message") or result),
+            }
+            stop_payload["termination_reason"] = "budget_exceeded"
+            stop_payload["budget"] = budget_payload
+            session_run_end_kwargs = {
+                "status": "budget_exceeded",
+                "session_state": "budget_exceeded",
+                "error": budget_payload["message"],
+            }
         self._apply_terminal_lifecycle_event(
             "Stop",
-            payload={"result": result, "interrupted": False},
+            payload=stop_payload,
         )
         self._emit_event(
             AgentEvent.session_run_end(
@@ -1075,6 +1220,7 @@ class Agent:
                 render_response=not getattr(
                     self._loop, "last_response_streamed", False
                 ),
+                **session_run_end_kwargs,
             )
         )
         return result

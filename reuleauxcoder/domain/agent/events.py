@@ -61,6 +61,7 @@ class AgentEvent:
 
     # Error specific fields
     error_message: Optional[str] = None
+    runtime_artifacts: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def session_run_start(cls, user_input: str) -> "AgentEvent":
@@ -71,11 +72,29 @@ class AgentEvent:
         )
 
     @classmethod
-    def session_run_end(cls, response: str, *, render_response: bool = True) -> "AgentEvent":
+    def session_run_end(
+        cls,
+        response: str,
+        *,
+        render_response: bool = True,
+        status: str | None = None,
+        error: str | None = None,
+        session_state: str | None = None,
+    ) -> "AgentEvent":
         """Create a session run end event."""
+        data = {
+            "response": response,
+            "render_response": render_response,
+        }
+        if status:
+            data["status"] = status
+        if error:
+            data["error"] = error
+        if session_state:
+            data["session_state"] = session_state
         return cls(
             event_type=AgentEventType.SESSION_RUN_END,
-            data={"response": response, "render_response": render_response},
+            data=data,
         )
 
     @classmethod
@@ -194,11 +213,21 @@ class AgentEvent:
         )
 
     @classmethod
-    def lifecycle_hook(cls, payload: dict[str, Any]) -> "AgentEvent":
+    def lifecycle_hook(
+        cls,
+        payload: dict[str, Any],
+        *,
+        runtime_artifacts: list[dict[str, Any]] | None = None,
+    ) -> "AgentEvent":
         """Create a canonical lifecycle hook observation event."""
         return cls(
             event_type=AgentEventType.LIFECYCLE_HOOK,
             data=dict(payload),
+            runtime_artifacts=[
+                dict(artifact)
+                for artifact in runtime_artifacts or []
+                if isinstance(artifact, dict)
+            ],
         )
 
     @classmethod
