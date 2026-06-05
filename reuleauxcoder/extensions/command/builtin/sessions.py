@@ -32,7 +32,7 @@ from labrastro_server.infrastructure.persistence.factory import (
     create_session_store as create_configured_session_store,
 )
 from reuleauxcoder.interfaces.cli.views.common import stop_stream_and_clear
-from reuleauxcoder.interfaces.events import UIEventKind
+from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from reuleauxcoder.interfaces.view_registration import register_view
 
 
@@ -264,6 +264,7 @@ def _handle_save_session(command, ctx) -> CommandResult:
         ctx.agent,
         session_id,
         session_data=_build_session_save_data(ctx.agent, session_id, fingerprint),
+        metadata={"ui_bus": ctx.ui_bus},
     )
     ctx.ui_bus.success(
         f"Session saved: {session_id}", kind=UIEventKind.SESSION, session_id=session_id
@@ -300,6 +301,7 @@ def _handle_new_session(command, ctx) -> CommandResult:
             ctx.agent,
             sid,
             session_data=_build_session_save_data(ctx.agent, sid, fingerprint),
+            metadata={"ui_bus": ctx.ui_bus},
         )
         ctx.ui_bus.info(
             f"Session auto-saved: {sid}", kind=UIEventKind.SESSION, session_id=sid
@@ -413,10 +415,24 @@ def _emit_session_save_hooks(
         session_data=dict(session_data or {}),
         metadata=dict(metadata or {}),
     )
-    dispatch_internal_lifecycle_hook_point(
-        getattr(agent, "lifecycle_dispatcher", None),
-        HookPoint.SESSION_SAVE,
-        context,
-        trigger_source="session",
-        origin="session",
-    )
+    dispatcher = getattr(agent, "lifecycle_dispatcher", None)
+    if dispatcher is not None:
+        result = dispatch_internal_lifecycle_hook_point(
+            dispatcher,
+            HookPoint.SESSION_SAVE,
+            context,
+            trigger_source="session",
+            origin="session",
+        )
+        _emit_internal_lifecycle_audit(context, result)
+        return
+    hook_registry = getattr(agent, "hook_registry", None)
+    run_observers = getattr(hook_registry, "run_observers", None)
+    if callable(run_observers):
+        run_observers(HookPoint.SESSION_SAVE, context)
+
+
+def _emit_internal_lifecycle_audit(context: SessionSaveContext, result) -> None:
+    ui_bus = context.metadata.get("ui_bus")
+    if isinstance(ui_bus, UIEventBus):
+        ui_bus.emit_lifecycle_hook_audit_events(result)

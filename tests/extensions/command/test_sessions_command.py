@@ -3,6 +3,14 @@ from types import SimpleNamespace
 
 from reuleauxcoder.domain.config.models import ApprovalConfig, Config
 from reuleauxcoder.domain.hooks.base import ObserverHook
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDeclaration,
+    LifecycleHookDispatcher,
+    LifecycleHookOutput,
+    LifecycleHookRuntimeAdapter,
+    LifecycleHookRuntimeAdapterRegistry,
+    LifecycleHookRegistry,
+)
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import HookPoint, SessionSaveContext
 from reuleauxcoder.domain.session.models import SessionRuntimeState
@@ -63,6 +71,22 @@ class FakeAgent:
         self.state.total_prompt_tokens = 0
         self.state.total_completion_tokens = 0
         self.state.current_round = 0
+
+
+class CaptureInternalLifecycleAdapter(LifecycleHookRuntimeAdapter):
+    handler_type = "internal"
+    supported_events = {"SessionEnd"}
+    supported_placements = {"server"}
+
+    def unavailable_reason(self, declaration, *, placement=None):
+        del declaration, placement
+        return ""
+
+    def dispatch(self, declaration, context):
+        del declaration, context
+        return LifecycleHookOutput.from_dict(
+            {"diagnostics": [{"code": "session_end_observed"}]}
+        )
 
 
 def _build_ctx(tmp_path: Path, *, fingerprint: str = "local") -> SimpleNamespace:
@@ -245,3 +269,49 @@ def test_session_save_hooks_receive_full_session_data(tmp_path: Path) -> None:
     assert captured[0]["total_prompt_tokens"] == 3
     assert captured[0]["total_completion_tokens"] == 5
     assert captured[0]["fingerprint"] == "local"
+
+
+def test_session_save_lifecycle_enters_unified_ui_audit(tmp_path: Path) -> None:
+    ctx = _build_ctx(tmp_path)
+    ctx.agent.messages.append({"role": "user", "content": "capture me"})
+    ctx.agent.lifecycle_dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry(
+            [
+                LifecycleHookDeclaration.from_dict(
+                    "hook:system_builtin:session_save:observer",
+                    {
+                        "event": "SessionEnd",
+                        "source": "system_builtin",
+                        "placement": "server",
+                        "handler_type": "internal",
+                        "handler_ref": "session_save_observer",
+                        "display_name": "Session save observer",
+                        "summary": "Observes saved sessions.",
+                        "permissions": [],
+                        "trust": "trusted",
+                    },
+                )
+            ]
+        ),
+        runtime_adapters=LifecycleHookRuntimeAdapterRegistry(
+            [CaptureInternalLifecycleAdapter()]
+        ),
+    )
+
+    result = _handle_save_session(SaveSessionCommand(), ctx)
+
+    audit_events = [
+        event
+        for event in ctx.ui_bus._history
+        if event.data.get("event_type") == "lifecycle_hook"
+    ]
+    assert result.session_id
+    assert audit_events
+    audit = audit_events[0].data
+    assert audit["event_name"] == "SessionEnd"
+    assert audit["session_run_id"] == result.session_id
+    assert audit["trigger_source"] == "session"
+    assert audit["source"] == "system_builtin"
+    assert audit["hook_id"] == "hook:system_builtin:session_save:observer"
+    assert audit["payload"]["technical"]["old_hook_point"] == "session_save"
+    assert audit["diagnostics"] == [{"code": "session_end_observed"}]
