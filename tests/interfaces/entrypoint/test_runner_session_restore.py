@@ -2,7 +2,16 @@
 from types import SimpleNamespace
 
 from reuleauxcoder.domain.config.models import ApprovalConfig, Config, ModeConfig
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDeclaration,
+    LifecycleHookDispatcher,
+    LifecycleHookOutput,
+    LifecycleHookRuntimeAdapter,
+    LifecycleHookRuntimeAdapterRegistry,
+    LifecycleHookRegistry,
+)
 from reuleauxcoder.domain.hooks.registry import HookRegistry
+from reuleauxcoder.domain.hooks.types import HookPoint, SessionStartContext
 from reuleauxcoder.domain.session.models import SessionRuntimeState
 from reuleauxcoder.infrastructure.persistence.session_store import SessionStore
 from reuleauxcoder.interfaces.entrypoint.runner import (
@@ -58,6 +67,22 @@ class FakeAgent:
 
     def set_mode(self, mode_name: str) -> None:
         self.active_mode = mode_name
+
+
+class CaptureSessionStartLifecycleAdapter(LifecycleHookRuntimeAdapter):
+    handler_type = "internal"
+    supported_events = {"SessionStart"}
+    supported_placements = {"server"}
+
+    def unavailable_reason(self, declaration, *, placement=None):
+        del declaration, placement
+        return ""
+
+    def dispatch(self, declaration, context):
+        del declaration, context
+        return LifecycleHookOutput.from_dict(
+            {"diagnostics": [{"code": "session_start_observed"}]}
+        )
 
 
 def _build_config(tmp_path: Path) -> Config:
@@ -123,6 +148,59 @@ def test_restore_session_auto_resume_latest_is_fingerprint_scoped(
         and f"Auto-resumed latest session: {local_id}" in event.message
         for event in ui_bus._history
     )
+
+
+def test_runner_session_start_lifecycle_enters_unified_ui_audit() -> None:
+    agent = FakeAgent()
+    ui_bus = UIEventBus()
+    agent.lifecycle_dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry(
+            [
+                LifecycleHookDeclaration.from_dict(
+                    "hook:system_builtin:session_start:observer",
+                    {
+                        "event": "SessionStart",
+                        "source": "system_builtin",
+                        "placement": "server",
+                        "handler_type": "internal",
+                        "handler_ref": "session_start_observer",
+                        "display_name": "Session start observer",
+                        "summary": "Observes restored sessions.",
+                        "permissions": [],
+                        "trust": "trusted",
+                    },
+                )
+            ]
+        ),
+        runtime_adapters=LifecycleHookRuntimeAdapterRegistry(
+            [CaptureSessionStartLifecycleAdapter()]
+        ),
+    )
+
+    AppRunner._run_lifecycle_hooks(
+        agent,
+        HookPoint.SESSION_START,
+        SessionStartContext(
+            hook_point=HookPoint.SESSION_START,
+            session_id="session-1",
+            metadata={"ui_bus": ui_bus, "source": "restore"},
+        ),
+    )
+
+    audit_events = [
+        event
+        for event in ui_bus._history
+        if event.data.get("event_type") == "lifecycle_hook"
+    ]
+    assert audit_events
+    audit = audit_events[0].data
+    assert audit["event_name"] == "SessionStart"
+    assert audit["session_run_id"] == "session-1"
+    assert audit["trigger_source"] == "runner"
+    assert audit["source"] == "system_builtin"
+    assert audit["hook_id"] == "hook:system_builtin:session_start:observer"
+    assert audit["payload"]["technical"]["old_hook_point"] == "session_start"
+    assert audit["diagnostics"] == [{"code": "session_start_observed"}]
 
 
 def test_restore_session_manual_resume_warns_on_cross_fingerprint_and_restores_runtime(

@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 import threading
 import time
 
@@ -17,6 +19,15 @@ from reuleauxcoder.domain.agent_runtime.models import (
     WorktreeRole,
 )
 from reuleauxcoder.domain.config.models import build_agent_run_snapshot
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDeclaration,
+    LifecycleHookDispatcher,
+    LifecycleHookRegistry,
+    bind_lifecycle_runtime_adapters_to_agent,
+    build_lifecycle_event_context,
+    default_lifecycle_hook_runtime_adapters,
+)
+from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunRequest,
@@ -24,10 +35,14 @@ from labrastro_server.services.agent_runtime.control_plane import (
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
+    ExecutorRunRequest,
     ExecutorRunResult,
 )
 from labrastro_server.services.agent_runtime.runtime_store import (
     runtime_slot_key_for_agent_run,
+)
+from labrastro_server.services.agent_runtime.session_projection import (
+    agent_run_event_to_session_events,
 )
 from labrastro_server.services.agent_runtime.scheduler import BasicAgentScheduler
 from labrastro_server.services.agent_runtime.worktree import (
@@ -190,6 +205,123 @@ def test_agent_run_request_normalizes_budget_into_control_plane_metadata() -> No
     assert control.agent_run_to_dict(run.id)["budget"] == run.metadata["budget"]
 
 
+def test_agent_run_claim_includes_budget_in_executor_request() -> None:
+    control = AgentRunControlPlane()
+    control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="manual",
+            agent_id="coder",
+            prompt="run",
+            executor="reuleauxcoder",
+            budget={"max_tool_calls": "2", "timeout_sec": 30},
+        ),
+        task_id="run-budget",
+    )
+
+    claim = control.claim_agent_run(worker_id="worker-1", executors=["reuleauxcoder"])
+
+    assert claim is not None
+    assert claim.executor_request.budget == {"max_tool_calls": 2, "timeout_sec": 30}
+    raw = claim.executor_request.to_dict()
+    assert raw["budget"] == {"max_tool_calls": 2, "timeout_sec": 30}
+    assert ExecutorRunRequest.from_dict(raw).budget == {
+        "max_tool_calls": 2,
+        "timeout_sec": 30,
+    }
+
+
+def test_budget_exceeded_executor_result_blocks_agent_run_with_session_end_audit() -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="manual",
+            agent_id="coder",
+            prompt="run",
+            executor="reuleauxcoder",
+            budget={"max_turns": 1},
+        ),
+        task_id="run-budget-terminal",
+    )
+
+    message = "AgentRun budget exceeded: max_turns=1"
+    completed = control.complete_agent_run(
+        run.id,
+        ExecutorRunResult(
+            task_id=run.id,
+            status="blocked",
+            output=f"({message})",
+            error=message,
+            events=[
+                ExecutorEvent.session_run_end(
+                    f"({message})",
+                    response_rendered=True,
+                    status="budget_exceeded",
+                    error=message,
+                    session_state="budget_exceeded",
+                )
+            ],
+        ),
+    )
+    events = [event.to_dict() for event in control.list_events(run.id)]
+
+    assert completed.status == TaskStatus.BLOCKED
+    assert completed.failure_reason == message
+    assert control.agent_run_to_dict(run.id)["status"] == "blocked"
+    session_end = next(event for event in events if event["type"] == "session_run_end")
+    assert session_end["payload"]["data"]["status"] == "budget_exceeded"
+    assert session_end["payload"]["data"]["error"] == message
+    assert events[-1]["type"] == "blocked"
+    assert events[-1]["payload"]["agent_run"]["status"] == "blocked"
+
+
+def test_session_projection_inverts_render_response_fallback_to_response_rendered() -> None:
+    projected = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 7,
+            "type": "session_run_end",
+            "payload": {
+                "data": {
+                    "response": "streamed answer",
+                    "render_response": False,
+                }
+            },
+        }
+    )
+
+    assert projected == [
+        (
+            "session_run_end",
+            {
+                "agent_run_id": "run-1",
+                "agent_id": "agent",
+                "workflow": "agent_run",
+                "raw_event_refs": [
+                    {"agent_run_id": "run-1", "seq": 7, "type": "session_run_end"}
+                ],
+                "response": "streamed answer",
+                "response_rendered": True,
+            },
+        )
+    ]
+
+    explicit = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 8,
+            "type": "session_run_end",
+            "payload": {
+                "data": {
+                    "response": "final answer",
+                    "render_response": False,
+                    "response_rendered": False,
+                }
+            },
+        }
+    )
+    assert explicit[0][1]["response_rendered"] is False
+
+
 def test_agent_run_request_rejects_unknown_budget_fields() -> None:
     with pytest.raises(ValueError, match="unsupported AgentRun budget field"):
         AgentRunRequest(
@@ -244,9 +376,20 @@ def test_cancel_agent_run_cascades_to_child_agent_runs() -> None:
     child_delegated_completed = [
         event for event in child_events if event["type"] == "delegated_run_completed"
     ][0]
+    child_lifecycle_events = [
+        event for event in child_events if event["type"] == "lifecycle_hook"
+    ]
     assert child_cancel_requested["payload"]["reason"] == "parent_cancelled:user_stop"
     assert child_parent_cancelled["payload"]["parent_run_id"] == parent.id
     assert child_delegated_completed["payload"]["agent_run_id"] == queued_grandchild.id
+    assert [event["payload"]["event_name"] for event in child_lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert child_lifecycle_events[0]["payload"]["payload"]["child_agent_run_id"] == (
+        queued_grandchild.id
+    )
+    assert child_lifecycle_events[0]["payload"]["payload"]["status"] == "cancelled"
     assert grandchild.status == TaskStatus.CANCELLED
     assert grandchild.cancel_reason == "parent_cancelled:user_stop"
     assert grandchild_events[-2]["type"] == "cancelled"
@@ -283,6 +426,9 @@ def test_child_agent_run_terminal_state_is_projected_to_parent_audit() -> None:
     delegated_event = [
         event for event in parent_events if event["type"] == "delegated_run_completed"
     ][0]
+    lifecycle_events = [
+        event for event in parent_events if event["type"] == "lifecycle_hook"
+    ]
     assert delegated_event["payload"] == {
         "run_id": child.id,
         "agent_run_id": child.id,
@@ -296,6 +442,232 @@ def test_child_agent_run_terminal_state_is_projected_to_parent_audit() -> None:
         "parent_task_id": None,
         "delegated_by_run_id": parent.id,
     }
+    assert [event["payload"]["event_name"] for event in lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert lifecycle_events[0]["payload"]["agent_run_id"] == parent.id
+    assert lifecycle_events[0]["payload"]["payload"]["child_agent_run_id"] == child.id
+    assert lifecycle_events[0]["payload"]["payload"]["status"] == "completed"
+    assert lifecycle_events[1]["payload"]["agent_run_id"] == parent.id
+    assert lifecycle_events[1]["payload"]["payload"]["child_agent_run_id"] == child.id
+    assert lifecycle_events[1]["payload"]["payload"]["status"] == "completed"
+    session_lifecycle_events = [
+        agent_run_event_to_session_events(event)[0]
+        for event in lifecycle_events
+    ]
+    assert [event_type for event_type, _ in session_lifecycle_events] == [
+        "lifecycle_hook",
+        "lifecycle_hook",
+    ]
+    assert [payload["event_name"] for _, payload in session_lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+
+
+def test_lifecycle_agent_adapter_child_completion_projects_to_parent_session() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        task_id="parent-run",
+    )
+
+    class Agent:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(current_round=0)
+            self.runtime_task_id = parent.id
+            self.agent_run_control_plane = control
+            self.runtime_config = SimpleNamespace(
+                agent_registry=SimpleNamespace(
+                    agents={"reviewer": AgentConfig(id="reviewer")}
+                )
+            )
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+        def _emit_event(self, event) -> None:  # noqa: ARG002
+            return None
+
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:lifecycle-agent-review",
+        {
+            "event": "Stop",
+            "source": "admin_managed",
+            "placement": "server",
+            "handler_type": "agent",
+            "handler_ref": "reviewer",
+            "display_name": "Lifecycle reviewer",
+            "summary": "Delegates Stop review to a child AgentRun.",
+            "permissions": [],
+            "trust": "trusted",
+            "technical": {"prompt": "review lifecycle output"},
+        },
+    )
+    agent = Agent()
+    dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry([declaration]),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(),
+    )
+    agent.lifecycle_dispatcher = dispatcher
+    bind_lifecycle_runtime_adapters_to_agent(agent)
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context(
+            "Stop",
+            agent_run_id=parent.id,
+            session_run_id="session-1",
+            turn_id="turn-1",
+            trigger_source="taskflow",
+        )
+    )
+
+    assert results[0].output.diagnostics[0]["code"] == "agent_run_submitted"
+    child = control.list_agent_runs(agent_id="reviewer")[0]
+    assert child["parent_run_id"] == parent.id
+    assert child["metadata"]["lifecycle_hook_id"] == "hook:lifecycle-agent-review"
+    assert child["metadata"]["parent_session_id"] == "session-1"
+    assert child["metadata"]["parent_turn_id"] == "turn-1"
+
+    control.complete_agent_run(
+        child["id"],
+        ExecutorRunResult(
+            task_id=child["id"],
+            status="completed",
+            output="review passed",
+        ),
+    )
+
+    parent_events = [event.to_dict() for event in control.list_events(parent.id)]
+    delegated_event = [
+        event for event in parent_events if event["type"] == "delegated_run_completed"
+    ][0]
+    lifecycle_events = [
+        event for event in parent_events if event["type"] == "lifecycle_hook"
+    ]
+    session_events = agent_run_event_to_session_events(delegated_event)
+    session_lifecycle_events = [
+        agent_run_event_to_session_events(event)[0]
+        for event in lifecycle_events
+    ]
+
+    assert delegated_event["payload"]["agent_run_id"] == child["id"]
+    assert delegated_event["payload"]["parent_run_id"] == parent.id
+    assert session_events[0][0] == "context_event"
+    assert session_events[0][1]["phase"] == "delegated_run_completed"
+    assert session_events[0][1]["child_agent_run_id"] == child["id"]
+    assert session_events[0][1]["result"] == "review passed"
+    assert [event["payload"]["event_name"] for event in lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert lifecycle_events[0]["payload"]["payload"]["lifecycle_hook_id"] == (
+        "hook:lifecycle-agent-review"
+    )
+    assert lifecycle_events[0]["payload"]["payload"]["parent_session_id"] == "session-1"
+    assert lifecycle_events[0]["payload"]["payload"]["parent_turn_id"] == "turn-1"
+    assert [payload["event_name"] for _, payload in session_lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+
+
+def test_lifecycle_agent_adapter_child_cancel_projects_to_parent_session() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        task_id="parent-run",
+    )
+
+    class Agent:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(current_round=0)
+            self.runtime_task_id = parent.id
+            self.agent_run_control_plane = control
+            self.runtime_config = SimpleNamespace(
+                agent_registry=SimpleNamespace(
+                    agents={"reviewer": AgentConfig(id="reviewer")}
+                )
+            )
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+        def _emit_event(self, event) -> None:  # noqa: ARG002
+            return None
+
+    declaration = LifecycleHookDeclaration.from_dict(
+        "hook:lifecycle-agent-review",
+        {
+            "event": "Stop",
+            "source": "admin_managed",
+            "placement": "server",
+            "handler_type": "agent",
+            "handler_ref": "reviewer",
+            "display_name": "Lifecycle reviewer",
+            "summary": "Delegates Stop review to a child AgentRun.",
+            "permissions": [],
+            "trust": "trusted",
+            "technical": {"prompt": "review lifecycle output"},
+        },
+    )
+    agent = Agent()
+    dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry([declaration]),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(),
+    )
+    agent.lifecycle_dispatcher = dispatcher
+    bind_lifecycle_runtime_adapters_to_agent(agent)
+
+    results = dispatcher.dispatch(
+        build_lifecycle_event_context(
+            "Stop",
+            agent_run_id=parent.id,
+            session_run_id="session-1",
+            turn_id="turn-1",
+            trigger_source="taskflow",
+        )
+    )
+    child = control.list_agent_runs(agent_id="reviewer")[0]
+
+    assert results[0].output.diagnostics[0]["code"] == "agent_run_submitted"
+    assert control.cancel_agent_run(parent.id, reason="user_stop") is True
+
+    cancelled_child = control.get_agent_run(child["id"])
+    parent_events = [event.to_dict() for event in control.list_events(parent.id)]
+    lifecycle_events = [
+        event for event in parent_events if event["type"] == "lifecycle_hook"
+    ]
+    session_lifecycle_events = [
+        agent_run_event_to_session_events(event)[0]
+        for event in lifecycle_events
+    ]
+
+    assert cancelled_child.status == TaskStatus.CANCELLED
+    assert cancelled_child.cancel_reason == "parent_cancelled:user_stop"
+    assert [event["payload"]["event_name"] for event in lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert lifecycle_events[0]["payload"]["payload"]["child_agent_run_id"] == child["id"]
+    assert lifecycle_events[0]["payload"]["payload"]["status"] == "cancelled"
+    assert lifecycle_events[0]["payload"]["payload"]["lifecycle_hook_id"] == (
+        "hook:lifecycle-agent-review"
+    )
+    assert lifecycle_events[0]["payload"]["payload"]["parent_session_id"] == "session-1"
+    assert lifecycle_events[0]["payload"]["payload"]["parent_turn_id"] == "turn-1"
+    assert [payload["event_name"] for _, payload in session_lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert session_lifecycle_events[0][1]["child_agent_run_id"] == child["id"]
+    assert session_lifecycle_events[0][1]["status"] == "cancelled"
+    assert session_lifecycle_events[0][1]["lifecycle_hook_id"] == (
+        "hook:lifecycle-agent-review"
+    )
+    assert session_lifecycle_events[0][1]["parent_session_id"] == "session-1"
+    assert session_lifecycle_events[0][1]["parent_turn_id"] == "turn-1"
 
 
 def test_agent_run_snapshots_agent_model_binding_for_server_origin() -> None:
@@ -651,6 +1023,186 @@ def test_environment_runtime_events_are_derived_from_allowlisted_shell_commands(
     assert "environment.entry_checked" in event_types
     assert "environment.entry_verified" in event_types
     assert "environment.summary" in event_types
+
+
+def test_worktree_ready_status_emits_worktree_create_lifecycle_audit() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="worktree",
+            agent_id="coder",
+            prompt="run in worktree",
+            executor=ExecutorType.FAKE,
+            execution_location=ExecutionLocation.DAEMON_WORKTREE,
+            metadata={"worker_kind": "sandbox_worker"},
+        ),
+        task_id="task-worktree",
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "worktree_ready",
+            workdir="/runtime/worktrees/ws/coder-task",
+            runtime_root="/runtime",
+        ),
+    )
+
+    events = [event.to_dict() for event in control.list_events(task.id)]
+    lifecycle_events = [
+        event for event in events if event["type"] == "lifecycle_hook"
+    ]
+    assert [event["payload"]["event_name"] for event in lifecycle_events] == [
+        "WorktreeCreate"
+    ]
+    payload = lifecycle_events[0]["payload"]
+    assert payload["agent_run_id"] == task.id
+    assert payload["trigger_source"] == "manual"
+    assert payload["payload"]["workdir"] == "/runtime/worktrees/ws/coder-task"
+    assert payload["payload"]["runtime_working_directory"] == (
+        "/runtime/worktrees/ws/coder-task"
+    )
+    assert payload["payload"]["runtime_root"] == "/runtime"
+    assert payload["payload"]["execution_location"] == "daemon_worktree"
+    assert payload["payload"]["worker_kind"] == "sandbox_worker"
+    assert payload["payload"]["path_space"] == "agent_run_worktree"
+    session_events = agent_run_event_to_session_events(lifecycle_events[0])
+    assert session_events[0][0] == "lifecycle_hook"
+    assert session_events[0][1]["event_name"] == "WorktreeCreate"
+
+
+def test_worktree_removed_status_emits_worktree_remove_lifecycle_audit() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="worktree-remove",
+            agent_id="coder",
+            prompt="cleanup worktree",
+            executor=ExecutorType.FAKE,
+            execution_location=ExecutionLocation.DAEMON_WORKTREE,
+            metadata={"worker_kind": "sandbox_worker"},
+        ),
+        task_id="task-worktree-remove",
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "worktree_removed",
+            workdir="/runtime/worktrees/ws/coder-task",
+            runtime_root="/runtime",
+        ),
+    )
+
+    events = [event.to_dict() for event in control.list_events(task.id)]
+    lifecycle_events = [
+        event for event in events if event["type"] == "lifecycle_hook"
+    ]
+    assert [event["payload"]["event_name"] for event in lifecycle_events] == [
+        "WorktreeRemove"
+    ]
+    payload = lifecycle_events[0]["payload"]
+    assert payload["agent_run_id"] == task.id
+    assert payload["trigger_source"] == "manual"
+    assert payload["payload"]["workdir"] == "/runtime/worktrees/ws/coder-task"
+    assert payload["payload"]["runtime_working_directory"] == (
+        "/runtime/worktrees/ws/coder-task"
+    )
+    assert payload["payload"]["runtime_root"] == "/runtime"
+    assert payload["payload"]["execution_location"] == "daemon_worktree"
+    assert payload["payload"]["worker_kind"] == "sandbox_worker"
+    assert payload["payload"]["path_space"] == "agent_run_worktree"
+    session_events = agent_run_event_to_session_events(lifecycle_events[0])
+    assert session_events[0][0] == "lifecycle_hook"
+    assert session_events[0][1]["event_name"] == "WorktreeRemove"
+
+
+def test_permission_request_terminal_gate_projects_final_permission_audit() -> None:
+    projected = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 7,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "text": None,
+                "data": {
+                    "tool_name": "shell",
+                    "tool_call_id": "call-1",
+                    "output": "Permission denied",
+                    "meta": {
+                        "tool_diagnostics": [
+                            {
+                                "code": "permission_denied",
+                                "severity": "error",
+                                "metadata": {
+                                    "permission": {
+                                        "action": "deny",
+                                        "authorized": False,
+                                        "policy_matched": "lifecycle_hook:deny",
+                                        "reason": (
+                                            "PermissionRequest lifecycle denied shell."
+                                        ),
+                                        "audit": {
+                                            "lifecycle_event": "PermissionRequest",
+                                            "lifecycle_hooks": [
+                                                {
+                                                    "hook_id": (
+                                                        "hook:admin:shell-permission:"
+                                                        "PermissionRequest:0"
+                                                    ),
+                                                    "display_name": (
+                                                        "Shell permission guard"
+                                                    ),
+                                                    "decision": "deny",
+                                                    "reason": (
+                                                        "Blocks shell in this "
+                                                        "workspace."
+                                                    ),
+                                                }
+                                            ],
+                                            "pre_tool_lifecycle": {
+                                                "hook_id": (
+                                                    "hook:skill:pretool:"
+                                                    "PreToolUse:0"
+                                                ),
+                                                "display_name": "PreTool allow observer",
+                                                "decision": "allow",
+                                            },
+                                            "technical": {
+                                                "raw_command": "rm -rf private-data"
+                                            },
+                                        },
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+    )
+
+    assert projected[0][0] == "tool_call_end"
+    permission = projected[0][1]["meta"]["permission"]
+    assert permission == {
+        "action": "deny",
+        "authorized": False,
+        "policy_matched": "lifecycle_hook:deny",
+        "reason": "PermissionRequest lifecycle denied shell.",
+        "lifecycle_event": "PermissionRequest",
+        "lifecycle_hooks": [
+            {
+                "hook_id": "hook:admin:shell-permission:PermissionRequest:0",
+                "display_name": "Shell permission guard",
+                "decision": "deny",
+                "reason": "Blocks shell in this workspace.",
+            }
+        ],
+    }
+    assert "PreToolUse" not in str(permission)
+    assert "raw_command" not in str(permission)
+    assert "private-data" not in str(permission)
 
 
 def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
@@ -1050,6 +1602,35 @@ def test_local_peer_cannot_claim_remote_server_agent_run() -> None:
     assert claim.executor_request.metadata["worker_kind"] == "server_worker"
 
 
+@pytest.mark.parametrize(
+    "execution_location",
+    [ExecutionLocation.REMOTE_SERVER, ExecutionLocation.DAEMON_WORKTREE],
+)
+def test_generic_agent_runs_feature_does_not_claim_non_local_agent_run(
+    execution_location: ExecutionLocation,
+) -> None:
+    control = AgentRunControlPlane()
+    control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="issue-1",
+            agent_id="reviewer",
+            prompt="run",
+            executor=ExecutorType.FAKE,
+            execution_location=execution_location,
+        ),
+        task_id=f"task-{execution_location.value}",
+    )
+
+    claim = control.claim_agent_run(
+        worker_id="generic-local-peer",
+        executors=["fake"],
+        peer_features=["agent_runs", "agent_runs.local_workspace"],
+        workspace_root="G:/repo/main",
+    )
+
+    assert claim is None
+
+
 def test_local_cli_executor_records_local_model_request_origin() -> None:
     control = AgentRunControlPlane(
         runtime_snapshot={
@@ -1368,6 +1949,69 @@ def test_waiting_approval_event_updates_task_status() -> None:
     assert control.get_agent_run(task.id).status.value == "waiting_approval"
 
 
+def test_waiting_approval_status_projects_to_session_approval_request() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run shell"),
+        task_id="task-approval-projection",
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "waiting_approval",
+            approval_id="approval-1",
+            tool_name="shell",
+            tool_call_id="call-1",
+            reason="PermissionRequest lifecycle asked for shell review.",
+            intent="Review shell command",
+            tool_args={"command": "npm test"},
+            permission={
+                "action": "require_approval",
+                "authorized": True,
+                "policy_matched": "lifecycle_hook:ask",
+                "reason": "PermissionRequest lifecycle asked for shell review.",
+            },
+        ),
+    )
+
+    status_event = [
+        event.to_dict()
+        for event in control.list_events(task.id, after_seq=0)
+        if event.type == "status"
+    ][0]
+    projected = agent_run_event_to_session_events(status_event)
+
+    assert [event_type for event_type, _ in projected] == [
+        "context_event",
+        "approval_request",
+    ]
+    assert projected[1][1] == {
+        "agent_run_id": task.id,
+        "agent_id": "agent",
+        "workflow": "agent_run",
+        "raw_event_refs": [
+            {
+                "agent_run_id": task.id,
+                "seq": status_event["seq"],
+                "type": "status",
+            }
+        ],
+        "approval_id": "approval-1",
+        "tool_name": "shell",
+        "tool_call_id": "call-1",
+        "reason": "PermissionRequest lifecycle asked for shell review.",
+        "intent": "Review shell command",
+        "tool_args": {"command": "npm test"},
+        "permission": {
+            "action": "require_approval",
+            "authorized": True,
+            "policy_matched": "lifecycle_hook:ask",
+            "reason": "PermissionRequest lifecycle asked for shell review.",
+        },
+    }
+
+
 def test_taskflow_waiting_approval_event_becomes_blocked_review() -> None:
     control = AgentRunControlPlane(
         runtime_snapshot={
@@ -1412,6 +2056,81 @@ def test_taskflow_waiting_approval_event_becomes_blocked_review() -> None:
     assert blocked
     assert blocked[-1].payload["permission"]["action"] == "blocked_review"
     assert blocked[-1].payload["tool_name"] == "shell"
+
+
+def test_background_permission_blocked_review_projects_to_session_decision() -> None:
+    control = AgentRunControlPlane(
+        runtime_snapshot={
+            "runtime_profiles": {
+                "server_fake": {
+                    "executor": "fake",
+                    "execution_location": "remote_server",
+                    "worker_kind": "server_worker",
+                }
+            },
+            "agents": {
+                "worker": {
+                    "runtime_profile": "server_fake",
+                    "taskflow_eligible": True,
+                }
+            },
+        }
+    )
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="taskflow-1",
+            agent_id="worker",
+            prompt="run background",
+            source="taskflow",
+        ),
+        task_id="taskflow-review",
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "waiting_approval",
+            approval_id="approval-1",
+            tool_name="shell",
+            reason="PermissionRequest lifecycle asked for shell review.",
+        ),
+    )
+
+    blocked_event = [
+        event.to_dict()
+        for event in control.list_events(task.id, after_seq=0)
+        if event.type == "permission.blocked_review"
+    ][0]
+    projected = agent_run_event_to_session_events(blocked_event)
+
+    assert projected[0][0] == "workflow_decision"
+    assert projected[0][1] == {
+        "agent_run_id": task.id,
+        "agent_id": "agent",
+        "workflow": "agent_run_permission",
+        "raw_event_refs": [
+            {
+                "agent_run_id": task.id,
+                "seq": blocked_event["seq"],
+                "type": "permission.blocked_review",
+            }
+        ],
+        "decision_type": "permission_review",
+        "status": "pending",
+        "title": "Permission review required",
+        "summary": "PermissionRequest lifecycle asked for shell review.",
+        "approval_id": "approval-1",
+        "tool_name": "shell",
+        "review": {
+            "tool_name": "shell",
+            "reason": "PermissionRequest lifecycle asked for shell review.",
+            "permission": {
+                "action": "blocked_review",
+                "authorized": False,
+                "reason": "PermissionRequest lifecycle asked for shell review.",
+            },
+        },
+    }
 
 
 def test_delegation_waiting_approval_event_becomes_blocked_review() -> None:
@@ -1797,6 +2516,104 @@ def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
     ]
     assert artifacts[2]["status"] == "failed"
     assert artifacts[2]["metadata"]["stage"] == "pr_create"
+
+
+def test_complete_task_persists_lifecycle_overflow_artifacts_without_event_content() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="issue-1",
+            agent_id="coder",
+            prompt="run",
+            executor=ExecutorType.REULEAUXCODER,
+            execution_location=ExecutionLocation.LOCAL_WORKSPACE,
+        ),
+        task_id="task-lifecycle-overflow-artifact",
+    )
+    huge = "OVERSIZED_LIFECYCLE_OUTPUT_SECRET" * 500
+    artifact_id = "lifecycle-output-overflow:hook-oversized:1"
+
+    control.complete_agent_run(
+        task.id,
+        ExecutorRunResult(
+            task_id=task.id,
+            status="completed",
+            output="done",
+            events=[
+                ExecutorEvent(
+                    type="lifecycle_hook",
+                    data={
+                        "phase": "result",
+                        "event_name": "UserPromptSubmit",
+                        "hook_id": "hook:oversized",
+                        "display_name": "Oversized guard",
+                        "source": "skill",
+                        "handler_type": "prompt",
+                        "decision": "deny",
+                        "continue_flow": False,
+                        "output": {
+                            "reason": (
+                                "blocked...[truncated; "
+                                f"artifact_ref={artifact_id}]"
+                            ),
+                            "artifacts": [
+                                {
+                                    "kind": "lifecycle_output_overflow",
+                                    "id": artifact_id,
+                                    "field": "reason",
+                                    "original_chars": len(huge),
+                                }
+                            ],
+                        },
+                    },
+                )
+            ],
+            artifacts=[
+                {
+                    "artifact_id": artifact_id,
+                    "type": "log",
+                    "status": "generated",
+                    "content": huge,
+                    "metadata": {
+                        "kind": "lifecycle_output_overflow",
+                        "hook_id": "hook:oversized",
+                        "event_name": "UserPromptSubmit",
+                        "field": "reason",
+                        "original_chars": len(huge),
+                    },
+                }
+            ],
+        ),
+    )
+
+    artifacts = control.artifacts_to_dict(task.id)
+    assert artifacts == [
+        {
+            "id": artifact_id,
+            "task_id": task.id,
+            "type": "log",
+            "status": "generated",
+            "branch_name": None,
+            "pr_url": None,
+            "content": huge,
+            "path": None,
+            "metadata": {
+                "kind": "lifecycle_output_overflow",
+                "hook_id": "hook:oversized",
+                "event_name": "UserPromptSubmit",
+                "field": "reason",
+                "original_chars": len(huge),
+            },
+            "merge_status": None,
+            "merged_by": None,
+        }
+    ]
+    events_json = json.dumps(
+        [event.to_dict() for event in control.list_events(task.id)],
+        sort_keys=True,
+    )
+    assert artifact_id in events_json
+    assert "OVERSIZED_LIFECYCLE_OUTPUT_SECRET" not in events_json
 
 
 def test_worktree_manager_rejects_paths_outside_runtime_root() -> None:

@@ -218,7 +218,7 @@ def test_agent_run_complete_creates_github_pr_artifact() -> None:
             {
                 "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
                 "cwd": "/tmp",
-                "features": ["agent_runs"],
+                "features": ["agent_runs.daemon_worktree"],
             },
         )
         peer_token = register_body["payload"]["peer_token"]

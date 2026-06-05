@@ -44,8 +44,14 @@ from labrastro_server.services.agent_runtime.prompt_renderer import (
 )
 from labrastro_server.services.agent_runtime.runtime_store import (
     DEFAULT_RUNTIME_EVENT_LIMIT,
+    artifact_attached_event_payload,
     clamp_event_limit,
+    delegated_run_completed_payload,
+    delegated_terminal_lifecycle_events,
+    executor_result_artifacts,
+    parent_agent_run_id,
     runtime_slots_allow_agent_run_claim,
+    worktree_lifecycle_events,
 )
 from labrastro_server.services.agent_runtime.runtime_policy import (
     model_request_origin_for_runtime,
@@ -222,29 +228,11 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
 
 
 def _parent_agent_run_id(task: AgentRunRecord) -> str:
-    return str(
-        task.parent_run_id
-        or task.parent_task_id
-        or task.delegated_by_run_id
-        or ""
-    )
+    return parent_agent_run_id(task)
 
 
 def _delegated_run_completed_payload(task: AgentRunRecord) -> dict[str, Any]:
-    status = task.status.value
-    return {
-        "run_id": task.id,
-        "agent_run_id": task.id,
-        "agent_id": task.agent_id,
-        "task": task.prompt,
-        "status": status,
-        "result": task.output or "",
-        "error": "" if status == TaskStatus.COMPLETED.value else task.failure_reason or "",
-        "source": task.source.value,
-        "parent_run_id": task.parent_run_id,
-        "parent_task_id": task.parent_task_id,
-        "delegated_by_run_id": task.delegated_by_run_id,
-    }
+    return delegated_run_completed_payload(task)
 
 
 def _artifact_to_dict(artifact: TaskArtifact) -> dict[str, Any]:
@@ -546,6 +534,7 @@ class PostgresAgentRunStore:
                         if task.metadata.get("model") is not None
                         else None,
                         executor_session_id=task.executor_session_id,
+                        budget=_dict_from(metadata.get("budget")),
                         metadata=metadata,
                     ),
                     runtime_snapshot=dict(self.runtime_snapshot),
@@ -757,6 +746,8 @@ class PostgresAgentRunStore:
                     return False, reason
             task = self._task_from_row(self._task_row(conn, task_id))
             self._append_event(conn, task_id, event.type.value, event.to_dict())
+            for event_type, payload in worktree_lifecycle_events(task, event):
+                self._append_event(conn, task_id, event_type, payload)
             expansion = expand_environment_executor_event(task.metadata, event)
             for event_type, payload in expansion.events:
                 self._append_event(conn, task_id, event_type, payload)
@@ -972,7 +963,7 @@ class PostgresAgentRunStore:
                         "blocked",
                         {"error": expansion.policy_error},
                     )
-            for artifact in artifacts or []:
+            for artifact in executor_result_artifacts(result, artifacts):
                 self._attach_artifact_with_conn(conn, task_id, **artifact)
             task = self._task_from_row(self._task_row(conn, task_id))
             summary = environment_summary_event(
@@ -1373,10 +1364,15 @@ class PostgresAgentRunStore:
                         )
                         WHERE NOT child.id = ANY(descendants.path)
                     )
-                    SELECT DISTINCT ON (id) *
-                    FROM descendants
-                    {status_clause}
-                    ORDER BY id, created_at ASC
+                    , deduped AS (
+                        SELECT DISTINCT ON (id) *
+                        FROM descendants
+                        {status_clause}
+                        ORDER BY id, array_length(path, 1) ASC, created_at ASC
+                    )
+                    SELECT *
+                    FROM deduped
+                    ORDER BY array_length(path, 1) ASC, path ASC, created_at ASC
                     """
                 ),
                 {"parent_run_id": parent_run_id},
@@ -1559,6 +1555,8 @@ class PostgresAgentRunStore:
             "delegated_run_completed",
             _delegated_run_completed_payload(task),
         )
+        for event_type, payload in delegated_terminal_lifecycle_events(task):
+            self._append_event(conn, parent_run_id, event_type, payload)
 
     def _append_event(
         self, conn: Any, task_id: str, event_type: str, payload: dict[str, Any]
@@ -2029,7 +2027,12 @@ class PostgresAgentRunStore:
             text(f"UPDATE labrastro_agent_runs SET {', '.join(set_parts)} WHERE id=:task_id"),
             updates,
         )
-        self._append_event(conn, task_id, "artifact_attached", {"artifact": _artifact_to_dict(artifact)})
+        self._append_event(
+            conn,
+            task_id,
+            "artifact_attached",
+            artifact_attached_event_payload(artifact),
+        )
         return artifact
 
     def _has_open_pr(self, conn: Any, task_id: str) -> bool:

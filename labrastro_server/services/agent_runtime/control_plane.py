@@ -25,6 +25,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     WorkerKind,
     WorktreeRole,
 )
+from reuleauxcoder.domain.agent.runtime_budget import RUNTIME_BUDGET_FIELDS
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunRequest,
@@ -46,8 +47,14 @@ from labrastro_server.services.agent_runtime.prompt_renderer import (
 from labrastro_server.services.agent_runtime.runtime_store import (
     DEFAULT_RUNTIME_EVENT_LIMIT,
     AgentRunStore,
+    artifact_attached_event_payload,
     clamp_event_limit,
+    delegated_run_completed_payload,
+    delegated_terminal_lifecycle_events,
+    executor_result_artifacts,
+    parent_agent_run_id,
     runtime_slots_allow_agent_run_claim,
+    worktree_lifecycle_events,
 )
 from labrastro_server.services.agent_runtime.runtime_policy import (
     model_request_origin_for_runtime,
@@ -156,29 +163,11 @@ def _agent_run_to_dict(task: AgentRunRecord) -> dict[str, Any]:
 
 
 def _parent_agent_run_id(task: AgentRunRecord) -> str:
-    return str(
-        task.parent_run_id
-        or task.parent_task_id
-        or task.delegated_by_run_id
-        or ""
-    )
+    return parent_agent_run_id(task)
 
 
 def _delegated_run_completed_payload(task: AgentRunRecord) -> dict[str, Any]:
-    status = task.status.value
-    return {
-        "run_id": task.id,
-        "agent_run_id": task.id,
-        "agent_id": task.agent_id,
-        "task": task.prompt,
-        "status": status,
-        "result": task.output or "",
-        "error": "" if status == TaskStatus.COMPLETED.value else task.failure_reason or "",
-        "source": task.source.value,
-        "parent_run_id": task.parent_run_id,
-        "parent_task_id": task.parent_task_id,
-        "delegated_by_run_id": task.delegated_by_run_id,
-    }
+    return delegated_run_completed_payload(task)
 
 
 def _artifact_to_dict(artifact: TaskArtifact) -> dict[str, Any]:
@@ -201,14 +190,6 @@ def _dict_from(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-_AGENT_RUN_BUDGET_FIELDS = {
-    "token_budget",
-    "max_turns",
-    "max_tool_calls",
-    "timeout_sec",
-}
-
-
 def _normalize_agent_run_budget(value: Any) -> dict[str, int]:
     if value in (None, ""):
         return {}
@@ -219,8 +200,8 @@ def _normalize_agent_run_budget(value: Any) -> dict[str, int]:
         field_name = str(key or "").strip()
         if not field_name:
             continue
-        if field_name not in _AGENT_RUN_BUDGET_FIELDS:
-            allowed = ", ".join(sorted(_AGENT_RUN_BUDGET_FIELDS))
+        if field_name not in RUNTIME_BUDGET_FIELDS:
+            allowed = ", ".join(sorted(RUNTIME_BUDGET_FIELDS))
             raise ValueError(
                 f"unsupported AgentRun budget field '{field_name}'; allowed: {allowed}"
             )
@@ -417,6 +398,27 @@ class AgentRunControlPlane:
         self.runtime_snapshot = dict(runtime_snapshot or {})
         self.pr_flow = pr_flow or InMemoryPRFlow()
         self._store = store
+        if self._store is not None:
+            if runtime_snapshot is not None:
+                self._store.configure(
+                    max_running_tasks=self.max_running_tasks,
+                    runtime_snapshot=self.runtime_snapshot,
+                )
+            else:
+                self.max_running_tasks = max(
+                    1,
+                    int(
+                        getattr(
+                            self._store,
+                            "max_running_tasks",
+                            self.max_running_tasks,
+                        )
+                        or 1
+                    ),
+                )
+                self.runtime_snapshot = dict(
+                    getattr(self._store, "runtime_snapshot", {}) or {}
+                )
         self._sandbox_provider = sandbox_provider
         self._sandbox_profile = sandbox_profile
         self._lock = threading.RLock()
@@ -938,6 +940,7 @@ class AgentRunControlPlane:
                         if task.metadata.get("model") is not None
                         else None,
                         executor_session_id=task.executor_session_id,
+                        budget=_dict_from(metadata.get("budget")),
                         metadata=metadata,
                     ),
                     runtime_snapshot=dict(self.runtime_snapshot),
@@ -1354,6 +1357,8 @@ class AgentRunControlPlane:
                     return False, reason
             task = self._task_locked(task_id)
             self._append_event_locked(task_id, event.type.value, event.to_dict())
+            for event_type, payload in worktree_lifecycle_events(task, event):
+                self._append_event_locked(task_id, event_type, payload)
             expansion = expand_environment_executor_event(task.metadata, event)
             for event_type, payload in expansion.events:
                 self._append_event_locked(task_id, event_type, payload)
@@ -1513,7 +1518,7 @@ class AgentRunControlPlane:
                         "blocked",
                         {"error": policy_error},
                     )
-            for artifact in artifacts or []:
+            for artifact in executor_result_artifacts(result, artifacts):
                 self.attach_artifact(task_id, **artifact)
             summary = environment_summary_event(
                 task.metadata,
@@ -1726,6 +1731,8 @@ class AgentRunControlPlane:
             "delegated_run_completed",
             _delegated_run_completed_payload(task),
         )
+        for event_type, payload in delegated_terminal_lifecycle_events(task):
+            self._append_event_locked(parent_run_id, event_type, payload)
 
     def attach_artifact(
         self,
@@ -1775,7 +1782,7 @@ class AgentRunControlPlane:
             self._append_event_locked(
                 task_id,
                 "artifact_attached",
-                {"artifact": _artifact_to_dict(artifact)},
+                artifact_attached_event_payload(artifact),
             )
             return artifact
 

@@ -11,7 +11,6 @@ from labrastro_server.infrastructure.persistence.postgres_taskflow_store import 
 )
 from labrastro_server.taskflow.application.project_service import ProjectService
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
-from labrastro_server.taskflow.domain.project_state import ProjectState
 
 
 pytestmark = pytest.mark.skipif(
@@ -20,13 +19,35 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_taskflow_tables() -> None:
+    database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
+    run_migrations(database_url)
+    engine = create_postgres_engine(database_url)
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                TRUNCATE
+                    labrastro_taskflow_events,
+                    labrastro_taskflow_states,
+                    labrastro_taskflow_projects
+                RESTART IDENTITY CASCADE
+                """
+            )
+        )
+
+
 def _service() -> TaskflowService:
     database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
     run_migrations(database_url)
     store = PostgresTaskflowStore(create_postgres_engine(database_url))
     project_service = ProjectService(store=store)
-    project_service.save_project_state(
-        ProjectState.new(project_id="project-pg-taskflow", name="Taskflow PG")
+    project_service.get_or_create_project_state(
+        "project-pg-taskflow",
+        name="Taskflow PG",
     )
     return TaskflowService(project_service=project_service, state_store=store)
 

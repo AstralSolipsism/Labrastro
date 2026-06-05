@@ -32,6 +32,250 @@ RUNNING_AGENT_RUN_STATUSES = {
     TaskStatus.WAITING_APPROVAL,
 }
 
+_WORKTREE_LIFECYCLE_STATUS = {
+    "worktree_ready": (
+        "WorktreeCreate",
+        "agent_run_worktree_ready",
+        "AgentRun worktree ready",
+    ),
+    "worktree_removed": (
+        "WorktreeRemove",
+        "agent_run_worktree_removed",
+        "AgentRun worktree removed",
+    ),
+}
+
+
+def parent_agent_run_id(task: AgentRunRecord) -> str:
+    return str(
+        task.parent_run_id
+        or task.parent_task_id
+        or task.delegated_by_run_id
+        or ""
+    )
+
+
+def artifact_attached_event_payload(artifact: TaskArtifact) -> dict[str, Any]:
+    metadata = dict(artifact.metadata)
+    artifact_payload = {
+        "id": artifact.id,
+        "task_id": artifact.task_id,
+        "type": artifact.type.value,
+        "status": artifact.status.value,
+        "branch_name": artifact.branch_name,
+        "pr_url": artifact.pr_url,
+        "content": artifact.content,
+        "path": artifact.path,
+        "metadata": metadata,
+        "merge_status": artifact.merge_status.value if artifact.merge_status else None,
+        "merged_by": artifact.merged_by,
+    }
+    if metadata.get("kind") == "lifecycle_output_overflow":
+        artifact_payload["content"] = None
+        artifact_payload["metadata"] = {
+            **metadata,
+            "content_stored": True,
+            "content_omitted_from_event": True,
+        }
+    return {"artifact": artifact_payload}
+
+
+def executor_result_artifacts(
+    result: ExecutorRunResult,
+    artifacts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    combined: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*(artifacts or []), *(getattr(result, "artifacts", []) or [])]:
+        if not isinstance(item, dict):
+            continue
+        artifact_id = str(item.get("artifact_id") or item.get("id") or "")
+        if artifact_id and artifact_id in seen:
+            continue
+        if artifact_id:
+            seen.add(artifact_id)
+        combined.append(dict(item))
+    return combined
+
+
+def delegated_run_completed_payload(task: AgentRunRecord) -> dict[str, Any]:
+    status = task.status.value
+    return {
+        "run_id": task.id,
+        "agent_run_id": task.id,
+        "agent_id": task.agent_id,
+        "task": task.prompt,
+        "status": status,
+        "result": task.output or "",
+        "error": "" if status == TaskStatus.COMPLETED.value else task.failure_reason or "",
+        "source": task.source.value,
+        "parent_run_id": task.parent_run_id,
+        "parent_task_id": task.parent_task_id,
+        "delegated_by_run_id": task.delegated_by_run_id,
+    }
+
+
+def delegated_terminal_lifecycle_events(
+    task: AgentRunRecord,
+) -> list[tuple[str, dict[str, Any]]]:
+    parent_run_id = parent_agent_run_id(task)
+    if not parent_run_id or parent_run_id == task.id:
+        return []
+    terminal_payload = delegated_run_completed_payload(task)
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    status = terminal_payload["status"]
+    level = (
+        "info"
+        if status == TaskStatus.COMPLETED.value
+        else "warning"
+        if status == TaskStatus.CANCELLED.value
+        else "error"
+    )
+    message = f"{task.agent_id or 'delegated agent'} {status}"
+    payload = {
+        **terminal_payload,
+        "child_agent_run_id": task.id,
+        "child_agent_id": task.agent_id,
+        "parent_session_id": str(metadata.get("parent_session_id") or ""),
+        "parent_turn_id": str(metadata.get("parent_turn_id") or ""),
+        "lifecycle_hook_id": str(metadata.get("lifecycle_hook_id") or ""),
+        "lifecycle_hook_source": str(metadata.get("lifecycle_hook_source") or ""),
+    }
+    return [
+        (
+            "lifecycle_hook",
+            _delegated_terminal_lifecycle_payload(
+                task,
+                event_name=event_name,
+                parent_run_id=parent_run_id,
+                level=level,
+                message=message,
+                payload=payload,
+            ),
+        )
+        for event_name in ("TaskCompleted", "SubagentStop")
+    ]
+
+
+def worktree_lifecycle_events(
+    task: AgentRunRecord,
+    event: ExecutorEvent,
+) -> list[tuple[str, dict[str, Any]]]:
+    if event.type.value != "status":
+        return []
+    status = str(event.data.get("status") or "").strip()
+    if status not in _WORKTREE_LIFECYCLE_STATUS:
+        return []
+    workdir = str(event.data.get("workdir") or task.workdir or "").strip()
+    if not workdir:
+        return []
+    event_name, diagnostic_code, message_prefix = _WORKTREE_LIFECYCLE_STATUS[status]
+    hook_id = f"agent_run_control_plane:{event_name}"
+    message = f"{message_prefix}: {workdir}"
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    runtime_root = str(event.data.get("runtime_root") or metadata.get("runtime_root") or "")
+    execution_location = (
+        task.execution_location.value if task.execution_location else ""
+    )
+    path_space = (
+        "agent_run_worktree"
+        if execution_location == ExecutionLocation.DAEMON_WORKTREE.value
+        else "agent_run_workspace"
+    )
+    payload = {
+        "workdir": workdir,
+        "runtime_working_directory": workdir,
+        "runtime_workspace_root": task.workdir or workdir,
+        "runtime_root": runtime_root,
+        "execution_location": execution_location,
+        "worker_kind": str(metadata.get("worker_kind") or ""),
+        "worktree_role": str(metadata.get("worktree_role") or ""),
+        "agent_id": task.agent_id,
+        "agent_run_id": task.id,
+        "path_space": path_space,
+        "source_event": status,
+    }
+    return [
+        (
+            "lifecycle_hook",
+            {
+                "phase": "result",
+                "event_name": event_name,
+                "placement": "server",
+                "session_run_id": str(task.executor_session_id or ""),
+                "agent_run_id": task.id,
+                "turn_id": "",
+                "trigger_source": task.source.value,
+                "hook_id": hook_id,
+                "display_name": event_name,
+                "source": "agent_run_control_plane",
+                "handler_type": "internal",
+                "decision": "none",
+                "continue_flow": True,
+                "diagnostics": [
+                    {
+                        "code": diagnostic_code,
+                        "message": message,
+                        "level": "info",
+                        "event_name": event_name,
+                        "handler_type": "internal",
+                        "hook_id": hook_id,
+                    }
+                ],
+                "level": "info",
+                "title": event_name,
+                "message": message,
+                "user_message": message,
+                "payload": payload,
+            },
+        )
+    ]
+
+
+def _delegated_terminal_lifecycle_payload(
+    task: AgentRunRecord,
+    *,
+    event_name: str,
+    parent_run_id: str,
+    level: str,
+    message: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    session_run_id = str(metadata.get("parent_session_id") or "")
+    turn_id = str(metadata.get("parent_turn_id") or "")
+    hook_id = f"agent_run_control_plane:{event_name}"
+    return {
+        "phase": "result",
+        "event_name": event_name,
+        "placement": "server",
+        "session_run_id": session_run_id,
+        "agent_run_id": parent_run_id,
+        "turn_id": turn_id,
+        "trigger_source": task.source.value,
+        "hook_id": hook_id,
+        "display_name": event_name,
+        "source": "agent_run_control_plane",
+        "handler_type": "internal",
+        "decision": "none",
+        "continue_flow": True,
+        "diagnostics": [
+            {
+                "code": "delegated_agent_run_terminal",
+                "message": message,
+                "level": level,
+                "event_name": event_name,
+                "handler_type": "internal",
+                "hook_id": hook_id,
+            }
+        ],
+        "level": level,
+        "title": event_name,
+        "message": message,
+        "user_message": message,
+        "payload": payload,
+    }
+
 
 def clamp_event_limit(
     limit: int | None,

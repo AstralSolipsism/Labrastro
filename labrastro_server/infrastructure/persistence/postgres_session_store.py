@@ -51,6 +51,12 @@ def _jsonb_safe(value: Any) -> Any:
     return value
 
 
+def _text_safe(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return str(value).replace("\x00", "\uFFFD")
+
+
 def _json(value: Any) -> str:
     return json.dumps(_jsonb_safe(value if value is not None else {}), ensure_ascii=False)
 
@@ -598,14 +604,14 @@ class PostgresSessionStore:
                 """
             ),
             {
-                "id": session.id,
-                "fingerprint": session.fingerprint,
-                "model": session.model,
+                "id": _text_safe(session.id),
+                "fingerprint": _text_safe(session.fingerprint),
+                "model": _text_safe(session.model),
                 "saved_at": _saved_at_to_dt(session.saved_at),
-                "preview": session.get_preview(),
+                "preview": _text_safe(session.get_preview()),
                 "messages": _json(session.messages),
                 "runtime_state": _json(session.runtime_state.to_dict()),
-                "active_mode": session.active_mode,
+                "active_mode": _text_safe(session.active_mode),
                 "total_prompt_tokens": session.total_prompt_tokens,
                 "total_completion_tokens": session.total_completion_tokens,
                 "has_history_content": bool(has_history_content),

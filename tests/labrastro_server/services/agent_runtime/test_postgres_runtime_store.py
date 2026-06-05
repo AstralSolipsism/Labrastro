@@ -11,14 +11,53 @@ from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
     AgentRunRequest,
 )
-from labrastro_server.services.agent_runtime.executor_backend import ExecutorRunResult
+from labrastro_server.services.agent_runtime.executor_backend import (
+    ExecutorEvent,
+    ExecutorRunResult,
+)
 from labrastro_server.services.agent_runtime.postgres_store import PostgresAgentRunStore
+from labrastro_server.services.agent_runtime.session_projection import (
+    agent_run_event_to_session_events,
+)
 
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("LABRASTRO_TEST_DATABASE_URL"),
     reason="LABRASTRO_TEST_DATABASE_URL is not configured",
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_agent_run_tables() -> None:
+    database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
+    run_migrations(database_url)
+    engine = create_postgres_engine(database_url)
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                TRUNCATE
+                    labrastro_agent_run_events,
+                    labrastro_agent_run_claims,
+                    labrastro_agent_run_sessions,
+                    labrastro_agent_run_artifacts,
+                    labrastro_agent_run_cancel_requests,
+                    labrastro_agent_runs
+                RESTART IDENTITY CASCADE
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO labrastro_agent_run_locks(name)
+                VALUES ('global_claim')
+                ON CONFLICT (name) DO NOTHING
+                """
+            )
+        )
 
 
 def _control() -> AgentRunControlPlane:
@@ -43,6 +82,42 @@ def _control() -> AgentRunControlPlane:
         },
     )
     return AgentRunControlPlane(store=store)
+
+
+def test_control_plane_initializes_postgres_store_runtime_snapshot_from_control_config() -> None:
+    database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
+    run_migrations(database_url)
+    engine = create_postgres_engine(database_url)
+    store = PostgresAgentRunStore(engine)
+    snapshot = {
+        "runtime_profiles": {
+            "fake-profile": {
+                "executor": "fake",
+                "execution_location": "daemon_worktree",
+            }
+        },
+        "agents": {
+            "pg-agent": {
+                "runtime_profile": "fake-profile",
+                "max_concurrent_tasks": 1,
+            }
+        },
+    }
+    control = AgentRunControlPlane(store=store, runtime_snapshot=snapshot)
+
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-control-store-snapshot",
+            agent_id="pg-agent",
+            prompt="snapshot smoke",
+        )
+    )
+    claim = control.claim_agent_run(worker_id="pg-worker", executors=["fake"])
+
+    assert store.runtime_snapshot == snapshot
+    assert claim is not None
+    assert claim.task.id == task.id
+    assert claim.executor_request.runtime_profile_id == "fake-profile"
 
 
 def test_postgres_runtime_store_claim_complete_and_reload() -> None:
@@ -187,6 +262,24 @@ def test_postgres_runtime_store_preserves_agent_run_budget() -> None:
     assert detail["metadata"]["budget"] == {"token_budget": 1200, "max_turns": 2}
 
 
+def test_postgres_runtime_store_claim_includes_budget_in_executor_request() -> None:
+    control = _control()
+    control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-budget-claim",
+            agent_id="pg-agent",
+            prompt="budget claim smoke",
+            executor="reuleauxcoder",
+            budget={"max_tool_calls": "2", "timeout_sec": 30},
+        )
+    )
+
+    claim = control.claim_agent_run(worker_id="pg-worker", executors=["reuleauxcoder"])
+
+    assert claim is not None
+    assert claim.executor_request.budget == {"max_tool_calls": 2, "timeout_sec": 30}
+
+
 def test_postgres_runtime_store_projects_child_terminal_event_to_parent() -> None:
     control = _control()
     parent = control.submit_agent_run(
@@ -201,7 +294,14 @@ def test_postgres_runtime_store_projects_child_terminal_event_to_parent() -> Non
             issue_id="pg-child-terminal",
             agent_id="pg-agent",
             prompt="child",
-            parent_task_id=parent.id,
+            parent_run_id=parent.id,
+            delegated_by_run_id=parent.id,
+            metadata={
+                "lifecycle_hook_id": "hook:postgres-lifecycle-agent",
+                "lifecycle_hook_source": "admin_managed",
+                "parent_session_id": "session-pg",
+                "parent_turn_id": "turn-pg",
+            },
         )
     )
 
@@ -214,10 +314,118 @@ def test_postgres_runtime_store_projects_child_terminal_event_to_parent() -> Non
     delegated = [
         event for event in parent_events if event.type == "delegated_run_completed"
     ][0]
+    lifecycle_events = [
+        event for event in parent_events if event.type == "lifecycle_hook"
+    ]
     assert delegated.payload["agent_run_id"] == child.id
-    assert delegated.payload["parent_task_id"] == parent.id
+    assert delegated.payload["parent_run_id"] == parent.id
+    assert delegated.payload["delegated_by_run_id"] == parent.id
     assert delegated.payload["status"] == "completed"
     assert delegated.payload["result"] == "child done"
+    assert [event.payload["event_name"] for event in lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert lifecycle_events[0].payload["agent_run_id"] == parent.id
+    assert lifecycle_events[0].payload["payload"]["child_agent_run_id"] == child.id
+    assert lifecycle_events[0].payload["payload"]["status"] == "completed"
+    assert lifecycle_events[0].payload["payload"]["lifecycle_hook_id"] == (
+        "hook:postgres-lifecycle-agent"
+    )
+    assert lifecycle_events[0].payload["payload"]["lifecycle_hook_source"] == (
+        "admin_managed"
+    )
+    assert lifecycle_events[0].payload["payload"]["parent_session_id"] == "session-pg"
+    assert lifecycle_events[0].payload["payload"]["parent_turn_id"] == "turn-pg"
+    assert lifecycle_events[1].payload["agent_run_id"] == parent.id
+    assert lifecycle_events[1].payload["payload"]["child_agent_run_id"] == child.id
+    assert lifecycle_events[1].payload["payload"]["status"] == "completed"
+    session_lifecycle_events = [
+        agent_run_event_to_session_events(event.to_dict())[0]
+        for event in lifecycle_events
+    ]
+    assert [payload["event_name"] for _, payload in session_lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert session_lifecycle_events[0][1]["lifecycle_hook_id"] == (
+        "hook:postgres-lifecycle-agent"
+    )
+    assert session_lifecycle_events[0][1]["lifecycle_hook_source"] == "admin_managed"
+    assert session_lifecycle_events[0][1]["parent_session_id"] == "session-pg"
+    assert session_lifecycle_events[0][1]["parent_turn_id"] == "turn-pg"
+
+
+def test_postgres_runtime_store_emits_worktree_create_lifecycle_audit() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-worktree",
+            agent_id="pg-agent",
+            prompt="worktree",
+            execution_location="daemon_worktree",
+            metadata={"worker_kind": "sandbox_worker"},
+        )
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "worktree_ready",
+            workdir="/runtime/worktrees/ws/pg-agent-task",
+            runtime_root="/runtime",
+        ),
+    )
+
+    events = control.list_events(task.id, after_seq=0)
+    lifecycle_events = [
+        event for event in events if event.type == "lifecycle_hook"
+    ]
+    assert [event.payload["event_name"] for event in lifecycle_events] == [
+        "WorktreeCreate"
+    ]
+    payload = lifecycle_events[0].payload["payload"]
+    assert payload["workdir"] == "/runtime/worktrees/ws/pg-agent-task"
+    assert payload["runtime_root"] == "/runtime"
+    assert payload["execution_location"] == "daemon_worktree"
+    assert payload["worker_kind"] == "sandbox_worker"
+    assert payload["path_space"] == "agent_run_worktree"
+
+
+def test_postgres_runtime_store_emits_worktree_remove_lifecycle_audit() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-worktree-remove",
+            agent_id="pg-agent",
+            prompt="worktree remove",
+            execution_location="daemon_worktree",
+            metadata={"worker_kind": "sandbox_worker"},
+        )
+    )
+
+    control.append_executor_event(
+        task.id,
+        ExecutorEvent.status(
+            "worktree_removed",
+            workdir="/runtime/worktrees/ws/pg-agent-task",
+            runtime_root="/runtime",
+        ),
+    )
+
+    events = control.list_events(task.id, after_seq=0)
+    lifecycle_events = [
+        event for event in events if event.type == "lifecycle_hook"
+    ]
+    assert [event.payload["event_name"] for event in lifecycle_events] == [
+        "WorktreeRemove"
+    ]
+    payload = lifecycle_events[0].payload["payload"]
+    assert payload["workdir"] == "/runtime/worktrees/ws/pg-agent-task"
+    assert payload["runtime_root"] == "/runtime"
+    assert payload["execution_location"] == "daemon_worktree"
+    assert payload["worker_kind"] == "sandbox_worker"
+    assert payload["path_space"] == "agent_run_worktree"
 
 
 def test_postgres_runtime_store_cascades_cancel_to_child_sandbox_runs() -> None:
@@ -247,8 +455,15 @@ def test_postgres_runtime_store_cascades_cancel_to_child_sandbox_runs() -> None:
             issue_id="pg-child-cancel",
             agent_id="pg-agent",
             prompt="child",
-            parent_task_id=parent.id,
+            parent_run_id=parent.id,
+            delegated_by_run_id=parent.id,
             sandbox_session_id="ssn-child",
+            metadata={
+                "lifecycle_hook_id": "hook:postgres-lifecycle-agent",
+                "lifecycle_hook_source": "admin_managed",
+                "parent_session_id": "session-pg",
+                "parent_turn_id": "turn-pg",
+            },
         )
     )
     grandchild = control.submit_agent_run(
@@ -278,8 +493,37 @@ def test_postgres_runtime_store_cascades_cancel_to_child_sandbox_runs() -> None:
     delegated = [
         event for event in parent_events if event.type == "delegated_run_completed"
     ][0]
+    lifecycle_events = [
+        event for event in parent_events if event.type == "lifecycle_hook"
+    ]
     assert delegated.payload["agent_run_id"] == child.id
+    assert delegated.payload["parent_run_id"] == parent.id
+    assert delegated.payload["delegated_by_run_id"] == parent.id
     assert delegated.payload["status"] == "cancelled"
+    assert [event.payload["event_name"] for event in lifecycle_events] == [
+        "TaskCompleted",
+        "SubagentStop",
+    ]
+    assert lifecycle_events[0].payload["payload"]["child_agent_run_id"] == child.id
+    assert lifecycle_events[0].payload["payload"]["status"] == "cancelled"
+    assert lifecycle_events[0].payload["payload"]["lifecycle_hook_id"] == (
+        "hook:postgres-lifecycle-agent"
+    )
+    assert lifecycle_events[0].payload["payload"]["lifecycle_hook_source"] == (
+        "admin_managed"
+    )
+    assert lifecycle_events[0].payload["payload"]["parent_session_id"] == "session-pg"
+    assert lifecycle_events[0].payload["payload"]["parent_turn_id"] == "turn-pg"
+    session_lifecycle_events = [
+        agent_run_event_to_session_events(event.to_dict())[0]
+        for event in lifecycle_events
+    ]
+    assert session_lifecycle_events[0][1]["lifecycle_hook_id"] == (
+        "hook:postgres-lifecycle-agent"
+    )
+    assert session_lifecycle_events[0][1]["lifecycle_hook_source"] == "admin_managed"
+    assert session_lifecycle_events[0][1]["parent_session_id"] == "session-pg"
+    assert session_lifecycle_events[0][1]["parent_turn_id"] == "turn-pg"
 
 
 def test_postgres_runtime_store_assigns_reuleauxcoder_executor_session() -> None:
