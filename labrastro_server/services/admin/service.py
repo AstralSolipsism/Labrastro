@@ -68,6 +68,7 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     LIFECYCLE_HOOK_TRUST_STATES,
     LifecycleHookRegistry,
     default_lifecycle_hook_catalog_runtime_adapters,
+    lifecycle_event_catalog_items,
     lifecycle_declarations_from_config_hooks,
     sanitize_lifecycle_hooks_for_config,
 )
@@ -99,6 +100,8 @@ from reuleauxcoder.interfaces.vscode.registration import VSCODE_CHAT_PROFILE
 ProviderTestHandler = Callable[[ProviderConfig, str, str], dict[str, Any]]
 ProviderModelsHandler = Callable[[ProviderConfig], dict[str, Any]]
 ConfigReloadHandler = Callable[[], None]
+ConfigChangeHandler = Callable[[dict[str, Any]], None]
+LifecycleHookResultsProvider = Callable[[str, str], dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +147,106 @@ SETTINGS_UI_ACTIONS: tuple[dict[str, Any], ...] = (
 )
 
 
+def lifecycle_hook_recent_results_from_agent_runs(
+    runtime_control_plane: Any,
+    source: str,
+    owner_id: str,
+    *,
+    run_limit: int = 50,
+    event_limit: int = 500,
+) -> dict[str, dict[str, Any]]:
+    if runtime_control_plane is None:
+        return {}
+    hook_prefix = f"hook:{str(source or '').strip()}:{str(owner_id or '').strip()}:"
+    if hook_prefix == "hook:::":
+        return {}
+    try:
+        runs = runtime_control_plane.list_agent_runs(limit=max(1, int(run_limit or 1)))
+    except Exception:
+        logger.debug("failed to list AgentRuns for lifecycle hook recent results", exc_info=True)
+        return {}
+
+    results: dict[str, dict[str, Any]] = {}
+    for run in [item for item in runs if isinstance(item, dict)]:
+        task_id = str(run.get("id") or run.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        try:
+            events = runtime_control_plane.list_events(
+                task_id,
+                after_seq=0,
+                limit=max(1, int(event_limit or 1)),
+            )
+        except Exception:
+            logger.debug(
+                "failed to list AgentRun events for lifecycle hook recent results",
+                exc_info=True,
+            )
+            continue
+        for event in reversed(list(events or [])):
+            if _event_attr(event, "type") != "lifecycle_hook":
+                continue
+            payload = _event_payload(event)
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            hook_id = str(data.get("hook_id") or "").strip()
+            if not hook_id.startswith(hook_prefix) or hook_id in results:
+                continue
+            results[hook_id] = _lifecycle_hook_recent_result_from_event(
+                data,
+                agent_run_id=task_id,
+            )
+    return results
+
+
+def _event_attr(event: Any, name: str) -> str:
+    if isinstance(event, dict):
+        return str(event.get(name) or "")
+    return str(getattr(event, name, "") or "")
+
+
+def _event_payload(event: Any) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event, dict) else getattr(event, "payload", None)
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _lifecycle_hook_recent_result_from_event(
+    data: dict[str, Any],
+    *,
+    agent_run_id: str,
+) -> dict[str, Any]:
+    decision = str(data.get("decision") or "none").strip() or "none"
+    error = data.get("error")
+    status = "success"
+    if error:
+        status = "error"
+    elif decision in {"deny", "denied"} or data.get("continue_flow") is False:
+        status = "denied"
+    elif decision in {"defer", "deferred"}:
+        status = "deferred"
+    summary = (
+        str(data.get("message") or "").strip()
+        or _error_summary(error)
+        or str(data.get("display_name") or data.get("event_name") or status).strip()
+    )
+    result: dict[str, Any] = {
+        "status": status,
+        "summary": summary,
+        "decision": decision,
+        "event": str(data.get("event_name") or ""),
+        "agent_run_id": agent_run_id,
+    }
+    session_run_id = str(data.get("session_run_id") or "").strip()
+    if session_run_id:
+        result["session_run_id"] = session_run_id
+    return {key: value for key, value in result.items() if value}
+
+
+def _error_summary(error: Any) -> str:
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("error") or "").strip()
+    return str(error or "").strip()
+
+
 class RemoteAdminConfigManager:
     """Read and update host-owned provider and model-profile config."""
 
@@ -152,13 +255,17 @@ class RemoteAdminConfigManager:
         config_path: Path | str | None = None,
         *,
         reload_handler: ConfigReloadHandler | None = None,
+        config_change_handler: ConfigChangeHandler | None = None,
         provider_test_handler: ProviderTestHandler | None = None,
         provider_models_handler: ProviderModelsHandler | None = None,
+        lifecycle_hook_results_provider: LifecycleHookResultsProvider | None = None,
     ) -> None:
         self.config_path = Path(config_path or ConfigLoader.GLOBAL_CONFIG_PATH)
         self.reload_handler = reload_handler
+        self.config_change_handler = config_change_handler
         self.provider_test_handler = provider_test_handler
         self.provider_models_handler = provider_models_handler
+        self.lifecycle_hook_results_provider = lifecycle_hook_results_provider
         self._lock = threading.Lock()
         self.model_capability_catalog = ModelCapabilityCatalogService(
             self.config_path.parent / "model-capabilities"
@@ -2032,6 +2139,7 @@ class RemoteAdminConfigManager:
             "mention_providers": mention_providers,
             "ui_actions": self._ui_action_catalog(),
             "agent_tools": self._agent_tool_catalog(data),
+            "lifecycle_hook_events": lifecycle_event_catalog_items(),
         }
 
     def record_environment_requirement(self, payload: dict[str, Any]) -> AdminConfigResult:
@@ -3102,10 +3210,37 @@ class RemoteAdminConfigManager:
         save_yaml_config(self.config_path, data)
         reload_error = self._reload()
         if reload_error is None:
+            self._emit_config_change(data, previous_data)
             return None
         save_yaml_config(self.config_path, previous_data)
         self._reload()
         return reload_error
+
+    def _emit_config_change(
+        self,
+        data: dict[str, Any],
+        previous_data: dict[str, Any],
+    ) -> None:
+        handler = self.config_change_handler
+        if handler is None:
+            return
+        event = {
+            "event_name": "ConfigChange",
+            "status": "committed",
+            "config_path": str(self.config_path),
+            "previous_etag": self.config_etag(previous_data),
+            "current_etag": self.config_etag(data),
+            "changed_sections": _changed_config_sections(previous_data, data),
+            "execution_target": "server",
+            "path_space": "server_config",
+            "runtime_working_directory": str(Path.cwd()),
+            "runtime_workspace_root": "",
+            "trigger_source": "admin",
+        }
+        try:
+            handler(event)
+        except Exception:
+            logger.exception("ConfigChange lifecycle handler failed for %s", self.config_path)
 
     def _load_data(self) -> dict[str, Any]:
         try:
@@ -3444,6 +3579,19 @@ class RemoteAdminConfigManager:
             "check": str(view.get("check") or ""),
             "install": str(view.get("install") or ""),
             "command": str(view.get("command") or view.get("path_hint") or ""),
+            "args": (
+                [str(item) for item in view.get("args") or []]
+                if isinstance(view.get("args"), list)
+                else []
+            ),
+            "env": (
+                {str(key): str(value) for key, value in view.get("env", {}).items()}
+                if isinstance(view.get("env"), dict)
+                else {}
+            ),
+            "cwd": str(view.get("cwd") or ""),
+            "distribution": str(view.get("distribution") or ""),
+            "transport": str(view.get("transport") or view.get("distribution") or ""),
             "path_hint": str(view.get("path_hint") or ""),
             "source_path": str(view.get("source_path") or ""),
             "install_prompt": str(view.get("install_prompt") or ""),
@@ -3508,8 +3656,23 @@ class RemoteAdminConfigManager:
                 "risk_level": "",
                 "technical": {"error": str(exc)},
             }]
+        recent_results: dict[str, Any] = {}
+        configured_results = view.get("lifecycle_hook_results")
+        if not isinstance(configured_results, dict):
+            configured_results = view.get("hook_results")
+        if isinstance(configured_results, dict):
+            recent_results.update(dict(configured_results))
+        if self.lifecycle_hook_results_provider is not None:
+            try:
+                provider_results = self.lifecycle_hook_results_provider(source, name)
+            except Exception:
+                logger.debug("failed to load lifecycle hook recent results", exc_info=True)
+                provider_results = {}
+            if isinstance(provider_results, dict):
+                recent_results.update(provider_results)
         return registry.dashboard_items(
-            runtime_adapters=default_lifecycle_hook_catalog_runtime_adapters()
+            runtime_adapters=default_lifecycle_hook_catalog_runtime_adapters(),
+            recent_results=recent_results,
         )
 
     def _chat_command_catalog(self) -> list[dict[str, Any]]:
@@ -4114,6 +4277,32 @@ class RemoteAdminConfigManager:
         if recommendation is not None:
             view["capability_recommendation"] = recommendation
         return view
+
+
+def _changed_config_sections(
+    previous_data: dict[str, Any],
+    data: dict[str, Any],
+) -> list[str]:
+    sections = sorted({str(key) for key in previous_data} | {str(key) for key in data})
+    changed: list[str] = []
+    for section in sections:
+        previous_json = json.dumps(
+            previous_data.get(section),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        current_json = json.dumps(
+            data.get(section),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if previous_json != current_json:
+            changed.append(section)
+    return changed
 
 
 def _field_or_env(payload: dict[str, Any], field_name: str, env_field_name: str) -> str | None:

@@ -112,6 +112,421 @@ def test_agent_run_log_event_projects_as_process_context() -> None:
     assert payload["level"] == "info"
 
 
+def test_lifecycle_hook_session_projection_hides_raw_technical_details() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 2,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": "PostToolUse",
+                    "hook_id": "hook:command",
+                    "display_name": "Command observer",
+                    "source": "skill",
+                    "handler_type": "command",
+                    "decision": "none",
+                    "continue_flow": True,
+                    "level": "warning",
+                    "title": "Command observer",
+                    "payload": {
+                        "tool_names": ["shell"],
+                        "technical": {
+                            "command": "RAW_COMMAND_SECRET",
+                            "stdout": "RAW_STDOUT_SECRET",
+                        },
+                    },
+                    "output": {
+                        "diagnostics": [
+                            {
+                                "code": "command_nonzero_exit",
+                                "message": "Command exited with code 1",
+                                "stdout": "RAW_STDOUT_SECRET",
+                                "stderr": "RAW_STDERR_SECRET",
+                            }
+                        ],
+                        "artifacts": [{"kind": "raw", "content": "RAW_ARTIFACT_SECRET"}],
+                    },
+                    "diagnostics": [
+                        {
+                            "code": "command_nonzero_exit",
+                            "message": "Command exited with code 1",
+                            "stdout": "RAW_STDOUT_SECRET",
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["phase"] == "result"
+    assert payload["event_name"] == "PostToolUse"
+    assert payload["hook_id"] == "hook:command"
+    assert payload["display_name"] == "Command observer"
+    assert payload["source"] == "skill"
+    assert payload["handler_type"] == "command"
+    assert payload["diagnostics"] == [
+        {"code": "command_nonzero_exit", "message": "Command exited with code 1"}
+    ]
+    assert "payload" not in payload
+    assert "output" not in payload
+    assert "technical" not in rendered
+    assert "RAW_COMMAND_SECRET" not in rendered
+    assert "RAW_STDOUT_SECRET" not in rendered
+    assert "RAW_STDERR_SECRET" not in rendered
+    assert "RAW_ARTIFACT_SECRET" not in rendered
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 2, "type": "lifecycle_hook"}
+    ]
+
+
+def test_lifecycle_hook_session_projection_exposes_overflow_artifact_refs_without_raw_values() -> None:
+    huge = "OVERSIZED_LIFECYCLE_SECRET" * 1000
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 22,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": "UserPromptSubmit",
+                    "hook_id": "hook:oversized",
+                    "display_name": "Oversized output guard",
+                    "source": "skill",
+                    "handler_type": "prompt",
+                    "decision": "deny",
+                    "continue_flow": False,
+                    "diagnostics": [
+                        {
+                            "code": "lifecycle_output_overflow",
+                            "message": "Lifecycle hook output exceeded size limits.",
+                            "artifact_refs": [
+                                "lifecycle-output-overflow:hook_oversized:1"
+                            ],
+                            "raw": huge,
+                        }
+                    ],
+                    "output": {
+                        "reason": "truncated reason",
+                        "artifacts": [
+                            {
+                                "kind": "lifecycle_output_overflow",
+                                "id": "lifecycle-output-overflow:hook_oversized:1",
+                                "field": "reason",
+                                "original_chars": len(huge),
+                                "content": huge,
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert "OVERSIZED_LIFECYCLE_SECRET" not in rendered
+    assert payload["diagnostics"] == [
+        {
+            "code": "lifecycle_output_overflow",
+            "message": "Lifecycle hook output exceeded size limits.",
+        }
+    ]
+    assert payload["artifacts"] == [
+        {
+            "kind": "lifecycle_output_overflow",
+            "id": "lifecycle-output-overflow:hook_oversized:1",
+            "field": "reason",
+            "original_chars": len(huge),
+        }
+    ]
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 22, "type": "lifecycle_hook"}
+    ]
+
+
+def test_lifecycle_hook_session_projection_preserves_output_audit_fields_without_model_only_values() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 23,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": "PreToolUse",
+                    "hook_id": "hook:pretool",
+                    "display_name": "PreToolUse guard",
+                    "source": "skill",
+                    "handler_type": "command",
+                    "decision": "deny",
+                    "continue_flow": False,
+                    "reason": "shell command blocked by lifecycle",
+                    "user_message": "This command needs review.",
+                    "diagnostics": [
+                        {
+                            "code": "lifecycle_output_field_ignored",
+                            "message": "additional_context is model-only.",
+                            "field": "additional_context",
+                            "raw": "RAW_DIAGNOSTIC_SECRET",
+                        }
+                    ],
+                    "artifacts": [
+                        {
+                            "kind": "review",
+                            "id": "artifact-1",
+                            "content": "RAW_ARTIFACT_SECRET",
+                        }
+                    ],
+                    "output": {
+                        "additional_context": [
+                            {
+                                "role": "system",
+                                "content": "RAW_MODEL_CONTEXT_SECRET",
+                            }
+                        ],
+                        "updated_input": {
+                            "tool_call": {
+                                "name": "shell",
+                                "arguments": {"command": "RAW_REWRITTEN_COMMAND"},
+                            }
+                        },
+                        "diagnostics": [
+                            {
+                                "code": "raw_output_diagnostic",
+                                "message": "RAW_OUTPUT_DIAGNOSTIC_SECRET",
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["decision"] == "deny"
+    assert payload["continue_flow"] is False
+    assert payload["reason"] == "shell command blocked by lifecycle"
+    assert payload["user_message"] == "This command needs review."
+    assert payload["diagnostics"] == [
+        {
+            "code": "lifecycle_output_field_ignored",
+            "message": "additional_context is model-only.",
+        }
+    ]
+    assert payload["artifacts"] == [{"kind": "review", "id": "artifact-1"}]
+    assert "output" not in payload
+    assert "updated_input" not in rendered
+    assert "RAW_MODEL_CONTEXT_SECRET" not in rendered
+    assert "RAW_REWRITTEN_COMMAND" not in rendered
+    assert "RAW_DIAGNOSTIC_SECRET" not in rendered
+    assert "RAW_ARTIFACT_SECRET" not in rendered
+    assert "RAW_OUTPUT_DIAGNOSTIC_SECRET" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("handler_type", "raw_fields"),
+    [
+        (
+            "prompt",
+            {
+                "prompt": "RAW_PROMPT_SECRET",
+                "completion": "RAW_COMPLETION_SECRET",
+            },
+        ),
+        (
+            "command",
+            {
+                "command": "RAW_COMMAND_SECRET",
+                "stdout": "RAW_STDOUT_SECRET",
+                "stderr": "RAW_STDERR_SECRET",
+            },
+        ),
+        (
+            "http",
+            {
+                "request_body": "RAW_HTTP_REQUEST_SECRET",
+                "response_body": "RAW_HTTP_RESPONSE_SECRET",
+            },
+        ),
+        (
+            "mcp_tool",
+            {
+                "arguments": {"secret": "RAW_MCP_ARGUMENT_SECRET"},
+                "result": "RAW_MCP_RESULT_SECRET",
+            },
+        ),
+        (
+            "agent",
+            {
+                "prompt": "RAW_AGENT_PROMPT_SECRET",
+                "result": "RAW_AGENT_RESULT_SECRET",
+            },
+        ),
+        (
+            "internal",
+            {
+                "legacy_context": "RAW_INTERNAL_CONTEXT_SECRET",
+                "result": "RAW_INTERNAL_RESULT_SECRET",
+            },
+        ),
+    ],
+)
+def test_lifecycle_hook_session_projection_hides_handler_raw_outputs(
+    handler_type: str,
+    raw_fields: dict,
+) -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 3,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": "PostToolUse",
+                    "hook_id": f"hook:{handler_type}",
+                    "display_name": f"{handler_type} observer",
+                    "source": "skill",
+                    "handler_type": handler_type,
+                    "payload": {
+                        "tool_names": ["shell"],
+                        "technical": dict(raw_fields),
+                    },
+                    "technical": {
+                        "handler_ref": "RAW_HANDLER_REF_SECRET",
+                        **raw_fields,
+                    },
+                    "output": {
+                        "raw": dict(raw_fields),
+                        "diagnostics": [
+                            {
+                                "code": f"{handler_type}_failed_open",
+                                "message": f"{handler_type} failed open",
+                                **raw_fields,
+                            }
+                        ],
+                        "artifacts": [
+                            {
+                                "kind": "raw",
+                                "content": (
+                                    f"RAW_{handler_type.upper()}_ARTIFACT_SECRET"
+                                ),
+                            }
+                        ],
+                    },
+                    "diagnostics": [
+                        {
+                            "code": f"{handler_type}_failed_open",
+                            "message": f"{handler_type} failed open",
+                            **raw_fields,
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["handler_type"] == handler_type
+    assert payload["diagnostics"] == [
+        {
+            "code": f"{handler_type}_failed_open",
+            "message": f"{handler_type} failed open",
+        }
+    ]
+    assert "payload" not in payload
+    assert "technical" not in rendered
+    assert "RAW_HANDLER_REF_SECRET" not in rendered
+    for raw_value in raw_fields.values():
+        if isinstance(raw_value, dict):
+            for nested_value in raw_value.values():
+                assert str(nested_value) not in rendered
+            continue
+        assert str(raw_value) not in rendered
+    assert f"RAW_{handler_type.upper()}_ARTIFACT_SECRET" not in rendered
+
+
+@pytest.mark.parametrize(
+    "handler_type",
+    ["prompt", "command", "http", "mcp_tool", "agent", "internal"],
+)
+def test_lifecycle_hook_session_projection_preserves_success_result_for_each_handler_type(
+    handler_type: str,
+) -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 4,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": "PostToolUse",
+                    "hook_id": f"hook:{handler_type}",
+                    "display_name": f"{handler_type} observer",
+                    "source": "skill",
+                    "handler_type": handler_type,
+                    "decision": "none",
+                    "continue_flow": True,
+                    "level": "info",
+                    "message": f"{handler_type} lifecycle hook completed",
+                    "payload": {
+                        "tool_names": ["shell"],
+                        "tool_call_ids": ["call-1"],
+                        "tool_sources": ["builtin"],
+                    },
+                    "diagnostics": [
+                        {
+                            "code": f"{handler_type}_ok",
+                            "message": f"{handler_type} completed",
+                            "handler_type": handler_type,
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    assert payload["phase"] == "result"
+    assert payload["event_name"] == "PostToolUse"
+    assert payload["hook_id"] == f"hook:{handler_type}"
+    assert payload["handler_type"] == handler_type
+    assert payload["decision"] == "none"
+    assert payload["continue_flow"] is True
+    assert payload["message"] == f"{handler_type} lifecycle hook completed"
+    assert payload["tool_names"] == ["shell"]
+    assert payload["tool_call_ids"] == ["call-1"]
+    assert payload["tool_sources"] == ["builtin"]
+    assert payload["diagnostics"] == [
+        {
+            "code": f"{handler_type}_ok",
+            "message": f"{handler_type} completed",
+            "handler_type": handler_type,
+        }
+    ]
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 4, "type": "lifecycle_hook"}
+    ]
+
+
 def test_delegated_agent_run_completion_projects_as_process_context() -> None:
     session_events = agent_run_event_to_session_events(
         {
@@ -171,6 +586,288 @@ def test_agent_run_lifecycle_hook_event_projects_as_lifecycle_hook_session_event
     ]
 
 
+def test_agent_run_usage_event_projects_lifecycle_prompt_token_accounting() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 4,
+            "type": "usage",
+            "payload": {
+                "type": "usage",
+                "data": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 10,
+                    "run_status": "running",
+                    "usage_extra": {
+                        "lifecycle_prompt": {
+                            "hook_id": "hook:prompt-review",
+                            "provider": "test",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    assert session_events[0][0] == "context_event"
+    payload = session_events[0][1]
+    assert payload["phase"] == "agent_run_usage"
+    assert payload["usage"]["prompt_tokens"] == 7
+    assert payload["usage"]["completion_tokens"] == 10
+    assert payload["usage"]["usage_extra"]["lifecycle_prompt"]["hook_id"] == (
+        "hook:prompt-review"
+    )
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 4, "type": "usage"}
+    ]
+
+
+def test_agent_run_session_start_projects_final_prompt_to_session_document() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 5,
+            "type": "session_run_start",
+            "payload": {
+                "type": "session_run_start",
+                "data": {"prompt": "rewritten prompt"},
+            },
+        }
+    )
+
+    document = None
+    for seq, (event_type, payload) in enumerate(session_events, start=1):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=seq,
+            session_run_id="run-1",
+            session_run_seq=seq,
+        )
+
+    assert [event_type for event_type, _ in session_events] == ["session_run_start"]
+    assert document["turns"][0]["userMessage"]["text"] == "rewritten prompt"
+    assert document["session"]["title"] == "rewritten prompt"
+    assert document["stats"]["taskText"] == "rewritten prompt"
+    assert document["turns"][0]["userMessage"]["rawEventRefs"] == [
+        {"agent_run_id": "run-1", "seq": 5, "type": "session_run_start"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "event_name",
+    ["PostToolUse", "PostToolUseFailure", "PostToolBatch"],
+)
+def test_post_tool_lifecycle_diagnostics_project_user_safely(
+    event_name: str,
+) -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 6,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": event_name,
+                    "hook_id": "hook:post-tool-audit",
+                    "display_name": "Post tool audit",
+                    "source": "skill",
+                    "handler_type": "prompt",
+                    "payload": {
+                        "tool_names": ["write_file"],
+                        "tool_call_ids": ["call-1"],
+                        "tool_sources": ["builtin"],
+                        "mcp_servers": ["github"],
+                        "technical": {
+                            "tool_names": ["RAW_TECHNICAL_TOOL"],
+                            "trace": "RAW_TRACE_SECRET",
+                        },
+                    },
+                    "diagnostics": [
+                        {
+                            "code": "post_tool_review",
+                            "message": "Post-tool review recorded.",
+                            "stdout": "RAW_STDOUT_SECRET",
+                        }
+                    ],
+                    "output": {
+                        "diagnostics": [
+                            {
+                                "code": "raw_output_diag",
+                                "message": "RAW_OUTPUT_SECRET",
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["event_name"] == event_name
+    assert payload["tool_names"] == ["write_file"]
+    assert payload["tool_call_ids"] == ["call-1"]
+    assert payload["tool_sources"] == ["builtin"]
+    assert payload["mcp_servers"] == ["github"]
+    assert payload["diagnostics"] == [
+        {"code": "post_tool_review", "message": "Post-tool review recorded."}
+    ]
+    assert "technical" not in rendered
+    assert "RAW_TECHNICAL_TOOL" not in rendered
+    assert "RAW_TRACE_SECRET" not in rendered
+    assert "RAW_STDOUT_SECRET" not in rendered
+    assert "RAW_OUTPUT_SECRET" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("event_name", "message", "artifact_kind"),
+    [
+        ("Stop", "Final review recorded.", "review"),
+        ("StopFailure", "Lifecycle recovery: retry after reconnecting.", "failure_report"),
+    ],
+)
+def test_terminal_lifecycle_session_projection_keeps_message_and_safe_artifact_refs(
+    event_name: str,
+    message: str,
+    artifact_kind: str,
+) -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 4,
+            "type": "lifecycle_hook",
+            "payload": {
+                "type": "lifecycle_hook",
+                "data": {
+                    "phase": "result",
+                    "event_name": event_name,
+                    "hook_id": f"hook:{event_name.lower()}",
+                    "display_name": f"{event_name} review",
+                    "level": "warning",
+                    "message": message,
+                    "artifacts": [
+                        {
+                            "kind": artifact_kind,
+                            "id": "artifact-1",
+                            "content": "RAW_ARTIFACT_SECRET",
+                        }
+                    ],
+                    "diagnostics": [
+                        {
+                            "code": "lifecycle_output_field_ignored",
+                            "message": "decision ignored",
+                            "field": "decision",
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["lifecycle_hook"]
+    payload = session_events[0][1]
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["event_name"] == event_name
+    assert payload["message"] == message
+    assert payload["artifacts"] == [{"kind": artifact_kind, "id": "artifact-1"}]
+    assert payload["diagnostics"] == [
+        {"code": "lifecycle_output_field_ignored", "message": "decision ignored"}
+    ]
+    assert "RAW_ARTIFACT_SECRET" not in rendered
+
+
+def test_mcp_elicitation_lifecycle_projects_safe_runtime_context() -> None:
+    session_events = []
+    for seq, (event_name, phase, extra_payload) in enumerate(
+        [
+            (
+                "Elicitation",
+                "request",
+                {
+                    "message": "Choose repository",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"token": {"description": "RAW_SCHEMA_SECRET"}},
+                    },
+                    "tool_arguments": {"query": "RAW_TOOL_ARGUMENT_SECRET"},
+                },
+            ),
+            (
+                "ElicitationResult",
+                "result",
+                {
+                    "message": "MCP elicitation accepted.",
+                    "result_action": "accept",
+                    "result_content": {"token": "RAW_RESULT_SECRET"},
+                },
+            ),
+        ],
+        start=10,
+    ):
+        session_events.extend(
+            agent_run_event_to_session_events(
+                {
+                    "agent_run_id": "run-1",
+                    "seq": seq,
+                    "type": "lifecycle_hook",
+                    "payload": {
+                        "type": "lifecycle_hook",
+                        "data": {
+                            "event_type": "lifecycle_hook",
+                            "phase": phase,
+                            "event_name": event_name,
+                            "placement": "server",
+                            "session_run_id": "session-1",
+                            "agent_run_id": "run-1",
+                            "turn_id": "turn-1",
+                            "tool_call_id": "call-mcp-1",
+                            "tool_name": "search",
+                            "mcp_server": "docs",
+                            "trigger_source": "mcp",
+                            "source": "mcp_server",
+                            "decision": "none",
+                            "continue_flow": True,
+                            "level": "info",
+                            "title": event_name,
+                            "message": extra_payload["message"],
+                            "payload": {
+                                "tool_call_id": "call-mcp-1",
+                                "tool_name": "search",
+                                "mcp_server": "docs",
+                                **extra_payload,
+                            },
+                        },
+                    },
+                }
+            )
+        )
+
+    assert [event_type for event_type, _payload in session_events] == [
+        "lifecycle_hook",
+        "lifecycle_hook",
+    ]
+    request_payload = session_events[0][1]
+    result_payload = session_events[1][1]
+    rendered = json.dumps([request_payload, result_payload], ensure_ascii=False)
+    assert request_payload["event_name"] == "Elicitation"
+    assert request_payload.get("tool_name") == "search"
+    assert request_payload.get("tool_call_id") == "call-mcp-1"
+    assert request_payload["mcp_server"] == "docs"
+    assert request_payload["message"] == "Choose repository"
+    assert result_payload["event_name"] == "ElicitationResult"
+    assert result_payload["result_action"] == "accept"
+    assert result_payload["message"] == "MCP elicitation accepted."
+    assert "RAW_SCHEMA_SECRET" not in rendered
+    assert "RAW_TOOL_ARGUMENT_SECRET" not in rendered
+    assert "RAW_RESULT_SECRET" not in rendered
+
+
 def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
     start_events = agent_run_event_to_session_events(
         {
@@ -210,6 +907,271 @@ def test_agent_run_tool_events_project_with_stable_tool_identity() -> None:
     assert end_events[0][1]["tool_name"] == "fetch_capabilities"
     assert start_events[0][1]["tool_call_id"] == "call-1"
     assert end_events[0][1]["tool_call_id"] == "call-1"
+
+
+def test_agent_run_tool_use_projection_preserves_lifecycle_transformed_args() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 7,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "write_file",
+                    "tool_call_id": "call-1",
+                    "input": {
+                        "path": "safe.txt",
+                        "content": "rewritten content",
+                    },
+                    "meta": {
+                        "lifecycle_updated_input": {
+                            "original_path": "unsafe.txt",
+                            "hook_id": "hook:rewrite-tool-call",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    assert [event_type for event_type, _ in session_events] == ["tool_call_start"]
+    payload = session_events[0][1]
+    assert payload.get("tool_name") == "write_file"
+    assert payload.get("tool_call_id") == "call-1"
+    assert payload["tool_args"] == {
+        "path": "safe.txt",
+        "content": "rewritten content",
+    }
+    assert "unsafe.txt" not in json.dumps(payload["tool_args"], ensure_ascii=False)
+
+
+def test_permission_denied_feedback_projects_through_tool_result_session_event() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 3,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "data": {
+                    "tool_name": "write_file",
+                    "tool_call_id": "call-denied",
+                    "output": (
+                        "Error: tool 'write_file' denied by permission gateway: "
+                        "write_file denied by policy\n"
+                        "Permission feedback: Use read_file or ask for write_file capability."
+                    ),
+                    "meta": {
+                        "tool_diagnostics": [
+                            {
+                                "code": "permission_deny",
+                                "metadata": {
+                                    "permission": {
+                                        "action": "deny",
+                                        "authorized": False,
+                                        "audit": {
+                                            "permission_denied_lifecycle": [
+                                                {
+                                                    "hook_id": (
+                                                        "hook:permission-denied-feedback"
+                                                    ),
+                                                    "user_message": (
+                                                        "Use read_file or ask for "
+                                                        "write_file capability."
+                                                    ),
+                                                    "diagnostics": [
+                                                        {
+                                                            "code": (
+                                                                "recoverable_permission_denied"
+                                                            )
+                                                        }
+                                                    ],
+                                                }
+                                            ]
+                                        },
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+    )
+
+    assert session_events[0][0] == "tool_call_end"
+    payload = session_events[0][1]
+    assert payload.get("tool_name") == "write_file"
+    assert payload.get("tool_call_id") == "call-denied"
+    assert "Permission feedback: Use read_file" in payload["tool_result"]
+    lifecycle_audit = payload["meta"]["meta"]["tool_diagnostics"][0]["metadata"][
+        "permission"
+    ]["audit"]["permission_denied_lifecycle"]
+    assert lifecycle_audit[0]["hook_id"] == "hook:permission-denied-feedback"
+    assert lifecycle_audit[0]["diagnostics"][0]["code"] == "recoverable_permission_denied"
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 3, "type": "tool_result"}
+    ]
+
+
+def test_pre_tool_terminal_gate_projects_lifecycle_audit_and_blocked_tool_result() -> None:
+    session_events = agent_run_events_to_session_events(
+        [
+            {
+                "agent_run_id": "run-1",
+                "seq": 2,
+                "type": "lifecycle_hook",
+                "payload": {
+                    "type": "lifecycle_hook",
+                    "data": {
+                        "phase": "result",
+                        "event_name": "PreToolUse",
+                        "hook_id": "hook:pretool-risk",
+                        "display_name": "Pre-tool risk guard",
+                        "source": "skill",
+                        "handler_type": "prompt",
+                        "decision": "defer",
+                        "continue_flow": True,
+                        "level": "info",
+                        "payload": {
+                            "tool_names": ["read_file"],
+                            "tool_call_ids": ["call-pretool"],
+                            "tool_sources": ["builtin"],
+                            "mcp_servers": [],
+                            "technical": {"tool_call": {"arguments": {"path": "secret.txt"}}},
+                        },
+                        "output": {
+                            "decision": "defer",
+                            "reason": "read_file deferred by lifecycle",
+                        },
+                    },
+                },
+            },
+            {
+                "agent_run_id": "run-1",
+                "seq": 3,
+                "type": "tool_result",
+                "payload": {
+                    "type": "tool_result",
+                    "data": {
+                        "tool_name": "read_file",
+                        "tool_call_id": "call-pretool",
+                        "output": "read_file deferred by lifecycle",
+                        "meta": {
+                            "tool_diagnostics": [
+                                {
+                                    "stage": "preflight",
+                                    "kind": "tool_result_error",
+                                    "severity": "error",
+                                    "code": "lifecycle_pre_tool_denied",
+                                    "message": "read_file deferred by lifecycle",
+                                }
+                            ]
+                        },
+                    },
+                },
+            },
+        ]
+    )
+
+    assert [event_type for event_type, _ in session_events] == [
+        "lifecycle_hook",
+        "tool_call_end",
+    ]
+    lifecycle_payload = session_events[0][1]
+    assert lifecycle_payload["event_name"] == "PreToolUse"
+    assert lifecycle_payload["decision"] == "defer"
+    assert lifecycle_payload["hook_id"] == "hook:pretool-risk"
+    assert lifecycle_payload["tool_names"] == ["read_file"]
+    rendered_lifecycle = json.dumps(lifecycle_payload, ensure_ascii=False, sort_keys=True)
+    assert "secret.txt" not in rendered_lifecycle
+    assert lifecycle_payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 2, "type": "lifecycle_hook"}
+    ]
+
+    tool_payload = session_events[1][1]
+    assert tool_payload.get("tool_name") == "read_file"
+    assert tool_payload.get("tool_call_id") == "call-pretool"
+    assert tool_payload["tool_result"] == "read_file deferred by lifecycle"
+    diagnostic = tool_payload["meta"]["meta"]["tool_diagnostics"][0]
+    assert diagnostic["code"] == "lifecycle_pre_tool_denied"
+    assert diagnostic["message"] == "read_file deferred by lifecycle"
+    assert tool_payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 3, "type": "tool_result"}
+    ]
+
+
+def test_permission_request_terminal_gate_projects_final_permission_audit() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 4,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "data": {
+                    "tool_name": "shell",
+                    "tool_call_id": "call-shell",
+                    "output": (
+                        "Error: tool 'shell' denied by permission gateway: "
+                        "shell blocked by lifecycle"
+                    ),
+                    "meta": {
+                        "tool_diagnostics": [
+                            {
+                                "stage": "preflight",
+                                "kind": "tool_result_error",
+                                "severity": "error",
+                                "code": "permission_deny",
+                                "message": "shell blocked by lifecycle",
+                                "metadata": {
+                                    "permission": {
+                                        "action": "deny",
+                                        "authorized": False,
+                                        "policy_matched": "lifecycle_hook:deny",
+                                        "audit": {
+                                            "lifecycle_hooks": [
+                                                {
+                                                    "hook_id": "hook:shell-permission",
+                                                    "display_name": "Shell guard",
+                                                    "handler_type": "command",
+                                                    "decision": "deny",
+                                                    "reason": "shell blocked by lifecycle",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+    )
+
+    assert session_events[0][0] == "tool_call_end"
+    payload = session_events[0][1]
+    assert payload.get("tool_name") == "shell"
+    assert payload.get("tool_call_id") == "call-shell"
+    assert "shell blocked by lifecycle" in payload["tool_result"]
+    diagnostic = payload["meta"]["meta"]["tool_diagnostics"][0]
+    permission = diagnostic["metadata"]["permission"]
+    assert permission["action"] == "deny"
+    assert permission["policy_matched"] == "lifecycle_hook:deny"
+    assert permission["audit"]["lifecycle_hooks"] == [
+        {
+            "hook_id": "hook:shell-permission",
+            "display_name": "Shell guard",
+            "handler_type": "command",
+            "decision": "deny",
+            "reason": "shell blocked by lifecycle",
+        }
+    ]
+    assert payload["raw_event_refs"] == [
+        {"agent_run_id": "run-1", "seq": 4, "type": "tool_result"}
+    ]
 
 
 def test_agent_run_tool_result_projects_large_output_as_raw_audit_summary() -> None:
@@ -400,6 +1362,69 @@ def test_agent_run_projection_summarizes_large_batched_text() -> None:
     assert "open raw events for the complete content" in payload["content"]
     assert payload["content_projection"]["content_truncated"] is True
     assert [item["seq"] for item in payload["raw_event_refs"]] == list(range(1, 12))
+
+
+def test_agent_run_session_run_end_projects_budget_exceeded_terminal_state() -> None:
+    session_events = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "run-1",
+            "seq": 3,
+            "type": "session_run_end",
+            "payload": {
+                "type": "session_run_end",
+                "data": {
+                    "response": "(AgentRun budget exceeded: max_turns=1)",
+                    "response_rendered": True,
+                    "status": "budget_exceeded",
+                    "error": "AgentRun budget exceeded: max_turns=1",
+                    "session_state": "budget_exceeded",
+                },
+            },
+        }
+    )
+
+    assert session_events == [
+        (
+            "session_run_end",
+            {
+                "agent_run_id": "run-1",
+                "agent_id": "agent",
+                "workflow": "agent_run",
+                "raw_event_refs": [
+                    {"agent_run_id": "run-1", "seq": 3, "type": "session_run_end"}
+                ],
+                "response": "(AgentRun budget exceeded: max_turns=1)",
+                "response_rendered": True,
+                "status": "budget_exceeded",
+                "error": "AgentRun budget exceeded: max_turns=1",
+                "session_state": "budget_exceeded",
+            },
+        )
+    ]
+
+    document = apply_session_event(
+        None,
+        session_id="session-1",
+        event_type="session_run_start",
+        payload={"prompt": "inspect repo"},
+        session_event_seq=1,
+        session_run_id="session-run-1",
+        session_run_seq=1,
+    )
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type=session_events[0][0],
+        payload=session_events[0][1],
+        session_event_seq=2,
+        session_run_id="session-run-1",
+        session_run_seq=2,
+    )
+
+    assert document["run_state"]["status"] == "budget_exceeded"
+    assert document["stats"]["runStatus"] == "budget_exceeded"
+    assert document["run_state"]["error"] == "AgentRun budget exceeded: max_turns=1"
+    assert document["session"]["state"] == "budget_exceeded"
 
 
 def test_project_notes_input_creates_read_only_ingest_run() -> None:
@@ -929,12 +1954,22 @@ def test_package_installer_preserves_lifecycle_hooks_for_package_components_and_
                     "kind": "skill",
                     "name": "code-review",
                     "skill_content": skill_content,
+                    "runtime_footprint": {
+                        "runs_on": "local_peer",
+                        "install_required_on": ["local_peer"],
+                        "config_required_on": ["local_peer"],
+                    },
                     "hooks": skill_hooks,
                 },
                 {
                     "kind": "mcp_server",
                     "name": "github",
                     "command": "github-mcp-server",
+                    "runtime_footprint": {
+                        "runs_on": "local_peer",
+                        "install_required_on": ["local_peer"],
+                        "config_required_on": ["local_peer"],
+                    },
                     "hooks": mcp_hooks,
                 },
             ],
@@ -949,6 +1984,43 @@ def test_package_installer_preserves_lifecycle_hooks_for_package_components_and_
     assert data["capability_components"]["mcp_server:github"]["hooks"] == expected_mcp_hooks
     assert data["skills"]["items"]["code-review"]["hooks"] == expected_skill_hooks
     assert data["mcp"]["servers"]["github"]["hooks"] == expected_mcp_hooks
+    assert data["capability_packages"]["review"]["runtime_footprint"]["runs_on"] == "local_peer"
+    assert data["capability_components"]["skill:code-review"]["runtime_footprint"]["runs_on"] == "local_peer"
+    assert data["capability_components"]["mcp_server:github"]["runtime_footprint"]["runs_on"] == "local_peer"
+    assert data["skills"]["items"]["code-review"]["runtime_footprint"]["runs_on"] == "local_peer"
+    assert data["mcp"]["servers"]["github"]["runtime_footprint"]["runs_on"] == "local_peer"
+    assert data["mcp"]["servers"]["github"]["placement"] == "peer"
+
+
+def test_package_installer_does_not_auto_grant_agent_capability_refs(tmp_path) -> None:
+    data: dict[str, object] = {
+        "agents": {
+            "coder": {
+                "id": "coder",
+                "capability_refs": [],
+            }
+        }
+    }
+
+    CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        data,
+        {
+            "id": "review",
+            "components": [
+                {
+                    "kind": "mcp_server",
+                    "name": "github",
+                    "command": "github-mcp-server",
+                    "args": ["stdio"],
+                    "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},
+                },
+            ],
+        },
+    )
+
+    assert data["agents"]["coder"]["capability_refs"] == []
+    assert "review" in data["capability_packages"]
+    assert "github" in data["mcp"]["servers"]
 
 
 def test_package_installer_rejects_invalid_lifecycle_hook_before_config_write(tmp_path) -> None:
@@ -981,6 +2053,41 @@ def test_package_installer_rejects_invalid_lifecycle_hook_before_config_write(tm
 
     assert exc_info.value.error == "invalid_lifecycle_hook"
     assert "placement" in exc_info.value.message
+    assert data == {}
+
+
+def test_package_installer_rejects_internal_lifecycle_handler_before_config_write(
+    tmp_path,
+) -> None:
+    data: dict[str, object] = {}
+
+    with pytest.raises(CapabilityPackageIngestError) as exc_info:
+        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+            data,
+            {
+                "id": "review",
+                "hooks": [
+                    {
+                        "event": "PreToolUse",
+                        "handler_type": "internal",
+                        "handler_ref": "memory_context",
+                        "display_name": "Unsafe internal hook",
+                        "summary": "Attempts to call Python hooks from package config.",
+                        "permissions": [],
+                    }
+                ],
+                "components": [
+                    {
+                        "kind": "mcp_server",
+                        "name": "github",
+                        "command": "github-mcp-server",
+                    }
+                ],
+            },
+        )
+
+    assert exc_info.value.error == "invalid_lifecycle_hook"
+    assert "internal handlers" in exc_info.value.message
     assert data == {}
 
 
