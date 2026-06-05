@@ -1,11 +1,14 @@
 ﻿"""Tests for ContextManager wall-hit progressive compression state machine."""
 
+from types import SimpleNamespace
+
 from reuleauxcoder.domain.context.manager import (
     MESSAGE_TOKEN_KEY,
     ContextManager,
     estimate_message_tokens,
     estimate_tokens,
 )
+from reuleauxcoder.domain.hooks.lifecycle import LifecycleHookOutput
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 
 
@@ -52,6 +55,30 @@ def _make_snippable_tool_messages(count: int = 11) -> list[dict]:
         tool_message["tool_call_id"] = tool_call_id
         messages.append(tool_message)
     return messages
+
+
+class _CompressionLifecycleAgent:
+    def __init__(self, pre_output: LifecycleHookOutput | None = None) -> None:
+        self.pre_output = pre_output or LifecycleHookOutput()
+        self.calls: list[SimpleNamespace] = []
+
+    def _dispatch_agent_lifecycle_event(
+        self,
+        event_name: str,
+        *,
+        payload: dict,
+        metadata: dict | None = None,
+        fail_closed_message: str | None = None,  # noqa: ARG002
+    ):
+        self.calls.append(
+            SimpleNamespace(
+                event_name=event_name,
+                payload=payload,
+                metadata=dict(metadata or {}),
+            )
+        )
+        output = self.pre_output if event_name == "PreCompact" else LifecycleHookOutput()
+        return [SimpleNamespace(output=output)]
 
 
 class TestWallHitStateMachine:
@@ -259,6 +286,56 @@ class TestWallHitStateMachine:
         assert context_events[1].data["before_message_count"] == 8
         assert context_events[1].data["after_message_count"] < 8
 
+    def test_pre_compact_lifecycle_denial_blocks_compression_before_mutation(self) -> None:
+        ui_bus = UIEventBus()
+        manager = ContextManager(max_tokens=1000, ui_bus=ui_bus)
+        manager._collapse_at = 1
+        agent = _CompressionLifecycleAgent(
+            LifecycleHookOutput(
+                decision="deny",
+                continue_flow=False,
+                user_message="Keep full context.",
+            )
+        )
+        manager.bind_lifecycle_agent(agent)
+        messages = [_make_user_message(100) for _ in range(8)]
+        original_contents = [
+            {"role": message.get("role"), "content": message.get("content")}
+            for message in messages
+        ]
+
+        assert manager.maybe_compress(messages, llm=None) is False
+
+        assert [
+            {"role": message.get("role"), "content": message.get("content")}
+            for message in messages
+        ] == original_contents
+        assert [call.event_name for call in agent.calls] == ["PreCompact"]
+        assert agent.calls[0].payload["before_message_count"] == 8
+        assert ui_bus._history == []
+
+    def test_compaction_dispatches_pre_and_post_lifecycle_boundaries(self) -> None:
+        ui_bus = UIEventBus()
+        manager = ContextManager(max_tokens=1000, ui_bus=ui_bus)
+        manager._collapse_at = 1
+        agent = _CompressionLifecycleAgent()
+        manager.bind_lifecycle_agent(agent)
+        messages = [_make_user_message(100) for _ in range(8)]
+
+        assert manager.maybe_compress(messages, llm=None) is True
+
+        assert [call.event_name for call in agent.calls] == [
+            "PreCompact",
+            "PostCompact",
+        ]
+        assert agent.calls[0].payload["before_message_count"] == 8
+        assert agent.calls[1].payload["after_message_count"] < 8
+        assert agent.calls[1].payload["applied_layers"] == ["hard_collapse"]
+        context_events = [
+            event for event in ui_bus._history if event.kind == UIEventKind.CONTEXT
+        ]
+        assert [event.data["phase"] for event in context_events] == ["before", "after"]
+
     def test_force_compress_success_emits_context_ui_events(self) -> None:
         """Manual force compression should use the same detailed UI event path."""
 
@@ -304,6 +381,23 @@ class TestWallHitStateMachine:
             assert context_events[1].data["after_tokens"] == manager.get_context_tokens(
                 messages
             )
+
+    def test_force_compress_post_compact_lifecycle_reports_manual_trigger(self) -> None:
+        manager = ContextManager()
+        agent = _CompressionLifecycleAgent()
+        manager.bind_lifecycle_agent(agent)
+        messages = [{"role": "user", "content": f"message {i}"} for i in range(5)]
+
+        assert manager.force_compress(messages, "collapse", llm=None) is True
+
+        assert [call.event_name for call in agent.calls] == [
+            "PreCompact",
+            "PostCompact",
+        ]
+        assert agent.calls[0].payload["trigger"] == "manual"
+        assert agent.calls[0].payload["requested_strategy"] == "collapse"
+        assert agent.calls[1].payload["trigger"] == "manual"
+        assert agent.calls[1].payload["requested_strategy"] == "collapse"
 
     def test_strategy_description_uses_configured_recent_turn_count(self) -> None:
         manager = ContextManager(summarize_keep_recent_turns=7)

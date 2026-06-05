@@ -3,6 +3,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Any
 
+from reuleauxcoder.domain.hooks.lifecycle_policy import lifecycle_gate_output_is_terminal
+
 if TYPE_CHECKING:
     from reuleauxcoder.services.llm.client import LLM
     from reuleauxcoder.interfaces.events import UIEventBus
@@ -201,6 +203,10 @@ class ContextManager:
         self._snip_hit_count = 0
         self._summarize_hit_count = 0
         self._max_hits = 3
+        self._lifecycle_agent: Any | None = None
+
+    def bind_lifecycle_agent(self, agent: Any) -> None:
+        self._lifecycle_agent = agent
 
     def get_context_tokens(self, messages: list[dict]) -> int:
         """Get current locally-estimated context token count."""
@@ -237,6 +243,13 @@ class ContextManager:
         applied_layers: list[str] = []
 
         current = before_tokens
+        if self._compression_would_attempt(current, messages) and self._pre_compact_denied(
+            before_tokens=before_tokens,
+            before_message_count=before_message_count,
+            before_snapshot=before_snapshot,
+            trigger="auto",
+        ):
+            return False
 
         # Layer 3: Hard collapse - unconditional fallback
         if current > self._collapse_at and len(messages) > 4:
@@ -350,6 +363,7 @@ class ContextManager:
                 before_snapshot=before_snapshot,
                 after_messages=messages,
                 applied_layers=applied_layers,
+                trigger="auto",
             )
 
         return compressed
@@ -365,6 +379,16 @@ class ContextManager:
         before_message_count = len(messages)
         before_snapshot = self._snapshot_messages(messages)
         applied_layer: str | None = None
+        if strategy not in {"snip", "summarize", "collapse"}:
+            return False
+        if self._pre_compact_denied(
+            before_tokens=before_tokens,
+            before_message_count=before_message_count,
+            before_snapshot=before_snapshot,
+            trigger="manual",
+            requested_strategy=strategy,
+        ):
+            return False
 
         if strategy == "snip":
             changed = self._snip_tool_outputs(messages)
@@ -378,6 +402,8 @@ class ContextManager:
                     before_snapshot=before_snapshot,
                     after_messages=messages,
                     applied_layers=[applied_layer],
+                    trigger="manual",
+                    requested_strategy=strategy,
                 )
             return changed
         if strategy == "summarize":
@@ -394,6 +420,8 @@ class ContextManager:
                     before_snapshot=before_snapshot,
                     after_messages=messages,
                     applied_layers=[applied_layer],
+                    trigger="manual",
+                    requested_strategy=strategy,
                 )
             return changed
         if strategy == "collapse":
@@ -409,9 +437,128 @@ class ContextManager:
                 before_snapshot=before_snapshot,
                 after_messages=messages,
                 applied_layers=[applied_layer],
+                trigger="manual",
+                requested_strategy=strategy,
             )
             return True
         return False
+
+    def _compression_would_attempt(self, current_tokens: int, messages: list[dict]) -> bool:
+        if current_tokens > self._collapse_at and len(messages) > 4:
+            return True
+        if current_tokens > self._summarize_at:
+            return True
+        return current_tokens > self._snip_at and not self._snip_exhausted
+
+    def _pre_compact_denied(
+        self,
+        *,
+        before_tokens: int,
+        before_message_count: int,
+        before_snapshot: list[dict[str, Any]],
+        trigger: str,
+        requested_strategy: str | None = None,
+    ) -> bool:
+        payload = self._pre_compact_payload(
+            before_tokens=before_tokens,
+            before_message_count=before_message_count,
+            before_snapshot=before_snapshot,
+            trigger=trigger,
+            requested_strategy=requested_strategy,
+        )
+        for result in self._dispatch_compression_lifecycle(
+            "PreCompact",
+            payload=payload,
+            metadata={"compression_trigger": trigger},
+            fail_closed_message="PreCompact lifecycle dispatch failed",
+        ):
+            output = getattr(result, "output", None)
+            if output is not None and lifecycle_gate_output_is_terminal(output):
+                return True
+        return False
+
+    def _dispatch_post_compact_lifecycle(
+        self,
+        *,
+        before_tokens: int,
+        before_message_count: int,
+        before_snapshot: list[dict[str, Any]],
+        after_messages: list[dict],
+        applied_layers: list[str],
+        trigger: str,
+        requested_strategy: str | None = None,
+    ) -> None:
+        after_tokens = self.get_context_tokens(after_messages)
+        after_message_count = len(after_messages)
+        after_snapshot = self._snapshot_messages(after_messages)
+        payload = {
+            **self._pre_compact_payload(
+                before_tokens=before_tokens,
+                before_message_count=before_message_count,
+                before_snapshot=before_snapshot,
+                trigger=trigger,
+                requested_strategy=requested_strategy,
+            ),
+            "after_tokens": after_tokens,
+            "after_message_count": after_message_count,
+            "token_delta": after_tokens - before_tokens,
+            "message_delta": after_message_count - before_message_count,
+            "after_context": after_snapshot,
+            "strategy": self._describe_strategy(applied_layers),
+            "applied_layers": list(applied_layers),
+        }
+        self._dispatch_compression_lifecycle(
+            "PostCompact",
+            payload=payload,
+            metadata={"compression_trigger": trigger},
+        )
+
+    def _pre_compact_payload(
+        self,
+        *,
+        before_tokens: int,
+        before_message_count: int,
+        before_snapshot: list[dict[str, Any]],
+        trigger: str,
+        requested_strategy: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "trigger": trigger,
+            "before_tokens": before_tokens,
+            "before_message_count": before_message_count,
+            "max_tokens": self.max_tokens,
+            "thresholds": {
+                "snip_at": self._snip_at,
+                "summarize_at": self._summarize_at,
+                "collapse_at": self._collapse_at,
+            },
+            "context_snapshot": before_snapshot,
+        }
+        if requested_strategy:
+            payload["requested_strategy"] = requested_strategy
+        return payload
+
+    def _dispatch_compression_lifecycle(
+        self,
+        event_name: str,
+        *,
+        payload: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        fail_closed_message: str | None = None,
+    ) -> list[Any]:
+        agent = self._lifecycle_agent
+        dispatch = getattr(agent, "_dispatch_agent_lifecycle_event", None)
+        if not callable(dispatch):
+            return []
+        return list(
+            dispatch(
+                event_name,
+                payload=payload,
+                metadata=metadata,
+                fail_closed_message=fail_closed_message,
+            )
+            or []
+        )
 
     def _snip_tool_outputs(self, messages: list[dict]) -> bool:
         """Layer 1: Truncate older tool results, keeping recent agent rounds intact."""
@@ -555,17 +702,27 @@ class ContextManager:
         before_snapshot: list[dict[str, Any]],
         after_messages: list[dict],
         applied_layers: list[str],
+        trigger: str,
+        requested_strategy: str | None = None,
     ) -> None:
         """Push UI events describing context compression lifecycle."""
-        if not self._ui_bus:
-            return
-
         after_tokens = self.get_context_tokens(after_messages)
         after_message_count = len(after_messages)
         after_snapshot = self._snapshot_messages(after_messages)
         strategy = self._describe_strategy(applied_layers)
         delta_tokens = after_tokens - before_tokens
         delta_messages = after_message_count - before_message_count
+        self._dispatch_post_compact_lifecycle(
+            before_tokens=before_tokens,
+            before_message_count=before_message_count,
+            before_snapshot=before_snapshot,
+            after_messages=after_messages,
+            applied_layers=applied_layers,
+            trigger=trigger,
+            requested_strategy=requested_strategy,
+        )
+        if not self._ui_bus:
+            return
 
         self._ui_bus.info(
             f"Context auto-compression triggered at {before_tokens} tokens / {before_message_count} messages.",

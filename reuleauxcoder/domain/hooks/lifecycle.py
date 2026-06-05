@@ -14,12 +14,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
 
+from reuleauxcoder.domain.agent.events import AgentEvent
+from reuleauxcoder.domain.agent.runtime_boundary import (
+    runtime_boundary_fields,
+    runtime_agent_run_id,
+    runtime_working_directory,
+)
+from reuleauxcoder.domain.agent.runtime_budget import runtime_budget_limit_message
 from reuleauxcoder.domain.hooks.base import GuardHook, ObserverHook, TransformHook
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.types import (
     GuardDecision,
     HookContext,
     HookPoint,
+)
+from reuleauxcoder.domain.hooks.lifecycle_policy import (
+    lifecycle_gate_event_is_gate,
+    lifecycle_gate_output_is_terminal,
+    lifecycle_output_message,
 )
 from reuleauxcoder.domain.llm.models import ToolCall
 
@@ -54,13 +66,30 @@ LIFECYCLE_HOOK_EVENTS: set[str] = {
 
 LIFECYCLE_HOOK_CONFIG_EVENTS: set[str] = {
     "UserPromptSubmit",
+    "UserPromptExpansion",
     "PermissionRequest",
+    "PermissionDenied",
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
     "PostToolBatch",
+    "SubagentStart",
+    "TaskCreated",
+    "PreCompact",
+    "PostCompact",
+    "ConfigChange",
+    "CwdChanged",
+    "FileChanged",
+    "Notification",
     "Stop",
     "StopFailure",
+}
+
+LIFECYCLE_HOOK_CONTROL_PLANE_AUDIT_EVENTS: set[str] = {
+    "TaskCompleted",
+    "SubagentStop",
+    "WorktreeCreate",
+    "WorktreeRemove",
 }
 
 LIFECYCLE_HOOK_SOURCES: set[str] = {
@@ -105,9 +134,23 @@ LIFECYCLE_HOOK_OUTPUT_SUPPORTED_FIELDS: dict[str, set[str]] = {
         "updated_input",
         "diagnostics",
     },
+    "UserPromptExpansion": {
+        "continue_flow",
+        "decision",
+        "reason",
+        "user_message",
+        "additional_context",
+        "updated_input",
+        "diagnostics",
+    },
     "PermissionRequest": {
         "continue_flow",
         "decision",
+        "reason",
+        "user_message",
+        "diagnostics",
+    },
+    "PermissionDenied": {
         "reason",
         "user_message",
         "diagnostics",
@@ -123,6 +166,71 @@ LIFECYCLE_HOOK_OUTPUT_SUPPORTED_FIELDS: dict[str, set[str]] = {
     "PostToolUse": {"updated_input", "diagnostics"},
     "PostToolUseFailure": {"diagnostics"},
     "PostToolBatch": {"diagnostics"},
+    "SubagentStart": {"reason", "user_message", "diagnostics", "artifacts"},
+    "TaskCreated": {
+        "continue_flow",
+        "decision",
+        "reason",
+        "user_message",
+        "diagnostics",
+    },
+    "PreCompact": {
+        "continue_flow",
+        "decision",
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
+    "PostCompact": {
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
+    "ConfigChange": {
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
+    "CwdChanged": {
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
+    "FileChanged": {
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
+    "Notification": {
+        "reason",
+        "user_message",
+        "diagnostics",
+        "artifacts",
+    },
+    "WorktreeCreate": {
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
+    "WorktreeRemove": {
+        "reason",
+        "user_message",
+        "additional_context",
+        "diagnostics",
+        "artifacts",
+    },
     "Stop": {"reason", "user_message", "diagnostics", "artifacts"},
     "StopFailure": {"reason", "user_message", "diagnostics", "artifacts"},
 }
@@ -147,15 +255,51 @@ LIFECYCLE_TOOL_MATCHER_FIELDS: set[str] = {
     "mcp_servers",
 }
 
+
+def lifecycle_event_catalog_items() -> list[dict[str, Any]]:
+    """Return ADR lifecycle events with explicit external wiring status."""
+
+    items: list[dict[str, Any]] = []
+    for event_name in sorted(LIFECYCLE_HOOK_EVENTS):
+        external_supported = event_name in LIFECYCLE_HOOK_CONFIG_EVENTS
+        audit_only = event_name in LIFECYCLE_HOOK_CONTROL_PLANE_AUDIT_EVENTS
+        runtime_status = (
+            "external_config_supported"
+            if external_supported
+            else "control_plane_audit_only"
+            if audit_only
+            else "external_event_unwired"
+        )
+        item = {
+            "event": event_name,
+            "in_adr_catalog": True,
+            "external_config_supported": external_supported,
+            "runtime_status": runtime_status,
+        }
+        if audit_only:
+            item["runtime_reason"] = "emitted_by_agent_run_control_plane"
+        items.append({
+            **item,
+        })
+    return items
+
 _AUTHORITATIVE_CONTEXT_FIELDS: set[str] = {
     "event_name",
     "placement",
+    "source",
     "trigger_source",
     "session_run_id",
     "agent_run_id",
     "turn_id",
+    "origin",
+    "locale",
+    "metadata",
     "timestamp",
 }
+
+LIFECYCLE_HOOK_OUTPUT_STRING_LIMIT = 4096
+LIFECYCLE_HOOK_OUTPUT_TOTAL_STRING_LIMIT = 32768
+LIFECYCLE_HOOK_OUTPUT_PREVIEW_LIMIT = 256
 
 CONFIG_HOOK_FIELDS: set[str] = {
     "event",
@@ -166,6 +310,7 @@ CONFIG_HOOK_FIELDS: set[str] = {
     "display_name",
     "summary",
     "permissions",
+    "credentials",
     "trust",
     "risk_level",
     "technical",
@@ -183,6 +328,7 @@ DERIVED_HOOK_VIEW_FIELDS: set[str] = {
     "unavailable_reason",
     "placement_runtime",
     "hook_views",
+    "recent_result",
 }
 
 TECHNICAL_FORBIDDEN_FIELDS: set[str] = CONFIG_HOOK_FIELDS.union(
@@ -225,6 +371,7 @@ class LifecycleHookDeclaration:
     display_name: str
     summary: str
     permissions: list[str]
+    credentials: list[str] = field(default_factory=list)
     matcher: Any = "*"
     handler_ref: str = ""
     trust: str = "pending_review"
@@ -275,6 +422,11 @@ class LifecycleHookDeclaration:
             display_name=display_name,
             summary=summary,
             permissions=permissions,
+            credentials=(
+                _string_list(data.get("credentials"), "credentials")
+                if "credentials" in data
+                else []
+            ),
             matcher=_validated_matcher(data.get("matcher", "*")),
             handler_ref=_string(data.get("handler_ref")),
             trust=trust,
@@ -295,6 +447,7 @@ class LifecycleHookDeclaration:
             "handler_ref": self.handler_ref,
             "matcher": self.matcher,
             "permissions": list(self.permissions),
+            "credentials": list(self.credentials),
             "display_name": self.display_name,
             "summary": self.summary,
             "trust": self.trust,
@@ -318,6 +471,11 @@ class LifecycleHookOutput:
     updated_input: dict[str, Any] | None = None
     diagnostics: list[Any] = field(default_factory=list)
     artifacts: list[Any] = field(default_factory=list)
+    runtime_artifacts: list[Any] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "LifecycleHookOutput":
@@ -329,8 +487,11 @@ class LifecycleHookOutput:
         updated_input = data.get("updated_input")
         if updated_input is not None and not isinstance(updated_input, dict):
             raise ValueError("lifecycle hook output updated_input must be a full object")
+        continue_flow = data.get("continue_flow", True)
+        if not isinstance(continue_flow, bool):
+            raise ValueError("lifecycle hook output continue_flow must be a boolean")
         return cls(
-            continue_flow=bool(data.get("continue_flow", True)),
+            continue_flow=continue_flow,
             decision=decision,
             reason=data.get("reason"),
             user_message=_string(data.get("user_message")),
@@ -424,6 +585,7 @@ def _updated_input_shape_diagnostics(
         return []
     expected_keys = {
         "UserPromptSubmit": {"user_input"},
+        "UserPromptExpansion": {"command_text", "user_input"},
         "PreToolUse": {"tool_call"},
         "PostToolUse": {"result"},
     }.get(event_name)
@@ -477,6 +639,53 @@ class InternalLifecycleHookPointResult:
     blocked: bool = False
     message: str = ""
     diagnostics: list[object] = field(default_factory=list)
+    lifecycle_context: LifecycleHookEventContext | None = None
+    dispatch_results: list[LifecycleHookDispatchResult] = field(default_factory=list)
+
+
+def _apply_lifecycle_updated_input_to_context(
+    context: LifecycleHookEventContext,
+    output: LifecycleHookOutput,
+) -> None:
+    updated_input = getattr(output, "updated_input", None)
+    if not isinstance(updated_input, dict):
+        return
+
+    payload = dict(context.payload or {})
+    if context.event_name in {"UserPromptSubmit", "UserPromptExpansion"}:
+        candidate = updated_input.get("user_input")
+        if context.event_name == "UserPromptExpansion":
+            candidate = updated_input.get("command_text", candidate)
+        if isinstance(candidate, str):
+            if context.event_name == "UserPromptExpansion":
+                payload["command_text"] = candidate
+            else:
+                payload["user_input"] = candidate
+            context.payload = payload
+        return
+
+    if context.event_name != "PreToolUse":
+        return
+
+    tool_call = updated_input.get("tool_call")
+    if not isinstance(tool_call, dict):
+        return
+    technical = payload.get("technical")
+    technical_payload = dict(technical) if isinstance(technical, dict) else {}
+    previous = technical_payload.get("tool_call")
+    merged_tool_call = dict(previous) if isinstance(previous, dict) else {}
+    merged_tool_call.update(dict(tool_call))
+    technical_payload["tool_call"] = merged_tool_call
+    payload["technical"] = technical_payload
+
+    tool_name = _string(merged_tool_call.get("name"))
+    tool_call_id = _string(merged_tool_call.get("id"))
+    if tool_name:
+        payload["tool_names"] = [tool_name]
+    if tool_call_id:
+        payload["tool_call_ids"] = [tool_call_id]
+
+    context.payload = payload
 
 
 LifecycleHookHandler = Callable[
@@ -591,6 +800,7 @@ class InternalHookRegistryLifecycleHookRuntimeAdapter:
     """Adapter that runs legacy in-process HookRegistry hooks behind lifecycle."""
 
     hook_registry: HookRegistry | None = None
+    agent: Any | None = None
     handler_type: str = "internal"
     supported_placements: set[str] = field(default_factory=lambda: {"server"})
     supported_events: set[str] | None = None
@@ -608,6 +818,8 @@ class InternalHookRegistryLifecycleHookRuntimeAdapter:
         )
         if reason:
             return reason
+        if declaration.permissions and self.agent is None:
+            return "runtime_unavailable:agent_context"
         if declaration.source not in _INTERNAL_HANDLER_ALLOWED_SOURCES:
             return "handler_source_unavailable:internal"
         if not _string(declaration.technical.get("old_hook_point")):
@@ -621,6 +833,33 @@ class InternalHookRegistryLifecycleHookRuntimeAdapter:
         declaration: LifecycleHookDeclaration,
         context: LifecycleHookEventContext,
     ) -> LifecycleHookOutput:
+        if declaration.permissions:
+            if self.agent is None:
+                return _adapter_failure_output(
+                    declaration,
+                    "internal adapter requires Agent context to enforce declared permissions",
+                    code="agent_context_unavailable",
+                    handler_type="internal",
+                )
+            permission_output = _lifecycle_permission_failure_output(
+                self.agent,
+                declaration,
+                handler_type="internal",
+                tool_name="lifecycle_internal",
+                arguments=_lifecycle_adapter_permission_arguments(
+                    declaration,
+                    context,
+                    agent=self.agent,
+                    handler_type="internal",
+                    handler_ref=declaration.handler_ref,
+                    old_hook_point=_string(
+                        declaration.technical.get("old_hook_point")
+                    ),
+                ),
+                tool_source="lifecycle_hook",
+            )
+            if permission_output is not None:
+                return permission_output
         old_hook_point = _string(declaration.technical.get("old_hook_point"))
         if not old_hook_point:
             return _internal_declarative_output(declaration)
@@ -695,6 +934,7 @@ class PromptLifecycleHookRuntimeAdapter:
     """Adapter that asks a controlled model call for LifecycleHookOutput JSON."""
 
     llm: Any | None = None
+    agent: Any | None = None
     handler_type: str = "prompt"
     supported_placements: set[str] = field(default_factory=lambda: {"server"})
     supported_events: set[str] | None = None
@@ -716,6 +956,8 @@ class PromptLifecycleHookRuntimeAdapter:
             return "handler_ref_unavailable:prompt"
         if self.llm is None or not callable(getattr(self.llm, "chat", None)):
             return "runtime_unavailable:prompt_model"
+        if declaration.permissions and self.agent is None:
+            return "runtime_unavailable:agent_context"
         return ""
 
     def dispatch(
@@ -727,15 +969,47 @@ class PromptLifecycleHookRuntimeAdapter:
         if not instruction:
             return _prompt_adapter_failure_output(
                 declaration,
+                context,
                 "prompt adapter declaration has no instruction",
                 code="handler_ref_unavailable",
             )
         if self.llm is None or not callable(getattr(self.llm, "chat", None)):
             return _prompt_adapter_failure_output(
                 declaration,
+                context,
                 "prompt adapter has no model runtime",
                 code="prompt_model_unavailable",
             )
+        budget_output = _lifecycle_runtime_budget_failure_output(
+            self.agent,
+            declaration,
+            handler_type="prompt",
+        )
+        if budget_output is not None:
+            return budget_output
+        if declaration.permissions:
+            if self.agent is None:
+                return _adapter_failure_output(
+                    declaration,
+                    "prompt adapter requires Agent context to enforce declared permissions",
+                    code="agent_context_unavailable",
+                    handler_type="prompt",
+                )
+            permission_output = _lifecycle_permission_failure_output(
+                self.agent,
+                declaration,
+                handler_type="prompt",
+                tool_name="lifecycle_prompt",
+                arguments=_lifecycle_adapter_permission_arguments(
+                    declaration,
+                    context,
+                    agent=self.agent,
+                    handler_type="prompt",
+                ),
+                tool_source="lifecycle_hook",
+            )
+            if permission_output is not None:
+                return permission_output
         messages = _prompt_adapter_messages(declaration, context, instruction)
         try:
             response = self.llm.chat(
@@ -751,9 +1025,18 @@ class PromptLifecycleHookRuntimeAdapter:
         except Exception as exc:
             return _prompt_adapter_failure_output(
                 declaration,
+                context,
                 f"prompt adapter model request failed: {exc}",
                 code="prompt_model_failed",
             )
+        _record_lifecycle_prompt_usage(self.agent, response)
+        budget_output = _lifecycle_runtime_budget_failure_output(
+            self.agent,
+            declaration,
+            handler_type="prompt",
+        )
+        if budget_output is not None:
+            return budget_output
         raw_content = str(getattr(response, "content", "") or "").strip()
         try:
             output_data = _parse_lifecycle_output_json(raw_content)
@@ -761,6 +1044,7 @@ class PromptLifecycleHookRuntimeAdapter:
         except Exception as exc:
             return _prompt_adapter_failure_output(
                 declaration,
+                context,
                 f"prompt adapter returned invalid LifecycleHookOutput JSON: {exc}",
                 code="prompt_output_invalid",
                 raw_content=raw_content,
@@ -802,27 +1086,39 @@ class CommandLifecycleHookRuntimeAdapter:
     ) -> LifecycleHookOutput:
         command = _command_adapter_command(declaration)
         if not command:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 "command adapter declaration has no command",
                 code="handler_ref_unavailable",
                 handler_type="command",
             )
+        budget_output = _lifecycle_runtime_budget_failure_output(
+            self.agent,
+            declaration,
+            handler_type="command",
+        )
+        if budget_output is not None:
+            return budget_output
         permission_output = _lifecycle_permission_failure_output(
             self.agent,
             declaration,
             handler_type="command",
             tool_name="shell",
-            arguments={
-                "command": command,
-                "intent": _command_adapter_intent(declaration, context),
-            },
+            arguments=_lifecycle_adapter_permission_arguments(
+                declaration,
+                context,
+                agent=self.agent,
+                handler_type="command",
+                command=command,
+                intent=_command_adapter_intent(declaration, context),
+            ),
             tool_source="builtin",
         )
         if permission_output is not None:
             return permission_output
         timeout = _int_value(declaration.technical.get("timeout_sec"), default=30)
-        cwd = str(getattr(self.agent, "runtime_working_directory", "") or "") or None
+        cwd = runtime_working_directory(self.agent) or None
         try:
             completed = subprocess.run(
                 command,
@@ -833,15 +1129,17 @@ class CommandLifecycleHookRuntimeAdapter:
                 timeout=max(1, timeout),
             )
         except Exception as exc:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"command adapter failed: {exc}",
                 code="command_failed",
                 handler_type="command",
             )
         if completed.returncode != 0:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"command adapter exited with code {completed.returncode}",
                 code="command_nonzero_exit",
                 handler_type="command",
@@ -852,6 +1150,7 @@ class CommandLifecycleHookRuntimeAdapter:
             )
         return _lifecycle_output_from_external_json(
             declaration,
+            context,
             completed.stdout,
             handler_type="command",
         )
@@ -892,18 +1191,32 @@ class HttpLifecycleHookRuntimeAdapter:
     ) -> LifecycleHookOutput:
         url = _http_adapter_url(declaration)
         if not url:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 "http adapter declaration has no URL",
                 code="handler_ref_unavailable",
                 handler_type="http",
             )
+        budget_output = _lifecycle_runtime_budget_failure_output(
+            self.agent,
+            declaration,
+            handler_type="http",
+        )
+        if budget_output is not None:
+            return budget_output
         permission_output = _lifecycle_permission_failure_output(
             self.agent,
             declaration,
             handler_type="http",
             tool_name="http_request",
-            arguments={"url": url},
+            arguments=_lifecycle_adapter_permission_arguments(
+                declaration,
+                context,
+                agent=self.agent,
+                handler_type="http",
+                url=url,
+            ),
             tool_source="builtin",
         )
         if permission_output is not None:
@@ -923,21 +1236,24 @@ class HttpLifecycleHookRuntimeAdapter:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 response_text = response.read(256_000).decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"http adapter returned {exc.code}",
                 code="http_status_error",
                 handler_type="http",
             )
         except Exception as exc:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"http adapter failed: {exc}",
                 code="http_failed",
                 handler_type="http",
             )
         return _lifecycle_output_from_external_json(
             declaration,
+            context,
             response_text,
             handler_type="http",
         )
@@ -977,8 +1293,9 @@ class MCPToolLifecycleHookRuntimeAdapter:
         context: LifecycleHookEventContext,
     ) -> LifecycleHookOutput:
         if self.agent is None:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 "mcp_tool adapter has no Agent context",
                 code="agent_context_unavailable",
                 handler_type="mcp_tool",
@@ -986,13 +1303,38 @@ class MCPToolLifecycleHookRuntimeAdapter:
         tool_name = declaration.handler_ref.strip()
         tool = getattr(self.agent, "get_tool", lambda _name: None)(tool_name)
         if tool is None:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"MCP tool not found: {tool_name}",
                 code="mcp_tool_unavailable",
                 handler_type="mcp_tool",
             )
         arguments = _adapter_arguments(declaration, context)
+        budget_output = _lifecycle_runtime_budget_failure_output(
+            self.agent,
+            declaration,
+            handler_type="mcp_tool",
+        )
+        if budget_output is not None:
+            return budget_output
+        permission_output = _lifecycle_permission_failure_output(
+            self.agent,
+            declaration,
+            handler_type="mcp_tool",
+            tool_name=tool_name,
+            arguments=_lifecycle_adapter_permission_arguments(
+                declaration,
+                context,
+                agent=self.agent,
+                handler_type="mcp_tool",
+                **arguments,
+            ),
+            tool_source=str(getattr(tool, "tool_source", "") or "mcp"),
+            tool=tool,
+        )
+        if permission_output is not None:
+            return permission_output
         try:
             result = _execute_lifecycle_tool_call(
                 self.agent,
@@ -1003,14 +1345,16 @@ class MCPToolLifecycleHookRuntimeAdapter:
                 ),
             )
         except Exception as exc:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"MCP tool adapter failed: {exc}",
                 code="mcp_tool_failed",
                 handler_type="mcp_tool",
             )
         return _lifecycle_output_from_external_json(
             declaration,
+            context,
             str(result or ""),
             handler_type="mcp_tool",
         )
@@ -1054,16 +1398,18 @@ class AgentLifecycleHookRuntimeAdapter:
         target_agent_id = _agent_adapter_agent_id(declaration)
         prompt = _agent_adapter_prompt(declaration, context)
         if not target_agent_id or not prompt:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 "agent adapter requires target agent id and prompt",
                 code="handler_ref_unavailable",
                 handler_type="agent",
             )
         control = getattr(self.agent, "agent_run_control_plane", None)
         if control is None:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 "agent adapter has no AgentRun control plane",
                 code="agent_run_control_plane_unavailable",
                 handler_type="agent",
@@ -1073,13 +1419,37 @@ class AgentLifecycleHookRuntimeAdapter:
             getattr(getattr(config, "agent_registry", None), "agents", {}) or {}
         ).get(target_agent_id)
         if target_config is None:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"agent adapter target agent not found: {target_agent_id}",
                 code="agent_not_found",
                 handler_type="agent",
                 diagnostics_extra={"agent_id": target_agent_id},
             )
+        budget_output = _lifecycle_runtime_budget_failure_output(
+            self.agent,
+            declaration,
+            handler_type="agent",
+        )
+        if budget_output is not None:
+            return budget_output
+        permission_output = _lifecycle_permission_failure_output(
+            self.agent,
+            declaration,
+            handler_type="agent",
+            tool_name="lifecycle_agent",
+            arguments=_lifecycle_adapter_permission_arguments(
+                declaration,
+                context,
+                agent=self.agent,
+                handler_type="agent",
+                target_agent_id=target_agent_id,
+            ),
+            tool_source="lifecycle_hook",
+        )
+        if permission_output is not None:
+            return permission_output
         from reuleauxcoder.domain.permission_gateway import PermissionGateway
 
         decision = PermissionGateway().evaluate_agent_invocation(
@@ -1093,12 +1463,27 @@ class AgentLifecycleHookRuntimeAdapter:
                 decision,
                 handler_type="agent",
             )
+        parent_run_id = context.agent_run_id or runtime_agent_run_id(self.agent) or None
+        task_payload = _agent_adapter_child_lifecycle_payload(
+            declaration,
+            context,
+            target_agent_id=target_agent_id,
+            prompt=prompt,
+            parent_run_id=parent_run_id,
+        )
+        task_lifecycle_output = _dispatch_agent_adapter_child_lifecycle(
+            self.agent,
+            "TaskCreated",
+            task_payload,
+            gate=True,
+        )
+        if task_lifecycle_output is not None:
+            return task_lifecycle_output
         try:
             from labrastro_server.services.agent_runtime.control_plane import (
                 AgentRunRequest,
             )
 
-            parent_run_id = context.agent_run_id or None
             run = control.submit_agent_run(
                 AgentRunRequest(
                     issue_id=f"lifecycle:{declaration.id}",
@@ -1120,9 +1505,21 @@ class AgentLifecycleHookRuntimeAdapter:
                     },
                 )
             )
+            subagent_payload = dict(task_payload)
+            subagent_payload.update({
+                "child_agent_run_id": str(getattr(run, "id", "") or ""),
+                "status": str(getattr(getattr(run, "status", None), "value", "") or ""),
+            })
+            _dispatch_agent_adapter_child_lifecycle(
+                self.agent,
+                "SubagentStart",
+                subagent_payload,
+                gate=False,
+            )
         except Exception as exc:
-            return _adapter_failure_output(
+            return _adapter_dispatch_failure_output(
                 declaration,
+                context,
                 f"agent adapter failed: {exc}",
                 code="agent_run_submit_failed",
                 handler_type="agent",
@@ -1138,6 +1535,188 @@ class AgentLifecycleHookRuntimeAdapter:
                 "id": str(getattr(run, "id", "") or ""),
             }],
         })
+
+
+def _agent_adapter_child_lifecycle_payload(
+    declaration: LifecycleHookDeclaration,
+    context: LifecycleHookEventContext,
+    *,
+    target_agent_id: str,
+    prompt: str,
+    parent_run_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "agent_id": target_agent_id,
+        "task": prompt,
+        "parent_run_id": str(parent_run_id or ""),
+        "source": "delegation",
+        "trigger_source": context.source,
+        "parent_session_id": context.session_run_id,
+        "parent_turn_id": context.turn_id,
+        "lifecycle_hook_id": declaration.id,
+        "lifecycle_event": context.event_name,
+        "lifecycle_hook_source": declaration.source,
+        "lifecycle_handler_type": declaration.handler_type,
+    }
+
+
+def _dispatch_agent_adapter_child_lifecycle(
+    agent: Any,
+    event_name: str,
+    payload: dict[str, Any],
+    *,
+    gate: bool,
+) -> LifecycleHookOutput | None:
+    dispatcher = getattr(agent, "lifecycle_dispatcher", None)
+    dispatch = getattr(dispatcher, "dispatch", None)
+    if not callable(dispatch):
+        return None
+    context = build_lifecycle_event_context(
+        event_name,
+        placement="server",
+        trigger_source=str(payload.get("trigger_source") or "lifecycle_hook"),
+        session_run_id=str(payload.get("parent_session_id") or ""),
+        agent_run_id=str(payload.get("parent_run_id") or runtime_agent_run_id(agent)),
+        turn_id=str(payload.get("parent_turn_id") or ""),
+        origin="agent",
+        locale=str(getattr(agent, "locale", "") or ""),
+        metadata={
+            "handler_type": "agent",
+            "agent_id": str(payload.get("agent_id") or ""),
+            "lifecycle_hook_id": str(payload.get("lifecycle_hook_id") or ""),
+        },
+        payload=payload,
+    )
+    try:
+        results = list(dispatch(context))
+    except Exception as exc:
+        message = f"{event_name} lifecycle dispatch failed."
+        _emit_agent_adapter_child_lifecycle_observation(
+            agent,
+            "dispatch_failed",
+            context,
+            error=f"{type(exc).__name__}: {exc}",
+            message=message,
+        )
+        if not gate:
+            return None
+        return LifecycleHookOutput(
+            continue_flow=False,
+            decision="deny",
+            user_message=message,
+            diagnostics=[
+                {
+                    "code": "child_agent_lifecycle_dispatch_failed",
+                    "event_name": event_name,
+                    "message": message,
+                }
+            ],
+        )
+    for result in results:
+        _emit_agent_adapter_child_lifecycle_observation(
+            agent,
+            "result",
+            context,
+            result=result,
+        )
+        output = getattr(result, "output", None)
+        if gate and lifecycle_gate_output_is_terminal(output):
+            message = lifecycle_output_message(
+                output,
+                fallback=f"{event_name} lifecycle blocked child AgentRun.",
+            )
+            return LifecycleHookOutput(
+                continue_flow=False,
+                decision="deny",
+                user_message=message,
+                diagnostics=[
+                    {
+                        "code": "child_agent_lifecycle_denied",
+                        "event_name": event_name,
+                        "message": message,
+                    }
+                ],
+            )
+    return None
+
+
+def _emit_agent_adapter_child_lifecycle_observation(
+    agent: Any,
+    phase: str,
+    context: LifecycleHookEventContext,
+    *,
+    result: object | None = None,
+    error: str = "",
+    message: str = "",
+) -> None:
+    emit = getattr(agent, "_emit_event", None)
+    if not callable(emit):
+        return
+    try:
+        declaration = getattr(result, "declaration", None)
+        output = getattr(result, "output", None)
+        output_dict = output.to_dict() if hasattr(output, "to_dict") else {}
+        diagnostics = (
+            list(output_dict.get("diagnostics") or [])
+            if isinstance(output_dict, dict)
+            else []
+        )
+        decision = (
+            str(output_dict.get("decision") or "none")
+            if isinstance(output_dict, dict)
+            else "none"
+        )
+        continue_flow = (
+            bool(output_dict.get("continue_flow", True))
+            if isinstance(output_dict, dict)
+            else True
+        )
+        level = (
+            "error"
+            if error or decision == "deny" or continue_flow is False
+            else "warning"
+            if diagnostics
+            else "info"
+        )
+        event_payload = {
+            "phase": phase,
+            "event_name": context.event_name,
+            "placement": context.placement,
+            "session_run_id": context.session_run_id,
+            "agent_run_id": context.agent_run_id,
+            "turn_id": context.turn_id,
+            "trigger_source": context.source,
+            "hook_id": str(getattr(declaration, "id", "") or ""),
+            "display_name": str(getattr(declaration, "display_name", "") or ""),
+            "source": str(getattr(declaration, "source", "") or ""),
+            "decision": decision,
+            "continue_flow": continue_flow,
+            "diagnostics": diagnostics,
+            "error": error,
+            "level": level,
+            "title": str(getattr(declaration, "display_name", "") or context.event_name),
+            "payload": dict(context.payload or {}),
+        }
+        if isinstance(output_dict, dict):
+            event_payload.update(lifecycle_output_audit_fields(output))
+            event_payload["output"] = output_dict
+            output_message = lifecycle_output_message(output, fallback="")
+            if output_message:
+                event_payload["message"] = output_message
+        if message:
+            event_payload["message"] = message
+        emit(
+            AgentEvent.lifecycle_hook(
+                event_payload,
+                runtime_artifacts=lifecycle_runtime_artifacts_for_event(
+                    output,
+                    event_name=context.event_name,
+                    context=context,
+                ),
+            )
+        )
+    except Exception:
+        return
 
 
 class LifecycleHookRuntimeAdapterRegistry:
@@ -1186,7 +1765,10 @@ class LifecycleHookRuntimeAdapterRegistry:
             raise RuntimeError(
                 f"lifecycle hook runtime adapter unavailable: {declaration.handler_type}"
             )
-        return _coerce_hook_output(adapter.dispatch(declaration, context))
+        return _coerce_hook_output(
+            adapter.dispatch(declaration, context),
+            declaration=declaration,
+        )
 
 
 class LifecycleHookRegistry:
@@ -1250,10 +1832,15 @@ class LifecycleHookRegistry:
         self,
         *,
         runtime_adapters: LifecycleHookRuntimeAdapterRegistry | None = None,
+        recent_results: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         adapters = runtime_adapters or default_lifecycle_hook_runtime_adapters()
         return [
-            _dashboard_item(declaration, runtime_adapters=adapters)
+            _dashboard_item(
+                declaration,
+                runtime_adapters=adapters,
+                recent_results=recent_results,
+            )
             for declaration in self._declarations.values()
         ]
 
@@ -1295,8 +1882,19 @@ class LifecycleHookDispatcher:
         for declaration in declarations:
             if not _matcher_matches(declaration.matcher, context):
                 continue
-            output = self.runtime_adapters.dispatch(declaration, context)
+            try:
+                output = self.runtime_adapters.dispatch(declaration, context)
+            except Exception as exc:
+                output = _lifecycle_dispatch_failure_output(
+                    declaration,
+                    context,
+                    exc,
+                )
             results.append(LifecycleHookDispatchResult(declaration, output))
+            if lifecycle_gate_event_is_gate(context.event_name):
+                if lifecycle_gate_output_is_terminal(output):
+                    break
+                _apply_lifecycle_updated_input_to_context(context, output)
         return results
 
 
@@ -1328,7 +1926,10 @@ def default_lifecycle_hook_catalog_runtime_adapters() -> LifecycleHookRuntimeAda
     catalog_agent = _LifecycleCatalogAgent()
     return LifecycleHookRuntimeAdapterRegistry([
         InternalHookRegistryLifecycleHookRuntimeAdapter(),
-        PromptLifecycleHookRuntimeAdapter(llm=_LifecycleCatalogPromptLLM()),
+        PromptLifecycleHookRuntimeAdapter(
+            llm=_LifecycleCatalogPromptLLM(),
+            agent=catalog_agent,
+        ),
         CommandLifecycleHookRuntimeAdapter(agent=catalog_agent),
         HttpLifecycleHookRuntimeAdapter(agent=catalog_agent),
         MCPToolLifecycleHookRuntimeAdapter(agent=catalog_agent),
@@ -1336,12 +1937,165 @@ def default_lifecycle_hook_catalog_runtime_adapters() -> LifecycleHookRuntimeAda
     ])
 
 
-def _coerce_hook_output(value: Any) -> LifecycleHookOutput:
+def _coerce_hook_output(
+    value: Any,
+    *,
+    declaration: LifecycleHookDeclaration | None = None,
+) -> LifecycleHookOutput:
     if isinstance(value, LifecycleHookOutput):
+        output = value
+    elif isinstance(value, dict):
+        output = LifecycleHookOutput.from_dict(value)
+    else:
+        raise ValueError("lifecycle hook handler must return LifecycleHookOutput or dict")
+    if declaration is None:
+        return output
+    return _bounded_lifecycle_hook_output(output, declaration)
+
+
+def _bounded_lifecycle_hook_output(
+    output: LifecycleHookOutput,
+    declaration: LifecycleHookDeclaration,
+) -> LifecycleHookOutput:
+    overflow_artifacts: list[dict[str, Any]] = []
+    runtime_artifacts: list[dict[str, Any]] = [
+        dict(item)
+        for item in getattr(output, "runtime_artifacts", []) or []
+        if isinstance(item, dict)
+    ]
+    total_string_chars = 0
+
+    def overflow_ref(field_path: str, value: str) -> str:
+        safe_hook_id = "".join(
+            char if char.isalnum() else "-"
+            for char in (declaration.id or "hook")
+        ).strip("-") or "hook"
+        artifact_id = (
+            f"lifecycle-output-overflow:{safe_hook_id}:{len(overflow_artifacts) + 1}"
+        )
+        overflow_artifacts.append({
+            "kind": "lifecycle_output_overflow",
+            "id": artifact_id,
+            "hook_id": declaration.id,
+            "field": field_path,
+            "original_chars": len(value),
+            "original_bytes": len(value.encode("utf-8", errors="replace")),
+            "preview": value[:LIFECYCLE_HOOK_OUTPUT_PREVIEW_LIMIT],
+        })
+        runtime_artifacts.append({
+            "artifact_id": artifact_id,
+            "type": "log",
+            "status": "generated",
+            "content": value,
+            "metadata": {
+                "kind": "lifecycle_output_overflow",
+                "hook_id": declaration.id,
+                "source": declaration.source,
+                "handler_type": declaration.handler_type,
+                "field": field_path,
+                "original_chars": len(value),
+                "original_bytes": len(value.encode("utf-8", errors="replace")),
+                "preview": value[:LIFECYCLE_HOOK_OUTPUT_PREVIEW_LIMIT],
+            },
+        })
+        return artifact_id
+
+    def sanitize(value: Any, field_path: str) -> Any:
+        nonlocal total_string_chars
+        if isinstance(value, str):
+            value_chars = len(value)
+            if (
+                value_chars <= LIFECYCLE_HOOK_OUTPUT_STRING_LIMIT
+                and total_string_chars + value_chars <= LIFECYCLE_HOOK_OUTPUT_TOTAL_STRING_LIMIT
+            ):
+                total_string_chars += value_chars
+                return value
+            artifact_id = overflow_ref(field_path, value)
+            preview = value[:LIFECYCLE_HOOK_OUTPUT_PREVIEW_LIMIT]
+            total_string_chars += len(preview)
+            return f"{preview}...[truncated; artifact_ref={artifact_id}]"
+        if isinstance(value, dict):
+            return {
+                str(key): sanitize(
+                    item,
+                    f"{field_path}.{key}" if field_path else str(key),
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                sanitize(item, f"{field_path}[{index}]")
+                for index, item in enumerate(value)
+            ]
         return value
-    if isinstance(value, dict):
-        return LifecycleHookOutput.from_dict(value)
-    raise ValueError("lifecycle hook handler must return LifecycleHookOutput or dict")
+
+    data = output.to_dict()
+    sanitized = {key: sanitize(value, str(key)) for key, value in data.items()}
+    if not overflow_artifacts:
+        bounded = LifecycleHookOutput.from_dict(sanitized)
+        bounded.runtime_artifacts = runtime_artifacts
+        return bounded
+
+    diagnostics = list(sanitized.get("diagnostics") or [])
+    diagnostics.append({
+        "code": "lifecycle_output_overflow",
+        "hook_id": declaration.id,
+        "message": "Lifecycle hook output exceeded size limits; full values are referenced as artifacts.",
+        "fields": [artifact["field"] for artifact in overflow_artifacts],
+        "artifact_refs": [artifact["id"] for artifact in overflow_artifacts],
+    })
+    artifacts = list(sanitized.get("artifacts") or [])
+    artifacts.extend(overflow_artifacts)
+    sanitized["diagnostics"] = diagnostics
+    sanitized["artifacts"] = artifacts
+    bounded = LifecycleHookOutput.from_dict(sanitized)
+    bounded.runtime_artifacts = runtime_artifacts
+    return bounded
+
+
+def lifecycle_runtime_artifacts_for_event(
+    output: Any,
+    *,
+    event_name: str,
+    context: Any,
+) -> list[dict[str, Any]]:
+    artifacts = [
+        dict(item)
+        for item in getattr(output, "runtime_artifacts", []) or []
+        if isinstance(item, dict)
+    ]
+    if not artifacts:
+        return []
+    enriched: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        metadata = dict(artifact.get("metadata") or {})
+        artifact["metadata"] = {
+            **metadata,
+            "event_name": str(event_name or getattr(context, "event_name", "") or ""),
+            "session_run_id": str(getattr(context, "session_run_id", "") or ""),
+            "agent_run_id": str(getattr(context, "agent_run_id", "") or ""),
+            "turn_id": str(getattr(context, "turn_id", "") or ""),
+            "placement": str(getattr(context, "placement", "") or ""),
+            "trigger_source": str(getattr(context, "source", "") or ""),
+        }
+        enriched.append(artifact)
+    return enriched
+
+
+def lifecycle_output_audit_fields(output: Any) -> dict[str, Any]:
+    output_dict = output.to_dict() if hasattr(output, "to_dict") else {}
+    if not isinstance(output_dict, dict):
+        return {}
+    audit: dict[str, Any] = {}
+    if output_dict.get("reason") is not None:
+        audit["reason"] = output_dict.get("reason")
+    user_message = str(output_dict.get("user_message") or "").strip()
+    if user_message:
+        audit["user_message"] = user_message
+    artifacts = output_dict.get("artifacts")
+    if isinstance(artifacts, list) and artifacts:
+        audit["artifacts"] = list(artifacts)
+    return audit
 
 
 def dispatch_internal_lifecycle_hook_point(
@@ -1395,6 +2149,8 @@ def dispatch_internal_lifecycle_hook_point(
         blocked=bool(blocked_message),
         message=blocked_message,
         diagnostics=diagnostics,
+        lifecycle_context=lifecycle_context,
+        dispatch_results=list(results),
     )
 
 
@@ -1604,25 +2360,23 @@ def _parse_lifecycle_output_json(raw_content: str) -> dict[str, Any]:
 
 def _prompt_adapter_failure_output(
     declaration: LifecycleHookDeclaration,
+    context: LifecycleHookEventContext,
     message: str,
     *,
     code: str,
     raw_content: str = "",
 ) -> LifecycleHookOutput:
-    diagnostic: dict[str, Any] = {
-        "code": code,
-        "handler_type": "prompt",
-        "hook_id": declaration.id,
-        "message": message,
-    }
+    diagnostic: dict[str, Any] = {}
     if raw_content:
         diagnostic["raw_content_preview"] = raw_content[:500]
-    return LifecycleHookOutput.from_dict({
-        "continue_flow": False,
-        "decision": "deny",
-        "reason": message,
-        "diagnostics": [diagnostic],
-    })
+    return _adapter_dispatch_failure_output(
+        declaration,
+        context,
+        message,
+        code=code,
+        handler_type="prompt",
+        diagnostics_extra=diagnostic,
+    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -1668,10 +2422,29 @@ def bind_lifecycle_runtime_adapters_to_agent(agent: Any) -> None:
     get_adapter = getattr(runtime_adapters, "get", None)
     if not callable(get_adapter):
         return
-    for handler_type in ("command", "http", "mcp_tool", "agent"):
+    for handler_type in ("internal", "prompt", "command", "http", "mcp_tool", "agent"):
         adapter = get_adapter(handler_type)
         if adapter is not None and hasattr(adapter, "agent"):
             setattr(adapter, "agent", agent)
+
+
+def bind_lifecycle_dispatcher_to_hook_registry(
+    hook_registry: HookRegistry | None,
+    dispatcher: LifecycleHookDispatcher | None,
+) -> None:
+    if hook_registry is None:
+        return
+    hooks_by_point = getattr(hook_registry, "_hooks", {})
+    values = hooks_by_point.values() if isinstance(hooks_by_point, dict) else []
+    for hooks in values:
+        for hook in list(hooks):
+            setter = getattr(hook, "set_lifecycle_dispatcher", None)
+            if not callable(setter):
+                continue
+            try:
+                setter(dispatcher)
+            except Exception:
+                continue
 
 
 def _command_adapter_command(declaration: LifecycleHookDeclaration) -> str:
@@ -1764,6 +2537,71 @@ def _external_adapter_request(
     }
 
 
+def _lifecycle_adapter_permission_arguments(
+    declaration: LifecycleHookDeclaration,
+    context: LifecycleHookEventContext,
+    *,
+    agent: Any | None = None,
+    handler_type: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        **extra,
+        **runtime_boundary_fields(agent),
+        "hook_id": declaration.id,
+        "event_name": context.event_name,
+        "handler_type": handler_type,
+        "permissions": list(declaration.permissions),
+    }
+
+
+def _lifecycle_runtime_budget_failure_output(
+    agent: Any,
+    declaration: LifecycleHookDeclaration,
+    *,
+    handler_type: str,
+) -> LifecycleHookOutput | None:
+    if agent is None:
+        return None
+    message = runtime_budget_limit_message(agent)
+    if not message:
+        return None
+    return _adapter_failure_output(
+        declaration,
+        f"{handler_type} lifecycle hook blocked by AgentRun budget: {message}",
+        code="runtime_budget_exceeded",
+        handler_type=handler_type,
+        diagnostics_extra={"budget": {"message": message}},
+    )
+
+
+def _record_lifecycle_prompt_usage(agent: Any, response: Any) -> None:
+    if agent is None:
+        return
+    state = getattr(agent, "state", None)
+    if state is None:
+        return
+
+    def _add_int(attr: str, response_attr: str) -> None:
+        try:
+            current = int(getattr(state, attr, 0) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        try:
+            amount = int(getattr(response, response_attr, 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        setattr(state, attr, current + amount)
+
+    _add_int("total_prompt_tokens", "prompt_tokens")
+    _add_int("total_completion_tokens", "completion_tokens")
+
+    usage_extra = getattr(response, "usage_extra", None)
+    state_usage_extra = getattr(state, "usage_extra", None)
+    if isinstance(usage_extra, dict) and isinstance(state_usage_extra, dict):
+        state_usage_extra.update(usage_extra)
+
+
 def _evaluate_lifecycle_tool_permission(
     agent: Any,
     *,
@@ -1843,6 +2681,28 @@ def _lifecycle_approval_failure_output(
     arguments: dict[str, Any],
     tool_source: str,
 ) -> LifecycleHookOutput | None:
+    reason = str(getattr(permission, "reason", "") or "").strip()
+    if not bool(getattr(agent, "permission_interactive", True)):
+        from reuleauxcoder.domain.permission_gateway import (
+            PermissionAction,
+            PermissionDecision,
+        )
+
+        return _permission_denied_lifecycle_output(
+            declaration,
+            PermissionDecision(
+                action=PermissionAction.BLOCKED_REVIEW,
+                authorized=False,
+                reason=reason or f"{tool_name} requires lifecycle hook approval.",
+                audit={
+                    "lifecycle_hook_id": declaration.id,
+                    "lifecycle_event": declaration.event,
+                    "lifecycle_handler_type": handler_type,
+                    "permission": _permission_dict(permission),
+                },
+            ),
+            handler_type=handler_type,
+        )
     provider = getattr(agent, "approval_provider", None)
     request_approval = getattr(provider, "request_approval", None)
     if not callable(request_approval):
@@ -1856,7 +2716,6 @@ def _lifecycle_approval_failure_output(
             handler_type=handler_type,
             diagnostics_extra={"permission": _permission_dict(permission)},
         )
-    reason = str(getattr(permission, "reason", "") or "").strip()
     try:
         from reuleauxcoder.domain.approval import ApprovalRequest
 
@@ -1977,8 +2836,86 @@ def _adapter_failure_output(
     })
 
 
+def _adapter_dispatch_failure_output(
+    declaration: LifecycleHookDeclaration,
+    context: LifecycleHookEventContext,
+    message: str,
+    *,
+    code: str,
+    handler_type: str,
+    diagnostics_extra: dict[str, Any] | None = None,
+) -> LifecycleHookOutput:
+    diagnostic_extra = {
+        "event_name": context.event_name,
+        "failure_policy": (
+            "fail_closed"
+            if lifecycle_gate_event_is_gate(context.event_name)
+            else "fail_open"
+        ),
+        **(_jsonable(diagnostics_extra or {})),
+    }
+    if lifecycle_gate_event_is_gate(context.event_name):
+        return _adapter_failure_output(
+            declaration,
+            message,
+            code=code,
+            handler_type=handler_type,
+            diagnostics_extra=diagnostic_extra,
+        )
+    return LifecycleHookOutput.from_dict({
+        "diagnostics": [
+            {
+                "code": code,
+                "handler_type": handler_type,
+                "hook_id": declaration.id,
+                "message": message,
+                **diagnostic_extra,
+            }
+        ]
+    })
+
+
+def _lifecycle_dispatch_failure_output(
+    declaration: LifecycleHookDeclaration,
+    context: LifecycleHookEventContext,
+    exc: Exception,
+) -> LifecycleHookOutput:
+    message = (
+        f"lifecycle hook '{declaration.display_name or declaration.id}' failed "
+        f"during {context.event_name}: {exc}"
+    )
+    if lifecycle_gate_event_is_gate(context.event_name):
+        output = _adapter_failure_output(
+            declaration,
+            message,
+            code="lifecycle_hook_failed_closed",
+            handler_type=declaration.handler_type,
+            diagnostics_extra={
+                "event_name": context.event_name,
+                "failure_policy": "fail_closed",
+                "error_type": type(exc).__name__,
+            },
+        )
+    else:
+        output = LifecycleHookOutput.from_dict({
+            "diagnostics": [
+                {
+                    "code": "lifecycle_hook_failed_open",
+                    "handler_type": declaration.handler_type,
+                    "hook_id": declaration.id,
+                    "event_name": context.event_name,
+                    "failure_policy": "fail_open",
+                    "error_type": type(exc).__name__,
+                    "message": message,
+                }
+            ]
+        })
+    return _bounded_lifecycle_hook_output(output, declaration)
+
+
 def _lifecycle_output_from_external_json(
     declaration: LifecycleHookDeclaration,
+    context: LifecycleHookEventContext,
     raw_content: str,
     *,
     handler_type: str,
@@ -1987,8 +2924,9 @@ def _lifecycle_output_from_external_json(
         data = _parse_lifecycle_output_json(raw_content)
         return LifecycleHookOutput.from_dict(data)
     except Exception as exc:
-        return _adapter_failure_output(
+        return _adapter_dispatch_failure_output(
             declaration,
+            context,
             f"{handler_type} adapter returned invalid LifecycleHookOutput JSON: {exc}",
             code=f"{handler_type}_output_invalid",
             handler_type=handler_type,
@@ -2205,6 +3143,8 @@ def sanitize_lifecycle_hooks_for_config(
             "permissions": list(declaration.permissions),
             "trust": declaration.trust,
         }
+        if declaration.credentials:
+            item["credentials"] = list(declaration.credentials)
         if declaration.handler_ref:
             item["handler_ref"] = declaration.handler_ref
         if declaration.matcher != "*":
@@ -2336,7 +3276,8 @@ def _choice(
     value = _string(data.get(field_name), fallback)
     if value not in allowed:
         raise ValueError(
-            f"lifecycle hook {field_name} must be one of {', '.join(sorted(allowed))}"
+            f"lifecycle hook {field_name} must be one of {', '.join(sorted(allowed))}; "
+            f"got {value!r}"
         )
     return value
 
@@ -2407,6 +3348,7 @@ def _dashboard_item(
     declaration: LifecycleHookDeclaration,
     *,
     runtime_adapters: LifecycleHookRuntimeAdapterRegistry,
+    recent_results: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     technical = dict(declaration.technical)
     if declaration.handler_ref:
@@ -2444,13 +3386,85 @@ def _dashboard_item(
         "enabled": executable,
         "executable": executable,
         "can_manage": can_manage,
+        "management_actions": _lifecycle_hook_management_actions(declaration)
+        if can_manage
+        else [],
         "unavailable_reason": unavailable_reason,
         "placement_runtime": placement_runtime,
         "runtime_context_required": _runtime_context_required(declaration),
         "permissions": list(declaration.permissions),
+        "credentials": list(declaration.credentials),
         "risk_level": declaration.risk_level,
+        "recent_result": _lifecycle_hook_recent_result(
+            declaration,
+            recent_results,
+        ),
         "technical": technical,
     }
+
+
+def _lifecycle_hook_recent_result(
+    declaration: LifecycleHookDeclaration,
+    recent_results: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(recent_results, dict):
+        for key in (
+            declaration.id,
+            declaration.event,
+            declaration.handler_ref,
+        ):
+            raw = recent_results.get(key)
+            if isinstance(raw, dict):
+                return _sanitize_lifecycle_hook_recent_result(raw)
+    return {
+        "status": "unrecorded",
+        "summary": "No lifecycle executions recorded.",
+    }
+
+
+def _sanitize_lifecycle_hook_recent_result(raw: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "status",
+        "summary",
+        "reason",
+        "decision",
+        "event",
+        "session_run_id",
+        "agent_run_id",
+        "occurred_at",
+        "updated_at",
+    }
+    result = {
+        key: _string(value)
+        for key, value in raw.items()
+        if key in allowed and _string(value)
+    }
+    if "status" not in result:
+        result["status"] = "unknown"
+    if "summary" not in result:
+        result["summary"] = result.get("reason", "") or result["status"]
+    return result
+
+
+def _lifecycle_hook_management_actions(
+    declaration: LifecycleHookDeclaration,
+) -> list[dict[str, str]]:
+    actions: list[dict[str, str]] = []
+    labels = {
+        "pending_review": "Mark pending review",
+        "trusted": "Trust hook",
+        "disabled": "Disable hook",
+        "blocked": "Block hook",
+    }
+    for trust in ("pending_review", "trusted", "disabled", "blocked"):
+        if trust == declaration.trust:
+            continue
+        actions.append({
+            "trust": trust,
+            "label": labels[trust],
+            "endpoint": "admin.lifecycle_hooks.trust",
+        })
+    return actions
 
 
 def _placement_runtime(
@@ -2799,6 +3813,8 @@ def _adapter_runtime_unavailable_reason(
 
 
 def _runtime_context_required(declaration: LifecycleHookDeclaration) -> list[str]:
+    if declaration.handler_type == "internal" and declaration.permissions:
+        return ["agent"]
     return list(
         {
             "prompt": ["prompt_model"],
@@ -2858,11 +3874,13 @@ __all__ = [
     "build_tool_batch_lifecycle_payload",
     "build_tool_lifecycle_payload",
     "canonical_lifecycle_hook_id",
+    "bind_lifecycle_dispatcher_to_hook_registry",
     "bind_lifecycle_runtime_adapters_to_agent",
     "default_lifecycle_hook_catalog_runtime_adapters",
     "default_lifecycle_hook_runtime_adapters",
     "dispatch_internal_lifecycle_hook_point",
     "lifecycle_declarations_from_config_hooks",
+    "lifecycle_event_catalog_items",
     "lifecycle_registry_from_config",
     "sanitize_lifecycle_hooks_for_config",
     "system_builtin_lifecycle_declarations_from_hook_registry",

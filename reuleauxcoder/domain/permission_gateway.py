@@ -13,6 +13,12 @@ from reuleauxcoder.domain.approval_engine import (
     ToolSource,
 )
 from reuleauxcoder.domain.config.models import ApprovalConfig, ApprovalRuleConfig
+from reuleauxcoder.domain.hooks.lifecycle_policy import (
+    lifecycle_gate_output_is_terminal,
+    lifecycle_gate_terminal_kind,
+    lifecycle_output_decision,
+    lifecycle_output_message,
+)
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.extensions.tools.policies import DEFAULT_TOOL_POLICIES, ToolPolicy
 
@@ -569,25 +575,19 @@ class PermissionGateway:
         for output in request.lifecycle_outputs:
             if not isinstance(output, dict):
                 continue
-            decision = str(output.get("decision") or "none").strip().lower()
-            if bool(output.get("continue_flow", True)) is False and decision in {
-                "",
-                "allow",
-                "defer",
-                "none",
-            }:
-                decision = "deny"
-            if decision == "deny":
-                reason = _lifecycle_reason(
+            decision = lifecycle_output_decision(output)
+            if lifecycle_gate_output_is_terminal(output):
+                kind = lifecycle_gate_terminal_kind(output)
+                reason = lifecycle_output_message(
                     output,
-                    fallback=f"{request.target.name} denied by lifecycle hook",
+                    fallback=f"{request.target.name} blocked by lifecycle hook",
                 )
                 return PermissionDecision(
                     action=PermissionAction.DENY,
                     authorized=False,
                     reason=reason,
                     capability_matched=capability_matched,
-                    policy_matched="lifecycle_hook:deny",
+                    policy_matched=f"lifecycle_hook:{kind}",
                     audit=self._audit(request),
                 )
             if decision == "ask":

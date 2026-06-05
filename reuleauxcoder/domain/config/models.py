@@ -878,6 +878,7 @@ class MCPServerConfig:
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = ""
     hooks: list[dict[str, Any]] = field(default_factory=list)
+    lifecycle_hook_results: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.runtime_footprint = runtime_footprint_for_mcp(self)
@@ -925,6 +926,7 @@ class MCPServerConfig:
             "package_ids": list(self.package_ids),
             "managed_by": self.managed_by,
             "hooks": [dict(item) for item in self.hooks],
+            "lifecycle_hook_results": dict(self.lifecycle_hook_results),
         }
 
     @classmethod
@@ -1018,6 +1020,11 @@ class MCPServerConfig:
             package_ids=_string_list_config_value(d.get("package_ids", [])),
             managed_by=str(d.get("managed_by", "")),
             hooks=_dict_list_config_value(d.get("hooks", [])),
+            lifecycle_hook_results=(
+                dict(d.get("lifecycle_hook_results"))
+                if isinstance(d.get("lifecycle_hook_results"), dict)
+                else {}
+            ),
         )
 
 
@@ -1164,6 +1171,7 @@ class SkillRegistrationConfig:
     package_ids: list[str] = field(default_factory=list)
     managed_by: str = "user"
     hooks: list[dict[str, Any]] = field(default_factory=list)
+    lifecycle_hook_results: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.runtime_footprint = runtime_footprint_for_skill(self)
@@ -1205,6 +1213,11 @@ class SkillRegistrationConfig:
             package_ids=_string_list_config_value(data.get("package_ids", [])),
             managed_by=str(data.get("managed_by") or "user"),
             hooks=_dict_list_config_value(data.get("hooks", [])),
+            lifecycle_hook_results=(
+                dict(data.get("lifecycle_hook_results"))
+                if isinstance(data.get("lifecycle_hook_results"), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1233,6 +1246,7 @@ class SkillRegistrationConfig:
             "package_ids": list(self.package_ids),
             "managed_by": self.managed_by,
             "hooks": [dict(item) for item in self.hooks],
+            "lifecycle_hook_results": dict(self.lifecycle_hook_results),
         }
 
 

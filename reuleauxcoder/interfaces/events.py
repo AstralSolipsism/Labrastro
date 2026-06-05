@@ -113,10 +113,16 @@ class UIEventBus:
     emitting thread when queued.
     """
 
-    def __init__(self, *, event_queue: queue.Queue | None = None):
+    def __init__(
+        self,
+        *,
+        event_queue: queue.Queue | None = None,
+        lifecycle_dispatcher: Any | None = None,
+    ):
         self._queue = event_queue
         self._handlers: list[Callable[[UIEvent], None]] = []
         self._history: list[UIEvent] = []
+        self._lifecycle_dispatcher = lifecycle_dispatcher
 
     @property
     def is_queued(self) -> bool:
@@ -137,12 +143,197 @@ class UIEventBus:
                 except Exception:
                     pass
 
+    def set_lifecycle_dispatcher(self, dispatcher: Any | None) -> None:
+        self._lifecycle_dispatcher = dispatcher
+
     def emit(self, event: UIEvent) -> None:
+        self._publish(event)
+        self._dispatch_notification_lifecycle(event)
+
+    def _publish(self, event: UIEvent) -> None:
         self._history.append(event)
         if self._queue is not None:
             self._queue.put(event)
         else:
             self._dispatch(event)
+
+    def _dispatch_notification_lifecycle(self, event: UIEvent) -> None:
+        if self._notification_lifecycle_skip(event):
+            return
+        dispatcher = self._lifecycle_dispatcher
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return
+        try:
+            from reuleauxcoder.domain.hooks.lifecycle import (
+                build_lifecycle_event_context,
+            )
+
+            context = build_lifecycle_event_context(
+                "Notification",
+                placement="server",
+                trigger_source=str(event.data.get("trigger_source") or event.kind.value),
+                session_run_id=str(event.data.get("session_run_id") or ""),
+                agent_run_id=str(event.data.get("agent_run_id") or ""),
+                turn_id=str(event.data.get("turn_id") or ""),
+                origin="ui",
+                metadata={
+                    "ui_event_kind": event.kind.value,
+                    "ui_event_level": event.level.value,
+                },
+                payload={
+                    "message": event.message,
+                    "level": event.level.value,
+                    "kind": event.kind.value,
+                    **dict(event.data),
+                },
+            )
+            results = dispatch(context)
+        except Exception:
+            return
+        for result in results or []:
+            audit = self._notification_lifecycle_audit_event(event, context, result)
+            if audit is not None:
+                self._publish(audit)
+
+    @staticmethod
+    def _notification_lifecycle_skip(event: UIEvent) -> bool:
+        data = event.data if isinstance(event.data, dict) else {}
+        if data.get("event_type") == "lifecycle_hook":
+            return True
+        if data.get("agent_event") is not None:
+            return True
+        if data.get("event_type"):
+            return True
+        if event.kind is UIEventKind.VIEW:
+            return True
+        return False
+
+    @staticmethod
+    def _notification_lifecycle_audit_event(
+        event: UIEvent,
+        context: Any,
+        result: Any,
+    ) -> UIEvent | None:
+        declaration = getattr(result, "declaration", None)
+        output = getattr(result, "output", None)
+        if output is not None:
+            try:
+                from reuleauxcoder.domain.hooks.lifecycle import (
+                    annotate_lifecycle_output_diagnostics,
+                )
+
+                annotate_lifecycle_output_diagnostics("Notification", output)
+            except Exception:
+                pass
+        output_dict = output.to_dict() if hasattr(output, "to_dict") else {}
+        if not isinstance(output_dict, dict):
+            output_dict = {}
+        diagnostics = output_dict.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+        decision = str(output_dict.get("decision") or "none")
+        continue_flow = output_dict.get("continue_flow", True)
+        if not isinstance(continue_flow, bool):
+            continue_flow = True
+        message = (
+            str(output_dict.get("user_message") or "").strip()
+            or str(output_dict.get("reason") or "").strip()
+            or f"Notification observed: {event.message}"
+        )
+        level = event.level
+        if diagnostics and level is UIEventLevel.INFO:
+            level = UIEventLevel.WARNING
+        payload = {
+            "event_type": "lifecycle_hook",
+            "phase": "result",
+            "event_name": "Notification",
+            "placement": str(getattr(context, "placement", "") or "server"),
+            "session_run_id": str(getattr(context, "session_run_id", "") or ""),
+            "agent_run_id": str(getattr(context, "agent_run_id", "") or ""),
+            "turn_id": str(getattr(context, "turn_id", "") or ""),
+            "trigger_source": str(getattr(context, "source", "") or ""),
+            "hook_id": str(getattr(declaration, "id", "") or ""),
+            "display_name": str(getattr(declaration, "display_name", "") or ""),
+            "source": str(getattr(declaration, "source", "") or ""),
+            "decision": decision,
+            "continue_flow": continue_flow,
+            "diagnostics": diagnostics,
+            "level": level.value,
+            "title": str(getattr(declaration, "display_name", "") or "Notification"),
+            "message": message,
+            "payload": dict(getattr(context, "payload", {}) or {}),
+            "output": output_dict,
+        }
+        return UIEvent(
+            message=message,
+            level=level,
+            kind=UIEventKind.AGENT,
+            data=payload,
+        )
+
+    def emit_lifecycle_hook_audit_events(self, result: Any) -> None:
+        """Publish structured lifecycle audit for internally bridged hook points."""
+
+        context = getattr(result, "lifecycle_context", None)
+        if context is None:
+            return
+        for dispatch_result in getattr(result, "dispatch_results", []) or []:
+            audit = self._lifecycle_hook_audit_event(context, dispatch_result)
+            if audit is not None:
+                self.emit(audit)
+
+    @staticmethod
+    def _lifecycle_hook_audit_event(context: Any, result: Any) -> UIEvent | None:
+        declaration = getattr(result, "declaration", None)
+        output = getattr(result, "output", None)
+        output_dict = output.to_dict() if hasattr(output, "to_dict") else {}
+        if not isinstance(output_dict, dict):
+            output_dict = {}
+        diagnostics = output_dict.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+        decision = str(output_dict.get("decision") or "none")
+        continue_flow = output_dict.get("continue_flow", True)
+        if not isinstance(continue_flow, bool):
+            continue_flow = True
+        event_name = str(getattr(context, "event_name", "") or "")
+        display_name = str(getattr(declaration, "display_name", "") or event_name)
+        message = (
+            str(output_dict.get("user_message") or "").strip()
+            or str(output_dict.get("reason") or "").strip()
+            or f"{display_name} observed {event_name}"
+        )
+        level = UIEventLevel.WARNING if diagnostics else UIEventLevel.INFO
+        payload = {
+            "event_type": "lifecycle_hook",
+            "phase": "result",
+            "event_name": event_name,
+            "placement": str(getattr(context, "placement", "") or "server"),
+            "session_run_id": str(getattr(context, "session_run_id", "") or ""),
+            "agent_run_id": str(getattr(context, "agent_run_id", "") or ""),
+            "turn_id": str(getattr(context, "turn_id", "") or ""),
+            "trigger_source": str(getattr(context, "source", "") or ""),
+            "origin": str(getattr(context, "origin", "") or ""),
+            "hook_id": str(getattr(declaration, "id", "") or ""),
+            "display_name": display_name,
+            "source": str(getattr(declaration, "source", "") or ""),
+            "handler_type": str(getattr(declaration, "handler_type", "") or ""),
+            "decision": decision,
+            "continue_flow": continue_flow,
+            "diagnostics": diagnostics,
+            "level": level.value,
+            "title": display_name,
+            "message": message,
+            "payload": _safe_lifecycle_context_payload(context),
+            "output": output_dict,
+        }
+        return UIEvent(
+            message=message,
+            level=level,
+            kind=UIEventKind.AGENT,
+            data=payload,
+        )
 
     def drain(self) -> None:
         """Dequeue and dispatch all pending events (queued mode only).
@@ -243,6 +434,22 @@ class UIEventBus:
                 reuse_key=reuse_key,
             )
         )
+
+
+def _safe_lifecycle_context_payload(context: Any) -> dict[str, Any]:
+    payload = dict(getattr(context, "payload", {}) or {})
+    technical = payload.get("technical")
+    if isinstance(technical, dict):
+        safe_technical = {
+            key: value
+            for key, value in technical.items()
+            if key != "legacy_context"
+        }
+        if safe_technical:
+            payload["technical"] = safe_technical
+        else:
+            payload.pop("technical", None)
+    return payload
 
 
 class AgentEventBridge:

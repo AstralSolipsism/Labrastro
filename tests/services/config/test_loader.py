@@ -11,6 +11,7 @@ from reuleauxcoder.domain.config.models import (
     TOOL_DIAGNOSTICS_CONFIG_FIELDS,
     ProviderConfig,
 )
+from reuleauxcoder.domain.hooks.lifecycle import lifecycle_registry_from_config
 from reuleauxcoder.domain.memory.registry import MemoryProviderRegistry
 from reuleauxcoder.domain.config.schema import CONFIG_SCHEMA
 from reuleauxcoder.services.config.loader import ConfigLoader
@@ -460,6 +461,223 @@ def test_parse_config_rejects_legacy_memory_backend_fields() -> None:
                 }
             }
         )
+
+
+def test_parse_config_validates_public_lifecycle_hook_contract_fields() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "skills": {
+                "items": {
+                    "code-review": {
+                        "name": "code-review",
+                        "hooks": [
+                            {
+                                "event": "UserPromptSubmit",
+                                "placement": "server",
+                                "handler_type": "prompt",
+                                "handler_ref": "skills/code-review/SKILL.md",
+                                "matcher": {"trigger_source": "chat"},
+                                "display_name": "Review prompt guard",
+                                "summary": "Checks review prompts before the model sees them.",
+                                "permissions": ["prompt.read"],
+                                "risk_level": "low",
+                                "technical": {"prompt_template": "review"},
+                                "trust": "trusted",
+                            }
+                        ],
+                    }
+                }
+            },
+            "mcp": {
+                "servers": {
+                    "github": {
+                        "command": "github-mcp-server",
+                        "hooks": [
+                            {
+                                "event": "PostToolUse",
+                                "placement": "server",
+                                "handler_type": "mcp_tool",
+                                "handler_ref": "github.audit",
+                                "matcher": {"tool_names": ["search_issues"]},
+                                "display_name": "GitHub audit",
+                                "summary": "Records GitHub MCP tool results.",
+                                "permissions": ["audit.write"],
+                                "risk_level": "medium",
+                                "technical": {"mcp_server": "github"},
+                                "trust": "trusted",
+                            }
+                        ],
+                    }
+                }
+            },
+            "capability_packages": {
+                "review": {
+                    "enabled": True,
+                    "hooks": [
+                        {
+                            "event": "PreToolUse",
+                            "placement": "server",
+                            "handler_type": "http",
+                            "handler_ref": "https://hooks.example.test/review",
+                            "matcher": {"tool_names": ["write_file"]},
+                            "display_name": "Review package policy",
+                            "summary": "Checks writes before tools run.",
+                            "permissions": ["http.lifecycle"],
+                            "risk_level": "high",
+                            "technical": {"endpoint": "review"},
+                            "trust": "pending_review",
+                        }
+                    ],
+                }
+            },
+            "capability_components": {
+                "mcp_server:github": {
+                    "kind": "mcp_server",
+                    "name": "github",
+                    "hooks": [
+                        {
+                            "event": "PermissionRequest",
+                            "placement": "server",
+                            "handler_type": "agent",
+                            "handler_ref": "reviewer",
+                            "display_name": "Permission reviewer",
+                            "summary": "Reviews permission requests.",
+                            "permissions": ["agent.run"],
+                            "risk_level": "medium",
+                            "technical": {"agent_id": "reviewer"},
+                            "trust": "trusted",
+                        }
+                    ],
+                }
+            },
+        }
+    )
+
+    assert config.validate() == []
+
+    items = {
+        item["id"]: item
+        for item in lifecycle_registry_from_config(config).dashboard_items()
+    }
+    skill_hook = items["hook:skill:code-review:UserPromptSubmit:0"]
+    assert {
+        key: skill_hook[key]
+        for key in (
+            "id",
+            "event",
+            "source",
+            "owner_id",
+            "owner_enabled",
+            "owner_status",
+            "placement",
+            "handler_type",
+            "display_name",
+            "summary",
+            "trust",
+            "permissions",
+            "credentials",
+            "risk_level",
+            "technical",
+        )
+    } == {
+        "id": "hook:skill:code-review:UserPromptSubmit:0",
+        "event": "UserPromptSubmit",
+        "source": "skill",
+        "owner_id": "code-review",
+        "owner_enabled": True,
+        "owner_status": "installed",
+        "placement": "server",
+        "handler_type": "prompt",
+        "display_name": "Review prompt guard",
+        "summary": "Checks review prompts before the model sees them.",
+        "trust": "trusted",
+        "permissions": ["prompt.read"],
+        "credentials": [],
+        "risk_level": "low",
+        "technical": {
+            "handler_ref": "skills/code-review/SKILL.md",
+            "matcher": {"trigger_source": "chat"},
+            "prompt_template": "review",
+        },
+    }
+    assert items["hook:mcp_server:github:PostToolUse:0"]["source"] == "mcp_server"
+    assert items["hook:mcp_server:github:PostToolUse:0"]["permissions"] == [
+        "audit.write"
+    ]
+    assert items["hook:mcp_server:github:PostToolUse:0"]["technical"] == {
+        "handler_ref": "github.audit",
+        "matcher": {"tool_names": ["search_issues"]},
+        "mcp_server": "github",
+    }
+    assert items["hook:capability_package:review:PreToolUse:0"]["handler_type"] == "http"
+    assert items["hook:capability_package:review:PreToolUse:0"]["trust"] == (
+        "pending_review"
+    )
+    assert items["hook:mcp_server:mcp_server:github:PermissionRequest:0"]["source"] == (
+        "mcp_server"
+    )
+    assert items["hook:mcp_server:mcp_server:github:PermissionRequest:0"][
+        "handler_type"
+    ] == "agent"
+
+
+def test_parse_config_rejects_internal_lifecycle_handler_from_user_config() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "capability_packages": {
+                "review": {
+                    "hooks": [
+                        {
+                            "event": "UserPromptSubmit",
+                            "placement": "server",
+                            "handler_type": "internal",
+                            "handler_ref": "memory_context",
+                            "display_name": "Unsafe internal hook",
+                            "summary": "Attempts to call Python hooks from user config.",
+                            "permissions": [],
+                        }
+                    ],
+                }
+            }
+        }
+    )
+
+    errors = config.validate()
+
+    assert len(errors) == 1
+    assert errors[0].startswith("capability_packages.review.hooks:")
+    assert "internal handlers" in errors[0]
+
+
+def test_parse_config_rejects_invalid_lifecycle_placement_from_user_config() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "mcp": {
+                "servers": {
+                    "github": {
+                        "command": "github-mcp-server",
+                        "hooks": [
+                            {
+                                "event": "PostToolUse",
+                                "placement": "local_peer",
+                                "handler_type": "mcp_tool",
+                                "display_name": "GitHub audit",
+                                "summary": "Records GitHub MCP tool results.",
+                                "permissions": [],
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+    )
+
+    errors = config.validate()
+
+    assert len(errors) == 1
+    assert errors[0].startswith("mcp.servers.github.hooks:")
+    assert "placement" in errors[0]
+    assert "local_peer" in errors[0]
 
 
 def test_host_config_keeps_session_auto_save_enabled() -> None:

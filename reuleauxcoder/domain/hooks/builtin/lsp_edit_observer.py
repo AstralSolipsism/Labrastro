@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from reuleauxcoder.domain.config.models import Config
@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from reuleauxcoder.domain.hooks.base import TransformHook
 from reuleauxcoder.domain.hooks.discovery import register_hook
+from reuleauxcoder.domain.hooks.lifecycle import build_lifecycle_event_context
 from reuleauxcoder.domain.hooks.types import AfterToolExecuteContext, HookPoint
 from reuleauxcoder.extensions.lsp.diagnostics import render_blocks
 
@@ -21,6 +22,7 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
     """Append diagnostics to successful local edit/write tool results."""
 
     lsp_manager: "LspManager | None" = None
+    lifecycle_dispatcher: Any | None = None
 
     def __init__(self, priority: int = -10):
         TransformHook.__init__(
@@ -30,6 +32,7 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
             extension_name="core",
         )
         self.lsp_manager = None
+        self.lifecycle_dispatcher = None
 
     @classmethod
     def create_from_config(cls, config: "Config") -> "LspEditObserverHook":
@@ -37,6 +40,9 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
 
     def set_lsp_manager(self, manager: "LspManager | None") -> None:
         self.lsp_manager = manager
+
+    def set_lifecycle_dispatcher(self, dispatcher: Any | None) -> None:
+        self.lifecycle_dispatcher = dispatcher
 
     def run(self, context: AfterToolExecuteContext) -> AfterToolExecuteContext:
         if self.lsp_manager is None or context.tool_call is None:
@@ -55,6 +61,7 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
             block = self.lsp_manager.notify_file_changed(file_path)
         except Exception:
             return context
+        self._dispatch_file_changed_lifecycle(context, file_path, block)
         if block is None:
             return context
         rendered = render_blocks(
@@ -65,3 +72,55 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
         if rendered:
             context.result = f"{context.result}\n\n{rendered}"
         return context
+
+    def _dispatch_file_changed_lifecycle(
+        self,
+        context: AfterToolExecuteContext,
+        file_path: str,
+        block: Any | None,
+    ) -> None:
+        dispatcher = self.lifecycle_dispatcher
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return
+        metadata = dict(context.metadata or {})
+        tool_call = context.tool_call
+        diagnostic_count = len(getattr(block, "items", []) or []) if block is not None else 0
+        execution_target = str(metadata.get("execution_target") or "local")
+        payload = {
+            "file_path": file_path,
+            "watcher": "lsp",
+            "tool_names": [str(getattr(tool_call, "name", "") or "")],
+            "tool_call_ids": [str(getattr(tool_call, "id", "") or "")],
+            "execution_target": execution_target,
+            "runtime_working_directory": str(
+                metadata.get("runtime_working_directory") or ""
+            ),
+            "runtime_workspace_root": str(
+                metadata.get("runtime_workspace_root") or ""
+            ),
+            "path_space": (
+                "local_workspace"
+                if execution_target == "local"
+                else str(metadata.get("path_space") or execution_target)
+            ),
+            "diagnostic_count": diagnostic_count,
+        }
+        lifecycle_context = build_lifecycle_event_context(
+            "FileChanged",
+            placement="server",
+            trigger_source=str(metadata.get("trigger_source") or "tool"),
+            session_run_id=str(context.session_id or ""),
+            agent_run_id=str(metadata.get("agent_run_id") or ""),
+            turn_id=str(metadata.get("turn_id") or ""),
+            origin="agent",
+            metadata={
+                "tool_source": str(metadata.get("tool_source") or "builtin"),
+                "mcp_server": str(metadata.get("mcp_server") or ""),
+            },
+            payload=payload,
+        )
+        try:
+            dispatch(lifecycle_context)
+        except Exception:
+            return

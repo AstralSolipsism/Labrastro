@@ -237,6 +237,49 @@ def test_lifecycle_deny_is_resolved_by_permission_gateway() -> None:
     assert decision.audit["lifecycle_hooks"][0]["hook_id"] == "hook:block-sensitive-read"
 
 
+def test_lifecycle_defer_is_resolved_by_permission_gateway() -> None:
+    decision = PermissionGateway().evaluate(
+        _request(
+            lifecycle_outputs=[
+                {
+                    "hook_id": "hook:defer-read",
+                    "display_name": "Deferred read guard",
+                    "decision": "defer",
+                    "reason": "read_file deferred by lifecycle policy",
+                }
+            ],
+        )
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert decision.reason == "read_file deferred by lifecycle policy"
+    assert decision.policy_matched == "lifecycle_hook:defer"
+    assert decision.audit["lifecycle_hooks"][0]["hook_id"] == "hook:defer-read"
+
+
+def test_lifecycle_continue_flow_false_is_resolved_by_permission_gateway() -> None:
+    decision = PermissionGateway().evaluate(
+        _request(
+            lifecycle_outputs=[
+                {
+                    "hook_id": "hook:stop-read",
+                    "display_name": "Stopped read guard",
+                    "decision": "allow",
+                    "continue_flow": False,
+                    "reason": "read_file stopped by lifecycle policy",
+                }
+            ],
+        )
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert decision.reason == "read_file stopped by lifecycle policy"
+    assert decision.policy_matched == "lifecycle_hook:deny"
+    assert decision.audit["lifecycle_hooks"][0]["hook_id"] == "hook:stop-read"
+
+
 def test_lifecycle_ask_uses_existing_interactive_and_background_review_boundary() -> None:
     request = _request(
         lifecycle_outputs=[
