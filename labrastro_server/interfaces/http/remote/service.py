@@ -23,6 +23,7 @@ from labrastro_server.services.admin.service import (
     ProviderModelsHandler,
     ProviderTestHandler,
     RemoteAdminConfigManager,
+    lifecycle_hook_recent_results_from_agent_runs,
 )
 from labrastro_server.services.auth.service import AuthService
 from labrastro_server.interfaces.http.remote.protocol import (
@@ -350,6 +351,8 @@ class _RemoteSessionRun:
     seq_next: int = 1
     approval_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
     approval_resolutions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    user_input_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
+    user_input_resolutions: dict[str, dict[str, Any]] = field(default_factory=dict)
     follow_up_tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_ticket: dict[str, Any] | None = None
     created_at: float = field(default_factory=time.time)
@@ -374,6 +377,7 @@ class _RemoteSessionRun:
     _pending_live_events: list[_PendingLiveSessionRunEvent] = field(default_factory=list, init=False, repr=False)
     _last_live_flush_at: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _approval_resolved_event_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _user_input_resolved_event_ids: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.session_id is None:
@@ -407,6 +411,8 @@ class _RemoteSessionRun:
             self._flush_live_events_locked(now, force=True)
             if event_type == "approval_resolved":
                 seq = self._append_approval_resolved_event_locked(normalized_payload)
+            elif event_type == "user_input_resolved":
+                seq = self._append_user_input_resolved_event_locked(normalized_payload)
             else:
                 seq = self._append_event_locked(event_type, normalized_payload)
             self._update_status_for_event_locked(event_type, normalized_payload)
@@ -462,6 +468,14 @@ class _RemoteSessionRun:
                 return self._event_buffer.latest_seq
             self._approval_resolved_event_ids.add(approval_id)
         return self._append_event_locked("approval_resolved", payload)
+
+    def _append_user_input_resolved_event_locked(self, payload: dict[str, Any]) -> int:
+        input_id = str(payload.get("input_id") or "")
+        if input_id:
+            if input_id in self._user_input_resolved_event_ids:
+                return self._event_buffer.latest_seq
+            self._user_input_resolved_event_ids.add(input_id)
+        return self._append_event_locked("user_input_resolved", payload)
 
     def _append_live_event_locked(
         self, event_type: str, payload: dict[str, Any], now: float
@@ -682,6 +696,8 @@ class _RemoteSessionRun:
             )
             for event_payload in self._cancel_pending_approvals_locked(close_reason):
                 self._append_approval_resolved_event_locked(event_payload)
+            for event_payload in self._cancel_pending_user_inputs_locked(close_reason):
+                self._append_user_input_resolved_event_locked(event_payload)
             self.running = False
             self.done = True
             if self.status not in {"error", "cancelled", "interrupted"}:
@@ -737,6 +753,7 @@ class _RemoteSessionRun:
                 "error": self.last_error,
                 "recovery": dict(self.recovery_ticket) if self.recovery_ticket else None,
                 "approvals": self._pending_approvals_locked(),
+                "user_inputs": self._pending_user_inputs_locked(),
             }
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
@@ -1070,6 +1087,199 @@ class _RemoteSessionRun:
             "state": state,
         }
 
+    def register_user_input(
+        self, input_id: str, payload: dict[str, Any] | None = None
+    ) -> None:
+        with self.cond:
+            input_id = str(input_id)
+            self.user_input_waiters[input_id] = {
+                "input_id": input_id,
+                "state": "requested",
+                "payload": self._user_input_payload(input_id, payload),
+                "registered": True,
+            }
+            self.user_input_resolutions.pop(input_id, None)
+
+    def resolve_user_input(
+        self,
+        input_id: str,
+        action: str,
+        content: dict[str, Any] | None,
+        reason: str | None,
+    ) -> str | None:
+        with self.cond:
+            input_id = str(input_id)
+            waiter = self.user_input_waiters.get(input_id)
+            normalized_content = dict(content) if isinstance(content, dict) else {}
+            if waiter is None:
+                resolved = self.user_input_resolutions.get(input_id)
+                if (
+                    resolved
+                    and resolved.get("action") == action
+                    and resolved.get("content") == normalized_content
+                ):
+                    return "already_resolved"
+                return None
+            if waiter.get("done"):
+                if (
+                    waiter.get("action") == action
+                    and waiter.get("content") == normalized_content
+                ):
+                    return "already_resolved"
+                return None
+            waiter["done"] = True
+            waiter["action"] = action
+            waiter["content"] = normalized_content
+            waiter["reason"] = reason
+            waiter["state"] = "resolved"
+            self._record_user_input_resolution_locked(
+                input_id, action, normalized_content, reason, "resolved"
+            )
+            self.cond.notify_all()
+            return "resolved"
+
+    def wait_user_input(
+        self, input_id: str, timeout_sec: float | None = None
+    ) -> tuple[str, dict[str, Any], str | None]:
+        deadline = time.time() + timeout_sec if timeout_sec else None
+        with self.cond:
+            input_id = str(input_id)
+            waiter = self.user_input_waiters.setdefault(
+                input_id,
+                {
+                    "input_id": input_id,
+                    "state": "requested",
+                    "payload": self._user_input_payload(input_id, None),
+                    "registered": False,
+                },
+            )
+            waiter.setdefault("input_id", input_id)
+            while not waiter.get("done"):
+                if deadline is None:
+                    self.cond.wait(timeout=0.5)
+                    continue
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    waiter["done"] = True
+                    waiter["action"] = "decline"
+                    waiter["content"] = {}
+                    waiter["reason"] = "user_input_timeout"
+                    waiter["state"] = "timed_out"
+                    break
+                self.cond.wait(timeout=remaining)
+            action = str(waiter.get("action") or "decline")
+            content = waiter.get("content")
+            if not isinstance(content, dict):
+                content = {}
+            reason = waiter.get("reason")
+            self._record_user_input_resolution_locked(
+                input_id,
+                action,
+                dict(content),
+                reason if isinstance(reason, str) else None,
+                str(waiter.get("state") or "resolved"),
+            )
+            self.user_input_waiters.pop(input_id, None)
+            return action, dict(content), reason if isinstance(reason, str) else None
+
+    def cancel_pending_user_inputs(self, reason: str) -> list[dict[str, Any]]:
+        with self.cond:
+            resolved_inputs = self._cancel_pending_user_inputs_locked(reason)
+            self.cond.notify_all()
+            return resolved_inputs
+
+    def _cancel_pending_user_inputs_locked(self, reason: str) -> list[dict[str, Any]]:
+        resolved_inputs: list[dict[str, Any]] = []
+        for waiter in self.user_input_waiters.values():
+            if waiter.get("done"):
+                continue
+            waiter["done"] = True
+            waiter["action"] = "cancel"
+            waiter["content"] = {}
+            waiter["reason"] = reason
+            waiter["state"] = "cancelled"
+            self._record_user_input_resolution_locked(
+                str(waiter.get("input_id") or ""),
+                "cancel",
+                {},
+                reason,
+                "cancelled",
+            )
+            if waiter.get("registered"):
+                event_payload = self._user_input_resolved_event_payload_locked(
+                    waiter,
+                    "cancel",
+                    {},
+                    reason,
+                )
+                if event_payload:
+                    resolved_inputs.append(event_payload)
+        return resolved_inputs
+
+    def _pending_user_inputs_locked(self) -> list[dict[str, Any]]:
+        inputs: list[dict[str, Any]] = []
+        for waiter in self.user_input_waiters.values():
+            if waiter.get("done"):
+                continue
+            input_id = str(waiter.get("input_id") or "")
+            payload = self._user_input_payload(
+                input_id,
+                waiter.get("payload") if isinstance(waiter.get("payload"), dict) else None,
+            )
+            payload["state"] = str(waiter.get("state") or "requested")
+            inputs.append(payload)
+        return inputs
+
+    def _user_input_resolved_event_payload_locked(
+        self,
+        waiter: dict[str, Any],
+        action: str,
+        content: dict[str, Any],
+        reason: str | None,
+    ) -> dict[str, Any]:
+        input_id = str(waiter.get("input_id") or "")
+        payload = self._user_input_payload(
+            input_id,
+            waiter.get("payload") if isinstance(waiter.get("payload"), dict) else None,
+        )
+        resolved: dict[str, Any] = {
+            "input_id": str(payload.get("input_id") or input_id),
+            "action": action,
+            "content": dict(content),
+        }
+        kind = payload.get("kind")
+        if isinstance(kind, str) and kind:
+            resolved["kind"] = kind
+        if reason is not None:
+            resolved["reason"] = reason
+        return resolved
+
+    @staticmethod
+    def _user_input_payload(
+        input_id: str, payload: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        out = dict(payload) if isinstance(payload, dict) else {}
+        out["input_id"] = str(out.get("input_id") or input_id)
+        return out
+
+    def _record_user_input_resolution_locked(
+        self,
+        input_id: str,
+        action: str,
+        content: dict[str, Any],
+        reason: str | None,
+        state: str,
+    ) -> None:
+        if not input_id:
+            return
+        self.user_input_resolutions[input_id] = {
+            "input_id": input_id,
+            "action": action,
+            "content": dict(content),
+            "reason": reason,
+            "state": state,
+        }
+
 
 class RemoteRelayHTTPService:
     """Expose ``RelayServer`` over a minimal HTTP API for remote peers."""
@@ -1144,6 +1354,19 @@ class RemoteRelayHTTPService:
             reload_handler=admin_config_reload_handler,
             provider_test_handler=admin_provider_test_handler,
             provider_models_handler=admin_provider_models_handler,
+            lifecycle_hook_results_provider=(
+                (
+                    lambda source, owner_id, runtime=runtime_control_plane: (
+                        lifecycle_hook_recent_results_from_agent_runs(
+                            runtime,
+                            source,
+                            owner_id,
+                        )
+                    )
+                )
+                if runtime_control_plane is not None
+                else None
+            ),
         )
         self.runtime_control_plane = runtime_control_plane
         self.taskflow_service = taskflow_service or TaskflowService(
@@ -1501,9 +1724,12 @@ class RemoteRelayHTTPService:
                 )
                 continue
             resolved_approvals = session.cancel_pending_approvals(reason)
+            resolved_user_inputs = session.cancel_pending_user_inputs(reason)
             session.append_event("error", {"message": reason})
             for event_payload in resolved_approvals:
                 session.append_event("approval_resolved", event_payload)
+            for event_payload in resolved_user_inputs:
+                session.append_event("user_input_resolved", event_payload)
             session.mark_done(reason)
 
     def _enqueue_outbound(self, peer_id: str, envelope: RelayEnvelope) -> None:
@@ -1650,6 +1876,9 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/session-runs/follow-up/cancel":
                     self._handle_session_run_follow_up_cancel()
+                    return
+                if parsed.path == "/remote/session-runs/user-input/reply":
+                    self._handle_session_run_user_input_reply()
                     return
                 if parsed.path == "/remote/approval/reply":
                     self._handle_approval_reply()

@@ -37,11 +37,13 @@ from reuleauxcoder.domain.hooks import (
     instantiate_hooks,
 )
 from reuleauxcoder.domain.hooks.lifecycle import (
+    bind_lifecycle_dispatcher_to_hook_registry,
     dispatch_internal_lifecycle_hook_point,
     system_builtin_lifecycle_declarations_from_hook_registry,
 )
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 from reuleauxcoder.extensions.mcp.manager import MCPManager
+from reuleauxcoder.extensions.mcp.timeouts import MCP_ELICITATION_TIMEOUT_SEC
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
 from labrastro_server.relay.server import RelayServer
@@ -225,6 +227,7 @@ class AppRunner:
         agent.context._ui_bus = ui_bus
 
         self._register_hooks(agent, config)
+        ui_bus.set_lifecycle_dispatcher(getattr(agent, "lifecycle_dispatcher", None))
         self._init_lsp(config, agent, ui_bus)
         self._wire_agent_tool_parent(agent)
         return config, ui_bus, llm, agent
@@ -259,6 +262,10 @@ class AppRunner:
                 if declaration.id not in existing_ids:
                     register(declaration)
                     existing_ids.add(declaration.id)
+        bind_lifecycle_dispatcher_to_hook_registry(
+            getattr(agent, "hook_registry", None),
+            getattr(agent, "lifecycle_dispatcher", None),
+        )
 
     def _init_lsp(self, config: Config, agent: Agent, ui_bus: UIEventBus) -> None:
         """Initialize host-side LSP for local execution."""
@@ -459,19 +466,25 @@ class AppRunner:
         | SessionSaveContext,
     ) -> None:
         """Run hooks for a lifecycle event without mutating control flow."""
-        dispatch_internal_lifecycle_hook_point(
+        result = dispatch_internal_lifecycle_hook_point(
             getattr(agent, "lifecycle_dispatcher", None),
             hook_point,
             context,
             trigger_source="runner",
             origin="runner",
         )
+        ui_bus = context.metadata.get("ui_bus")
+        if isinstance(ui_bus, UIEventBus):
+            ui_bus.emit_lifecycle_hook_audit_events(result)
 
     def _init_mcp(
         self, mcp_servers: list[Any], agent: Agent, ui_bus: UIEventBus
     ) -> MCPManager:
         """Initialize MCP manager and connect to servers."""
         manager = self.dependencies.create_mcp_manager(ui_bus)
+        set_elicitation_handler = getattr(manager, "set_elicitation_handler", None)
+        if callable(set_elicitation_handler):
+            set_elicitation_handler(self._mcp_elicitation_handler)
         manager.start()
 
         enabled_servers = [s for s in mcp_servers if getattr(s, "enabled", True)]
@@ -492,6 +505,68 @@ class AppRunner:
 
         self._mcp_manager = manager
         return manager
+
+    def _mcp_elicitation_handler(self, request: dict[str, Any]) -> dict[str, Any]:
+        session_run_id = str(request.get("session_run_id") or "")
+        service = self._relay_http_service
+        get_session = getattr(service, "_get_session_run", None)
+        session = get_session(session_run_id) if callable(get_session) else None
+        if session is None:
+            return {
+                "action": "decline",
+                "content": {},
+                "reason": "mcp_elicitation_session_unavailable",
+            }
+
+        request_id = str(request.get("request_id") or "")
+        tool_call_id = str(request.get("tool_call_id") or "")
+        input_id_parts = [
+            "mcp_elicitation",
+            session_run_id,
+            tool_call_id or "tool",
+            request_id or "request",
+        ]
+        input_id = ":".join(input_id_parts)
+        input_schema = request.get("input_schema")
+        payload = {
+            "input_id": input_id,
+            "kind": "mcp_elicitation",
+            "event_name": "Elicitation",
+            "session_run_id": session_run_id,
+            "agent_run_id": str(request.get("agent_run_id") or ""),
+            "turn_id": str(request.get("turn_id") or ""),
+            "tool_call_id": tool_call_id,
+            "mcp_server": str(request.get("mcp_server") or ""),
+            "tool_name": str(request.get("tool_name") or ""),
+            "request_id": request_id,
+            "message": str(request.get("message") or "MCP elicitation requested."),
+            "input_schema": dict(input_schema) if isinstance(input_schema, dict) else {},
+        }
+        session.register_user_input(input_id, payload)
+        session.append_event("user_input_request", payload)
+        timeout_sec = request.get("timeout_sec")
+        try:
+            timeout = (
+                float(timeout_sec)
+                if timeout_sec is not None
+                else MCP_ELICITATION_TIMEOUT_SEC
+            )
+        except (TypeError, ValueError):
+            timeout = MCP_ELICITATION_TIMEOUT_SEC
+        action, content, reason = session.wait_user_input(input_id, timeout_sec=timeout)
+        resolved_payload: dict[str, Any] = {
+            "input_id": input_id,
+            "kind": "mcp_elicitation",
+            "action": action,
+            "content": dict(content),
+        }
+        if reason is not None:
+            resolved_payload["reason"] = reason
+        session.append_event("user_input_resolved", resolved_payload)
+        result: dict[str, Any] = {"action": action, "content": dict(content)}
+        if reason is not None:
+            result["reason"] = reason
+        return result
 
 
 def _agent_config_id(config: Config, agent: Any) -> str:

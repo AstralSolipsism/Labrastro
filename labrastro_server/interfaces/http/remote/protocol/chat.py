@@ -277,6 +277,7 @@ class SessionRunStatusResponse:
     error: str | None = None
     recovery: dict[str, Any] | None = None
     approvals: list[dict[str, Any]] = field(default_factory=list)
+    user_inputs: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -304,6 +305,7 @@ class SessionRunStatusResponse:
             "error": self.error,
             "recovery": dict(self.recovery) if isinstance(self.recovery, dict) else None,
             "approvals": _dict_list(self.approvals),
+            "user_inputs": _dict_list(self.user_inputs),
         }
 
     @classmethod
@@ -335,6 +337,7 @@ class SessionRunStatusResponse:
             error=d.get("error") if isinstance(d.get("error"), str) else None,
             recovery=d.get("recovery") if isinstance(d.get("recovery"), dict) else None,
             approvals=_dict_list(d.get("approvals")),
+            user_inputs=_dict_list(d.get("user_inputs")),
         )
 
 @dataclass
@@ -496,6 +499,56 @@ class SessionRunRecoverResponse:
         )
 
 @dataclass
+class SessionRunUserInputReplyRequest:
+    peer_token: str
+    session_run_id: str
+    input_id: str
+    action: str
+    content: dict[str, Any] = field(default_factory=dict)
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "peer_token": self.peer_token,
+            "session_run_id": self.session_run_id,
+            "input_id": self.input_id,
+            "action": self.action,
+            "content": dict(self.content),
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunUserInputReplyRequest":
+        content = d.get("content")
+        return cls(
+            peer_token=d["peer_token"],
+            session_run_id=d["session_run_id"],
+            input_id=d.get("input_id") or d.get("inputId"),
+            action=str(d.get("action") or "decline"),
+            content=content if isinstance(content, dict) else {},
+            reason=d.get("reason") if isinstance(d.get("reason"), str) else None,
+        )
+
+
+@dataclass
+class SessionRunUserInputReplyResponse:
+    ok: bool
+    error: str | None = None
+    state: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"ok": self.ok, "error": self.error, "state": self.state}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunUserInputReplyResponse":
+        return cls(
+            ok=bool(d.get("ok", False)),
+            error=d.get("error"),
+            state=d.get("state") if isinstance(d.get("state"), str) else None,
+        )
+
+
+@dataclass
 class ApprovalReplyRequest:
     peer_token: str
     session_run_id: str
@@ -558,6 +611,8 @@ __all__ = [
     "SessionRunFollowUpResponse",
     "SessionRunRecoverRequest",
     "SessionRunRecoverResponse",
+    "SessionRunUserInputReplyRequest",
+    "SessionRunUserInputReplyResponse",
     "ApprovalReplyRequest",
     "ApprovalReplyResponse",
 ]

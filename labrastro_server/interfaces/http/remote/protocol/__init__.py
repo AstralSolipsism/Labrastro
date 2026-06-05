@@ -29,6 +29,8 @@ from labrastro_server.interfaces.http.remote.protocol.chat import (
     SessionRunStatusResponse,
     SessionRunEventsRequest,
     SessionRunEventsBatch,
+    SessionRunUserInputReplyRequest,
+    SessionRunUserInputReplyResponse,
 )
 from labrastro_server.interfaces.http.remote.protocol.environment import (
     EnvironmentManifestRequest,
@@ -87,6 +89,8 @@ __all__ = [
     "SessionRunStatusResponse",
     "SessionRunEventsRequest",
     "SessionRunEventsBatch",
+    "SessionRunUserInputReplyRequest",
+    "SessionRunUserInputReplyResponse",
     "CleanupRequest",
     "CleanupResult",
     "DisconnectNotice",

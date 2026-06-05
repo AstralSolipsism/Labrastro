@@ -57,6 +57,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("session_run.cancel", "POST", "/remote/session-runs/cancel", "SessionRunCancelRequest", "SessionRunCancelResponse", "peer_token"),
     RemoteEndpoint("session_run.follow_up", "POST", "/remote/session-runs/follow-up", "SessionRunFollowUpRequest", "SessionRunFollowUpResponse", "peer_token"),
     RemoteEndpoint("session_run.follow_up_cancel", "POST", "/remote/session-runs/follow-up/cancel", "SessionRunFollowUpCancelRequest", "SessionRunFollowUpResponse", "peer_token"),
+    RemoteEndpoint("session_run.user_input_reply", "POST", "/remote/session-runs/user-input/reply", "SessionRunUserInputReplyRequest", "SessionRunUserInputReplyResponse", "peer_token"),
     RemoteEndpoint("chat.approval_reply", "POST", "/remote/approval/reply", "ApprovalReplyRequest", "ApprovalReplyResponse", "peer_token"),
     RemoteEndpoint("agent_runs.events", "GET", "/remote/agent-runs/{agent_run_id}/events", "AgentRunEventsQuery", "AgentRunEventsResponse", "peer_token"),
     RemoteEndpoint("agent_runs.claim", "POST", "/remote/agent-runs/claim", "AgentRunClaimRequest", "AgentRunClaimResponse", "peer_token"),

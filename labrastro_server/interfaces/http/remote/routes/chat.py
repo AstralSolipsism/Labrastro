@@ -31,6 +31,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionRunStartResponse,
     SessionRunStatusRequest,
     SessionRunStatusResponse,
+    SessionRunUserInputReplyRequest,
+    SessionRunUserInputReplyResponse,
     SessionRunEventsRequest,
     SessionRunEventsBatch,
     CleanupResult,
@@ -516,4 +518,33 @@ class RemoteChatRoutes:
         self._send_json(
             HTTPStatus.OK,
             ApprovalReplyResponse(ok=True, state=state).to_dict(),
+        )
+
+    def _handle_session_run_user_input_reply(self) -> None:
+        payload = self._read_json()
+        try:
+            req = SessionRunUserInputReplyRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_user_input_reply_request")
+            return
+
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
+        if control is None:
+            return
+        _control_peer_id, session = control
+        if req.action not in {"accept", "decline", "cancel"}:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_user_input_action")
+            return
+        state = session.resolve_user_input(
+            req.input_id,
+            req.action,
+            req.content,
+            req.reason,
+        )
+        if state is None:
+            self._send_error(HTTPStatus.NOT_FOUND, "user_input_not_found")
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            SessionRunUserInputReplyResponse(ok=True, state=state).to_dict(),
         )

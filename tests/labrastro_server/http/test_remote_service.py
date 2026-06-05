@@ -6237,6 +6237,302 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_session_run_user_input_reply_routes_structured_mcp_elicitation_content(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+
+        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            input_id = "mcp-elicitation-1"
+            request_payload = {
+                "input_id": input_id,
+                "kind": "mcp_elicitation",
+                "event_name": "Elicitation",
+                "mcp_server": "docs",
+                "tool_name": "lookup",
+                "tool_call_id": "tool-call-1",
+                "message": "Pick a format",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"format": {"type": "string"}},
+                },
+            }
+            session.register_user_input(input_id, request_payload)
+            session.append_event("user_input_request", request_payload)
+            action, content, reason = session.wait_user_input(input_id, timeout_sec=2)
+            session.append_event(
+                "user_input_resolved",
+                {
+                    "input_id": input_id,
+                    "kind": "mcp_elicitation",
+                    "action": action,
+                    "content": content,
+                    "reason": reason,
+                },
+            )
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            session_run_events_handler=session_run_events_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "ask mcp"},
+            )
+            session_run_id = start_body["session_run_id"]
+
+            stream_body = _session_run_events_first_body(
+                service.base_url,
+                peer_token,
+                session_run_id,
+            )
+            input_events = [
+                event
+                for event in stream_body["events"]
+                if event["type"] == "user_input_request"
+            ]
+            assert input_events
+            input_id = input_events[0]["payload"]["input_id"]
+
+            status, reply_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/user-input/reply",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "input_id": input_id,
+                    "action": "accept",
+                    "content": {"format": "markdown"},
+                    "reason": "chosen",
+                },
+            )
+            assert status == 200
+            assert reply_body["ok"] is True
+
+            resolved_body = _session_run_events_body(
+                service.base_url,
+                peer_token,
+                session_run_id,
+                cursor=stream_body["next_cursor"],
+            )
+            resolved_events = [
+                event
+                for event in resolved_body["events"]
+                if event["type"] == "user_input_resolved"
+            ]
+            assert resolved_events
+            assert resolved_events[0]["payload"] == {
+                "input_id": input_id,
+                "kind": "mcp_elicitation",
+                "action": "accept",
+                "content": {"format": "markdown"},
+                "reason": "chosen",
+            }
+            assert resolved_body["done"] is True
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_status_reports_pending_mcp_user_inputs(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        input_ready = threading.Event()
+
+        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            input_id = "mcp-elicitation-status"
+            request_payload = {
+                "input_id": input_id,
+                "kind": "mcp_elicitation",
+                "event_name": "Elicitation",
+                "mcp_server": "docs",
+                "tool_name": "lookup",
+                "tool_call_id": "tool-call-status",
+                "message": "Pick a format",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"format": {"type": "string"}},
+                },
+            }
+            session.register_user_input(input_id, request_payload)
+            session.append_event("user_input_request", request_payload)
+            input_ready.set()
+            action, content, reason = session.wait_user_input(input_id, timeout_sec=5)
+            session.append_event(
+                "user_input_resolved",
+                {
+                    "input_id": input_id,
+                    "kind": "mcp_elicitation",
+                    "action": action,
+                    "content": content,
+                    "reason": reason,
+                },
+            )
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            session_run_events_handler=session_run_events_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "ask mcp"},
+            )
+            session_run_id = start_body["session_run_id"]
+            assert input_ready.wait(2)
+
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {"peer_token": peer_token, "session_run_id": session_run_id, "cursor": 0},
+            )
+            assert status == 200
+            assert status_body["user_inputs"] == [
+                {
+                    "input_id": "mcp-elicitation-status",
+                    "kind": "mcp_elicitation",
+                    "event_name": "Elicitation",
+                    "mcp_server": "docs",
+                    "tool_name": "lookup",
+                    "tool_call_id": "tool-call-status",
+                    "message": "Pick a format",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"format": {"type": "string"}},
+                    },
+                    "state": "requested",
+                }
+            ]
+
+            _, reply_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/user-input/reply",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "input_id": "mcp-elicitation-status",
+                    "action": "decline",
+                    "reason": "test_cleanup",
+                },
+            )
+            assert reply_body["ok"] is True
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_cancel_resolves_registered_pending_user_input(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        input_ready = threading.Event()
+
+        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            input_id = "mcp-elicitation-cancel"
+            payload = {
+                "input_id": input_id,
+                "kind": "mcp_elicitation",
+                "event_name": "Elicitation",
+                "message": "Pick a format",
+            }
+            session.register_user_input(input_id, payload)
+            session.append_event("user_input_request", payload)
+            input_ready.set()
+            action, content, reason = session.wait_user_input(input_id, timeout_sec=5)
+            session.append_event(
+                "user_input_resolved",
+                {
+                    "input_id": input_id,
+                    "kind": "mcp_elicitation",
+                    "action": action,
+                    "content": content,
+                    "reason": reason,
+                },
+            )
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            session_run_events_handler=session_run_events_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "cancel mcp"},
+            )
+            session_run_id = start_body["session_run_id"]
+            assert input_ready.wait(2)
+
+            status, cancel_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/cancel",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "reason": "user_cancelled",
+                },
+            )
+            assert status == 200
+            assert cancel_body["ok"] is True
+
+            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
+            resolved_events = [
+                event
+                for event in stream_body["events"]
+                if event["type"] == "user_input_resolved"
+            ]
+            assert len(resolved_events) == 1
+            assert resolved_events[0]["payload"] == {
+                "input_id": "mcp-elicitation-cancel",
+                "kind": "mcp_elicitation",
+                "action": "cancel",
+                "content": {},
+                "reason": "user_cancelled",
+            }
+            assert any(event["type"] == "session_run_cancelled" for event in stream_body["events"])
+            assert stream_body["done"] is True
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_session_run_done_resolves_registered_pending_approval(self) -> None:
         relay = RelayServer()
         relay.start()
