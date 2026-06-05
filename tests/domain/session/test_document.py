@@ -1045,6 +1045,44 @@ def test_terminal_error_settles_stale_pending_approval() -> None:
     assert tool["approvalResultReason"] == "peer_disconnected: peer_shutdown"
 
 
+def test_approval_request_preserves_lifecycle_hook_identity_metadata() -> None:
+    document = _session_run_start(None, "需要审批", 1)
+    document = apply_session_event(
+        document,
+        session_id="session-1",
+        event_type="approval_request",
+        payload={
+            "approval_id": "approval-1",
+            "tool_call_id": "call-1",
+            "tool_name": "lifecycle:UserPromptSubmit",
+            "tool_source": "lifecycle_hook",
+            "reason": "Review prompt before continuing.",
+            "tool_args": {"user_input": "install linked skill"},
+            "lifecycle_event": "UserPromptSubmit",
+            "lifecycle_hooks": [
+                {
+                    "hook_id": "hook:admin:prompt-review:UserPromptSubmit:0",
+                    "display_name": "Prompt review",
+                    "handler_type": "prompt",
+                    "reason": "Review prompt before continuing.",
+                }
+            ],
+        },
+        session_event_seq=2,
+    )
+
+    tool = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert tool["resultMeta"]["lifecycle_event"] == "UserPromptSubmit"
+    assert tool["resultMeta"]["lifecycle_hooks"] == [
+        {
+            "hook_id": "hook:admin:prompt-review:UserPromptSubmit:0",
+            "display_name": "Prompt review",
+            "handler_type": "prompt",
+            "reason": "Review prompt before continuing.",
+        }
+    ]
+
+
 def test_orphaned_running_session_run_settles_stale_pending_approval() -> None:
     document = _session_run_start(None, "需要审批", 1)
     document["run_state"]["session_run_id"] = "run-missing"

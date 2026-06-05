@@ -561,6 +561,7 @@ def _session_event_message(
 def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: dict[str, Any]) -> None:
     response = str(payload.get("response") or "")
     rendered = bool(payload.get("response_rendered"))
+    status = str(payload.get("status") or "").strip()
     _settle_stale_pending_approvals(doc, status="denied", reason="session_run_closed", meta=meta)
     if response and not rendered:
         _append_text_part(
@@ -572,6 +573,15 @@ def _apply_session_run_end(doc: dict[str, Any], payload: dict[str, Any], meta: d
             replace_stream_key="assistant-stream",
             append=False,
         )
+    if status and status != "done":
+        _apply_terminal_session_run_event(
+            doc,
+            status=status,
+            session_state=str(payload.get("session_state") or status),
+            error=str(payload.get("error") or response or status),
+            meta=meta,
+        )
+        return
     _apply_terminal_session_run_event(
         doc,
         status="done",
@@ -780,6 +790,7 @@ def _apply_tool_or_output_event(
             "toolCallId": _tool_call_id(payload),
             "source": _string(payload, "tool_source"),
             "input": payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {},
+            "resultMeta": _approval_request_result_meta(payload),
         }, meta)
     elif event_type == "approval_resolved":
         _patch_tool_part(doc, _tool_call_id(payload), _string(payload, "approval_id"), {
@@ -1009,6 +1020,48 @@ def _tool_end_status(result_meta: dict[str, Any]) -> str:
             }:
                 return "error"
     return "returned"
+
+
+_APPROVAL_LIFECYCLE_HOOK_FIELDS = (
+    "hook_id",
+    "display_name",
+    "source",
+    "handler_type",
+    "decision",
+    "reason",
+)
+
+
+def _approval_request_result_meta(payload: dict[str, Any]) -> dict[str, Any] | None:
+    result_meta = (
+        dict(payload.get("meta")) if isinstance(payload.get("meta"), dict) else {}
+    )
+    if isinstance(payload.get("permission"), dict):
+        result_meta["permission"] = dict(payload["permission"])
+    lifecycle_event = _string(payload, "lifecycle_event")
+    if lifecycle_event:
+        result_meta["lifecycle_event"] = lifecycle_event
+    lifecycle_hooks = _approval_lifecycle_hooks(payload.get("lifecycle_hooks"))
+    if lifecycle_hooks:
+        result_meta["lifecycle_hooks"] = lifecycle_hooks
+    return result_meta or None
+
+
+def _approval_lifecycle_hooks(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    hooks: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        public_item = {
+            field: item[field]
+            for field in _APPROVAL_LIFECYCLE_HOOK_FIELDS
+            if item.get(field) is not None
+        }
+        if public_item:
+            hooks.append(public_item)
+    return hooks
 
 
 def _tool_part_insert_index(

@@ -36,6 +36,7 @@ from reuleauxcoder.domain.agent.events import (
     AgentEventType,
     ToolFailureKind,
 )
+from reuleauxcoder.domain.agent.runtime_boundary import runtime_agent_run_id
 from reuleauxcoder.domain.agent.tool_diagnostics import (
     ToolDiagnostic,
     ToolDiagnosticKind,
@@ -57,6 +58,16 @@ from reuleauxcoder.domain.config.models import (
     resolve_agent_environment_requirement_scope_ids,
     resolve_agent_effective_capability_scope,
 )
+from reuleauxcoder.domain.hooks.lifecycle import (
+    LifecycleHookDispatcher,
+    bind_lifecycle_dispatcher_to_hook_registry,
+    bind_lifecycle_runtime_adapters_to_agent,
+    build_lifecycle_event_context,
+    default_lifecycle_hook_runtime_adapters,
+    lifecycle_registry_from_config,
+    system_builtin_lifecycle_declarations_from_hook_registry,
+)
+from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
 from reuleauxcoder.domain.session.document import settle_orphaned_running_session_run
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
@@ -129,6 +140,35 @@ def _stable_digest(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256-{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _rebuild_agent_lifecycle_dispatcher(agent: Agent, config: Any) -> LifecycleHookDispatcher:
+    hook_registry = getattr(agent, "hook_registry", None)
+    if hook_registry is None:
+        hook_registry = HookRegistry()
+        setattr(agent, "hook_registry", hook_registry)
+    dispatcher = LifecycleHookDispatcher(
+        lifecycle_registry_from_config(config),
+        runtime_adapters=default_lifecycle_hook_runtime_adapters(
+            hook_registry=hook_registry,
+            prompt_llm=getattr(agent, "llm", None),
+        ),
+    )
+    existing_ids = {
+        str(getattr(item, "id", "") or "")
+        for item in getattr(dispatcher.registry, "query", lambda: [])()
+    }
+    for declaration in system_builtin_lifecycle_declarations_from_hook_registry(
+        hook_registry
+    ):
+        if declaration.id in existing_ids:
+            continue
+        dispatcher.registry.register(declaration)
+        existing_ids.add(declaration.id)
+    setattr(agent, "lifecycle_dispatcher", dispatcher)
+    bind_lifecycle_runtime_adapters_to_agent(agent)
+    bind_lifecycle_dispatcher_to_hook_registry(hook_registry, dispatcher)
+    return dispatcher
 
 
 def _tool_arguments_preview(value: Any, limit: int = 240) -> str:
@@ -513,6 +553,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 ),
             )
         setattr(agent, "runtime_config", next_config)
+        _rebuild_agent_lifecycle_dispatcher(agent, next_config)
         chat_agent = _chat_entrypoint_agent_config(next_config)
         catalog_agent_id = str(getattr(chat_agent, "id", "") or DEFAULT_MAIN_CHAT_AGENT_ID)
         setattr(
@@ -541,6 +582,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             resolve_agent_environment_requirement_scope_ids(next_config)
         )
         if ui_bus is not None:
+            ui_bus.set_lifecycle_dispatcher(getattr(agent, "lifecycle_dispatcher", None))
             old_mcp_manager = getattr(agent, "mcp_manager", None)
             if old_mcp_manager is not None:
                 try:
@@ -556,6 +598,47 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             ui_bus.info("Remote admin config reloaded.", kind=UIEventKind.REMOTE)
 
     runner._relay_http_service.admin_manager.reload_handler = _reload_config
+
+    def _dispatch_config_change_lifecycle(event: dict[str, Any]) -> None:
+        dispatcher = getattr(agent, "lifecycle_dispatcher", None)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            return
+        metadata = {
+            key: event[key]
+            for key in (
+                "status",
+                "config_path",
+                "previous_etag",
+                "current_etag",
+                "changed_sections",
+                "execution_target",
+                "path_space",
+                "runtime_working_directory",
+                "runtime_workspace_root",
+            )
+            if key in event
+        }
+        context = build_lifecycle_event_context(
+            "ConfigChange",
+            placement="server",
+            trigger_source=str(event.get("trigger_source") or "admin"),
+            session_run_id=str(getattr(agent, "current_session_id", "") or ""),
+            agent_run_id=runtime_agent_run_id(agent),
+            turn_id=str(getattr(agent, "runtime_turn_id", "") or ""),
+            origin="admin",
+            locale=str(getattr(agent, "locale", "") or ""),
+            metadata=metadata,
+            payload=dict(event),
+        )
+        try:
+            dispatch(context)
+        except Exception:
+            return
+
+    runner._relay_http_service.admin_manager.config_change_handler = (
+        _dispatch_config_change_lifecycle
+    )
 
     def _peer_fingerprint(peer_id: str) -> str:
         peer = relay_server.registry.get(peer_id)
@@ -1341,6 +1424,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         peer_agent: Agent,
         peer_id: str,
         command_text: str,
+        *,
+        invalid_as_chat: bool = False,
     ) -> ChatCommandDispatchResponse:
         current_config = _current_config()
         if current_config is None:
@@ -1390,6 +1475,13 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             for event in getattr(command_bus, "_history", [])
         ]
         if command_result["action"] == "chat":
+            if invalid_as_chat:
+                return ChatCommandDispatchResponse(
+                    ok=True,
+                    action="chat",
+                    session_id=session_id,
+                    events=events,
+                )
             events.append(
                 {
                     "type": "error",
@@ -1451,21 +1543,6 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         )
         response.events.append({"type": "session_run_end", "payload": {"response": ""}})
         return response
-
-    def _is_registered_vscode_chat_command(
-        peer_agent: Agent,
-        command_text: str,
-    ) -> bool:
-        if not command_text.startswith("/"):
-            return False
-        return (
-            runner.dependencies.create_action_registry().parse(
-                command_text,
-                ui_profile=VSCODE_CHAT_PROFILE,
-                current_session_id=getattr(peer_agent, "current_session_id", None),
-            )
-            is not None
-        )
 
     def _stream_session_run(peer_id: str, prompt: str, remote_session) -> None:
         def _ensure_session_run_start() -> None:
@@ -1638,19 +1715,28 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             )
             startup_announced.add(startup_key)
 
-        if _is_registered_vscode_chat_command(peer_agent, prompt):
+        if prompt.startswith("/"):
             command_response = _dispatch_vscode_command(
-                peer_agent, peer_id, prompt
+                peer_agent,
+                peer_id,
+                prompt,
+                invalid_as_chat=True,
             )
-            _ensure_session_run_start()
-            for event in command_response.events:
-                remote_session.append_event(
-                    str(event.get("type") or "output"),
-                    event.get("payload") if isinstance(event.get("payload"), dict) else {},
-                )
-            remote_session.append_event("session_run_end", {"response": ""})
-            interactive_run_limiter.release_agent_slot(runtime_agent_id)
-            return
+            if command_response.events:
+                _ensure_session_run_start()
+                for event in command_response.events:
+                    remote_session.append_event(
+                        str(event.get("type") or "output"),
+                        event.get("payload")
+                        if isinstance(event.get("payload"), dict)
+                        else {},
+                    )
+            if command_response.action != "chat":
+                if not command_response.events:
+                    _ensure_session_run_start()
+                remote_session.append_event("session_run_end", {"response": ""})
+                interactive_run_limiter.release_agent_slot(runtime_agent_id)
+                return
 
         ansi_console = Console(
             record=True, force_terminal=True, color_system="truecolor"
@@ -1788,6 +1874,49 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 return request.intent.strip()
             value = dict(request.tool_args or {}).get("intent")
             return value.strip() if isinstance(value, str) and value.strip() else None
+
+        def _approval_lifecycle_payload(
+            request: ApprovalRequest,
+        ) -> dict[str, Any]:
+            metadata = (
+                dict(request.metadata)
+                if isinstance(request.metadata, dict)
+                else {}
+            )
+            payload: dict[str, Any] = {}
+            lifecycle_event = str(metadata.get("lifecycle_event") or "").strip()
+            if lifecycle_event:
+                payload["lifecycle_event"] = lifecycle_event
+            lifecycle_hooks = _approval_lifecycle_hooks(
+                metadata.get("lifecycle_hooks")
+            )
+            if lifecycle_hooks:
+                payload["lifecycle_hooks"] = lifecycle_hooks
+            return payload
+
+        def _approval_lifecycle_hooks(value: Any) -> list[dict[str, Any]]:
+            if not isinstance(value, list):
+                return []
+            public_fields = (
+                "hook_id",
+                "display_name",
+                "source",
+                "handler_type",
+                "decision",
+                "reason",
+            )
+            hooks: list[dict[str, Any]] = []
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                public_item = {
+                    field: item[field]
+                    for field in public_fields
+                    if item.get(field) is not None
+                }
+                if public_item:
+                    hooks.append(public_item)
+            return hooks
 
         def _section_markdown(section: dict[str, Any]) -> str:
             title = str(section.get("title") or "Details")
@@ -1986,6 +2115,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     "sections": sections,
                     "preview_unavailable": preview is None or not preview.ok,
                     "preview_error": preview_error,
+                    **_approval_lifecycle_payload(request),
                     "format": "markdown",
                     "content": "\n\n".join(
                         part
@@ -2321,6 +2451,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
 
 def _structured_ui_event_type(event) -> str:
     data = getattr(event, "data", {}) or {}
+    if data.get("event_type") == "lifecycle_hook":
+        return "lifecycle_hook"
     if event.kind == UIEventKind.CONTEXT and (
         data.get("context_kind") == "memory_injection"
         or data.get("schema") == "memory_context.v1"

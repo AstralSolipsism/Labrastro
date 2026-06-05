@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import time
 from typing import Any, Callable, Protocol
 
 from reuleauxcoder.domain.agent_runtime.models import (
@@ -20,6 +21,7 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
     optional_worktree_role,
 )
 from reuleauxcoder.domain.agent.events import AgentEventType
+from reuleauxcoder.domain.agent.runtime_budget import normalize_runtime_budget
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 
 
@@ -36,6 +38,8 @@ class ExecutorEventType(str, Enum):
     USAGE = "usage"
     RESULT = "result"
     LIFECYCLE_HOOK = "lifecycle_hook"
+    SESSION_RUN_START = "session_run_start"
+    SESSION_RUN_END = "session_run_end"
 
 
 def _coerce_executor(value: ExecutorType | str) -> ExecutorType:
@@ -78,6 +82,7 @@ class ExecutorRunRequest:
     branch: str | None = None
     model: str | None = None
     executor_session_id: str | None = None
+    budget: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -92,6 +97,7 @@ class ExecutorRunRequest:
             self.model_request_origin = ModelRequestOrigin(str(self.model_request_origin))
         self.worktree_role = optional_worktree_role(self.worktree_role)
         self.publish_policy = optional_publish_policy(self.publish_policy)
+        self.budget = dict(self.budget) if isinstance(self.budget, dict) else {}
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +118,7 @@ class ExecutorRunRequest:
             "branch": self.branch,
             "model": self.model,
             "executor_session_id": self.executor_session_id,
+            "budget": dict(self.budget),
             "metadata": dict(self.metadata),
         }
 
@@ -157,6 +164,9 @@ class ExecutorRunRequest:
                 if data.get("executor_session_id") is not None
                 else None
             ),
+            budget=dict(data.get("budget", {}))
+            if isinstance(data.get("budget"), dict)
+            else {},
             metadata=dict(data.get("metadata", {}))
             if isinstance(data.get("metadata"), dict)
             else {},
@@ -194,6 +204,68 @@ class ExecutorEvent:
     def log(cls, message: str, *, level: str = "info", **data: Any) -> "ExecutorEvent":
         return cls(type=ExecutorEventType.LOG, text=message, data={"level": level, **data})
 
+    @classmethod
+    def session_run_start(cls, prompt: str, **data: Any) -> "ExecutorEvent":
+        return cls(
+            type=ExecutorEventType.SESSION_RUN_START,
+            data={"prompt": prompt, **data},
+        )
+
+    @classmethod
+    def session_run_end(
+        cls,
+        response: str,
+        *,
+        response_rendered: bool = True,
+        **data: Any,
+    ) -> "ExecutorEvent":
+        return cls(
+            type=ExecutorEventType.SESSION_RUN_END,
+            data={
+                "response": response,
+                "response_rendered": response_rendered,
+                **data,
+            },
+        )
+
+    @classmethod
+    def tool_use(
+        cls,
+        *,
+        tool_name: str,
+        tool_call_id: str | None = None,
+        tool_args: dict[str, Any] | None = None,
+        **data: Any,
+    ) -> "ExecutorEvent":
+        return cls(
+            type=ExecutorEventType.TOOL_USE,
+            data={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id or "",
+                "input": dict(tool_args or {}),
+                **data,
+            },
+        )
+
+    @classmethod
+    def tool_result(
+        cls,
+        *,
+        tool_name: str,
+        output: str,
+        tool_call_id: str | None = None,
+        **data: Any,
+    ) -> "ExecutorEvent":
+        return cls(
+            type=ExecutorEventType.TOOL_RESULT,
+            data={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id or "",
+                "output": output,
+                **data,
+            },
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": self.type.value,
@@ -222,6 +294,7 @@ class ExecutorRunResult:
     executor_session_id: str | None = None
     events: list[ExecutorEvent] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -259,6 +332,11 @@ class ExecutorRunResult:
             usage=dict(data.get("usage", {}))
             if isinstance(data.get("usage"), dict)
             else {},
+            artifacts=[
+                dict(artifact)
+                for artifact in data.get("artifacts", [])
+                if isinstance(artifact, dict)
+            ],
             error=str(data["error"]) if data.get("error") is not None else None,
         )
 
@@ -339,6 +417,9 @@ class ReuleauxCoderExecutorBackend:
             worktree_role=optional_worktree_role(session.metadata.get("worktree_role")),
             publish_policy=optional_publish_policy(session.metadata.get("publish_policy")),
             prompt=prompt,
+            budget=dict(session.metadata.get("budget"))
+            if isinstance(session.metadata.get("budget"), dict)
+            else {},
             metadata=dict(session.metadata),
         )
         agent = self._create_agent(request)
@@ -364,7 +445,12 @@ class ReuleauxCoderExecutorBackend:
 
     def _run_agent(self, request: ExecutorRunRequest, agent: Any) -> ExecutorRunResult:
         events = [ExecutorEvent.status("running", task_id=request.task_id)]
-        lifecycle_handler = self._attach_lifecycle_event_capture(agent, events)
+        runtime_artifacts: list[dict[str, Any]] = []
+        lifecycle_handler = self._attach_lifecycle_event_capture(
+            agent,
+            events,
+            runtime_artifacts,
+        )
         try:
             output = self._agent_chat(agent, request.prompt)
         except Exception as exc:  # pragma: no cover - defensive adapter boundary
@@ -377,26 +463,54 @@ class ReuleauxCoderExecutorBackend:
                 output="",
                 executor_session_id=getattr(agent, "current_session_id", None),
                 events=events,
+                artifacts=runtime_artifacts,
                 error=message,
             )
         finally:
             if lifecycle_handler is not None:
                 self._detach_agent_event_handler(agent, lifecycle_handler)
+            self._active_agents.pop(request.task_id, None)
 
+        result_status, result_error = self._result_status_from_session_run_end(
+            events,
+            output,
+        )
         events.append(ExecutorEvent.text_event(output))
-        events.append(ExecutorEvent.status("completed", task_id=request.task_id))
+        events.append(ExecutorEvent.status(result_status, task_id=request.task_id))
         return ExecutorRunResult(
             task_id=request.task_id,
-            status="completed",
+            status=result_status,
             output=output,
             executor_session_id=getattr(agent, "current_session_id", None),
             events=events,
+            artifacts=runtime_artifacts,
+            error=result_error,
         )
+
+    @staticmethod
+    def _result_status_from_session_run_end(
+        events: list[ExecutorEvent],
+        output: str,
+    ) -> tuple[str, str | None]:
+        for event in reversed(events):
+            if event.type != ExecutorEventType.SESSION_RUN_END:
+                continue
+            status = str(event.data.get("status") or "").strip()
+            if not status or status == "done":
+                return "completed", None
+            message = str(event.data.get("error") or output or status)
+            if status in {"blocked", "denied", "budget_exceeded"}:
+                return "blocked", message
+            if status == "cancelled":
+                return "cancelled", message
+            return "failed", message
+        return "completed", None
 
     @staticmethod
     def _attach_lifecycle_event_capture(
         agent: Any,
         events: list[ExecutorEvent],
+        runtime_artifacts: list[dict[str, Any]],
     ) -> Callable[[Any], None] | None:
         add_event_handler = getattr(agent, "add_event_handler", None)
         if not callable(add_event_handler):
@@ -405,15 +519,78 @@ class ReuleauxCoderExecutorBackend:
         def _on_agent_event(event: Any) -> None:
             event_type = getattr(event, "event_type", None)
             event_type_value = str(getattr(event_type, "value", event_type) or "")
-            if event_type_value != AgentEventType.LIFECYCLE_HOOK.value:
-                return
             data = getattr(event, "data", {})
-            events.append(
-                ExecutorEvent(
-                    type=ExecutorEventType.LIFECYCLE_HOOK,
-                    data=dict(data) if isinstance(data, dict) else {},
+            payload = dict(data) if isinstance(data, dict) else {}
+            if event_type_value == AgentEventType.LIFECYCLE_HOOK.value:
+                for artifact in getattr(event, "runtime_artifacts", []) or []:
+                    if isinstance(artifact, dict):
+                        runtime_artifacts.append(dict(artifact))
+                events.append(
+                    ExecutorEvent(
+                        type=ExecutorEventType.LIFECYCLE_HOOK,
+                        data=payload,
+                    )
                 )
-            )
+                return
+            if event_type_value == AgentEventType.SESSION_RUN_START.value:
+                prompt = str(payload.get("user_input") or payload.get("prompt") or "")
+                events.append(ExecutorEvent.session_run_start(prompt))
+                return
+            if event_type_value == AgentEventType.SESSION_RUN_END.value:
+                response = str(payload.get("response") or "")
+                response_rendered = payload.get("response_rendered", True)
+                events.append(
+                    ExecutorEvent.session_run_end(
+                        response,
+                        response_rendered=bool(response_rendered),
+                        **{
+                            key: value
+                            for key, value in payload.items()
+                            if key
+                            not in {
+                                "response",
+                                "response_rendered",
+                                "render_response",
+                            }
+                        },
+                    )
+                )
+                return
+            if event_type_value == AgentEventType.TOOL_CALL_START.value:
+                events.append(
+                    ExecutorEvent.tool_use(
+                        tool_name=str(getattr(event, "tool_name", "") or ""),
+                        tool_call_id=getattr(event, "tool_call_id", None),
+                        tool_args=getattr(event, "tool_args", None),
+                        **{
+                            key: value
+                            for key, value in payload.items()
+                            if key not in {"tool_name", "tool_call_id", "tool_args"}
+                        },
+                    )
+                )
+                return
+            if event_type_value == AgentEventType.TOOL_CALL_END.value:
+                events.append(
+                    ExecutorEvent.tool_result(
+                        tool_name=str(getattr(event, "tool_name", "") or ""),
+                        tool_call_id=getattr(event, "tool_call_id", None),
+                        output=str(getattr(event, "tool_result", "") or ""),
+                        **{
+                            key: value
+                            for key, value in payload.items()
+                            if key not in {
+                                "tool_name",
+                                "tool_call_id",
+                                "tool_result",
+                                "output",
+                            }
+                        },
+                    )
+                )
+                return
+            if event_type_value == AgentEventType.USAGE_UPDATE.value:
+                events.append(ExecutorEvent.usage(**payload))
 
         add_event_handler(_on_agent_event)
         return _on_agent_event
@@ -459,12 +636,40 @@ class ReuleauxCoderExecutorBackend:
         effective = permission_context.get("effective_capabilities")
         if not isinstance(effective, dict):
             effective = metadata.get("effective_capabilities")
+        budget = normalize_runtime_budget(request.budget)
 
         if agent_id:
             setattr(agent, "agent_config_id", agent_id)
+        setattr(agent, "runtime_agent_run_id", request.task_id)
         setattr(agent, "runtime_task_id", request.task_id)
+        setattr(agent, "runtime_budget", budget)
+        setattr(agent, "runtime_tool_call_count", 0)
+        if "max_turns" in budget:
+            setattr(agent, "max_rounds", budget["max_turns"])
+        if "timeout_sec" in budget:
+            setattr(agent, "runtime_timeout_sec", budget["timeout_sec"])
+            setattr(agent, "runtime_deadline", time.monotonic() + budget["timeout_sec"])
+        if "token_budget" in budget:
+            setattr(agent, "runtime_token_budget", budget["token_budget"])
+        if budget:
+            enforcement = {
+                "max_tool_calls": "tool_executor",
+                "max_turns": "agent_loop",
+                "timeout_sec": "agent_loop_and_tool_executor",
+                "token_budget": "agent_loop_and_tool_executor",
+            }
+            setattr(
+                agent,
+                "runtime_budget_enforcement",
+                {
+                    field_name: enforcement[field_name]
+                    for field_name in budget
+                    if field_name in enforcement
+                },
+            )
         if request.workdir:
             setattr(agent, "runtime_workspace_root", request.workdir)
+            setattr(agent, "runtime_working_directory", request.workdir)
         setattr(agent, "permission_trigger_source", source)
         setattr(agent, "permission_interactive", permission_context.get("interactive") is True)
         if runtime_profile_id:

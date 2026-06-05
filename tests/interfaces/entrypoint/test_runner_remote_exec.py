@@ -42,6 +42,14 @@ from reuleauxcoder.domain.session.document import (
 
 TEST_AUTH_PASSWORD = "admin-password"
 from reuleauxcoder.domain.approval import ApprovalRequest
+from reuleauxcoder.domain.hooks.lifecycle import (
+    FunctionLifecycleHookRuntimeAdapter,
+    LifecycleHookDeclaration,
+    LifecycleHookDispatcher,
+    LifecycleHookOutput,
+    LifecycleHookRegistry,
+    LifecycleHookRuntimeAdapterRegistry,
+)
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
@@ -66,7 +74,7 @@ from reuleauxcoder.interfaces.entrypoint.remote_relay import (
     _structured_ui_event_type,
     switch_session_model,
 )
-from reuleauxcoder.interfaces.events import UIEvent, UIEventKind
+from reuleauxcoder.interfaces.events import UIEvent, UIEventBus, UIEventKind
 from reuleauxcoder.services.llm.factory import resolve_model_runtime
 
 
@@ -95,6 +103,136 @@ def test_chat_locale_prompt_append_maps_supported_locales() -> None:
     )
     assert _chat_locale_prompt_append("ja").startswith("Language: Use English")
     assert _chat_locale_prompt_append(None) == ""
+
+
+def test_reload_rebuilds_agent_lifecycle_dispatcher_from_config_hooks() -> None:
+    from reuleauxcoder.domain.config.models import (
+        SkillRegistrationConfig,
+        SkillsConfig,
+    )
+    from reuleauxcoder.interfaces.entrypoint.remote_relay import (
+        _rebuild_agent_lifecycle_dispatcher,
+    )
+
+    agent = FakeAgent(FakeLLM("fake-model"), lifecycle_dispatcher=None)
+    config = SimpleNamespace(
+        skills=SkillsConfig(
+            items={
+                "reload-audit": SkillRegistrationConfig(
+                    name="reload-audit",
+                    hooks=[
+                        {
+                            "event": "ConfigChange",
+                            "handler_type": "prompt",
+                            "handler_ref": "skills/reload-audit/SKILL.md",
+                            "display_name": "Reload audit",
+                            "summary": "Audits config reloads.",
+                            "permissions": ["prompt.read"],
+                            "trust": "trusted",
+                        }
+                    ],
+                )
+            }
+        ),
+        mcp_servers=[],
+        capability_packages={},
+        capability_components={},
+    )
+
+    _rebuild_agent_lifecycle_dispatcher(agent, config)
+
+    assert agent.lifecycle_dispatcher is not None
+    declarations = agent.lifecycle_dispatcher.registry.query(event="ConfigChange")
+    assert [declaration.id for declaration in declarations] == [
+        "hook:skill:reload-audit:ConfigChange:0"
+    ]
+    assert declarations[0].trust == "trusted"
+
+
+def test_remote_config_change_lifecycle_context_uses_runtime_authority() -> None:
+    port = _free_port()
+    contexts = []
+
+    def lifecycle_handler(_declaration, context):
+        contexts.append(context)
+        return LifecycleHookOutput()
+
+    lifecycle_dispatcher = LifecycleHookDispatcher(
+        LifecycleHookRegistry([
+            LifecycleHookDeclaration.from_dict(
+                "hook:test:config-change",
+                {
+                    "event": "ConfigChange",
+                    "source": "admin_managed",
+                    "placement": "server",
+                    "handler_type": "internal",
+                    "handler_ref": "config-change",
+                    "display_name": "Config change",
+                    "summary": "Audits config changes.",
+                    "permissions": [],
+                    "trust": "trusted",
+                },
+            )
+        ]),
+        runtime_adapters=LifecycleHookRuntimeAdapterRegistry([
+            FunctionLifecycleHookRuntimeAdapter("internal", lifecycle_handler),
+        ]),
+    )
+    runner = _build_runner_with_fake_agent(
+        f"127.0.0.1:{port}",
+        lifecycle_dispatcher=lifecycle_dispatcher,
+    )
+    ctx = runner.initialize()
+    try:
+        agent = ctx.agent
+        agent.current_session_id = "session-authority"
+        agent.runtime_agent_run_id = "run-authority"
+        agent.runtime_turn_id = "turn-authority"
+        agent.locale = "zh-CN"
+
+        handler = runner._relay_http_service.admin_manager.config_change_handler
+        assert handler is not None
+        handler({
+            "event_name": "PayloadEvent",
+            "placement": "peer",
+            "trigger_source": "admin",
+            "session_run_id": "session-payload",
+            "agent_run_id": "run-payload",
+            "turn_id": "turn-payload",
+            "origin": "payload-origin",
+            "locale": "en",
+            "timestamp": "payload-time",
+            "metadata": {"payload": "metadata"},
+            "status": "committed",
+            "changed_sections": ["skills"],
+        })
+
+        config_contexts = [
+            context for context in contexts if context.event_name == "ConfigChange"
+        ]
+        assert len(config_contexts) == 1
+        context = config_contexts[0]
+        assert context.event_name == "ConfigChange"
+        assert context.placement == "server"
+        assert context.source == "admin"
+        assert context.session_run_id == "session-authority"
+        assert context.agent_run_id == "run-authority"
+        assert context.turn_id == "turn-authority"
+        assert context.origin == "admin"
+        assert context.locale == "zh-CN"
+        assert context.payload["event_name"] == "ConfigChange"
+        assert context.payload["placement"] == "server"
+        assert context.payload["session_run_id"] == "session-authority"
+        assert context.payload["agent_run_id"] == "run-authority"
+        assert context.payload["turn_id"] == "turn-authority"
+        assert "origin" not in context.payload
+        assert "locale" not in context.payload
+        assert "metadata" not in context.payload
+        assert context.payload["changed_sections"] == ["skills"]
+        assert context.metadata["status"] == "committed"
+        assert context.metadata["changed_sections"] == ["skills"]
+    finally:
+        runner.cleanup(ctx.agent)
 
 
 def test_runtime_config_with_chat_locale_merges_prompt_without_mutating_source() -> None:
@@ -441,7 +579,13 @@ class FakeContext:
 
 
 class FakeAgent:
-    def __init__(self, llm: FakeLLM, tools=None, chat_behavior=None) -> None:
+    def __init__(
+        self,
+        llm: FakeLLM,
+        tools=None,
+        chat_behavior=None,
+        lifecycle_dispatcher=None,
+    ) -> None:
         self.llm = llm
         self.tools = list(tools or [])
         self.context = FakeContext()
@@ -463,6 +607,7 @@ class FakeAgent:
         self.hook_registry = HookRegistry()
         self._event_handlers = []
         self.approval_provider = None
+        self.lifecycle_dispatcher = lifecycle_dispatcher
         self._stop_requested = False
         self._chat_behavior = chat_behavior or (lambda _agent, prompt: f"ok:{prompt}")
 
@@ -505,6 +650,7 @@ def _build_runner_with_fake_agent(
     active_main_model_profile: str | None = None,
     providers: ProvidersConfig | None = None,
     session_store=None,
+    lifecycle_dispatcher=None,
 ) -> AppRunner:
     default_providers = ProvidersConfig(
         items={
@@ -562,7 +708,10 @@ def _build_runner_with_fake_agent(
             create_llm=lambda cfg: FakeLLM(resolve_model_runtime(cfg).model),
             load_tools=load_tools or (lambda _backend: []),
             create_agent=lambda llm, _tools, _config: FakeAgent(
-                llm, tools=_tools, chat_behavior=chat_behavior
+                llm,
+                tools=_tools,
+                chat_behavior=chat_behavior,
+                lifecycle_dispatcher=lifecycle_dispatcher,
             ),
             create_remote_http_service=create_remote_http_service,
             create_configured_session_store=(
@@ -654,6 +803,48 @@ def test_remote_relay_maps_memory_context_to_dedicated_event_type() -> None:
     assert payload["schema"] == "memory_context.v1"
     assert payload["context_kind"] == "memory_injection"
     assert payload["provided_items"] == 1
+
+
+def test_remote_relay_maps_notification_lifecycle_audit_to_lifecycle_hook() -> None:
+    event = UIEvent.info(
+        "Notification audited.",
+        kind=UIEventKind.AGENT,
+        event_type="lifecycle_hook",
+        event_name="Notification",
+        payload={"message": "MCP server needs attention."},
+    )
+
+    assert _structured_ui_event_type(event) == "lifecycle_hook"
+    payload = _structured_ui_event_payload(event)
+    assert payload["event_name"] == "Notification"
+    assert payload["payload"]["message"] == "MCP server needs attention."
+
+
+def test_remote_relay_maps_session_lifecycle_audit_to_lifecycle_hook() -> None:
+    ui_bus = UIEventBus()
+    event = UIEvent.info(
+        "Session end audited.",
+        kind=UIEventKind.AGENT,
+        event_type="lifecycle_hook",
+        event_name="SessionEnd",
+        session_run_id="session-1",
+        trigger_source="session",
+        source="system_builtin",
+        hook_id="hook:system_builtin:session_save:observer",
+        payload={"technical": {"old_hook_point": "session_save"}},
+        diagnostics=[{"code": "session_end_observed"}],
+    )
+    ui_bus.emit(event)
+
+    assert _structured_ui_event_type(ui_bus._history[0]) == "lifecycle_hook"
+    payload = _structured_ui_event_payload(ui_bus._history[0])
+    assert payload["event_name"] == "SessionEnd"
+    assert payload["session_run_id"] == "session-1"
+    assert payload["trigger_source"] == "session"
+    assert payload["source"] == "system_builtin"
+    assert payload["hook_id"] == "hook:system_builtin:session_save:observer"
+    assert payload["payload"]["technical"]["old_hook_point"] == "session_save"
+    assert payload["diagnostics"] == [{"code": "session_end_observed"}]
 
 
 def test_remote_relay_maps_chat_mentions_to_reference_only_context() -> None:
@@ -2469,6 +2660,88 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
+    def test_runner_remote_approval_request_preserves_lifecycle_hook_identity(
+        self, tmp_path: Path
+    ) -> None:
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            decision = agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="lifecycle:UserPromptSubmit",
+                    tool_args={"user_input": "install linked skill"},
+                    tool_source="lifecycle_hook",
+                    reason="Review prompt before continuing.",
+                    metadata={
+                        "tool_call_id": "call-lifecycle-prompt",
+                        "lifecycle_event": "UserPromptSubmit",
+                        "lifecycle_hooks": [
+                            {
+                                "hook_id": (
+                                    "hook:admin:prompt-review:"
+                                    "UserPromptSubmit:0"
+                                ),
+                                "display_name": "Prompt review",
+                                "handler_type": "prompt",
+                                "reason": "Review prompt before continuing.",
+                            }
+                        ],
+                    },
+                )
+            )
+            return "approved" if decision.approved else "denied"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=[],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "review prompt"},
+            )
+            _, _cursor, events, _done = _session_run_events_until(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["session_run_id"],
+                lambda event: event["type"] == "approval_request",
+            )
+            approval_payload = next(
+                event["payload"]
+                for event in events
+                if event["type"] == "approval_request"
+            )
+
+            assert approval_payload["lifecycle_event"] == "UserPromptSubmit"
+            assert approval_payload["lifecycle_hooks"] == [
+                {
+                    "hook_id": "hook:admin:prompt-review:UserPromptSubmit:0",
+                    "display_name": "Prompt review",
+                    "handler_type": "prompt",
+                    "reason": "Review prompt before continuing.",
+                }
+            ]
+
+            _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/approval/reply",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": start_body["session_run_id"],
+                    "approval_id": approval_payload["approval_id"],
+                    "decision": "allow_once",
+                },
+            )
+        finally:
+            runner.cleanup(ctx.agent)
+
     def test_runner_remote_write_preview_failure_is_tool_denial(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -3132,5 +3405,76 @@ class TestRunnerRemoteExec:
                 assert not any(event["type"] == "view" for event in events)
 
             assert captured_prompts == prompts
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_stream_chat_user_prompt_expansion_rewrites_unregistered_slash_command(
+        self,
+    ) -> None:
+        workspace = Path(__file__).resolve().parent
+        port = _free_port()
+        captured_prompts: list[str] = []
+
+        def chat_behavior(_agent: FakeAgent, prompt: str) -> str:
+            captured_prompts.append(prompt)
+            return f"ok:{prompt}"
+
+        def lifecycle_handler(_declaration, _context):
+            return LifecycleHookOutput(updated_input={"command_text": "/help"})
+
+        lifecycle_dispatcher = LifecycleHookDispatcher(
+            LifecycleHookRegistry([
+                LifecycleHookDeclaration.from_dict(
+                    "hook:test:rewrite-command",
+                    {
+                        "event": "UserPromptExpansion",
+                        "source": "admin_managed",
+                        "placement": "server",
+                        "handler_type": "internal",
+                        "handler_ref": "rewrite-command",
+                        "display_name": "Rewrite command",
+                        "summary": "Rewrites unavailable slash command before parse.",
+                        "permissions": [],
+                        "trust": "trusted",
+                    },
+                )
+            ]),
+            runtime_adapters=LifecycleHookRuntimeAdapterRegistry([
+                FunctionLifecycleHookRuntimeAdapter("internal", lifecycle_handler),
+            ]),
+        )
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            lifecycle_dispatcher=lifecycle_dispatcher,
+        )
+        ctx = runner.initialize()
+        try:
+            assert runner._relay_server is not None
+            assert runner._relay_http_service is not None
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "/unsafe"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["session_run_id"],
+            )
+
+            assert captured_prompts == []
+            assert any(event["type"] == "lifecycle_hook" for event in events)
+            assert any(event["type"] == "view" for event in events)
+            assert not any(
+                event["type"] == "session_run_end"
+                and event["payload"].get("response") == "ok:/unsafe"
+                for event in events
+            )
         finally:
             runner.cleanup(ctx.agent)
