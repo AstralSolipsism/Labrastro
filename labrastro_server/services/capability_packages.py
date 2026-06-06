@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
-import subprocess
 import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from enum import Enum
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
@@ -24,8 +26,18 @@ from labrastro_server.services.agent_runtime.session_projection import (
     agent_run_events_to_session_events,
     agent_run_event_to_session_events,
 )
+from labrastro_server.services.capability_package_ingest import (
+    CapabilityDraftAssembler,
+    CapabilityDraftAssemblyResult,
+    CapabilityDraftFieldPatch,
+    CapabilityFailureCode,
+    CapabilityIngestState,
+    CapabilitySourceEvidence,
+    extract_capability_draft_field_patches,
+)
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRecord,
+    ArtifactType,
     CAPABILITY_COMPONENT_KINDS,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
@@ -63,6 +75,10 @@ from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import FetchCapab
 
 LOGGER = logging.getLogger(__name__)
 CAPABILITY_INGEST_WORKFLOW = "capability_package_ingest"
+_CAPABILITY_SOURCE_BUNDLE_ARTIFACT_KIND = "capability_source_bundle"
+_CAPABILITY_SOURCE_BUNDLE_ARTIFACT_SCHEMA = "capability_source_bundle.v1"
+_CAPABILITY_SOURCE_SEED_BUNDLE_ARTIFACT_KIND = "capability_source_seed_bundle"
+_CAPABILITY_SOURCE_SEED_BUNDLE_ARTIFACT_SCHEMA = "capability_source_seed_bundle.v1"
 _CAPABILITY_AGENT_TOOL_EVENTS = {
     "tool_call_start",
     "tool_call_end",
@@ -134,6 +150,10 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "skill_content_unresolved": "无法定位能力包 Skill 内容",
         "command_evidence_missing": "能力包依赖命令缺少来源证据",
         "source_discovery_incomplete": "能力包来源探索不完整",
+        "field_generation_incomplete": "能力包字段生成不完整",
+        "draft_generation_interrupted": "能力包草案生成中断",
+        "draft_field_missing": "能力包草案缺少必要字段",
+        "model_output_incomplete": "模型输出不完整，未能形成能力包草案",
         "draft_not_produced": "未生成可安装的能力包草案",
         "draft_invalid": "能力包草案未通过校验",
         "output_truncated_marker": "\n... 内容已从主时间线省略，请打开原始事件查看完整内容 ...\n",
@@ -182,12 +202,43 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "skill_content_unresolved": "Could not resolve capability package Skill content",
         "command_evidence_missing": "Capability package dependency commands lack source evidence",
         "source_discovery_incomplete": "Capability package source discovery is incomplete",
+        "field_generation_incomplete": "Capability package field generation is incomplete",
+        "draft_generation_interrupted": "Capability package draft generation was interrupted",
+        "draft_field_missing": "Capability package draft is missing required fields",
+        "model_output_incomplete": "Model output was incomplete and did not form a capability package draft",
         "draft_not_produced": "No installable capability package draft was produced",
         "draft_invalid": "Capability package draft did not pass validation",
         "output_truncated_marker": "\n... output omitted from the main timeline; open raw events for the complete content ...\n",
     },
 }
 MAX_SNIPPET_CHARS = 36_000
+_CAPABILITY_WORKSPACE_SKILL_FILE_LIMIT = 100
+_CAPABILITY_WORKSPACE_SKILL_FILE_MAX_CHARS = 200_000
+_CAPABILITY_PROMPT_DOCUMENT_CONTENT_PREVIEW_CHARS = 1_200
+_CAPABILITY_WORKSPACE_SKILL_SKIP_DIRS = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".pnpm-store",
+    ".pytest_cache",
+    ".rcoder",
+    ".ruff_cache",
+    ".tox",
+    ".turbo",
+    ".venv",
+    ".yarn",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "env",
+    "node_modules",
+    "out",
+    "target",
+    "venv",
+}
 DEFAULT_CAPABILITY_FOCUS = "install setup configure authentication requirements runtime sdk executable mcp skill"
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _CAPABILITY_COMPONENT_CONFIG_FIELDS = {
@@ -335,6 +386,82 @@ class CapabilityPackageIngestResult:
     agent_run: AgentRunRecord
     source: dict[str, Any]
     source_bundle: dict[str, Any]
+
+
+class CapabilityRunPhase(str, Enum):
+    AGENT_RUN_WAITING = "agent_run_waiting"
+    DRAFT_MISSING = "draft_missing"
+    DRAFT_PENDING_VALIDATION = "draft_pending_validation"
+    VALIDATION_FAILED = "validation_failed"
+    MATERIALIZATION_FAILED = "materialization_failed"
+    DRAFT_READY = "draft_ready"
+
+
+class CapabilityEvidenceSource(str, Enum):
+    METADATA = "metadata"
+    SEED_ARTIFACT = "seed_artifact"
+    AGENT_RUN_EVENTS = "agent_run_events"
+    ARTIFACT = "artifact"
+
+
+@dataclass(frozen=True)
+class CapabilityRunState:
+    phase: CapabilityRunPhase
+    agent_run_status: str
+    draft_present: bool
+    validation_ok: bool
+    materialization_ready: bool
+    materialization_source: CapabilityEvidenceSource
+    source_summary: dict[str, Any]
+    failure_code: str = ""
+    seed_source_bundle_artifact_id: str = ""
+    source_bundle_artifact_id: str = ""
+    source_evidence: dict[str, Any] = field(default_factory=dict)
+    field_generation: dict[str, Any] = field(default_factory=dict)
+    draft_assembly: dict[str, Any] = field(default_factory=dict)
+    ingest_state: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "phase": self.phase.value,
+            "agent_run_status": self.agent_run_status,
+            "draft_present": self.draft_present,
+            "validation_ok": self.validation_ok,
+            "materialization_ready": self.materialization_ready,
+            "materialization_source": self.materialization_source.value,
+            "source_summary": dict(self.source_summary),
+        }
+        if self.failure_code:
+            result["failure_code"] = self.failure_code
+        if self.seed_source_bundle_artifact_id:
+            result["seed_source_bundle_artifact_id"] = self.seed_source_bundle_artifact_id
+        if self.source_bundle_artifact_id:
+            result["source_bundle_artifact_id"] = self.source_bundle_artifact_id
+        if self.source_evidence:
+            result["source_evidence"] = deepcopy(self.source_evidence)
+        if self.field_generation:
+            result["field_generation"] = deepcopy(self.field_generation)
+        if self.draft_assembly:
+            result["draft_assembly"] = deepcopy(self.draft_assembly)
+        if self.ingest_state:
+            result["ingest_state"] = deepcopy(self.ingest_state)
+        return result
+
+
+@dataclass(frozen=True)
+class _CapabilityMaterializationEvidence:
+    source_bundle: dict[str, Any]
+    materialization_bundle: dict[str, Any]
+    materialization_source: str
+    seed_source_bundle_artifact_id: str = ""
+    source_bundle_artifact_id: str = ""
+
+
+@dataclass(frozen=True)
+class _SkillContentResolution:
+    content: str = ""
+    source_ref: str = ""
+    source_document_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -507,9 +634,10 @@ class CapabilityPackagerRunner:
         revision_instruction: str = "",
     ) -> AgentRunRecord:
         bundle = evidence_bundle.to_dict()
+        prompt_bundle = _source_bundle_for_packager_prompt(bundle)
         locale = _metadata_locale(agent_run_metadata)
         prompt = _render_packager_prompt(
-            bundle=bundle,
+            bundle=prompt_bundle,
             locale=locale,
             revision_draft=revision_draft,
             revision_instruction=revision_instruction,
@@ -518,7 +646,7 @@ class CapabilityPackagerRunner:
             "workflow": CAPABILITY_INGEST_WORKFLOW,
             "agent_run_source": "capability_ingest",
             "capability_source": evidence_bundle.source,
-            "source_bundle": bundle,
+            "source_bundle": prompt_bundle,
         }
         for key in (
             "session_id",
@@ -573,6 +701,176 @@ class CapabilityPackagerRunner:
             )
         ]
         return agent_run, events
+
+    def diagnostic_events(self, agent_run_id: str) -> list[dict[str, Any]]:
+        return self._paged_agent_run_events(agent_run_id)
+
+    def materialization_events(self, agent_run_id: str) -> list[dict[str, Any]]:
+        return [
+            event
+            for event in self._paged_agent_run_events(agent_run_id)
+            if _is_capability_materialization_event(event)
+        ]
+
+    def _paged_agent_run_events(self, agent_run_id: str) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        cursor = 0
+        while True:
+            batch = self.runtime_control_plane.list_events(
+                agent_run_id,
+                after_seq=cursor,
+                limit=1000,
+            )
+            if not batch:
+                break
+            event_dicts = [event.to_dict() for event in batch]
+            events.extend(event_dicts)
+            cursor = max(int(event.seq) for event in batch)
+            if len(batch) < 1000:
+                break
+        return events
+
+    def materialization_source_bundle(self, agent_run_id: str) -> dict[str, Any] | None:
+        """Return the persisted materialization evidence bundle for an AgentRun."""
+
+        artifact = self._source_bundle_artifact(
+            agent_run_id,
+            artifact_id=_capability_source_bundle_artifact_id(agent_run_id),
+            kind=_CAPABILITY_SOURCE_BUNDLE_ARTIFACT_KIND,
+            schema=_CAPABILITY_SOURCE_BUNDLE_ARTIFACT_SCHEMA,
+        )
+        if artifact is None:
+            return None
+        return _source_bundle_from_artifact(artifact)
+
+    def seed_source_bundle(self, agent_run_id: str) -> dict[str, Any] | None:
+        """Return the initial source evidence bundle persisted for an AgentRun."""
+
+        artifact = self._source_bundle_artifact(
+            agent_run_id,
+            artifact_id=_capability_seed_source_bundle_artifact_id(agent_run_id),
+            kind=_CAPABILITY_SOURCE_SEED_BUNDLE_ARTIFACT_KIND,
+            schema=_CAPABILITY_SOURCE_SEED_BUNDLE_ARTIFACT_SCHEMA,
+        )
+        if artifact is None:
+            return None
+        return _source_bundle_from_artifact(artifact)
+
+    def persist_seed_source_bundle(
+        self,
+        agent_run_id: str,
+        source_bundle: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Persist the collector seed evidence as an AgentRun document artifact."""
+
+        existing = self.seed_source_bundle(agent_run_id)
+        if existing is not None:
+            return existing
+        return self._persist_source_bundle_artifact(
+            agent_run_id,
+            _source_bundle_with_document_ids(source_bundle),
+            artifact_id=_capability_seed_source_bundle_artifact_id(agent_run_id),
+            kind=_CAPABILITY_SOURCE_SEED_BUNDLE_ARTIFACT_KIND,
+            schema=_CAPABILITY_SOURCE_SEED_BUNDLE_ARTIFACT_SCHEMA,
+        )
+
+    def persist_materialization_source_bundle(
+        self,
+        agent_run_id: str,
+        source_bundle: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Persist source materialization evidence as an AgentRun document artifact."""
+
+        bundle = source_bundle if isinstance(source_bundle, dict) else {}
+        if not _source_bundle_has_materialization_documents(bundle):
+            return None
+        existing = self.materialization_source_bundle(agent_run_id)
+        if existing is not None:
+            return existing
+        return self._persist_source_bundle_artifact(
+            agent_run_id,
+            bundle,
+            artifact_id=_capability_source_bundle_artifact_id(agent_run_id),
+            kind=_CAPABILITY_SOURCE_BUNDLE_ARTIFACT_KIND,
+            schema=_CAPABILITY_SOURCE_BUNDLE_ARTIFACT_SCHEMA,
+        )
+
+    def _persist_source_bundle_artifact(
+        self,
+        agent_run_id: str,
+        source_bundle: dict[str, Any],
+        *,
+        artifact_id: str,
+        kind: str,
+        schema: str,
+    ) -> dict[str, Any] | None:
+        bundle = source_bundle if isinstance(source_bundle, dict) else {}
+        attach = getattr(self.runtime_control_plane, "attach_artifact", None)
+        if not callable(attach):
+            return None
+        try:
+            artifact = attach(
+                agent_run_id,
+                artifact_id=artifact_id,
+                type=ArtifactType.DOCUMENT.value,
+                status="generated",
+                content=json.dumps(bundle, ensure_ascii=False, sort_keys=True),
+                metadata=_capability_source_bundle_artifact_metadata(
+                    agent_run_id,
+                    bundle,
+                    kind=kind,
+                    schema=schema,
+                ),
+            )
+        except Exception:
+            LOGGER.debug(
+                "failed to persist capability source bundle artifact",
+                exc_info=True,
+            )
+            artifact = self._source_bundle_artifact(
+                agent_run_id,
+                artifact_id=artifact_id,
+                kind=kind,
+                schema=schema,
+            )
+            return _source_bundle_from_artifact(artifact) if artifact else None
+        if hasattr(artifact, "to_dict"):
+            artifact_dict = artifact.to_dict()
+        elif isinstance(artifact, dict):
+            artifact_dict = artifact
+        else:
+            artifact_dict = {}
+        return _source_bundle_from_artifact(artifact_dict) or bundle
+
+    def _source_bundle_artifact(
+        self,
+        agent_run_id: str,
+        *,
+        artifact_id: str,
+        kind: str,
+        schema: str,
+    ) -> dict[str, Any] | None:
+        artifacts_loader = getattr(self.runtime_control_plane, "artifacts_to_dict", None)
+        if not callable(artifacts_loader):
+            return None
+        try:
+            artifacts = artifacts_loader(agent_run_id)
+        except Exception:
+            LOGGER.debug(
+                "failed to list AgentRun artifacts for capability source bundle",
+                exc_info=True,
+            )
+            return None
+        for artifact in reversed([item for item in artifacts if isinstance(item, dict)]):
+            if _is_capability_source_bundle_artifact(
+                artifact,
+                agent_run_id=agent_run_id,
+                artifact_id=artifact_id,
+                kind=kind,
+                schema=schema,
+            ):
+                return artifact
+        return None
 
 
 class CapabilityDraftValidator:
@@ -1046,6 +1344,12 @@ class CapabilityPackageIngestService:
         source_payload: dict[str, Any] = raw_source if isinstance(raw_source, dict) else payload
         evidence_bundle = self.collector.collect(source_payload)
         workspace_root = str(payload.get("workspace_root") or "").strip()
+        seed_source_bundle = _source_bundle_with_workspace_skill_documents(
+            evidence_bundle.to_dict(),
+            workspace_root,
+        )
+        seed_source_bundle = _source_bundle_with_document_ids(seed_source_bundle)
+        evidence_bundle = EvidenceBundle.from_dict(seed_source_bundle)
         agent_run = self.packager_runner.start(
             evidence_bundle=evidence_bundle,
             workspace_root=workspace_root,
@@ -1053,10 +1357,13 @@ class CapabilityPackageIngestService:
             revision_draft=revision_draft,
             revision_instruction=revision_instruction,
         )
+        persist_seed = getattr(self.packager_runner, "persist_seed_source_bundle", None)
+        if callable(persist_seed):
+            persist_seed(agent_run.id, seed_source_bundle)
         return CapabilityPackageIngestResult(
             agent_run=agent_run,
             source=evidence_bundle.source,
-            source_bundle=evidence_bundle.to_dict(),
+            source_bundle=seed_source_bundle,
         )
 
     def status(self, agent_run_id: str) -> dict[str, Any]:
@@ -1067,7 +1374,7 @@ class CapabilityPackageIngestService:
                 "agent_run_id is required",
             )
         try:
-            agent_run, events = self.packager_runner.status(task_id)
+            agent_run, display_events = self.packager_runner.status(task_id)
         except KeyError as exc:
             raise CapabilityPackageIngestError(
                 "agent_run_not_found",
@@ -1075,31 +1382,61 @@ class CapabilityPackageIngestService:
                 status=HTTPStatus.NOT_FOUND,
             ) from exc
         draft = _extract_draft(agent_run.get("output"))
+        diagnostic_events_loader = getattr(
+            self.packager_runner,
+            "diagnostic_events",
+            None,
+        )
+        diagnostic_events: list[dict[str, Any]] = []
+        diagnostic_events_loaded = False
+
+        def _load_diagnostic_events() -> list[dict[str, Any]]:
+            nonlocal diagnostic_events, diagnostic_events_loaded
+            if not diagnostic_events_loaded:
+                diagnostic_events = (
+                    diagnostic_events_loader(task_id)
+                    if callable(diagnostic_events_loader)
+                    else display_events
+                )
+                diagnostic_events_loaded = True
+            return diagnostic_events
+
         if draft is None:
-            for event in reversed(events):
+            for event in reversed(_load_diagnostic_events() or display_events):
                 payload = event.get("payload")
                 if isinstance(payload, dict):
                     draft = _extract_draft(payload.get("text") or payload.get("output"))
                     if draft is not None:
                         break
         metadata = agent_run.get("metadata") if isinstance(agent_run, dict) else {}
-        source_bundle = (
-            metadata.get("source_bundle")
-            if isinstance(metadata, dict) and isinstance(metadata.get("source_bundle"), dict)
-            else {}
+        materialization = _capability_materialization_evidence(
+            task_id=task_id,
+            agent_run=agent_run,
+            metadata=metadata,
+            events=display_events,
+            packager_runner=self.packager_runner,
+            load_materialization_events=_load_diagnostic_events,
+            draft_present=draft is not None,
         )
-        materialization_bundle = source_bundle
+        materialization_bundle = materialization.materialization_bundle
+        materialization_source = materialization.materialization_source
+        seed_source_bundle_artifact_id = materialization.seed_source_bundle_artifact_id
+        source_bundle_artifact_id = materialization.source_bundle_artifact_id
+        field_patch_events = _load_diagnostic_events() or display_events
+        field_patches = _capability_draft_field_patches(
+            agent_run,
+            field_patch_events,
+        )
+        draft_assembly = CapabilityDraftAssembler().assemble(
+            source_bundle=materialization_bundle,
+            patches=field_patches,
+        )
+        if draft is None and isinstance(draft_assembly.draft, dict):
+            draft = draft_assembly.draft
         if draft is not None:
-            workspace_root = _agent_run_materialization_workdir(agent_run, metadata)
-            materialization_bundle = _source_bundle_with_agent_run_documents(
-                source_bundle,
-                events,
-            )
             draft = _canonical_capability_draft_from_decision(
                 draft,
                 materialization_bundle,
-                workspace_root=workspace_root,
-                sandbox_container_id=str(metadata.get("sandbox_container_id") or ""),
             )
         validation: dict[str, Any] | None = None
         if draft is not None:
@@ -1111,11 +1448,32 @@ class CapabilityPackageIngestService:
             draft,
             validation,
             materialization_bundle,
+            agent_run=agent_run,
+            events=_load_diagnostic_events() or display_events,
+            missing_draft_code=_draft_assembly_missing_draft_code(
+                draft_assembly,
+                field_patches,
+            ),
         )
         return {
             "ok": True,
             "agent_run": agent_run,
-            "events": events,
+            "events": display_events,
+            "capability_run_state": _capability_run_state(
+                agent_run,
+                draft,
+                validation,
+                failure,
+                materialization_bundle,
+                materialization_source=materialization_source,
+                seed_source_bundle_artifact_id=seed_source_bundle_artifact_id,
+                source_bundle_artifact_id=source_bundle_artifact_id,
+                field_generation=_capability_field_generation_state(
+                    field_patches,
+                    draft_assembly,
+                ),
+                draft_assembly=draft_assembly.to_dict(),
+            ),
             "draft": draft,
             "source_bundle": materialization_bundle,
             "validation": validation,
@@ -1453,9 +1811,11 @@ class CapabilityPackageSessionRunService:
         previous_agent_run_id: str,
         followup_id: str,
     ) -> CapabilityPackageIngestResult:
-        evidence_bundle = EvidenceBundle.from_dict(source_bundle)
+        seed_source_bundle = _source_bundle_with_document_ids(source_bundle)
+        evidence_bundle = EvidenceBundle.from_dict(seed_source_bundle)
         workspace_root = str(payload.get("workspace_root") or "").strip()
-        agent_run = CapabilityPackagerRunner(self.runtime_control_plane).start(
+        runner = CapabilityPackagerRunner(self.runtime_control_plane)
+        agent_run = runner.start(
             evidence_bundle=evidence_bundle,
             workspace_root=workspace_root,
             revision_draft=draft,
@@ -1469,10 +1829,11 @@ class CapabilityPackageSessionRunService:
                 },
             ),
         )
+        runner.persist_seed_source_bundle(agent_run.id, seed_source_bundle)
         return CapabilityPackageIngestResult(
             agent_run=agent_run,
             source=evidence_bundle.source,
-            source_bundle=evidence_bundle.to_dict(),
+            source_bundle=seed_source_bundle,
         )
 
     def _project_agent_run_events(self, session: Any, agent_run_id: str) -> None:
@@ -2622,8 +2983,9 @@ def _render_packager_prompt(
         if use_zh:
             revision_block = (
                 "\n修改请求：\n"
-                "用户已经审阅上一版草案。请输出一份完整的新结构决策，不要输出补丁。"
-                "保留仍然有效的字段，并在证据包支持时应用用户的修改意见。\n"
+                "用户已经审阅上一版草案。请只输出需要变更的 capability_draft_patch / "
+                "capability_draft_patches 字段补丁。保留仍然有效的字段，并在证据包支持时"
+                "应用用户的修改意见；不要把未变化字段重新输出成完整最终草案。\n"
                 f"用户意见：\n{revision_text or '（没有额外文字）'}\n"
                 "上一版草案：\n"
                 f"```json\n{current_draft_json}\n```\n"
@@ -2631,9 +2993,11 @@ def _render_packager_prompt(
         else:
             revision_block = (
                 "\nRevision request:\n"
-                "The user has reviewed the previous draft. Produce a complete revised structure decision, "
-                "not a patch. Keep every field that remains valid, and apply the user's "
-                "requested changes when they are supported by the evidence bundle.\n"
+                "The user has reviewed the previous draft. Produce only the needed "
+                "capability_draft_patch / capability_draft_patches field patches. Keep every "
+                "field that remains valid, and apply the user's requested changes when they "
+                "are supported by the evidence bundle. Do not restate unchanged fields as a "
+                "complete final draft.\n"
                 f"User instruction:\n{revision_text or '(no extra text)'}\n"
                 "Previous draft:\n"
                 f"```json\n{current_draft_json}\n```\n"
@@ -2646,11 +3010,40 @@ def _render_packager_prompt(
             "你必须按顺序完成：source_discovery、evidence_extraction、materialization_plan、draft_decision。\n"
             "对于 GitHub 仓库，优先使用 list/glob/grep/read_file/fetch_capabilities 探索真实结构，"
             "重点检查 skills/**/SKILL.md、SKILL.md、README、docs、llms.txt 和 manifest 文件。\n"
-            "如果仓库已经包含 Skill 文件，能力包 Skill 必须来自这些文件的精确 source_path/content_ref。\n"
+            "如果仓库已经包含 Skill 文件，能力包 Skill 必须来自这些文件的精确 source_document_id/source_path；"
+            "content_ref 只能使用真实观察到的工具调用引用，不能自造。\n"
+            "读取 Skill 文件时必须获取完整文件内容，例如 read_file override=true；分页或截断读取不能用于安装物化。\n"
             "只能提取来源支持的说明；environment_requirements 只记录安装后的能力实际运行/检查需要的依赖，"
             "且 check/install/command 必须有来源中的精确命令证据。不要把外部安装方式（例如 npx skills add）转换成 Labrastro 运行依赖。\n"
-            "最终只输出一个紧凑 JSON 对象，不要使用 markdown fence，不要输出完整文件正文。\n"
-            "JSON 结构如下：\n"
+            "最终输出主协议是字段补丁，不是完整最终草案 JSON。每看明白一个字段就可以输出一个紧凑 JSON 对象；"
+            "不要使用 markdown fence，不要输出完整文件正文。字段补丁结构如下：\n"
+            "{\n"
+            '  "capability_draft_patch": {\n'
+            '    "field_path": "repo_summary",\n'
+            '    "value": "仓库/文档用途总结",\n'
+            '    "source_refs": [{"source_document_id": "cap-src-doc-..."}, {"source_path": "skills/code-review/SKILL.md"}, {"content_ref": "read-file-call-id"}],\n'
+            '    "confidence": 0.86,\n'
+            '    "diagnostics": []\n'
+            "  }\n"
+            "}\n"
+            "也可以批量输出：\n"
+            "{\n"
+            '  "capability_draft_patches": [\n'
+            '    {"field_path": "repo_summary", "value": "...", "source_refs": []},\n'
+            '    {"field_path": "contributions.skills", "value": [], "source_refs": []},\n'
+            '    {"field_path": "install_plan", "value": [], "source_refs": []},\n'
+            '    {"field_path": "usage", "value": [], "source_refs": []},\n'
+            '    {"field_path": "evidence", "value": [], "source_refs": []},\n'
+            '    {"field_path": "risk_level", "value": "low|medium|high", "source_refs": []}\n'
+            "  ]\n"
+            "}\n"
+            "Do not produce a complete final draft JSON as the primary output; complete draft JSON is accepted only as a legacy fallback.\n"
+            "服务端会按 field_path 组装最终草案。需要填的字段包括：id、name、description、source、runtime_footprint、"
+            "source_inventory、materialization_plan、contributions.skills、contributions.mcp_servers、"
+            "contributions.builtin_tools、contributions.prompt_fragments、contributions.credential_refs、"
+            "contributions.environment_requirements、effective_capabilities、install_plan、usage、evidence、"
+            "credentials、risk_level、execution_policy、notes。\n"
+            "字段 value 的兼容结构如下：\n"
             "{\n"
             '  "id": "package-id", "name": "Package Name", "description": "...",\n'
             '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
@@ -2658,7 +3051,8 @@ def _render_packager_prompt(
             '"install_required_on": [], "config_required_on": [], "user_message": "..."},\n'
             '  "source_inventory": {"files": [], "skill_files": [], "docs": []},\n'
             '  "materialization_plan": [\n'
-            '    {"component_id": "skill:code-review", "source_path": "skills/code-review/SKILL.md", '
+            '    {"component_id": "skill:code-review", "source_document_id": "cap-src-doc-...", '
+            '"source_path": "skills/code-review/SKILL.md", '
             '"content_ref": "read-file-call-id"}\n'
             "  ],\n"
             '  "contributions": {\n'
@@ -2687,7 +3081,8 @@ def _render_packager_prompt(
             '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
             "}\n\n"
             "由能力包管理的 Skills 必须可以安装到服务端标准 Skill 目录；"
-            "每个 Skill 组件必须给出可由证据包或 worktree 定位的 source_path/content_ref，"
+            "每个 Skill 组件必须给出可由证据包或 worktree 定位的 source_document_id/source_path，"
+            "只有存在真实工具调用引用时才给 content_ref，"
             "完整 skill_content 由后端读取并组装，不要在模型输出中搬运大文件。\n"
             "运行端必须明确：server runs in Labrastro backend；peer means the user's local VS Code side；"
             "both 表示两端都需要安装/配置证据。hooks 必须使用标准 matcher 列表字段 "
@@ -2710,14 +3105,47 @@ def _render_packager_prompt(
         "the real structure. Prioritize skills/**/SKILL.md, SKILL.md, README, docs, llms.txt, "
         "and manifest files.\n"
         "When the repository already contains Skill files, package-managed Skills must map "
-        "to the exact source_path/content_ref for those files.\n"
+        "to the exact source_document_id/source_path for those files; content_ref may only "
+        "use an actually observed tool-call reference and must not be invented.\n"
+        "Read Skill files with complete file content, for example read_file override=true; "
+        "paged or truncated reads cannot be used for install materialization.\n"
         "Extract only instructions supported by source evidence. environment_requirements are "
         "only for dependencies actually needed to run/check the installed capability, and "
         "check/install/command values must have exact command evidence. Do not turn external "
         "installation methods such as npx skills add into Labrastro runtime dependencies.\n"
-        "Return final output as one compact JSON object. Do not wrap it in a markdown fence, "
-        "and do not output complete file bodies.\n"
-        "Use this shape:\n"
+        "The primary final-output protocol is field patches, not a complete final draft JSON. "
+        "As soon as you understand one field, emit one compact JSON object for that field. "
+        "Do not wrap it in a markdown fence, and do not output complete file bodies.\n"
+        "Use this field patch shape:\n"
+        "{\n"
+        '  "capability_draft_patch": {\n'
+        '    "field_path": "repo_summary",\n'
+        '    "value": "Repository/docs purpose summary",\n'
+        '    "source_refs": [{"source_document_id": "cap-src-doc-..."}, {"source_path": "skills/code-review/SKILL.md"}, {"content_ref": "read-file-call-id"}],\n'
+        '    "confidence": 0.86,\n'
+        '    "diagnostics": []\n'
+        "  }\n"
+        "}\n"
+        "You may also emit a batch:\n"
+        "{\n"
+        '  "capability_draft_patches": [\n'
+        '    {"field_path": "repo_summary", "value": "...", "source_refs": []},\n'
+        '    {"field_path": "contributions.skills", "value": [], "source_refs": []},\n'
+        '    {"field_path": "install_plan", "value": [], "source_refs": []},\n'
+        '    {"field_path": "usage", "value": [], "source_refs": []},\n'
+        '    {"field_path": "evidence", "value": [], "source_refs": []},\n'
+        '    {"field_path": "risk_level", "value": "low|medium|high", "source_refs": []}\n'
+        "  ]\n"
+        "}\n"
+        "Do not produce a complete final draft JSON as the primary output; "
+        "complete draft JSON is accepted only as a legacy fallback.\n"
+        "The backend assembles the final draft by field_path. Fill these fields: id, name, "
+        "description, source, runtime_footprint, source_inventory, materialization_plan, "
+        "contributions.skills, contributions.mcp_servers, contributions.builtin_tools, "
+        "contributions.prompt_fragments, contributions.credential_refs, "
+        "contributions.environment_requirements, effective_capabilities, install_plan, usage, "
+        "evidence, credentials, risk_level, execution_policy, notes.\n"
+        "Use these compatible value shapes:\n"
         "{\n"
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
         '  "source": {"type": "github_repo|docs_url|project_notes", "url": "..."},\n'
@@ -2725,7 +3153,8 @@ def _render_packager_prompt(
         '"install_required_on": [], "config_required_on": [], "user_message": "..."},\n'
         '  "source_inventory": {"files": [], "skill_files": [], "docs": []},\n'
         '  "materialization_plan": [\n'
-        '    {"component_id": "skill:code-review", "source_path": "skills/code-review/SKILL.md", '
+        '    {"component_id": "skill:code-review", "source_document_id": "cap-src-doc-...", '
+        '"source_path": "skills/code-review/SKILL.md", '
         '"content_ref": "read-file-call-id"}\n'
         "  ],\n"
         '  "contributions": {\n'
@@ -2754,8 +3183,9 @@ def _render_packager_prompt(
         '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
         "}\n\n"
         "package-managed Skills must be installable into the server canonical Skill directory; "
-        "include source_path/content_ref for every Skill component so the backend can read "
-        "and assemble canonical skill_content. Do not copy large Skill files into the model output.\n"
+        "include source_document_id/source_path for every Skill component so the backend can read "
+        "and assemble canonical skill_content. Include content_ref only for observed tool-call "
+        "references. Do not copy large Skill files into the model output.\n"
         "Runtime placement must be explicit: server runs in Labrastro backend; "
         "peer means the user's local VS Code side; both means both sides require evidence-backed "
         "installation/configuration. hooks must use the standard matcher list fields "
@@ -2800,9 +3230,6 @@ def _extract_draft(value: Any) -> dict[str, Any] | None:
 def _canonical_capability_draft_from_decision(
     raw_draft: dict[str, Any],
     source_bundle: dict[str, Any] | None,
-    *,
-    workspace_root: str = "",
-    sandbox_container_id: str = "",
 ) -> dict[str, Any]:
     draft = deepcopy(raw_draft)
     bundle = source_bundle if isinstance(source_bundle, dict) else {}
@@ -2813,18 +3240,14 @@ def _canonical_capability_draft_from_decision(
         kind = str(item.get("kind") or item.get("type") or "").strip().lower()
         if kind != "skill" or _component_skill_content_value(item):
             return item
-        content, source_ref = _resolve_skill_content_from_source_bundle(
+        resolution = _resolve_skill_content_from_source_bundle(
             item,
             bundle,
-            workspace_root=workspace_root,
-            sandbox_container_id=sandbox_container_id,
         )
-        if not content:
+        if not resolution.content:
             reason = _skill_content_resolution_error(
                 item,
                 bundle,
-                workspace_root=workspace_root,
-                sandbox_container_id=sandbox_container_id,
             )
             if reason:
                 item = dict(item)
@@ -2834,13 +3257,16 @@ def _canonical_capability_draft_from_decision(
                 item["config"] = config
             return item
         item = dict(item)
-        item["skill_content"] = content
+        item["skill_content"] = resolution.content
         config = dict(item.get("config")) if isinstance(item.get("config"), dict) else {}
-        config.setdefault("skill_content", content)
-        if source_ref:
-            item["source_path"] = source_ref
-            config["source_path"] = source_ref
-            config["content_source"] = source_ref
+        config.setdefault("skill_content", resolution.content)
+        if resolution.source_ref:
+            item["source_path"] = resolution.source_ref
+            config["source_path"] = resolution.source_ref
+            config["content_source"] = resolution.source_ref
+        if resolution.source_document_id:
+            item["source_document_id"] = resolution.source_document_id
+            config["source_document_id"] = resolution.source_document_id
         item["config"] = config
         return item
 
@@ -2908,6 +3334,9 @@ def _component_with_materialization_plan(
     item = dict(component)
     config = dict(item.get("config")) if isinstance(item.get("config"), dict) else {}
     for field_name in (
+        "source_document_id",
+        "source_doc_id",
+        "document_id",
         "source_path",
         "content_ref",
         "content_path",
@@ -2966,11 +3395,216 @@ def _agent_run_materialization_workdir(
     return ""
 
 
+def _agent_run_status_is_terminal(agent_run: dict[str, Any]) -> bool:
+    status = str(agent_run.get("status") or "").strip().lower()
+    return status in {"completed", "failed", "cancelled", "blocked"}
+
+
+def _capability_source_bundle_artifact_id(agent_run_id: str) -> str:
+    return f"capability-source-bundle:{str(agent_run_id or '').strip()}"
+
+
+def _capability_seed_source_bundle_artifact_id(agent_run_id: str) -> str:
+    return f"capability-source-seed-bundle:{str(agent_run_id or '').strip()}"
+
+
+def _capability_source_bundle_artifact_metadata(
+    agent_run_id: str,
+    source_bundle: dict[str, Any],
+    *,
+    kind: str = _CAPABILITY_SOURCE_BUNDLE_ARTIFACT_KIND,
+    schema: str = _CAPABILITY_SOURCE_BUNDLE_ARTIFACT_SCHEMA,
+) -> dict[str, Any]:
+    summary = _source_bundle_summary(source_bundle)
+    return {
+        "kind": kind,
+        "schema": schema,
+        "agent_run_id": str(agent_run_id or "").strip(),
+        "workflow": CAPABILITY_INGEST_WORKFLOW,
+        "source_summary": summary,
+    }
+
+
+def _is_capability_source_bundle_artifact(
+    artifact: dict[str, Any],
+    *,
+    agent_run_id: str,
+    artifact_id: str,
+    kind: str,
+    schema: str,
+) -> bool:
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+    return (
+        str(artifact.get("id") or "") == artifact_id
+        and str(artifact.get("type") or "") == ArtifactType.DOCUMENT.value
+        and str(metadata.get("kind") or "") == kind
+        and str(metadata.get("schema") or "") == schema
+        and str(metadata.get("agent_run_id") or "") == str(agent_run_id or "").strip()
+    )
+
+
+def _source_bundle_from_artifact(artifact: dict[str, Any]) -> dict[str, Any] | None:
+    content = artifact.get("content")
+    if isinstance(content, dict):
+        return deepcopy(content)
+    if not isinstance(content, str) or not content.strip():
+        return None
+    parsed = _json_object_from_text(content)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _source_bundle_has_materialization_documents(source_bundle: dict[str, Any]) -> bool:
+    if _dict_list(source_bundle.get("documents")):
+        return True
+    inventory = source_bundle.get("source_inventory")
+    if isinstance(inventory, dict):
+        return bool(
+            _dict_list(inventory.get("documents"))
+            or _dict_list(inventory.get("skill_files"))
+            or _dict_list(inventory.get("raw_event_refs"))
+        )
+    return False
+
+
+def _source_bundle_has_source_documents(source_bundle: dict[str, Any]) -> bool:
+    return bool(_dict_list(source_bundle.get("documents")))
+
+
+def _source_bundle_has_complete_source_documents(source_bundle: dict[str, Any]) -> bool:
+    for document in _dict_list(source_bundle.get("documents")):
+        if document.get("content_complete") is False:
+            continue
+        if str(document.get("content") or "").strip():
+            return True
+    inventory = source_bundle.get("source_inventory")
+    if isinstance(inventory, dict):
+        for document in _dict_list(inventory.get("documents")):
+            if document.get("content_complete") is False:
+                continue
+            if str(document.get("content") or "").strip():
+                return True
+    return False
+
+
+def _source_bundle_has_agent_run_inventory(source_bundle: dict[str, Any]) -> bool:
+    inventory = source_bundle.get("source_inventory")
+    if not isinstance(inventory, dict):
+        return False
+    return bool(
+        _dict_list(inventory.get("documents"))
+        or _dict_list(inventory.get("files"))
+        or _dict_list(inventory.get("skill_files"))
+        or _dict_list(inventory.get("tool_calls"))
+        or _dict_list(inventory.get("raw_event_refs"))
+    )
+
+
+def _is_capability_materialization_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    if event_type in {"tool_use", "tool_result"}:
+        data = _agent_run_event_data(event)
+        tool_data = _event_tool_data(data)
+        tool_name = str(tool_data.get("tool_name") or tool_data.get("name") or "").strip()
+        return _is_source_inventory_tool(tool_name)
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    if _capability_draft_field_patches_from_event(event):
+        return True
+    return any(
+        _extract_draft(payload.get(field_name)) is not None
+        for field_name in ("text", "output")
+    )
+
+
+def _capability_draft_field_patches(
+    agent_run: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> list[CapabilityDraftFieldPatch]:
+    patches: list[CapabilityDraftFieldPatch] = []
+    for event in events:
+        patches.extend(_capability_draft_field_patches_from_event(event))
+    output = agent_run.get("output") if isinstance(agent_run, dict) else None
+    if str(output or "").strip():
+        # Completed AgentRun output is the terminal answer and must override
+        # earlier streamed field patches for the same field_path.
+        patches.extend(
+            extract_capability_draft_field_patches(
+                output,
+                producer_event_refs=[
+                    {
+                        "agent_run_id": str(agent_run.get("id") or ""),
+                        "type": "agent_run_output",
+                    }
+                ],
+            )
+        )
+    return patches
+
+
+def _capability_draft_field_patches_from_event(
+    event: dict[str, Any],
+) -> list[CapabilityDraftFieldPatch]:
+    if not isinstance(event, dict):
+        return []
+    patches: list[CapabilityDraftFieldPatch] = []
+    producer_event_refs = [_agent_run_event_ref(event)]
+    for value in _capability_event_text_values(event):
+        patches.extend(
+            extract_capability_draft_field_patches(
+                value,
+                producer_event_refs=producer_event_refs,
+            )
+        )
+    return patches
+
+
+def _capability_event_text_values(event: dict[str, Any]) -> list[str]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    values: list[str] = []
+    for source in (payload, data):
+        for field_name in ("text", "output", "content"):
+            value = source.get(field_name)
+            if isinstance(value, str) and value.strip():
+                values.append(value)
+    return _unique_strings(values)
+
+
+def _draft_assembly_missing_draft_code(
+    draft_assembly: CapabilityDraftAssemblyResult,
+    field_patches: list[CapabilityDraftFieldPatch],
+) -> str:
+    if not field_patches:
+        return ""
+    failure_code = draft_assembly.failure_code
+    if isinstance(failure_code, CapabilityFailureCode):
+        return failure_code.value
+    return str(failure_code or "").strip()
+
+
+def _capability_field_generation_state(
+    field_patches: list[CapabilityDraftFieldPatch],
+    draft_assembly: CapabilityDraftAssemblyResult,
+) -> dict[str, Any]:
+    return {
+        "patch_count": len(field_patches),
+        "patches": [patch.to_dict() for patch in field_patches],
+        "field_state": deepcopy(draft_assembly.field_state),
+    }
+
+
 def _source_bundle_with_agent_run_documents(
     source_bundle: dict[str, Any],
     events: list[dict[str, Any]],
+    *,
+    workspace_root: str = "",
 ) -> dict[str, Any]:
-    inventory = _source_inventory_from_agent_run_events(events)
+    source_bundle = _source_bundle_with_document_ids(source_bundle)
+    inventory = _source_inventory_from_agent_run_events(
+        events,
+        workspace_root=workspace_root,
+    )
     if not (
         inventory.documents
         or inventory.files
@@ -2981,19 +3615,7 @@ def _source_bundle_with_agent_run_documents(
         return source_bundle
     bundle = deepcopy(source_bundle) if isinstance(source_bundle, dict) else {}
     existing = _dict_list(bundle.get("documents"))
-    seen = {
-        str(item.get("source_path") or item.get("path") or item.get("title") or "").strip()
-        for item in existing
-        if isinstance(item, dict)
-    }
-    for document in inventory.documents:
-        key = str(document.get("source_path") or document.get("title") or "").strip()
-        if key and key in seen:
-            continue
-        existing.append(document)
-        if key:
-            seen.add(key)
-    bundle["documents"] = existing
+    bundle["documents"] = _dedupe_documents([*existing, *inventory.documents])
     if inventory.evidence:
         bundle["evidence"] = _dedupe_evidence(
             [*_dict_list(bundle.get("evidence")), *inventory.evidence]
@@ -3006,12 +3628,163 @@ def _source_bundle_with_agent_run_documents(
     return bundle
 
 
-def _documents_from_agent_run_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return _source_inventory_from_agent_run_events(events).documents
+def _source_bundle_with_document_ids(source_bundle: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(source_bundle, dict):
+        return {}
+    bundle = deepcopy(source_bundle)
+    documents = _dict_list(bundle.get("documents"))
+    if documents:
+        bundle["documents"] = [_document_with_source_document_id(item) for item in documents]
+    return bundle
+
+
+def _source_bundle_for_packager_prompt(source_bundle: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(source_bundle, dict):
+        return {}
+    bundle = deepcopy(source_bundle)
+    documents = _dict_list(bundle.get("documents"))
+    if documents:
+        bundle["documents"] = [_document_for_packager_prompt(item) for item in documents]
+    inventory = bundle.get("source_inventory")
+    if isinstance(inventory, dict):
+        inventory = deepcopy(inventory)
+        inventory_documents = _dict_list(inventory.get("documents"))
+        if inventory_documents:
+            inventory["documents"] = [
+                _document_for_packager_prompt(item) for item in inventory_documents
+            ]
+        bundle["source_inventory"] = inventory
+    return bundle
+
+
+def _document_for_packager_prompt(document: dict[str, Any]) -> dict[str, Any]:
+    item = dict(document)
+    content = str(item.get("content") or "")
+    if not content:
+        return item
+    should_omit = (
+        str(item.get("source_kind") or "") == "workspace_root_skill_file"
+        or len(content) > MAX_SNIPPET_CHARS
+    )
+    if not should_omit:
+        return item
+    item.pop("content", None)
+    item["content_preview"] = _truncate(
+        content,
+        _CAPABILITY_PROMPT_DOCUMENT_CONTENT_PREVIEW_CHARS,
+    )
+    item["content_chars"] = len(content)
+    item["content_omitted_from_prompt"] = True
+    return item
+
+
+def _source_bundle_with_workspace_skill_documents(
+    source_bundle: dict[str, Any],
+    workspace_root: str,
+) -> dict[str, Any]:
+    bundle = deepcopy(source_bundle) if isinstance(source_bundle, dict) else {}
+    root_text = str(workspace_root or "").strip()
+    if not root_text:
+        return bundle
+    root = Path(root_text).expanduser()
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return bundle
+    if not root_resolved.is_dir():
+        return bundle
+    documents = _dict_list(bundle.get("documents"))
+    seen = {
+        str(item.get("source_path") or item.get("path") or item.get("title") or "").strip()
+        for item in documents
+    }
+    evidence = _dict_list(bundle.get("evidence"))
+    for path in _unique_skill_files(root_resolved):
+        relative = str(path.relative_to(root_resolved)).replace("\\", "/")
+        if relative in seen:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not content:
+            continue
+        content_hash = _source_document_content_hash(content)
+        content_chars = len(content)
+        content_complete = content_chars <= _CAPABILITY_WORKSPACE_SKILL_FILE_MAX_CHARS
+        document = {
+            "title": relative,
+            "source_path": relative,
+            "path": relative,
+            "workspace_relative_path": relative,
+            "content_hash": content_hash,
+            "content_chars": content_chars,
+            "content_complete": content_complete,
+            "source_kind": "workspace_root_skill_file",
+            "path_identities": sorted(_source_path_identity_values(relative)),
+        }
+        if content_complete:
+            document["content"] = content
+        else:
+            document["content_preview"] = _truncate(
+                content,
+                _CAPABILITY_PROMPT_DOCUMENT_CONTENT_PREVIEW_CHARS,
+            )
+        documents.append(
+            document
+        )
+        evidence.append(
+            {
+                "title": relative,
+                "source_url": relative,
+                "excerpt": _truncate(content, 360),
+            }
+        )
+        seen.add(relative)
+    if documents:
+        bundle["documents"] = documents
+    if evidence:
+        bundle["evidence"] = _dedupe_evidence(evidence)
+    return bundle
+
+
+def _document_with_source_document_id(document: dict[str, Any]) -> dict[str, Any]:
+    item = dict(document)
+    if _source_document_ids(item):
+        return item
+    content = str(item.get("content") or "")
+    content_hash = str(item.get("content_hash") or "").strip()
+    if not content_hash and content:
+        content_hash = _source_document_content_hash(content)
+        item["content_hash"] = content_hash
+    source_ref = _best_source_ref(item)
+    content_ref = str(item.get("content_ref") or item.get("tool_call_id") or "").strip()
+    if not (source_ref or content_hash or content_ref):
+        return item
+    item["source_document_id"] = _source_document_id(
+        source_kind=str(item.get("source_kind") or "source_document"),
+        source_path=source_ref,
+        content_hash=content_hash,
+        content_ref=content_ref,
+    )
+    return item
+
+
+def _documents_from_agent_run_events(
+    events: list[dict[str, Any]],
+    *,
+    workspace_root: str = "",
+) -> list[dict[str, Any]]:
+    return _source_inventory_from_agent_run_events(
+        events,
+        workspace_root=workspace_root,
+    ).documents
 
 
 def _source_inventory_from_agent_run_events(
     events: list[dict[str, Any]],
+    *,
+    workspace_root: str = "",
 ) -> CapabilitySourceInventory:
     tool_inputs: dict[str, dict[str, Any]] = {}
     documents: list[dict[str, Any]] = []
@@ -3056,27 +3829,53 @@ def _source_inventory_from_agent_run_events(
             tool_data,
             input_data,
             raw_event_ref=ref,
+            workspace_root=workspace_root,
         ):
             files.append(file_ref)
         if path and output and _tool_result_is_document_read(tool_name):
+            source_path = _canonical_source_path(path, workspace_root)
+            content, content_meta = _canonical_tool_document_content(tool_name, output)
+            content_hash = _source_document_content_hash(content)
+            source_document_id = _source_document_id(
+                source_kind="agent_run_tool_result",
+                source_path=source_path,
+                content_hash=content_hash,
+                content_ref=tool_call_id,
+            )
             document = {
-                "title": path,
-                "source_path": path,
-                "path": path,
-                "content": output.replace("\r\n", "\n").strip(),
+                "source_document_id": source_document_id,
+                "title": source_path,
+                "source_path": source_path,
+                "path": source_path,
+                "content": content,
+                "content_hash": content_hash,
                 "source_kind": "agent_run_tool_result",
                 "tool_name": tool_name,
                 "tool_call_id": tool_call_id,
                 "content_ref": tool_call_id,
+                **content_meta,
+                "path_identities": sorted(
+                    _source_path_identity_values(path, workspace_root)
+                    | _source_path_identity_values(source_path)
+                ),
                 "raw_event_refs": [ref],
             }
+            if source_path != path:
+                document["raw_source_path"] = path
             documents.append(document)
-            files.append(_source_file_ref(path, tool_name, ref))
-            if _is_skill_file_path(path):
+            files.append(
+                _source_file_ref(
+                    path,
+                    tool_name,
+                    ref,
+                    workspace_root=workspace_root,
+                )
+            )
+            if _is_skill_file_path(source_path):
                 evidence.append(
                     {
-                        "title": path,
-                        "source_url": path,
+                        "title": source_path,
+                        "source_url": source_path,
                         "excerpt": _truncate(output, 360),
                         "raw_event_refs": [ref],
                     }
@@ -3152,7 +3951,7 @@ def _is_source_inventory_tool(tool_name: str) -> bool:
 
 def _tool_result_is_document_read(tool_name: str) -> bool:
     normalized = str(tool_name or "").strip().lower().replace("-", "_")
-    return normalized in {"cat", "read", "read_file", "read_files", "list_file"}
+    return normalized in {"cat", "read", "read_file", "read_files"}
 
 
 def _tool_result_output_text(
@@ -3170,6 +3969,52 @@ def _tool_result_output_text(
     return str(data.get("text") or "")
 
 
+def _canonical_tool_document_content(
+    tool_name: str,
+    output: str,
+) -> tuple[str, dict[str, Any]]:
+    content = str(output or "").replace("\r\n", "\n").strip()
+    metadata: dict[str, Any] = {"content_complete": True}
+    normalized_tool = str(tool_name or "").strip().lower().replace("-", "_")
+    if normalized_tool == "read_file":
+        content, numbered = _strip_read_file_line_numbers(content)
+        if numbered:
+            metadata["content_format"] = "read_file_numbered"
+        if _read_file_output_is_partial(output):
+            metadata["content_complete"] = False
+            metadata["content_incomplete_reason"] = "read_file_paged_output"
+    return content, metadata
+
+
+def _strip_read_file_line_numbers(value: str) -> tuple[str, bool]:
+    lines = str(value or "").replace("\r\n", "\n").splitlines()
+    if not lines:
+        return "", False
+    stripped: list[str] = []
+    saw_numbered = False
+    for line in lines:
+        if _READ_FILE_PAGED_OUTPUT_RE.match(line.strip()):
+            continue
+        match = re.match(r"^\s*\d+\t(.*)$", line)
+        if not match:
+            return str(value or "").replace("\r\n", "\n").strip(), False
+        stripped.append(match.group(1))
+        saw_numbered = True
+    return "\n".join(stripped).strip(), saw_numbered
+
+
+_READ_FILE_PAGED_OUTPUT_RE = re.compile(
+    r"^\.\.\. \(\d+ lines total, showing \d+-\d+; use override=true to read full file\)$"
+)
+
+
+def _read_file_output_is_partial(value: str) -> bool:
+    return any(
+        _READ_FILE_PAGED_OUTPUT_RE.match(line.strip())
+        for line in str(value or "").replace("\r\n", "\n").splitlines()
+    )
+
+
 def _source_file_refs_from_tool_result(
     tool_name: str,
     output: str,
@@ -3177,6 +4022,7 @@ def _source_file_refs_from_tool_result(
     input_data: dict[str, Any],
     *,
     raw_event_ref: dict[str, Any],
+    workspace_root: str = "",
 ) -> list[dict[str, Any]]:
     paths: list[str] = []
     explicit_path = _tool_result_source_path(tool_data, input_data)
@@ -3184,7 +4030,12 @@ def _source_file_refs_from_tool_result(
         paths.append(explicit_path)
     paths.extend(_paths_from_tool_output(output))
     return [
-        _source_file_ref(path, tool_name, raw_event_ref)
+        _source_file_ref(
+            path,
+            tool_name,
+            raw_event_ref,
+            workspace_root=workspace_root,
+        )
         for path in _unique_strings(paths)
         if _looks_like_source_path(path)
     ]
@@ -3194,16 +4045,49 @@ def _source_file_ref(
     path: str,
     tool_name: str,
     raw_event_ref: dict[str, Any],
+    *,
+    workspace_root: str = "",
 ) -> dict[str, Any]:
     normalized = _normalize_source_path(path)
-    return {
-        "path": normalized,
-        "source_path": normalized,
+    source_path = _canonical_source_path(normalized, workspace_root)
+    result = {
+        "path": source_path,
+        "source_path": source_path,
         "source_kind": "agent_run_tool_result",
         "tool_name": tool_name,
-        "kind": "skill" if _is_skill_file_path(normalized) else "file",
+        "kind": "skill" if _is_skill_file_path(source_path) else "file",
+        "path_identities": sorted(
+            _source_path_identity_values(normalized, workspace_root)
+            | _source_path_identity_values(source_path)
+        ),
         "raw_event_refs": [dict(raw_event_ref)],
     }
+    if source_path != normalized:
+        result["raw_source_path"] = normalized
+    return result
+
+
+def _canonical_source_path(value: str, workspace_root: str = "") -> str:
+    normalized = _normalize_source_path(value)
+    root = _normalize_source_path(workspace_root)
+    if not normalized or not root:
+        return normalized
+    normalized_lower = normalized.lower()
+    root_lower = root.lower()
+    if normalized_lower == root_lower:
+        return ""
+    if normalized_lower.startswith(f"{root_lower}/"):
+        return normalized[len(root) + 1 :].strip("/")
+    return normalized
+
+
+def _source_path_identity_values(value: str, workspace_root: str = "") -> set[str]:
+    normalized = _normalize_source_path(value)
+    values = _path_identity_values(normalized)
+    canonical = _canonical_source_path(normalized, workspace_root)
+    if canonical and canonical != normalized:
+        values.update(_path_identity_values(canonical))
+    return values
 
 
 def _paths_from_tool_output(output: str) -> list[str]:
@@ -3325,23 +4209,117 @@ def _dedupe_source_files(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _document_dedupe_key(value: dict[str, Any]) -> str:
+    for field_name in ("source_path", "path", "url", "title", "tool_call_id"):
+        raw_value = str(value.get(field_name) or "").strip()
+        if not raw_value:
+            continue
+        if field_name in {"source_path", "path"}:
+            return _normalize_source_path(raw_value)
+        return raw_value
+    return ""
+
+
+def _document_has_complete_content(value: dict[str, Any]) -> bool:
+    return value.get("content_complete") is not False and bool(
+        str(value.get("content") or "").strip()
+    )
+
+
+def _document_content_chars(value: dict[str, Any]) -> int:
+    content = str(value.get("content") or "").strip()
+    if content:
+        return len(content)
+    raw_count = value.get("content_chars")
+    if isinstance(raw_count, int):
+        return raw_count
+    try:
+        return int(str(raw_count or "0"))
+    except ValueError:
+        return 0
+
+
+def _document_merge_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _document_list_values(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return []
+
+
+def _preferred_document(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    existing_complete = _document_has_complete_content(existing)
+    incoming_complete = _document_has_complete_content(incoming)
+    if incoming_complete and not existing_complete:
+        return _merge_source_documents(existing, incoming)
+    if existing_complete and not incoming_complete:
+        return _merge_source_documents(incoming, existing)
+    existing_chars = _document_content_chars(existing)
+    incoming_chars = _document_content_chars(incoming)
+    if incoming_chars >= existing_chars:
+        return _merge_source_documents(existing, incoming)
+    return _merge_source_documents(incoming, existing)
+
+
+def _merge_source_documents(base: dict[str, Any], preferred: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in preferred.items():
+        if _document_merge_value_present(value):
+            merged[key] = deepcopy(value)
+    path_identities = [
+        str(item)
+        for item in [
+            *_document_list_values(base.get("path_identities")),
+            *_document_list_values(preferred.get("path_identities")),
+        ]
+        if str(item).strip()
+    ]
+    if path_identities:
+        merged["path_identities"] = sorted(_unique_strings(path_identities))
+    raw_event_refs = [
+        item
+        for item in [
+            *_dict_list(base.get("raw_event_refs")),
+            *_dict_list(preferred.get("raw_event_refs")),
+        ]
+    ]
+    if raw_event_refs:
+        merged["raw_event_refs"] = _dedupe_raw_event_refs(raw_event_refs)
+    content = str(merged.get("content") or "").strip()
+    if content:
+        merged["content_chars"] = len(content)
+        if not str(merged.get("content_hash") or "").strip():
+            merged["content_hash"] = _source_document_content_hash(content)
+    return merged
+
+
 def _dedupe_documents(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
+    keyed_indexes: dict[str, int] = {}
     result: list[dict[str, Any]] = []
     for value in values:
-        key = str(
-            value.get("source_path")
-            or value.get("path")
-            or value.get("url")
-            or value.get("title")
-            or value.get("tool_call_id")
-            or ""
-        ).strip()
-        if key and key in seen:
+        if not isinstance(value, dict):
             continue
-        if key:
-            seen.add(key)
-        result.append(dict(value))
+        item = dict(value)
+        key = _document_dedupe_key(item)
+        if not key:
+            result.append(item)
+            continue
+        existing_index = keyed_indexes.get(key)
+        if existing_index is None:
+            keyed_indexes[key] = len(result)
+            result.append(item)
+            continue
+        result[existing_index] = _preferred_document(result[existing_index], item)
     return result
 
 
@@ -3408,53 +4386,95 @@ def _tool_result_source_path(
 def _resolve_skill_content_from_source_bundle(
     component: dict[str, Any],
     source_bundle: dict[str, Any],
-    *,
-    workspace_root: str = "",
-    sandbox_container_id: str = "",
-) -> tuple[str, str]:
+) -> _SkillContentResolution:
+    source_document_ids = _skill_content_source_document_ids(component)
     candidates = _skill_content_source_candidates(component)
     documents = _dict_list(source_bundle.get("documents"))
     if documents:
+        if source_document_ids:
+            for document in documents:
+                if document.get("content_complete") is False:
+                    continue
+                if not source_document_ids.intersection(_source_document_ids(document)):
+                    continue
+                content = str(document.get("content") or "").replace("\r\n", "\n").strip()
+                if content:
+                    return _skill_content_resolution_from_document(document, content)
+            return _SkillContentResolution()
         for document in documents:
+            if document.get("content_complete") is False:
+                continue
             content = str(document.get("content") or "").replace("\r\n", "\n").strip()
             if not content:
                 continue
             identity = _source_document_identity(document)
             if candidates and candidates.intersection(identity):
-                return content, _best_source_ref(document)
+                return _skill_content_resolution_from_document(document, content)
         component_name = str(component.get("name") or component.get("id") or "").strip().lower()
         skill_documents = [
             document
             for document in documents
             if any(_is_skill_file_path(value) for value in _source_document_identity(document))
         ]
-        if component_name and len(skill_documents) <= 1:
+        if component_name and not candidates and len(skill_documents) <= 1:
             for document in documents:
+                if document.get("content_complete") is False:
+                    continue
                 content = str(document.get("content") or "").replace("\r\n", "\n").strip()
                 if not content:
                     continue
                 identity_text = " ".join(sorted(_source_document_identity(document))).lower()
                 if component_name in identity_text and "skill.md" in identity_text:
-                    return content, _best_source_ref(document)
-    if workspace_root:
-        content, source_ref = _resolve_skill_content_from_worktree(
-            candidates,
-            workspace_root,
-            sandbox_container_id=sandbox_container_id,
-        )
-        if content:
-            return content, source_ref
-    return "", ""
+                    return _skill_content_resolution_from_document(document, content)
+    return _SkillContentResolution()
+
+
+def _skill_content_resolution_from_document(
+    document: dict[str, Any],
+    content: str,
+) -> _SkillContentResolution:
+    document_ids = sorted(_source_document_ids(document))
+    return _SkillContentResolution(
+        content=content,
+        source_ref=_best_source_ref(document),
+        source_document_id=document_ids[0] if document_ids else "",
+    )
 
 
 def _skill_content_resolution_error(
     component: dict[str, Any],
     source_bundle: dict[str, Any],
-    *,
-    workspace_root: str = "",
-    sandbox_container_id: str = "",
 ) -> str:
+    source_document_ids = _skill_content_source_document_ids(component)
     candidates = _skill_content_source_candidates(component)
+    component_name = str(component.get("name") or component.get("id") or "").strip().lower()
+    for document in _dict_list(source_bundle.get("documents")):
+        if document.get("content_complete") is not False:
+            continue
+        document_ids = _source_document_ids(document)
+        identity = _source_document_identity(document)
+        matched = bool(source_document_ids and source_document_ids.intersection(document_ids))
+        if matched:
+            return (
+                "matched source document is incomplete; read the full Skill file "
+                "before materialization"
+            )
+        matched = bool(candidates and candidates.intersection(identity))
+        if (
+            not matched
+            and not candidates
+            and component_name
+            and any(_is_skill_file_path(value) for value in identity)
+            and component_name in " ".join(sorted(identity)).lower()
+        ):
+            matched = True
+        if matched:
+            return (
+                "matched source document is incomplete; read the full Skill file "
+                "before materialization"
+            )
+    if source_document_ids:
+        return "source_document_id did not match any complete source document"
     inventory_matches = _source_bundle_skill_file_refs(source_bundle)
     if len(inventory_matches) > 1:
         relative_matches = {
@@ -3468,127 +4488,44 @@ def _skill_content_resolution_error(
             return ""
         return (
             "multiple SKILL.md files found in AgentRun source inventory; "
-            "draft must provide an exact source_path or content_ref"
+            "draft must provide an exact source_document_id or source_path"
         )
-    if not workspace_root:
-        return ""
-    matches = _worktree_skill_file_refs(
-        workspace_root,
-        sandbox_container_id=sandbox_container_id,
-    )
-    if len(matches) <= 1:
-        return ""
-    relative_matches = {path.replace("\\", "/").strip().strip("/").lower() for path in matches}
-    if candidates and any(
-        candidate.replace("\\", "/").strip().strip("/").lower() in relative_matches
-        for candidate in candidates
-    ):
-        return ""
-    return (
-        "multiple SKILL.md files found in AgentRun workdir; "
-        "draft must provide an exact source_path or content_ref"
-    )
-
-
-def _resolve_skill_content_from_worktree(
-    candidates: set[str],
-    workspace_root: str,
-    *,
-    sandbox_container_id: str = "",
-) -> tuple[str, str]:
-    root = Path(workspace_root).expanduser()
-    try:
-        root_resolved = root.resolve()
-    except OSError:
-        root_resolved = None
-    if root_resolved is not None and root_resolved.is_dir():
-        content, source_ref = _resolve_skill_content_from_local_worktree(candidates, root_resolved)
-        if content:
-            return content, source_ref
-    if sandbox_container_id:
-        content, source_ref = _resolve_skill_content_from_container_worktree(
-            candidates,
-            workspace_root,
-            sandbox_container_id,
+    if candidates:
+        return (
+            "source bundle does not contain a complete source document matching "
+            "the requested source_document_id or source_path"
         )
-        if content:
-            return content, source_ref
-    return "", ""
-
-
-def _resolve_skill_content_from_local_worktree(
-    candidates: set[str],
-    root_resolved: Path,
-) -> tuple[str, str]:
-    for candidate in sorted(candidates):
-        if not candidate or candidate.lower() == "readme.md":
-            continue
-        path = Path(candidate)
-        target = path if path.is_absolute() else root_resolved / path
-        try:
-            target_resolved = target.resolve()
-        except OSError:
-            continue
-        try:
-            target_resolved.relative_to(root_resolved)
-        except ValueError:
-            continue
-        if not target_resolved.is_file():
-            continue
-        try:
-            content = target_resolved.read_text(encoding="utf-8").replace("\r\n", "\n").strip()
-        except OSError:
-            continue
-        if content:
-            return content, str(target_resolved.relative_to(root_resolved)).replace("\\", "/")
-    matches = _unique_skill_files(root_resolved)
-    if len(matches) != 1:
-        return "", ""
-    target_resolved = matches[0]
-    try:
-        content = target_resolved.read_text(encoding="utf-8").replace("\r\n", "\n").strip()
-    except OSError:
-        return "", ""
-    if content:
-        return content, str(target_resolved.relative_to(root_resolved)).replace("\\", "/")
-    return "", ""
+    return ""
 
 
 def _unique_skill_files(root_resolved: Path) -> list[Path]:
     if not root_resolved.is_dir():
         return []
     matches: list[Path] = []
-    for path in root_resolved.rglob("SKILL.md"):
+    for current_root, dirnames, filenames in os.walk(root_resolved):
+        dirnames[:] = [
+            dirname
+            for dirname in sorted(dirnames)
+            if dirname.lower() not in _CAPABILITY_WORKSPACE_SKILL_SKIP_DIRS
+        ]
+        if "SKILL.md" not in filenames:
+            continue
+        path = Path(current_root) / "SKILL.md"
         try:
             relative = path.relative_to(root_resolved)
         except ValueError:
             continue
         parts = {part.lower() for part in relative.parts[:-1]}
-        if ".git" in parts or ".rcoder" in parts:
+        if parts.intersection(_CAPABILITY_WORKSPACE_SKILL_SKIP_DIRS):
             continue
         if path.is_file():
             matches.append(path)
-    return sorted(matches, key=lambda item: str(item.relative_to(root_resolved)).replace("\\", "/"))
-
-
-def _worktree_skill_file_refs(
-    workspace_root: str,
-    *,
-    sandbox_container_id: str = "",
-) -> list[str]:
-    root = Path(workspace_root).expanduser()
-    try:
-        root_resolved = root.resolve()
-    except OSError:
-        root_resolved = None
-    if root_resolved is not None and root_resolved.is_dir():
-        return [
-            str(path.relative_to(root_resolved)).replace("\\", "/")
-            for path in _unique_skill_files(root_resolved)
-        ]
-    if sandbox_container_id:
-        return _container_skill_file_refs(sandbox_container_id, workspace_root)
-    return []
+        if len(matches) >= _CAPABILITY_WORKSPACE_SKILL_FILE_LIMIT:
+            break
+    return sorted(
+        matches,
+        key=lambda item: str(item.relative_to(root_resolved)).replace("\\", "/"),
+    )
 
 
 def _source_bundle_skill_file_refs(source_bundle: dict[str, Any]) -> list[str]:
@@ -3605,103 +4542,6 @@ def _source_bundle_skill_file_refs(source_bundle: dict[str, Any]) -> list[str]:
             if _is_skill_file_path(value):
                 refs.append(_normalize_source_path(value))
     return _unique_strings(refs)
-
-
-def _resolve_skill_content_from_container_worktree(
-    candidates: set[str],
-    workspace_root: str,
-    sandbox_container_id: str,
-) -> tuple[str, str]:
-    for candidate in sorted(candidates):
-        relative = _safe_container_relative_path(candidate)
-        if not relative or relative.lower() == "readme.md":
-            continue
-        content = _read_container_text(
-            sandbox_container_id,
-            workspace_root,
-            relative,
-        )
-        if content:
-            return content, relative
-    matches = _container_skill_file_refs(sandbox_container_id, workspace_root)
-    if len(matches) != 1:
-        return "", ""
-    content = _read_container_text(sandbox_container_id, workspace_root, matches[0])
-    if content:
-        return content, matches[0]
-    return "", ""
-
-
-def _container_skill_file_refs(container_id: str, workspace_root: str) -> list[str]:
-    script = r'''
-root="$1"
-[ -d "$root" ] || exit 0
-cd "$root" || exit 0
-find . -type f -name SKILL.md ! -path '*/.git/*' ! -path '*/.rcoder/*' | sed 's#^\./##' | sort
-'''
-    completed = _run_docker_exec(container_id, script, workspace_root)
-    if completed.returncode != 0:
-        return []
-    return [
-        line.strip()
-        for line in completed.stdout.splitlines()
-        if _safe_container_relative_path(line.strip())
-    ]
-
-
-def _read_container_text(
-    container_id: str,
-    workspace_root: str,
-    relative_path: str,
-) -> str:
-    relative = _safe_container_relative_path(relative_path)
-    if not relative:
-        return ""
-    script = r'''
-root="$1"
-rel="$2"
-target="$root/$rel"
-[ -f "$target" ] || exit 1
-cat "$target"
-'''
-    completed = _run_docker_exec(container_id, script, workspace_root, relative)
-    if completed.returncode != 0:
-        return ""
-    return completed.stdout.replace("\r\n", "\n").strip()
-
-
-def _run_docker_exec(
-    container_id: str,
-    script: str,
-    *args: str,
-) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["docker", "exec", container_id, "sh", "-lc", script, "sh", *args],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return subprocess.CompletedProcess(
-            args=["docker", "exec", container_id],
-            returncode=1,
-            stdout="",
-            stderr=str(exc),
-        )
-
-
-def _safe_container_relative_path(value: str) -> str:
-    normalized = value.replace("\\", "/").strip().strip("/")
-    if not normalized or normalized == ".":
-        return ""
-    if normalized.startswith("../") or "/../" in normalized or normalized.endswith("/.."):
-        return ""
-    if normalized.startswith("/") or re.match(r"^[a-zA-Z]:", normalized):
-        return ""
-    return normalized
 
 
 def _skill_content_source_candidates(component: dict[str, Any]) -> set[str]:
@@ -3734,10 +4574,41 @@ def _skill_content_source_candidates(component: dict[str, Any]) -> set[str]:
     return values
 
 
+def _skill_content_source_document_ids(component: dict[str, Any]) -> set[str]:
+    raw_config = component.get("config")
+    config: dict[str, Any] = dict(raw_config) if isinstance(raw_config, dict) else {}
+    values: set[str] = set()
+    for container in (component, config):
+        for field_name in ("source_document_id", "source_doc_id", "document_id"):
+            value = str(container.get(field_name) or "").strip()
+            if value:
+                values.add(value)
+                values.add(value.lower())
+    return values
+
+
+def _source_document_ids(document: dict[str, Any]) -> set[str]:
+    metadata = document.get("metadata")
+    containers = (document, metadata if isinstance(metadata, dict) else {})
+    values: set[str] = set()
+    for container in containers:
+        for field_name in ("source_document_id", "source_doc_id", "document_id"):
+            value = str(container.get(field_name) or "").strip()
+            if value:
+                values.add(value)
+                values.add(value.lower())
+    return values
+
+
 def _source_document_identity(document: dict[str, Any]) -> set[str]:
     fields = (
+        "source_document_id",
+        "source_doc_id",
+        "document_id",
         "source_path",
         "path",
+        "raw_source_path",
+        "workspace_relative_path",
         "url",
         "final_url",
         "title",
@@ -3756,6 +4627,13 @@ def _source_document_identity(document: dict[str, Any]) -> set[str]:
             value = str(metadata.get(field_name) or "").strip()
             if value:
                 values.update(_path_identity_values(value))
+    for container in (document, metadata if isinstance(metadata, dict) else {}):
+        raw_identities = container.get("path_identities")
+        if isinstance(raw_identities, list):
+            for identity in raw_identities:
+                value = str(identity or "").strip()
+                if value:
+                    values.update(_path_identity_values(value))
     raw_event_refs = document.get("raw_event_refs")
     if isinstance(raw_event_refs, list):
         for ref in raw_event_refs:
@@ -3793,6 +4671,32 @@ def _best_source_ref(document: dict[str, Any]) -> str:
     return ""
 
 
+def _source_document_content_hash(content: str) -> str:
+    return hashlib.sha256(str(content or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _source_document_id(
+    *,
+    source_kind: str,
+    source_path: str,
+    content_hash: str,
+    content_ref: str = "",
+) -> str:
+    normalized_path = _normalize_source_path(str(source_path or ""))
+    normalized_hash = str(content_hash or "").strip()
+    payload = {
+        "source_kind": str(source_kind or "").strip(),
+        "source_path": normalized_path,
+        "content_hash": normalized_hash,
+        "content_ref": str(content_ref or "").strip()
+        if not normalized_path and not normalized_hash
+        else "",
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"cap-src-doc-{digest}"
+
+
 def _document_from_fetch_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     sections = _dict_list(payload.get("sections"))
     content_parts: list[str] = []
@@ -3815,13 +4719,24 @@ def _document_from_fetch_payload(payload: dict[str, Any]) -> dict[str, Any] | No
     content = "\n\n".join(content_parts).strip()
     if not content and not payload.get("ok"):
         return None
+    source_path = str(payload.get("source_path") or payload.get("path") or "")
+    final_url = str(payload.get("final_url") or payload.get("url") or "")
+    source_kind = str(payload.get("source_kind") or "fetch_capabilities")
+    content_hash = str(payload.get("content_hash") or "").strip()
+    if not content_hash and content:
+        content_hash = _source_document_content_hash(content)
     return {
+        "source_document_id": _source_document_id(
+            source_kind=source_kind,
+            source_path=source_path or final_url,
+            content_hash=content_hash,
+        ),
         "title": str(payload.get("title") or payload.get("url") or "Documentation"),
-        "url": str(payload.get("final_url") or payload.get("url") or ""),
-        "source_path": str(payload.get("source_path") or payload.get("path") or ""),
+        "url": final_url,
+        "source_path": source_path,
         "content": content[:MAX_SNIPPET_CHARS],
-        "source_kind": str(payload.get("source_kind") or ""),
-        "content_hash": str(payload.get("content_hash") or ""),
+        "source_kind": source_kind,
+        "content_hash": content_hash,
         "fetched_at": str(payload.get("fetched_at") or ""),
         "sections": sections,
         "errors": _dict_list(payload.get("errors")),
@@ -3886,6 +4801,10 @@ def _capability_draft_failure(
     draft: dict[str, Any] | None,
     validation: dict[str, Any] | None,
     source_bundle: dict[str, Any] | None,
+    *,
+    agent_run: dict[str, Any] | None = None,
+    events: list[dict[str, Any]] | None = None,
+    missing_draft_code: str = "",
 ) -> dict[str, Any] | None:
     validation_data = validation if isinstance(validation, dict) else {}
     messages = [
@@ -3900,7 +4819,10 @@ def _capability_draft_failure(
     if _source_discovery_is_incomplete(bundle):
         result_type = "source_discovery_incomplete"
     elif not isinstance(draft, dict):
-        result_type = "draft_not_produced"
+        result_type = (
+            str(missing_draft_code or "").strip()
+            or _missing_draft_failure_code(agent_run, events)
+        )
     elif any("requires skill_content" in message for message in messages):
         result_type = "skill_content_unresolved"
     elif any("command lacks evidence" in message for message in messages):
@@ -3915,6 +4837,92 @@ def _capability_draft_failure(
         if isinstance(bundle.get("source_inventory"), dict)
         else {},
     }
+
+
+def _missing_draft_failure_code(
+    agent_run: dict[str, Any] | None,
+    events: list[dict[str, Any]] | None,
+) -> str:
+    output = agent_run.get("output") if isinstance(agent_run, dict) else None
+    if _model_output_looks_incomplete_json(output):
+        return "model_output_incomplete"
+    if _agent_run_events_indicate_draft_generation_interruption(events or []):
+        return "draft_generation_interrupted"
+    return "draft_not_produced"
+
+
+def _agent_run_events_indicate_draft_generation_interruption(
+    events: list[dict[str, Any]],
+) -> bool:
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "").strip()
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        text_values = [
+            event_type,
+            str(payload.get("type") or ""),
+            str(payload.get("text") or ""),
+            str(data.get("status") or ""),
+            str(data.get("stream_status") or ""),
+            str(data.get("classification") or ""),
+            str(data.get("notice_code") or ""),
+            str(data.get("error") or ""),
+            str(data.get("message") or ""),
+            str(data.get("message_key") or ""),
+        ]
+        combined = " ".join(value.lower() for value in text_values if value)
+        if "provider_stream_interrupted" in combined:
+            return True
+        if "model_output_interrupted" in combined:
+            return True
+        if str(data.get("stream_status") or "").strip().lower() == "interrupted":
+            return True
+        if "incomplete chunked read" in combined:
+            return True
+        if "peer closed connection without sending complete message body" in combined:
+            return True
+        recovery = data.get("recovery")
+        if isinstance(recovery, dict) and recovery.get("failed"):
+            classification = str(data.get("classification") or "").lower()
+            if "interrupted" in classification:
+                return True
+    return False
+
+
+def _model_output_looks_incomplete_json(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    candidates = [text]
+    candidates.extend(match.group(1).strip() for match in _JSON_FENCE_RE.finditer(text))
+    first_object = min(
+        [index for index in (text.find("{"), text.find("[")) if index >= 0],
+        default=-1,
+    )
+    if first_object >= 0:
+        candidates.append(text[first_object:].strip())
+    for candidate in candidates:
+        if _json_candidate_looks_incomplete(candidate):
+            return True
+    return False
+
+
+def _json_candidate_looks_incomplete(candidate: Any) -> bool:
+    text = str(candidate or "").strip()
+    if not text or text[0] not in "{[":
+        return False
+    try:
+        json.loads(text)
+        return False
+    except json.JSONDecodeError:
+        pass
+    opens = text.count("{") + text.count("[")
+    closes = text.count("}") + text.count("]")
+    if opens > closes:
+        return True
+    return text.endswith(("\\", '"', ":", ",", "{", "["))
 
 
 def _source_discovery_is_incomplete(source_bundle: dict[str, Any]) -> bool:
@@ -3951,6 +4959,187 @@ def _source_bundle_summary(source_bundle: dict[str, Any]) -> dict[str, Any]:
         "files": len(_dict_list(inventory.get("files"))) if isinstance(inventory, dict) else 0,
         "skill_files": len(_dict_list(inventory.get("skill_files"))) if isinstance(inventory, dict) else 0,
     }
+
+
+def _capability_materialization_evidence(
+    *,
+    task_id: str,
+    agent_run: dict[str, Any],
+    metadata: dict[str, Any],
+    events: list[dict[str, Any]],
+    packager_runner: Any,
+    load_materialization_events: Callable[[], list[dict[str, Any]]],
+    draft_present: bool,
+) -> _CapabilityMaterializationEvidence:
+    seed_loader = getattr(packager_runner, "seed_source_bundle", None)
+    seed_bundle = seed_loader(task_id) if callable(seed_loader) else None
+    seed_source_bundle_artifact_id = (
+        _capability_seed_source_bundle_artifact_id(task_id)
+        if isinstance(seed_bundle, dict)
+        else ""
+    )
+    metadata_source_bundle = (
+        metadata.get("source_bundle")
+        if isinstance(metadata, dict) and isinstance(metadata.get("source_bundle"), dict)
+        else {}
+    )
+    if _source_bundle_has_complete_source_documents(metadata_source_bundle):
+        source_bundle = metadata_source_bundle
+        materialization_source = CapabilityEvidenceSource.METADATA.value
+    elif isinstance(seed_bundle, dict) and _source_bundle_has_complete_source_documents(
+        seed_bundle
+    ):
+        source_bundle = seed_bundle
+        materialization_source = CapabilityEvidenceSource.SEED_ARTIFACT.value
+    elif _source_bundle_has_source_documents(metadata_source_bundle):
+        source_bundle = metadata_source_bundle
+        materialization_source = CapabilityEvidenceSource.METADATA.value
+    elif isinstance(seed_bundle, dict) and _source_bundle_has_source_documents(seed_bundle):
+        source_bundle = seed_bundle
+        materialization_source = CapabilityEvidenceSource.SEED_ARTIFACT.value
+    elif metadata_source_bundle:
+        source_bundle = metadata_source_bundle
+        materialization_source = CapabilityEvidenceSource.METADATA.value
+    elif isinstance(seed_bundle, dict):
+        source_bundle = seed_bundle
+        materialization_source = CapabilityEvidenceSource.SEED_ARTIFACT.value
+    else:
+        source_bundle = {}
+        materialization_source = CapabilityEvidenceSource.METADATA.value
+    source_bundle = _source_bundle_with_document_ids(source_bundle)
+    materialization_bundle = source_bundle
+    source_bundle_artifact_id = ""
+    workspace_root = _agent_run_materialization_workdir(agent_run, metadata)
+    artifact_loader = getattr(
+        packager_runner,
+        "materialization_source_bundle",
+        None,
+    )
+    artifact_bundle = artifact_loader(task_id) if callable(artifact_loader) else None
+    if isinstance(artifact_bundle, dict):
+        materialization_bundle = artifact_bundle
+        materialization_source = CapabilityEvidenceSource.ARTIFACT.value
+        source_bundle_artifact_id = _capability_source_bundle_artifact_id(task_id)
+    else:
+        materialization_bundle = _source_bundle_with_agent_run_documents(
+            source_bundle,
+            load_materialization_events() or events,
+            workspace_root=workspace_root,
+        )
+        has_agent_run_inventory = _source_bundle_has_agent_run_inventory(
+            materialization_bundle
+        )
+        if has_agent_run_inventory:
+            materialization_source = CapabilityEvidenceSource.AGENT_RUN_EVENTS.value
+        persist = getattr(
+            packager_runner,
+            "persist_materialization_source_bundle",
+            None,
+        )
+        if (
+            callable(persist)
+            and _agent_run_status_is_terminal(agent_run)
+            and (draft_present or has_agent_run_inventory)
+        ):
+            persisted_bundle = persist(task_id, materialization_bundle)
+            if isinstance(persisted_bundle, dict):
+                materialization_bundle = persisted_bundle
+                materialization_source = CapabilityEvidenceSource.ARTIFACT.value
+                source_bundle_artifact_id = _capability_source_bundle_artifact_id(
+                    task_id
+                )
+    return _CapabilityMaterializationEvidence(
+        source_bundle=source_bundle,
+        materialization_bundle=materialization_bundle,
+        materialization_source=materialization_source,
+        seed_source_bundle_artifact_id=seed_source_bundle_artifact_id,
+        source_bundle_artifact_id=source_bundle_artifact_id,
+    )
+
+
+def _capability_run_state(
+    agent_run: dict[str, Any],
+    draft: dict[str, Any] | None,
+    validation: dict[str, Any] | None,
+    failure: dict[str, Any] | None,
+    source_bundle: dict[str, Any],
+    *,
+    materialization_source: str,
+    seed_source_bundle_artifact_id: str = "",
+    source_bundle_artifact_id: str = "",
+    field_generation: dict[str, Any] | None = None,
+    draft_assembly: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    agent_status = str(agent_run.get("status") or "").strip().lower()
+    draft_present = isinstance(draft, dict)
+    validation_ok = bool(validation.get("ok")) if isinstance(validation, dict) else False
+    failure_code = str(failure.get("code") or "").strip() if isinstance(failure, dict) else ""
+    materialization_ready = bool(draft_present and validation_ok and not failure_code)
+    if not draft_present:
+        phase = (
+            CapabilityRunPhase.AGENT_RUN_WAITING
+            if not _agent_run_status_is_terminal(agent_run)
+            else CapabilityRunPhase.DRAFT_MISSING
+        )
+    elif isinstance(validation, dict) and not validation_ok:
+        phase = CapabilityRunPhase.VALIDATION_FAILED
+    elif failure_code:
+        phase = CapabilityRunPhase.MATERIALIZATION_FAILED
+    elif materialization_ready:
+        phase = CapabilityRunPhase.DRAFT_READY
+    else:
+        phase = CapabilityRunPhase.DRAFT_PENDING_VALIDATION
+    try:
+        evidence_source = CapabilityEvidenceSource(
+            str(materialization_source or "").strip()
+        )
+    except ValueError:
+        evidence_source = CapabilityEvidenceSource.METADATA
+    source_evidence = CapabilitySourceEvidence(
+        source_bundle=source_bundle,
+        source_bundle_artifact_id=source_bundle_artifact_id,
+        seed_source_bundle_artifact_id=seed_source_bundle_artifact_id,
+    )
+    source_evidence_state: dict[str, Any] = {
+        "source": source_evidence.source,
+        "source_summary": _source_bundle_summary(source_evidence.source_bundle),
+        "materialization_source": evidence_source.value,
+    }
+    if source_evidence.seed_source_bundle_artifact_id:
+        source_evidence_state["seed_source_bundle_artifact_id"] = (
+            source_evidence.seed_source_bundle_artifact_id
+        )
+    if source_evidence.source_bundle_artifact_id:
+        source_evidence_state["source_bundle_artifact_id"] = (
+            source_evidence.source_bundle_artifact_id
+        )
+    field_generation_state = field_generation or {}
+    draft_assembly_state = draft_assembly or {}
+    ingest_state = CapabilityIngestState(
+        phase=phase.value,
+        agent_run_id=str(agent_run.get("id") or agent_run.get("task_id") or ""),
+        source_evidence_state=source_evidence_state,
+        field_generation_state=field_generation_state,
+        draft_assembly_state=draft_assembly_state,
+        validation_state=dict(validation) if isinstance(validation, dict) else {},
+        failure=dict(failure) if isinstance(failure, dict) else None,
+    )
+    return CapabilityRunState(
+        phase=phase,
+        agent_run_status=agent_status,
+        draft_present=draft_present,
+        validation_ok=validation_ok,
+        materialization_ready=materialization_ready,
+        materialization_source=evidence_source,
+        source_summary=_source_bundle_summary(source_bundle),
+        failure_code=failure_code,
+        seed_source_bundle_artifact_id=seed_source_bundle_artifact_id,
+        source_bundle_artifact_id=source_bundle_artifact_id,
+        source_evidence=source_evidence_state,
+        field_generation=field_generation_state,
+        draft_assembly=draft_assembly_state,
+        ingest_state=ingest_state.to_dict(),
+    ).to_dict()
 
 
 def _component_command_evidence_messages(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -89,6 +88,32 @@ def _review_draft(*, command: str = "gh") -> dict[str, object]:
         "credentials": ["GITHUB_TOKEN"],
         "risk_level": "low",
     }
+
+
+def _capability_patch_json(
+    field_path: str,
+    value: object,
+    *,
+    source_path: str = "",
+) -> str:
+    patch: dict[str, object] = {
+        "field_path": field_path,
+        "value": value,
+    }
+    if source_path:
+        patch["source_refs"] = [{"source_path": source_path}]
+    return json.dumps({"capability_draft_patch": patch})
+
+
+def _capability_patch_stream(
+    patches: list[tuple[str, object]],
+    *,
+    source_path: str = "",
+) -> str:
+    return "\n".join(
+        _capability_patch_json(field_path, value, source_path=source_path)
+        for field_path, value in patches
+    )
 
 
 def test_agent_run_log_event_projects_as_process_context() -> None:
@@ -1448,10 +1473,26 @@ def test_project_notes_input_creates_read_only_ingest_run() -> None:
     assert result.source["type"] == "project_notes"
     assert result.source["package_id_hint"] == "review"
     assert result.source_bundle["documents"][0]["title"] == "Project notes"
+    assert result.source_bundle["documents"][0]["source_document_id"].startswith(
+        "cap-src-doc-"
+    )
+    seed_artifact_id = f"capability-source-seed-bundle:{result.agent_run.id}"
+    seed_artifacts = [
+        item
+        for item in control.artifacts_to_dict(result.agent_run.id)
+        if item["id"] == seed_artifact_id
+    ]
+    assert len(seed_artifacts) == 1
+    assert seed_artifacts[0]["metadata"]["kind"] == "capability_source_seed_bundle"
+    assert json.loads(seed_artifacts[0]["content"])["documents"][0][
+        "source_document_id"
+    ].startswith("cap-src-doc-")
     assert "capability_packages" not in control.runtime_snapshot
     assert "capability_components" not in control.runtime_snapshot
     assert '"skill_content"' not in result.agent_run.prompt
     assert "source_path" in result.agent_run.prompt
+    assert "source_document_id" in result.agent_run.prompt
+    assert "content_ref only for observed tool-call" in result.agent_run.prompt
     assert "Do not copy large Skill files into the model output." in result.agent_run.prompt
 
 
@@ -1461,6 +1502,16 @@ def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -
         locale="en-US",
     )
 
+    assert '"capability_draft_patch"' in prompt
+    assert '"capability_draft_patches"' in prompt
+    assert '"field_path": "repo_summary"' in prompt
+    assert '"field_path": "contributions.skills"' in prompt
+    assert '"field_path": "install_plan"' in prompt
+    assert '"field_path": "usage"' in prompt
+    assert '"field_path": "evidence"' in prompt
+    assert '"field_path": "risk_level"' in prompt
+    assert "Do not produce a complete final draft JSON as the primary output" in prompt
+    assert "complete draft JSON is accepted only as a legacy fallback" in prompt
     assert '"hooks"' in prompt
     assert '"runtime_footprint"' in prompt
     assert '"placement": "server|peer|both"' in prompt
@@ -2321,6 +2372,66 @@ def test_ingest_status_extracts_completed_draft_json() -> None:
         "Install gh, then use gh pr view for review."
     )
     assert status["validation"]["ok"] is True
+    run_state = status["capability_run_state"]
+    assert run_state["field_generation"]["patch_count"] == 1
+    assert run_state["field_generation"]["field_state"]["full_draft"]["status"] == "filled"
+    assert run_state["draft_assembly"]["field_state"]["full_draft"]["status"] == "filled"
+
+
+def test_ingest_status_final_output_patch_overrides_earlier_event_patch() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install gh, then use gh pr view for review.",
+            }
+        }
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent.text_event(_capability_patch_json("risk_level", "high")),
+    )
+    output_patches: list[tuple[str, object]] = [
+        ("id", "review"),
+        ("name", "Review"),
+        (
+            "contributions.environment_requirements",
+            [
+                {
+                    "id": "envreq:executable:gh",
+                    "kind": "executable",
+                    "name": "gh",
+                    "command": "gh",
+                    "check": "gh --version",
+                }
+            ],
+        ),
+        ("install_plan", []),
+        ("usage", []),
+        (
+            "evidence",
+            [{"title": "Project notes", "excerpt": "Install gh and run gh --version"}],
+        ),
+        ("risk_level", "low"),
+    ]
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=_capability_patch_stream(output_patches),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["draft"]["risk_level"] == "low"
+    assert status["validation"]["ok"] is True
+    risk_state = status["capability_run_state"]["field_generation"]["field_state"]["risk_level"]
+    assert risk_state["value"] == "low"
+    assert risk_state["producer_event_refs"][-1]["type"] == "agent_run_output"
 
 
 def test_ingest_status_builds_skill_content_from_source_bundle() -> None:
@@ -2382,7 +2493,209 @@ def test_ingest_status_builds_skill_content_from_source_bundle() -> None:
     skill = status["draft"]["contributions"]["skills"][0]
     assert skill["skill_content"] == skill_content.strip()
     assert skill["config"]["skill_content"] == skill_content.strip()
+    source_document_id = status["source_bundle"]["documents"][0]["source_document_id"]
+    assert source_document_id.startswith("cap-src-doc-")
+    assert skill["source_document_id"] == source_document_id
+    assert skill["config"]["source_document_id"] == source_document_id
     assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_resolves_skill_content_by_source_document_id() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this review skill by source document id.",
+            }
+        }
+    )
+    skill_content = "---\nname: code-review\n---\n\nReview code changes.\n"
+    source_document_id = "cap-src-doc-review-skill"
+    control.get_agent_run(result.agent_run.id).metadata["source_bundle"] = {
+        "source": {"type": "project_notes"},
+        "documents": [
+            {
+                "source_document_id": source_document_id,
+                "title": "skills/code-review/SKILL.md",
+                "source_path": "skills/code-review/SKILL.md",
+                "content": skill_content,
+            }
+        ],
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "errors": [],
+    }
+    draft_decision = {
+        "id": "review",
+        "name": "Review",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:code-review",
+                "source_document_id": source_document_id,
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    assert skill["source_document_id"] == source_document_id
+    assert skill["config"]["source_document_id"] == source_document_id
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_restores_source_bundle_from_seed_artifact_when_metadata_missing() -> None:
+    class _Collector:
+        def collect(self, source_payload: dict[str, object]) -> EvidenceBundle:
+            del source_payload
+            return EvidenceBundle(
+                source={"type": "project_notes"},
+                documents=[
+                    {
+                        "title": "skills/code-review/SKILL.md",
+                        "source_path": "skills/code-review/SKILL.md",
+                        "content": "---\nname: code-review\n---\n\nReview code changes.\n",
+                    }
+                ],
+                evidence=[{"title": "Skill", "excerpt": "Review code changes."}],
+            )
+
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control, collector=_Collector())
+    result = service.start({"source": {"type": "project_notes"}})
+    source_document_id = result.source_bundle["documents"][0]["source_document_id"]
+    seed_artifact_id = f"capability-source-seed-bundle:{result.agent_run.id}"
+    task = control.get_agent_run(result.agent_run.id)
+    task.metadata.pop("source_bundle", None)
+    draft_decision = {
+        "id": "review",
+        "name": "Review",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:code-review",
+                "source_document_id": source_document_id,
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == "---\nname: code-review\n---\n\nReview code changes."
+    assert status["source_bundle"]["documents"][0]["source_document_id"] == source_document_id
+    assert status["capability_run_state"]["seed_source_bundle_artifact_id"] == seed_artifact_id
+    assert status["capability_run_state"]["materialization_source"] == "artifact"
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_invalid_source_document_id_does_not_fallback_to_source_path() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this review skill with a bad source document id.",
+            }
+        }
+    )
+    skill_content = "---\nname: code-review\n---\n\nReview code changes.\n"
+    control.get_agent_run(result.agent_run.id).metadata["source_bundle"] = {
+        "source": {"type": "project_notes"},
+        "documents": [
+            {
+                "source_document_id": "cap-src-doc-real",
+                "title": "skills/code-review/SKILL.md",
+                "source_path": "skills/code-review/SKILL.md",
+                "content": skill_content,
+            }
+        ],
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "errors": [],
+    }
+    draft_decision = {
+        "id": "review",
+        "name": "Review",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:code-review",
+                "source_document_id": "cap-src-doc-invented",
+                "source_path": "skills/code-review/SKILL.md",
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                }
+            ]
+        },
+        "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert "skill_content" not in skill
+    assert status["validation"]["ok"] is False
+    assert any(
+        "source_document_id did not match any complete source document" in message
+        for message in status["validation"]["messages"]
+    )
 
 
 def test_ingest_status_builds_skill_content_from_workspace_root(tmp_path: Path) -> None:
@@ -2437,11 +2750,77 @@ def test_ingest_status_builds_skill_content_from_workspace_root(tmp_path: Path) 
 
     status = service.status(result.agent_run.id)
 
-    assert status["draft"]["contributions"]["skills"][0]["skill_content"].startswith("---\nname: code-review")
+    skill = status["draft"]["contributions"]["skills"][0]
+    document = next(
+        item
+        for item in status["source_bundle"]["documents"]
+        if item.get("source_path") == "skills/code-review/SKILL.md"
+    )
+    assert skill["skill_content"].startswith("---\nname: code-review")
+    assert skill["source_document_id"] == document["source_document_id"]
+    assert status["capability_run_state"]["seed_source_bundle_artifact_id"]
     assert status["validation"]["ok"] is True
 
 
-def test_ingest_status_uses_agent_run_workdir_and_unique_skill_fallback(tmp_path: Path) -> None:
+def test_ingest_start_elides_workspace_skill_content_from_prompt_and_metadata(
+    tmp_path: Path,
+) -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    marker = "WORKSPACE_SKILL_FULL_BODY_MARKER"
+    skill_path = tmp_path / "skills" / "review" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_content = (
+        "---\nname: review\ndescription: Review code changes.\n---\n\n"
+        + ("A" * 5000)
+        + marker
+    )
+    skill_path.write_text(skill_content, encoding="utf-8")
+    dependency_skill = tmp_path / "node_modules" / "third-party" / "SKILL.md"
+    dependency_skill.parent.mkdir(parents=True)
+    dependency_skill.write_text("THIRD_PARTY_SKILL_SHOULD_NOT_BE_SCANNED", encoding="utf-8")
+
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install the local review skill.",
+            },
+            "workspace_root": str(tmp_path),
+        }
+    )
+
+    source_docs = {
+        item["source_path"]: item
+        for item in result.source_bundle["documents"]
+        if item.get("source_path")
+    }
+    assert "skills/review/SKILL.md" in source_docs
+    assert "node_modules/third-party/SKILL.md" not in source_docs
+    assert marker in source_docs["skills/review/SKILL.md"]["content"]
+    seed_artifact_id = f"capability-source-seed-bundle:{result.agent_run.id}"
+    seed_artifact = next(
+        item
+        for item in control.artifacts_to_dict(result.agent_run.id)
+        if item["id"] == seed_artifact_id
+    )
+    assert marker in seed_artifact["content"]
+    assert marker not in result.agent_run.prompt
+
+    metadata_docs = {
+        item["source_path"]: item
+        for item in result.agent_run.metadata["source_bundle"]["documents"]
+        if item.get("source_path")
+    }
+    metadata_doc = metadata_docs["skills/review/SKILL.md"]
+    assert metadata_doc["source_document_id"] == source_docs["skills/review/SKILL.md"][
+        "source_document_id"
+    ]
+    assert metadata_doc["content_omitted_from_prompt"] is True
+    assert marker not in json.dumps(metadata_doc)
+
+
+def test_ingest_status_does_not_read_skill_content_from_agent_run_workdir(tmp_path: Path) -> None:
     control = _control_plane()
     service = CapabilityPackageIngestService(control)
     skill_path = tmp_path / "SKILL.md"
@@ -2498,59 +2877,17 @@ def test_ingest_status_uses_agent_run_workdir_and_unique_skill_fallback(tmp_path
     status = service.status(result.agent_run.id)
 
     skill = status["draft"]["contributions"]["skills"][0]
-    assert skill["skill_content"] == skill_content.strip()
-    assert skill["source_path"] == "SKILL.md"
-    assert status["validation"]["ok"] is True
+    assert "skill_content" not in skill
+    assert status["validation"]["ok"] is False
+    assert any(
+        "source bundle does not contain a complete source document" in message
+        for message in status["validation"]["messages"]
+    )
 
 
-def test_ingest_status_reads_skill_content_from_sandbox_container_workdir(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ingest_status_does_not_read_skill_content_from_sandbox_container_workdir() -> None:
     control = _control_plane()
     service = CapabilityPackageIngestService(control)
-    skill_content = (
-        "---\n"
-        "name: stop-slop\n"
-        "description: Detect vague AI writing.\n"
-        "---\n\n"
-        "Detect vague AI writing.\n"
-    )
-
-    def fake_docker_exec(
-        container_id: str,
-        script: str,
-        *args: str,
-    ) -> subprocess.CompletedProcess[str]:
-        assert container_id == "sandbox-container-1"
-        if "find ." in script:
-            return subprocess.CompletedProcess(
-                args=["docker", "exec"],
-                returncode=0,
-                stdout="SKILL.md\n",
-                stderr="",
-            )
-        if "cat" in script:
-            assert args[0] == "/workspace/.rcoder/agent-runs/workspace/task/workdir/stop-slop"
-            if args[1] != "SKILL.md":
-                return subprocess.CompletedProcess(
-                    args=["docker", "exec"],
-                    returncode=1,
-                    stdout="",
-                    stderr="missing",
-                )
-            return subprocess.CompletedProcess(
-                args=["docker", "exec"],
-                returncode=0,
-                stdout=skill_content,
-                stderr="",
-            )
-        raise AssertionError(f"unexpected docker script: {script}")
-
-    monkeypatch.setattr(
-        capability_packages_module,
-        "_run_docker_exec",
-        fake_docker_exec,
-    )
     result = service.start(
         {
             "source": {
@@ -2597,12 +2934,15 @@ def test_ingest_status_reads_skill_content_from_sandbox_container_workdir(
     status = service.status(result.agent_run.id)
 
     skill = status["draft"]["contributions"]["skills"][0]
-    assert skill["skill_content"] == skill_content.strip()
-    assert skill["source_path"] == "SKILL.md"
-    assert status["validation"]["ok"] is True
+    assert "skill_content" not in skill
+    assert status["validation"]["ok"] is False
+    assert any(
+        "source bundle does not contain a complete source document" in message
+        for message in status["validation"]["messages"]
+    )
 
 
-def test_ingest_status_reports_ambiguous_workdir_skill_content(tmp_path: Path) -> None:
+def test_ingest_status_requires_source_document_instead_of_scanning_ambiguous_workdir(tmp_path: Path) -> None:
     control = _control_plane()
     service = CapabilityPackageIngestService(control)
     for name in ("one", "two"):
@@ -2655,8 +2995,7 @@ def test_ingest_status_reports_ambiguous_workdir_skill_content(tmp_path: Path) -
 
     assert status["validation"]["ok"] is False
     assert any(
-        "multiple SKILL.md files found" in message
-        and "exact source_path or content_ref" in message
+        "source bundle does not contain a complete source document" in message
         for message in status["validation"]["messages"]
     )
 
@@ -2723,7 +3062,195 @@ def test_ingest_status_builds_skill_content_from_agent_run_read_file_event() -> 
 
     status = service.status(result.agent_run.id)
 
-    assert status["draft"]["contributions"]["skills"][0]["skill_content"] == skill_content.strip()
+    skill = status["draft"]["contributions"]["skills"][0]
+    document = next(
+        item
+        for item in status["source_bundle"]["documents"]
+        if item.get("source_path") == "skills/code-review/SKILL.md"
+    )
+    assert skill["skill_content"] == skill_content.strip()
+    assert skill["source_document_id"] == document["source_document_id"]
+    assert skill["config"]["source_document_id"] == document["source_document_id"]
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_prefers_full_read_after_paged_read_file_same_source_path() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this skill after completing a paged read.",
+            }
+        }
+    )
+    source_path = "skills/partial/SKILL.md"
+    paged_output = "\n".join(
+        [
+            "1\t---",
+            "2\tname: partial",
+            "3\t---",
+            "4\t",
+            "5\tPartial preview.",
+            "... (12 lines total, showing 1-5; use override=true to read full file)",
+        ]
+    )
+    full_content = "---\nname: partial\n---\n\nComplete skill content.\n"
+    for call_id, output, input_payload in (
+        ("read-partial", paged_output, {"file_path": source_path, "limit": 5}),
+        ("read-full", full_content, {"file_path": source_path, "override": True}),
+    ):
+        control.append_executor_event(
+            result.agent_run.id,
+            ExecutorEvent(
+                type="tool_use",
+                data={
+                    "tool_name": "read_file",
+                    "tool_call_id": call_id,
+                    "input": input_payload,
+                },
+            ),
+        )
+        control.append_executor_event(
+            result.agent_run.id,
+            ExecutorEvent(
+                type="tool_result",
+                data={
+                    "tool_name": "read_file",
+                    "tool_call_id": call_id,
+                    "output": output,
+                },
+            ),
+        )
+    draft_decision = {
+        "id": "partial",
+        "name": "Partial",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:partial",
+                "source_path": source_path,
+                "content_ref": "read-full",
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:partial",
+                    "kind": "skill",
+                    "name": "partial",
+                }
+            ]
+        },
+        "evidence": [{"title": "Partial skill", "excerpt": source_path}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == full_content.strip()
+    assert status["validation"]["ok"] is True
+    inventory = status["source_bundle"]["source_inventory"]
+    document = next(item for item in inventory["documents"] if item["source_path"] == source_path)
+    assert document["content_complete"] is True
+    assert document["tool_call_id"] == "read-full"
+    assert document["content_ref"] == "read-full"
+
+
+def test_ingest_status_treats_list_file_as_inventory_not_skill_content() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    skill_content = "---\nname: gsap-core\n---\n\nUse GSAP core.\n"
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "list_file",
+                "tool_call_id": "list-skill-dir",
+                "input": {"path": "skills/gsap-core"},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "list_file",
+                "tool_call_id": "list-skill-dir",
+                "output": source_path,
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-skill",
+                "input": {"path": source_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-skill",
+                "output": skill_content,
+            },
+        ),
+    )
+    draft_decision = {
+        "id": "gsap-skills",
+        "name": "GSAP Skills",
+        "source": {"type": "github_repo", "url": "https://github.com/greensock/gsap-skills"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:gsap-core",
+                    "kind": "skill",
+                    "name": "gsap-core",
+                    "source_path": source_path,
+                }
+            ]
+        },
+        "evidence": [{"title": "GSAP", "excerpt": source_path}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    inventory = status["source_bundle"]["source_inventory"]
+    assert {item["path"] for item in inventory["skill_files"]} == {source_path}
+    assert {item["source_path"] for item in inventory["documents"]} == {source_path}
+    assert all(item.get("tool_name") != "list_file" for item in inventory["documents"])
     assert status["validation"]["ok"] is True
 
 
@@ -2855,7 +3382,916 @@ def test_ingest_status_materializes_gsap_style_skill_repo_from_agent_run_reads()
     assert inventory["raw_event_refs"]
 
 
-def test_ingest_status_uses_exact_source_path_when_workdir_has_multiple_skills(
+def test_ingest_status_reports_incomplete_model_output_after_source_discovery() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    skill_content = (
+        "---\n"
+        "name: gsap-core\n"
+        "description: Use GSAP core animation APIs.\n"
+        "---\n\n"
+        "Use GSAP core animation APIs with source-backed guidance.\n"
+    )
+    for index in range(1005):
+        control.append_executor_event(
+            result.agent_run.id,
+            ExecutorEvent(
+                type="status",
+                data={"status": "thinking", "index": index},
+            ),
+        )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "input": {"file_path": source_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "output": skill_content,
+            },
+        ),
+    )
+    truncated_output = (
+        '{"id": "gsap-skills", "name": "GSAP Skills", '
+        '"source": {"type": "github_repo", "url": "https://github.com/greensock/gsap-skills"}, '
+        '"contributions": {"skills": [{"id": "skill:gsap-core", "kind": "skill", '
+        '"name": "gsap-core", "runs_on": "server'
+    )
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=truncated_output,
+            events=[
+                ExecutorEvent.status(
+                    "model_output_interrupted",
+                    stream_status="interrupted",
+                    classification="text_interrupted",
+                    message="peer closed connection without sending complete message body",
+                    recovery={"attempted": True, "failed": True, "max_attempts": 1},
+                )
+            ],
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["draft"] is None
+    assert status["failure"]["code"] == "model_output_incomplete"
+    assert status["failure"]["code"] != "source_discovery_incomplete"
+    inventory = status["source_bundle"]["source_inventory"]
+    assert {item["source_path"] for item in inventory["documents"]} == {source_path}
+    assert {item["path"] for item in inventory["skill_files"]} == {source_path}
+    assert status["capability_run_state"]["materialization_source"] == "artifact"
+    assert status["capability_run_state"]["source_summary"]["skill_files"] == 1
+
+
+def test_ingest_status_diagnoses_interrupted_output_beyond_display_event_window() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install a skill from interrupted model output.",
+            }
+        }
+    )
+    for index in range(1005):
+        control.append_executor_event(
+            result.agent_run.id,
+            ExecutorEvent.status("thinking", index=index),
+        )
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output="",
+            events=[
+                ExecutorEvent.status(
+                    "model_output_interrupted",
+                    stream_status="interrupted",
+                    classification="text_interrupted",
+                    message="peer closed connection without sending complete message body",
+                    recovery={"attempted": True, "failed": True, "max_attempts": 1},
+                )
+            ],
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert len(status["events"]) == 1000
+    assert status["draft"] is None
+    assert status["failure"]["code"] == "draft_generation_interrupted"
+    assert status["failure"]["code"] not in {
+        "draft_not_produced",
+        "source_discovery_incomplete",
+    }
+
+
+def test_ingest_status_records_field_patch_without_draft_ready() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "input": {"file_path": source_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "output": "---\nname: gsap-core\n---\n\nUse GSAP core.\n",
+            },
+        ),
+    )
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output="",
+            events=[
+                ExecutorEvent.text_event(
+                    json.dumps(
+                        {
+                            "capability_draft_patch": {
+                                "field_path": "repo_summary",
+                                "value": "GSAP skill repository with animation guidance.",
+                                "source_refs": [
+                                    {"source_path": source_path},
+                                ],
+                            }
+                        }
+                    )
+                )
+            ],
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["draft"] is None
+    assert status["failure"]["code"] == "field_generation_incomplete"
+    run_state = status["capability_run_state"]
+    assert run_state["phase"] == "draft_missing"
+    assert run_state["source_evidence"]["source_summary"]["skill_files"] == 1
+    assert run_state["ingest_state"]["phase"] == "draft_missing"
+    assert run_state["ingest_state"]["field_generation_state"]["patch_count"] == 1
+    assert run_state["field_generation"]["patch_count"] == 1
+    assert run_state["field_generation"]["field_state"]["repo_summary"]["status"] == "filled"
+    assert run_state["draft_assembly"]["missing_fields"]
+    assert "contributions" in run_state["draft_assembly"]["missing_fields"]
+
+
+def test_ingest_status_assembles_completed_draft_from_field_patches() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    skill_content = (
+        "---\n"
+        "name: gsap-core\n"
+        "description: Use GSAP core animation APIs.\n"
+        "---\n\n"
+        "Use GSAP core animation APIs with source-backed guidance.\n"
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "input": {"file_path": source_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "output": skill_content,
+            },
+        ),
+    )
+
+    def patch_event(field_path: str, value: object) -> ExecutorEvent:
+        return ExecutorEvent.text_event(
+            json.dumps(
+                {
+                    "capability_draft_patch": {
+                        "field_path": field_path,
+                        "value": value,
+                        "source_refs": [{"source_path": source_path}],
+                    }
+                }
+            )
+        )
+
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output="",
+            events=[
+                patch_event("id", "gsap-skills"),
+                patch_event("name", "GSAP Skills"),
+                patch_event(
+                    "description",
+                    "Installable GSAP animation guidance from repository Skill files.",
+                ),
+                patch_event(
+                    "source_inventory",
+                    {
+                        "skill_files": [
+                            {
+                                "source_path": source_path,
+                            }
+                        ],
+                        "docs": [],
+                        "files": [],
+                    },
+                ),
+                patch_event(
+                    "contributions.skills",
+                    [
+                        {
+                            "id": "skill:gsap-core",
+                            "kind": "skill",
+                            "name": "gsap-core",
+                            "display_name": "GSAP core",
+                            "summary": "Use GSAP core animation APIs.",
+                            "source_path": source_path,
+                        }
+                    ],
+                ),
+                patch_event("install_plan", ["Install the gsap-core Skill file."]),
+                patch_event("usage", ["Use gsap-core when authoring GSAP animations."]),
+                patch_event(
+                    "evidence",
+                    [{"title": "GSAP core", "excerpt": "Use GSAP core animation APIs."}],
+                ),
+                patch_event("risk_level", "low"),
+            ],
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["failure"] is None
+    assert status["validation"]["ok"] is True
+    draft = status["draft"]
+    assert draft["source_inventory"]["skill_files"][0]["source_path"] == source_path
+    skill = draft["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    run_state = status["capability_run_state"]
+    assert run_state["field_generation"]["patch_count"] == 9
+    assert run_state["draft_assembly"]["draft_present"] is True
+    assert run_state["draft_assembly"]["missing_fields"] == []
+
+
+def test_ingest_status_assembles_completed_draft_from_agent_run_output_patch_stream() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    skill_content = (
+        "---\n"
+        "name: gsap-core\n"
+        "description: Use GSAP core animation APIs.\n"
+        "---\n\n"
+        "Use GSAP core animation APIs with source-backed guidance.\n"
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent.tool_use(
+            tool_name="read_file",
+            tool_call_id="read-gsap-core",
+            tool_args={"file_path": source_path},
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent.tool_result(
+            tool_name="read_file",
+            tool_call_id="read-gsap-core",
+            output=skill_content,
+        ),
+    )
+    patches: list[tuple[str, object]] = [
+        ("id", "gsap-skills"),
+        ("name", "GSAP Skills"),
+        (
+            "description",
+            "Installable GSAP animation guidance from repository Skill files.",
+        ),
+        (
+            "source_inventory",
+            {"skill_files": [{"source_path": source_path}], "docs": [], "files": []},
+        ),
+        (
+            "contributions.skills",
+            [
+                {
+                    "id": "skill:gsap-core",
+                    "kind": "skill",
+                    "name": "gsap-core",
+                    "display_name": "GSAP core",
+                    "summary": "Use GSAP core animation APIs.",
+                    "source_path": source_path,
+                }
+            ],
+        ),
+        ("install_plan", []),
+        ("usage", []),
+        (
+            "evidence",
+            [{"title": "GSAP core", "excerpt": "Use GSAP core animation APIs."}],
+        ),
+        ("risk_level", "low"),
+    ]
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=_capability_patch_stream(patches, source_path=source_path),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["failure"] is None
+    assert status["validation"]["ok"] is True
+    assert status["draft"]["install_plan"] == []
+    assert status["draft"]["usage"] == []
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    run_state = status["capability_run_state"]
+    assert run_state["field_generation"]["patch_count"] == len(patches)
+    assert run_state["draft_assembly"]["draft_present"] is True
+    assert run_state["draft_assembly"]["missing_fields"] == []
+
+
+def test_ingest_status_loads_patch_stream_event_beyond_event_window() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    skill_content = (
+        "---\n"
+        "name: gsap-core\n"
+        "description: Use GSAP core animation APIs.\n"
+        "---\n\n"
+        "Use GSAP core animation APIs with source-backed guidance.\n"
+    )
+    for index in range(1005):
+        control.append_executor_event(
+            result.agent_run.id,
+            ExecutorEvent.status("discovering", index=index),
+        )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent.tool_use(
+            tool_name="read_file",
+            tool_call_id="read-gsap-core",
+            tool_args={"file_path": source_path},
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent.tool_result(
+            tool_name="read_file",
+            tool_call_id="read-gsap-core",
+            output=skill_content,
+        ),
+    )
+    patches: list[tuple[str, object]] = [
+        ("id", "gsap-skills"),
+        ("name", "GSAP Skills"),
+        (
+            "source_inventory",
+            {"skill_files": [{"source_path": source_path}], "docs": [], "files": []},
+        ),
+        (
+            "contributions.skills",
+            [
+                {
+                    "id": "skill:gsap-core",
+                    "kind": "skill",
+                    "name": "gsap-core",
+                    "source_path": source_path,
+                }
+            ],
+        ),
+        ("install_plan", []),
+        ("usage", []),
+        (
+            "evidence",
+            [{"title": "GSAP core", "excerpt": "Use GSAP core animation APIs."}],
+        ),
+        ("risk_level", "low"),
+    ]
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent.text_event(_capability_patch_stream(patches, source_path=source_path)),
+    )
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output="",
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert len(status["events"]) == 1000
+    assert status["failure"] is None
+    assert status["validation"]["ok"] is True
+    assert status["draft"]["contributions"]["skills"][0]["skill_content"] == skill_content.strip()
+    run_state = status["capability_run_state"]
+    assert run_state["field_generation"]["patch_count"] == len(patches)
+    assert run_state["draft_assembly"]["missing_fields"] == []
+    assert run_state["materialization_source"] == "artifact"
+
+
+def test_ingest_status_materializes_source_documents_beyond_event_window_with_runtime_paths() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    task = control.get_agent_run(result.agent_run.id)
+    task.workdir = "/workspace/.rcoder/agent-runs/workspace/task-abc/workdir/gsap-skills"
+    core_runtime_path = (
+        "/workspace/.rcoder/agent-runs/workspace/task-abc/workdir/"
+        "gsap-skills/skills/gsap-core/SKILL.md"
+    )
+    timeline_runtime_path = (
+        "/workspace/.rcoder/agent-runs/workspace/task-abc/workdir/"
+        "gsap-skills/skills/gsap-timeline/SKILL.md"
+    )
+    core_source_path = "skills/gsap-core/SKILL.md"
+    timeline_source_path = "skills/gsap-timeline/SKILL.md"
+    core_skill_content = (
+        "---\n"
+        "name: gsap-core\n"
+        "description: Use GSAP core animation APIs.\n"
+        "---\n\n"
+        "Use GSAP core animation APIs with source-backed guidance.\n"
+    )
+    timeline_skill_content = (
+        "---\n"
+        "name: gsap-timeline\n"
+        "description: Build GSAP timelines.\n"
+        "---\n\n"
+        "Build coordinated GSAP timelines.\n"
+    )
+    for index in range(1005):
+        control.append_executor_event(
+            result.agent_run.id,
+            ExecutorEvent(
+                type="status",
+                data={"status": "discovering", "index": index},
+            ),
+        )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "call-read-core",
+                "input": {"file_path": core_runtime_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "call-read-core",
+                "output": core_skill_content,
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "call-read-timeline",
+                "input": {"file_path": timeline_runtime_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "call-read-timeline",
+                "output": timeline_skill_content,
+            },
+        ),
+    )
+    draft_decision = {
+        "id": "gsap-skills",
+        "name": "GSAP Skills",
+        "source": {"type": "github_repo", "url": "https://github.com/greensock/gsap-skills"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:gsap-core",
+                "source_path": core_source_path,
+                "content_ref": "read-file:skills/gsap-core/SKILL.md:round-03",
+            },
+            {
+                "component_id": "skill:gsap-timeline",
+                "source_path": timeline_source_path,
+                "content_ref": "read-file:skills/gsap-timeline/SKILL.md:round-03",
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:gsap-core",
+                    "kind": "skill",
+                    "name": "gsap-core",
+                },
+                {
+                    "id": "skill:gsap-timeline",
+                    "kind": "skill",
+                    "name": "gsap-timeline",
+                }
+            ]
+        },
+        "evidence": [{"title": "GSAP skills", "excerpt": core_source_path}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skills = {
+        item["name"]: item
+        for item in status["draft"]["contributions"]["skills"]
+    }
+    assert skills["gsap-core"]["skill_content"] == core_skill_content.strip()
+    assert skills["gsap-core"]["source_path"] == core_source_path
+    assert skills["gsap-timeline"]["skill_content"] == timeline_skill_content.strip()
+    assert skills["gsap-timeline"]["source_path"] == timeline_source_path
+    assert status["validation"]["ok"] is True
+    inventory = status["source_bundle"]["source_inventory"]
+    assert {item["path"] for item in inventory["skill_files"]} == {
+        core_source_path,
+        timeline_source_path,
+    }
+    assert {
+        item["source_path"]
+        for item in inventory["documents"]
+        if item["source_path"].startswith("skills/gsap-")
+    } == {core_source_path, timeline_source_path}
+    document_ids = {
+        item["source_path"]: item["source_document_id"]
+        for item in inventory["documents"]
+        if item["source_path"].startswith("skills/gsap-")
+    }
+    assert set(document_ids) == {core_source_path, timeline_source_path}
+    assert all(value.startswith("cap-src-doc-") for value in document_ids.values())
+    assert status["capability_run_state"]["phase"] == "draft_ready"
+    assert status["capability_run_state"]["materialization_source"] == "artifact"
+    artifact_id = f"capability-source-bundle:{result.agent_run.id}"
+    assert status["capability_run_state"]["source_bundle_artifact_id"] == artifact_id
+    artifacts = [
+        item
+        for item in control.artifacts_to_dict(result.agent_run.id)
+        if item["id"] == artifact_id
+    ]
+    assert len(artifacts) == 1
+    assert artifacts[0]["type"] == "document"
+    assert artifacts[0]["metadata"]["kind"] == "capability_source_bundle"
+    persisted_bundle = json.loads(artifacts[0]["content"])
+    persisted_inventory = persisted_bundle["source_inventory"]
+    assert {item["path"] for item in persisted_inventory["skill_files"]} == {
+        core_source_path,
+        timeline_source_path,
+    }
+    assert {
+        item["source_path"]: item["source_document_id"]
+        for item in persisted_inventory["documents"]
+        if item["source_path"].startswith("skills/gsap-")
+    } == document_ids
+
+    control._events[result.agent_run.id] = []
+    replayed_status = service.status(result.agent_run.id)
+
+    replayed_skills = {
+        item["name"]: item
+        for item in replayed_status["draft"]["contributions"]["skills"]
+    }
+    assert replayed_status["events"] == []
+    assert replayed_status["capability_run_state"]["materialization_source"] == "artifact"
+    assert replayed_skills["gsap-core"]["skill_content"] == core_skill_content.strip()
+    assert replayed_skills["gsap-timeline"]["skill_content"] == timeline_skill_content.strip()
+    replayed_inventory = replayed_status["source_bundle"]["source_inventory"]
+    assert {
+        item["source_path"]: item["source_document_id"]
+        for item in replayed_inventory["documents"]
+        if item["source_path"].startswith("skills/gsap-")
+    } == document_ids
+    artifacts_after_replay = [
+        item
+        for item in control.artifacts_to_dict(result.agent_run.id)
+        if item["id"] == artifact_id
+    ]
+    assert len(artifacts_after_replay) == 1
+
+
+def test_ingest_status_strips_read_file_line_numbers_from_skill_content() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this numbered skill.",
+            }
+        }
+    )
+    source_path = "skills/numbered/SKILL.md"
+    skill_content = "---\nname: numbered\n---\n\nUse numbered output safely.\n"
+    numbered_output = "\n".join(
+        f"{index}\t{line}"
+        for index, line in enumerate(skill_content.splitlines(), start=1)
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-numbered",
+                "input": {"file_path": source_path},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-numbered",
+                "output": numbered_output,
+            },
+        ),
+    )
+    draft_decision = {
+        "id": "numbered",
+        "name": "Numbered",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:numbered",
+                "source_path": source_path,
+                "content_ref": "read-numbered",
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:numbered",
+                    "kind": "skill",
+                    "name": "numbered",
+                }
+            ]
+        },
+        "evidence": [{"title": "Numbered skill", "excerpt": source_path}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_does_not_resolve_fake_content_ref_by_component_name() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this skill with an invalid ref.",
+            }
+        }
+    )
+    skill_content = "---\nname: gsap-core\n---\n\nUse GSAP core.\n"
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-real-core",
+                "input": {"file_path": "skills/gsap-core/SKILL.md"},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-real-core",
+                "output": skill_content,
+            },
+        ),
+    )
+    draft_decision = {
+        "id": "fake-ref",
+        "name": "Fake Ref",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:gsap-core",
+                "content_ref": "read-file:skills/gsap-core/SKILL.md:round-03",
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:gsap-core",
+                    "kind": "skill",
+                    "name": "gsap-core",
+                }
+            ]
+        },
+        "evidence": [{"title": "GSAP skill", "excerpt": "skills/gsap-core/SKILL.md"}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert "skill_content" not in skill
+    assert status["validation"]["ok"] is False
+    assert status["capability_run_state"]["phase"] == "validation_failed"
+    assert any("requires skill_content" in message for message in status["validation"]["messages"])
+
+
+def test_ingest_status_rejects_paged_read_file_skill_content_without_complete_source() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this partially read skill.",
+            }
+        }
+    )
+    source_path = "skills/partial/SKILL.md"
+    paged_output = "\n".join(
+        [
+            "1\t---",
+            "2\tname: partial",
+            "3\t---",
+            "4\t",
+            "5\tPartial content.",
+            "... (12 lines total, showing 1-5; use override=true to read full file)",
+        ]
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-partial",
+                "input": {"file_path": source_path, "limit": 5},
+            },
+        ),
+    )
+    control.append_executor_event(
+        result.agent_run.id,
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-partial",
+                "output": paged_output,
+            },
+        ),
+    )
+    draft_decision = {
+        "id": "partial",
+        "name": "Partial",
+        "source": {"type": "project_notes"},
+        "materialization_plan": [
+            {
+                "component_id": "skill:partial",
+                "source_path": source_path,
+                "content_ref": "read-partial",
+            }
+        ],
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:partial",
+                    "kind": "skill",
+                    "name": "partial",
+                }
+            ]
+        },
+        "evidence": [{"title": "Partial skill", "excerpt": source_path}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert "skill_content" not in skill
+    assert status["validation"]["ok"] is False
+    assert status["capability_run_state"]["phase"] == "validation_failed"
+    inventory = status["source_bundle"]["source_inventory"]
+    document = next(item for item in inventory["documents"] if item["source_path"] == source_path)
+    assert document["content_complete"] is False
+    assert document["content_incomplete_reason"] == "read_file_paged_output"
+    assert any("source document is incomplete" in message for message in status["validation"]["messages"])
+
+
+def test_ingest_status_requires_source_document_even_with_exact_workdir_path(
     tmp_path: Path,
 ) -> None:
     control = _control_plane()
@@ -2909,9 +4345,62 @@ def test_ingest_status_uses_exact_source_path_when_workdir_has_multiple_skills(
     status = service.status(result.agent_run.id)
 
     skill = status["draft"]["contributions"]["skills"][0]
-    assert skill["skill_content"] == "---\nname: two\n---\n\ntwo skill"
-    assert skill["source_path"] == "skills/two/SKILL.md"
-    assert status["validation"]["ok"] is True
+    assert "skill_content" not in skill
+    assert status["validation"]["ok"] is False
+    assert status["capability_run_state"]["phase"] == "validation_failed"
+    assert any(
+        "source bundle does not contain a complete source document" in message
+        for message in status["validation"]["messages"]
+    )
+
+
+def test_ingest_status_classifies_draft_invalid_as_validation_failed() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start(
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install this invalid skill draft.",
+            }
+        }
+    )
+    draft_decision = {
+        "id": "invalid-skill",
+        "name": "Invalid Skill",
+        "source": {"type": "project_notes"},
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:invalid",
+                    "kind": "skill",
+                    "name": "invalid",
+                    "skill_content": "---\nname: invalid\n---\n\nInvalid skill.\n",
+                    "access": "admin",
+                }
+            ]
+        },
+        "evidence": [{"title": "Invalid skill", "excerpt": "Invalid skill."}],
+        "risk_level": "low",
+    }
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=json.dumps(draft_decision),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["validation"]["ok"] is False
+    assert status["failure"]["result_type"] == "draft_invalid"
+    assert status["capability_run_state"]["phase"] == "validation_failed"
+    assert any(
+        "component.access must be read, write, or both" in message
+        for message in status["validation"]["messages"]
+    )
 
 
 def test_ingest_status_reports_unsupported_external_install_envreq() -> None:
@@ -2988,6 +4477,7 @@ def test_ingest_status_reports_unsupported_external_install_envreq() -> None:
     assert status["draft"]["contributions"]["environment_requirements"][0]["id"] == "envreq:executable:npx"
     assert status["validation"]["draft"]["contributions"]["environment_requirements"][0]["id"] == "envreq:executable:npx"
     assert status["failure"]["result_type"] == "command_evidence_missing"
+    assert status["capability_run_state"]["phase"] == "validation_failed"
     assert any(
         "envreq:executable:npx command lacks evidence: npx --version" in message
         for message in status["validation"]["messages"]
@@ -3074,6 +4564,301 @@ def test_capability_package_session_reports_structured_skill_content_failure(
     )
     error = next(event["payload"] for event in session.events if event["type"] == "error")
     assert error["code"] == "skill_content_unresolved"
+
+
+def test_capability_package_session_reports_incomplete_field_generation_without_approval(
+    tmp_path: Path,
+) -> None:
+    class FakeAdminManager:
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            raise AssertionError("incomplete field generation must not install")
+
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-field-incomplete",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        locale="en",
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(
+        session,
+        {"repoUrl": "https://github.com/greensock/gsap-skills"},
+    )
+    agent_run_id = _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "workflow_step"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    control.append_executor_event(
+        str(agent_run_id),
+        ExecutorEvent(
+            type="tool_use",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "input": {"file_path": "skills/gsap-core/SKILL.md"},
+            },
+        ),
+    )
+    control.append_executor_event(
+        str(agent_run_id),
+        ExecutorEvent(
+            type="tool_result",
+            data={
+                "tool_name": "read_file",
+                "tool_call_id": "read-gsap-core",
+                "output": "---\nname: gsap-core\n---\n\nUse GSAP core.\n",
+            },
+        ),
+    )
+    control.complete_agent_run(
+        str(agent_run_id),
+        ExecutorRunResult(
+            task_id=str(agent_run_id),
+            status="completed",
+            output="",
+            events=[
+                ExecutorEvent.text_event(
+                    json.dumps(
+                        {
+                            "capability_draft_patch": {
+                                "field_path": "repo_summary",
+                                "value": "GSAP skill repository.",
+                            }
+                        }
+                    )
+                )
+            ],
+        ),
+    )
+
+    _wait_for(lambda: session.done)
+
+    assert not any(event["type"] == "workflow_decision" for event in session.events)
+    assert not any(event["type"] == "workflow_artifact" for event in session.events)
+    result = next(
+        event["payload"]
+        for event in session.events
+        if event["type"] == "workflow_result"
+        and event["payload"].get("result_type") == "field_generation_incomplete"
+    )
+    assert result["status"] == "error"
+    assert result["result"]["code"] == "field_generation_incomplete"
+    failed_event = next(
+        event["payload"]
+        for event in session.events
+        if event["type"] == "session_run_failed"
+    )
+    assert failed_event["code"] == "field_generation_incomplete"
+
+
+def test_capability_package_session_reports_interrupted_output_beyond_display_event_window(
+    tmp_path: Path,
+) -> None:
+    class FakeAdminManager:
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            raise AssertionError("interrupted draft must not install")
+
+    control = _control_plane()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-output-interrupted",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        locale="en",
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Generate one interrupted skill.",
+            }
+        },
+    )
+    agent_run_id = _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "workflow_step"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    for index in range(1005):
+        control.append_executor_event(
+            str(agent_run_id),
+            ExecutorEvent.status("thinking", index=index),
+        )
+    control.complete_agent_run(
+        str(agent_run_id),
+        ExecutorRunResult(
+            task_id=str(agent_run_id),
+            status="completed",
+            output="",
+            events=[
+                ExecutorEvent.status(
+                    "model_output_interrupted",
+                    stream_status="interrupted",
+                    classification="text_interrupted",
+                    message="peer closed connection without sending complete message body",
+                    recovery={"attempted": True, "failed": True, "max_attempts": 1},
+                )
+            ],
+        ),
+    )
+
+    _wait_for(lambda: session.done)
+
+    assert not any(event["type"] == "workflow_decision" for event in session.events)
+    assert not any(event["type"] == "workflow_artifact" for event in session.events)
+    result = next(
+        event["payload"]
+        for event in session.events
+        if event["type"] == "workflow_result"
+        and event["payload"].get("result_type") == "draft_generation_interrupted"
+    )
+    assert result["status"] == "error"
+    assert result["result"]["code"] == "draft_generation_interrupted"
+    failed_event = next(
+        event["payload"]
+        for event in session.events
+        if event["type"] == "session_run_failed"
+    )
+    assert failed_event["code"] == "draft_generation_interrupted"
+
+
+def test_capability_package_session_requests_approval_from_patch_stream_with_empty_lists(
+    tmp_path: Path,
+) -> None:
+    class FakeAdminManager:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def accept_capability_package_draft(self, payload: dict[str, object]):
+            self.payloads.append(payload)
+
+            class Result:
+                ok = True
+                status = 200
+                payload = {"ok": True, "package_id": "review-empty-plan"}
+
+            return Result()
+
+    control = _control_plane()
+    admin = FakeAdminManager()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-empty-list-patches",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        locale="en",
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        admin,
+        poll_timeout_sec=0.05,
+    )
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install gh, then use gh pr view for review.",
+            }
+        },
+    )
+    agent_run_id = _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "workflow_step"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    patches: list[tuple[str, object]] = [
+        ("id", "review-empty-plan"),
+        ("name", "Review Empty Plan"),
+        (
+            "contributions.environment_requirements",
+            [
+                {
+                    "id": "envreq:executable:gh",
+                    "kind": "executable",
+                    "name": "gh",
+                    "command": "gh",
+                    "check": "gh --version",
+                }
+            ],
+        ),
+        ("install_plan", []),
+        ("usage", []),
+        (
+            "evidence",
+            [
+                {
+                    "title": "Project notes",
+                    "excerpt": "Install gh and run gh --version.",
+                }
+            ],
+        ),
+        ("risk_level", "low"),
+    ]
+    control.complete_agent_run(
+        str(agent_run_id),
+        ExecutorRunResult(
+            task_id=str(agent_run_id),
+            status="completed",
+            output=_capability_patch_stream(patches),
+        ),
+    )
+
+    approval = _wait_for(
+        lambda: next(
+            (
+                event["payload"]
+                for event in session.events
+                if event["type"] == "workflow_decision"
+            ),
+            None,
+        )
+    )
+    draft_event = next(event for event in session.events if event["type"] == "workflow_artifact")
+    assert draft_event["payload"]["artifact_type"] == "capability_package_draft"
+    assert draft_event["payload"]["artifact"]["package_id"] == "review-empty-plan"
+    assert approval["tool_name"] == "install_capability_package"
+    assert approval["decision_type"] == "capability_package_install"
+    assert approval["review"]["package_id"] == "review-empty-plan"
+    session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
+    _wait_for(lambda: session.done)
+
+    assert admin.payloads
+    draft = admin.payloads[0]["draft"]  # type: ignore[index]
+    assert draft["id"] == "review-empty-plan"  # type: ignore[index]
+    assert draft["install_plan"] == []  # type: ignore[index]
+    assert draft["usage"] == []  # type: ignore[index]
 
 
 def test_capability_package_session_run_requests_install_approval_and_installs(tmp_path: Path) -> None:
