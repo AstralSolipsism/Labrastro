@@ -93,6 +93,7 @@ from reuleauxcoder.services.providers.model_capabilities import (
     utc_now_iso,
 )
 from reuleauxcoder.services.providers.manager import ProviderManager
+from reuleauxcoder.services.providers.diagnostics import provider_error_envelope
 from reuleauxcoder.extensions.tools.registry import build_tools
 from reuleauxcoder.interfaces.vscode.registration import VSCODE_CHAT_PROFILE
 
@@ -171,37 +172,72 @@ def lifecycle_hook_recent_results_from_agent_runs(
         task_id = str(run.get("id") or run.get("task_id") or "").strip()
         if not task_id:
             continue
+        run_results: dict[str, dict[str, Any]] = {}
+        for event in _iter_lifecycle_hook_events(
+            runtime_control_plane,
+            task_id,
+            event_limit=max(1, int(event_limit or 1)),
+        ):
+            if _event_attr(event, "type") != "lifecycle_hook":
+                continue
+            payload = _event_payload(event)
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            hook_id = str(data.get("hook_id") or "").strip()
+            if not hook_id.startswith(hook_prefix):
+                continue
+            run_results[hook_id] = _lifecycle_hook_recent_result_from_event(
+                data,
+                agent_run_id=task_id,
+            )
+        for hook_id, result in run_results.items():
+            results.setdefault(hook_id, result)
+    return results
+
+
+def _iter_lifecycle_hook_events(
+    runtime_control_plane: Any,
+    task_id: str,
+    *,
+    event_limit: int,
+) -> list[Any]:
+    events: list[Any] = []
+    cursor = 0
+    while True:
         try:
-            events = runtime_control_plane.list_events(
+            batch = runtime_control_plane.list_events(
                 task_id,
-                after_seq=0,
-                limit=max(1, int(event_limit or 1)),
+                after_seq=cursor,
+                limit=event_limit,
             )
         except Exception:
             logger.debug(
                 "failed to list AgentRun events for lifecycle hook recent results",
                 exc_info=True,
             )
-            continue
-        for event in reversed(list(events or [])):
-            if _event_attr(event, "type") != "lifecycle_hook":
-                continue
-            payload = _event_payload(event)
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-            hook_id = str(data.get("hook_id") or "").strip()
-            if not hook_id.startswith(hook_prefix) or hook_id in results:
-                continue
-            results[hook_id] = _lifecycle_hook_recent_result_from_event(
-                data,
-                agent_run_id=task_id,
-            )
-    return results
+            return events
+        if not batch:
+            return events
+        for event in batch:
+            if _event_attr(event, "type") == "lifecycle_hook":
+                events.append(event)
+        next_cursor = max([cursor, *[_event_seq(event) for event in batch]])
+        if next_cursor <= cursor or len(batch) < event_limit:
+            return events
+        cursor = next_cursor
 
 
 def _event_attr(event: Any, name: str) -> str:
     if isinstance(event, dict):
         return str(event.get(name) or "")
     return str(getattr(event, name, "") or "")
+
+
+def _event_seq(event: Any) -> int:
+    value = event.get("seq") if isinstance(event, dict) else getattr(event, "seq", 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _event_payload(event: Any) -> dict[str, Any]:
@@ -2776,6 +2812,7 @@ class RemoteAdminConfigManager:
             return AdminConfigResult(False, {"error": "provider_id_required"}, 400)
         if not model:
             return AdminConfigResult(False, {"error": "model_required"}, 400)
+        provider: ProviderConfig | None = None
         try:
             provider = self._expanded_provider(provider_id)
             if provider is None:
@@ -2797,7 +2834,16 @@ class RemoteAdminConfigManager:
                     "response": preview,
                 }
         except Exception as exc:
-            return AdminConfigResult(False, {"error": "provider_test_failed", "message": str(exc)}, 500)
+            return AdminConfigResult(
+                False,
+                provider_error_envelope(
+                    provider,
+                    model,
+                    exc,
+                    code="provider_test_failed",
+                ),
+                500,
+            )
         return AdminConfigResult(True, result)
 
     def delete_provider(self, payload: dict[str, Any]) -> AdminConfigResult:

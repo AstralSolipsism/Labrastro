@@ -36,6 +36,11 @@ class _Provider:
         return ProviderResponse(content="hello", reasoning_content="plan")
 
 
+class _FailingProvider:
+    def chat(self, _request):
+        raise RuntimeError("Error code: 500 - {'message': 'invalid csrf token'}")
+
+
 def _control_plane(*, locale: str = "") -> AgentRunControlPlane:
     control = AgentRunControlPlane(
         runtime_snapshot={
@@ -129,6 +134,50 @@ def test_model_bridge_validates_claim_and_uses_run_model_binding(monkeypatch, ca
     assert "provider=deepseek" in log_text
     assert "model=deepseek-v4-pro" in log_text
     assert "sk-test" not in log_text
+
+
+def test_model_bridge_provider_failure_keeps_protocol_diagnostics(monkeypatch) -> None:
+    class _ZenmuxAnthropicAdminManager:
+        def _expanded_provider(self, provider_id: str):
+            if provider_id == "deepseek":
+                return ProviderConfig(
+                    id="deepseek",
+                    type="anthropic_messages",
+                    api_key="sk-secret-should-not-leak",
+                    base_url="https://zenmux.ai/api/v1",
+                )
+            return None
+
+    control = _control_plane()
+    monkeypatch.setattr(
+        "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
+        lambda _self, _config: _FailingProvider(),
+    )
+    bridge = AgentRunModelBridge(
+        runtime_control_plane=control,
+        admin_manager=_ZenmuxAnthropicAdminManager(),
+    )
+    prepared = bridge.prepare(
+        {
+            "agent_run_id": "run-1",
+            "request_id": next(iter(control._claims)),
+            "worker_id": "worker-1",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        peer_id="peer-1",
+    )
+
+    try:
+        bridge.execute(prepared)
+    except AgentRunModelBridgeError as exc:
+        assert exc.code == "provider_request_failed"
+        assert exc.details is not None
+        assert exc.details["suspected_reason"] == "provider_protocol_mismatch_suspected"
+        assert "openai_chat" in exc.details["recommended_action"]
+        assert "invalid csrf token" in exc.details["upstream_message"]
+        assert "sk-secret" not in str(exc.details)
+    else:  # pragma: no cover - defensive assertion branch
+        raise AssertionError("expected provider diagnostics error")
 
 
 def test_model_bridge_injects_locale_instruction_from_agent_run_metadata(monkeypatch) -> None:

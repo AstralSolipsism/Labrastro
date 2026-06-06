@@ -82,7 +82,11 @@ def _agent_run_model_interrupted_payload(
 
 
 def _agent_run_model_error_payload(exc: AgentRunModelBridgeError) -> dict[str, Any]:
-    return {"error": exc.code, "message": exc.message}
+    payload = dict(exc.details or {})
+    payload.update({"error": exc.code, "message": exc.message})
+    if exc.details:
+        payload["details"] = dict(exc.details)
+    return payload
 
 
 def _agent_run_model_unhandled_error_payload(exc: Exception) -> dict[str, Any]:
@@ -368,7 +372,7 @@ class RemoteAgentRunRoutes:
         try:
             prepared = bridge.prepare(payload, peer_id=peer_id)
         except AgentRunModelBridgeError as exc:
-            self._send_error(exc.status, exc.code, exc.message)
+            self._send_error(exc.status, exc.code, exc.message, exc.details or {})
             return
         self.service.runtime_control_plane.append_executor_event(
             str(prepared.metadata.get("agent_run_id") or ""),
@@ -397,7 +401,7 @@ class RemoteAgentRunRoutes:
                 )
                 return
             except AgentRunModelBridgeError as exc:
-                self._send_error(exc.status, exc.code, exc.message)
+                self._send_error(exc.status, exc.code, exc.message, exc.details or {})
                 return
             self._send_json(
                 HTTPStatus.OK,

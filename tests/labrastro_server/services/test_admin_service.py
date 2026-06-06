@@ -1064,6 +1064,95 @@ def test_lifecycle_hook_recent_results_from_agent_runs_filters_owner_and_keeps_l
     }
 
 
+def test_lifecycle_hook_recent_results_scans_beyond_first_event_page() -> None:
+    class _Event:
+        def __init__(self, seq: int, event_type: str, payload: dict) -> None:
+            self.seq = seq
+            self.type = event_type
+            self.payload = payload
+
+    class _Runtime:
+        def __init__(self) -> None:
+            self.events = [
+                *[
+                    _Event(seq, "status", {"data": {"status": "running"}})
+                    for seq in range(1, 1001)
+                ],
+                _Event(
+                    1001,
+                    "lifecycle_hook",
+                    {
+                        "data": {
+                            "hook_id": "hook:skill:code-review:PreToolUse:0",
+                            "source": "skill",
+                            "event_name": "PreToolUse",
+                            "decision": "allow",
+                            "continue_flow": True,
+                        }
+                    },
+                ),
+            ]
+
+        def list_agent_runs(self, *, limit: int = 50):
+            del limit
+            return [{"id": "run-long"}]
+
+        def list_events(self, task_id: str, *, after_seq: int = 0, limit: int = 500):
+            assert task_id == "run-long"
+            return [event for event in self.events if event.seq > after_seq][:limit]
+
+    results = lifecycle_hook_recent_results_from_agent_runs(
+        _Runtime(),
+        "skill",
+        "code-review",
+        event_limit=500,
+    )
+
+    assert results["hook:skill:code-review:PreToolUse:0"] == {
+        "status": "success",
+        "summary": "PreToolUse",
+        "decision": "allow",
+        "event": "PreToolUse",
+        "agent_run_id": "run-long",
+    }
+
+
+def test_provider_test_reports_protocol_mismatch_hint(tmp_path: Path) -> None:
+    def _fail_provider_test(_provider, _model: str, _prompt: str):
+        raise RuntimeError("Error code: 500 - {'message': 'invalid csrf token'}")
+
+    manager = MemoryAdminManager(
+        tmp_path / "config.yaml",
+        provider_test_handler=_fail_provider_test,
+    )
+    manager.data["providers"] = {
+        "items": {
+            "Zenmux": {
+                "type": "anthropic_messages",
+                "api_key": "sk-secret-should-not-leak",
+                "base_url": "https://zenmux.ai/api/v1",
+            }
+        }
+    }
+
+    result = manager.test_provider(
+        {
+            "provider_id": "Zenmux",
+            "model": "anthropic/claude-opus-4.7",
+            "prompt": "ping",
+        }
+    )
+
+    assert result.status == 500
+    assert result.payload["error"] == "provider_test_failed"
+    assert result.payload["provider_id"] == "Zenmux"
+    assert result.payload["provider_type"] == "anthropic_messages"
+    assert result.payload["suspected_reason"] == "provider_protocol_mismatch_suspected"
+    assert "openai_chat" in result.payload["recommended_action"]
+    assert "invalid csrf token" in result.payload["upstream_message"]
+    assert "sk-secret" not in str(result.payload)
+
+
 def test_behavior_catalog_exposes_lifecycle_event_wiring_status(tmp_path: Path) -> None:
     manager = MemoryAdminManager(tmp_path / "config.yaml")
 

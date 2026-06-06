@@ -16,6 +16,7 @@ from reuleauxcoder.domain.session.locale import (
     session_locale_prompt_append,
 )
 from reuleauxcoder.services.providers.manager import ProviderManager
+from reuleauxcoder.services.providers.diagnostics import provider_error_envelope
 from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 
 
@@ -34,6 +35,7 @@ class AgentRunModelBridgeError(Exception):
     code: str
     message: str
     status: HTTPStatus = HTTPStatus.BAD_REQUEST
+    details: dict[str, Any] | None = None
 
     def __str__(self) -> str:
         return self.message
@@ -210,10 +212,16 @@ class AgentRunModelBridge:
                 prepared.provider_config.id,
                 prepared.provider_model,
             )
+            details = provider_error_envelope(
+                prepared.provider_config,
+                prepared.provider_model,
+                exc,
+            )
             raise AgentRunModelBridgeError(
                 "provider_request_failed",
-                "Provider request failed.",
+                str(details.get("message") or "Provider request failed."),
                 HTTPStatus.BAD_GATEWAY,
+                details,
             ) from exc
 
     def _provider_config(self, provider_id: str) -> ProviderConfig | None:

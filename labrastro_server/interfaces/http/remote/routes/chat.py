@@ -65,18 +65,28 @@ from reuleauxcoder.interfaces.events import UIEventKind
 logger = logging.getLogger(__name__)
 
 
-def _session_run_events_handler_error_payload(exc: Exception) -> dict[str, str]:
+def _session_run_events_handler_error_payload(exc: Exception) -> dict[str, Any]:
     message = str(exc).strip()
     code = getattr(exc, "code", None)
     protocol_message = getattr(exc, "message", None)
+    details = getattr(exc, "details", None)
+    provider_diagnostic = getattr(exc, "provider_diagnostic", None)
+    diagnostic_payload = details if isinstance(details, dict) else {}
+    if isinstance(provider_diagnostic, dict):
+        diagnostic_payload = {**diagnostic_payload, "provider_diagnostic": provider_diagnostic}
     if isinstance(code, str) and code.startswith("REMOTE_"):
         return {
+            **diagnostic_payload,
             "message": str(protocol_message or message or code),
             "code": code,
         }
     if isinstance(exc, ValueError) and message.startswith("remote peer "):
-        return {"message": message, "code": "session_run_handler_failed"}
-    return {"message": "session_run_handler_failed", "code": "session_run_handler_failed"}
+        return {**diagnostic_payload, "message": message, "code": "session_run_handler_failed"}
+    return {
+        **diagnostic_payload,
+        "message": str(diagnostic_payload.get("message") or "session_run_handler_failed"),
+        "code": str(diagnostic_payload.get("code") or "session_run_handler_failed"),
+    }
 
 
 def _sse_wait_timeout(timeout_sec: float) -> float:

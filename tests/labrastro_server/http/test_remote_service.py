@@ -96,6 +96,27 @@ def test_session_run_events_handler_error_payload_preserves_remote_protocol_code
     }
 
 
+def test_session_run_events_handler_error_payload_preserves_provider_diagnostic() -> None:
+    class RemoteChatProviderError(Exception):
+        code = "REMOTE_CHAT_ERROR"
+        message = "Try provider type openai_chat. Upstream error: invalid csrf token"
+        provider_diagnostic = {
+            "code": "REMOTE_CHAT_ERROR",
+            "message": "Try provider type openai_chat. Upstream error: invalid csrf token",
+            "provider_id": "Zenmux",
+            "provider_type": "anthropic_messages",
+            "recommended_action": "Try provider type openai_chat.",
+            "upstream_message": "invalid csrf token",
+        }
+
+    payload = _session_run_events_handler_error_payload(RemoteChatProviderError("wrapped"))
+
+    assert payload["message"] == "Try provider type openai_chat. Upstream error: invalid csrf token"
+    assert payload["code"] == "REMOTE_CHAT_ERROR"
+    assert payload["provider_diagnostic"]["provider_id"] == "Zenmux"
+    assert payload["provider_diagnostic"]["recommended_action"] == "Try provider type openai_chat."
+
+
 def _agent_run_settings_from_config(data: dict) -> tuple[RunLimitsConfig, dict]:
     run_limits = RunLimitsConfig.from_dict(data.get("run_limits", {}))
     runtime_profiles = RuntimeProfilesConfig.from_dict(data.get("runtime_profiles", {}))

@@ -88,6 +88,7 @@ from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from reuleauxcoder.interfaces.vscode.registration import VSCODE_CHAT_PROFILE
 from reuleauxcoder.services.llm.factory import llm_trace_enabled, resolve_model_runtime
 from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
+from reuleauxcoder.services.providers.diagnostics import provider_error_envelope
 from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_SYSTEM_PROMPT,
     TASKFLOW_WORKFLOW_MODE,
@@ -2403,20 +2404,43 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             _flush_output()
             _save_peer_session(peer_agent, peer_id)
             _append_final_stream_content()
+            llm = getattr(peer_agent, "llm", None)
+            provider_config = getattr(llm, "provider_config", None)
+            provider_diagnostic = provider_error_envelope(
+                provider_config,
+                str(getattr(llm, "model", "") or ""),
+                exc,
+                code="REMOTE_CHAT_ERROR",
+            )
+            has_actionable_provider_diagnostic = any(
+                provider_diagnostic.get(key)
+                for key in (
+                    "suspected_reason",
+                    "recommended_action",
+                    "upstream_status",
+                    "request_param_keys",
+                )
+            )
+            failure_message = str(
+                provider_diagnostic.get("message") if has_actionable_provider_diagnostic else exc
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.CHAT,
                 kind=ToolDiagnosticKind.CHAT_TERMINAL_ERROR,
                 code="REMOTE_CHAT_ERROR",
-                message=str(exc),
+                message=failure_message,
             )
             _record_remote_diagnostics([diagnostic])
             failure_payload = {
-                "message": str(exc),
+                **(provider_diagnostic if has_actionable_provider_diagnostic else {}),
+                "message": failure_message,
                 "code": "REMOTE_CHAT_ERROR",
                 "recoverable": False,
                 "failure_kind": ToolFailureKind.CHAT_TERMINAL_ERROR.value,
                 "tool_diagnostics": [diagnostic.to_dict()],
             }
+            if has_actionable_provider_diagnostic:
+                failure_payload["provider_diagnostic"] = provider_diagnostic
             diagnostic_path = getattr(exc, "llm_diagnostic_path", None)
             if diagnostic_path:
                 failure_payload["diagnostic_path"] = str(diagnostic_path)
