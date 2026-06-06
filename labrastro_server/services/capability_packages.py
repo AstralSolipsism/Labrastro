@@ -3500,7 +3500,7 @@ def _source_bundle_has_agent_run_inventory(source_bundle: dict[str, Any]) -> boo
 
 
 def _is_capability_materialization_event(event: dict[str, Any]) -> bool:
-    event_type = str(event.get("type") or "")
+    event_type = _source_inventory_tool_event_type(str(event.get("type") or ""))
     if event_type in {"tool_use", "tool_result"}:
         data = _agent_run_event_data(event)
         tool_data = _event_tool_data(data)
@@ -3797,13 +3797,13 @@ def _source_inventory_from_agent_run_events(
     for event in events:
         if not isinstance(event, dict):
             continue
-        event_type = str(event.get("type") or "")
+        event_type = _source_inventory_tool_event_type(str(event.get("type") or ""))
         data = _agent_run_event_data(event)
         tool_data = _event_tool_data(data)
         tool_call_id = _event_tool_call_id(tool_data, data)
         tool_name = str(tool_data.get("tool_name") or tool_data.get("name") or "").strip()
         if event_type == "tool_use" and tool_call_id:
-            tool_inputs[tool_call_id] = dict(tool_data)
+            tool_inputs[tool_call_id] = _tool_input_data(tool_data, data)
         if event_type not in {"tool_use", "tool_result"}:
             continue
         if not _is_source_inventory_tool(tool_name):
@@ -3909,6 +3909,15 @@ def _source_inventory_from_agent_run_events(
     )
 
 
+def _source_inventory_tool_event_type(event_type: str) -> str:
+    normalized = str(event_type or "").strip()
+    if normalized == "tool_call_start":
+        return "tool_use"
+    if normalized == "tool_call_end":
+        return "tool_result"
+    return normalized
+
+
 def _agent_run_event_data(event: dict[str, Any]) -> dict[str, Any]:
     payload = event.get("payload")
     return payload if isinstance(payload, dict) else {}
@@ -3926,6 +3935,18 @@ def _event_tool_call_id(tool_data: dict[str, Any], data: dict[str, Any]) -> str:
         or data.get("tool_call_id")
         or ""
     ).strip()
+
+
+def _tool_input_data(
+    tool_data: dict[str, Any],
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    for container in (tool_data, data):
+        for field_name in ("input", "tool_args", "arguments", "args"):
+            value = container.get(field_name)
+            if isinstance(value, dict):
+                return dict(value)
+    return dict(tool_data)
 
 
 def _agent_run_event_ref(event: dict[str, Any]) -> dict[str, Any]:
@@ -3958,14 +3979,16 @@ def _tool_result_output_text(
     tool_data: dict[str, Any],
     data: dict[str, Any],
 ) -> str:
-    output = tool_data.get("output")
-    if isinstance(output, str):
-        return output
-    if output is not None:
-        try:
-            return json.dumps(output, ensure_ascii=False)
-        except TypeError:
-            return str(output)
+    for container in (tool_data, data):
+        for field_name in ("output", "tool_result", "result", "content"):
+            output = container.get(field_name)
+            if isinstance(output, str):
+                return output
+            if output is not None:
+                try:
+                    return json.dumps(output, ensure_ascii=False)
+                except TypeError:
+                    return str(output)
     return str(data.get("text") or "")
 
 
@@ -4374,8 +4397,13 @@ def _tool_result_source_path(
     tool_data: dict[str, Any],
     input_data: dict[str, Any],
 ) -> str:
-    input_payload = input_data.get("input") if isinstance(input_data.get("input"), dict) else {}
-    for container in (tool_data, input_data, input_payload):
+    nested_payloads: list[dict[str, Any]] = []
+    for source in (tool_data, input_data):
+        for field_name in ("input", "tool_args", "arguments", "args"):
+            value = source.get(field_name)
+            if isinstance(value, dict):
+                nested_payloads.append(value)
+    for container in (tool_data, input_data, *nested_payloads):
         for field_name in ("source_path", "path", "file", "file_path", "relative_path"):
             value = str(container.get(field_name) or "").strip()
             if value:

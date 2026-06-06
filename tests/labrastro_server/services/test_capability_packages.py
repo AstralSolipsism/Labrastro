@@ -66,6 +66,16 @@ def _wait_for(predicate, *, timeout_sec: float = 3.0):
     raise AssertionError("timed out waiting for condition")
 
 
+def _append_raw_agent_run_event(
+    control: AgentRunControlPlane,
+    task_id: str,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    with control._lock:  # type: ignore[attr-defined]
+        control._append_event_locked(task_id, event_type, payload)  # type: ignore[attr-defined]
+
+
 def _review_draft(*, command: str = "gh") -> dict[str, object]:
     return {
         "id": "review",
@@ -3072,6 +3082,94 @@ def test_ingest_status_builds_skill_content_from_agent_run_read_file_event() -> 
     assert skill["source_document_id"] == document["source_document_id"]
     assert skill["config"]["source_document_id"] == document["source_document_id"]
     assert status["validation"]["ok"] is True
+
+
+def test_ingest_status_builds_source_inventory_from_session_tool_call_events() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+    result = service.start({"repoUrl": "https://github.com/greensock/gsap-skills"})
+    source_path = "skills/gsap-core/SKILL.md"
+    skill_content = (
+        "---\n"
+        "name: gsap-core\n"
+        "description: Use GSAP core animation APIs.\n"
+        "---\n\n"
+        "Use GSAP core animation APIs with source-backed guidance.\n"
+    )
+    _append_raw_agent_run_event(
+        control,
+        result.agent_run.id,
+        "tool_call_start",
+        {
+            "tool_name": "read_file",
+            "tool_call_id": "read-gsap-core",
+            "tool_args": {"file_path": source_path},
+        },
+    )
+    _append_raw_agent_run_event(
+        control,
+        result.agent_run.id,
+        "tool_call_end",
+        {
+            "tool_name": "read_file",
+            "tool_call_id": "read-gsap-core",
+            "tool_result": skill_content,
+        },
+    )
+    patches: list[tuple[str, object]] = [
+        ("id", "gsap-skills"),
+        ("name", "GSAP Skills"),
+        (
+            "description",
+            "Installable GSAP animation guidance from repository Skill files.",
+        ),
+        (
+            "source_inventory",
+            {"skill_files": [{"source_path": source_path}], "docs": [], "files": []},
+        ),
+        (
+            "contributions.skills",
+            [
+                {
+                    "id": "skill:gsap-core",
+                    "kind": "skill",
+                    "name": "gsap-core",
+                    "display_name": "GSAP core",
+                    "summary": "Use GSAP core animation APIs.",
+                    "source_path": source_path,
+                }
+            ],
+        ),
+        ("install_plan", []),
+        ("usage", []),
+        (
+            "evidence",
+            [{"title": "GSAP core", "excerpt": "Use GSAP core animation APIs."}],
+        ),
+        ("risk_level", "low"),
+    ]
+    control.complete_agent_run(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output=_capability_patch_stream(patches, source_path=source_path),
+        ),
+    )
+
+    status = service.status(result.agent_run.id)
+
+    assert status["failure"] is None
+    assert status["validation"]["ok"] is True
+    skill = status["draft"]["contributions"]["skills"][0]
+    assert skill["skill_content"] == skill_content.strip()
+    inventory = status["source_bundle"]["source_inventory"]
+    assert {item["source_path"] for item in inventory["documents"]} == {source_path}
+    assert {item["path"] for item in inventory["skill_files"]} == {source_path}
+    assert {item["event_type"] for item in inventory["tool_calls"]} == {
+        "tool_use",
+        "tool_result",
+    }
 
 
 def test_ingest_status_prefers_full_read_after_paged_read_file_same_source_path() -> None:
