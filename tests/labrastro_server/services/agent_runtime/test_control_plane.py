@@ -38,6 +38,7 @@ from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorRunRequest,
     ExecutorRunResult,
 )
+from labrastro_server.services.agent_runtime.postgres_store import PostgresAgentRunStore
 from labrastro_server.services.agent_runtime.runtime_store import (
     runtime_slot_key_for_agent_run,
 )
@@ -772,6 +773,74 @@ def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
 
     detail = control.load_agent_run_detail(task.id, event_limit=2)
     assert [event["seq"] for event in detail["events"]] == [5, 6]
+
+
+def test_list_agent_runs_returns_newest_first_like_postgres_store() -> None:
+    control = AgentRunControlPlane()
+    control.submit_agent_run(
+        AgentRunRequest(issue_id="issue-order", agent_id="coder", prompt="old"),
+        task_id="task-old",
+    )
+    control.submit_agent_run(
+        AgentRunRequest(issue_id="issue-order", agent_id="coder", prompt="new"),
+        task_id="task-new",
+    )
+
+    assert [item["id"] for item in control.list_agent_runs()] == ["task-new", "task-old"]
+    assert [item["id"] for item in control.list_agent_runs(limit=1)] == ["task-new"]
+
+
+def test_postgres_artifact_query_orders_by_insert_sequence() -> None:
+    captured_sql: list[str] = []
+
+    class _Rows:
+        def mappings(self):
+            return []
+
+    class _Conn:
+        def execute(self, statement, params):
+            del params
+            captured_sql.append(str(statement))
+            return _Rows()
+
+    class _Begin:
+        def __enter__(self):
+            return _Conn()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Engine:
+        def begin(self):
+            return _Begin()
+
+    store = PostgresAgentRunStore.__new__(PostgresAgentRunStore)
+    store.engine = _Engine()
+
+    assert store.list_artifacts("task-order") == []
+    assert "ORDER BY artifact_seq ASC" in captured_sql[0]
+    assert "id ASC" not in captured_sql[0]
+
+
+def test_artifact_sequence_migration_backfills_in_stable_historical_order() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    migration_path = (
+        repo_root
+        / "labrastro_server"
+        / "infrastructure"
+        / "persistence"
+        / "migrations"
+        / "versions"
+        / "0013_agent_run_artifact_sequence.py"
+    )
+
+    sql = " ".join(migration_path.read_text(encoding="utf-8").split()).lower()
+
+    assert "row_number() over (order by created_at asc, id asc)" in sql
+    assert "where artifact.artifact_seq is null" in sql
+    assert "max(artifact_seq)" in sql
+    assert "setval(" in sql
+    assert "set artifact_seq = nextval" not in sql
 
 
 def test_failed_agent_run_exposes_terminal_reason_when_output_is_empty() -> None:

@@ -175,6 +175,41 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     assert len(detail["events"]) == 1
 
 
+def test_postgres_runtime_store_preserves_artifact_append_order_from_completion_transaction() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            issue_id="pg-artifact-order",
+            agent_id="pg-agent",
+            prompt="postgres artifact order",
+        )
+    )
+
+    control.complete_agent_run(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        artifacts=[
+            {
+                "artifact_id": "artifact-z",
+                "type": "log",
+                "status": "generated",
+                "content": "first",
+            },
+            {
+                "artifact_id": "artifact-a",
+                "type": "log",
+                "status": "generated",
+                "content": "second",
+            },
+        ],
+    )
+
+    assert [item["id"] for item in control.artifacts_to_dict(task.id)] == [
+        "artifact-z",
+        "artifact-a",
+    ]
+
+
 def test_postgres_runtime_store_host_restart_fails_running_task() -> None:
     control = _control()
     task = control.submit_agent_run(

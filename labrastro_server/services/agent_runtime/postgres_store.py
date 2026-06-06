@@ -1291,7 +1291,13 @@ class PostgresAgentRunStore:
     def list_artifacts(self, task_id: str) -> list[TaskArtifact]:
         with self.engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT * FROM labrastro_agent_run_artifacts WHERE task_id=:task_id"),
+                text(
+                    """
+                    SELECT * FROM labrastro_agent_run_artifacts
+                    WHERE task_id=:task_id
+                    ORDER BY artifact_seq ASC
+                    """
+                ),
                 {"task_id": task_id},
             ).mappings()
             return [self._artifact_from_row(row) for row in rows]

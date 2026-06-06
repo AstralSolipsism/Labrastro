@@ -1890,7 +1890,7 @@ class AgentRunControlPlane:
                 tasks = [task for task in tasks if task.get("agent_id") == agent_id]
             if issue_id:
                 tasks = [task for task in tasks if task.get("issue_id") == issue_id]
-            return tasks[-max(1, int(limit or 50)) :]
+            return list(reversed(tasks))[: max(1, int(limit or 50))]
 
     def load_agent_run_detail(
         self,
