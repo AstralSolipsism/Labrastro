@@ -245,8 +245,7 @@ class CLIRenderer:
         )
         if not result:
             return
-        # Special rendering for edit_file with diff
-        if name == "edit_file" and "---" in result:
+        if name == "apply_patch" and "---" in result:
             self._render_diff(result)
         else:
             display = self._compact_tool_output(name, result)

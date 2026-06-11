@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 
@@ -140,7 +140,7 @@ def test_postgres_session_store_trace_events_reduce_to_record_document() -> None
             session_id,
             "tool_call_end",
             {
-                "tool_name": "write_file",
+                "tool_name": "apply_patch",
                 "tool_call_id": "tool-1",
                 "tool_result": "x" * 512,
             },

@@ -41,6 +41,7 @@ from reuleauxcoder.app.runtime.agent_runtime import (
     get_interactive_run_limiter,
 )
 from reuleauxcoder.domain.approval import ApprovalRequest
+from reuleauxcoder.domain.files import LocalWorkspaceMutationBackend
 from reuleauxcoder.domain.hooks.types import (
     AfterToolExecuteContext,
     BeforeToolExecuteContext,
@@ -86,12 +87,26 @@ class _LifecycleOutputRecord:
     handler_type: str
 
 
+def _meta_has_approval_denied(meta: dict | None) -> bool:
+    diagnostics = (meta or {}).get("tool_diagnostics")
+    if not isinstance(diagnostics, list):
+        return False
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        if str(diagnostic.get("kind") or "") == ToolFailureKind.APPROVAL_DENIED.value:
+            return True
+    return False
+
+
 class ToolExecutor:
     """Handles tool execution for the agent."""
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
         self._budget_lock = self._runtime_budget_lock()
+        self._file_change_started_item_ids: set[str] = set()
+        self._file_change_changes_by_item_id: dict[str, list[dict]] = {}
 
     def _runtime_budget_lock(self) -> threading.Lock:
         lock = getattr(self.agent, "runtime_budget_lock", None)
@@ -172,6 +187,7 @@ class ToolExecutor:
         index: int | None = None,
         meta: dict | None = None,
     ) -> None:
+        self._emit_apply_patch_file_change_completed(tc, result, index=index, meta=meta)
         self.agent._emit_event(
             AgentEvent.tool_call_end(
                 tc.name,
@@ -190,6 +206,7 @@ class ToolExecutor:
         tool: object | None = None,
         index: int | None = None,
     ) -> None:
+        self._emit_apply_patch_file_change_started(tc, index=index)
         self.agent._emit_event(
             AgentEvent.tool_call_start(
                 tc.name,
@@ -199,6 +216,126 @@ class ToolExecutor:
                 index=index,
             )
         )
+
+    @staticmethod
+    def _file_change_item_id(tc: "ToolCall", index: int | None = None) -> str:
+        stable = tc.id or (f"index-{index}" if index is not None else "pending")
+        return f"file-change:{stable}"
+
+    def _emit_apply_patch_file_change_started(
+        self,
+        tc: "ToolCall",
+        *,
+        index: int | None = None,
+    ) -> str | None:
+        if tc.name != "apply_patch":
+            return None
+        item_id = self._file_change_item_id(tc, index)
+        if item_id in self._file_change_started_item_ids:
+            return item_id
+        changes = self._preview_apply_patch_changes(tc)
+        self._file_change_started_item_ids.add(item_id)
+        self._file_change_changes_by_item_id[item_id] = changes
+        self.agent._emit_event(
+            AgentEvent.file_change_started(
+                item_id=item_id,
+                tool_call_id=tc.id,
+                changes=changes,
+            )
+        )
+        return item_id
+
+    def _emit_apply_patch_file_change_completed(
+        self,
+        tc: "ToolCall",
+        result: str,
+        *,
+        index: int | None = None,
+        meta: dict | None = None,
+    ) -> None:
+        if tc.name != "apply_patch":
+            return
+        item_id = self._emit_apply_patch_file_change_started(tc, index=index)
+        if item_id is None:
+            return
+        failure_kind = str((meta or {}).get("failure_kind") or "")
+        text_result = str(result or "")
+        if failure_kind == ToolFailureKind.APPROVAL_DENIED.value or _meta_has_approval_denied(meta):
+            status = "declined"
+        elif text_result.startswith("Error"):
+            status = "failed"
+        else:
+            status = "completed"
+        self.agent._emit_event(
+            AgentEvent.file_change_completed(
+                item_id=item_id,
+                tool_call_id=tc.id,
+                changes=self._file_change_changes_by_item_id.get(item_id, []),
+                status=status,
+                error=text_result if status in {"failed", "declined"} else None,
+            )
+        )
+
+    def _emit_apply_patch_approval_requested(
+        self,
+        tc: "ToolCall",
+        *,
+        reason: str | None,
+        index: int | None = None,
+    ) -> str | None:
+        item_id = self._emit_apply_patch_file_change_started(tc, index=index)
+        if item_id is None:
+            return None
+        approval_id = f"approval:{tc.id or item_id}"
+        self.agent._emit_event(
+            AgentEvent.file_change_approval_requested(
+                item_id=item_id,
+                approval_id=approval_id,
+                tool_call_id=tc.id,
+                reason=reason or "",
+            )
+        )
+        return approval_id
+
+    def _emit_apply_patch_approval_resolved(
+        self,
+        tc: "ToolCall",
+        *,
+        approval_id: str | None,
+        decision: str,
+        reason: str | None,
+        index: int | None = None,
+    ) -> None:
+        item_id = self._emit_apply_patch_file_change_started(tc, index=index)
+        if item_id is None:
+            return
+        self.agent._emit_event(
+            AgentEvent.file_change_approval_resolved(
+                item_id=item_id,
+                approval_id=approval_id or f"approval:{tc.id or item_id}",
+                decision=decision,
+                tool_call_id=tc.id,
+                reason=reason or "",
+            )
+        )
+
+    def _preview_apply_patch_changes(self, tc: "ToolCall") -> list[dict]:
+        patch = tc.arguments.get("patch") if isinstance(tc.arguments, dict) else None
+        if not isinstance(patch, str) or not patch.strip():
+            return []
+        mutation_backend = getattr(self.agent, "workspace_mutation_backend", None)
+        preview_text_patch = getattr(mutation_backend, "preview_text_patch", None)
+        if callable(preview_text_patch):
+            result = preview_text_patch(patch)
+        else:
+            workspace_root = (
+                runtime_workspace_root(self.agent)
+                or runtime_working_directory(self.agent)
+            )
+            result = LocalWorkspaceMutationBackend(workspace_root).preview_text_patch(patch)
+        if result.changes:
+            return [change.to_dict() for change in result.changes]
+        return []
 
     @staticmethod
     def _sync_tool_call(target: "ToolCall", source: "ToolCall") -> "ToolCall":
@@ -418,6 +555,17 @@ class ToolExecutor:
                 decision.reason
                 or f"Tool '{tc.name}' requires approval, but no approval provider is configured"
             )
+            self._emit_apply_patch_approval_resolved(
+                tc,
+                approval_id=self._emit_apply_patch_approval_requested(
+                    tc,
+                    reason=decision.reason,
+                    index=index,
+                ),
+                decision="deny_once",
+                reason=message,
+                index=index,
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.APPROVAL,
                 kind=ToolDiagnosticKind.APPROVAL_DENIED,
@@ -437,6 +585,11 @@ class ToolExecutor:
             return message
         try:
             approval_tool_args, approval_intent = self._approval_payload_args(tc.arguments)
+            file_change_approval_id = self._emit_apply_patch_approval_requested(
+                tc,
+                reason=decision.reason,
+                index=index,
+            )
             decision_result = provider.request_approval(
                 ApprovalRequest(
                     tool_name=tc.name,
@@ -454,6 +607,13 @@ class ToolExecutor:
             )
         except (KeyboardInterrupt, EOFError):
             message = f"Tool '{tc.name}' approval interrupted by user"
+            self._emit_apply_patch_approval_resolved(
+                tc,
+                approval_id=locals().get("file_change_approval_id"),
+                decision="deny_once",
+                reason=message,
+                index=index,
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.APPROVAL,
                 kind=ToolDiagnosticKind.APPROVAL_DENIED,
@@ -471,6 +631,13 @@ class ToolExecutor:
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
+        self._emit_apply_patch_approval_resolved(
+            tc,
+            approval_id=file_change_approval_id,
+            decision=decision_result.mode,
+            reason=decision_result.reason,
+            index=index,
+        )
         if decision_result.approved:
             return None
         message = decision_result.reason or f"Tool '{tc.name}' denied by approval provider"
@@ -550,6 +717,17 @@ class ToolExecutor:
                 tool_name=tc.name,
                 tool_call_id=tc.id,
             )
+            self._emit_apply_patch_approval_resolved(
+                tc,
+                approval_id=self._emit_apply_patch_approval_requested(
+                    tc,
+                    reason=message,
+                    index=index,
+                ),
+                decision="deny_once",
+                reason=diagnostic.message,
+                index=index,
+            )
             self._record_lifecycle_diagnostics([diagnostic], validation_context)
             self._emit_tool_end(
                 tc,
@@ -562,6 +740,11 @@ class ToolExecutor:
 
         try:
             approval_tool_args, approval_intent = self._approval_payload_args(tc.arguments)
+            file_change_approval_id = self._emit_apply_patch_approval_requested(
+                tc,
+                reason=message,
+                index=index,
+            )
             decision_result = request_approval(
                 ApprovalRequest(
                     tool_name=tc.name,
@@ -578,6 +761,13 @@ class ToolExecutor:
             )
         except (KeyboardInterrupt, EOFError):
             message = f"Tool '{tc.name}' lifecycle approval interrupted by user"
+            self._emit_apply_patch_approval_resolved(
+                tc,
+                approval_id=locals().get("file_change_approval_id"),
+                decision="deny_once",
+                reason=message,
+                index=index,
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.APPROVAL,
                 kind=ToolDiagnosticKind.APPROVAL_DENIED,
@@ -595,6 +785,13 @@ class ToolExecutor:
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
             )
             return message
+        self._emit_apply_patch_approval_resolved(
+            tc,
+            approval_id=file_change_approval_id,
+            decision=decision_result.mode,
+            reason=decision_result.reason,
+            index=index,
+        )
 
         if decision_result.approved:
             return None

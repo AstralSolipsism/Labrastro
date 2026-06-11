@@ -471,6 +471,16 @@ class AgentEventBridge:
             AgentEventType.TOOL_CALL_START,
             AgentEventType.TOOL_CALL_END,
             AgentEventType.DELEGATED_RUN_COMPLETED,
+            AgentEventType.FILE_CHANGE_STARTED,
+            AgentEventType.FILE_CHANGE_PATCH_UPDATED,
+            AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED,
+            AgentEventType.FILE_CHANGE_APPROVAL_RESOLVED,
+            AgentEventType.FILE_CHANGE_COMPLETED,
+            AgentEventType.DOCUMENT_DRAFT_STARTED,
+            AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED,
+            AgentEventType.DOCUMENT_DRAFT_COMMITTED,
+            AgentEventType.DOCUMENT_DRAFT_FAILED,
+            AgentEventType.DOCUMENT_DRAFT_CANCELLED,
         ):
             level = UIEventLevel.DEBUG
 

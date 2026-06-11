@@ -32,13 +32,13 @@ def make_cli_handler(ui_interactor: UIInteractor) -> ApprovalHandler:
         sections: list[dict] = []
         diff_text = build_preview_diff(req)
         if diff_text is not None:
-            title = (
-                "Proposed file diff"
-                if req.tool_name == "write_file"
-                else "Proposed edit diff"
-            )
             sections.append(
-                {"id": "diff", "title": title, "kind": "diff", "content": diff_text}
+                {
+                    "id": "diff",
+                    "title": "Proposed patch diff",
+                    "kind": "diff",
+                    "content": diff_text,
+                }
             )
         elif req.tool_args:
             sections.append(

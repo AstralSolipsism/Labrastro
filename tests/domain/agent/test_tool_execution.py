@@ -1,4 +1,4 @@
-"""Tests for ToolExecutor, including CWD sync behaviour."""
+﻿"""Tests for ToolExecutor, including CWD sync behaviour."""
 
 import time
 import threading
@@ -28,9 +28,8 @@ from reuleauxcoder.domain.hooks.types import (
 )
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
-from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
+from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
-from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
 
 
 class _ShellToolStub:
@@ -298,11 +297,11 @@ def test_tool_executor_binds_mcp_lifecycle_context_before_tool_side_effect() -> 
 
 def test_after_tool_legacy_context_includes_runtime_boundaries() -> None:
     tool = SimpleNamespace(
-        name="write_file",
+        name="apply_patch",
         tool_source="builtin",
-        execute=lambda **kwargs: "Wrote main.py",
+        execute=lambda **kwargs: "Applied patch",
         preflight_validate=lambda **kwargs: None,
-        schema=lambda: {"type": "function", "function": {"name": "write_file"}},
+        schema=lambda: {"type": "function", "function": {"name": "apply_patch"}},
     )
     captured: list[dict] = []
     agent = _AgentStub(tool)
@@ -315,8 +314,8 @@ def test_after_tool_legacy_context_includes_runtime_boundaries() -> None:
 
     tc = ToolCall(
         id="call_write",
-        name="write_file",
-        arguments={"file_path": "main.py", "content": "x"},
+        name="apply_patch",
+        arguments={"patch": "*** Begin Patch\n*** End Patch"},
     )
     executor.execute(tc)
 
@@ -416,15 +415,14 @@ def test_shell_tool_initializes_cwd_from_runtime_workspace_root() -> None:
     assert getattr(agent, "runtime_working_directory", None) == "/tmp/workspace-root"
 
 
-def test_write_file_missing_required_arguments_returns_tool_error() -> None:
-    agent = _AgentStub(WriteFileTool())
+def test_apply_patch_missing_required_arguments_returns_tool_error() -> None:
+    agent = _AgentStub(ApplyPatchTool())
     executor = ToolExecutor(agent)
 
-    result = executor.execute(ToolCall(id="call_4", name="write_file", arguments={}))
+    result = executor.execute(ToolCall(id="call_4", name="apply_patch", arguments={}))
 
-    assert result.startswith("Error: bad arguments for write_file: invalid arguments")
-    assert "$.file_path: expected string, got missing" in result
-    assert "$.content: expected string, got missing" in result
+    assert result.startswith("Error: bad arguments for apply_patch: invalid arguments")
+    assert "$.patch: expected string, got missing" in result
 
 
 def test_tool_executor_enforces_runtime_max_tool_calls_budget() -> None:
@@ -760,22 +758,20 @@ def test_tool_executor_blocks_side_effects_after_token_budget() -> None:
     assert tool.calls == 0
 
 
-def test_edit_file_missing_required_arguments_does_not_raise_from_preflight() -> None:
-    agent = _AgentStub(EditFileTool())
+def test_apply_patch_missing_required_arguments_does_not_raise_from_preflight() -> None:
+    agent = _AgentStub(ApplyPatchTool())
     executor = ToolExecutor(agent)
 
-    result = executor.execute(ToolCall(id="call_5", name="edit_file", arguments={}))
+    result = executor.execute(ToolCall(id="call_5", name="apply_patch", arguments={}))
 
-    assert result.startswith("Error: bad arguments for edit_file: invalid arguments")
-    assert "$.file_path: expected string, got missing" in result
-    assert "$.old_string: expected string, got missing" in result
-    assert "$.new_string: expected string, got missing" in result
+    assert result.startswith("Error: bad arguments for apply_patch: invalid arguments")
+    assert "$.patch: expected string, got missing" in result
 
 
 def test_provider_argument_error_returns_tool_error_before_execution() -> None:
     tool = SimpleNamespace(
-        name="write_file",
-        parameters={"type": "object", "required": ["file_path", "content"]},
+        name="apply_patch",
+        parameters={"type": "object", "required": ["patch"]},
         execute=lambda **kwargs: "should not execute",
         preflight_validate=lambda **kwargs: None,
     )
@@ -785,13 +781,13 @@ def test_provider_argument_error_returns_tool_error_before_execution() -> None:
     result = executor.execute(
         ToolCall(
             id="call_6",
-            name="write_file",
+            name="apply_patch",
             arguments={},
             argument_error="missing tool arguments",
         )
     )
 
-    assert result == "Error: bad arguments for write_file: missing tool arguments"
+    assert result == "Error: bad arguments for apply_patch: missing tool arguments"
 
 
 def test_tool_executor_repairs_deepseek_bare_string_array_before_execution(tmp_path, monkeypatch) -> None:
@@ -885,7 +881,7 @@ def test_tool_executor_keeps_unrepairable_placeholder_as_tool_error(tmp_path, mo
 
 def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
     tool = SimpleNamespace(
-        name="write_file",
+        name="apply_patch",
         parameters={"type": "object", "properties": {}},
         execute=lambda **kwargs: "should not execute",
         preflight_validate=lambda **kwargs: None,
@@ -895,25 +891,25 @@ def test_tool_executor_blocks_tools_outside_effective_capabilities() -> None:
         action=PermissionAction.DENY,
         authorized=False,
         reason=(
-            "builtin_tool 'write_file' is not authorized by this Agent's "
+            "builtin_tool 'apply_patch' is not authorized by this Agent's "
             "effective_capabilities"
         ),
     )
     executor = ToolExecutor(agent)
 
     result = executor.execute(
-        ToolCall(id="call_blocked", name="write_file", arguments={})
+        ToolCall(id="call_blocked", name="apply_patch", arguments={})
     )
 
     assert result == (
-        "Error: tool 'write_file' denied by permission gateway: builtin_tool "
-        "'write_file' is not authorized by this Agent's effective_capabilities"
+        "Error: tool 'apply_patch' denied by permission gateway: builtin_tool "
+        "'apply_patch' is not authorized by this Agent's effective_capabilities"
     )
 
 
 def test_tool_executor_permission_denied_lifecycle_feedback_enters_user_error() -> None:
     tool = SimpleNamespace(
-        name="write_file",
+        name="apply_patch",
         parameters={"type": "object", "properties": {}},
         execute=lambda **kwargs: "should not execute",
         preflight_validate=lambda **kwargs: None,
@@ -931,13 +927,13 @@ def test_tool_executor_permission_denied_lifecycle_feedback_enters_user_error() 
             return PermissionDecision(
                 action=PermissionAction.DENY,
                 authorized=False,
-                reason="write_file denied by policy",
+                reason="apply_patch denied by policy",
                 policy_matched="effective_capabilities",
                 audit={
                     "permission_denied_lifecycle": [
                         {
                             "hook_id": "hook:permission-denied-feedback",
-                            "user_message": "Use read_file or ask for write_file capability.",
+                            "user_message": "Use read_file or ask for apply_patch capability.",
                             "diagnostics": [
                                 {"code": "recoverable_permission_denied"}
                             ],
@@ -949,13 +945,13 @@ def test_tool_executor_permission_denied_lifecycle_feedback_enters_user_error() 
     agent = RecordingAgent()
 
     result = ToolExecutor(agent).execute(
-        ToolCall(id="call_blocked", name="write_file", arguments={})
+        ToolCall(id="call_blocked", name="apply_patch", arguments={})
     )
 
     assert result == (
-        "Error: tool 'write_file' denied by permission gateway: "
-        "write_file denied by policy\n"
-        "Permission feedback: Use read_file or ask for write_file capability."
+        "Error: tool 'apply_patch' denied by permission gateway: "
+        "apply_patch denied by policy\n"
+        "Permission feedback: Use read_file or ask for apply_patch capability."
     )
     tool_events = [
         event
@@ -971,7 +967,7 @@ def test_tool_executor_permission_denied_lifecycle_feedback_enters_user_error() 
 
 def test_tool_executor_permission_deny_emits_end_only_with_index_and_diagnostics() -> None:
     tool = SimpleNamespace(
-        name="write_file",
+        name="apply_patch",
         parameters={"type": "object", "properties": {}},
         execute=lambda **kwargs: "should not execute",
         preflight_validate=lambda **kwargs: None,
@@ -989,20 +985,20 @@ def test_tool_executor_permission_deny_emits_end_only_with_index_and_diagnostics
             return PermissionDecision(
                 action=PermissionAction.DENY,
                 authorized=False,
-                reason="write_file denied by policy",
+                reason="apply_patch denied by policy",
                 policy_matched="effective_capabilities",
             )
 
     agent = RecordingAgent()
 
     result = ToolExecutor(agent).execute(
-        ToolCall(id="call_blocked", name="write_file", arguments={}),
+        ToolCall(id="call_blocked", name="apply_patch", arguments={}),
         index=2,
     )
 
     assert result == (
-        "Error: tool 'write_file' denied by permission gateway: "
-        "write_file denied by policy"
+        "Error: tool 'apply_patch' denied by permission gateway: "
+        "apply_patch denied by policy"
     )
     tool_events = [
         event
@@ -1070,7 +1066,7 @@ def test_tool_executor_preflight_failure_emits_end_only_with_index_and_diagnosti
 
 def test_tool_executor_approval_deny_emits_end_only_with_index_and_failure_meta() -> None:
     class CaptureTool:
-        name = "write_file"
+        name = "apply_patch"
         description = "Write a file"
         parameters = {"type": "object", "properties": {}}
         tool_source = "builtin"
@@ -1103,13 +1099,13 @@ def test_tool_executor_approval_deny_emits_end_only_with_index_and_failure_meta(
             return PermissionDecision(
                 action=PermissionAction.REQUIRE_APPROVAL,
                 authorized=True,
-                reason="write_file requires approval",
+                reason="apply_patch requires approval",
             )
 
     agent = RecordingAgent()
 
     result = ToolExecutor(agent).execute(
-        ToolCall(id="call_approval", name="write_file", arguments={}),
+        ToolCall(id="call_approval", name="apply_patch", arguments={}),
         index=4,
     )
 
@@ -1161,7 +1157,7 @@ def test_tool_executor_applies_pre_tool_lifecycle_update_then_reevaluates_permis
             updated_input = dict(context.payload)
             updated_input["tool_call"] = {
                 "id": "call-transformed",
-                "name": "write_file",
+                "name": "apply_patch",
                 "arguments": {},
             }
             return [
@@ -1176,7 +1172,7 @@ def test_tool_executor_applies_pre_tool_lifecycle_update_then_reevaluates_permis
             super().__init__(CaptureTool("read_file"))
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             self.permission_tool_call_ids: list[str] = []
             self.lifecycle_dispatcher = LifecycleDispatcher()
@@ -1186,11 +1182,11 @@ def test_tool_executor_applies_pre_tool_lifecycle_update_then_reevaluates_permis
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
             self.permission_tool_call_ids.append(getattr(tool_call, "id", ""))
-            if getattr(tool, "name", "") == "write_file":
+            if getattr(tool, "name", "") == "apply_patch":
                 return PermissionDecision(
                     action=PermissionAction.DENY,
                     authorized=False,
-                    reason="write_file denied after lifecycle update",
+                    reason="apply_patch denied after lifecycle update",
                 )
             return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
 
@@ -1201,8 +1197,8 @@ def test_tool_executor_applies_pre_tool_lifecycle_update_then_reevaluates_permis
     )
 
     assert result == (
-        "Error: tool 'write_file' denied by permission gateway: "
-        "write_file denied after lifecycle update"
+        "Error: tool 'apply_patch' denied by permission gateway: "
+        "apply_patch denied after lifecycle update"
     )
     assert agent.lifecycle_dispatcher.contexts[0].event_name == "PreToolUse"
     assert (
@@ -1267,9 +1263,9 @@ def test_tool_executor_does_not_apply_permission_before_pre_tool_lifecycle_updat
 
     class LifecycleAgent(_AgentStub):
         def __init__(self) -> None:
-            super().__init__(CaptureTool("write_file"))
+            super().__init__(CaptureTool("apply_patch"))
             self._tools = {
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
                 "read_file": CaptureTool("read_file"),
             }
             self.permission_checks = []
@@ -1281,23 +1277,23 @@ def test_tool_executor_does_not_apply_permission_before_pre_tool_lifecycle_updat
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
             tool_name = getattr(tool, "name", "")
             self.permission_checks.append(tool_name)
-            if tool_name == "write_file":
+            if tool_name == "apply_patch":
                 return PermissionDecision(
                     action=PermissionAction.DENY,
                     authorized=False,
-                    reason="write_file denied before lifecycle update",
+                    reason="apply_patch denied before lifecycle update",
                 )
             return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
 
     agent = LifecycleAgent()
 
     result = ToolExecutor(agent).execute(
-        ToolCall(id="call-original", name="write_file", arguments={})
+        ToolCall(id="call-original", name="apply_patch", arguments={})
     )
 
     assert result == "executed:read_file"
     assert agent.permission_checks == ["read_file"]
-    assert agent._tools["write_file"].executed is False
+    assert agent._tools["apply_patch"].executed is False
     assert agent._tools["read_file"].executed is True
 
 
@@ -1847,9 +1843,9 @@ def test_tool_executor_pre_tool_lifecycle_update_is_visible_to_next_matching_hoo
 
     class LifecycleAgent(_AgentStub):
         def __init__(self) -> None:
-            super().__init__(CaptureTool("write_file"))
+            super().__init__(CaptureTool("apply_patch"))
             self._tools = {
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
                 "read_file": CaptureTool("read_file"),
             }
             self.lifecycle_dispatcher = LifecycleHookDispatcher(
@@ -1868,12 +1864,12 @@ def test_tool_executor_pre_tool_lifecycle_update_is_visible_to_next_matching_hoo
     agent = LifecycleAgent()
 
     result = ToolExecutor(agent).execute(
-        ToolCall(id="call-original", name="write_file", arguments={})
+        ToolCall(id="call-original", name="apply_patch", arguments={})
     )
 
     assert result == "executed:read_file"
     assert seen_tool_names == [["read_file"]]
-    assert agent._tools["write_file"].executed is False
+    assert agent._tools["apply_patch"].executed is False
     assert agent._tools["read_file"].executed is True
 
 
@@ -1911,7 +1907,7 @@ def test_tool_executor_emits_canonical_start_after_pre_tool_lifecycle_update() -
                         updated_input={
                             "tool_call": {
                                 "id": "call-transformed",
-                                "name": "write_file",
+                                "name": "apply_patch",
                                 "arguments": {"path": "after.txt"},
                             }
                         }
@@ -1925,7 +1921,7 @@ def test_tool_executor_emits_canonical_start_after_pre_tool_lifecycle_update() -
             self.events = []
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             self.lifecycle_dispatcher = LifecycleDispatcher()
 
@@ -1945,7 +1941,7 @@ def test_tool_executor_emits_canonical_start_after_pre_tool_lifecycle_update() -
         index=7,
     )
 
-    assert result == "executed:write_file"
+    assert result == "executed:apply_patch"
     tool_events = [
         event for event in agent.events
         if event.event_type in {
@@ -1954,12 +1950,12 @@ def test_tool_executor_emits_canonical_start_after_pre_tool_lifecycle_update() -
         }
     ]
     assert [(event.event_type, event.tool_name, event.tool_call_id) for event in tool_events] == [
-        (AgentEventType.TOOL_CALL_START, "write_file", "call-original"),
-        (AgentEventType.TOOL_CALL_END, "write_file", "call-original"),
+        (AgentEventType.TOOL_CALL_START, "apply_patch", "call-original"),
+        (AgentEventType.TOOL_CALL_END, "apply_patch", "call-original"),
     ]
     assert tool_events[0].tool_args == {"path": "after.txt"}
     assert tool_events[0].data["index"] == 7
-    assert agent._tools["write_file"].executed_arguments == {"path": "after.txt"}
+    assert agent._tools["apply_patch"].executed_arguments == {"path": "after.txt"}
 
 
 def test_tool_executor_emits_lifecycle_hook_observation_events() -> None:
@@ -2403,7 +2399,7 @@ def test_tool_executor_post_tool_batch_uses_lifecycle_transformed_tool_calls() -
                                 "updated_input": {
                                     "tool_call": {
                                         "id": "call-read",
-                                        "name": "write_file",
+                                        "name": "apply_patch",
                                         "arguments": {},
                                     }
                                 }
@@ -2420,7 +2416,7 @@ def test_tool_executor_post_tool_batch_uses_lifecycle_transformed_tool_calls() -
             super().__init__(CaptureTool("read_file"))
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
                 "noop": CaptureTool("noop"),
             }
             self.lifecycle_dispatcher = LifecycleDispatcher()
@@ -2437,13 +2433,13 @@ def test_tool_executor_post_tool_batch_uses_lifecycle_transformed_tool_calls() -
         ]
     )
 
-    assert results == ["executed:write_file", "executed:noop"]
+    assert results == ["executed:apply_patch", "executed:noop"]
     assert agent._tools["read_file"].calls == 0
-    assert agent._tools["write_file"].calls == 1
+    assert agent._tools["apply_patch"].calls == 1
     batch_payload = agent.lifecycle_dispatcher.batch_payloads[-1]
-    assert batch_payload["tool_names"] == ["write_file", "noop"]
+    assert batch_payload["tool_names"] == ["apply_patch", "noop"]
     assert batch_payload["technical"]["tool_calls"] == [
-        {"id": "call-read", "name": "write_file", "arguments": {}},
+        {"id": "call-read", "name": "apply_patch", "arguments": {}},
         {"id": "call-noop", "name": "noop", "arguments": {}},
     ]
 
@@ -2468,7 +2464,7 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
             super().__init__(CaptureTool("read_file"))
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             self.permission_tool_call_ids: list[str] = []
             _install_legacy_before_tool_transform(self, self._transform)
@@ -2477,16 +2473,16 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
             self.permission_tool_call_ids.append(getattr(tool_call, "id", ""))
-            if getattr(tool, "name", "") == "write_file":
+            if getattr(tool, "name", "") == "apply_patch":
                 return PermissionDecision(
                     action=PermissionAction.DENY,
                     authorized=False,
-                    reason="write_file denied after transform",
+                    reason="apply_patch denied after transform",
                 )
             return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
 
@@ -2496,13 +2492,13 @@ def test_tool_executor_reevaluates_permission_after_tool_call_transform() -> Non
 
     assert (
         result
-        == "Error: tool 'write_file' denied by permission gateway: write_file denied after transform"
+        == "Error: tool 'apply_patch' denied by permission gateway: apply_patch denied after transform"
     )
 
 
 def test_tool_executor_pre_tool_allow_cannot_bypass_permission_gateway() -> None:
     class CaptureTool:
-        name = "write_file"
+        name = "apply_patch"
         description = "Write"
         parameters = {}
         tool_source = "builtin"
@@ -2547,18 +2543,18 @@ def test_tool_executor_pre_tool_allow_cannot_bypass_permission_gateway() -> None
             return PermissionDecision(
                 action=PermissionAction.DENY,
                 authorized=False,
-                reason="permission gateway denied write_file",
+                reason="permission gateway denied apply_patch",
             )
 
     agent = DenyingAgent()
 
     result = ToolExecutor(agent).execute(
-        ToolCall(id="call-write", name="write_file", arguments={})
+        ToolCall(id="call-write", name="apply_patch", arguments={})
     )
 
     assert result == (
-        "Error: tool 'write_file' denied by permission gateway: "
-        "permission gateway denied write_file"
+        "Error: tool 'apply_patch' denied by permission gateway: "
+        "permission gateway denied apply_patch"
     )
     assert agent._tool.calls == 0
     assert agent.permission_tool_call_ids == ["call-write"]
@@ -2587,7 +2583,7 @@ def test_legacy_tool_transform_cannot_rewrite_provider_tool_call_id() -> None:
             super().__init__(CaptureTool("read_file"))
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             self.permission_tool_call_ids: list[str] = []
             self.end_tool_call_ids: list[str] = []
@@ -2597,7 +2593,7 @@ def test_legacy_tool_transform_cannot_rewrite_provider_tool_call_id() -> None:
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
@@ -2704,7 +2700,7 @@ def test_tool_executor_requests_approval_after_tool_call_transform() -> None:
             self.approval_provider = ApprovalProvider()
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             _install_legacy_before_tool_transform(self, self._transform)
 
@@ -2712,15 +2708,15 @@ def test_tool_executor_requests_approval_after_tool_call_transform() -> None:
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
-            if getattr(tool, "name", "") == "write_file":
+            if getattr(tool, "name", "") == "apply_patch":
                 return PermissionDecision(
                     action=PermissionAction.REQUIRE_APPROVAL,
                     authorized=True,
-                    reason="write_file requires approval after transform",
+                    reason="apply_patch requires approval after transform",
                 )
             return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
 
@@ -2731,7 +2727,7 @@ def test_tool_executor_requests_approval_after_tool_call_transform() -> None:
 
     assert result == "executed"
     assert len(agent.approval_provider.requests) == 1
-    assert agent.approval_provider.requests[0].tool_name == "write_file"
+    assert agent.approval_provider.requests[0].tool_name == "apply_patch"
 
 
 def test_tool_executor_separates_shell_intent_from_approval_tool_args() -> None:
@@ -2823,7 +2819,7 @@ def test_tool_executor_rejects_shell_without_intent_before_approval() -> None:
 
 def test_tool_executor_requests_approval_for_final_arguments_after_transform() -> None:
     class CaptureTool:
-        name = "write_file"
+        name = "apply_patch"
         description = "Write a file"
         parameters = {}
         tool_source = "builtin"
@@ -2861,14 +2857,14 @@ def test_tool_executor_requests_approval_for_final_arguments_after_transform() -
             return PermissionDecision(
                 action=PermissionAction.REQUIRE_APPROVAL,
                 authorized=True,
-                reason="write_file requires approval",
+                reason="apply_patch requires approval",
             )
 
     agent = TransformingAgent()
     result = ToolExecutor(agent).execute(
         ToolCall(
             id="call-original",
-            name="write_file",
+            name="apply_patch",
             arguments={"file_path": "/tmp/before.txt"},
         )
     )
@@ -2911,7 +2907,7 @@ def test_tool_executor_requests_approval_for_final_tool_after_transform() -> Non
             self.approval_provider = ApprovalProvider()
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             _install_legacy_before_tool_transform(self, self._transform)
 
@@ -2919,7 +2915,7 @@ def test_tool_executor_requests_approval_for_final_tool_after_transform() -> Non
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
@@ -2934,12 +2930,12 @@ def test_tool_executor_requests_approval_for_final_tool_after_transform() -> Non
         ToolCall(id="call-original", name="read_file", arguments={})
     )
 
-    assert result == "executed:write_file"
+    assert result == "executed:apply_patch"
     assert [request.tool_name for request in agent.approval_provider.requests] == [
-        "write_file",
+        "apply_patch",
     ]
     assert agent._tools["read_file"].executed is False
-    assert agent._tools["write_file"].executed is True
+    assert agent._tools["apply_patch"].executed is True
 
 
 def test_tool_executor_blocks_background_approval_after_transform_without_prompting() -> None:
@@ -2969,7 +2965,7 @@ def test_tool_executor_blocks_background_approval_after_transform_without_prompt
             self.approval_provider = ApprovalProvider()
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             _install_legacy_before_tool_transform(self, self._transform)
 
@@ -2977,15 +2973,15 @@ def test_tool_executor_blocks_background_approval_after_transform_without_prompt
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
-            if getattr(tool, "name", "") == "write_file":
+            if getattr(tool, "name", "") == "apply_patch":
                 return PermissionDecision(
                     action=PermissionAction.BLOCKED_REVIEW,
                     authorized=False,
-                    reason="write_file requires background review",
+                    reason="apply_patch requires background review",
                 )
             return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
 
@@ -2995,10 +2991,10 @@ def test_tool_executor_blocks_background_approval_after_transform_without_prompt
     )
 
     assert result == (
-        "Error: tool 'write_file' blocked pending review: "
-        "write_file requires background review"
+        "Error: tool 'apply_patch' blocked pending review: "
+        "apply_patch requires background review"
     )
-    assert agent._tools["write_file"].executed is False
+    assert agent._tools["apply_patch"].executed is False
 
 
 def test_tool_executor_handles_interrupted_approval_after_transform() -> None:
@@ -3028,7 +3024,7 @@ def test_tool_executor_handles_interrupted_approval_after_transform() -> None:
             self.approval_provider = ApprovalProvider()
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             _install_legacy_before_tool_transform(self, self._transform)
 
@@ -3036,15 +3032,15 @@ def test_tool_executor_handles_interrupted_approval_after_transform() -> None:
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
-            if getattr(tool, "name", "") == "write_file":
+            if getattr(tool, "name", "") == "apply_patch":
                 return PermissionDecision(
                     action=PermissionAction.REQUIRE_APPROVAL,
                     authorized=True,
-                    reason="write_file requires approval after transform",
+                    reason="apply_patch requires approval after transform",
                 )
             return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
 
@@ -3053,8 +3049,8 @@ def test_tool_executor_handles_interrupted_approval_after_transform() -> None:
         ToolCall(id="call-original", name="read_file", arguments={})
     )
 
-    assert result == "Tool 'write_file' approval interrupted by user"
-    assert agent._tools["write_file"].executed is False
+    assert result == "Tool 'apply_patch' approval interrupted by user"
+    assert agent._tools["apply_patch"].executed is False
 
 
 def test_tool_executor_executes_transformed_tool_when_permission_allows() -> None:
@@ -3079,7 +3075,7 @@ def test_tool_executor_executes_transformed_tool_when_permission_allows() -> Non
             super().__init__(CaptureTool("read_file"))
             self._tools = {
                 "read_file": CaptureTool("read_file"),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             self.permission_checks = []
             _install_legacy_before_tool_transform(self, self._transform)
@@ -3088,7 +3084,7 @@ def test_tool_executor_executes_transformed_tool_when_permission_allows() -> Non
             return self._tools.get(name)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call = ToolCall(id="call-transformed", name="write_file", arguments={})
+            ctx.tool_call = ToolCall(id="call-transformed", name="apply_patch", arguments={})
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
@@ -3100,10 +3096,10 @@ def test_tool_executor_executes_transformed_tool_when_permission_allows() -> Non
         ToolCall(id="call-original", name="read_file", arguments={})
     )
 
-    assert result == "executed:write_file"
-    assert agent.permission_checks == ["write_file"]
+    assert result == "executed:apply_patch"
+    assert agent.permission_checks == ["apply_patch"]
     assert agent._tools["read_file"].executed is False
-    assert agent._tools["write_file"].executed is True
+    assert agent._tools["apply_patch"].executed is True
 
 
 def test_tool_executor_revalidates_lifecycle_updated_tool_arguments_before_execution() -> None:
@@ -3124,10 +3120,9 @@ def test_tool_executor_revalidates_lifecycle_updated_tool_arguments_before_execu
         parameters = {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string"},
-                "content": {"type": "string"},
+                "patch": {"type": "string"},
             },
-            "required": ["file_path", "content"],
+            "required": ["patch"],
         }
         tool_source = "builtin"
 
@@ -3159,8 +3154,8 @@ def test_tool_executor_revalidates_lifecycle_updated_tool_arguments_before_execu
                         updated_input={
                             "tool_call": {
                                 "id": "call-transformed",
-                                "name": "write_file",
-                                "arguments": {"file_path": "/tmp/out.txt"},
+                                "name": "apply_patch",
+                                "arguments": {"path": "/tmp/out.txt"},
                             }
                         }
                     ),
@@ -3172,7 +3167,7 @@ def test_tool_executor_revalidates_lifecycle_updated_tool_arguments_before_execu
             super().__init__(ReadTool())
             self._tools = {
                 "read_file": ReadTool(),
-                "write_file": CaptureTool("write_file"),
+                "apply_patch": CaptureTool("apply_patch"),
             }
             self.lifecycle_dispatcher = LifecycleDispatcher()
 
@@ -3188,19 +3183,19 @@ def test_tool_executor_revalidates_lifecycle_updated_tool_arguments_before_execu
         ToolCall(id="call-original", name="read_file", arguments={})
     )
 
-    assert result.startswith("Error: bad arguments for write_file: invalid arguments")
-    assert "$.content: expected string, got missing" in result
-    assert agent._tools["write_file"].executed is False
+    assert result.startswith("Error: bad arguments for apply_patch: invalid arguments")
+    assert "$.patch: expected string, got missing" in result
+    assert agent._tools["apply_patch"].executed is False
 
 
 def test_tool_executor_reruns_preflight_after_legacy_tool_call_transform() -> None:
-    class WriteTool:
-        name = "write_file"
+    class PatchTool:
+        name = "apply_patch"
         description = "Write a file"
         parameters = {
             "type": "object",
-            "properties": {"file_path": {"type": "string"}},
-            "required": ["file_path"],
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
         }
         tool_source = "builtin"
 
@@ -3212,18 +3207,18 @@ def test_tool_executor_reruns_preflight_after_legacy_tool_call_transform() -> No
             return "should not execute"
 
         def preflight_validate(self, **kwargs) -> str | None:
-            if kwargs.get("file_path") == "/blocked.txt":
-                return "blocked path"
+            if kwargs.get("patch") == "blocked":
+                return "blocked patch"
             return None
 
     class TransformingAgent(_AgentStub):
         def __init__(self) -> None:
-            self.tool = WriteTool()
+            self.tool = PatchTool()
             super().__init__(self.tool)
             _install_legacy_before_tool_transform(self, self._transform)
 
         def _transform(self, _point, ctx):
-            ctx.tool_call.arguments["file_path"] = "/blocked.txt"
+            ctx.tool_call.arguments["patch"] = "blocked"
             return ctx
 
         def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
@@ -3234,10 +3229,10 @@ def test_tool_executor_reruns_preflight_after_legacy_tool_call_transform() -> No
     result = ToolExecutor(agent).execute(
         ToolCall(
             id="call-original",
-            name="write_file",
-            arguments={"file_path": "/allowed.txt"},
+            name="apply_patch",
+            arguments={"patch": "allowed"},
         )
     )
 
-    assert result == "blocked path"
+    assert result == "blocked patch"
     assert agent.tool.executed is False

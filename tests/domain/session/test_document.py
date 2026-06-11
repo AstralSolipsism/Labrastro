@@ -633,6 +633,126 @@ def test_live_session_run_events_reduce_into_canonical_transcript_blocks() -> No
     assert document["stats"]["runStatus"] == "done"
 
 
+def test_file_change_events_reduce_into_single_replayable_part() -> None:
+    document = _session_run_start(None, "修改文件", 1)
+    changes = [
+        {
+            "path": "main.py",
+            "kind": "update",
+            "diff": "--- a/main.py\n+++ b/main.py\n@@\n-old\n+new\n",
+        }
+    ]
+    events = [
+        (
+            "file_change_started",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "changes": [],
+                "status": "in_progress",
+            },
+        ),
+        (
+            "file_change_patch_updated",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "changes": changes,
+                "patch_preview": "*** Begin Patch",
+            },
+        ),
+        (
+            "file_change_approval_requested",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "approval_id": "approval:call-1",
+                "reason": "requires approval",
+            },
+        ),
+        (
+            "file_change_approval_resolved",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "approval_id": "approval:call-1",
+                "decision": "allow_once",
+            },
+        ),
+        (
+            "file_change_completed",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "changes": changes,
+                "status": "completed",
+            },
+        ),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = _session_run_event(document, event_type, payload, index)
+
+    parts = _assistant_parts(document)
+    assert len(parts) == 1
+    part = parts[0]
+    assert part["type"] == "file_change"
+    assert part["itemId"] == "file-change:call-1"
+    assert part["toolCallId"] == "call-1"
+    assert part["status"] == "completed"
+    assert part["path"] == "main.py"
+    assert part["addedLines"] == 1
+    assert part["removedLines"] == 1
+    assert part["approvalId"] == "approval:call-1"
+    assert part["approvalDecision"] == "allow_once"
+    assert part["diff"].endswith("-old\n+new")
+
+
+def test_document_draft_events_reduce_into_single_status_part() -> None:
+    document = _session_run_start(None, "生成文档", 1)
+    events = [
+        (
+            "document_draft_started",
+            {
+                "draft_id": "draft-1",
+                "target_path": "docs/architecture.md",
+                "title": "Architecture",
+                "format": "markdown",
+            },
+        ),
+        (
+            "document_draft_commit_requested",
+            {
+                "draft_id": "draft-1",
+                "target_path": "docs/architecture.md",
+                "item_id": "file-change:draft:draft-1",
+                "approval_id": "approval:draft:draft-1",
+            },
+        ),
+        (
+            "document_draft_committed",
+            {
+                "draft_id": "draft-1",
+                "target_path": "docs/architecture.md",
+                "item_id": "file-change:draft:draft-1",
+            },
+        ),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = _session_run_event(document, event_type, payload, index)
+
+    parts = _assistant_parts(document)
+    assert len(parts) == 1
+    part = parts[0]
+    assert part["type"] == "document_draft"
+    assert part["draftId"] == "draft-1"
+    assert part["targetPath"] == "docs/architecture.md"
+    assert part["itemId"] == "file-change:draft:draft-1"
+    assert part["approvalId"] == "approval:draft:draft-1"
+    assert part["status"] == "committed"
+
+
 def test_session_run_end_finalizes_existing_stream_without_duplicate_when_response_not_rendered() -> None:
     document = _session_run_start(None, "运行测试", 1)
     document = apply_session_event(

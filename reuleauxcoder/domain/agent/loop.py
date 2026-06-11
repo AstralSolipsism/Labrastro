@@ -16,11 +16,19 @@ from reuleauxcoder.domain.agent.runtime_budget import (
     runtime_budget_limit,
     runtime_budget_int,
 )
+from reuleauxcoder.domain.agent.document_draft import DocumentDraftRuntime
 from reuleauxcoder.domain.agent.runtime_boundary import (
     runtime_agent_run_id,
+    runtime_execution_target,
+    runtime_workspace_root,
     runtime_working_directory,
 )
 from reuleauxcoder.domain.approval import ApprovalRequest
+from reuleauxcoder.domain.files import (
+    LocalWorkspaceMutationBackend,
+    PatchArgumentStreamDecoder,
+    PatchArgumentStreamError,
+)
 from reuleauxcoder.domain.hooks.lifecycle import (
     build_lifecycle_event_context,
     lifecycle_output_audit_fields,
@@ -548,6 +556,72 @@ class AgentLoop:
             if response.stream_status == "completed" and not recovery.get("failed"):
                 self.agent._emit_event(AgentEvent.provider_stream_recovered(payload))
 
+    def _emit_apply_patch_stream_delta(
+        self,
+        decoders: dict[str, PatchArgumentStreamDecoder],
+        buffers: dict[str, str],
+        started_items: set[str],
+        *,
+        index: int,
+        tool_call_id: str | None,
+        arguments_delta: str,
+    ) -> None:
+        item_id = f"file-change:{tool_call_id or f'index-{index}'}"
+        if item_id not in started_items:
+            started_items.add(item_id)
+            self.agent._emit_event(
+                AgentEvent.file_change_started(
+                    item_id=item_id,
+                    tool_call_id=tool_call_id,
+                    changes=[],
+                )
+            )
+        key = tool_call_id or f"index:{index}"
+        decoder = decoders.setdefault(key, PatchArgumentStreamDecoder())
+        try:
+            patch_delta = decoder.push_delta(arguments_delta)
+        except PatchArgumentStreamError as exc:
+            self.agent._emit_event(
+                AgentEvent.tool_call_protocol_error(
+                    "apply_patch",
+                    tool_call_id=tool_call_id,
+                    code="PATCH_ARGUMENT_STREAM_INVALID",
+                    message=str(exc),
+                )
+            )
+            self.agent._emit_event(
+                AgentEvent.file_change_completed(
+                    item_id=item_id,
+                    tool_call_id=tool_call_id,
+                    changes=[],
+                    status="failed",
+                    error=str(exc),
+                )
+            )
+            return
+        if not patch_delta:
+            return
+        next_patch = f"{buffers.get(key, '')}{patch_delta}"
+        buffers[key] = next_patch
+        self.agent._emit_event(
+            AgentEvent.file_change_patch_updated(
+                item_id=item_id,
+                tool_call_id=tool_call_id,
+                changes=self._preview_stream_patch_changes(next_patch),
+                patch_delta=patch_delta,
+                patch_preview=next_patch[-2000:],
+            )
+        )
+
+    def _preview_stream_patch_changes(self, patch: str) -> list[dict[str, Any]]:
+        if runtime_execution_target(self.agent) == "remote_peer":
+            return []
+        workspace_root = runtime_workspace_root(self.agent) or runtime_working_directory(self.agent)
+        result = LocalWorkspaceMutationBackend(workspace_root).preview_text_patch(patch)
+        if result.changes:
+            return [change.to_dict() for change in result.changes]
+        return []
+
     def run(self) -> str:
         """Run the conversation loop."""
         self.last_run_interrupted = False
@@ -561,11 +635,21 @@ class AgentLoop:
             self.agent.llm,
         )
         self._emit_usage_update("running")
+        draft_runtime = DocumentDraftRuntime(
+            workspace_root=runtime_workspace_root(self.agent)
+            or runtime_working_directory(self.agent)
+            or os.getcwd(),
+            mutation_backend=getattr(self.agent, "workspace_mutation_backend", None),
+            approval_provider=getattr(self.agent, "approval_provider", None),
+            emit=self.agent._emit_event,
+        )
 
         for round_num in range(self.agent.max_rounds):
             if self.agent.stop_requested():
+                draft_runtime.cancel_active("stopped by cancellation request")
                 return "(stopped by cancellation request)"
             if budget_result := self._budget_stop_result():
+                draft_runtime.cancel_active(budget_result)
                 return budget_result
 
             self.agent.state.current_round = round_num
@@ -573,10 +657,14 @@ class AgentLoop:
             streamed_output = False
             streamed_reasoning = False
             self._inject_pending_follow_ups()
+            patch_decoders: dict[str, PatchArgumentStreamDecoder] = {}
+            patch_buffers: dict[str, str] = {}
+            started_file_changes: set[str] = set()
 
             def _on_token(token: str) -> None:
                 nonlocal streamed_output
                 streamed_output = True
+                draft_runtime.append_stream_delta(token)
                 self.agent._emit_event(AgentEvent.stream_token(token))
 
             def _on_reasoning_token(token: str) -> None:
@@ -592,16 +680,27 @@ class AgentLoop:
                     index = int(delta.get("index") or 0)
                 except (TypeError, ValueError):
                     index = 0
+                tool_call_id = str(delta.get("tool_call_id") or "") or None
+                arguments_delta = str(delta.get("arguments_delta") or "")
                 self.agent._emit_event(
                     AgentEvent.tool_call_delta(
                         index=index,
-                        tool_call_id=str(delta.get("tool_call_id") or "") or None,
+                        tool_call_id=tool_call_id,
                         tool_name=raw_name or None,
-                        arguments_delta=str(delta.get("arguments_delta") or ""),
+                        arguments_delta=arguments_delta,
                         arguments_preview=str(delta.get("arguments_preview") or ""),
                         tool_source=self._tool_source(raw_name) if raw_name else None,
                     )
                 )
+                if raw_name == "apply_patch":
+                    self._emit_apply_patch_stream_delta(
+                        patch_decoders,
+                        patch_buffers,
+                        started_file_changes,
+                        index=index,
+                        tool_call_id=tool_call_id,
+                        arguments_delta=arguments_delta,
+                    )
 
             resp = self.agent.llm.chat(
                 messages=self._full_messages(),
@@ -627,6 +726,7 @@ class AgentLoop:
                 self.agent._emit_event(AgentEvent.reasoning_token(resp.reasoning_content))
             if budget_result := self._budget_stop_result():
                 self.last_response_streamed = streamed_output
+                draft_runtime.cancel_active(budget_result)
                 return budget_result
 
             if resp.stream_status == "interrupted":
@@ -634,12 +734,14 @@ class AgentLoop:
                 self.last_run_interrupted = True
                 self.last_interruption_payload = self._stream_interruption_payload(resp)
                 self.agent.state.messages.append(resp.message)
+                draft_runtime.cancel_active("provider stream interrupted")
                 return resp.content
 
             # No tool calls -> done
             if not resp.tool_calls:
                 self.last_response_streamed = streamed_output
                 self.agent.state.messages.append(resp.message)
+                draft_runtime.commit_active()
                 return resp.content
 
             # Tool calls -> execute
@@ -658,6 +760,8 @@ class AgentLoop:
             if len(resp.tool_calls) == 1:
                 tc = resp.tool_calls[0]
                 result = self.agent._executor.execute(tc, index=0)
+                if tc.name == "draft_document_begin":
+                    draft_runtime.begin_from_tool_result(result)
                 refresh_assistant_tool_call_message()
                 self.agent.state.messages.append(
                     {
@@ -674,6 +778,8 @@ class AgentLoop:
                         if self.agent.stop_requested():
                             return "(stopped by cancellation request)"
                         result = self.agent._executor.execute(tc, index=tool_index)
+                        if tc.name == "draft_document_begin":
+                            draft_runtime.begin_from_tool_result(result)
                         refresh_assistant_tool_call_message()
                         self.agent.state.messages.append(
                             {
@@ -690,6 +796,8 @@ class AgentLoop:
                     results = self.agent._executor.execute_parallel(resp.tool_calls)
                     refresh_assistant_tool_call_message()
                     for tc, result in zip(resp.tool_calls, results):
+                        if tc.name == "draft_document_begin":
+                            draft_runtime.begin_from_tool_result(result)
                         self.agent.state.messages.append(
                             {
                                 "role": "tool",
@@ -707,8 +815,10 @@ class AgentLoop:
             self._emit_usage_update()
 
         if budget_result := self._budget_stop_result():
+            draft_runtime.cancel_active(budget_result)
             return budget_result
         if max_turns_result := self._max_turns_stop_result():
+            draft_runtime.cancel_active(max_turns_result)
             return max_turns_result
 
         summary_prompt = (
@@ -759,6 +869,8 @@ class AgentLoop:
             self.last_run_interrupted = True
             self.last_interruption_payload = self._stream_interruption_payload(summary_resp)
             self.agent.state.messages.append(summary_resp.message)
+            draft_runtime.cancel_active("provider stream interrupted")
             return summary_resp.content
         self.agent.state.messages.append(summary_resp.message)
+        draft_runtime.commit_active()
         return summary_resp.content or "(reached maximum tool-call rounds)"

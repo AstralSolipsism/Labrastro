@@ -158,9 +158,34 @@ def apply_session_event(
         )
     elif event_type == "session_run_end":
         _apply_session_run_end(doc, payload, meta)
-    elif event_type in {"output", "tool_call_delta", "tool_call_stream", "tool_call_start", "tool_call_end",
-                        "tool_call_protocol_error", "approval_request", "approval_resolved"}:
+    elif event_type in {
+        "output",
+        "tool_call_delta",
+        "tool_call_stream",
+        "tool_call_start",
+        "tool_call_end",
+        "tool_call_protocol_error",
+        "approval_request",
+        "approval_resolved",
+    }:
         _apply_tool_or_output_event(doc, event_type, payload, meta)
+    elif event_type in {
+        "file_change_started",
+        "file_change_patch_updated",
+        "file_change_approval_requested",
+        "file_change_approval_resolved",
+        "file_change_completed",
+        "turn_diff_updated",
+    }:
+        _apply_file_change_event(doc, event_type, payload, meta)
+    elif event_type in {
+        "document_draft_started",
+        "document_draft_commit_requested",
+        "document_draft_committed",
+        "document_draft_failed",
+        "document_draft_cancelled",
+    }:
+        _apply_document_draft_event(doc, event_type, payload, meta)
     elif event_type == "runtime_status":
         _apply_runtime_status(doc, payload, meta)
     elif event_type == "lifecycle_hook":
@@ -803,6 +828,219 @@ def _apply_tool_or_output_event(
             "resultReason": _string(payload, "reason"),
             "status": "approved" if _string(payload, "decision") == "allow_once" else "denied",
         }, meta)
+
+
+def _apply_file_change_event(
+    doc: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    item_id = _string(payload, "item_id") or _string(payload, "itemId")
+    if not item_id:
+        item_id = f"file-change-{meta.get('sessionRunId') or meta.get('sessionEventSeq')}"
+    existing = _find_file_change_part(doc, item_id) or {}
+    changes = (
+        [dict(item) for item in payload.get("changes", []) if isinstance(item, dict)]
+        if isinstance(payload.get("changes"), list)
+        else _list_value(existing.get("changes"))
+    )
+    stats = _file_change_diff_stats(changes)
+    patch: dict[str, Any] = {
+        "itemId": item_id,
+        "toolCallId": _tool_call_id(payload) or existing.get("toolCallId"),
+        "status": _file_change_status(payload, event_type, existing),
+        "changes": changes,
+        "diff": _combined_file_change_diff(changes) or existing.get("diff"),
+        "addedLines": stats["added"],
+        "removedLines": stats["removed"],
+        "path": _primary_file_change_path(changes) or existing.get("path"),
+        "updatedAt": payload.get("updated_at") or payload.get("updatedAt"),
+        "durationMs": payload.get("duration_ms") or payload.get("durationMs"),
+        "error": _string(payload, "error") or existing.get("error"),
+    }
+    if event_type == "file_change_patch_updated":
+        patch["patchPreview"] = _string(payload, "patch_preview") or existing.get("patchPreview")
+    elif event_type == "file_change_approval_requested":
+        patch["approvalId"] = _string(payload, "approval_id")
+        patch["approvalReason"] = _string(payload, "reason")
+    elif event_type == "file_change_approval_resolved":
+        patch["approvalId"] = _string(payload, "approval_id") or existing.get("approvalId")
+        patch["approvalDecision"] = _string(payload, "decision")
+        patch["approvalResultReason"] = _string(payload, "reason")
+
+    _upsert_file_change_part(doc, item_id, patch, meta)
+
+
+def _upsert_file_change_part(
+    doc: dict[str, Any],
+    item_id: str,
+    patch: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    assistant = _ensure_assistant_message(doc)
+    parts = []
+    found = False
+    for part in _list_value(assistant.get("parts")):
+        if isinstance(part, dict) and part.get("type") == "file_change" and part.get("itemId") == item_id:
+            next_part = {**part, **_defined(patch), **_public_meta(meta)}
+            raw_event_refs = _merge_raw_event_refs(part.get("rawEventRefs"), meta.get("rawEventRefs"))
+            if raw_event_refs:
+                next_part["rawEventRefs"] = raw_event_refs
+            parts.append(next_part)
+            found = True
+            continue
+        parts.append(part)
+    if not found:
+        parts.append(
+            _part(
+                item_id,
+                "file_change",
+                meta,
+                {
+                    "title": "文件变更",
+                    **_defined(patch),
+                },
+            )
+        )
+    assistant["parts"] = parts
+
+
+def _find_file_change_part(doc: dict[str, Any], item_id: str) -> dict[str, Any] | None:
+    if not item_id:
+        return None
+    for turn in _list(doc, "turns"):
+        if not isinstance(turn, dict):
+            continue
+        for message in _list_value(turn.get("assistantMessages")):
+            if not isinstance(message, dict):
+                continue
+            for part in _list_value(message.get("parts")):
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "file_change"
+                    and part.get("itemId") == item_id
+                ):
+                    return part
+    return None
+
+
+def _file_change_status(
+    payload: dict[str, Any],
+    event_type: str,
+    existing: dict[str, Any],
+) -> str:
+    raw = _string(payload, "status")
+    allowed = {"in_progress", "completed", "failed", "declined", "cancelled"}
+    if raw in allowed:
+        return raw
+    if event_type == "file_change_approval_requested":
+        return "in_progress"
+    if event_type == "file_change_approval_resolved":
+        return "declined" if _string(payload, "decision") != "allow_once" else "in_progress"
+    if event_type == "file_change_completed":
+        return "completed"
+    return str(existing.get("status") or "in_progress")
+
+
+def _primary_file_change_path(changes: list[Any]) -> str:
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        path = str(change.get("move_path") or change.get("path") or "")
+        if path:
+            return path
+    return ""
+
+
+def _combined_file_change_diff(changes: list[Any]) -> str:
+    diffs = [
+        str(change.get("diff") or "")
+        for change in changes
+        if isinstance(change, dict) and str(change.get("diff") or "")
+    ]
+    return "\n".join(diffs).strip()
+
+
+def _file_change_diff_stats(changes: list[Any]) -> dict[str, int]:
+    added = 0
+    removed = 0
+    for diff in _combined_file_change_diff(changes).splitlines():
+        if diff.startswith("+++") or diff.startswith("---"):
+            continue
+        if diff.startswith("+"):
+            added += 1
+        elif diff.startswith("-"):
+            removed += 1
+    return {"added": added, "removed": removed}
+
+
+def _apply_document_draft_event(
+    doc: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    draft_id = _string(payload, "draft_id") or _string(payload, "draftId")
+    if not draft_id:
+        draft_id = f"draft-{meta.get('sessionRunId') or meta.get('sessionEventSeq')}"
+    patch = {
+        "draftId": draft_id,
+        "targetPath": _string(payload, "target_path") or _string(payload, "targetPath") or None,
+        "title": _string(payload, "title") or None,
+        "format": _string(payload, "format") or None,
+        "status": _document_draft_status(payload, event_type),
+        "itemId": _string(payload, "item_id") or _string(payload, "itemId") or None,
+        "approvalId": _string(payload, "approval_id") or _string(payload, "approvalId") or None,
+        "error": _string(payload, "error") or None,
+        "reason": _string(payload, "reason") or None,
+    }
+    _upsert_document_draft_part(doc, draft_id, patch, meta)
+
+
+def _upsert_document_draft_part(
+    doc: dict[str, Any],
+    draft_id: str,
+    patch: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    assistant = _ensure_assistant_message(doc)
+    parts = []
+    found = False
+    for part in _list_value(assistant.get("parts")):
+        if isinstance(part, dict) and part.get("type") == "document_draft" and part.get("draftId") == draft_id:
+            parts.append({**part, **_defined(patch), **_public_meta(meta)})
+            found = True
+            continue
+        parts.append(part)
+    if not found:
+        parts.append(
+            _part(
+                draft_id,
+                "document_draft",
+                meta,
+                {
+                    "title": "文档草稿",
+                    **_defined(patch),
+                },
+            )
+        )
+    assistant["parts"] = parts
+
+
+def _document_draft_status(payload: dict[str, Any], event_type: str) -> str:
+    raw = _string(payload, "status")
+    allowed = {"declared", "streaming", "committing", "committed", "cancelled", "failed"}
+    if raw in allowed:
+        return raw
+    mapping = {
+        "document_draft_started": "streaming",
+        "document_draft_commit_requested": "committing",
+        "document_draft_committed": "committed",
+        "document_draft_failed": "failed",
+        "document_draft_cancelled": "cancelled",
+    }
+    return mapping.get(event_type, "streaming")
 
 
 def _append_text_part(

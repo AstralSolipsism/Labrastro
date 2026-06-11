@@ -393,7 +393,7 @@ def test_agent_loop_stores_lifecycle_transformed_tool_call_in_history() -> None:
     )
 
     def execute_transformed(tool_call: ToolCall, index: int = 0) -> str:  # noqa: ARG001
-        tool_call.name = "write_file"
+        tool_call.name = "apply_patch"
         tool_call.arguments = {"path": "after.txt"}
         return "tool-ok"
 
@@ -408,7 +408,7 @@ def test_agent_loop_stores_lifecycle_transformed_tool_call_in_history() -> None:
     assert result == "done"
     assistant_tool_message = agent.state.messages[1]
     stored_tool_call = assistant_tool_message["tool_calls"][0]
-    assert stored_tool_call["function"]["name"] == "write_file"
+    assert stored_tool_call["function"]["name"] == "apply_patch"
     assert stored_tool_call["function"]["arguments"] == '{"path": "after.txt"}'
 
 

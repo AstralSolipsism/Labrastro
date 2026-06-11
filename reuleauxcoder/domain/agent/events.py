@@ -23,6 +23,17 @@ class AgentEventType(Enum):
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
+    FILE_CHANGE_STARTED = "file_change_started"
+    FILE_CHANGE_PATCH_UPDATED = "file_change_patch_updated"
+    FILE_CHANGE_APPROVAL_REQUESTED = "file_change_approval_requested"
+    FILE_CHANGE_APPROVAL_RESOLVED = "file_change_approval_resolved"
+    FILE_CHANGE_COMPLETED = "file_change_completed"
+    TURN_DIFF_UPDATED = "turn_diff_updated"
+    DOCUMENT_DRAFT_STARTED = "document_draft_started"
+    DOCUMENT_DRAFT_COMMIT_REQUESTED = "document_draft_commit_requested"
+    DOCUMENT_DRAFT_COMMITTED = "document_draft_committed"
+    DOCUMENT_DRAFT_FAILED = "document_draft_failed"
+    DOCUMENT_DRAFT_CANCELLED = "document_draft_cancelled"
     LIFECYCLE_HOOK = "lifecycle_hook"
     PROVIDER_STREAM_INTERRUPTED = "provider_stream_interrupted"
     PROVIDER_STREAM_RECOVERING = "provider_stream_recovering"
@@ -210,6 +221,217 @@ class AgentEvent:
             tool_call_id=tool_call_id,
             data=payload,
             error_message=message,
+        )
+
+    @classmethod
+    def file_change_started(
+        cls,
+        *,
+        item_id: str,
+        tool_call_id: str | None = None,
+        changes: list[dict[str, Any]] | None = None,
+        status: str = "in_progress",
+    ) -> "AgentEvent":
+        payload = {
+            "item_id": item_id,
+            "tool_call_id": tool_call_id or "",
+            "changes": list(changes or []),
+            "status": status,
+        }
+        return cls(
+            event_type=AgentEventType.FILE_CHANGE_STARTED,
+            tool_call_id=tool_call_id or None,
+            data=payload,
+        )
+
+    @classmethod
+    def file_change_patch_updated(
+        cls,
+        *,
+        item_id: str,
+        tool_call_id: str | None = None,
+        changes: list[dict[str, Any]] | None = None,
+        patch_delta: str = "",
+        patch_preview: str = "",
+    ) -> "AgentEvent":
+        payload = {
+            "item_id": item_id,
+            "tool_call_id": tool_call_id or "",
+            "changes": list(changes or []),
+            "patch_delta": patch_delta,
+            "patch_preview": patch_preview,
+            "status": "in_progress",
+        }
+        return cls(
+            event_type=AgentEventType.FILE_CHANGE_PATCH_UPDATED,
+            tool_call_id=tool_call_id or None,
+            data=payload,
+        )
+
+    @classmethod
+    def file_change_approval_requested(
+        cls,
+        *,
+        item_id: str,
+        approval_id: str,
+        tool_call_id: str | None = None,
+        reason: str = "",
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED,
+            tool_call_id=tool_call_id or None,
+            data={
+                "item_id": item_id,
+                "approval_id": approval_id,
+                "tool_call_id": tool_call_id or "",
+                "reason": reason,
+                "status": "awaiting_approval",
+            },
+        )
+
+    @classmethod
+    def file_change_approval_resolved(
+        cls,
+        *,
+        item_id: str,
+        approval_id: str,
+        decision: str,
+        tool_call_id: str | None = None,
+        reason: str = "",
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.FILE_CHANGE_APPROVAL_RESOLVED,
+            tool_call_id=tool_call_id or None,
+            data={
+                "item_id": item_id,
+                "approval_id": approval_id,
+                "tool_call_id": tool_call_id or "",
+                "decision": decision,
+                "reason": reason,
+                "status": "approved" if decision == "allow_once" else "declined",
+            },
+        )
+
+    @classmethod
+    def file_change_completed(
+        cls,
+        *,
+        item_id: str,
+        tool_call_id: str | None = None,
+        changes: list[dict[str, Any]] | None = None,
+        status: str,
+        error: str | None = None,
+        duration_ms: int | None = None,
+    ) -> "AgentEvent":
+        payload: dict[str, Any] = {
+            "item_id": item_id,
+            "tool_call_id": tool_call_id or "",
+            "changes": list(changes or []),
+            "status": status,
+        }
+        if error:
+            payload["error"] = error
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        return cls(
+            event_type=AgentEventType.FILE_CHANGE_COMPLETED,
+            tool_call_id=tool_call_id or None,
+            data=payload,
+        )
+
+    @classmethod
+    def document_draft_started(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        title: str,
+        format: str = "markdown",
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_STARTED,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "title": title,
+                "format": format,
+                "status": "streaming",
+            },
+        )
+
+    @classmethod
+    def document_draft_commit_requested(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        item_id: str,
+        approval_id: str,
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "item_id": item_id,
+                "approval_id": approval_id,
+                "status": "committing",
+            },
+        )
+
+    @classmethod
+    def document_draft_committed(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        item_id: str,
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_COMMITTED,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "item_id": item_id,
+                "status": "committed",
+            },
+        )
+
+    @classmethod
+    def document_draft_failed(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        error: str,
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_FAILED,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "status": "failed",
+                "error": error,
+            },
+            error_message=error,
+        )
+
+    @classmethod
+    def document_draft_cancelled(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        reason: str,
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_CANCELLED,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "status": "cancelled",
+                "reason": reason,
+            },
         )
 
     @classmethod

@@ -1,4 +1,4 @@
-from reuleauxcoder.domain.agent.events import (
+﻿from reuleauxcoder.domain.agent.events import (
     AgentEvent,
     AgentEventType,
     ToolFailureKind,
@@ -63,17 +63,17 @@ def test_agent_event_tool_call_end_keeps_full_long_result_with_preview() -> None
 
 def test_agent_event_tool_call_protocol_error_contains_payload() -> None:
     event = AgentEvent.tool_call_protocol_error(
-        "write_file",
+        "apply_patch",
         tool_call_id="call-1",
         code="REMOTE_PREVIEW_REQUIRED",
         message="remote peer must provide a tool preview",
     )
 
     assert event.event_type is AgentEventType.TOOL_CALL_PROTOCOL_ERROR
-    assert event.tool_name == "write_file"
+    assert event.tool_name == "apply_patch"
     assert event.tool_call_id == "call-1"
     assert event.data == {
-        "tool_name": "write_file",
+        "tool_name": "apply_patch",
         "tool_call_id": "call-1",
         "code": "REMOTE_PREVIEW_REQUIRED",
         "message": "remote peer must provide a tool preview",
@@ -86,11 +86,41 @@ def test_agent_event_tool_call_protocol_error_contains_payload() -> None:
                 "code": "REMOTE_PREVIEW_REQUIRED",
                 "message": "remote peer must provide a tool preview",
                 "repairable": False,
-                "tool_name": "write_file",
+                "tool_name": "apply_patch",
                 "tool_call_id": "call-1",
             }
         ],
     }
+
+
+def test_agent_event_file_change_started_contains_stable_payload() -> None:
+    event = AgentEvent.file_change_started(
+        item_id="file-change:call-1",
+        tool_call_id="call-1",
+        changes=[{"path": "main.py", "kind": "update", "diff": "---\n+ok"}],
+    )
+
+    assert event.event_type is AgentEventType.FILE_CHANGE_STARTED
+    assert event.tool_call_id == "call-1"
+    assert event.data == {
+        "item_id": "file-change:call-1",
+        "tool_call_id": "call-1",
+        "changes": [{"path": "main.py", "kind": "update", "diff": "---\n+ok"}],
+        "status": "in_progress",
+    }
+
+
+def test_agent_event_file_change_completed_contains_status_and_error() -> None:
+    event = AgentEvent.file_change_completed(
+        item_id="file-change:call-1",
+        tool_call_id="call-1",
+        status="failed",
+        error="patch context does not match file",
+    )
+
+    assert event.event_type is AgentEventType.FILE_CHANGE_COMPLETED
+    assert event.data["status"] == "failed"
+    assert event.data["error"] == "patch context does not match file"
 
 
 def test_agent_event_delegated_run_completed_contains_payload() -> None:
