@@ -27,6 +27,7 @@ _GO_AVAILABLE = shutil.which("go") is not None
 
 from labrastro_server.interfaces.http.remote.service import (
     RemoteRelayHTTPService as _RemoteRelayHTTPService,
+    _SessionRunEventBuffer,
     _RemoteSessionRun,
 )
 from labrastro_server.interfaces.http.remote.routes.chat import (
@@ -69,12 +70,11 @@ from labrastro_server.interfaces.http.remote.protocol import (
     RelayEnvelope,
 )
 from labrastro_server.relay.server import RelayServer
-from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
+from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
 from reuleauxcoder.extensions.tools.builtin.glob import GlobTool
 from reuleauxcoder.extensions.tools.builtin.grep import GrepTool
 from reuleauxcoder.extensions.tools.builtin.read import ReadFileTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
-from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from reuleauxcoder.interfaces.entrypoint.runner import (
     _default_create_remote_artifact_provider,
@@ -603,8 +603,10 @@ class TestRemoteRelayHTTPService:
             result = relay.send_preview_request(
                 peer_id,
                 ToolPreviewRequest(
-                    tool_name="write_file",
-                    args={"file_path": "a.txt", "content": "new"},
+                    tool_name="apply_patch",
+                    args={
+                        "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch",
+                    },
                     cwd="/repo",
                 ),
                 timeout_sec=2,
@@ -2088,7 +2090,7 @@ class TestRemoteRelayHTTPService:
                         "provider_id": "deepseek",
                         "compat": "deepseek",
                         "model": "deepseek-v4",
-                        "tool": "write_file",
+                        "tool": "apply_patch",
                     },
                     "diagnostics": [
                         {
@@ -2096,10 +2098,10 @@ class TestRemoteRelayHTTPService:
                             "kind": "schema_issue",
                             "severity": "error",
                             "code": "missing_required",
-                            "path": "$.content",
+                            "path": "$.patch",
                             "expected": "string",
                             "actual": "missing",
-                            "message": "$.content: expected string, got missing",
+                            "message": "$.patch: expected string, got missing",
                             "repairable": False,
                         },
                         {
@@ -2114,12 +2116,12 @@ class TestRemoteRelayHTTPService:
                         },
                     ],
                     "validation": {
-                        "tool_name": "write_file",
+                        "tool_name": "apply_patch",
                         "final_valid": False,
                         "initial_issues": [
                             {
                                 "code": "missing_required",
-                                "path": "$.content",
+                                "path": "$.patch",
                                 "expected": "string",
                                 "actual": "missing",
                             }
@@ -2210,7 +2212,7 @@ class TestRemoteRelayHTTPService:
             }
             assert stats["by_model"][0]["name"] == "deepseek-v4"
             assert stats["by_stage"][0]["name"] == "argument_validation"
-            assert stats["issues"][0]["path"] == "$.content"
+            assert stats["issues"][0]["path"] == "$.patch"
             assert stats["repairs"][0]["action"] == "optional_null_omitted"
         finally:
             service.stop()
@@ -2533,7 +2535,7 @@ class TestRemoteRelayHTTPService:
                         "envreq:runtime:node",
                         "envreq:executable:npm",
                     ],
-                    permissions={"tools": {"write_file": "require_approval"}},
+                    permissions={"tools": {"apply_patch": "require_approval"}},
                 ),
                 MCPServerConfig(
                     name="missing-platform",
@@ -2608,7 +2610,7 @@ class TestRemoteRelayHTTPService:
                 "envreq:runtime:node",
                 "envreq:executable:npm",
             ]
-            assert server_manifest["permissions"]["tools"]["write_file"] == "require_approval"
+            assert server_manifest["permissions"]["tools"]["apply_patch"] == "require_approval"
             assert manifest["diagnostics"][0]["server"] == "missing-platform"
 
             try:
@@ -4364,20 +4366,12 @@ class TestRemoteRelayHTTPService:
                     "read-ok",
                 ),
                 (
-                    WriteFileTool(backend=backend),
-                    {"file_path": "/tmp/demo.txt", "content": "hello"},
-                    "write_file",
-                    "write-ok",
-                ),
-                (
-                    EditFileTool(backend=backend),
+                    ApplyPatchTool(backend=backend),
                     {
-                        "file_path": "/tmp/demo.txt",
-                        "old_string": "a",
-                        "new_string": "b",
+                        "patch": "*** Begin Patch\n*** Update File: demo.txt\n@@\n-old\n+new\n*** End Patch",
                     },
-                    "edit_file",
-                    "edit-ok",
+                    "apply_patch",
+                    "patch-ok",
                 ),
                 (
                     GlobTool(backend=backend),
@@ -6035,6 +6029,52 @@ class TestRemoteRelayHTTPService:
         finally:
             service.stop()
             relay.stop()
+
+    def test_session_run_artifact_envelope_preserves_file_change_identity(
+        self, tmp_path: Path
+    ) -> None:
+        buffer = _SessionRunEventBuffer(
+            session_run_id="run-1",
+            artifact_root=tmp_path / "session-run-events",
+            max_events=20,
+            max_payload_bytes=128,
+            max_total_bytes=4096,
+        )
+        large_diff = "--- a/src/a.ts\n+++ b/src/a.ts\n" + "\n".join(
+            f"+line-{index}" for index in range(80)
+        )
+
+        buffer.append({
+            "session_run_id": "run-1",
+            "seq": 1,
+            "type": "file_change_patch_updated",
+            "payload": {
+                "item_id": "file-change-1",
+                "tool_call_id": "tool-1",
+                "approval_id": "approval-1",
+                "draft_id": "draft-1",
+                "status": "in_progress",
+                "changes": [{"path": "src/a.ts", "kind": "update", "diff": large_diff}],
+                "patch_preview": large_diff,
+            },
+        })
+
+        event = buffer.snapshot()[0]
+        payload = event["payload"]
+        assert payload["item_id"] == "file-change-1"
+        assert payload["tool_call_id"] == "tool-1"
+        assert payload["approval_id"] == "approval-1"
+        assert payload["draft_id"] == "draft-1"
+        assert payload["status"] == "in_progress"
+        assert "changes" not in payload
+        assert "patch_preview" not in payload
+        artifact = payload["artifact_ref"]
+        assert artifact["encoding"] == "json+gzip"
+        assert artifact["fields"] == ["changes", "patch_preview"]
+        with gzip.open(Path(artifact["path"]), "rt", encoding="utf-8") as fh:
+            stored = json.load(fh)
+        assert stored["changes"][0]["diff"] == large_diff
+        assert stored["patch_preview"] == large_diff
 
     def test_session_run_gc_removes_closed_idle_sessions_and_artifacts(
         self, tmp_path: Path
@@ -8895,17 +8935,30 @@ class TestRemoteRelayHTTPService:
             )
             assert "1\thello world" in read_result
 
-            write_result = WriteFileTool(backend=backend).execute(
-                file_path=str(target_file),
-                content="alpha\nbeta\n",
+            write_result = ApplyPatchTool(backend=backend).execute(
+                patch=(
+                    "*** Begin Patch\n"
+                    "*** Update File: demo.txt\n"
+                    "@@\n"
+                    "-hello world\n"
+                    "+alpha\n"
+                    "+beta\n"
+                    "*** End Patch"
+                ),
             )
-            assert "Wrote" in write_result
+            assert "Applied patch" in write_result
             assert target_file.read_text() == "alpha\nbeta\n"
 
-            edit_result = EditFileTool(backend=backend).execute(
-                file_path=str(target_file),
-                old_string="beta",
-                new_string="gamma",
+            edit_result = ApplyPatchTool(backend=backend).execute(
+                patch=(
+                    "*** Begin Patch\n"
+                    "*** Update File: demo.txt\n"
+                    "@@\n"
+                    " alpha\n"
+                    "-beta\n"
+                    "+gamma\n"
+                    "*** End Patch"
+                ),
             )
             assert "--- a/" in edit_result
             assert "+++ b/" in edit_result

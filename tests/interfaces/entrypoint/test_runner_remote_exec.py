@@ -1,4 +1,4 @@
-"""Tests for runner integration with remote execution."""
+﻿"""Tests for runner integration with remote execution."""
 
 from __future__ import annotations
 
@@ -2590,7 +2590,7 @@ class TestRunnerRemoteExec:
         def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
             decision = agent.approval_provider.request_approval(
                 ApprovalRequest(
-                    tool_name="write_file",
+                    tool_name="apply_patch",
                     tool_args={"file_path": "demo.txt", "content": "host\n"},
                     tool_source="builtin",
                     reason="confirm write",
@@ -2603,7 +2603,7 @@ class TestRunnerRemoteExec:
         runner = _build_runner_with_fake_agent(
             f"127.0.0.1:{port}",
             chat_behavior=chat_behavior,
-            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+            load_tools=lambda backend: [SimpleNamespace(name="apply_patch", backend=backend)],
         )
         ctx = runner.initialize()
         try:
@@ -2758,7 +2758,7 @@ class TestRunnerRemoteExec:
         def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
             decision = agent.approval_provider.request_approval(
                 ApprovalRequest(
-                    tool_name="write_file",
+                    tool_name="apply_patch",
                     tool_args={"file_path": "demo.txt", "content": "host\n"},
                     tool_source="builtin",
                     reason="confirm write",
@@ -2772,7 +2772,7 @@ class TestRunnerRemoteExec:
         runner = _build_runner_with_fake_agent(
             f"127.0.0.1:{port}",
             chat_behavior=chat_behavior,
-            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+            load_tools=lambda backend: [SimpleNamespace(name="apply_patch", backend=backend)],
         )
         ctx = runner.initialize()
         try:
@@ -2809,7 +2809,7 @@ class TestRunnerRemoteExec:
                                 "code": "REMOTE_TOOL_ERROR",
                                 "message": "old_string not found in demo.txt",
                                 "repairable": True,
-                                "tool_name": "write_file",
+                                "tool_name": "apply_patch",
                                 "tool_call_id": "call-write-preview-failed",
                             }
                         ],
@@ -2836,7 +2836,7 @@ class TestRunnerRemoteExec:
         def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
             agent.approval_provider.request_approval(
                 ApprovalRequest(
-                    tool_name="write_file",
+                    tool_name="apply_patch",
                     tool_args={"file_path": "demo.txt", "content": "host\n"},
                     tool_source="builtin",
                     reason="confirm write",
@@ -2849,7 +2849,7 @@ class TestRunnerRemoteExec:
         runner = _build_runner_with_fake_agent(
             f"127.0.0.1:{port}",
             chat_behavior=chat_behavior,
-            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+            load_tools=lambda backend: [SimpleNamespace(name="apply_patch", backend=backend)],
         )
         ctx = runner.initialize()
         try:
@@ -2876,7 +2876,7 @@ class TestRunnerRemoteExec:
             ]
             assert protocol_events
             payload = protocol_events[0]["payload"]
-            assert payload["tool_name"] == "write_file"
+            assert payload["tool_name"] == "apply_patch"
             assert payload["tool_call_id"] == "call-write-1"
             assert payload["code"] == "REMOTE_PREVIEW_REQUIRED"
             assert payload["failure_kind"] == ToolFailureKind.TOOL_PROTOCOL_ERROR.value
@@ -2903,7 +2903,7 @@ class TestRunnerRemoteExec:
         def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
             agent.approval_provider.request_approval(
                 ApprovalRequest(
-                    tool_name="write_file",
+                    tool_name="apply_patch",
                     tool_args={"file_path": "demo.txt", "content": "host\n"},
                     tool_source="builtin",
                     reason="confirm write",
@@ -2916,7 +2916,7 @@ class TestRunnerRemoteExec:
         runner = _build_runner_with_fake_agent(
             f"127.0.0.1:{port}",
             chat_behavior=chat_behavior,
-            load_tools=lambda backend: [SimpleNamespace(name="write_file", backend=backend)],
+            load_tools=lambda backend: [SimpleNamespace(name="apply_patch", backend=backend)],
         )
         ctx = runner.initialize()
         try:

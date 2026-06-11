@@ -18,6 +18,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ToolStreamChunk,
 )
 from labrastro_server.relay.server import RelayServer
+from reuleauxcoder.domain.files import FileChange, FileMutationResult
 from reuleauxcoder.extensions.tools.backend import ExecutionContext, ToolBackend
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 
@@ -37,11 +38,14 @@ class RemoteRelayToolBackend(ToolBackend):
         self.relay_server = relay_server
         self.ui_bus = ui_bus
         self._approved_preview_states: dict[str, ToolMutationPreviewState] = {}
+        self.execution_target = "remote_peer"
+        self.path_space = "remote_peer_workspace"
+        self.workspace_id = str(getattr(self.context, "workspace_root", "") or "")
 
     def exec_tool(self, tool_name: str, args: dict[str, Any]) -> str:
         """Execute a tool on the remote peer and return the text result.
 
-        If no peer is explicitly selected, picks the single online peer (MVP).
+        If no peer is explicitly selected, picks the default online peer.
         """
         peer_id = self.context.peer_id
         peer = None
@@ -64,6 +68,8 @@ class RemoteRelayToolBackend(ToolBackend):
         timeout = None
         if tool_name == "shell":
             timeout = args.get("timeout", 120)
+        elif tool_name == "draft_document_commit":
+            timeout = 120
         else:
             timeout = 30
 
@@ -142,6 +148,68 @@ class RemoteRelayToolBackend(ToolBackend):
         if state is not None and not state.is_empty():
             self._approved_preview_states[self._request_key(tool_name, args)] = state
 
+    def preview_text_patch(self, patch: str) -> FileMutationResult:
+        return self._preview_mutation_tool("apply_patch", {"patch": patch})
+
+    def apply_text_patch(self, patch: str) -> FileMutationResult:
+        return self._exec_mutation_tool("apply_patch", {"patch": patch})
+
+    def preview_document_commit(
+        self,
+        target_path: str,
+        content: str,
+    ) -> FileMutationResult:
+        return self._preview_mutation_tool(
+            "draft_document_commit",
+            {"target_path": target_path, "content": content},
+        )
+
+    def commit_document(
+        self,
+        target_path: str,
+        content: str,
+    ) -> FileMutationResult:
+        return self._exec_mutation_tool(
+            "draft_document_commit",
+            {"target_path": target_path, "content": content},
+        )
+
+    def _preview_mutation_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> FileMutationResult:
+        preview = self.preview_tool(tool_name, args)
+        if not preview.ok:
+            message = preview.error_message or preview.error_code or "remote preview failed"
+            return FileMutationResult(
+                status="failed",
+                message=f"Error: {message}",
+                error=message,
+            )
+        return FileMutationResult(
+            status="in_progress",
+            changes=_changes_from_preview(preview),
+            diff=preview.diff,
+            message=f"Preview {tool_name}",
+            plan_id=str(preview.meta.get("plan_id") or "") or None,
+            plan_hash=str(preview.meta.get("plan_hash") or "") or None,
+        )
+
+    def _exec_mutation_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> FileMutationResult:
+        result = self.exec_tool(tool_name, args)
+        if result.startswith("Error"):
+            return FileMutationResult(
+                status="failed",
+                message=result,
+                error=result,
+            )
+        return FileMutationResult(status="completed", message=result)
+
     def _build_stream_handler(self, tool_name: str, tool_call_id: str | None = None):
         remote_stream_handler = getattr(self.context, "remote_stream_handler", None)
         if tool_name != "shell" and remote_stream_handler is None:
@@ -194,3 +262,37 @@ class RemoteRelayToolBackend(ToolBackend):
             ensure_ascii=False,
             default=str,
         )
+
+
+def _changes_from_preview(preview: ToolPreviewResult) -> tuple[FileChange, ...]:
+    changes: list[FileChange] = []
+    for index, section in enumerate(preview.sections):
+        if not isinstance(section, dict):
+            continue
+        path = str(section.get("path") or preview.resolved_path or f"change-{index + 1}")
+        kind = str(section.get("change_kind") or "update")
+        if kind not in {"add", "update", "delete", "move"}:
+            kind = "update"
+        changes.append(
+            FileChange(
+                path=path,
+                kind=kind,  # type: ignore[arg-type]
+                diff=str(section.get("content") or ""),
+                move_path=(
+                    str(section["move_path"])
+                    if section.get("move_path") is not None
+                    else None
+                ),
+            )
+        )
+    if changes:
+        return tuple(changes)
+    if preview.diff:
+        return (
+            FileChange(
+                path=str(preview.resolved_path or "workspace"),
+                kind="update",
+                diff=preview.diff,
+            ),
+        )
+    return ()

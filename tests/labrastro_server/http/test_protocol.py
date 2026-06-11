@@ -1,4 +1,4 @@
-"""Tests for remote execution protocol message models."""
+﻿"""Tests for remote execution protocol message models."""
 
 from __future__ import annotations
 
@@ -443,7 +443,7 @@ class TestMCPManifest:
                         args=["--root", "{{workspace}}"],
                         env={"MODE": "local"},
                     ),
-                    permissions={"tools": {"write_file": "require_approval"}},
+                    permissions={"tools": {"apply_patch": "require_approval"}},
                     environment_requirement_refs=[
                         "envreq:runtime:node",
                         "envreq:executable:npm",
@@ -648,7 +648,7 @@ class TestExecToolResult:
 class TestToolPreview:
     def test_request_roundtrip(self) -> None:
         req = ToolPreviewRequest(
-            tool_name="write_file",
+            tool_name="apply_patch",
             args={"file_path": "a.txt", "content": "hello"},
             cwd="/repo",
             timeout_sec=12,
@@ -656,7 +656,7 @@ class TestToolPreview:
 
         restored = ToolPreviewRequest.from_dict(req.to_dict())
 
-        assert restored.tool_name == "write_file"
+        assert restored.tool_name == "apply_patch"
         assert restored.args["file_path"] == "a.txt"
         assert restored.cwd == "/repo"
         assert restored.timeout_sec == 12

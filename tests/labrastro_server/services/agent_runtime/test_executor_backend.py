@@ -529,7 +529,7 @@ def test_reuleauxcoder_backend_captures_tool_start_and_result_events() -> None:
             for handler in list(self._event_handlers):
                 handler(
                     AgentEvent.tool_call_start(
-                        "write_file",
+                        "apply_patch",
                         {"path": "a.txt", "content": "updated"},
                         tool_call_id="call-1",
                         tool_source="builtin",
@@ -538,7 +538,7 @@ def test_reuleauxcoder_backend_captures_tool_start_and_result_events() -> None:
                 )
                 handler(
                     AgentEvent.tool_call_end(
-                        "write_file",
+                        "apply_patch",
                         "wrote a.txt",
                         tool_call_id="call-1",
                         tool_source="builtin",
@@ -567,14 +567,14 @@ def test_reuleauxcoder_backend_captures_tool_start_and_result_events() -> None:
     ]
     assert [event.type.value for event in tool_events] == ["tool_use", "tool_result"]
     assert tool_events[0].data == {
-        "tool_name": "write_file",
+        "tool_name": "apply_patch",
         "tool_call_id": "call-1",
         "input": {"path": "a.txt", "content": "updated"},
         "tool_source": "builtin",
         "index": 0,
     }
     assert tool_events[1].data == {
-        "tool_name": "write_file",
+        "tool_name": "apply_patch",
         "tool_call_id": "call-1",
         "output": "wrote a.txt",
         "tool_source": "builtin",

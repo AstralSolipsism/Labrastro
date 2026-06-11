@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import threading
@@ -738,7 +738,7 @@ def test_post_tool_lifecycle_diagnostics_project_user_safely(
                     "source": "skill",
                     "handler_type": "prompt",
                     "payload": {
-                        "tool_names": ["write_file"],
+                        "tool_names": ["apply_patch"],
                         "tool_call_ids": ["call-1"],
                         "tool_sources": ["builtin"],
                         "mcp_servers": ["github"],
@@ -771,7 +771,7 @@ def test_post_tool_lifecycle_diagnostics_project_user_safely(
     payload = session_events[0][1]
     rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     assert payload["event_name"] == event_name
-    assert payload["tool_names"] == ["write_file"]
+    assert payload["tool_names"] == ["apply_patch"]
     assert payload["tool_call_ids"] == ["call-1"]
     assert payload["tool_sources"] == ["builtin"]
     assert payload["mcp_servers"] == ["github"]
@@ -978,7 +978,7 @@ def test_agent_run_tool_use_projection_preserves_lifecycle_transformed_args() ->
             "payload": {
                 "type": "tool_use",
                 "data": {
-                    "tool_name": "write_file",
+                    "tool_name": "apply_patch",
                     "tool_call_id": "call-1",
                     "input": {
                         "path": "safe.txt",
@@ -997,7 +997,7 @@ def test_agent_run_tool_use_projection_preserves_lifecycle_transformed_args() ->
 
     assert [event_type for event_type, _ in session_events] == ["tool_call_start"]
     payload = session_events[0][1]
-    assert payload.get("tool_name") == "write_file"
+    assert payload.get("tool_name") == "apply_patch"
     assert payload.get("tool_call_id") == "call-1"
     assert payload["tool_args"] == {
         "path": "safe.txt",
@@ -1015,12 +1015,12 @@ def test_permission_denied_feedback_projects_through_tool_result_session_event()
             "payload": {
                 "type": "tool_result",
                 "data": {
-                    "tool_name": "write_file",
+                    "tool_name": "apply_patch",
                     "tool_call_id": "call-denied",
                     "output": (
-                        "Error: tool 'write_file' denied by permission gateway: "
-                        "write_file denied by policy\n"
-                        "Permission feedback: Use read_file or ask for write_file capability."
+                        "Error: tool 'apply_patch' denied by permission gateway: "
+                        "apply_patch denied by policy\n"
+                        "Permission feedback: Use read_file or ask for apply_patch capability."
                     ),
                     "meta": {
                         "tool_diagnostics": [
@@ -1038,7 +1038,7 @@ def test_permission_denied_feedback_projects_through_tool_result_session_event()
                                                     ),
                                                     "user_message": (
                                                         "Use read_file or ask for "
-                                                        "write_file capability."
+                                                        "apply_patch capability."
                                                     ),
                                                     "diagnostics": [
                                                         {
@@ -1062,7 +1062,7 @@ def test_permission_denied_feedback_projects_through_tool_result_session_event()
 
     assert session_events[0][0] == "tool_call_end"
     payload = session_events[0][1]
-    assert payload.get("tool_name") == "write_file"
+    assert payload.get("tool_name") == "apply_patch"
     assert payload.get("tool_call_id") == "call-denied"
     assert "Permission feedback: Use read_file" in payload["tool_result"]
     lifecycle_audit = payload["meta"]["meta"]["tool_diagnostics"][0]["metadata"][
@@ -1276,7 +1276,7 @@ def test_agent_run_tool_use_projects_large_arguments_as_raw_audit_summary() -> N
             "payload": {
                 "type": "tool_use",
                 "data": {
-                    "tool_name": "write_file",
+                    "tool_name": "apply_patch",
                     "tool_call_id": "call-1",
                     "input": {"path": "SKILL.md", "content": large_content},
                 },

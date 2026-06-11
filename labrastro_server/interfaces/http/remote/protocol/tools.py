@@ -8,6 +8,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ToolMutationPreviewState:
+    plan_id: str | None = None
+    plan_hash: str | None = None
+    operations: list[dict[str, Any]] = field(default_factory=list)
     resolved_path: str | None = None
     old_sha256: str | None = None
     old_exists: bool | None = None
@@ -17,6 +20,9 @@ class ToolMutationPreviewState:
         return not any(
             value is not None
             for value in (
+                self.plan_id,
+                self.plan_hash,
+                self.operations,
                 self.resolved_path,
                 self.old_sha256,
                 self.old_exists,
@@ -26,6 +32,12 @@ class ToolMutationPreviewState:
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {}
+        if self.plan_id is not None:
+            payload["plan_id"] = self.plan_id
+        if self.plan_hash is not None:
+            payload["plan_hash"] = self.plan_hash
+        if self.operations:
+            payload["operations"] = [dict(item) for item in self.operations]
         if self.resolved_path is not None:
             payload["resolved_path"] = self.resolved_path
         if self.old_sha256 is not None:
@@ -41,6 +53,13 @@ class ToolMutationPreviewState:
         if not isinstance(d, dict) or not d:
             return None
         state = cls(
+            plan_id=str(d["plan_id"]) if d.get("plan_id") is not None else None,
+            plan_hash=str(d["plan_hash"]) if d.get("plan_hash") is not None else None,
+            operations=[
+                dict(item)
+                for item in d.get("operations", [])
+                if isinstance(item, dict)
+            ],
             resolved_path=(
                 str(d["resolved_path"]) if d.get("resolved_path") is not None else None
             ),
@@ -62,6 +81,9 @@ class ToolMutationPreviewState:
                 "old_sha256": preview.old_sha256,
                 "old_exists": preview.old_exists,
                 "old_size": preview.old_size,
+                "plan_id": preview.meta.get("plan_id"),
+                "plan_hash": preview.meta.get("plan_hash"),
+                "operations": preview.meta.get("operations", []),
             }
         )
 
@@ -216,7 +238,7 @@ class ToolPreviewResult:
 
 
 # ---------------------------------------------------------------------------
-# Stream chunk (MVP: shell only if needed; struct kept for forward-compat)
+# Stream chunk transport
 # ---------------------------------------------------------------------------
 
 @dataclass

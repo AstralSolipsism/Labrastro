@@ -13,18 +13,19 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ExecToolRequest,
     ExecToolResult,
     RemoteMCPToolInfo,
+    ToolMutationPreviewState,
 )
 from labrastro_server.relay.server import RelayServer
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from reuleauxcoder.extensions.tools.backend import ExecutionContext
-from reuleauxcoder.extensions.tools.builtin.edit import EditFileTool
+from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
+from reuleauxcoder.extensions.tools.builtin.draft_document import DraftDocumentBeginTool
 from reuleauxcoder.extensions.tools.builtin.glob import GlobTool
 from reuleauxcoder.extensions.tools.builtin.grep import GrepTool
 from reuleauxcoder.extensions.tools.builtin.list_file import ListFileTool
 from reuleauxcoder.extensions.tools.builtin.lsp import LspTool
 from reuleauxcoder.extensions.tools.builtin.read import ReadFileTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
-from reuleauxcoder.extensions.tools.builtin.write import WriteFileTool
 
 
 class TestRemoteBackendDispatch:
@@ -59,36 +60,39 @@ class TestRemoteBackendDispatch:
         finally:
             srv.stop()
 
-    def test_write_file_no_peer(self) -> None:
+    def test_apply_patch_no_peer(self) -> None:
         srv = RelayServer()
         srv.start()
         try:
             backend = RemoteRelayToolBackend(relay_server=srv)
-            tool = WriteFileTool(backend=backend)
-            result = tool.execute(file_path="/tmp/foo", content="bar")
+            tool = ApplyPatchTool(backend=backend)
+            result = tool.execute(
+                patch="*** Begin Patch\n*** Add File: foo.txt\n+bar\n*** End Patch\n"
+            )
             assert "no remote peer" in result.lower()
         finally:
             srv.stop()
 
-    def test_edit_file_no_peer(self) -> None:
+    def test_draft_document_begin_is_runtime_declaration(self) -> None:
         srv = RelayServer()
         srv.start()
         try:
             backend = RemoteRelayToolBackend(relay_server=srv)
-            tool = EditFileTool(backend=backend)
+            tool = DraftDocumentBeginTool(backend=backend)
             result = tool.execute(
-                file_path="/tmp/foo",
-                old_string="a",
-                new_string="b",
+                target_path="docs/architecture.md",
+                title="Architecture",
+                format="markdown",
             )
-            assert "no remote peer" in result.lower()
+            assert "draft document declared" in result.lower()
+            assert "target_path: docs/architecture.md" in result
 
             result = tool.execute(
-                file_path="/tmp/foo",
-                old_string="same",
-                new_string="same",
+                target_path="../outside.md",
+                title="Bad",
+                format="markdown",
             )
-            assert "must differ" in result.lower()
+            assert "workspace-relative" in result.lower()
         finally:
             srv.stop()
 
@@ -378,6 +382,89 @@ class TestRemoteBackendDispatch:
             )
             t.join(timeout=2)
             assert holder["result"] == "ok"
+        finally:
+            srv.stop()
+
+    def test_remote_backend_commits_document_through_peer_owner(self) -> None:
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import (
+                RegisterRequest,
+                RelayEnvelope,
+            )
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                    features=["tool_preview"],
+                )
+            )
+            backend = RemoteRelayToolBackend(
+                relay_server=srv,
+                context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+            )
+            backend.remember_approved_preview(
+                "draft_document_commit",
+                {"target_path": "docs/a.md", "content": "# A\n"},
+                ToolMutationPreviewState(
+                    plan_hash="plan-hash",
+                    operations=[
+                        {
+                            "path": "docs/a.md",
+                            "old_exists": False,
+                        }
+                    ],
+                ),
+            )
+
+            import threading
+            import time
+
+            holder: dict[str, object] = {}
+
+            def run_commit() -> None:
+                holder["result"] = backend.commit_document("docs/a.md", "# A\n")
+
+            t = threading.Thread(target=run_commit)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            assert env.payload["tool_name"] == "draft_document_commit"
+            assert env.payload["args"] == {
+                "target_path": "docs/a.md",
+                "content": "# A\n",
+            }
+            assert env.payload["expected_state"]["plan_hash"] == "plan-hash"
+            assert env.payload["expected_state"]["operations"] == [
+                {
+                    "path": "docs/a.md",
+                    "old_exists": False,
+                }
+            ]
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="Committed document docs/a.md").to_dict(),
+                ),
+            )
+            t.join(timeout=2)
+
+            result = holder["result"]
+            assert result.status == "completed"
+            assert result.message == "Committed document docs/a.md"
         finally:
             srv.stop()
 

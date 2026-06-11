@@ -24,7 +24,7 @@ class PeerInfo:
 
 
 class PeerRegistry:
-    """Registry of connected peers. MVP: single peer default selection."""
+    """Registry of connected peers with deterministic default selection."""
 
     def __init__(self, heartbeat_timeout_sec: float = 30.0):
         self._peers: dict[str, PeerInfo] = {}
@@ -81,13 +81,13 @@ class PeerRegistry:
         return info
 
     def pick_default_peer(self) -> PeerInfo | None:
-        """MVP: return the single online peer, or None."""
+        """Return the default online peer, or None."""
         online = [p for p in self._peers.values() if p.status == "online"]
         if not online:
             return None
         if len(online) == 1:
             return online[0]
-        # MVP 不处理多 peer 选择，返回第一个
+        # Keep current selection deterministic until callers pass peer_id.
         return online[0]
 
     def list_online(self) -> list[PeerInfo]:

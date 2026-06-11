@@ -94,7 +94,7 @@ from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_WORKFLOW_MODE,
 )
 
-REMOTE_PREVIEW_TOOLS = {"write_file", "edit_file"}
+REMOTE_PREVIEW_TOOLS = {"apply_patch", "draft_document_commit"}
 
 
 class RemoteToolProtocolError(RuntimeError):
@@ -1192,6 +1192,10 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         setattr(peer_agent, "runtime_execution_target", "remote_peer")
         setattr(peer_agent, "runtime_peer_context", peer_context)
         setattr(peer_agent, "runtime_working_directory", runtime_cwd)
+        setattr(peer_agent, "workspace_mutation_backend", peer_backend)
+        peer_backend.workspace_id = str(workspace_root)
+        peer_backend.execution_target = "remote_peer"
+        peer_backend.path_space = "remote_peer_workspace"
         for tool_info in relay_server.get_peer_mcp_tools(peer_id):
             peer_agent.add_tools([RemotePeerMCPTool(peer_backend, tool_info)])
         for tool in peer_agent.tools:
@@ -1867,8 +1871,16 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             return {
                 key: value
                 for key, value in dict(request.tool_args or {}).items()
-                if key != "intent"
+                if key not in {"intent", "content"}
             }
+
+        def _owner_tool_args(request: ApprovalRequest) -> dict[str, Any]:
+            args = _approval_tool_args(request)
+            if request.tool_name == "draft_document_commit":
+                content = request.metadata.get("draft_document_content")
+                if isinstance(content, str):
+                    args["content"] = content
+            return args
 
         def _approval_intent(request: ApprovalRequest) -> str | None:
             if isinstance(request.intent, str) and request.intent.strip():
@@ -2001,7 +2013,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     ),
                 )
 
-            preview = backend.preview_tool(request.tool_name, _approval_tool_args(request))
+            preview = backend.preview_tool(request.tool_name, _owner_tool_args(request))
             if not preview.ok:
                 return [], preview, _preview_failure_reason(preview)
             if preview.sections:
@@ -2147,7 +2159,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     if backend is not None and preview is not None and preview.ok:
                         backend.remember_approved_preview(
                             request.tool_name,
-                            _approval_tool_args(request),
+                            _owner_tool_args(request),
                             _preview_state(preview),
                         )
                     return ApprovalDecision.allow_once(reason)
@@ -2274,6 +2286,36 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "started_at": event.timestamp,
                     },
                 )
+                return
+            if event.event_type == AgentEventType.FILE_CHANGE_STARTED:
+                remote_session.append_event("file_change_started", event.data)
+                return
+            if event.event_type == AgentEventType.FILE_CHANGE_PATCH_UPDATED:
+                remote_session.append_event("file_change_patch_updated", event.data)
+                return
+            if event.event_type == AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED:
+                remote_session.append_event("file_change_approval_requested", event.data)
+                return
+            if event.event_type == AgentEventType.FILE_CHANGE_APPROVAL_RESOLVED:
+                remote_session.append_event("file_change_approval_resolved", event.data)
+                return
+            if event.event_type == AgentEventType.FILE_CHANGE_COMPLETED:
+                remote_session.append_event("file_change_completed", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_STARTED:
+                remote_session.append_event("document_draft_started", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED:
+                remote_session.append_event("document_draft_commit_requested", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_COMMITTED:
+                remote_session.append_event("document_draft_committed", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_FAILED:
+                remote_session.append_event("document_draft_failed", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_CANCELLED:
+                remote_session.append_event("document_draft_cancelled", event.data)
                 return
             if event.event_type == AgentEventType.TOOL_CALL_START:
                 if event.tool_name and event.tool_call_id:

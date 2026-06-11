@@ -163,6 +163,63 @@ class _PendingLiveSessionRunEvent:
 
 
 class _SessionRunEventBuffer:
+    _ARTIFACTABLE_PAYLOAD_FIELDS = {
+        "changes",
+        "content",
+        "diagnostics",
+        "diff",
+        "output",
+        "patch_delta",
+        "patch_preview",
+        "patchDelta",
+        "patchPreview",
+        "raw_args",
+        "rawArgs",
+        "sections",
+        "text",
+        "tool_args",
+        "tool_output",
+        "tool_result",
+        "toolArgs",
+        "toolOutput",
+        "toolResult",
+    }
+    _ENVELOPE_PAYLOAD_FIELDS = {
+        "approval_id",
+        "approvalId",
+        "created_at",
+        "createdAt",
+        "draft_id",
+        "draftId",
+        "event_id",
+        "eventId",
+        "format",
+        "item_id",
+        "itemId",
+        "message",
+        "message_key",
+        "path",
+        "reason",
+        "session_id",
+        "session_run_id",
+        "sessionId",
+        "sessionRunId",
+        "status",
+        "target_path",
+        "targetPath",
+        "timestamp",
+        "title",
+        "tool_call_id",
+        "tool_name",
+        "tool_source",
+        "toolCallId",
+        "toolName",
+        "toolSource",
+        "type",
+        "updated_at",
+        "updatedAt",
+    }
+
     def __init__(
         self,
         *,
@@ -266,31 +323,56 @@ class _SessionRunEventBuffer:
         payload = event.get("payload", {})
         if not isinstance(payload, dict):
             payload = {"value": payload}
-        payload_bytes = json.dumps(
+        original_payload_bytes = json.dumps(
             payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        if len(payload_bytes) <= self.max_payload_bytes:
+        if len(original_payload_bytes) <= self.max_payload_bytes:
             return {**event, "payload": payload}
 
+        artifact_payload = self._artifact_payload(payload)
+        payload_bytes = json.dumps(
+            artifact_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         seq = int(event.get("seq", 0) or 0)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = self.artifact_dir / f"{seq}.json.gz"
         artifact_path.write_bytes(gzip.compress(payload_bytes))
         preview = payload_bytes[:4096].decode("utf-8", errors="replace")
+        envelope = self._artifact_envelope_payload(payload)
+        envelope["artifact_ref"] = {
+            "type": "session_run_event_payload",
+            "path": str(artifact_path),
+            "encoding": "json+gzip",
+            "bytes": len(payload_bytes),
+            "preview": preview,
+            "fields": sorted(str(key) for key in artifact_payload.keys()),
+        }
         return {
             **event,
-            "payload": {
-                "artifact_ref": {
-                    "type": "session_run_event_payload",
-                    "path": str(artifact_path),
-                    "encoding": "json+gzip",
-                    "bytes": len(payload_bytes),
-                    "preview": preview,
-                }
-            },
+            "payload": envelope,
+        }
+
+    @classmethod
+    def _artifact_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        artifact_payload = {
+            key: value
+            for key, value in payload.items()
+            if key in cls._ARTIFACTABLE_PAYLOAD_FIELDS
+        }
+        return artifact_payload or dict(payload)
+
+    @classmethod
+    def _artifact_envelope_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in payload.items()
+            if key in cls._ENVELOPE_PAYLOAD_FIELDS
         }
 
     def _prune(self) -> None:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
@@ -2623,7 +2623,7 @@ def test_server_settings_accepts_lifecycle_tool_names_matcher_field(tmp_path: Pa
                                 "display_name": "Review package tool hook",
                                 "summary": "Adds review context for matching tools.",
                                 "permissions": [],
-                                "matcher": {"tool_names": ["read_file", "write_file"]},
+                                "matcher": {"tool_names": ["read_file", "apply_patch"]},
                             }
                         ],
                     }
@@ -2636,8 +2636,8 @@ def test_server_settings_accepts_lifecycle_tool_names_matcher_field(tmp_path: Pa
     settings = manager.read_server_settings()["settings"]
     hook = settings["capability_packages"]["review"]["hooks"][0]
     hook_view = settings["capability_packages"]["review"]["hook_views"][0]
-    assert hook["matcher"] == {"tool_names": ["read_file", "write_file"]}
-    assert hook_view["technical"]["matcher"] == {"tool_names": ["read_file", "write_file"]}
+    assert hook["matcher"] == {"tool_names": ["read_file", "apply_patch"]}
+    assert hook_view["technical"]["matcher"] == {"tool_names": ["read_file", "apply_patch"]}
 
 
 def test_server_settings_keeps_lifecycle_placement_separate_from_runtime_footprint(
