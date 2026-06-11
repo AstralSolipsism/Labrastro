@@ -31,7 +31,10 @@ from labrastro_server.services.capability_packages import (
     CapabilitySourceCollector,
     EvidenceBundle,
 )
-from reuleauxcoder.domain.agent_runtime.models import CapabilityComponentConfig
+from reuleauxcoder.domain.agent_runtime.models import (
+    CapabilityComponentConfig,
+    CapabilityPackageConfig,
+)
 from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord
 from reuleauxcoder.domain.session.document import apply_session_event
 
@@ -64,6 +67,28 @@ def _wait_for(predicate, *, timeout_sec: float = 3.0):
             return value
         time.sleep(0.02)
     raise AssertionError("timed out waiting for condition")
+
+
+def test_capability_package_state_keeps_activation_active_when_mcp_runtime_failed() -> None:
+    package = CapabilityPackageConfig.from_dict(
+        "github-mcp",
+        {
+            "name": "GitHub MCP",
+            "enabled": True,
+            "status": "installed",
+            "state": {
+                "install_state": "installed",
+                "activation_state": "active",
+                "runtime_state": "failed",
+                "check_state": "passed",
+            },
+        },
+    ).to_dict()
+
+    assert package["state"]["install_state"] == "installed"
+    assert package["state"]["activation_state"] == "active"
+    assert package["state"]["runtime_state"] == "failed"
+    assert package["state"]["check_state"] == "passed"
 
 
 def _append_raw_agent_run_event(

@@ -46,6 +46,9 @@ from reuleauxcoder.domain.agent_runtime.models import (
     TriggerMode,
     WorktreeRole,
 )
+from reuleauxcoder.domain.capability_packages import (
+    package_managed_component_enabled,
+)
 from reuleauxcoder.domain.hooks.lifecycle import sanitize_lifecycle_hooks_for_config
 from reuleauxcoder.domain.config.models import (
     DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
@@ -971,6 +974,11 @@ class CapabilityPackageInstaller:
         )
         component_ids: list[str] = []
         installed_component_footprints: list[dict[str, Any]] = []
+        owner_projection_packages = dict(packages)
+        owner_projection_packages[resolved_package_id] = {
+            "enabled": False,
+            "status": "installed",
+        }
         for component in component_specs:
             existing_raw = components.get(component.id)
             if isinstance(existing_raw, dict):
@@ -996,6 +1004,11 @@ class CapabilityPackageInstaller:
                 component.package_ids = _unique_strings(
                     [*component.package_ids, resolved_package_id]
                 )
+            component.enabled = package_managed_component_enabled(
+                package_ids=component.package_ids,
+                packages=owner_projection_packages,
+                default=False,
+            )
             components[component.id] = component.to_dict()
             component_ids.append(component.id)
             installed_component_footprints.append(component.runtime_footprint)
@@ -1007,13 +1020,15 @@ class CapabilityPackageInstaller:
             description=draft.description,
             source=draft.source,
             components=_unique_strings(component_ids),
-            enabled=True,
+            enabled=False,
             status="installed",
             install_plan=draft.install_plan,
             usage=draft.usage,
             effective_capabilities=draft.effective_capabilities,
             evidence=draft.evidence,
             credentials=draft.credentials,
+            credential_requirements=draft.credential_requirements,
+            credential_bindings=draft.credential_bindings,
             risk_level=draft.risk_level,
             notes=draft.notes,
             runtime_footprint=aggregate_runtime_footprint(installed_component_footprints),
@@ -1230,6 +1245,8 @@ class CapabilityPackageInstaller:
         component: CapabilityComponentConfig,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        # Compatibility bridge for legacy drafts that embed one SKILL.md body.
+        # Manifest-based bundle installs are assembled by capability_package_artifacts.
         content = _skill_content_from_payload(payload)
         if not content:
             raise CapabilityPackageIngestError(
