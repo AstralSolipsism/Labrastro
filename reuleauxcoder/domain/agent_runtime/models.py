@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from reuleauxcoder.domain.capability_packages import (
+    CapabilityCredentialBinding,
+    CapabilityCredentialRequirement,
+    capability_package_is_active,
+    capability_package_state_projection,
+)
 from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     resolve_environment_requirement_kind,
@@ -404,6 +410,7 @@ class CapabilityComponentConfig:
             result["source_path"] = self.source_path
         if self.hooks:
             result["hooks"] = [dict(item) for item in self.hooks]
+        result["state"] = capability_package_state_projection(result)
         return result
 
 
@@ -422,6 +429,8 @@ class CapabilityPackageDraft:
     effective_capabilities: list[str] = field(default_factory=list)
     evidence: list[dict[str, str]] = field(default_factory=list)
     credentials: list[str] = field(default_factory=list)
+    credential_requirements: list[dict[str, Any]] = field(default_factory=list)
+    credential_bindings: list[dict[str, Any]] = field(default_factory=list)
     risk_level: str = ""
     notes: list[str] = field(default_factory=list)
     hooks: list[dict[str, Any]] = field(default_factory=list)
@@ -445,6 +454,20 @@ class CapabilityPackageDraft:
             effective_capabilities=_string_list(data.get("effective_capabilities", [])),
             evidence=_string_dict_list(data.get("evidence", [])),
             credentials=_string_list(data.get("credentials", [])),
+            credential_requirements=[
+                item.to_dict()
+                for item in (
+                    CapabilityCredentialRequirement.from_dict(raw_item)
+                    for raw_item in _dict_list(data.get("credential_requirements", []))
+                )
+            ],
+            credential_bindings=[
+                item.to_dict()
+                for item in (
+                    CapabilityCredentialBinding.from_dict(raw_item)
+                    for raw_item in _dict_list(data.get("credential_bindings", []))
+                )
+            ],
             risk_level=str(data.get("risk_level", "") or ""),
             notes=_string_list(data.get("notes", [])),
             hooks=_dict_list(data.get("hooks", [])),
@@ -464,6 +487,12 @@ class CapabilityPackageDraft:
             "effective_capabilities": list(self.effective_capabilities),
             "evidence": [dict(item) for item in self.evidence],
             "credentials": list(self.credentials),
+            "credential_requirements": [
+                dict(item) for item in self.credential_requirements
+            ],
+            "credential_bindings": [
+                dict(item) for item in self.credential_bindings
+            ],
             "risk_level": self.risk_level,
             "notes": list(self.notes),
             "hooks": [dict(item) for item in self.hooks],
@@ -486,11 +515,20 @@ class CapabilityPackageConfig:
     effective_capabilities: list[str] = field(default_factory=list)
     evidence: list[dict[str, str]] = field(default_factory=list)
     credentials: list[str] = field(default_factory=list)
+    credential_requirements: list[dict[str, Any]] = field(default_factory=list)
+    credential_bindings: list[dict[str, Any]] = field(default_factory=list)
     risk_level: str = ""
     execution_policy: str = "inherit"
     generated_by: str = "capability_packager"
     notes: list[str] = field(default_factory=list)
     runtime_footprint: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict)
+    source_snapshot: dict[str, Any] = field(default_factory=dict)
+    manifest: dict[str, Any] = field(default_factory=dict)
+    update_candidate: dict[str, Any] = field(default_factory=dict)
+    rollback: dict[str, Any] = field(default_factory=dict)
+    upstream_version: str = ""
+    last_update: dict[str, Any] = field(default_factory=dict)
     hooks: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -524,6 +562,20 @@ class CapabilityPackageConfig:
             effective_capabilities=_string_list(data.get("effective_capabilities", [])),
             evidence=_string_dict_list(data.get("evidence", [])),
             credentials=_string_list(data.get("credentials", [])),
+            credential_requirements=[
+                item.to_dict()
+                for item in (
+                    CapabilityCredentialRequirement.from_dict(raw_item)
+                    for raw_item in _dict_list(data.get("credential_requirements", []))
+                )
+            ],
+            credential_bindings=[
+                item.to_dict()
+                for item in (
+                    CapabilityCredentialBinding.from_dict(raw_item)
+                    for raw_item in _dict_list(data.get("credential_bindings", []))
+                )
+            ],
             risk_level=str(data.get("risk_level", "") or ""),
             execution_policy=_choice(
                 data.get("execution_policy"),
@@ -535,6 +587,23 @@ class CapabilityPackageConfig:
             runtime_footprint=normalize_runtime_footprint(
                 data.get("runtime_footprint", {}),
             ),
+            state=dict(data.get("state") or {}) if isinstance(data.get("state"), dict) else {},
+            source_snapshot=dict(data.get("source_snapshot") or {})
+            if isinstance(data.get("source_snapshot"), dict)
+            else {},
+            manifest=dict(data.get("manifest") or {})
+            if isinstance(data.get("manifest"), dict)
+            else {},
+            update_candidate=dict(data.get("update_candidate") or {})
+            if isinstance(data.get("update_candidate"), dict)
+            else {},
+            rollback=dict(data.get("rollback") or {})
+            if isinstance(data.get("rollback"), dict)
+            else {},
+            upstream_version=str(data.get("upstream_version") or ""),
+            last_update=dict(data.get("last_update") or {})
+            if isinstance(data.get("last_update"), dict)
+            else {},
             hooks=_dict_list(data.get("hooks", [])),
         )
 
@@ -560,6 +629,14 @@ class CapabilityPackageConfig:
             result["evidence"] = [dict(item) for item in self.evidence]
         if self.credentials:
             result["credentials"] = list(self.credentials)
+        if self.credential_requirements:
+            result["credential_requirements"] = [
+                dict(item) for item in self.credential_requirements
+            ]
+        if self.credential_bindings:
+            result["credential_bindings"] = [
+                dict(item) for item in self.credential_bindings
+            ]
         if self.risk_level:
             result["risk_level"] = self.risk_level
         if self.execution_policy and self.execution_policy != "inherit":
@@ -567,8 +644,23 @@ class CapabilityPackageConfig:
         if self.notes:
             result["notes"] = list(self.notes)
         result["runtime_footprint"] = dict(self.runtime_footprint)
+        if self.state:
+            result["state"] = dict(self.state)
+        if self.source_snapshot:
+            result["source_snapshot"] = dict(self.source_snapshot)
+        if self.manifest:
+            result["manifest"] = dict(self.manifest)
+        if self.update_candidate:
+            result["update_candidate"] = dict(self.update_candidate)
+        if self.rollback:
+            result["rollback"] = dict(self.rollback)
+        if self.upstream_version:
+            result["upstream_version"] = self.upstream_version
+        if self.last_update:
+            result["last_update"] = dict(self.last_update)
         if self.hooks:
             result["hooks"] = [dict(item) for item in self.hooks]
+        result["state"] = capability_package_state_projection(result)
         return result
 
 
@@ -655,7 +747,7 @@ def resolve_capability_refs(
     component_map = components or {}
     for package_id in capability_refs:
         package = packages.get(package_id)
-        if package is None or not package.enabled:
+        if package is None or not capability_package_is_active(package.to_dict()):
             continue
         package_dict = package.to_dict()
         package_dict["id"] = package.id

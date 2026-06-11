@@ -572,7 +572,7 @@ def test_agent_effective_capability_scope_excludes_disabled_package_runtime_reso
                 "agents": {
                     "reviewer": {
                         "runtime_profile": "agent_remote",
-                        "capability_refs": ["review", "disabled-review"],
+                        "capability_refs": ["review", "disabled-review", "inactive-review"],
                     }
                 }
             },
@@ -591,6 +591,14 @@ def test_agent_effective_capability_scope_excludes_disabled_package_runtime_reso
                         "mcp:disabled-github",
                         "skill:disabled-review",
                         "envreq:executable:disabled-gh",
+                    ],
+                },
+                "inactive-review": {
+                    "enabled": True,
+                    "status": "installed",
+                    "state": {"activation_state": "inactive"},
+                    "components": [
+                        "skill:inactive-review",
                     ],
                 },
             },
@@ -622,6 +630,13 @@ def test_agent_effective_capability_scope_excludes_disabled_package_runtime_reso
                         "path_hint": "/srv/skills/packages/disabled-review/disabled-review/SKILL.md"
                     },
                 },
+                "skill:inactive-review": {
+                    "kind": "skill",
+                    "name": "inactive-review",
+                    "config": {
+                        "path_hint": "/srv/skills/packages/inactive-review/inactive-review/SKILL.md"
+                    },
+                },
                 "envreq:executable:disabled-gh": {
                     "kind": "environment_requirement",
                     "name": "disabled-gh",
@@ -641,6 +656,9 @@ def test_agent_effective_capability_scope_excludes_disabled_package_runtime_reso
                     },
                     "disabled-review": {
                         "path_hint": "/srv/skills/packages/disabled-review/disabled-review/SKILL.md"
+                    },
+                    "inactive-review": {
+                        "path_hint": "/srv/skills/packages/inactive-review/inactive-review/SKILL.md"
                     },
                 }
             },
@@ -667,9 +685,13 @@ def test_agent_effective_capability_scope_excludes_disabled_package_runtime_reso
     assert list(scope.skills.items) == ["code-review"]
     assert list(scope.environment.requirements) == ["envreq:executable:gh"]
     assert "disabled-review" not in scope.capability_catalog
+    assert "inactive-review" not in scope.capability_catalog
     catalog = build_capability_catalog(config, agent_id="reviewer")
     assert "`review`" in catalog
     assert "disabled-review" not in catalog
+    assert "inactive-review" not in catalog
+    fallback_catalog = build_capability_catalog(config)
+    assert "inactive-review" not in fallback_catalog
 
 
 def test_agent_run_snapshot_keeps_worker_capabilities_separate_from_main_chat() -> None:

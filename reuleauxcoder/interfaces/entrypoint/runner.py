@@ -27,6 +27,7 @@ from reuleauxcoder.domain.config.models import (
     DEFAULT_MAIN_CHAT_AGENT_ID,
     resolve_agent_effective_capability_scope,
 )
+from reuleauxcoder.domain.capability_packages import capability_package_is_active
 from reuleauxcoder.domain.hooks import (
     HookPoint,
     RunnerShutdownContext,
@@ -74,7 +75,10 @@ def build_capability_catalog(config: Config, agent_id: str = "") -> str:
     lines: list[str] = []
     components = config.capability_components
     for package_id, package in sorted(config.capability_packages.items()):
-        if not package.enabled or package_id == "environment":
+        if (
+            not capability_package_is_active(package.to_dict())
+            or package_id == "environment"
+        ):
             continue
         title = package.name or package_id
         description = f" - {package.description}" if package.description else ""

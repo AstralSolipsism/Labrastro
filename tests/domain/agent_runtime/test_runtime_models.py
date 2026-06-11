@@ -263,6 +263,39 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert "permissions" not in resolved["packages"][1]
 
 
+def test_resolve_capability_refs_uses_activation_state_not_enabled_only() -> None:
+    models = _models()
+    components = {
+        "skill:review": models.CapabilityComponentConfig.from_dict(
+            "skill:review",
+            {
+                "kind": "skill",
+                "name": "review",
+                "enabled": True,
+                "config": {"path_hint": "/skills/review"},
+            },
+        )
+    }
+    packages = {
+        "review": models.CapabilityPackageConfig.from_dict(
+            "review",
+            {
+                "enabled": True,
+                "status": "installed",
+                "state": {"activation_state": "inactive"},
+                "components": ["skill:review"],
+            },
+        )
+    }
+
+    resolved = models.resolve_capability_refs(["review"], packages, components)
+
+    assert resolved["packages"] == []
+    assert resolved["components"] == []
+    assert resolved["skills"] == []
+    assert resolved["capability_overlay"]["component_ids"] == []
+
+
 def test_task_and_artifact_status_are_independent() -> None:
     models = _models()
 
