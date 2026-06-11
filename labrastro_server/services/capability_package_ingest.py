@@ -322,6 +322,10 @@ def _is_draft_field_path(field_path: str) -> bool:
         "runtime_footprint",
         "hooks",
         "materialization_plan",
+        "manifest_candidate",
+        "open_findings",
+        "target_placement_proposals",
+        "exposed_path_candidates",
     }
 
 

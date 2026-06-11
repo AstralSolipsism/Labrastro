@@ -163,6 +163,48 @@ def test_assembler_records_repo_summary_patch_without_draft_ready() -> None:
     assert "contributions" in result.missing_fields
 
 
+def test_assembler_retains_manifest_candidate_and_open_finding_patches() -> None:
+    result = CapabilityDraftAssembler().assemble(
+        source_bundle=_source_bundle(),
+        patches=[
+            CapabilityDraftFieldPatch(
+                field_path="manifest_candidate",
+                value={"components": [{"id": "skill:waza/read"}]},
+            ),
+            CapabilityDraftFieldPatch(
+                field_path="open_findings",
+                value={
+                    "unclassified_requirements": [
+                        {"observed": "pip install html2text"}
+                    ]
+                },
+            ),
+            CapabilityDraftFieldPatch(
+                field_path="target_placement_proposals",
+                value=[{"component_id": "skill:waza/read", "target": "server"}],
+            ),
+            CapabilityDraftFieldPatch(
+                field_path="exposed_path_candidates",
+                value=[{"component_id": "skill:waza/read", "path": "references/a.md"}],
+            ),
+        ],
+    )
+
+    assert result.draft is None
+    assert result.field_state["manifest_candidate"]["value"] == {
+        "components": [{"id": "skill:waza/read"}]
+    }
+    assert result.field_state["open_findings"]["value"] == {
+        "unclassified_requirements": [{"observed": "pip install html2text"}]
+    }
+    assert result.field_state["target_placement_proposals"]["value"] == [
+        {"component_id": "skill:waza/read", "target": "server"}
+    ]
+    assert result.field_state["exposed_path_candidates"]["value"] == [
+        {"component_id": "skill:waza/read", "path": "references/a.md"}
+    ]
+
+
 def test_assembler_builds_compatible_draft_from_field_patches() -> None:
     result = CapabilityDraftAssembler().assemble(
         source_bundle=_source_bundle(),
