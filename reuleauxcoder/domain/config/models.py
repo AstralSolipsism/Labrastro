@@ -13,6 +13,10 @@ from reuleauxcoder.domain.agent_runtime.models import (
     RuntimeProfileConfig,
     resolve_capability_refs,
 )
+from reuleauxcoder.domain.capability_packages import (
+    capability_package_is_active,
+    capability_package_state_projection,
+)
 from reuleauxcoder.domain.environment_requirements import (
     EnvironmentPlacement,
     environment_requirement_name_from_id,
@@ -2748,14 +2752,17 @@ def _validate_lifecycle_hooks_for_config(config: Config) -> list[str]:
         )
 
     for package_id, package in config.capability_packages.items():
+        package_data = package.to_dict()
+        package_state = capability_package_state_projection(package_data)
         errors.extend(
             _validate_owner_lifecycle_hooks(
                 prefix=f"capability_packages.{package_id}.hooks",
                 owner_id=package.id or package_id,
                 source="capability_package",
                 hooks=package.hooks,
-                owner_enabled=package.enabled,
+                owner_enabled=capability_package_is_active(package_data),
                 owner_status=package.status,
+                owner_activation_state=package_state.get("activation_state", "active"),
             )
         )
 
@@ -2782,6 +2789,7 @@ def _validate_owner_lifecycle_hooks(
     hooks: list[dict[str, Any]],
     owner_enabled: bool,
     owner_status: str,
+    owner_activation_state: str = "active",
 ) -> list[str]:
     try:
         lifecycle_declarations_from_config_hooks(
@@ -2790,6 +2798,7 @@ def _validate_owner_lifecycle_hooks(
             hooks=hooks,
             owner_enabled=owner_enabled,
             owner_status=owner_status,
+            owner_activation_state=owner_activation_state,
         )
     except Exception as exc:
         return [f"{prefix}: {exc}"]

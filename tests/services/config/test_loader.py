@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
+from reuleauxcoder.domain.config import models as config_models
 from reuleauxcoder.domain.config.models import (
     DIAGNOSTICS_CONFIG_FIELDS,
     LLM_TRACE_DIAGNOSTICS_CONFIG_FIELDS,
@@ -619,6 +620,49 @@ def test_parse_config_validates_public_lifecycle_hook_contract_fields() -> None:
     assert items["hook:mcp_server:mcp_server:github:PermissionRequest:0"][
         "handler_type"
     ] == "agent"
+
+
+def test_config_validate_projects_capability_package_hook_activation_state(monkeypatch) -> None:
+    calls: list[dict] = []
+    original = config_models.lifecycle_declarations_from_config_hooks
+
+    def spy_lifecycle_declarations_from_config_hooks(**kwargs):
+        if kwargs.get("source") == "capability_package":
+            calls.append(dict(kwargs))
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        config_models,
+        "lifecycle_declarations_from_config_hooks",
+        spy_lifecycle_declarations_from_config_hooks,
+    )
+    config = ConfigLoader()._parse_config(
+        {
+            "capability_packages": {
+                "review": {
+                    "enabled": True,
+                    "status": "installed",
+                    "state": {"activation_state": "inactive"},
+                    "hooks": [
+                        {
+                            "event": "UserPromptSubmit",
+                            "placement": "server",
+                            "handler_type": "prompt",
+                            "handler_ref": "review",
+                            "display_name": "Review prompt guard",
+                            "summary": "Checks review prompts.",
+                            "permissions": [],
+                        }
+                    ],
+                }
+            }
+        }
+    )
+
+    assert config.validate() == []
+    assert calls
+    assert calls[0]["owner_enabled"] is False
+    assert calls[0]["owner_activation_state"] == "inactive"
 
 
 def test_parse_config_rejects_internal_lifecycle_handler_from_user_config() -> None:
