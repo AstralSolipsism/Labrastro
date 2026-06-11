@@ -804,8 +804,8 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
                                 index=0,
                                 id="call_1",
                                 function=SimpleNamespace(
-                                    name="write_file",
-                                    arguments='{"file_path":"demo.md",',
+                                    name="apply_patch",
+                                    arguments='{"patch":"*** Begin Patch',
                                 ),
                             )
                         ],
@@ -828,7 +828,7 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
                                 id=None,
                                 function=SimpleNamespace(
                                     name=None,
-                                    arguments='"content":"hello"}',
+                                    arguments='\\n*** End Patch"}',
                                 ),
                             )
                         ],
@@ -848,10 +848,9 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
         )
     )
 
-    assert response.tool_calls[0].name == "write_file"
+    assert response.tool_calls[0].name == "apply_patch"
     assert response.tool_calls[0].arguments == {
-        "file_path": "demo.md",
-        "content": "hello",
+        "patch": "*** Begin Patch\n*** End Patch",
     }
     assert response.tool_calls[0].argument_error is None
     assert response.provider_extra["tool_argument_diagnostics"] == []
@@ -861,7 +860,7 @@ def test_chat_provider_parses_streaming_tool_arguments_across_chunks() -> None:
         response.provider_extra["debug_raw_stream_chunks"][0]["choices"][0]["delta"][
             "tool_calls"
         ][0]["function"]["arguments"]
-        == '{"file_path":"demo.md",'
+        == '{"patch":"*** Begin Patch'
     )
 
 
@@ -983,7 +982,7 @@ def test_chat_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
                                 index=0,
                                 id="call_1",
                                 function=SimpleNamespace(
-                                    name="write_file",
+                                    name="apply_patch",
                                     arguments="",
                                 ),
                             )
@@ -1003,7 +1002,7 @@ def test_chat_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
     assert response.tool_calls[0].arguments == {}
     assert response.tool_calls[0].argument_error == "missing tool arguments"
     assert response.diagnostics[0].code == "invalid_tool_arguments"
-    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "write_file"
+    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "apply_patch"
 
 
 def test_chat_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
@@ -1024,8 +1023,8 @@ def test_chat_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
                                 index=0,
                                 id="call_1",
                                 function=SimpleNamespace(
-                                    name="write_file",
-                                    arguments='{"file_path":',
+                                    name="apply_patch",
+                                    arguments='{"patch":',
                                 ),
                             )
                         ],
@@ -1045,7 +1044,7 @@ def test_chat_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
     assert response.tool_calls[0].argument_error == "invalid JSON arguments: Expecting value"
     diagnostic = response.provider_extra["tool_argument_diagnostics"][0]
     assert diagnostic["code"] == "invalid_tool_arguments"
-    assert diagnostic["raw_arguments"] == '{"file_path":'
+    assert diagnostic["raw_arguments"] == '{"patch":'
 
 
 def test_responses_provider_marks_invalid_tool_arguments_as_diagnostic() -> None:
@@ -1059,8 +1058,8 @@ def test_responses_provider_marks_invalid_tool_arguments_as_diagnostic() -> None
                 type="function_call",
                 id="item_1",
                 call_id="call_1",
-                name="write_file",
-                arguments='{"file_path":',
+                name="apply_patch",
+                arguments='{"patch":',
             ),
         ),
         SimpleNamespace(
@@ -1092,7 +1091,7 @@ def test_anthropic_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
             content_block=SimpleNamespace(
                 type="tool_use",
                 id="call_1",
-                name="write_file",
+                name="apply_patch",
             ),
         )
     ]
@@ -1112,12 +1111,12 @@ def test_anthropic_provider_marks_empty_tool_arguments_as_diagnostic() -> None:
 
     assert response.tool_calls[0].argument_error == "missing tool arguments"
     assert response.diagnostics[0].code == "invalid_tool_arguments"
-    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "write_file"
+    assert response.provider_extra["tool_argument_diagnostics"][0]["tool_name"] == "apply_patch"
     assert deltas == [
         {
             "index": 0,
             "tool_call_id": "call_1",
-            "tool_name": "write_file",
+            "tool_name": "apply_patch",
             "arguments_delta": "",
             "arguments_preview": "",
             "status": "preparing",

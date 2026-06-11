@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import queue
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -78,6 +80,20 @@ class ProviderStreamInterruptedError(RuntimeError):
         self.__cause__ = original_error
 
 
+@dataclass(frozen=True, slots=True)
+class StreamLivenessLimits:
+    wall_time_sec: float = 600.0
+    idle_time_sec: float = 120.0
+
+
+class StreamLivenessError(TimeoutError):
+    """Raised when a provider stream violates runtime liveness limits."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def attach_stream_exception_diagnostics(
     exc: Exception,
     *,
@@ -126,6 +142,7 @@ class StreamSupervisor:
         attempts: list[dict[str, Any]] | None = None,
         stream_options_enabled: bool | None = None,
         debug_http_chunks: list[dict[str, Any]] | None = None,
+        liveness_limits: StreamLivenessLimits | None = None,
     ) -> None:
         self.provider_id = provider_id
         self.provider_type = provider_type
@@ -134,6 +151,7 @@ class StreamSupervisor:
         self.attempts = attempts
         self.stream_options_enabled = stream_options_enabled
         self.debug_http_chunks = debug_http_chunks
+        self.liveness_limits = liveness_limits or StreamLivenessLimits()
         self.phase = "stream_start"
         self.chunk_count = 0
         self.started_at = time.time()
@@ -146,7 +164,7 @@ class StreamSupervisor:
     ) -> None:
         try:
             self.phase = "stream_iterate"
-            for chunk_index, chunk in enumerate(stream):
+            for chunk_index, chunk in self._iter_with_liveness(stream):
                 self.chunk_count = chunk_index + 1
                 self.last_event_at = time.time()
                 decoder(chunk_index, chunk)
@@ -182,6 +200,69 @@ class StreamSupervisor:
                 interruption=interruption,
             ) from exc
 
+    def _iter_with_liveness(self, stream: Iterable[Any]) -> Iterable[tuple[int, Any]]:
+        events: queue.Queue[tuple[str, int | None, Any]] = queue.Queue(maxsize=1)
+        stop_requested = threading.Event()
+
+        def _producer() -> None:
+            try:
+                for index, chunk in enumerate(stream):
+                    if stop_requested.is_set():
+                        break
+                    _put_stream_event(events, stop_requested, ("chunk", index, chunk))
+                _put_stream_event(events, stop_requested, ("done", None, None))
+            except BaseException as exc:
+                _put_stream_event(events, stop_requested, ("error", None, exc))
+
+        producer = threading.Thread(
+            target=_producer,
+            name=f"provider-stream-{self.provider_id}",
+            daemon=True,
+        )
+        producer.start()
+        try:
+            while True:
+                self._check_wall_time()
+                timeout = self._next_wait_timeout()
+                try:
+                    kind, index, value = events.get(timeout=timeout)
+                except queue.Empty:
+                    self._check_idle_time(force=True)
+                    continue
+                if kind == "done":
+                    return
+                if kind == "error":
+                    raise value
+                self._check_idle_time(force=False)
+                yield int(index or 0), value
+        finally:
+            stop_requested.set()
+            _close_stream(stream)
+
+    def _next_wait_timeout(self) -> float:
+        now = time.time()
+        wall_remaining = self.liveness_limits.wall_time_sec - (now - self.started_at)
+        last_event = self.last_event_at or self.started_at
+        idle_remaining = self.liveness_limits.idle_time_sec - (now - last_event)
+        return max(0.001, min(0.5, wall_remaining, idle_remaining))
+
+    def _check_wall_time(self) -> None:
+        elapsed = time.time() - self.started_at
+        if elapsed > self.liveness_limits.wall_time_sec:
+            raise StreamLivenessError(
+                f"provider stream exceeded wall time limit ({self.liveness_limits.wall_time_sec:.0f}s)",
+                code="stream_wall_time_limit",
+            )
+
+    def _check_idle_time(self, *, force: bool) -> None:
+        last_event = self.last_event_at or self.started_at
+        idle = time.time() - last_event
+        if force and idle > self.liveness_limits.idle_time_sec:
+            raise StreamLivenessError(
+                f"provider stream idle for {idle:.0f}s without events",
+                code="stream_idle_timeout",
+            )
+
     def _interruption_payload(
         self, exc: Exception, partial: ProviderResponse
     ) -> dict[str, Any]:
@@ -203,6 +284,7 @@ class StreamSupervisor:
             "retry_action": retry_action,
             "error_type": type(exc).__name__,
             "message": str(exc),
+            "code": getattr(exc, "code", None),
             "last_event_at": self.last_event_at,
             "duration_ms": int((time.time() - self.started_at) * 1000),
         }
@@ -223,3 +305,25 @@ def _partial_kind(partial: ProviderResponse) -> str:
     if partial.prompt_tokens or partial.completion_tokens or partial.usage_extra:
         return "usage"
     return "empty"
+
+
+def _put_stream_event(
+    events: queue.Queue[tuple[str, int | None, Any]],
+    stop_requested: threading.Event,
+    event: tuple[str, int | None, Any],
+) -> None:
+    while not stop_requested.is_set():
+        try:
+            events.put(event, timeout=0.1)
+            return
+        except queue.Full:
+            continue
+
+
+def _close_stream(stream: Iterable[Any]) -> None:
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
