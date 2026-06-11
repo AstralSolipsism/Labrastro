@@ -37,6 +37,797 @@ class FailingCommitAdminManager(MemoryAdminManager):
         )
 
 
+def test_accept_capability_package_installs_without_activation(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+
+    result = manager.accept_capability_package_draft(
+        {
+            "package_id": "review",
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+
+    assert result.ok is True
+    package = result.payload["capability_package"]
+    assert package["state"]["install_state"] in {"materialized", "installed"}
+    assert package["state"]["activation_state"] == "inactive"
+    assert manager.data["capability_packages"]["review"]["enabled"] is False
+    assert manager.data["capability_components"]["skill:code-review"]["enabled"] is False
+    assert manager.data["skills"]["items"]["code-review"]["enabled"] is False
+
+    enabled = manager.enable_capability_package(
+        {"package_id": "review", "enabled": True}
+    )
+
+    assert enabled.ok is True
+    assert manager.data["capability_packages"]["review"]["enabled"] is True
+    assert manager.data["capability_components"]["skill:code-review"]["enabled"] is True
+    assert manager.data["skills"]["items"]["code-review"]["enabled"] is True
+
+
+def test_accept_capability_package_rolls_back_config_when_skill_file_write_fails(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    (tmp_path / "skills").write_text("not a directory", encoding="utf-8")
+
+    result = manager.accept_capability_package_draft(
+        {
+            "package_id": "review",
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+
+    assert result.ok is False
+    assert result.payload["error"] == "capability_package_skill_file_operation_failed"
+    assert manager.data.get("capability_packages", {}) == {}
+    assert manager.data.get("capability_components", {}) == {}
+    assert manager.data.get("skills", {}).get("items", {}) == {}
+
+
+def test_disable_capability_package_keeps_shared_component_active_for_other_owner(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    skill_content = (
+        "---\n"
+        "name: shared-review\n"
+        "description: Shared review skill.\n"
+        "---\n"
+        "Review.\n"
+    )
+    manager.data = {
+        "capability_packages": {
+            "review-a": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"activation_state": "active"},
+                "components": ["skill:shared-review"],
+            },
+            "review-b": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"activation_state": "active"},
+                "components": ["skill:shared-review"],
+            },
+        },
+        "capability_components": {
+            "skill:shared-review": {
+                "id": "skill:shared-review",
+                "kind": "skill",
+                "name": "shared-review",
+                "enabled": True,
+                "status": "installed",
+                "managed_by": "capability_package",
+                "package_ids": ["review-a", "review-b"],
+                "config": {"skill_content": skill_content},
+            }
+        },
+        "skills": {
+            "items": {
+                "shared-review": {
+                    "name": "shared-review",
+                    "enabled": True,
+                    "managed_by": "capability_package",
+                    "component_id": "skill:shared-review",
+                    "package_ids": ["review-a", "review-b"],
+                }
+            }
+        },
+    }
+
+    disabled_a = manager.enable_capability_package(
+        {"package_id": "review-a", "enabled": False}
+    )
+
+    assert disabled_a.ok is True
+    assert manager.data["capability_components"]["skill:shared-review"]["enabled"] is True
+    assert manager.data["skills"]["items"]["shared-review"]["enabled"] is True
+
+    disabled_b = manager.enable_capability_package(
+        {"package_id": "review-b", "enabled": False}
+    )
+
+    assert disabled_b.ok is True
+    assert manager.data["capability_components"]["skill:shared-review"]["enabled"] is False
+    assert manager.data["skills"]["items"]["shared-review"]["enabled"] is False
+
+
+def test_prepare_capability_package_update_records_candidate_without_activation(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {
+                    "snapshot_id": "snap-old",
+                    "source_ref": "main",
+                    "commit_sha": "1111111",
+                },
+                "manifest": {"components": [{"id": "skill:waza/read"}]},
+                "components": ["skill:waza/read"],
+            }
+        }
+    }
+
+    result = manager.prepare_capability_package_update(
+        {
+            "package_id": "waza",
+            "candidate_snapshot": {
+                "snapshot_id": "snap-new",
+                "source_ref": "main",
+                "commit_sha": "2222222",
+            },
+            "candidate_manifest": {
+                "components": [
+                    {"id": "skill:waza/read"},
+                    {"id": "skill:waza/write"},
+                ]
+            },
+        }
+    )
+
+    assert result.ok is True
+    package = manager.data["capability_packages"]["waza"]
+    assert package["enabled"] is True
+    assert package["state"]["activation_state"] == "active"
+    assert package["state"]["update_state"] == "candidate_ready"
+    assert package["update_candidate"]["upstream_version"] == "main@2222222"
+    assert package["update_candidate"]["manifest_diff"]["added_components"] == [
+        "skill:waza/write"
+    ]
+
+
+def test_prepare_capability_package_update_accepts_alias_payload(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {
+                    "snapshot_id": "snap-old",
+                    "source_ref": "main",
+                    "commit_sha": "1111111",
+                },
+                "manifest": {"components": [{"id": "skill:waza/read"}]},
+                "components": ["skill:waza/read"],
+            }
+        }
+    }
+
+    result = manager.prepare_capability_package_update(
+        {
+            "package_id": "waza",
+            "source_snapshot": {
+                "id": "snap-new",
+                "ref": "main",
+                "sha": "2222222",
+                "tag": "v2.0.0",
+            },
+            "manifest": {
+                "components": [
+                    {"id": "skill:waza/read"},
+                    {"id": "skill:waza/write"},
+                ]
+            },
+            "update_candidate_id": "cand-alias",
+        }
+    )
+
+    assert result.ok is True
+    package = manager.data["capability_packages"]["waza"]
+    assert package["enabled"] is True
+    candidate = package["update_candidate"]
+    assert candidate["candidate_id"] == "cand-alias"
+    assert candidate["upstream_version"] == "v2.0.0"
+    assert candidate["source_snapshot"]["snapshot_id"] == "snap-new"
+    assert candidate["source_snapshot"]["source_ref"] == "main"
+    assert candidate["source_snapshot"]["commit_sha"] == "2222222"
+    assert candidate["manifest_diff"]["added_components"] == ["skill:waza/write"]
+    assert package["state"]["activation_state"] == "active"
+    assert package["state"]["update_state"] == "candidate_ready"
+
+
+def test_apply_capability_package_update_candidate_does_not_auto_activate(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    old_content = "---\nname: waza-read\ndescription: Read Waza.\n---\nRead.\n"
+    new_content = "---\nname: waza-write\ndescription: Write Waza.\n---\nWrite.\n"
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {"snapshot_id": "snap-old"},
+                "manifest": {
+                    "components": [
+                        {
+                            "id": "skill:waza/read",
+                            "kind": "skill",
+                            "name": "waza-read",
+                            "config": {"skill_content": old_content},
+                        }
+                    ]
+                },
+                "update_candidate": {
+                    "candidate_id": "cand-1",
+                    "source_snapshot": {
+                        "snapshot_id": "snap-new",
+                        "source_ref": "main",
+                        "commit_sha": "2222222",
+                    },
+                    "manifest": {
+                        "components": [
+                            {
+                                "id": "skill:waza/write",
+                                "kind": "skill",
+                                "name": "waza-write",
+                                "config": {"skill_content": new_content},
+                            }
+                        ]
+                    },
+                    "manifest_diff": {
+                        "added_components": ["skill:waza/write"],
+                        "removed_components": ["skill:waza/read"],
+                    },
+                    "upstream_version": "main@2222222",
+                    "rollback_snapshot_id": "snap-old",
+                    "rollback_source_snapshot": {"snapshot_id": "snap-old"},
+                    "rollback_manifest": {
+                        "components": [
+                            {
+                                "id": "skill:waza/read",
+                                "kind": "skill",
+                                "name": "waza-read",
+                                "config": {"skill_content": old_content},
+                            }
+                        ]
+                    },
+                },
+            }
+        }
+    }
+
+    result = manager.apply_capability_package_update(
+        {"package_id": "waza", "activation_approved": False}
+    )
+
+    assert result.ok is True
+    package = manager.data["capability_packages"]["waza"]
+    assert package["enabled"] is False
+    assert package["components"] == ["skill:waza/write"]
+    assert package["state"]["activation_state"] == "inactive"
+    assert package["state"]["update_state"] == "rollback_available"
+    assert package["rollback"]["snapshot_id"] == "snap-old"
+
+
+def test_apply_capability_package_update_converges_materialized_resources(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    old_content = (
+        "---\n"
+        "name: waza-read\n"
+        "description: Read Waza.\n"
+        "---\n"
+        "Read.\n"
+    )
+    new_content = (
+        "---\n"
+        "name: waza-write\n"
+        "description: Write Waza.\n"
+        "---\n"
+        "Write.\n"
+    )
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"activation_state": "active"},
+                "source_snapshot": {"snapshot_id": "snap-old"},
+                "manifest": {
+                    "components": [
+                        {
+                            "id": "skill:waza-read",
+                            "kind": "skill",
+                            "name": "waza-read",
+                            "config": {"skill_content": old_content},
+                        }
+                    ]
+                },
+                "components": ["skill:waza-read"],
+                "update_candidate": {
+                    "candidate_id": "cand-1",
+                    "source_snapshot": {"snapshot_id": "snap-new"},
+                    "manifest": {
+                        "components": [
+                            {
+                                "id": "skill:waza-write",
+                                "kind": "skill",
+                                "name": "waza-write",
+                                "config": {"skill_content": new_content},
+                            }
+                        ]
+                    },
+                    "manifest_diff": {
+                        "added_components": ["skill:waza-write"],
+                        "removed_components": ["skill:waza-read"],
+                    },
+                    "rollback_snapshot_id": "snap-old",
+                    "rollback_source_snapshot": {"snapshot_id": "snap-old"},
+                    "rollback_manifest": {
+                        "components": [
+                            {
+                                "id": "skill:waza-read",
+                                "kind": "skill",
+                                "name": "waza-read",
+                                "config": {"skill_content": old_content},
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+        "capability_components": {
+            "skill:waza-read": {
+                "id": "skill:waza-read",
+                "kind": "skill",
+                "name": "waza-read",
+                "enabled": True,
+                "status": "installed",
+                "managed_by": "capability_package",
+                "package_ids": ["waza"],
+                "config": {"skill_content": old_content},
+            }
+        },
+        "skills": {
+            "items": {
+                "waza-read": {
+                    "name": "waza-read",
+                    "enabled": True,
+                    "managed_by": "capability_package",
+                    "component_id": "skill:waza-read",
+                    "package_ids": ["waza"],
+                }
+            }
+        },
+    }
+
+    result = manager.apply_capability_package_update(
+        {"package_id": "waza", "activation_approved": True}
+    )
+
+    assert result.ok is True
+    assert "skill:waza-read" not in manager.data["capability_components"]
+    assert "waza-read" not in manager.data["skills"]["items"]
+    assert manager.data["capability_components"]["skill:waza-write"]["package_ids"] == [
+        "waza"
+    ]
+    assert manager.data["skills"]["items"]["waza-write"]["component_id"] == (
+        "skill:waza-write"
+    )
+    installed_path = (
+        tmp_path
+        / "skills"
+        / "packages"
+        / "components"
+        / "skill-waza-write"
+        / "SKILL.md"
+    )
+    assert installed_path.read_text(encoding="utf-8") == new_content
+
+
+def test_rollback_capability_package_update_converges_materialized_resources(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    old_content = (
+        "---\n"
+        "name: waza-read\n"
+        "description: Read Waza.\n"
+        "---\n"
+        "Read.\n"
+    )
+    new_content = (
+        "---\n"
+        "name: waza-write\n"
+        "description: Write Waza.\n"
+        "---\n"
+        "Write.\n"
+    )
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "state": {
+                    "activation_state": "active",
+                    "update_state": "rollback_available",
+                },
+                "source_snapshot": {"snapshot_id": "snap-new"},
+                "manifest": {
+                    "components": [
+                        {
+                            "id": "skill:waza-write",
+                            "kind": "skill",
+                            "name": "waza-write",
+                            "config": {"skill_content": new_content},
+                        }
+                    ]
+                },
+                "components": ["skill:waza-write"],
+                "rollback": {
+                    "snapshot_id": "snap-old",
+                    "source_snapshot": {"snapshot_id": "snap-old"},
+                    "manifest": {
+                        "components": [
+                            {
+                                "id": "skill:waza-read",
+                                "kind": "skill",
+                                "name": "waza-read",
+                                "config": {"skill_content": old_content},
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+        "capability_components": {
+            "skill:waza-write": {
+                "id": "skill:waza-write",
+                "kind": "skill",
+                "name": "waza-write",
+                "enabled": True,
+                "status": "installed",
+                "managed_by": "capability_package",
+                "package_ids": ["waza"],
+                "config": {"skill_content": new_content},
+            }
+        },
+        "skills": {
+            "items": {
+                "waza-write": {
+                    "name": "waza-write",
+                    "enabled": True,
+                    "managed_by": "capability_package",
+                    "component_id": "skill:waza-write",
+                    "package_ids": ["waza"],
+                }
+            }
+        },
+    }
+
+    result = manager.rollback_capability_package_update(
+        {"package_id": "waza", "activation_approved": True}
+    )
+
+    assert result.ok is True
+    assert "skill:waza-write" not in manager.data["capability_components"]
+    assert "waza-write" not in manager.data["skills"]["items"]
+    assert manager.data["capability_components"]["skill:waza-read"]["package_ids"] == [
+        "waza"
+    ]
+    assert manager.data["skills"]["items"]["waza-read"]["component_id"] == (
+        "skill:waza-read"
+    )
+    installed_path = (
+        tmp_path
+        / "skills"
+        / "packages"
+        / "components"
+        / "skill-waza-read"
+        / "SKILL.md"
+    )
+    assert installed_path.read_text(encoding="utf-8") == old_content
+
+
+def test_rollback_capability_package_update_rejects_empty_rollback_metadata(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": False,
+                "status": "installed",
+                "state": {"update_state": "rollback_available"},
+                "rollback": {},
+            }
+        }
+    }
+
+    result = manager.rollback_capability_package_update({"package_id": "waza"})
+
+    assert result.ok is False
+    assert result.status == 400
+    assert result.payload["error"] == "rollback_not_available"
+    assert manager.data["capability_packages"]["waza"]["rollback"] == {}
+    assert manager.data["capability_packages"]["waza"]["state"]["update_state"] == (
+        "rollback_available"
+    )
+
+
+def test_rollback_capability_package_update_rejects_consumed_rollback(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": False,
+                "status": "installed",
+                "state": {"update_state": "current"},
+                "rollback": {
+                    "snapshot_id": "snap-old",
+                    "source_snapshot": {"snapshot_id": "snap-old"},
+                },
+            }
+        }
+    }
+
+    result = manager.rollback_capability_package_update({"package_id": "waza"})
+
+    assert result.ok is False
+    assert result.status == 400
+    assert result.payload["error"] == "rollback_not_available"
+    assert manager.data["capability_packages"]["waza"]["rollback"]["snapshot_id"] == (
+        "snap-old"
+    )
+    assert manager.data["capability_packages"]["waza"]["state"]["update_state"] == (
+        "current"
+    )
+
+
+def test_check_capability_package_update_does_not_report_no_diff_candidate(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {
+                    "snapshot_id": "snap-old",
+                    "source_ref": "main",
+                    "commit_sha": "1111111",
+                },
+                "manifest": {"components": [{"id": "skill:waza/read"}]},
+                "components": ["skill:waza/read"],
+            }
+        }
+    }
+
+    result = manager.check_capability_package_update(
+        {
+            "package_id": "waza",
+            "candidate_snapshot": {
+                "snapshot_id": "snap-old",
+                "source_ref": "main",
+                "commit_sha": "1111111",
+            },
+            "candidate_manifest": {"components": [{"id": "skill:waza/read"}]},
+        }
+    )
+
+    assert result.ok is True
+    assert result.payload["update_available"] is False
+    assert result.payload["update_candidate"]["manifest_diff"]["added_components"] == []
+
+
+def test_server_settings_projects_capability_package_credential_bindings(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "current_user_id": "user-a",
+        "workspace_id": "workspace-1",
+        "capability_packages": {
+            "github-tools": {
+                "name": "GitHub tools",
+                "credential_requirements": [
+                    {
+                        "id": "credreq:github",
+                        "provider": "github",
+                        "kind": "oauth",
+                        "placement": "server",
+                        "required_by": ["mcp:github"],
+                    }
+                ],
+                "credential_bindings": [
+                    {
+                        "requirement_id": "credreq:github",
+                        "scope": "workspace",
+                        "workspace_id": "workspace-1",
+                        "secret_ref_id": "github-workspace",
+                    },
+                    {
+                        "requirement_id": "credreq:github",
+                        "scope": "user",
+                        "user_id": "user-a",
+                        "secret_ref_id": "github-user",
+                    },
+                ],
+            }
+        },
+    }
+
+    settings = manager.read_server_settings()["settings"]
+    package = settings["capability_packages"]["github-tools"]
+
+    assert package["credential_state"] == "bound"
+    assert package["credential_requirements"][0] == {
+        "requirement_id": "credreq:github",
+        "provider": "github",
+        "kind": "oauth",
+        "placement": "server",
+        "required_by": ["mcp:github"],
+        "state": "bound",
+        "scope": "user",
+        "secret_ref_id": "github-user",
+        "credential_actor": "user_delegated",
+        "message": "user credential binding is selected",
+    }
+    assert "secret_value" not in str(package)
+
+
+def test_server_settings_does_not_apply_unscoped_global_credential_binding_to_packages(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "current_user_id": "user-a",
+        "workspace_id": "workspace-1",
+        "capability_credential_bindings": [
+            {
+                "requirement_id": "credreq:github",
+                "scope": "workspace",
+                "workspace_id": "workspace-1",
+                "secret_ref_id": "github-workspace",
+            }
+        ],
+        "capability_packages": {
+            "github-tools": {
+                "name": "GitHub tools",
+                "credential_requirements": [
+                    {
+                        "id": "credreq:github",
+                        "provider": "github",
+                        "kind": "oauth",
+                        "placement": "server",
+                    }
+                ],
+            },
+            "repo-review": {
+                "name": "Repo review",
+                "credential_requirements": [
+                    {
+                        "id": "credreq:github",
+                        "provider": "github",
+                        "kind": "oauth",
+                        "placement": "server",
+                    }
+                ],
+            },
+        },
+    }
+
+    settings = manager.read_server_settings()["settings"]
+
+    assert settings["capability_packages"]["github-tools"]["credential_state"] == "missing"
+    assert settings["capability_packages"]["repo-review"]["credential_state"] == "missing"
+
+
+def test_accept_capability_package_preserves_credential_requirements(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+
+    result = manager.accept_capability_package_draft(
+        {
+            "package_id": "github-tools",
+            "draft": {
+                "id": "github-tools",
+                "name": "GitHub tools",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "review",
+                        "skill_content": (
+                            "---\n"
+                            "name: review\n"
+                            "description: Review GitHub changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "credential_requirements": [
+                    {
+                        "id": "credreq:github",
+                        "provider": "github",
+                        "kind": "oauth",
+                        "placement": "server",
+                        "required_by": ["skill:review"],
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "github"}],
+                "risk_level": "low",
+            },
+        }
+    )
+
+    assert result.ok is True
+    package = manager.data["capability_packages"]["github-tools"]
+    assert package["credential_requirements"][0]["id"] == "credreq:github"
+    assert package["credential_requirements"][0]["required_by"] == ["skill:review"]
+    assert "secret_value" not in str(package)
+
+
 def test_record_skill_installs_pasted_skill_content_to_standard_path(tmp_path: Path) -> None:
     manager = MemoryAdminManager(tmp_path / "config.yaml")
     skill_content = (
@@ -868,6 +1659,7 @@ def test_skill_dashboard_returns_lifecycle_hook_summary_with_technical_details(t
             "owner_id": "code-review",
             "owner_enabled": True,
             "owner_status": "installed",
+            "owner_activation_state": "active",
             "placement": "server",
             "handler_type": "prompt",
             "display_name": "Review prompt guard",

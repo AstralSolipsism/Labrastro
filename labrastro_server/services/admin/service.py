@@ -58,6 +58,19 @@ from labrastro_server.services.capability_packages import (
     CapabilityPackageInstaller,
     EvidenceBundle,
 )
+from labrastro_server.services.capability_package_credentials import (
+    public_credential_package_projection,
+)
+from labrastro_server.services.capability_package_updates import (
+    apply_update_candidate,
+    build_update_candidate,
+    detect_upstream_version,
+    manifest_diff_has_changes,
+    manifest_diff,
+    normalize_update_candidate_payload,
+    rollback_update_available,
+    rollback_update_candidate,
+)
 from labrastro_server.services.agent_runtime.runtime_policy import (
     validate_runtime_profile_model_request_origin,
 )
@@ -71,6 +84,9 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     lifecycle_event_catalog_items,
     lifecycle_declarations_from_config_hooks,
     sanitize_lifecycle_hooks_for_config,
+)
+from reuleauxcoder.domain.capability_packages import (
+    package_managed_component_enabled,
 )
 from reuleauxcoder.domain.runtime_footprint import (
     normalize_runtime_footprint,
@@ -870,6 +886,20 @@ class RemoteAdminConfigManager:
                     package_id,
                     package_view,
                 )
+            package_view.update(
+                public_credential_package_projection(
+                    requirements=_dict_list_payload(
+                        package_view.get("credential_requirements")
+                    ),
+                    bindings=_capability_credential_bindings(
+                        data,
+                        package_id,
+                        package_view,
+                    ),
+                    user_id=str(data.get("current_user_id") or ""),
+                    workspace_id=str(data.get("workspace_id") or ""),
+                )
+            )
         for component_id, component_view in capability_components.items():
             if isinstance(component_view.get("hooks"), list):
                 component_view["hook_views"] = self._admin_resource_lifecycle_hooks(
@@ -1935,6 +1965,13 @@ class RemoteAdminConfigManager:
                     raw_draft,
                     package_id=package_id,
                 )
+                self._sync_capability_components_from_package_manifest(
+                    data,
+                    install_result.package_id,
+                    install_result.package.to_dict(),
+                    previous_component_ids=install_result.component_ids,
+                    installer=installer,
+                )
             except CapabilityPackageIngestError as exc:
                 return AdminConfigResult(
                     False,
@@ -1947,15 +1984,14 @@ class RemoteAdminConfigManager:
                     {"error": "invalid_capability_package_draft", "message": str(exc)},
                     400,
                 )
-            reload_error = self._commit_config(data, previous_data)
-            if reload_error:
-                return reload_error
-            file_error = self._apply_capability_package_skill_file_operations(
+            transaction_error = self._commit_capability_package_config_and_files(
+                data,
+                previous_data,
                 installer,
-                install_result.skill_file_operations,
+                installer.skill_file_operations,
             )
-            if file_error:
-                return file_error
+            if transaction_error:
+                return transaction_error
             return AdminConfigResult(
                 True,
                 {
@@ -1995,30 +2031,21 @@ class RemoteAdminConfigManager:
             installer = CapabilityPackageInstaller(
                 skill_install_root=self._capability_package_skill_install_root()
             )
-            for component_id in package.components:
-                raw_component = components.get(component_id)
-                if not isinstance(raw_component, dict):
-                    continue
-                component = CapabilityComponentConfig.from_dict(component_id, raw_component)
-                component.package_ids = [
-                    item for item in component.package_ids if item != package_id
-                ]
-                if component.package_ids:
-                    components[component_id] = component.to_dict()
-                    installer.materialize_component(data, component)
-                    continue
-                del components[component_id]
-                removed_components.append(component_id)
-                installer.remove_materialized_component(data, component)
-            reload_error = self._commit_config(data, previous_data)
-            if reload_error:
-                return reload_error
-            file_error = self._apply_capability_package_skill_file_operations(
+            removed_components = self._sync_capability_components_from_package_manifest(
+                data,
+                package_id,
+                {"manifest": {"components": []}, "components": []},
+                previous_component_ids=package.components,
+                installer=installer,
+            )
+            transaction_error = self._commit_capability_package_config_and_files(
+                data,
+                previous_data,
                 installer,
                 installer.skill_file_operations,
             )
-            if file_error:
-                return file_error
+            if transaction_error:
+                return transaction_error
             return AdminConfigResult(
                 True,
                 {
@@ -2032,6 +2059,84 @@ class RemoteAdminConfigManager:
 
     def _capability_package_skill_install_root(self) -> Path:
         return self.config_path.parent / "skills" / "packages"
+
+    def _commit_capability_package_config_and_files(
+        self,
+        data: dict[str, Any],
+        previous_data: dict[str, Any],
+        installer: CapabilityPackageInstaller | None,
+        operations: list[Any],
+    ) -> AdminConfigResult | None:
+        reload_error = self._commit_config(data, previous_data)
+        if reload_error:
+            return reload_error
+        if installer is None or not operations:
+            return None
+        file_snapshots = self._snapshot_capability_package_skill_file_operations(
+            operations
+        )
+        file_error = self._apply_capability_package_skill_file_operations(
+            installer,
+            operations,
+        )
+        if file_error is None:
+            return None
+        file_rollback_error = (
+            self._restore_capability_package_skill_file_operations(file_snapshots)
+        )
+        rollback_error = self._commit_config(deepcopy(previous_data), data)
+        if rollback_error:
+            payload = dict(file_error.payload)
+            payload["config_rollback_error"] = rollback_error.payload
+            payload["config_rollback_status"] = rollback_error.status
+            if file_rollback_error:
+                payload["file_rollback_error"] = file_rollback_error
+            return AdminConfigResult(False, payload, 500)
+        if file_rollback_error:
+            payload = dict(file_error.payload)
+            payload["file_rollback_error"] = file_rollback_error
+            return AdminConfigResult(False, payload, 500)
+        return file_error
+
+    def _snapshot_capability_package_skill_file_operations(
+        self,
+        operations: list[Any],
+    ) -> list[dict[str, Any]]:
+        snapshots: list[dict[str, Any]] = []
+        for operation in operations:
+            path = Path(getattr(operation, "path", ""))
+            existed = path.exists()
+            snapshots.append(
+                {
+                    "path": path,
+                    "existed": existed,
+                    "content": path.read_text(encoding="utf-8") if existed else None,
+                }
+            )
+        return snapshots
+
+    def _restore_capability_package_skill_file_operations(
+        self,
+        snapshots: list[dict[str, Any]],
+    ) -> str | None:
+        try:
+            for snapshot in reversed(snapshots):
+                path = snapshot["path"]
+                if snapshot["existed"]:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(snapshot.get("content") or "", encoding="utf-8")
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
+        except OSError as exc:
+            return str(exc)
+        return None
 
     def _apply_capability_package_skill_file_operations(
         self,
@@ -2082,12 +2187,33 @@ class RemoteAdminConfigManager:
             if not isinstance(raw_package, dict):
                 return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
             package = CapabilityPackageConfig.from_dict(package_id, raw_package)
-            package.enabled = True if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS else enabled
+            target_enabled = True if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS else enabled
+            package.enabled = target_enabled
+            package.state = dict(package.state)
+            package.state["activation_state"] = "active" if target_enabled else "inactive"
+            package.state.setdefault("install_state", "installed")
             packages[package_id] = package.to_dict()
             data["capability_packages"] = packages
-            reload_error = self._commit_config(data, previous_data)
-            if reload_error:
-                return reload_error
+            components = data.get("capability_components", {})
+            if isinstance(components, dict):
+                installer = CapabilityPackageInstaller(
+                    skill_install_root=self._capability_package_skill_install_root(),
+                )
+                self._sync_capability_components_from_package_manifest(
+                    data,
+                    package_id,
+                    packages[package_id],
+                    previous_component_ids=package.components,
+                    installer=installer,
+                )
+            transaction_error = self._commit_capability_package_config_and_files(
+                data,
+                previous_data,
+                installer if isinstance(components, dict) else None,
+                installer.skill_file_operations if isinstance(components, dict) else [],
+            )
+            if transaction_error:
+                return transaction_error
             return AdminConfigResult(
                 True,
                 {
@@ -2098,6 +2224,310 @@ class RemoteAdminConfigManager:
                     **self.read_server_settings(),
                 },
             )
+
+    def check_capability_package_update(self, payload: dict[str, Any]) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        data = self._load_data()
+        packages = data.get("capability_packages", {})
+        raw_package = packages.get(package_id) if isinstance(packages, dict) else None
+        if not isinstance(raw_package, dict):
+            return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+        update_payload = normalize_update_candidate_payload(payload)
+        if update_payload.has_candidate:
+            candidate = build_update_candidate(
+                package_id=package_id,
+                current_package=raw_package,
+                candidate_snapshot=update_payload.candidate_snapshot,
+                candidate_manifest=update_payload.candidate_manifest,
+                candidate_id=update_payload.candidate_id,
+                impact_summary=update_payload.impact_summary,
+            )
+            current_snapshot = (
+                raw_package.get("source_snapshot")
+                if isinstance(raw_package.get("source_snapshot"), dict)
+                else {}
+            )
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "current_version": detect_upstream_version(current_snapshot),
+                    "candidate_version": candidate["upstream_version"],
+                    "update_available": manifest_diff_has_changes(
+                        candidate["manifest_diff"]
+                    ),
+                    "update_candidate": candidate,
+                },
+            )
+        current_snapshot = (
+            raw_package.get("source_snapshot")
+            if isinstance(raw_package.get("source_snapshot"), dict)
+            else {}
+        )
+        return AdminConfigResult(
+            True,
+            {
+                "ok": True,
+                "package_id": package_id,
+                "current_version": detect_upstream_version(current_snapshot),
+                "update_available": False,
+            },
+        )
+
+    def prepare_capability_package_update(
+        self, payload: dict[str, Any]
+    ) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS:
+            return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
+        update_payload = normalize_update_candidate_payload(payload)
+        if not update_payload.candidate_snapshot:
+            return AdminConfigResult(False, {"error": "candidate_snapshot_required"}, 400)
+        if not update_payload.candidate_manifest:
+            return AdminConfigResult(False, {"error": "candidate_manifest_required"}, 400)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            packages = data.get("capability_packages", {})
+            if not isinstance(packages, dict):
+                packages = {}
+                data["capability_packages"] = packages
+            raw_package = packages.get(package_id)
+            if not isinstance(raw_package, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            candidate = build_update_candidate(
+                package_id=package_id,
+                current_package=raw_package,
+                candidate_snapshot=update_payload.candidate_snapshot,
+                candidate_manifest=update_payload.candidate_manifest,
+                candidate_id=update_payload.candidate_id,
+                impact_summary=update_payload.impact_summary,
+            )
+            package_data = dict(raw_package)
+            package_data["update_candidate"] = candidate
+            state = (
+                dict(package_data.get("state"))
+                if isinstance(package_data.get("state"), dict)
+                else {}
+            )
+            state["update_state"] = "candidate_ready"
+            package_data["state"] = state
+            package = CapabilityPackageConfig.from_dict(package_id, package_data)
+            packages[package_id] = package.to_dict()
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "update_candidate": candidate,
+                    "capability_package": package.to_dict(),
+                    **self.read_server_settings(),
+                },
+            )
+
+    def apply_capability_package_update(
+        self, payload: dict[str, Any]
+    ) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS:
+            return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            packages = data.get("capability_packages", {})
+            if not isinstance(packages, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            raw_package = packages.get(package_id)
+            if not isinstance(raw_package, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            raw_candidate = (
+                payload.get("candidate")
+                if isinstance(payload.get("candidate"), dict)
+                else raw_package.get("update_candidate")
+            )
+            if not isinstance(raw_candidate, dict) or not raw_candidate:
+                return AdminConfigResult(False, {"error": "update_candidate_required"}, 400)
+            requested_candidate_id = str(payload.get("candidate_id") or "").strip()
+            candidate_id = str(raw_candidate.get("candidate_id") or "").strip()
+            if requested_candidate_id and candidate_id and requested_candidate_id != candidate_id:
+                return AdminConfigResult(False, {"error": "update_candidate_mismatch"}, 409)
+            updated_package = apply_update_candidate(
+                raw_package,
+                raw_candidate,
+                activation_approved=_bool_field(payload, "activation_approved", False),
+            )
+            previous_component_ids = _package_component_ids(raw_package)
+            packages[package_id] = CapabilityPackageConfig.from_dict(
+                package_id,
+                updated_package,
+            ).to_dict()
+            installer = CapabilityPackageInstaller(
+                skill_install_root=self._capability_package_skill_install_root(),
+            )
+            self._sync_capability_components_from_package_manifest(
+                data,
+                package_id,
+                packages[package_id],
+                previous_component_ids=previous_component_ids,
+                installer=installer,
+            )
+            transaction_error = self._commit_capability_package_config_and_files(
+                data,
+                previous_data,
+                installer,
+                installer.skill_file_operations,
+            )
+            if transaction_error:
+                return transaction_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "capability_package": packages[package_id],
+                    **self.read_server_settings(),
+                },
+            )
+
+    def rollback_capability_package_update(
+        self, payload: dict[str, Any]
+    ) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS:
+            return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            packages = data.get("capability_packages", {})
+            if not isinstance(packages, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            raw_package = packages.get(package_id)
+            if not isinstance(raw_package, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            if not rollback_update_available(raw_package):
+                return AdminConfigResult(False, {"error": "rollback_not_available"}, 400)
+            updated_package = rollback_update_candidate(
+                raw_package,
+                activation_approved=_bool_field(payload, "activation_approved", False),
+            )
+            previous_component_ids = _package_component_ids(raw_package)
+            packages[package_id] = CapabilityPackageConfig.from_dict(
+                package_id,
+                updated_package,
+            ).to_dict()
+            installer = CapabilityPackageInstaller(
+                skill_install_root=self._capability_package_skill_install_root(),
+            )
+            self._sync_capability_components_from_package_manifest(
+                data,
+                package_id,
+                packages[package_id],
+                previous_component_ids=previous_component_ids,
+                installer=installer,
+            )
+            transaction_error = self._commit_capability_package_config_and_files(
+                data,
+                previous_data,
+                installer,
+                installer.skill_file_operations,
+            )
+            if transaction_error:
+                return transaction_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "capability_package": packages[package_id],
+                    **self.read_server_settings(),
+                },
+            )
+
+    def _sync_capability_components_from_package_manifest(
+        self,
+        data: dict[str, Any],
+        package_id: str,
+        package_data: dict[str, Any],
+        *,
+        previous_component_ids: list[str],
+        installer: CapabilityPackageInstaller | None = None,
+    ) -> list[str]:
+        installer = installer or CapabilityPackageInstaller(
+            skill_install_root=self._capability_package_skill_install_root(),
+        )
+        manifest = package_data.get("manifest")
+        components = data.get("capability_components", {})
+        if not isinstance(components, dict):
+            components = {}
+            data["capability_components"] = components
+        desired_items = (
+            _manifest_component_items(manifest) if isinstance(manifest, dict) else {}
+        )
+        if not desired_items:
+            desired_items = {
+                component_id: {}
+                for component_id in _package_component_ids(package_data)
+            }
+        desired_ids = list(desired_items)
+        removed_components: list[str] = []
+        for component_id in previous_component_ids:
+            if component_id in desired_items:
+                continue
+            raw_component = components.get(component_id)
+            if not isinstance(raw_component, dict):
+                continue
+            component = CapabilityComponentConfig.from_dict(component_id, raw_component)
+            component.package_ids = [
+                item for item in component.package_ids if item != package_id
+            ]
+            if component.package_ids:
+                component.enabled = _package_component_enabled_from_owners(
+                    data,
+                    component.package_ids,
+                )
+                components[component_id] = component.to_dict()
+                installer.materialize_component(data, component)
+            else:
+                del components[component_id]
+                removed_components.append(component_id)
+                installer.remove_materialized_component(data, component)
+        for component_id, manifest_item in desired_items.items():
+            raw_component = (
+                dict(components.get(component_id))
+                if isinstance(components.get(component_id), dict)
+                else {}
+            )
+            merged = {**raw_component, **_component_config_from_manifest_item(manifest_item)}
+            package_ids = [
+                item
+                for item in _string_values(merged.get("package_ids", []))
+                if item != package_id
+            ]
+            package_ids.append(package_id)
+            merged["package_ids"] = package_ids
+            merged["managed_by"] = "capability_package"
+            merged.setdefault("status", "installed")
+            merged["enabled"] = _package_component_enabled_from_owners(data, package_ids)
+            component = CapabilityComponentConfig.from_dict(
+                component_id,
+                merged,
+            )
+            components[component_id] = component.to_dict()
+            installer.materialize_component(data, component)
+        package_data["components"] = desired_ids or _package_component_ids(package_data)
+        return removed_components
 
     def _capability_component_view(
         self,
@@ -4365,6 +4795,73 @@ def _dict_field(payload: dict[str, Any], field_name: str, previous: dict[str, An
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _package_component_ids(value: dict[str, Any]) -> list[str]:
+    components = value.get("components") if isinstance(value, dict) else None
+    return _string_values(components)
+
+
+def _package_component_enabled_from_owners(
+    data: dict[str, Any],
+    package_ids: list[str],
+) -> bool:
+    packages = data.get("capability_packages", {})
+    return package_managed_component_enabled(
+        package_ids=package_ids,
+        packages=packages if isinstance(packages, dict) else {},
+        default=False,
+    )
+
+
+def _manifest_component_items(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw_components = manifest.get("components")
+    if not isinstance(raw_components, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for item in raw_components:
+        if not isinstance(item, dict):
+            continue
+        component_id = str(item.get("id") or item.get("component_id") or "").strip()
+        if component_id:
+            result[component_id] = dict(item)
+    return result
+
+
+def _component_config_from_manifest_item(item: dict[str, Any]) -> dict[str, Any]:
+    component_id = str(item.get("id") or item.get("component_id") or "").strip()
+    kind = str(item.get("kind") or item.get("type") or "").strip()
+    name = str(item.get("name") or "").strip()
+    if not name and ":" in component_id:
+        name = component_id.split(":", 1)[1]
+    result: dict[str, Any] = {
+        "kind": kind,
+        "name": name or component_id,
+        "display_name": str(item.get("display_name") or "").strip(),
+        "summary": str(item.get("summary") or "").strip(),
+        "description": str(item.get("description") or "").strip(),
+    }
+    for key in (
+        "runtime_footprint",
+        "config",
+        "source",
+        "risk_level",
+        "execution_policy",
+        "registry_path",
+        "source_path",
+        "hooks",
+    ):
+        if key in item:
+            result[key] = deepcopy(item[key])
+    return {key: value for key, value in result.items() if value not in ("", [], {})}
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if value is None or value == "":
+        return []
+    return [str(value)]
+
+
 def _bool_field(payload: dict[str, Any], field_name: str, default: Any) -> bool:
     if field_name not in payload:
         return bool(default)
@@ -4630,6 +5127,26 @@ def _payload_string_list(value: Any) -> list[str]:
     if value is None or value == "":
         return []
     return [str(value).strip()]
+
+
+def _dict_list_payload(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _capability_credential_bindings(
+    data: dict[str, Any],
+    package_id: str,
+    package_view: dict[str, Any],
+) -> list[dict[str, Any]]:
+    package_bindings = _dict_list_payload(package_view.get("credential_bindings"))
+    global_bindings = [
+        item
+        for item in _dict_list_payload(data.get("capability_credential_bindings"))
+        if str(item.get("package_id") or "").strip() == package_id
+    ]
+    return [*package_bindings, *global_bindings]
 
 
 def _capability_package_managed_resource_error(
