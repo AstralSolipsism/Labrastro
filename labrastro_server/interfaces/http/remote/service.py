@@ -69,6 +69,7 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_requirement_id,
     normalize_environment_requirement_kind,
 )
+from reuleauxcoder.domain.capability_packages import capability_package_is_active
 from reuleauxcoder.domain.session.locale import session_notice_text
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventKind
 from labrastro_server.interfaces.http.remote.routes.admin import RemoteAdminRoutes
@@ -80,6 +81,9 @@ from labrastro_server.interfaces.http.remote.routes.base import (
 )
 from labrastro_server.interfaces.http.remote.routes.chat import RemoteChatRoutes
 from labrastro_server.interfaces.http.remote.routes.collaboration import RemoteCollaborationRoutes
+from labrastro_server.interfaces.http.remote.routes.capability_packages import (
+    RemoteCapabilityPackageRoutes,
+)
 from labrastro_server.interfaces.http.remote.routes.github import RemoteGitHubRoutes
 from labrastro_server.interfaces.http.remote.routes.manifests import RemoteManifestRoutes
 from labrastro_server.interfaces.http.remote.routes.peer import RemotePeerRoutes
@@ -1401,6 +1405,10 @@ class RemoteRelayHTTPService:
         self._queues_lock = threading.Lock()
         self._peer_chat_locks: dict[str, threading.Lock] = {}
         self._peer_chat_locks_lock = threading.Lock()
+        self._capability_package_peer_results: dict[
+            str, dict[str, dict[str, Any]]
+        ] = {}
+        self._capability_package_peer_results_lock = threading.Lock()
         self._session_runs: dict[str, _RemoteSessionRun] = {}
         self._session_runs_lock = threading.Lock()
         self._session_run_max_events = max(1, int(session_run_max_events or 1))
@@ -1756,6 +1764,7 @@ class RemoteRelayHTTPService:
             RemoteAgentRunRoutes,
             RemoteGitHubRoutes,
             RemoteCollaborationRoutes,
+            RemoteCapabilityPackageRoutes,
             RemoteTaskflowRoutes,
             RemoteManifestRoutes,
             RemoteArtifactRoutes,
@@ -1831,6 +1840,12 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/environment/manifest":
                     self._handle_environment_manifest()
+                    return
+                if parsed.path == "/remote/capability-packages/install/plan":
+                    self._handle_capability_package_install_plan()
+                    return
+                if parsed.path == "/remote/capability-packages/install/result":
+                    self._handle_capability_package_install_result()
                     return
                 if parsed.path == "/remote/agent-runs/claim":
                     self._handle_agent_run_claim()
@@ -2171,7 +2186,7 @@ class RemoteRelayHTTPService:
             package = self.capability_packages.get(package_id)
             if package is None:
                 continue
-            if _env_bool_value(_env_tool_value(package, "enabled", True)):
+            if _environment_package_is_active(package_id, package):
                 return True
         return False
 
@@ -2202,6 +2217,19 @@ def _normalize_environment_requirement_scope_ids(
             if str(requirement_id).strip()
         }
     return scopes
+
+
+def _environment_package_is_active(package_id: str, package: Any) -> bool:
+    if isinstance(package, dict):
+        package_data = dict(package)
+    else:
+        to_dict = getattr(package, "to_dict", None)
+        package_data = to_dict() if callable(to_dict) else {}
+    if not isinstance(package_data, dict):
+        return False
+    package_data.setdefault("id", str(package_id or ""))
+    package_data.setdefault("status", "installed")
+    return capability_package_is_active(package_data)
 
 
 def _env_tool_value(tool: Any, field_name: str, default: Any = None) -> Any:

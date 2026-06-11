@@ -6,6 +6,9 @@ from labrastro_server.interfaces.http.remote.routes.auth import RemoteAuthRoutes
 from labrastro_server.interfaces.http.remote.routes.base import RemoteRelayBaseHandler
 from labrastro_server.interfaces.http.remote.routes.chat import RemoteChatRoutes
 from labrastro_server.interfaces.http.remote.routes.collaboration import RemoteCollaborationRoutes
+from labrastro_server.interfaces.http.remote.routes.capability_packages import (
+    RemoteCapabilityPackageRoutes,
+)
 from labrastro_server.interfaces.http.remote.routes.manifests import RemoteManifestRoutes
 from labrastro_server.interfaces.http.remote.routes.peer import RemotePeerRoutes
 from labrastro_server.interfaces.http.remote.routes.agent_runs import RemoteAgentRunRoutes
@@ -16,6 +19,7 @@ __all__ = [
     "RemoteAdminRoutes",
     "RemoteArtifactRoutes",
     "RemoteAuthRoutes",
+    "RemoteCapabilityPackageRoutes",
     "RemoteChatRoutes",
     "RemoteCollaborationRoutes",
     "RemoteManifestRoutes",

@@ -563,6 +563,45 @@ class RemoteAdminRoutes:
                 )
                 self._send_json(result.status, result.payload)
                 return
+            if path == "/remote/admin/capability-packages/updates/check":
+                result = self.service.admin_manager.check_capability_package_update(
+                    payload
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/updates/prepare":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.prepare_capability_package_update(
+                        payload
+                    ),
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/updates/apply":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.apply_capability_package_update(
+                        payload
+                    ),
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/updates/rollback":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.rollback_capability_package_update(
+                        payload
+                    ),
+                )
+                self._send_json(result.status, result.payload)
+                return
             if path == "/remote/admin/diagnostics/tool-diagnostics/stats":
                 self._send_json(
                     HTTPStatus.OK,
@@ -867,6 +906,9 @@ class RemoteAdminRoutes:
             "/remote/admin/capability-packages/drafts/accept",
             "/remote/admin/capability-packages/delete",
             "/remote/admin/capability-packages/enable",
+            "/remote/admin/capability-packages/updates/prepare",
+            "/remote/admin/capability-packages/updates/apply",
+            "/remote/admin/capability-packages/updates/rollback",
             "/remote/admin/environment-requirements/record",
             "/remote/admin/environment-requirements/delete",
             "/remote/admin/environment-requirements/enable",

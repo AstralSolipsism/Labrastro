@@ -2762,6 +2762,11 @@ class TestRemoteRelayHTTPService:
                 "disabled-package": {
                     "enabled": False,
                     "components": ["envreq:executable:package-disabled"],
+                },
+                "inactive-package": {
+                    "enabled": True,
+                    "state": {"activation_state": "inactive"},
+                    "components": ["envreq:executable:package-inactive"],
                 }
             },
             environment_requirements={
@@ -2839,6 +2844,15 @@ class TestRemoteRelayHTTPService:
                     "managed_by": "capability_package",
                     "package_ids": ["disabled-package"],
                     "component_id": "envreq:executable:package-disabled",
+                },
+                "envreq:executable:package-inactive": {
+                    "id": "envreq:executable:package-inactive",
+                    "kind": "executable",
+                    "name": "package-inactive",
+                    "command": "package-inactive",
+                    "managed_by": "capability_package",
+                    "package_ids": ["inactive-package"],
+                    "component_id": "envreq:executable:package-inactive",
                 }
             },
         )
@@ -2883,6 +2897,7 @@ class TestRemoteRelayHTTPService:
             assert "envreq:executable:disabled" not in requirements
             assert "envreq:path:disabled-skill" not in requirements
             assert "envreq:executable:package-disabled" not in requirements
+            assert "envreq:executable:package-inactive" not in requirements
             assert "mcp_servers" not in manifest
             assert requirements["envreq:executable:gitnexus"]["check"] == "gitnexus --version"
             assert requirements["envreq:executable:gitnexus"]["docs"][0]["title"] == "GitNexus"
@@ -7845,6 +7860,479 @@ class TestRemoteRelayHTTPService:
                 assert delete_exc.value.code == 400
                 delete_body = json.loads(delete_exc.value.read().decode("utf-8"))
                 assert delete_body["error"] == "builtin_capability_package"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_capability_package_accept_returns_separate_state_axes(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.host.yaml"
+        save_yaml_config(config_path, {})
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/drafts/accept",
+                {
+                    "package_id": "review",
+                    "draft": {
+                        "id": "review",
+                        "name": "Review",
+                        "components": [
+                            {
+                                "kind": "skill",
+                                "name": "code-review",
+                                "skill_content": (
+                                    "---\n"
+                                    "name: code-review\n"
+                                    "description: Review changes.\n"
+                                    "---\n"
+                                    "Review.\n"
+                                ),
+                            }
+                        ],
+                        "evidence": [{"title": "fixture", "excerpt": "review"}],
+                        "risk_level": "low",
+                    },
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+
+            assert status == 200
+            state = body["capability_package"]["state"]
+            assert state["install_state"] in {"materialized", "installed"}
+            assert state["activation_state"] == "inactive"
+            settings_state = body["settings"]["capability_packages"]["review"]["state"]
+            assert settings_state["install_state"] in {"materialized", "installed"}
+            assert settings_state["activation_state"] == "inactive"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_capability_package_update_candidate_routes(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / "config.host.yaml"
+        save_yaml_config(
+            config_path,
+            {
+                "capability_packages": {
+                    "waza": {
+                        "enabled": True,
+                        "status": "installed",
+                        "source_snapshot": {
+                            "snapshot_id": "snap-old",
+                            "source_ref": "main",
+                            "commit_sha": "1111111",
+                        },
+                        "manifest": {"components": [{"id": "skill:waza/read"}]},
+                        "components": ["skill:waza/read"],
+                    }
+                }
+            },
+        )
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            update_payload = {
+                "package_id": "waza",
+                "candidate_snapshot": {
+                    "snapshot_id": "snap-new",
+                    "source_ref": "main",
+                    "commit_sha": "2222222",
+                },
+                "candidate_manifest": {
+                    "components": [
+                        {
+                            "id": "skill:waza/read",
+                            "kind": "skill",
+                            "name": "waza-read",
+                            "config": {
+                                "skill_content": (
+                                    "---\n"
+                                    "name: waza-read\n"
+                                    "description: Read Waza.\n"
+                                    "---\n"
+                                    "Read.\n"
+                                )
+                            },
+                        },
+                        {
+                            "id": "skill:waza/write",
+                            "kind": "skill",
+                            "name": "waza-write",
+                            "config": {
+                                "skill_content": (
+                                    "---\n"
+                                    "name: waza-write\n"
+                                    "description: Write Waza.\n"
+                                    "---\n"
+                                    "Write.\n"
+                                )
+                            },
+                        },
+                    ]
+                },
+            }
+            check_status, check_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/updates/check",
+                update_payload,
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert check_status == 200
+            assert check_body["update_candidate"]["upstream_version"] == "main@2222222"
+            assert check_body["update_candidate"]["manifest_diff"]["added_components"] == [
+                "skill:waza/write"
+            ]
+
+            prepare_status, prepare_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/updates/prepare",
+                update_payload,
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert prepare_status == 200
+            prepared = prepare_body["settings"]["capability_packages"]["waza"]
+            assert prepared["enabled"] is True
+            assert prepared["state"]["update_state"] == "candidate_ready"
+
+            apply_status, apply_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/updates/apply",
+                {"package_id": "waza", "activation_approved": False},
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert apply_status == 200
+            applied = apply_body["settings"]["capability_packages"]["waza"]
+            assert applied["enabled"] is False
+            assert applied["state"]["activation_state"] == "inactive"
+            assert applied["state"]["update_state"] == "rollback_available"
+            assert applied["rollback"]["snapshot_id"] == "snap-old"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_peer_install_plan_waits_for_peer_result(
+        self, tmp_path: Path
+    ) -> None:
+        del tmp_path
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            capability_packages={
+                "waza": {
+                    "enabled": False,
+                    "status": "installed",
+                    "install_plans": [
+                        {
+                            "plan_id": "plan-waza",
+                            "actions": [
+                                {
+                                    "id": "install-waza-python",
+                                    "type": "install_python_packages",
+                                    "target": "local_peer",
+                                    "package_id": "waza",
+                                    "component_id": "skill:waza/read",
+                                    "params": {"packages": ["readability-lxml"]},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            status, plan_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer_token},
+            )
+
+            assert status == 200
+            assert plan_body["type"] == "capabilityPackage.installPlan"
+            action = plan_body["plan"]["actions"][0]
+            assert action["target"] == "local_peer"
+            action_key = "waza|plan-waza|install-waza-python|skill:waza/read"
+            peer_status = plan_body["peer_status"]["actions"][action_key]
+            assert peer_status["target"] == "local_peer"
+            assert peer_status["check_state"] in {"unknown", "pending"}
+            assert peer_status["install_state"] != "installed"
+            assert peer_status["peer_result"] is None
+
+            _, result_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/result",
+                {
+                    "peer_token": peer_token,
+                    "result": {
+                        "plan_id": "plan-waza",
+                        "action_id": "install-waza-python",
+                        "package_id": "waza",
+                        "component_id": "skill:waza/read",
+                        "target": "local_peer",
+                        "status": "passed",
+                        "version": "1.0.0",
+                        "content_hash": "sha256:abc",
+                        "message": "installed",
+                        "timestamp": "2026-06-11T00:00:00Z",
+                    },
+                },
+            )
+
+            assert result_body["type"] == "capabilityPackage.installResult"
+            updated = result_body["peer_status"]["actions"][action_key]
+            assert updated["check_state"] == "passed"
+            assert updated["install_state"] == "installed"
+            assert updated["peer_result"]["content_hash"] == "sha256:abc"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_peer_results_do_not_collide_on_action_id(
+        self, tmp_path: Path
+    ) -> None:
+        del tmp_path
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            capability_packages={
+                "waza": {
+                    "install_plans": [
+                        {
+                            "plan_id": "plan-python",
+                            "actions": [
+                                {
+                                    "id": "install-python",
+                                    "type": "install_python_packages",
+                                    "target": "local_peer",
+                                    "package_id": "waza",
+                                    "component_id": "skill:waza/read",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "docs": {
+                    "install_plans": [
+                        {
+                            "plan_id": "plan-python",
+                            "actions": [
+                                {
+                                    "id": "install-python",
+                                    "type": "install_python_packages",
+                                    "target": "local_peer",
+                                    "package_id": "docs",
+                                    "component_id": "skill:docs/read",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, result_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/result",
+                {
+                    "peer_token": peer_token,
+                    "result": {
+                        "plan_id": "plan-python",
+                        "action_id": "install-python",
+                        "package_id": "waza",
+                        "component_id": "skill:waza/read",
+                        "target": "local_peer",
+                        "status": "passed",
+                        "content_hash": "sha256:waza",
+                    },
+                },
+            )
+
+            actions = result_body["peer_status"]["actions"]
+            waza_key = "waza|plan-python|install-python|skill:waza/read"
+            docs_key = "docs|plan-python|install-python|skill:docs/read"
+            assert actions[waza_key]["check_state"] == "passed"
+            assert actions[waza_key]["install_state"] == "installed"
+            assert actions[docs_key]["check_state"] == "pending"
+            assert actions[docs_key]["install_state"] == "registered"
+            assert actions[docs_key]["peer_result"] is None
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_peer_result_matches_params_component_id(
+        self, tmp_path: Path
+    ) -> None:
+        del tmp_path
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            capability_packages={
+                "waza": {
+                    "install_plans": [
+                        {
+                            "plan_id": "plan-python",
+                            "actions": [
+                                {
+                                    "id": "install-python",
+                                    "type": "install_python_packages",
+                                    "target": "local_peer",
+                                    "params": {
+                                        "package_id": "waza",
+                                        "component_id": "skill:waza/read",
+                                        "packages": ["readability-lxml"],
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, plan_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer_token},
+            )
+            action_key = "waza|plan-python|install-python|skill:waza/read"
+            assert action_key in plan_body["peer_status"]["actions"]
+
+            _, result_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/result",
+                {
+                    "peer_token": peer_token,
+                    "result": {
+                        "plan_id": "plan-python",
+                        "action_id": "install-python",
+                        "package_id": "waza",
+                        "component_id": "skill:waza/read",
+                        "target": "local_peer",
+                        "status": "passed",
+                    },
+                },
+            )
+
+            updated = result_body["peer_status"]["actions"][action_key]
+            assert updated["check_state"] == "passed"
+            assert updated["install_state"] == "installed"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_peer_result_with_stale_hash_requires_retry(
+        self, tmp_path: Path
+    ) -> None:
+        del tmp_path
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            capability_packages={
+                "waza": {
+                    "install_plans": [
+                        {
+                            "plan_id": "plan-python",
+                            "actions": [
+                                {
+                                    "id": "install-python",
+                                    "type": "install_python_packages",
+                                    "target": "local_peer",
+                                    "package_id": "waza",
+                                    "component_id": "skill:waza/read",
+                                    "params": {
+                                        "packages": ["readability-lxml"],
+                                        "expected_content_hash": "sha256:new",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _, result_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/result",
+                {
+                    "peer_token": peer_token,
+                    "result": {
+                        "plan_id": "plan-python",
+                        "action_id": "install-python",
+                        "package_id": "waza",
+                        "component_id": "skill:waza/read",
+                        "target": "local_peer",
+                        "status": "passed",
+                        "content_hash": "sha256:old",
+                    },
+                },
+            )
+
+            action_key = "waza|plan-python|install-python|skill:waza/read"
+            updated = result_body["peer_status"]["actions"][action_key]
+            assert updated["check_state"] == "stale"
+            assert updated["install_state"] == "registered"
         finally:
             service.stop()
             relay.stop()
