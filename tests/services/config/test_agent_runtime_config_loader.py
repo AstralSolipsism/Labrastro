@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 import os
@@ -255,8 +255,8 @@ def test_default_system_agents_have_explicit_effective_tool_scopes() -> None:
     ]["tools"]
 
     assert environment_tools == ["builtin:shell"]
-    assert "builtin:write_file" not in environment_tools
-    assert "builtin:edit_file" not in environment_tools
+    assert "builtin:apply_patch" not in environment_tools
+    assert "builtin:apply_patch" not in environment_tools
     assert "builtin:delegate_agent" not in environment_tools
     assert packager_tools == [
         "builtin:fetch_capabilities",
@@ -266,8 +266,8 @@ def test_default_system_agents_have_explicit_effective_tool_scopes() -> None:
         "builtin:read_file",
     ]
     assert "builtin:shell" not in packager_tools
-    assert "builtin:write_file" not in packager_tools
-    assert "builtin:edit_file" not in packager_tools
+    assert "builtin:apply_patch" not in packager_tools
+    assert "builtin:apply_patch" not in packager_tools
     assert "builtin:delegate_agent" not in packager_tools
 
 
@@ -1786,6 +1786,7 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
     class FakeInstaller:
         def __init__(self) -> None:
             self.calls: list[tuple[dict, dict, str]] = []
+            self.skill_file_operations: list[dict] = []
 
         def install_draft(
             self,
@@ -1826,6 +1827,9 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
                 package=package,
                 component_ids=["envreq:executable:gh"],
             )
+
+        def materialize_component(self, data: dict, component) -> None:
+            del data, component
 
     installer = FakeInstaller()
     monkeypatch.setattr(admin_service, "CapabilityPackageInstaller", lambda **_: installer)

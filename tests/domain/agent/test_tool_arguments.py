@@ -1,4 +1,4 @@
-from reuleauxcoder.domain.agent.tool_arguments import (
+﻿from reuleauxcoder.domain.agent.tool_arguments import (
     ToolArgumentRepairPolicy,
     format_tool_argument_retry_message,
     validate_and_repair_tool_arguments,
@@ -35,7 +35,7 @@ def test_required_null_remains_invalid() -> None:
     }
 
     result = validate_and_repair_tool_arguments(
-        tool_name="write_file",
+        tool_name="apply_patch",
         arguments={"content": None},
         schema=schema,
     )
@@ -153,14 +153,14 @@ def test_retry_message_lists_precise_paths_and_types() -> None:
         "required": ["content"],
     }
     result = validate_and_repair_tool_arguments(
-        tool_name="write_file",
+        tool_name="apply_patch",
         arguments={},
         schema=schema,
     )
 
     message = format_tool_argument_retry_message(
-        "write_file", result.final_issues
+        "apply_patch", result.final_issues
     )
 
     assert "$.content: expected string, got missing" in message
-    assert "Re-call write_file" in message
+    assert "Re-call apply_patch" in message

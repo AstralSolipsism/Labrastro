@@ -1,4 +1,4 @@
-"""Inject fresh LSP diagnostics after local file edits."""
+"""Inject fresh LSP diagnostics after local patch mutations."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from reuleauxcoder.extensions.lsp.diagnostics import render_blocks
 @register_hook(HookPoint.AFTER_TOOL_EXECUTE, priority=-10)
 @dataclass(slots=True)
 class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
-    """Append diagnostics to successful local edit/write tool results."""
+    """Append diagnostics to successful local patch tool results."""
 
     lsp_manager: "LspManager | None" = None
     lifecycle_dispatcher: Any | None = None
@@ -49,23 +49,27 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
             return context
         if context.metadata.get("execution_target") == "remote_peer":
             return context
-        if context.tool_call.name not in {"write_file", "edit_file"}:
+        if context.tool_call.name != "apply_patch":
             return context
         if context.result.startswith("Error:"):
             return context
 
-        file_path = context.tool_call.arguments.get("file_path")
-        if not isinstance(file_path, str) or not file_path.strip():
+        file_paths = _patch_file_paths(context.tool_call.arguments.get("patch"))
+        if not file_paths:
             return context
-        try:
-            block = self.lsp_manager.notify_file_changed(file_path)
-        except Exception:
-            return context
-        self._dispatch_file_changed_lifecycle(context, file_path, block)
-        if block is None:
+        blocks = []
+        for file_path in file_paths:
+            try:
+                block = self.lsp_manager.notify_file_changed(file_path)
+            except Exception:
+                continue
+            self._dispatch_file_changed_lifecycle(context, file_path, block)
+            if block is not None:
+                blocks.append(block)
+        if not blocks:
             return context
         rendered = render_blocks(
-            [block],
+            blocks,
             max_diagnostics=self.lsp_manager.config.max_diagnostics,
             include_warnings=self.lsp_manager.config.include_warnings,
         )
@@ -124,3 +128,37 @@ class LspEditObserverHook(TransformHook[AfterToolExecuteContext]):
             dispatch(lifecycle_context)
         except Exception:
             return
+
+
+def _patch_file_paths(patch: Any) -> list[str]:
+    if not isinstance(patch, str) or not patch.strip():
+        return []
+    paths: list[str] = []
+    pending_update: str | None = None
+    for line in patch.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.startswith("*** Add File: "):
+            pending_update = None
+            _append_unique(paths, line[len("*** Add File: ") :].strip())
+            continue
+        if line.startswith("*** Delete File: "):
+            pending_update = None
+            _append_unique(paths, line[len("*** Delete File: ") :].strip())
+            continue
+        if line.startswith("*** Update File: "):
+            pending_update = line[len("*** Update File: ") :].strip()
+            _append_unique(paths, pending_update)
+            continue
+        if line.startswith("*** Move to: "):
+            _append_unique(paths, line[len("*** Move to: ") :].strip())
+            pending_update = None
+            continue
+        if line.startswith("*** "):
+            pending_update = None
+    if pending_update:
+        _append_unique(paths, pending_update)
+    return paths
+
+
+def _append_unique(paths: list[str], value: str) -> None:
+    if value and value not in paths:
+        paths.append(value)

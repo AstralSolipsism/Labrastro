@@ -76,9 +76,9 @@ approval:
       action: "allow"
     - tool_name: "lsp"
       action: "allow"
-    - tool_name: "write_file"
+    - tool_name: "apply_patch"
       action: "require_approval"
-    - tool_name: "edit_file"
+    - tool_name: "draft_document_begin"
       action: "require_approval"
     - tool_name: "shell"
       action: "require_approval"
@@ -397,7 +397,8 @@ skills:
 #             args: ["--root", "{{workspace}}"]
 #       permissions:
 #         tools:
-#           write_file: "require_approval"
+#           apply_patch: "require_approval"
+#           draft_document_begin: "require_approval"
 #       enabled: true
 #
 #     github:

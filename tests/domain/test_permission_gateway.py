@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import replace
 
@@ -363,13 +363,13 @@ def test_escalate_execution_policy_warns_and_inherit_defers_to_approval() -> Non
     inherited = PermissionGateway().evaluate(
         _request(
             effective_capabilities={
-                "tools": ["builtin:write_file"],
+                "tools": ["builtin:apply_patch"],
                 "execution_policies": [
-                    {"target": "builtin_tool:write_file", "policy": "inherit"}
+                    {"target": "builtin_tool:apply_patch", "policy": "inherit"}
                 ],
             },
-            target=_target(name="write_file"),
-            tool_call=ToolCall(id="call-write", name="write_file", arguments={}),
+            target=_target(name="apply_patch"),
+            tool_call=ToolCall(id="call-write", name="apply_patch", arguments={}),
             approval=ApprovalConfig(default_mode="deny"),
         )
     )

@@ -168,7 +168,7 @@ class ReuleauxTUI(App):
                     )
                     yield ChatMessage(
                         "system",
-                        "⚙️ Tool Execution: `write_to_file`\nPath: `reuleauxcoder/interfaces/tui/mockup.py`",
+                        "⚙️ Tool Execution: `apply_patch`\nPath: `reuleauxcoder/interfaces/tui/mockup.py`",
                     )
                     yield ChatMessage(
                         "assistant",

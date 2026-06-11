@@ -78,7 +78,7 @@ def test_platform_mcp_policy_allows_only_agent_declared_servers() -> None:
     effective = policy_module.PlatformMCPPolicy(
         platform_servers={
             "github": {"command": "github-mcp", "tools": ["create_pr", "comment"]},
-            "filesystem": {"command": "filesystem-mcp", "tools": ["write_file"]},
+            "filesystem": {"command": "filesystem-mcp", "tools": ["apply_patch"]},
         },
         allowed_servers=["github"],
     ).render_for_agent({"servers": ["github", "filesystem"]})

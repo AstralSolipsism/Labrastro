@@ -200,6 +200,10 @@ class ShellTool(Tool):
 
 
 def validate_shell_intent(command: object, intent: object) -> str | None:
+    if isinstance(command, str):
+        manual_write = classify_manual_file_write(command)
+        if manual_write:
+            return manual_write
     if not isinstance(intent, str) or not intent.strip():
         return "Error: shell tool requires a user-facing 'intent' before execution."
     value = intent.strip()
@@ -217,3 +221,25 @@ def validate_shell_intent(command: object, intent: object) -> str | None:
 
 def _normalize_intent_for_comparison(value: str) -> str:
     return re.sub(r"[\s`'\"“”‘’。.!！?？:：;；,，]+", "", value.strip().lower())
+
+
+def classify_manual_file_write(command: str) -> str | None:
+    normalized = str(command or "")
+    patterns = (
+        (r"(?im)^\s*(echo|printf)\b.*>\s*(?![&0-9])", "shell redirection"),
+        (r"(?im)<<\s*['\"]?\w+['\"]?\s*>\s*", "heredoc redirection"),
+        (r"(?im)\|\s*tee\s+(-a\s+)?[^\s|;]+", "tee file write"),
+        (r"(?i)\bSet-Content\b", "Set-Content"),
+        (r"(?i)\bOut-File\b", "Out-File"),
+        (r"(?i)\bAdd-Content\b", "Add-Content"),
+        (r"(?i)\bpython(?:3)?\b.*\bopen\s*\([^)]*['\"]w", "python file write"),
+        (r"(?i)\bnode\b.*\bwriteFileSync\s*\(", "node file write"),
+        (r"(?i)\bfs\.writeFileSync\s*\(", "node file write"),
+    )
+    for pattern, reason in patterns:
+        if re.search(pattern, normalized):
+            return (
+                f"Error: shell file editing is not allowed ({reason}). "
+                "Use apply_patch for file changes or draft_document_begin for long markdown documents."
+            )
+    return None

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sys
@@ -4003,7 +4003,7 @@ def test_lifecycle_dispatcher_fail_opens_observation_handler_exception() -> None
             {
                 "tool_call": {
                     "id": "call-read",
-                    "name": "write_file",
+                    "name": "apply_patch",
                     "arguments": {},
                 }
             },
@@ -4220,7 +4220,7 @@ def test_lifecycle_dispatcher_passes_updated_tool_call_to_next_pre_tool_hook() -
             _declaration_payload(
                 event="PreToolUse",
                 handler_ref="observe",
-                matcher={"tool_names": "write_file"},
+                matcher={"tool_names": "apply_patch"},
                 trust="trusted",
             ),
         ),
@@ -4233,7 +4233,7 @@ def test_lifecycle_dispatcher_passes_updated_tool_call_to_next_pre_tool_hook() -
                     "updated_input": {
                         "tool_call": {
                             "id": "call-original",
-                            "name": "write_file",
+                            "name": "apply_patch",
                             "arguments": {"file_path": "out.txt"},
                         }
                     }
@@ -4264,7 +4264,7 @@ def test_lifecycle_dispatcher_passes_updated_tool_call_to_next_pre_tool_hook() -
         )
     )
 
-    assert seen_tool_names == ["write_file"]
+    assert seen_tool_names == ["apply_patch"]
 
 
 def test_lifecycle_dispatcher_matches_standard_context_fields_only() -> None:
@@ -4287,7 +4287,7 @@ def test_lifecycle_dispatcher_matches_standard_context_fields_only() -> None:
             _declaration_payload(
                 handler_ref="tool-list",
                 trust="trusted",
-                matcher={"tool_names": ["write_file", "deploy"]},
+                matcher={"tool_names": ["apply_patch", "deploy"]},
             ),
         ),
     ])
@@ -4662,7 +4662,7 @@ def test_lifecycle_batch_tool_matcher_uses_same_list_semantics() -> None:
                 event="PostToolBatch",
                 handler_ref="write",
                 trust="trusted",
-                matcher={"tool_names": ["write_file", "edit_file"]},
+                matcher={"tool_names": ["apply_patch", "apply_patch"]},
             ),
         ),
         LifecycleHookDeclaration.from_dict(
@@ -4691,7 +4691,7 @@ def test_lifecycle_batch_tool_matcher_uses_same_list_semantics() -> None:
             payload=build_tool_batch_lifecycle_payload(
                 tool_calls=[
                     type("_ToolCall", (), {"id": "call-a", "name": "read_file", "arguments": {}})(),
-                    type("_ToolCall", (), {"id": "call-b", "name": "write_file", "arguments": {}})(),
+                    type("_ToolCall", (), {"id": "call-b", "name": "apply_patch", "arguments": {}})(),
                 ],
                 results=["a", "b"],
                 tool_sources=["builtin", "builtin"],

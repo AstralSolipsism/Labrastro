@@ -520,7 +520,7 @@ def test_parse_config_validates_public_lifecycle_hook_contract_fields() -> None:
                             "placement": "server",
                             "handler_type": "http",
                             "handler_ref": "https://hooks.example.test/review",
-                            "matcher": {"tool_names": ["write_file"]},
+                            "matcher": {"tool_names": ["apply_patch"]},
                             "display_name": "Review package policy",
                             "summary": "Checks writes before tools run.",
                             "permissions": ["http.lifecycle"],
@@ -1044,7 +1044,7 @@ def test_parse_config_reads_peer_mcp_artifacts() -> None:
                         ],
                         "build": {"type": "node", "package": "@demo/filesystem"},
                         "permissions": {
-                            "tools": {"write_file": "require_approval"}
+                            "tools": {"apply_patch": "require_approval"}
                         },
                     }
                 },
@@ -1068,7 +1068,7 @@ def test_parse_config_reads_peer_mcp_artifacts() -> None:
         "envreq:executable:npm",
     ]
     assert server.build["type"] == "node"
-    assert server.permissions["tools"]["write_file"] == "require_approval"
+    assert server.permissions["tools"]["apply_patch"] == "require_approval"
 
 
 def test_parse_config_reads_command_mcp_manifest_fields() -> None:

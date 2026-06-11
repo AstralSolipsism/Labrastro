@@ -224,14 +224,24 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "registry_path": "builtin:delegate_agent",
         "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
-    "builtin_tool:edit_file": {
+    "builtin_tool:apply_patch": {
         "kind": "builtin_tool",
-        "name": "edit_file",
-        "description": "Edit files in the active workspace.",
+        "name": "apply_patch",
+        "description": "Apply structured text patches to files in the active workspace.",
         "access": "write",
         "risk_level": "medium",
         "execution_policy": "inherit",
-        "registry_path": "builtin:edit_file",
+        "registry_path": "builtin:apply_patch",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:draft_document_begin": {
+        "kind": "builtin_tool",
+        "name": "draft_document_begin",
+        "description": "Declare a long markdown document draft target without passing content as tool arguments.",
+        "access": "write",
+        "risk_level": "medium",
+        "execution_policy": "inherit",
+        "registry_path": "builtin:draft_document_begin",
         "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
     "builtin_tool:fetch_capabilities": {
@@ -321,16 +331,6 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
             DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
             DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
         ],
-    },
-    "builtin_tool:write_file": {
-        "kind": "builtin_tool",
-        "name": "write_file",
-        "description": "Write files in the active workspace.",
-        "access": "write",
-        "risk_level": "medium",
-        "execution_policy": "inherit",
-        "registry_path": "builtin:write_file",
-        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
 }
 BUILTIN_TOOL_COMPONENT_FORCED_FIELDS: tuple[str, ...] = (

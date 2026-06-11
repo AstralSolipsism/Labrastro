@@ -31,6 +31,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     CapabilityComponentConfig,
     CapabilityPackageConfig,
 )
+from reuleauxcoder.domain.capability_packages import capability_package_state_projection
 from reuleauxcoder.domain.runtime_footprint import (
     aggregate_runtime_footprint,
     runtime_footprint_for_environment_requirement,
@@ -212,6 +213,7 @@ def test_capability_package_config_roundtrip_preserves_runtime_footprint() -> No
             "user_message": "服务端和本地端都需要配置",
         },
     )
+    package.state = capability_package_state_projection(package.to_dict())
 
     restored = CapabilityPackageConfig.from_dict("review", package.to_dict())
 
@@ -355,7 +357,7 @@ def test_peer_mcp_server_config_roundtrip() -> None:
                 launch=MCPLaunchConfig(command="{{bundle}}/run.sh"),
             )
         },
-        permissions={"tools": {"write_file": "require_approval"}},
+        permissions={"tools": {"apply_patch": "require_approval"}},
         environment_requirement_refs=["envreq:runtime:node", "envreq:executable:npm"],
         build={"type": "node", "package": "@demo/filesystem"},
     )

@@ -1,0 +1,74 @@
+"""Apply structured text patches through the runtime file mutation service."""
+
+from __future__ import annotations
+
+import os
+
+from reuleauxcoder.domain.files import LocalWorkspaceMutationBackend
+from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
+from reuleauxcoder.extensions.tools.base import Tool, backend_handler
+from reuleauxcoder.extensions.tools.registry import register_tool
+
+
+PATCH_ARGUMENT_CHARS_LIMIT = 64 * 1024
+
+
+@register_tool
+class ApplyPatchTool(Tool):
+    name = "apply_patch"
+    description = (
+        "Apply a structured text patch to workspace files. Use this as the only "
+        "file mutation protocol for adding, updating, deleting, or moving text files."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "patch": {
+                "type": "string",
+                "description": "Patch text using the *** Begin Patch grammar.",
+            },
+        },
+        "required": ["patch"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, backend: ToolBackend | None = None):
+        super().__init__(backend or LocalToolBackend())
+
+    def preflight_validate(self, **kwargs) -> str | None:
+        patch = kwargs.get("patch")
+        if not isinstance(patch, str) or not patch.strip():
+            return "Error: apply_patch requires a non-empty string patch"
+        if len(patch) > PATCH_ARGUMENT_CHARS_LIMIT:
+            return (
+                "Error: apply_patch patch exceeds 64 KiB; split the patch or use "
+                "draft_document_begin for long markdown documents"
+            )
+        if "\x00" in patch:
+            return "Error: apply_patch does not accept binary patch content"
+        return None
+
+    def execute(self, patch: str) -> str:
+        validation_error = self.preflight_validate(patch=patch)
+        if validation_error:
+            return validation_error
+        return self.run_backend(patch=patch)
+
+    @backend_handler("remote_relay")
+    def _execute_remote(self, patch: str) -> str:
+        validation_error = self.preflight_validate(patch=patch)
+        if validation_error:
+            return validation_error
+        return self.backend.exec_tool("apply_patch", {"patch": patch})
+
+    @backend_handler("local")
+    def _execute_local(self, patch: str) -> str:
+        workspace_root = getattr(getattr(self.backend, "context", None), "workspace_root", None)
+        cwd = getattr(getattr(self.backend, "context", None), "cwd", None)
+        mutation_backend = LocalWorkspaceMutationBackend(workspace_root or cwd or os.getcwd())
+        result = mutation_backend.apply_text_patch(patch)
+        if not result.ok:
+            return result.message
+        if result.diff:
+            return f"{result.message}\n{result.diff}"
+        return result.message

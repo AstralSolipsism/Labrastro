@@ -37,6 +37,19 @@ class CaptureLifecycleDispatcher:
         return []
 
 
+def _patch_for_main() -> str:
+    return "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: main.py",
+            "@@",
+            "-old",
+            "+new",
+            "*** End Patch",
+        ]
+    )
+
+
 def test_lsp_edit_observer_appends_local_diagnostics() -> None:
     manager = FakeManager()
     hook = LspEditObserverHook()
@@ -45,16 +58,16 @@ def test_lsp_edit_observer_appends_local_diagnostics() -> None:
         hook_point=HookPoint.AFTER_TOOL_EXECUTE,
         tool_call=ToolCall(
             id="call-1",
-            name="edit_file",
-            arguments={"file_path": "main.py"},
+            name="apply_patch",
+            arguments={"patch": _patch_for_main()},
         ),
-        result="Edited main.py",
+        result="Applied patch",
         metadata={"execution_target": "local"},
     )
 
     result = hook.run(context)
 
-    assert "Edited main.py" in result.result
+    assert "Applied patch" in result.result
     assert '<diagnostics file="main.py">' in result.result
     assert manager.changed == ["main.py"]
 
@@ -69,10 +82,10 @@ def test_lsp_edit_observer_dispatches_file_changed_lifecycle() -> None:
         hook_point=HookPoint.AFTER_TOOL_EXECUTE,
         tool_call=ToolCall(
             id="call-1",
-            name="edit_file",
-            arguments={"file_path": "main.py"},
+            name="apply_patch",
+            arguments={"patch": _patch_for_main()},
         ),
-        result="Edited main.py",
+        result="Applied patch",
         session_id="session-1",
         metadata={
             "execution_target": "local",
@@ -99,7 +112,7 @@ def test_lsp_edit_observer_dispatches_file_changed_lifecycle() -> None:
     assert lifecycle_context.turn_id == "turn-1"
     assert lifecycle_context.source == "chat"
     assert lifecycle_context.payload["file_path"] == "main.py"
-    assert lifecycle_context.payload["tool_names"] == ["edit_file"]
+    assert lifecycle_context.payload["tool_names"] == ["apply_patch"]
     assert lifecycle_context.payload["tool_call_ids"] == ["call-1"]
     assert lifecycle_context.payload["execution_target"] == "local"
     assert lifecycle_context.payload["runtime_working_directory"] == "/workspace"
@@ -116,17 +129,46 @@ def test_lsp_edit_observer_skips_remote_peer_results() -> None:
         hook_point=HookPoint.AFTER_TOOL_EXECUTE,
         tool_call=ToolCall(
             id="call-1",
-            name="write_file",
-            arguments={"file_path": "main.py"},
+            name="apply_patch",
+            arguments={"patch": _patch_for_main()},
         ),
-        result="Wrote main.py",
+        result="Applied patch",
         metadata={"execution_target": "remote_peer"},
     )
 
     result = hook.run(context)
 
-    assert result.result == "Wrote main.py"
+    assert result.result == "Applied patch"
     assert manager.changed == []
+
+
+def test_lsp_edit_observer_notifies_move_target() -> None:
+    manager = FakeManager()
+    hook = LspEditObserverHook()
+    hook.set_lsp_manager(manager)
+    context = AfterToolExecuteContext(
+        hook_point=HookPoint.AFTER_TOOL_EXECUTE,
+        tool_call=ToolCall(
+            id="call-1",
+            name="apply_patch",
+            arguments={
+                "patch": "\n".join(
+                    [
+                        "*** Begin Patch",
+                        "*** Update File: main.py",
+                        "*** Move to: src/main.py",
+                        "*** End Patch",
+                    ]
+                )
+            },
+        ),
+        result="Applied patch",
+        metadata={"execution_target": "local"},
+    )
+
+    hook.run(context)
+
+    assert manager.changed == ["main.py", "src/main.py"]
 
 
 def test_lsp_injector_adds_cached_diagnostics_to_request() -> None:

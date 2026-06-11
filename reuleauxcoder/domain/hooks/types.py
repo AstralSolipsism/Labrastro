@@ -21,7 +21,7 @@ class HookKind(str, Enum):
 
 
 class HookPoint(str, Enum):
-    """Supported hook points for the MVP runtime."""
+    """Supported hook points for the runtime."""
 
     BEFORE_TOOL_EXECUTE = "before_tool_execute"
     AFTER_TOOL_EXECUTE = "after_tool_execute"

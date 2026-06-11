@@ -93,7 +93,7 @@ def test_persist_llm_error_diagnostic_records_cause_chain_and_provider_details(
                 "max_tokens": 384000,
                 "stream_options": {"include_usage": True},
                 "api_key": "sk-secret",
-                "tools": [{"type": "function", "function": {"name": "write_file"}}],
+                "tools": [{"type": "function", "function": {"name": "apply_patch"}}],
             },
             raw_messages=[{"role": "user", "content": "hello"}],
             sanitized_messages=[{"role": "user", "content": "hello"}],
@@ -120,7 +120,7 @@ def test_persist_llm_error_diagnostic_records_cause_chain_and_provider_details(
     assert payload["error"]["cause_chain"][0]["type"] == "RuntimeError"
     assert payload["error"]["cause_chain"][1]["type"] == "OSError"
     assert "RuntimeError: Connection error." in payload["error"]["traceback"]
-    assert payload["request"]["tool_names"] == ["write_file"]
+    assert payload["request"]["tool_names"] == ["apply_patch"]
     assert payload["metadata"]["Authorization"] == "[REDACTED]"
     serialized = json.dumps(payload, ensure_ascii=False)
     assert "sk-secret" not in serialized
@@ -132,12 +132,12 @@ def test_tool_diagnostic_telemetry_aggregates_by_model_tool_stage_and_issue(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     validation = validate_and_repair_tool_arguments(
-        tool_name="write_file",
+        tool_name="apply_patch",
         arguments={},
         schema={
             "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
         },
     )
 
@@ -149,17 +149,17 @@ def test_tool_diagnostic_telemetry_aggregates_by_model_tool_stage_and_issue(
         validation=validation,
         metadata={
             "model": "deepseek-v4-pro",
-            "tool": "write_file",
+            "tool": "apply_patch",
             "provider_id": "deepseek",
         },
     )
 
     counts = aggregate_tool_diagnostic_events(path)
 
-    assert counts["model=deepseek-v4-pro|tool=write_file|final_valid=false"] == 1
+    assert counts["model=deepseek-v4-pro|tool=apply_patch|final_valid=false"] == 1
     assert (
         counts[
-            "issue|model=deepseek-v4-pro|tool=write_file|stage=argument_validation|kind=schema_issue|code=missing_required|path=$.content"
+            "issue|model=deepseek-v4-pro|tool=apply_patch|stage=argument_validation|kind=schema_issue|code=missing_required|path=$.patch"
         ]
         == 1
     )

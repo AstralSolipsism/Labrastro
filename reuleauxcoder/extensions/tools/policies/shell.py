@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from reuleauxcoder.domain.llm.models import ToolCall
+from reuleauxcoder.extensions.tools.builtin.shell import classify_manual_file_write
 from reuleauxcoder.extensions.tools.policies.base import ToolPolicy, ToolPolicyDecision
 
 
@@ -35,6 +36,10 @@ class ShellDangerousCommandPolicy(ToolPolicy):
         command = tool_call.arguments.get("command")
         if not isinstance(command, str):
             return ToolPolicyDecision.deny("shell tool requires a string 'command' argument")
+
+        manual_write = classify_manual_file_write(command)
+        if manual_write:
+            return ToolPolicyDecision.deny(manual_write)
 
         for pattern, reason in self.patterns:
             if re.search(pattern, command):
