@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -56,10 +57,10 @@ func ExecuteWithContext(
 		result = runShell(ctx, req.Args, cwd, req.TimeoutSec, onStream)
 	case "read_file":
 		result = readFile(req.Args, cwd)
-	case "write_file":
-		result = writeFile(req.Args, cwd, req.ExpectedState)
-	case "edit_file":
-		result = editFile(req.Args, cwd, req.ExpectedState)
+	case "apply_patch":
+		result = applyPatch(req.Args, cwd, req.ExpectedState)
+	case "draft_document_commit":
+		result = draftDocumentCommit(req.Args, cwd, req.ExpectedState)
 	case "glob":
 		result = globFiles(req.Args, cwd)
 	case "grep":
@@ -70,9 +71,6 @@ func ExecuteWithContext(
 		result = lspTool(req.Args, cwd)
 	default:
 		result = errorResult("REMOTE_TOOL_ERROR", fmt.Sprintf("unsupported tool %q", req.ToolName))
-	}
-	if result.OK && (req.ToolName == "write_file" || req.ToolName == "edit_file") {
-		result = appendLSPDiagnostics(result, req.Args, cwd)
 	}
 	result = prependWarning(result, staleWarning)
 	return finalizeToolResult(req, result, workspaceRoot)
@@ -88,14 +86,14 @@ func ShutdownLSP() {
 
 func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPreviewResult {
 	cwd, staleWarning := resolveRequestedCWD(currentCWD, req.CWD)
-	if req.ToolName != "write_file" && req.ToolName != "edit_file" {
+	if req.ToolName != "apply_patch" && req.ToolName != "draft_document_commit" {
 		return protocol.ToolPreviewResult{
 			OK:           false,
 			ErrorCode:    "REMOTE_TOOL_PREVIEW_UNSUPPORTED",
 			ErrorMessage: fmt.Sprintf("tool %q does not support preview", req.ToolName),
 		}
 	}
-	mutation, err := buildFileMutation(req.ToolName, req.Args, cwd)
+	mutations, err := buildMutationPlan(req.ToolName, req.Args, cwd, nil)
 	if err != nil {
 		return protocol.ToolPreviewResult{
 			OK:           false,
@@ -103,37 +101,68 @@ func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPr
 			ErrorMessage: err.Error(),
 		}
 	}
-	oldExists := mutation.oldState.exists
-	oldSize := mutation.oldState.size
-	oldMTimeNS := mutation.oldState.mtimeNS
-	section := map[string]any{
-		"id":            "diff",
-		"title":         mutation.diffTitle(),
-		"kind":          "diff",
-		"content":       mutation.diff,
-		"path":          mutation.filePath,
-		"resolved_path": mutation.resolvedPath,
+	if len(mutations) == 0 {
+		return protocol.ToolPreviewResult{
+			OK:           false,
+			ErrorCode:    "REMOTE_TOOL_ERROR",
+			ErrorMessage: "patch contains no file operations",
+		}
 	}
-	originalText, modifiedText := previewTexts(mutation.oldContent, mutation.newContent)
-	if originalText != "" || modifiedText != "" {
-		section["original_text"] = originalText
-		section["modified_text"] = modifiedText
+	sections := make([]map[string]any, 0, len(mutations))
+	var combinedDiff strings.Builder
+	for idx, mutation := range mutations {
+		section := map[string]any{
+			"id":            fmt.Sprintf("diff-%d", idx+1),
+			"title":         mutation.diffTitle(),
+			"kind":          "diff",
+			"change_kind":   mutation.kind,
+			"content":       mutation.diff,
+			"path":          mutation.filePath,
+			"resolved_path": mutation.resolvedPath,
+		}
+		if mutation.movePath != "" {
+			section["move_path"] = mutation.movePath
+		}
+		originalText, modifiedText := previewTexts(mutation.oldContent, mutation.newContent)
+		if originalText != "" || modifiedText != "" {
+			section["original_text"] = originalText
+			section["modified_text"] = modifiedText
+		}
+		sections = append(sections, section)
+		if mutation.diff != "" {
+			if combinedDiff.Len() > 0 {
+				combinedDiff.WriteString("\n")
+			}
+			combinedDiff.WriteString(mutation.diff)
+		}
 	}
+	first := mutations[0]
+	oldExists := first.oldState.exists
+	oldSize := first.oldState.size
+	oldMTimeNS := first.oldState.mtimeNS
+	originalText, modifiedText := previewTexts(first.oldContent, first.newContent)
 	result := protocol.ToolPreviewResult{
 		OK:           true,
-		Sections:     []map[string]any{section},
-		ResolvedPath: mutation.resolvedPath,
-		OldSHA256:    mutation.oldState.sha256,
+		Sections:     sections,
+		ResolvedPath: first.resolvedPath,
+		OldSHA256:    first.oldState.sha256,
 		OldExists:    &oldExists,
 		OldSize:      &oldSize,
 		OldMTimeNS:   &oldMTimeNS,
-		Diff:         mutation.diff,
+		Diff:         combinedDiff.String(),
 		OriginalText: originalText,
 		ModifiedText: modifiedText,
 	}
 	if staleWarning != "" {
 		result.Meta = map[string]any{"warning": strings.TrimSpace(staleWarning)}
 	}
+	if result.Meta == nil {
+		result.Meta = map[string]any{}
+	}
+	operations := mutationOperationStates(mutations)
+	result.Meta["plan_id"] = fmt.Sprintf("mutation-%x", sha256.Sum256([]byte(time.Now().String()+first.resolvedPath)))[:41]
+	result.Meta["plan_hash"] = mutationPlanHash(req.ToolName, operations, combinedDiff.String())
+	result.Meta["operations"] = operationStatesAsMaps(operations)
 	return result
 }
 
@@ -502,39 +531,192 @@ func readFile(args map[string]any, cwd string) protocol.ExecToolResult {
 	return protocol.ExecToolResult{OK: true, Result: result}
 }
 
-func writeFile(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
-	mutation, err := buildFileMutation("write_file", args, cwd)
-	if err != nil {
-		return errorResult("REMOTE_TOOL_ERROR", err.Error())
-	}
-	if stale := validateExpectedState(expectedState, mutation.oldState, mutation.resolvedPath); stale != "" {
-		return errorResult("REMOTE_TOOL_STALE_PREVIEW", stale)
-	}
-	if err := os.MkdirAll(filepath.Dir(mutation.resolvedPath), 0o755); err != nil {
-		return errorResult("REMOTE_TOOL_ERROR", err.Error())
-	}
-	if err := os.WriteFile(mutation.resolvedPath, []byte(mutation.newContent), 0o644); err != nil {
-		return errorResult("REMOTE_TOOL_ERROR", err.Error())
-	}
-	return protocol.ExecToolResult{OK: true, Result: fmt.Sprintf("Wrote %d lines to %s", mutation.lineCount, mutation.filePath)}
+type fileState struct {
+	exists  bool
+	sha256  string
+	size    int64
+	mtimeNS int64
 }
 
-func editFile(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
-	mutation, err := buildFileMutation("edit_file", args, cwd)
+type fileMutation struct {
+	kind             string
+	filePath         string
+	movePath         string
+	resolvedPath     string
+	moveResolvedPath string
+	oldContent       string
+	newContent       string
+	oldState         fileState
+	diff             string
+	lineCount        int
+}
+
+func (m fileMutation) diffTitle() string {
+	switch m.kind {
+	case "add":
+		return "Proposed file add"
+	case "delete":
+		return "Proposed file deletion"
+	case "move":
+		return "Proposed file move"
+	default:
+		return "Proposed file diff"
+	}
+}
+
+func applyPatch(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
+	mutations, err := buildMutationPlan("apply_patch", args, cwd, expectedState)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "stale preview: ") {
+			return errorResult("REMOTE_TOOL_STALE_PREVIEW", strings.TrimPrefix(err.Error(), "stale preview: "))
+		}
 		return errorResult("REMOTE_TOOL_ERROR", err.Error())
 	}
-	if stale := validateExpectedState(expectedState, mutation.oldState, mutation.resolvedPath); stale != "" {
-		return errorResult("REMOTE_TOOL_STALE_PREVIEW", stale)
-	}
-	if err := os.WriteFile(mutation.resolvedPath, []byte(mutation.newContent), 0o644); err != nil {
+	if err := applyMutationsTransactionally(mutations); err != nil {
 		return errorResult("REMOTE_TOOL_ERROR", err.Error())
 	}
-	result := fmt.Sprintf("Edited %s", mutation.filePath)
-	if mutation.diff != "" {
-		result += "\n" + mutation.diff
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("Applied patch (%d file changes)", len(mutations)))
+	for _, mutation := range mutations {
+		if mutation.diff != "" {
+			result.WriteString("\n")
+			result.WriteString(mutation.diff)
+		}
 	}
-	return protocol.ExecToolResult{OK: true, Result: result}
+	return protocol.ExecToolResult{OK: true, Result: result.String()}
+}
+
+func draftDocumentCommit(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
+	mutations, err := buildMutationPlan("draft_document_commit", args, cwd, expectedState)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "stale preview: ") {
+			return errorResult("REMOTE_TOOL_STALE_PREVIEW", strings.TrimPrefix(err.Error(), "stale preview: "))
+		}
+		return errorResult("REMOTE_TOOL_ERROR", err.Error())
+	}
+	if err := applyMutationsTransactionally(mutations); err != nil {
+		return errorResult("REMOTE_TOOL_ERROR", err.Error())
+	}
+	target := ""
+	if len(mutations) > 0 {
+		target = mutations[0].filePath
+	}
+	return protocol.ExecToolResult{OK: true, Result: fmt.Sprintf("Committed document %s", target)}
+}
+
+type filePathSnapshot struct {
+	path   string
+	exists bool
+	data   []byte
+	mode   os.FileMode
+}
+
+func applyMutationsTransactionally(mutations []fileMutation) error {
+	snapshots, err := snapshotMutationPaths(mutations)
+	if err != nil {
+		return err
+	}
+	if err := applyMutations(mutations); err != nil {
+		_ = restoreMutationSnapshots(snapshots)
+		return err
+	}
+	return nil
+}
+
+func applyMutations(mutations []fileMutation) error {
+	for _, mutation := range mutations {
+		if mutation.kind == "delete" {
+			if err := os.Remove(mutation.resolvedPath); err != nil {
+				return err
+			}
+			continue
+		}
+		target := mutation.resolvedPath
+		if mutation.kind == "move" {
+			target = mutation.moveResolvedPath
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, []byte(mutation.newContent), 0o644); err != nil {
+			return err
+		}
+		if mutation.kind == "move" && filepath.Clean(mutation.resolvedPath) != filepath.Clean(target) {
+			if err := os.Remove(mutation.resolvedPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func snapshotMutationPaths(mutations []fileMutation) ([]filePathSnapshot, error) {
+	seen := map[string]struct{}{}
+	var snapshots []filePathSnapshot
+	add := func(path string) error {
+		if strings.TrimSpace(path) == "" {
+			return nil
+		}
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			return nil
+		}
+		seen[clean] = struct{}{}
+		stat, err := os.Stat(clean)
+		if err != nil {
+			if os.IsNotExist(err) {
+				snapshots = append(snapshots, filePathSnapshot{path: clean, exists: false})
+				return nil
+			}
+			return err
+		}
+		if stat.IsDir() {
+			return fmt.Errorf("%s is a directory", clean)
+		}
+		data, err := os.ReadFile(clean)
+		if err != nil {
+			return err
+		}
+		snapshots = append(snapshots, filePathSnapshot{
+			path:   clean,
+			exists: true,
+			data:   data,
+			mode:   stat.Mode().Perm(),
+		})
+		return nil
+	}
+	for _, mutation := range mutations {
+		if err := add(mutation.resolvedPath); err != nil {
+			return nil, err
+		}
+		if mutation.kind == "move" {
+			if err := add(mutation.moveResolvedPath); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return snapshots, nil
+}
+
+func restoreMutationSnapshots(snapshots []filePathSnapshot) error {
+	var firstErr error
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		snapshot := snapshots[i]
+		if snapshot.exists {
+			if err := os.MkdirAll(filepath.Dir(snapshot.path), 0o755); err != nil && firstErr == nil {
+				firstErr = err
+				continue
+			}
+			if err := os.WriteFile(snapshot.path, snapshot.data, snapshot.mode); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := os.Remove(snapshot.path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func lspTool(args map[string]any, cwd string) protocol.ExecToolResult {
@@ -545,50 +727,130 @@ func lspTool(args map[string]any, cwd string) protocol.ExecToolResult {
 	return protocol.ExecToolResult{OK: true, Result: result}
 }
 
-func appendLSPDiagnostics(result protocol.ExecToolResult, args map[string]any, cwd string) protocol.ExecToolResult {
-	filePath, _ := args["file_path"].(string)
-	if strings.TrimSpace(filePath) == "" {
-		return result
+func buildMutationPlan(toolName string, args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) ([]fileMutation, error) {
+	switch toolName {
+	case "apply_patch":
+		return buildPatchMutations(args, cwd, expectedState)
+	case "draft_document_commit":
+		return buildDocumentCommitMutations(args, cwd, expectedState)
+	default:
+		return nil, fmt.Errorf("unsupported mutation tool %q", toolName)
 	}
-	diagnostics := lsp.DiagnosticsAfterEdit(filePath, cwd)
-	if strings.TrimSpace(diagnostics) == "" {
-		return result
-	}
-	result.Result = strings.TrimRight(result.Result, "\n") + "\n\n" + diagnostics
-	return result
 }
 
-type fileState struct {
-	exists  bool
-	sha256  string
-	size    int64
-	mtimeNS int64
-}
-
-type fileMutation struct {
-	toolName     string
-	filePath     string
-	resolvedPath string
-	oldContent   string
-	newContent   string
-	oldState     fileState
-	diff         string
-	lineCount    int
-}
-
-func (m fileMutation) diffTitle() string {
-	if m.toolName == "edit_file" {
-		return "Proposed edit diff"
+func buildPatchMutations(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) ([]fileMutation, error) {
+	patch, ok := args["patch"].(string)
+	if !ok || strings.TrimSpace(patch) == "" {
+		return nil, fmt.Errorf("patch must be a non-empty string")
 	}
-	return "Proposed file diff"
+	operations, err := parsePatchOperations(patch)
+	if err != nil {
+		return nil, err
+	}
+	mutations := make([]fileMutation, 0, len(operations))
+	for index, op := range operations {
+		resolved, err := resolveWorkspaceRelativePath(cwd, op.path)
+		if err != nil {
+			return nil, err
+		}
+		oldContent, oldState, err := readFileSnapshot(resolved)
+		if err != nil {
+			return nil, err
+		}
+		if expected := expectedOperationState(expectedState, index); expected != nil {
+			if stale := validateExpectedOperationState(expected, oldState, resolved); stale != "" {
+				return nil, fmt.Errorf("stale preview: %s", stale)
+			}
+		} else if expectedState != nil && len(expectedState.Operations) == 0 && index == 0 {
+			if stale := validateExpectedState(expectedState, oldState, resolved); stale != "" {
+				return nil, fmt.Errorf("stale preview: %s", stale)
+			}
+		}
+		mutation := fileMutation{
+			kind:         op.kind,
+			filePath:     op.path,
+			movePath:     op.movePath,
+			resolvedPath: resolved,
+			oldContent:   oldContent,
+			oldState:     oldState,
+		}
+		switch op.kind {
+		case "add":
+			if oldState.exists {
+				return nil, fmt.Errorf("file already exists: %s", op.path)
+			}
+			mutation.newContent, err = contentFromAddLines(op.lines)
+			if err != nil {
+				return nil, err
+			}
+		case "delete":
+			if !oldState.exists {
+				return nil, fmt.Errorf("file does not exist: %s", op.path)
+			}
+		case "update":
+			if !oldState.exists {
+				return nil, fmt.Errorf("file does not exist: %s", op.path)
+			}
+			mutation.newContent, err = applyUpdateHunks(oldContent, op.lines, op.path)
+			if err != nil {
+				return nil, err
+			}
+		case "move":
+			if !oldState.exists {
+				return nil, fmt.Errorf("file does not exist: %s", op.path)
+			}
+			if strings.TrimSpace(op.movePath) == "" {
+				return nil, fmt.Errorf("move patch requires target path")
+			}
+			mutation.moveResolvedPath, err = resolveWorkspaceRelativePath(cwd, op.movePath)
+			if err != nil {
+				return nil, err
+			}
+			_, targetState, err := readFileSnapshot(mutation.moveResolvedPath)
+			if err != nil {
+				return nil, err
+			}
+			if targetState.exists && filepath.Clean(mutation.moveResolvedPath) != filepath.Clean(mutation.resolvedPath) {
+				return nil, fmt.Errorf("move target already exists: %s", op.movePath)
+			}
+			if len(op.lines) == 0 {
+				mutation.newContent = oldContent
+			} else {
+				mutation.newContent, err = applyUpdateHunks(oldContent, op.lines, op.path)
+				if err != nil {
+					return nil, err
+				}
+			}
+		default:
+			return nil, fmt.Errorf("unsupported patch operation %q", op.kind)
+		}
+		diffName := mutation.filePath
+		if mutation.movePath != "" {
+			diffName = mutation.movePath
+		}
+		mutation.diff = unifiedWholeFileDiff(oldContent, mutation.newContent, diffName)
+		mutation.lineCount = countLines(mutation.newContent)
+		mutations = append(mutations, mutation)
+	}
+	if stale := validateExpectedPlanHash("apply_patch", expectedState, mutations); stale != "" {
+		return nil, fmt.Errorf("stale preview: %s", stale)
+	}
+	return mutations, nil
 }
 
-func buildFileMutation(toolName string, args map[string]any, cwd string) (*fileMutation, error) {
-	filePath, ok := args["file_path"].(string)
-	if !ok || filePath == "" {
-		return nil, fmt.Errorf("file_path must be a non-empty string")
+func buildDocumentCommitMutations(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) ([]fileMutation, error) {
+	targetPath, ok := args["target_path"].(string)
+	if !ok || strings.TrimSpace(targetPath) == "" {
+		return nil, fmt.Errorf("target_path must be a non-empty string")
 	}
-	resolved, err := resolvePath(cwd, filePath)
+	content, ok := args["content"].(string)
+	if !ok {
+		return nil, fmt.Errorf("content must be a string")
+	}
+	if strings.Contains(content, "\x00") {
+		return nil, fmt.Errorf("document content appears to be binary")
+	}
+	resolved, err := resolveWorkspaceRelativePath(cwd, targetPath)
 	if err != nil {
 		return nil, err
 	}
@@ -596,52 +858,295 @@ func buildFileMutation(toolName string, args map[string]any, cwd string) (*fileM
 	if err != nil {
 		return nil, err
 	}
-
-	var newContent string
-	switch toolName {
-	case "write_file":
-		content, ok := args["content"].(string)
-		if !ok {
-			return nil, fmt.Errorf("content must be a string")
+	if expected := expectedOperationState(expectedState, 0); expected != nil {
+		if stale := validateExpectedOperationState(expected, oldState, resolved); stale != "" {
+			return nil, fmt.Errorf("stale preview: %s", stale)
 		}
-		newContent = content
-	case "edit_file":
-		if !oldState.exists {
-			return nil, fmt.Errorf("file does not exist: %s", filePath)
+	} else if expectedState != nil && len(expectedState.Operations) == 0 {
+		if stale := validateExpectedState(expectedState, oldState, resolved); stale != "" {
+			return nil, fmt.Errorf("stale preview: %s", stale)
 		}
-		oldString, ok := args["old_string"].(string)
-		if !ok {
-			return nil, fmt.Errorf("old_string must be a string")
-		}
-		newString, ok := args["new_string"].(string)
-		if !ok {
-			return nil, fmt.Errorf("new_string must be a string")
-		}
-		if oldString == newString {
-			return nil, fmt.Errorf("old_string and new_string must differ")
-		}
-		var count int
-		newContent, count = buildEditedContent(oldContent, oldString, newString)
-		if count == 0 {
-			return nil, fmt.Errorf("old_string not found in %s", filePath)
-		}
-		if count > 1 {
-			return nil, fmt.Errorf("old_string appears %d times in %s", count, filePath)
-		}
-	default:
-		return nil, fmt.Errorf("unsupported tool %q", toolName)
 	}
-
-	return &fileMutation{
-		toolName:     toolName,
-		filePath:     filePath,
+	kind := "add"
+	if oldState.exists {
+		kind = "update"
+	}
+	mutation := fileMutation{
+		kind:         kind,
+		filePath:     targetPath,
 		resolvedPath: resolved,
 		oldContent:   oldContent,
-		newContent:   newContent,
 		oldState:     oldState,
-		diff:         unifiedWholeFileDiff(oldContent, newContent, filePath),
-		lineCount:    countLines(newContent),
-	}, nil
+		newContent:   content,
+		diff:         unifiedWholeFileDiff(oldContent, content, targetPath),
+		lineCount:    countLines(content),
+	}
+	mutations := []fileMutation{mutation}
+	if stale := validateExpectedPlanHash("draft_document_commit", expectedState, mutations); stale != "" {
+		return nil, fmt.Errorf("stale preview: %s", stale)
+	}
+	return mutations, nil
+}
+
+type patchOperation struct {
+	kind     string
+	path     string
+	movePath string
+	lines    []string
+}
+
+func parsePatchOperations(patch string) ([]patchOperation, error) {
+	normalized := strings.ReplaceAll(strings.ReplaceAll(patch, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(normalized, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "*** Begin Patch" {
+		return nil, fmt.Errorf("patch must start with *** Begin Patch")
+	}
+	if strings.TrimSpace(lines[len(lines)-1]) != "*** End Patch" {
+		return nil, fmt.Errorf("patch must end with *** End Patch")
+	}
+	var operations []patchOperation
+	for index := 1; index < len(lines)-1; {
+		line := lines[index]
+		switch {
+		case strings.HasPrefix(line, "*** Add File: "):
+			body, next := collectPatchBody(lines, index+1)
+			operations = append(operations, patchOperation{
+				kind:  "add",
+				path:  strings.TrimSpace(strings.TrimPrefix(line, "*** Add File: ")),
+				lines: body,
+			})
+			index = next
+		case strings.HasPrefix(line, "*** Delete File: "):
+			operations = append(operations, patchOperation{
+				kind: "delete",
+				path: strings.TrimSpace(strings.TrimPrefix(line, "*** Delete File: ")),
+			})
+			index++
+		case strings.HasPrefix(line, "*** Update File: "):
+			op := patchOperation{
+				kind: "update",
+				path: strings.TrimSpace(strings.TrimPrefix(line, "*** Update File: ")),
+			}
+			index++
+			if index < len(lines)-1 && strings.HasPrefix(lines[index], "*** Move to: ") {
+				op.kind = "move"
+				op.movePath = strings.TrimSpace(strings.TrimPrefix(lines[index], "*** Move to: "))
+				index++
+			}
+			op.lines, index = collectPatchBody(lines, index)
+			operations = append(operations, op)
+		default:
+			return nil, fmt.Errorf("unexpected patch line: %s", line)
+		}
+	}
+	if len(operations) == 0 {
+		return nil, fmt.Errorf("patch contains no file operations")
+	}
+	return operations, nil
+}
+
+func collectPatchBody(lines []string, index int) ([]string, int) {
+	var body []string
+	for index < len(lines)-1 && !strings.HasPrefix(lines[index], "*** ") {
+		body = append(body, lines[index])
+		index++
+	}
+	return body, index
+}
+
+func contentFromAddLines(lines []string) (string, error) {
+	content := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "+") {
+			return "", fmt.Errorf("Add File lines must start with +")
+		}
+		content = append(content, strings.TrimPrefix(line, "+"))
+	}
+	if len(content) == 0 {
+		return "", nil
+	}
+	return strings.Join(content, "\n") + "\n", nil
+}
+
+func applyUpdateHunks(oldContent string, lines []string, filePath string) (string, error) {
+	current := splitDiffLines(oldContent)
+	hunks, err := splitPatchHunks(lines)
+	if err != nil {
+		return "", err
+	}
+	if len(hunks) == 0 {
+		return "", fmt.Errorf("Update File requires at least one hunk: %s", filePath)
+	}
+	cursor := 0
+	for _, hunk := range hunks {
+		var oldSegment []string
+		var newSegment []string
+		for _, line := range hunk {
+			if line == "" {
+				return "", fmt.Errorf("hunk lines must start with space, -, or +")
+			}
+			text := line[1:]
+			switch line[0] {
+			case ' ':
+				oldSegment = append(oldSegment, text)
+				newSegment = append(newSegment, text)
+			case '-':
+				oldSegment = append(oldSegment, text)
+			case '+':
+				newSegment = append(newSegment, text)
+			default:
+				return "", fmt.Errorf("hunk lines must start with space, -, or +")
+			}
+		}
+		if len(oldSegment) == 0 {
+			return "", fmt.Errorf("update hunk must include context or removed lines")
+		}
+		match, err := findUniqueSegment(current, oldSegment, cursor)
+		if err != nil {
+			return "", err
+		}
+		next := append([]string{}, current[:match]...)
+		next = append(next, newSegment...)
+		next = append(next, current[match+len(oldSegment):]...)
+		current = next
+		cursor = match + len(newSegment)
+	}
+	result := strings.Join(current, "\n")
+	if strings.HasSuffix(oldContent, "\n") || strings.HasSuffix(oldContent, "\r") {
+		result += "\n"
+	}
+	return result, nil
+}
+
+func splitPatchHunks(lines []string) ([][]string, error) {
+	var hunks [][]string
+	var current []string
+	started := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "@@") {
+			if started {
+				hunks = append(hunks, current)
+			}
+			current = []string{}
+			started = true
+			continue
+		}
+		if !started {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			return nil, fmt.Errorf("Update File hunks must start with @@")
+		}
+		current = append(current, line)
+	}
+	if started {
+		hunks = append(hunks, current)
+	}
+	return hunks, nil
+}
+
+func findUniqueSegment(lines []string, segment []string, start int) (int, error) {
+	var matches []int
+	for i := start; i <= len(lines)-len(segment); i++ {
+		if equalStringSlices(lines[i:i+len(segment)], segment) {
+			matches = append(matches, i)
+		}
+	}
+	for i := 0; i < start && i <= len(lines)-len(segment); i++ {
+		if equalStringSlices(lines[i:i+len(segment)], segment) {
+			matches = append(matches, i)
+		}
+	}
+	if len(matches) == 0 {
+		return 0, fmt.Errorf("patch context does not match file")
+	}
+	if len(matches) > 1 {
+		return 0, fmt.Errorf("patch context matches multiple locations")
+	}
+	return matches[0], nil
+}
+
+func equalStringSlices(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveWorkspaceRelativePath(cwd, path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("file path must be a non-empty string")
+	}
+	if filepath.IsAbs(path) {
+		return "", fmt.Errorf("absolute paths are not allowed: %s", path)
+	}
+	clean := filepath.Clean(path)
+	for _, part := range strings.Split(filepath.ToSlash(clean), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("path traversal is not allowed: %s", path)
+		}
+	}
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	rootAbs := filepath.Clean(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		root = rootAbs
+	}
+	resolved, err := resolveMutationPathThroughSymlinks(root, clean)
+	if err != nil {
+		return "", err
+	}
+	if !pathWithinRoot(root, resolved) {
+		return "", fmt.Errorf("path escapes workspace root: %s", path)
+	}
+	return resolved, nil
+}
+
+func resolveMutationPathThroughSymlinks(root, rel string) (string, error) {
+	current := root
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(current, part)
+		info, err := os.Lstat(next)
+		if err != nil {
+			if os.IsNotExist(err) {
+				current = next
+				continue
+			}
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			current = next
+			continue
+		}
+		evaluated, err := filepath.EvalSymlinks(next)
+		if err != nil {
+			return "", err
+		}
+		current = evaluated
+	}
+	return filepath.Clean(current), nil
+}
+
+func pathWithinRoot(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func readFileSnapshot(path string) (string, fileState, error) {
@@ -668,6 +1173,43 @@ func readFileSnapshot(path string) (string, fileState, error) {
 	}, nil
 }
 
+func expectedOperationState(expected *protocol.ToolMutationPreviewState, index int) *protocol.ToolMutationOperationState {
+	if expected == nil || len(expected.Operations) == 0 || index < 0 || index >= len(expected.Operations) {
+		return nil
+	}
+	return &expected.Operations[index]
+}
+
+func validateExpectedOperationState(expected *protocol.ToolMutationOperationState, current fileState, resolvedPath string) string {
+	if expected == nil {
+		return ""
+	}
+	if expected.ResolvedPath != "" && filepath.Clean(expected.ResolvedPath) != filepath.Clean(resolvedPath) {
+		return fmt.Sprintf("approved preview targeted %s, current execution targets %s", expected.ResolvedPath, resolvedPath)
+	}
+	if expected.OldExists != nil && *expected.OldExists != current.exists {
+		return "file changed since approval preview was generated"
+	}
+	if current.exists && expected.OldSHA256 != "" && expected.OldSHA256 != current.sha256 {
+		return "file content changed since approval preview was generated"
+	}
+	if expected.OldSize != nil && current.exists && *expected.OldSize != current.size {
+		return "file size changed since approval preview was generated"
+	}
+	return ""
+}
+
+func validateExpectedPlanHash(toolName string, expected *protocol.ToolMutationPreviewState, mutations []fileMutation) string {
+	if expected == nil || expected.PlanHash == "" || len(expected.Operations) == 0 {
+		return ""
+	}
+	currentHash := mutationPlanHash(toolName, mutationOperationStates(mutations), combinedMutationDiff(mutations))
+	if expected.PlanHash != currentHash {
+		return "approved preview plan no longer matches current file state"
+	}
+	return ""
+}
+
 func validateExpectedState(expected *protocol.ToolMutationPreviewState, current fileState, resolvedPath string) string {
 	if expected == nil {
 		return ""
@@ -685,6 +1227,83 @@ func validateExpectedState(expected *protocol.ToolMutationPreviewState, current 
 		return "file size changed since approval preview was generated"
 	}
 	return ""
+}
+
+func mutationOperationStates(mutations []fileMutation) []protocol.ToolMutationOperationState {
+	states := make([]protocol.ToolMutationOperationState, 0, len(mutations))
+	for _, mutation := range mutations {
+		oldExists := mutation.oldState.exists
+		oldSize := mutation.oldState.size
+		state := protocol.ToolMutationOperationState{
+			Kind:             mutation.kind,
+			Path:             mutation.filePath,
+			MovePath:         mutation.movePath,
+			ResolvedPath:     mutation.resolvedPath,
+			MoveResolvedPath: mutation.moveResolvedPath,
+			OldExists:        &oldExists,
+		}
+		if mutation.oldState.exists {
+			state.OldSHA256 = mutation.oldState.sha256
+			state.OldSize = &oldSize
+		}
+		states = append(states, state)
+	}
+	return states
+}
+
+func operationStatesAsMaps(states []protocol.ToolMutationOperationState) []map[string]any {
+	items := make([]map[string]any, 0, len(states))
+	for _, state := range states {
+		item := map[string]any{
+			"kind":          state.Kind,
+			"path":          state.Path,
+			"resolved_path": state.ResolvedPath,
+			"old_exists":    state.OldExists,
+		}
+		if state.MovePath != "" {
+			item["move_path"] = state.MovePath
+		}
+		if state.MoveResolvedPath != "" {
+			item["move_resolved_path"] = state.MoveResolvedPath
+		}
+		if state.OldSHA256 != "" {
+			item["old_sha256"] = state.OldSHA256
+		}
+		if state.OldSize != nil {
+			item["old_size"] = state.OldSize
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+func mutationPlanHash(toolName string, operations []protocol.ToolMutationOperationState, diff string) string {
+	payload := map[string]any{
+		"tool_name":  toolName,
+		"operations": operationStatesAsMaps(operations),
+		"diff":       diff,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%#v", payload)))
+		return fmt.Sprintf("%x", sum)
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
+}
+
+func combinedMutationDiff(mutations []fileMutation) string {
+	var b strings.Builder
+	for _, mutation := range mutations {
+		if mutation.diff == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(mutation.diff)
+	}
+	return b.String()
 }
 
 func buildEditedContent(oldContent, oldString, newString string) (string, int) {

@@ -114,19 +114,24 @@ func TestExecuteShellNonZeroExitReturnsToolOutput(t *testing.T) {
 	}
 }
 
-func TestPreviewWriteFileDoesNotWriteAndExecuteDetectsStaleFile(t *testing.T) {
+func TestPreviewApplyPatchDoesNotWriteAndExecuteDetectsStaleFile(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "notes.txt")
 	if err := os.WriteFile(target, []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: notes.txt",
+		"@@",
+		"-old",
+		"+new",
+		"*** End Patch",
+	}, "\n")
 	req := protocol.ToolPreviewRequest{
-		ToolName: "write_file",
-		Args: map[string]any{
-			"file_path": "notes.txt",
-			"content":   "new\n",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
 	}
 	preview := Preview(req, dir)
 	if !preview.OK {
@@ -146,7 +151,7 @@ func TestPreviewWriteFileDoesNotWriteAndExecuteDetectsStaleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := Execute(protocol.ExecToolRequest{
-		ToolName:      "write_file",
+		ToolName:      "apply_patch",
 		Args:          req.Args,
 		ExpectedState: expectedStateFromPreview(preview),
 	}, dir, nil)
@@ -158,19 +163,24 @@ func TestPreviewWriteFileDoesNotWriteAndExecuteDetectsStaleFile(t *testing.T) {
 	}
 }
 
-func TestExecuteWriteFileIgnoresPreviewMTimeWhenContentMatches(t *testing.T) {
+func TestExecuteApplyPatchIgnoresPreviewMTimeWhenContentMatches(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "notes.txt")
 	if err := os.WriteFile(target, []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: notes.txt",
+		"@@",
+		"-old",
+		"+new",
+		"*** End Patch",
+	}, "\n")
 	req := protocol.ToolPreviewRequest{
-		ToolName: "write_file",
-		Args: map[string]any{
-			"file_path": "notes.txt",
-			"content":   "new\n",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
 	}
 	preview := Preview(req, dir)
 	if !preview.OK {
@@ -182,7 +192,7 @@ func TestExecuteWriteFileIgnoresPreviewMTimeWhenContentMatches(t *testing.T) {
 	}
 
 	result := Execute(protocol.ExecToolRequest{
-		ToolName:      "write_file",
+		ToolName:      "apply_patch",
 		Args:          req.Args,
 		ExpectedState: expectedStateFromPreview(preview),
 	}, dir, nil)
@@ -194,20 +204,24 @@ func TestExecuteWriteFileIgnoresPreviewMTimeWhenContentMatches(t *testing.T) {
 	}
 }
 
-func TestPreviewAndExecuteEditFileShareValidationAndState(t *testing.T) {
+func TestPreviewAndExecuteApplyPatchShareValidationAndState(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "main.txt")
 	if err := os.WriteFile(target, []byte("alpha beta\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: main.txt",
+		"@@",
+		"-alpha beta",
+		"+omega beta",
+		"*** End Patch",
+	}, "\n")
 	preview := Preview(protocol.ToolPreviewRequest{
-		ToolName: "edit_file",
-		Args: map[string]any{
-			"file_path":  "main.txt",
-			"old_string": "alpha",
-			"new_string": "omega",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
 	}, dir)
 	if !preview.OK {
 		t.Fatalf("preview failed: %s", preview.ErrorMessage)
@@ -217,12 +231,8 @@ func TestPreviewAndExecuteEditFileShareValidationAndState(t *testing.T) {
 	}
 
 	result := Execute(protocol.ExecToolRequest{
-		ToolName: "edit_file",
-		Args: map[string]any{
-			"file_path":  "main.txt",
-			"old_string": "alpha",
-			"new_string": "omega",
-		},
+		ToolName:      "apply_patch",
+		Args:          map[string]any{"patch": patch},
 		ExpectedState: expectedStateFromPreview(preview),
 	}, dir, nil)
 	if !result.OK {
@@ -236,20 +246,108 @@ func TestPreviewAndExecuteEditFileShareValidationAndState(t *testing.T) {
 	}
 }
 
-func TestEditFileMatchesOldStringAcrossLineEndings(t *testing.T) {
+func TestExecuteApplyPatchApprovedMultiFileState(t *testing.T) {
+	dir := t.TempDir()
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Add File: one.txt",
+		"+one",
+		"*** Add File: two.txt",
+		"+two",
+		"*** End Patch",
+	}, "\n")
+	preview := Preview(protocol.ToolPreviewRequest{
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
+	}, dir)
+	if !preview.OK {
+		t.Fatalf("preview failed: %s", preview.ErrorMessage)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName:      "apply_patch",
+		Args:          map[string]any{"patch": patch},
+		ExpectedState: expectedStateFromPreview(preview),
+	}, dir, nil)
+	if !result.OK {
+		t.Fatalf("execute failed: %#v", result)
+	}
+	if got := readFileForTest(t, filepath.Join(dir, "one.txt")); got != "one\n" {
+		t.Fatalf("one.txt = %q", got)
+	}
+	if got := readFileForTest(t, filepath.Join(dir, "two.txt")); got != "two\n" {
+		t.Fatalf("two.txt = %q", got)
+	}
+}
+
+func TestApplyPatchRejectsInvalidAddFileLine(t *testing.T) {
+	dir := t.TempDir()
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Add File: bad.txt",
+		"missing-plus",
+		"*** End Patch",
+	}, "\n")
+
+	preview := Preview(protocol.ToolPreviewRequest{
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
+	}, dir)
+	if preview.OK || !strings.Contains(preview.ErrorMessage, "Add File lines must start with +") {
+		t.Fatalf("preview = %#v, want add-line validation error", preview)
+	}
+}
+
+func TestApplyPatchRollsBackMultiFileWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "blocker"), []byte("file parent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Add File: one.txt",
+		"+one",
+		"*** Add File: blocker/two.txt",
+		"+two",
+		"*** End Patch",
+	}, "\n")
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
+	}, dir, nil)
+	if result.OK {
+		t.Fatalf("execute unexpectedly succeeded: %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "one.txt")); !os.IsNotExist(err) {
+		t.Fatalf("one.txt should have been rolled back, stat err=%v", err)
+	}
+	if got := readFileForTest(t, filepath.Join(dir, "blocker")); got != "file parent\n" {
+		t.Fatalf("blocker changed: %q", got)
+	}
+}
+
+func TestApplyPatchMatchesContextAcrossLineEndings(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "main.txt")
 	if err := os.WriteFile(target, []byte("alpha\r\nbeta\r\ngamma\r\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: main.txt",
+		"@@",
+		"-alpha",
+		"-beta",
+		"+one",
+		"+two",
+		" gamma",
+		"*** End Patch",
+	}, "\n")
 	req := protocol.ToolPreviewRequest{
-		ToolName: "edit_file",
-		Args: map[string]any{
-			"file_path":  "main.txt",
-			"old_string": "alpha\nbeta",
-			"new_string": "one\ntwo",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
 	}
 	preview := Preview(req, dir)
 	if !preview.OK {
@@ -260,69 +358,85 @@ func TestEditFileMatchesOldStringAcrossLineEndings(t *testing.T) {
 	}
 
 	result := Execute(protocol.ExecToolRequest{
-		ToolName:      "edit_file",
+		ToolName:      "apply_patch",
 		Args:          req.Args,
 		ExpectedState: expectedStateFromPreview(preview),
 	}, dir, nil)
 	if !result.OK {
 		t.Fatalf("execute failed: %#v", result)
 	}
-	if got := readFileForTest(t, target); got != "one\r\ntwo\r\ngamma\r\n" {
+	if got := readFileForTest(t, target); got != "one\ntwo\ngamma\n" {
 		t.Fatalf("execute content = %q", got)
 	}
 }
 
-func TestEditFileLineEndingFallbackPreservesSafeMatchCounts(t *testing.T) {
+func TestApplyPatchRejectsMissingAndDuplicateContext(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "main.txt")
 	if err := os.WriteFile(target, []byte("alpha\r\nbeta\r\nalpha\r\nbeta\r\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	duplicatePatch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: main.txt",
+		"@@",
+		"-alpha",
+		"-beta",
+		"+one",
+		"+two",
+		"*** End Patch",
+	}, "\n")
 	duplicate := Preview(protocol.ToolPreviewRequest{
-		ToolName: "edit_file",
-		Args: map[string]any{
-			"file_path":  "main.txt",
-			"old_string": "alpha\nbeta",
-			"new_string": "one\ntwo",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": duplicatePatch},
 	}, dir)
-	if duplicate.OK || !strings.Contains(duplicate.ErrorMessage, "appears 2 times") {
-		t.Fatalf("preview = %#v, want duplicate old_string error", duplicate)
+	if duplicate.OK || !strings.Contains(duplicate.ErrorMessage, "matches multiple locations") {
+		t.Fatalf("preview = %#v, want duplicate context error", duplicate)
 	}
 
+	missingPatch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: main.txt",
+		"@@",
+		"-missing",
+		"-beta",
+		"+one",
+		"+two",
+		"*** End Patch",
+	}, "\n")
 	missing := Preview(protocol.ToolPreviewRequest{
-		ToolName: "edit_file",
-		Args: map[string]any{
-			"file_path":  "main.txt",
-			"old_string": "missing\nbeta",
-			"new_string": "one\ntwo",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": missingPatch},
 	}, dir)
-	if missing.OK || !strings.Contains(missing.ErrorMessage, "old_string not found") {
-		t.Fatalf("preview = %#v, want missing old_string error", missing)
+	if missing.OK || !strings.Contains(missing.ErrorMessage, "context does not match") {
+		t.Fatalf("preview = %#v, want missing context error", missing)
 	}
 }
 
-func TestPreviewEditFileRejectsDuplicateOldString(t *testing.T) {
+func TestPreviewApplyPatchRejectsDuplicateContext(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "main.txt")
-	if err := os.WriteFile(target, []byte("same same\n"), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("same\nsame\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	patch := strings.Join([]string{
+		"*** Begin Patch",
+		"*** Update File: main.txt",
+		"@@",
+		"-same",
+		"+other",
+		"*** End Patch",
+	}, "\n")
 	preview := Preview(protocol.ToolPreviewRequest{
-		ToolName: "edit_file",
-		Args: map[string]any{
-			"file_path":  "main.txt",
-			"old_string": "same",
-			"new_string": "other",
-		},
+		ToolName: "apply_patch",
+		Args:     map[string]any{"patch": patch},
 	}, dir)
-	if preview.OK || !strings.Contains(preview.ErrorMessage, "appears 2 times") {
-		t.Fatalf("preview = %#v, want duplicate old_string error", preview)
+	if preview.OK || !strings.Contains(preview.ErrorMessage, "matches multiple locations") {
+		t.Fatalf("preview = %#v, want duplicate context error", preview)
 	}
-	if got := readFileForTest(t, target); got != "same same\n" {
+	if got := readFileForTest(t, target); got != "same\nsame\n" {
 		t.Fatalf("failed preview changed file, got %q", got)
 	}
 }
@@ -597,11 +711,84 @@ func archivedPathFromResult(t *testing.T, result string) string {
 }
 
 func expectedStateFromPreview(preview protocol.ToolPreviewResult) *protocol.ToolMutationPreviewState {
-	return &protocol.ToolMutationPreviewState{
+	state := &protocol.ToolMutationPreviewState{
 		ResolvedPath: preview.ResolvedPath,
 		OldSHA256:    preview.OldSHA256,
 		OldExists:    preview.OldExists,
 		OldSize:      preview.OldSize,
+	}
+	if planID, ok := preview.Meta["plan_id"].(string); ok {
+		state.PlanID = planID
+	}
+	if planHash, ok := preview.Meta["plan_hash"].(string); ok {
+		state.PlanHash = planHash
+	}
+	state.Operations = operationStatesFromPreviewMeta(preview.Meta["operations"])
+	return state
+}
+
+func operationStatesFromPreviewMeta(value any) []protocol.ToolMutationOperationState {
+	var items []map[string]any
+	switch typed := value.(type) {
+	case []map[string]any:
+		items = typed
+	case []any:
+		for _, item := range typed {
+			if mapped, ok := item.(map[string]any); ok {
+				items = append(items, mapped)
+			}
+		}
+	}
+	states := make([]protocol.ToolMutationOperationState, 0, len(items))
+	for _, item := range items {
+		oldExists := boolFromAny(item["old_exists"])
+		oldSize := int64FromAny(item["old_size"])
+		states = append(states, protocol.ToolMutationOperationState{
+			Kind:             stringFromAny(item["kind"]),
+			Path:             stringFromAny(item["path"]),
+			MovePath:         stringFromAny(item["move_path"]),
+			ResolvedPath:     stringFromAny(item["resolved_path"]),
+			MoveResolvedPath: stringFromAny(item["move_resolved_path"]),
+			OldSHA256:        stringFromAny(item["old_sha256"]),
+			OldExists:        oldExists,
+			OldSize:          oldSize,
+		})
+	}
+	return states
+}
+
+func stringFromAny(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return ""
+}
+
+func boolFromAny(value any) *bool {
+	switch typed := value.(type) {
+	case bool:
+		return &typed
+	case *bool:
+		return typed
+	default:
+		return nil
+	}
+}
+
+func int64FromAny(value any) *int64 {
+	switch typed := value.(type) {
+	case int64:
+		return &typed
+	case int:
+		converted := int64(typed)
+		return &converted
+	case float64:
+		converted := int64(typed)
+		return &converted
+	case *int64:
+		return typed
+	default:
+		return nil
 	}
 }
 

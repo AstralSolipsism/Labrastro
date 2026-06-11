@@ -186,7 +186,7 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func baseFeatures(lspAvailable bool) []string {
-	features := []string{"shell", "read_file", "write_file", "edit_file", "glob", "grep", "list_file", "tool_preview"}
+	features := []string{"shell", "read_file", "apply_patch", "glob", "grep", "list_file", "tool_preview"}
 	if lspAvailable {
 		features = append(features, "lsp")
 	}

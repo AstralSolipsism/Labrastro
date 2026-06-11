@@ -227,10 +227,24 @@ type ExecToolResult struct {
 }
 
 type ToolMutationPreviewState struct {
-	ResolvedPath string `json:"resolved_path,omitempty"`
-	OldSHA256    string `json:"old_sha256,omitempty"`
-	OldExists    *bool  `json:"old_exists,omitempty"`
-	OldSize      *int64 `json:"old_size,omitempty"`
+	PlanID       string                       `json:"plan_id,omitempty"`
+	PlanHash     string                       `json:"plan_hash,omitempty"`
+	Operations   []ToolMutationOperationState `json:"operations,omitempty"`
+	ResolvedPath string                       `json:"resolved_path,omitempty"`
+	OldSHA256    string                       `json:"old_sha256,omitempty"`
+	OldExists    *bool                        `json:"old_exists,omitempty"`
+	OldSize      *int64                       `json:"old_size,omitempty"`
+}
+
+type ToolMutationOperationState struct {
+	Kind             string `json:"kind,omitempty"`
+	Path             string `json:"path,omitempty"`
+	MovePath         string `json:"move_path,omitempty"`
+	ResolvedPath     string `json:"resolved_path,omitempty"`
+	MoveResolvedPath string `json:"move_resolved_path,omitempty"`
+	OldSHA256        string `json:"old_sha256,omitempty"`
+	OldExists        *bool  `json:"old_exists,omitempty"`
+	OldSize          *int64 `json:"old_size,omitempty"`
 }
 
 type ToolPreviewRequest struct {
