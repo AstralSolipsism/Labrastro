@@ -322,6 +322,7 @@ DERIVED_HOOK_VIEW_FIELDS: set[str] = {
     "owner_id",
     "owner_enabled",
     "owner_status",
+    "owner_activation_state",
     "enabled",
     "executable",
     "can_manage",
@@ -380,6 +381,7 @@ class LifecycleHookDeclaration:
     owner_id: str = ""
     owner_enabled: bool = True
     owner_status: str = "installed"
+    owner_activation_state: str = "active"
 
     @classmethod
     def from_dict(
@@ -435,6 +437,10 @@ class LifecycleHookDeclaration:
             owner_id=_string(data.get("owner_id")),
             owner_enabled=_bool_value(data.get("owner_enabled"), True),
             owner_status=_string(data.get("owner_status"), "installed"),
+            owner_activation_state=_string(
+                data.get("owner_activation_state"),
+                "active",
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -456,6 +462,7 @@ class LifecycleHookDeclaration:
             "owner_id": self.owner_id,
             "owner_enabled": self.owner_enabled,
             "owner_status": self.owner_status,
+            "owner_activation_state": self.owner_activation_state,
         }
 
 
@@ -3051,6 +3058,7 @@ def lifecycle_declarations_from_config_hooks(
     default_placement: str = "server",
     owner_enabled: bool = True,
     owner_status: str = "installed",
+    owner_activation_state: str = "active",
 ) -> list[LifecycleHookDeclaration]:
     """Project config-level hook manifests into public lifecycle declarations."""
 
@@ -3066,6 +3074,7 @@ def lifecycle_declarations_from_config_hooks(
         data["owner_id"] = owner_id
         data["owner_enabled"] = owner_enabled
         data["owner_status"] = owner_status or "installed"
+        data["owner_activation_state"] = owner_activation_state or "active"
         data.setdefault("placement", default_placement)
         data.setdefault("permissions", [])
         data.setdefault("trust", "pending_review")
@@ -3092,6 +3101,7 @@ def validate_lifecycle_hook_manifest(
     default_placement: str = "server",
     owner_enabled: bool = True,
     owner_status: str = "installed",
+    owner_activation_state: str = "active",
 ) -> LifecycleHookDeclaration:
     declarations = lifecycle_declarations_from_config_hooks(
         owner_id=owner_id,
@@ -3100,6 +3110,7 @@ def validate_lifecycle_hook_manifest(
         default_placement=default_placement,
         owner_enabled=owner_enabled,
         owner_status=owner_status,
+        owner_activation_state=owner_activation_state,
     )
     declaration = declarations[0]
     expected_id = canonical_lifecycle_hook_id(source, owner_id, declaration.event, index)
@@ -3199,6 +3210,7 @@ def lifecycle_registry_from_config(config: Any) -> LifecycleHookRegistry:
                     hooks=_owner_hooks(package),
                     owner_enabled=_owner_enabled(package),
                     owner_status=_owner_status(package),
+                    owner_activation_state=_owner_activation_state(package),
                 )
             )
 
@@ -3212,6 +3224,10 @@ def lifecycle_registry_from_config(config: Any) -> LifecycleHookRegistry:
                     hooks=_owner_hooks(component),
                     owner_enabled=_owner_enabled(component),
                     owner_status=_owner_status(component),
+                    owner_activation_state=_component_owner_activation_state(
+                        component,
+                        packages,
+                    ),
                 )
             )
 
@@ -3229,6 +3245,44 @@ def _owner_enabled(owner: Any) -> bool:
 
 def _owner_status(owner: Any) -> str:
     return _string(getattr(owner, "status", None), "installed")
+
+
+def _owner_activation_state(owner: Any) -> str:
+    state = getattr(owner, "state", None)
+    if isinstance(state, dict):
+        activation_state = _string(state.get("activation_state"))
+        if activation_state:
+            return activation_state
+    status = _owner_status(owner).lower()
+    if status in {"blocked", "failed"}:
+        return "blocked"
+    if not _owner_enabled(owner) and status in {"installed", "available", "ready"}:
+        return "inactive"
+    return "active"
+
+
+def _component_owner_activation_state(
+    component: Any,
+    packages: Any,
+) -> str:
+    status = _owner_status(component).lower()
+    if status in {"blocked", "failed"}:
+        return "blocked"
+    package_ids = _owner_package_ids(component)
+    if not package_ids or not isinstance(packages, dict):
+        return _owner_activation_state(component)
+    for package_id in package_ids:
+        package = packages.get(package_id)
+        if package is not None and _owner_activation_state(package) == "active":
+            return "active" if _owner_enabled(component) else "inactive"
+    return "inactive"
+
+
+def _owner_package_ids(owner: Any) -> list[str]:
+    values = getattr(owner, "package_ids", [])
+    if not isinstance(values, list):
+        return []
+    return [str(item) for item in values if str(item).strip()]
 
 
 def _component_hook_source(component: Any) -> str:
@@ -3378,6 +3432,7 @@ def _dashboard_item(
         "owner_id": declaration.owner_id,
         "owner_enabled": declaration.owner_enabled,
         "owner_status": declaration.owner_status,
+        "owner_activation_state": declaration.owner_activation_state,
         "placement": declaration.placement,
         "handler_type": declaration.handler_type,
         "display_name": declaration.display_name,
@@ -3766,6 +3821,9 @@ def _runtime_unavailable_reason(
 
 
 def _owner_unavailable_reason(declaration: LifecycleHookDeclaration) -> str:
+    activation_state = declaration.owner_activation_state.strip().lower()
+    if activation_state in {"inactive", "blocked"}:
+        return f"owner_activation:{activation_state}"
     if not declaration.owner_enabled:
         return "owner_disabled"
     status = declaration.owner_status.strip().lower()

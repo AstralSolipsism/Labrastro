@@ -116,6 +116,7 @@ def test_lifecycle_hook_declaration_roundtrip_preserves_public_contract() -> Non
         "owner_id": "",
         "owner_enabled": True,
         "owner_status": "installed",
+        "owner_activation_state": "active",
     }
 
 
@@ -895,6 +896,7 @@ def test_lifecycle_hook_registry_dashboard_items_separate_technical_details() ->
         "owner_id": "",
         "owner_enabled": True,
         "owner_status": "installed",
+        "owner_activation_state": "active",
         "placement": "server",
         "handler_type": "mcp_tool",
         "display_name": "Record deployment result",
@@ -5161,6 +5163,112 @@ def test_lifecycle_registry_from_config_marks_disabled_owners_non_executable() -
     assert items["hook:capability_package:stopped-package:PreToolUse:0"][
         "unavailable_reason"
     ] == "owner_status:stopped"
+
+
+def test_lifecycle_registry_gates_capability_package_hooks_by_activation_state() -> None:
+    hook = {
+        "event": "PreToolUse",
+        "handler_type": "agent",
+        "handler_ref": "agent:policy",
+        "display_name": "Policy",
+        "summary": "Checks tool use.",
+        "permissions": [],
+        "trust": "trusted",
+    }
+    inactive_config = SimpleNamespace(
+        skills=SkillsConfig(items={}),
+        mcp_servers=[],
+        capability_packages={
+            "review": CapabilityPackageConfig(
+                id="review",
+                enabled=False,
+                status="installed",
+                hooks=[hook],
+            )
+        },
+        capability_components={},
+    )
+    active_config = SimpleNamespace(
+        skills=SkillsConfig(items={}),
+        mcp_servers=[],
+        capability_packages={
+            "review": CapabilityPackageConfig(
+                id="review",
+                enabled=True,
+                status="installed",
+                hooks=[hook],
+            )
+        },
+        capability_components={},
+    )
+
+    inactive_registry = lifecycle_registry_from_config(inactive_config)
+    inactive_items = {
+        item["id"]: item for item in inactive_registry.dashboard_items()
+    }
+    inactive_hook = inactive_items["hook:capability_package:review:PreToolUse:0"]
+
+    assert inactive_hook["owner_activation_state"] == "inactive"
+    assert inactive_hook["executable"] is False
+    assert inactive_hook["unavailable_reason"] == "owner_activation:inactive"
+    assert inactive_registry.executable(event="PreToolUse", placement="server") == []
+
+    active_registry = lifecycle_registry_from_config(active_config)
+    assert [
+        item.id
+        for item in active_registry.executable(
+            event="PreToolUse",
+            placement="server",
+            runtime_adapters=_runtime_adapters(
+                agent=lambda _declaration, _context: LifecycleHookOutput()
+            ),
+        )
+    ] == ["hook:capability_package:review:PreToolUse:0"]
+
+
+def test_lifecycle_registry_gates_package_component_hooks_by_owner_activation() -> None:
+    hook = {
+        "event": "PreToolUse",
+        "handler_type": "agent",
+        "handler_ref": "agent:policy",
+        "display_name": "Policy",
+        "summary": "Checks tool use.",
+        "permissions": [],
+        "trust": "trusted",
+    }
+    config = SimpleNamespace(
+        skills=SkillsConfig(items={}),
+        mcp_servers=[],
+        capability_packages={
+            "review": CapabilityPackageConfig(
+                id="review",
+                enabled=False,
+                status="installed",
+                components=["skill:package-review"],
+            )
+        },
+        capability_components={
+            "skill:package-review": CapabilityComponentConfig(
+                id="skill:package-review",
+                kind="skill",
+                name="package-review",
+                enabled=True,
+                status="installed",
+                package_ids=["review"],
+                hooks=[hook],
+            )
+        },
+    )
+
+    registry = lifecycle_registry_from_config(config)
+    items = {item["id"]: item for item in registry.dashboard_items()}
+    component_hook = items["hook:skill:skill:package-review:PreToolUse:0"]
+
+    assert component_hook["owner_enabled"] is True
+    assert component_hook["owner_activation_state"] == "inactive"
+    assert component_hook["executable"] is False
+    assert component_hook["unavailable_reason"] == "owner_activation:inactive"
+    assert registry.executable(event="PreToolUse", placement="server") == []
 
 
 def test_config_validate_rejects_invalid_lifecycle_hooks_before_agent_runtime() -> None:
