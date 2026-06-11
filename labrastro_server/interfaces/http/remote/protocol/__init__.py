@@ -11,6 +11,9 @@ from labrastro_server.interfaces.http.remote.protocol.base import (
     RegisterResponse,
     RelayEnvelope,
 )
+from labrastro_server.interfaces.http.remote.protocol.capability_packages import (
+    CapabilityPackageInstallResultRecord,
+)
 from labrastro_server.interfaces.http.remote.protocol.chat import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
@@ -74,6 +77,7 @@ from labrastro_server.interfaces.http.remote.protocol.tools import (
 __all__ = [
     "ApprovalReplyRequest",
     "ApprovalReplyResponse",
+    "CapabilityPackageInstallResultRecord",
     "SessionRunCancelRequest",
     "SessionRunCancelResponse",
     "ChatCommandDispatchRequest",
