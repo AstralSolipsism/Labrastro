@@ -48,14 +48,17 @@ SessionRun 事件，这会放大高频参数碎片造成的 UI、存储和取消
 | 旧文本输出协议 | `outputDelta` deprecated | 不新增旧式 raw output 协议 |
 
 `draft_document_begin` 是 Labrastro 的产品扩展，不是 Codex 已有文件变更协议。它只用于
-长文档正文可见生成，必须服从同一原则：模型只声明目标，runtime 管状态、取消和提交。
+新长文档正文可见生成，必须服从同一原则：模型只声明新目标，runtime 管状态、取消和提交。
+已有文件的修改统一走 `apply_patch`。
 
 ## Product Rules
 
 - 模型可见的文件变更入口只有 `apply_patch`。
-- 模型可见的长文档生成入口只有 `draft_document_begin`。
+- 模型可见的新长文档生成入口只有 `draft_document_begin`。
 - `write_file` 和 `edit_file` 作为命名能力彻底删除，不保留 runtime 同名 helper。
 - 文件系统实际写入只允许通过运行时内部服务完成，模型不能直接传完整大正文给写盘原语。
+- `draft_document_commit` 只能创建新目标文件；目标已存在时必须失败并提示使用
+  `apply_patch` 修改已有文件。
 - `shell` 不是文件编辑协议；不得用 shell 的 echo、heredoc、`Set-Content`、
   `Out-File`、脚本片段等方式绕过 `apply_patch` 或 draft document commit。
 - 工具参数流不是正文流。正文必须通过 `assistant_delta` 或 draft document 通道可见。
@@ -119,6 +122,7 @@ SessionRun 事件，这会放大高频参数碎片造成的 UI、存储和取消
 ```text
 代码 patch
 局部文件修改
+覆盖已有目标文件
 工具参数传输
 直接写盘
 ```
@@ -173,10 +177,18 @@ agent_run worktree                          owner = agent-run runtime worktree p
 - 文件变更 event 可以由 server 统一发布，但 event 的 `changes`、`diff`、old state、
   result 必须来自 workspace owner。
 
-### `MutationPlan`
+### Preview State And MutationPlan
 
-`MutationPlan` 是 preview、approval 和 execute 的唯一绑定对象。不得继续用单个
-`resolved_path` 表达一次文件变更。
+当前实现合同分两层：
+
+- `apply_patch` 是通用文件变更协议，按 patch grammar 和上下文语义执行；本地执行不引入
+  额外的 approval token / `commit_plan` 绑定。
+- 远端 peer preview 可以返回 `expected_state`，execute 用它校验 old state 和
+  `plan_hash`；空 `operations` 不构成可校验状态。
+- `draft_document_commit` 是 create-only 发布路径，不是第二套已有文件修改协议。
+
+完整 `MutationPlan` 仍是跨 workspace owner 的演进方向，但不得把它解释为允许
+`draft_document_commit` 更新已有文件，或要求本地 `apply_patch` 偏离 patch/context 语义。
 
 ```text
 MutationPlan
@@ -205,15 +217,14 @@ MutationPlan
 
 规则：
 
-- preview 生成 `MutationPlan`。
-- approval 显示 `MutationPlan.changes` / `combined_diff`。
-- approval 通过后 execute 必须携带 `plan_id` 或完整 `MutationPlanRef`。
-- execute 必须重新读取每个 operation 的 old state，并校验 `plan_hash` 与 per-file
-  old state。
+- 远端 preview 生成可校验的 `expected_state` / `MutationPlan` 信息时，approval 后
+  execute 必须携带并校验它。
+- 本地 `apply_patch` 按批准的 patch 文本和当前上下文匹配执行，不额外引入
+  `commit_plan`。
+- `draft_document_commit` 生成 add-only 计划；如果目标已存在，preview 和 execute 都失败。
 - 多文件 patch 必须作为一个 plan 被批准和执行；禁止 preview 支持多文件而 execute
   只支持单文件。
-- 单文件旧 `ToolMutationPreviewState(resolved_path, old_sha256, old_exists, old_size)`
-  只能作为迁移前状态，不得作为完成态。
+- `ToolMutationPreviewState(operations=[])` 是空状态；`old_exists=False` 是有效状态。
 - plan 失败不得写入任何文件；如果底层文件系统无法提供原子提交，必须实现 staging
   或 rollback。
 
@@ -226,9 +237,9 @@ owner。
 draft_document_begin
   -> assistant_delta captures visible body
   -> draft runtime requests owner.preview_document_commit
-  -> owner returns MutationPlan(tool_name=draft_document_commit)
+  -> owner returns add-only preview for a new target
   -> approval binds to plan_id / plan_hash
-  -> owner.commit_plan(plan_id)
+  -> owner.commit_document creates the target if it still does not exist
   -> fileChange completed
 ```
 
@@ -791,7 +802,7 @@ Protocol、UI、Tests 中对应验收，不得只做其中一层。
 | T3 | ApplyPatch tool | 新增模型可见 `apply_patch`，接入 patch grammar 和 owner-backed `MutationPlan` | tool schema 只暴露 `apply_patch`，执行结果含 changes/diff/status；preview/approval/execute 使用同一 plan |
 | T4 | Patch streaming | 新增 `PatchArgumentStreamDecoder`，把 provider tool argument delta 增量解析为 patch/fileChange changes | partial JSON patch 产生 `file_change_patch_updated`，坏 JSON/坏 patch 产生 failed |
 | T5 | FileChange events | 引入 `file_change_started/patch_updated/approval_requested/approval_resolved/completed`、`turn_diff_updated`、snake_case status | SessionRun 回放、审批、终态、turn diff 均可重建；文件变更不走通用 approval UI |
-| T6 | Draft document | 新增 `draft_document_begin` 和 DocumentDraftRuntime，assistant stream 绑定 draft，完成后请求 owner 生成 document commit plan 并审批 | 正文实时可见，审批前不写盘；local/remote/agent_run owner 批准才提交，拒绝/取消/中断不写入 |
+| T6 | Draft document | 新增 `draft_document_begin` 和 DocumentDraftRuntime，assistant stream 绑定 draft，完成后请求 owner 生成 create-only document commit preview 并审批 | 正文实时可见，审批前不写盘；目标已存在时拒绝并提示 `apply_patch`；local/remote/agent_run owner 批准才创建新文件，拒绝/取消/中断不写入 |
 | T7 | Stream liveness | StreamSupervisor 增加 wall time、idle time、argument chars 边界，并覆盖所有 provider adapter | OpenAI Chat/Responses、Anthropic、labrastro_server adapter、agent_runs/model_bridge 均可终止并通知 UI |
 | T8 | Shell boundary | approval/preflight command classifier 禁止 shell 手写源码/文档/config 文件 | echo/heredoc/Set-Content/Out-File/python write/node write 被执行前拒绝 |
 | T9 | Frontend fileChange | reducer、ChatView、SessionTurn、presentation、approval details、timeline 渲染 fileChange、diff、`+N/-N`、status | patchUpdated 更新同一 item，completed 固化状态，旧工具词典不再驱动 UI |
@@ -847,7 +858,8 @@ Protocol、UI、Tests 中对应验收，不得只做其中一层。
 - `FileMutationService` 只暴露 `apply_text_patch` 和 `commit_document` 公共写盘入口。
 - `draft_document_begin` 不接受 `content` 参数。
 - draft streaming 完成后生成 commit diff 和审批请求。
-- draft commit 审批通过后通过 workspace owner 写入目标文件。
+- draft commit 目标已存在时在 preview 阶段失败，不发审批请求。
+- draft commit 审批通过后通过 workspace owner 创建目标文件。
 - draft commit 审批拒绝后不写入目标文件。
 - draft 取消后不写入目标文件。
 - draft provider interrupted 后不写入目标文件。
@@ -994,7 +1006,8 @@ Protocol、UI、Tests 中对应验收，不得只做其中一层。
 - 长正文不会进入工具参数。
 - 用户可以实时看到长文档正文。
 - draft 完成后由 runtime 请求 workspace owner 生成 commit diff，审批通过后由 owner
-  写入目标文件。
+  创建目标文件。
+- draft 目标文件已存在时，不进入审批，文件不被覆盖，错误提示使用 `apply_patch`。
 - remote peer draft 完成后由 peer owner 生成 commit diff，审批通过后写入 peer
   workspace。
 - draft 取消、中断、失败时不会写入目标文件。
