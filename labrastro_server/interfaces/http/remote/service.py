@@ -115,7 +115,7 @@ SessionTraceEventSink = Callable[
 ]
 
 _COALESCED_SESSION_RUN_EVENTS = frozenset(
-    {"assistant_delta", "reasoning_delta", "tool_call_stream"}
+    {"assistant_delta", "document_draft_delta", "reasoning_delta", "tool_call_stream"}
 )
 _LIVE_EVENT_FLUSH_INTERVAL_SEC = 0.04
 _LIVE_EVENT_MAX_CONTENT_CHARS = 1024

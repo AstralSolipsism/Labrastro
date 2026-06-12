@@ -386,6 +386,10 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
 
     session.append_event("session_run_start", {"prompt": "hi"})
     session.append_event("assistant_delta", {"content": "live-coalesced"})
+    session.append_event(
+        "document_draft_delta",
+        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "draft"},
+    )
     session.append_event("tool_call_stream", {"tool_call_id": "tool-1", "content": "live"})
     assert persisted == []
 
@@ -399,18 +403,20 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
     assert [event["type"] for event in persisted] == [
         "session_run_start",
         "assistant_delta",
+        "document_draft_delta",
         "tool_call_stream",
         "remote_peer_ready",
         "assistant_message",
         "session_run_end",
     ]
-    assert [event["session_id"] for event in persisted] == ["session-1"] * 6
+    assert [event["session_id"] for event in persisted] == ["session-1"] * 7
     event_by_type = {event["type"]: event for event in session.events}
     assert event_by_type["assistant_delta"]["session_event_seq"] == 2
-    assert event_by_type["tool_call_stream"]["session_event_seq"] == 3
-    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 4
-    assert event_by_type["assistant_message"]["session_event_seq"] == 5
-    assert event_by_type["session_run_end"]["session_event_seq"] == 6
+    assert event_by_type["document_draft_delta"]["session_event_seq"] == 3
+    assert event_by_type["tool_call_stream"]["session_event_seq"] == 4
+    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 5
+    assert event_by_type["assistant_message"]["session_event_seq"] == 6
+    assert event_by_type["session_run_end"]["session_event_seq"] == 7
 
 
 def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: Path) -> None:
@@ -478,6 +484,38 @@ def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -
 
     events, _done, _cursor = session.wait_events(cursor, 0.2)
     assert [event["type"] for event in events] == ["assistant_delta"]
+    assert events[0]["payload"]["content"] == "BC"
+
+
+def test_remote_session_run_session_coalesces_fast_document_draft_delta_events(
+    tmp_path: Path,
+) -> None:
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    session.append_event(
+        "document_draft_delta",
+        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "A"},
+    )
+    events, _done, cursor = session.wait_events(0, 0)
+    assert [event["payload"]["content"] for event in events] == ["A"]
+
+    session.append_event(
+        "document_draft_delta",
+        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "B"},
+    )
+    session.append_event(
+        "document_draft_delta",
+        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "C"},
+    )
+    events, _done, cursor = session.wait_events(cursor, 0)
+    assert events == []
+
+    events, _done, _cursor = session.wait_events(cursor, 0.2)
+    assert [event["type"] for event in events] == ["document_draft_delta"]
     assert events[0]["payload"]["content"] == "BC"
 
 
