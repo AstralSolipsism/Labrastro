@@ -628,6 +628,22 @@ class TestExecToolRequest:
         assert state is not None
         assert "old_mtime_ns" not in state.to_dict()
 
+    def test_expected_state_treats_empty_operations_as_empty(self) -> None:
+        assert ToolMutationPreviewState.from_dict({"operations": []}) is None
+
+        state = ToolMutationPreviewState.from_preview(
+            ToolPreviewResult(ok=True, meta={"operations": []})
+        )
+
+        assert state is None
+
+    def test_expected_state_keeps_false_old_exists(self) -> None:
+        state = ToolMutationPreviewState.from_dict({"old_exists": False})
+
+        assert state == ToolMutationPreviewState(old_exists=False)
+        assert state is not None
+        assert not state.is_empty()
+
 
 class TestExecToolResult:
     def test_roundtrip(self) -> None:

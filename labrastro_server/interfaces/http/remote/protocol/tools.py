@@ -17,17 +17,14 @@ class ToolMutationPreviewState:
     old_size: int | None = None
 
     def is_empty(self) -> bool:
-        return not any(
-            value is not None
-            for value in (
-                self.plan_id,
-                self.plan_hash,
-                self.operations,
-                self.resolved_path,
-                self.old_sha256,
-                self.old_exists,
-                self.old_size,
-            )
+        return (
+            self.plan_id is None
+            and self.plan_hash is None
+            and not self.operations
+            and self.resolved_path is None
+            and self.old_sha256 is None
+            and self.old_exists is None
+            and self.old_size is None
         )
 
     def to_dict(self) -> dict[str, Any]:

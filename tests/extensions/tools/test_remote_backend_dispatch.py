@@ -468,6 +468,70 @@ class TestRemoteBackendDispatch:
         finally:
             srv.stop()
 
+    def test_remote_backend_does_not_send_empty_expected_state(self) -> None:
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import (
+                RegisterRequest,
+                RelayEnvelope,
+            )
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                    features=["tool_preview"],
+                )
+            )
+            backend = RemoteRelayToolBackend(
+                relay_server=srv,
+                context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+            )
+            backend.remember_approved_preview(
+                "draft_document_commit",
+                {"target_path": "docs/a.md", "content": "# A\n"},
+                ToolMutationPreviewState(operations=[]),
+            )
+
+            import threading
+            import time
+
+            holder: dict[str, object] = {}
+
+            def run_commit() -> None:
+                holder["result"] = backend.commit_document("docs/a.md", "# A\n")
+
+            t = threading.Thread(target=run_commit)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            assert env.payload["tool_name"] == "draft_document_commit"
+            assert env.payload["expected_state"] == {}
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="Committed document docs/a.md").to_dict(),
+                ),
+            )
+            t.join(timeout=2)
+
+            result = holder["result"]
+            assert result.status == "completed"
+        finally:
+            srv.stop()
+
     def test_relay_server_fails_inflight_requests_on_disconnect(self) -> None:
         srv = RelayServer()
         received: list[tuple[str, object]] = []
