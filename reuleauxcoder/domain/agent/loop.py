@@ -664,7 +664,17 @@ class AgentLoop:
             def _on_token(token: str) -> None:
                 nonlocal streamed_output
                 streamed_output = True
-                draft_runtime.append_stream_delta(token)
+                draft = draft_runtime.active
+                if draft is not None and draft.status == "streaming":
+                    draft_runtime.append_stream_delta(token)
+                    self.agent._emit_event(
+                        AgentEvent.document_draft_delta(
+                            draft_id=draft.draft_id,
+                            target_path=draft.target_path,
+                            content=token,
+                        )
+                    )
+                    return
                 self.agent._emit_event(AgentEvent.stream_token(token))
 
             def _on_reasoning_token(token: str) -> None:

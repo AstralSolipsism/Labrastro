@@ -79,7 +79,12 @@ class _SequenceLLM:
 
     def chat(self, **kwargs) -> LLMResponse:  # noqa: ARG002
         self.calls += 1
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        on_token = kwargs.get("on_token")
+        if callable(on_token):
+            for token in response.tokens:
+                on_token(token)
+        return response
 
 
 class _RunAgentStub(_AgentStub):
@@ -266,6 +271,60 @@ def test_agent_loop_reuses_skill_catalog_expansion_within_turn_without_reexecuti
 
     assert result == "done"
     assert len(agent.lifecycle_dispatcher.contexts) == 1
+
+
+def test_agent_loop_routes_document_draft_stream_to_draft_delta_not_assistant_delta(
+    tmp_path,
+) -> None:
+    declaration = "\n".join(
+        [
+            "Draft document declared: Architecture",
+            "draft_id: draft-test",
+            "target_path: docs/architecture.md",
+            "Continue the document body in assistant markdown stream.",
+        ]
+    )
+    agent = _RunAgentStub(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="draft_document_begin",
+                        arguments={"target_path": "docs/architecture.md"},
+                    ),
+                ],
+            ),
+            LLMResponse(
+                content="# Architecture\n\nBody\n",
+                tokens=["# Architecture\n", "\nBody\n"],
+            ),
+        ]
+    )
+    agent.runtime_workspace_root = str(tmp_path)
+    agent._executor = SimpleNamespace(
+        execute=lambda _tool_call, index=0: declaration,  # noqa: ARG005
+        execute_parallel=agent._execute_tools,
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    result = loop.run()
+
+    assert result == "# Architecture\n\nBody\n"
+    event_types = [event.event_type.value for event in agent._events]
+    assert "document_draft_delta" in event_types
+    assert "stream_token" not in event_types
+    draft_deltas = [
+        event.data
+        for event in agent._events
+        if event.event_type.value == "document_draft_delta"
+    ]
+    assert [delta["content"] for delta in draft_deltas] == [
+        "# Architecture\n",
+        "\nBody\n",
+    ]
+    assert all(delta["draft_id"] == "draft-test" for delta in draft_deltas)
+    assert loop.last_response_streamed is True
 
 
 def test_agent_loop_runtime_workspace_root_falls_back_to_working_directory() -> None:

@@ -477,6 +477,7 @@ class AgentEventBridge:
             AgentEventType.FILE_CHANGE_APPROVAL_RESOLVED,
             AgentEventType.FILE_CHANGE_COMPLETED,
             AgentEventType.DOCUMENT_DRAFT_STARTED,
+            AgentEventType.DOCUMENT_DRAFT_DELTA,
             AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED,
             AgentEventType.DOCUMENT_DRAFT_COMMITTED,
             AgentEventType.DOCUMENT_DRAFT_FAILED,

@@ -30,6 +30,7 @@ class AgentEventType(Enum):
     FILE_CHANGE_COMPLETED = "file_change_completed"
     TURN_DIFF_UPDATED = "turn_diff_updated"
     DOCUMENT_DRAFT_STARTED = "document_draft_started"
+    DOCUMENT_DRAFT_DELTA = "document_draft_delta"
     DOCUMENT_DRAFT_COMMIT_REQUESTED = "document_draft_commit_requested"
     DOCUMENT_DRAFT_COMMITTED = "document_draft_committed"
     DOCUMENT_DRAFT_FAILED = "document_draft_failed"
@@ -355,6 +356,24 @@ class AgentEvent:
                 "target_path": target_path,
                 "title": title,
                 "format": format,
+                "status": "streaming",
+            },
+        )
+
+    @classmethod
+    def document_draft_delta(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        content: str,
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_DELTA,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "content": content,
                 "status": "streaming",
             },
         )
