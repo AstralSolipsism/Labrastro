@@ -753,6 +753,50 @@ def test_document_draft_events_reduce_into_single_status_part() -> None:
     assert part["status"] == "committed"
 
 
+def test_document_draft_delta_updates_count_without_assistant_text() -> None:
+    document = _session_run_start(None, "生成文档", 1)
+    document = _session_run_event(
+        document,
+        "document_draft_started",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/architecture.md",
+            "title": "Architecture",
+            "format": "markdown",
+        },
+        2,
+    )
+    document = _session_run_event(
+        document,
+        "document_draft_delta",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/architecture.md",
+            "content": "# Architecture\n",
+        },
+        3,
+    )
+    document = _session_run_event(
+        document,
+        "document_draft_delta",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/architecture.md",
+            "content": "\nBody\n",
+        },
+        4,
+    )
+
+    parts = _assistant_parts(document)
+    assert len(parts) == 1
+    assert parts[0]["type"] == "document_draft"
+    assert parts[0]["draftId"] == "draft-1"
+    assert parts[0]["contentLength"] == len("# Architecture\n\nBody\n")
+    rendered = str(document["turns"][0]["assistantMessages"])
+    assert "# Architecture" not in rendered
+    assert "Body" not in rendered
+
+
 def test_session_run_end_finalizes_existing_stream_without_duplicate_when_response_not_rendered() -> None:
     document = _session_run_start(None, "运行测试", 1)
     document = apply_session_event(

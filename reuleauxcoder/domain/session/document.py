@@ -180,6 +180,7 @@ def apply_session_event(
         _apply_file_change_event(doc, event_type, payload, meta)
     elif event_type in {
         "document_draft_started",
+        "document_draft_delta",
         "document_draft_commit_requested",
         "document_draft_committed",
         "document_draft_failed",
@@ -995,7 +996,28 @@ def _apply_document_draft_event(
         "error": _string(payload, "error") or None,
         "reason": _string(payload, "reason") or None,
     }
+    if event_type == "document_draft_delta":
+        current_length = _document_draft_content_length(doc, draft_id)
+        patch["contentLength"] = current_length + len(_string(payload, "content"))
     _upsert_document_draft_part(doc, draft_id, patch, meta)
+
+
+def _document_draft_content_length(doc: dict[str, Any], draft_id: str) -> int:
+    for turn in reversed(_list_value(doc.get("turns"))):
+        if not isinstance(turn, dict):
+            continue
+        for message in reversed(_list_value(turn.get("assistantMessages"))):
+            if not isinstance(message, dict):
+                continue
+            for part in _list_value(message.get("parts")):
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "document_draft"
+                    and part.get("draftId") == draft_id
+                ):
+                    length = _number(part, "contentLength")
+                    return int(length) if length is not None else 0
+    return 0
 
 
 def _upsert_document_draft_part(
@@ -1035,6 +1057,7 @@ def _document_draft_status(payload: dict[str, Any], event_type: str) -> str:
         return raw
     mapping = {
         "document_draft_started": "streaming",
+        "document_draft_delta": "streaming",
         "document_draft_commit_requested": "committing",
         "document_draft_committed": "committed",
         "document_draft_failed": "failed",
