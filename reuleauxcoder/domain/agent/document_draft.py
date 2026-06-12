@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import re
-from typing import Callable
+from typing import Any, Callable
 
 from reuleauxcoder.domain.agent.events import AgentEvent
+from reuleauxcoder.domain.agent.document_draft_text import draft_text_units
 from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.files import (
     LocalWorkspaceMutationBackend,
@@ -22,10 +24,63 @@ class DocumentDraft:
     format: str = "markdown"
     body_parts: list[str] = field(default_factory=list)
     status: str = "declared"
+    _content_length: int = field(default=0, init=False, repr=False)
+    _content_hasher: Any = field(
+        default_factory=hashlib.sha256,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        parts = list(self.body_parts)
+        self.body_parts = []
+        for part in parts:
+            self.append_body_delta(part)
 
     @property
     def content(self) -> str:
         return "".join(self.body_parts)
+
+    @property
+    def content_length(self) -> int:
+        return self._content_length
+
+    @property
+    def content_sha256(self) -> str:
+        return self._content_hasher.hexdigest()
+
+    def append_body_delta(self, text: str) -> None:
+        if not text:
+            return
+        self.body_parts.append(text)
+        self._content_length += draft_text_units(text)
+        self._content_hasher.update(text.encode("utf-8"))
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDraftSnapshot:
+    draft_id: str
+    target_path: str
+    title: str
+    format: str
+    status: str
+    content: str
+    content_length: int
+    content_sha256: str
+
+    @classmethod
+    def from_draft(cls, draft: DocumentDraft) -> "DocumentDraftSnapshot":
+        content = draft.content
+        return cls(
+            draft_id=draft.draft_id,
+            target_path=draft.target_path,
+            title=draft.title,
+            format=draft.format,
+            status=draft.status,
+            content=content,
+            content_length=draft_text_units(content),
+            content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        )
 
 
 class DocumentDraftRuntime:
@@ -68,7 +123,12 @@ class DocumentDraftRuntime:
         if self.active is None or not text:
             return
         if self.active.status == "streaming":
-            self.active.body_parts.append(text)
+            self.active.append_body_delta(text)
+
+    def snapshot_active(self) -> DocumentDraftSnapshot | None:
+        if self.active is None:
+            return None
+        return DocumentDraftSnapshot.from_draft(self.active)
 
     def commit_active(self) -> None:
         draft = self.active
@@ -228,7 +288,6 @@ class DocumentDraftRuntime:
                 metadata={
                     "draft_id": draft.draft_id,
                     "runtime_workspace_root": self.workspace_root,
-                    "draft_document_content": draft.content,
                     "workspace_mutation_owner": {
                         "workspace_id": str(
                             getattr(self.mutation_backend, "workspace_id", "")

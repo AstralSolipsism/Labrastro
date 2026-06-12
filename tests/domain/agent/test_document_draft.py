@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from reuleauxcoder.domain.agent.document_draft import DocumentDraftRuntime
@@ -175,3 +176,50 @@ def test_document_draft_runtime_commits_through_workspace_owner(tmp_path: Path) 
         "execution_target": "remote_peer",
         "path_space": "remote_peer_workspace",
     }
+    assert "draft_document_content" not in provider.requests[0].metadata
+
+
+def test_document_draft_runtime_snapshot_reads_active_draft_source(
+    tmp_path: Path,
+) -> None:
+    events = []
+    runtime = DocumentDraftRuntime(
+        workspace_root=str(tmp_path),
+        approval_provider=ApprovalProvider(ApprovalDecision.deny_once("no")),
+        emit=events.append,
+    )
+
+    runtime.begin_from_tool_result(_declaration())
+    runtime.append_stream_delta("# Architecture\n")
+    runtime.append_stream_delta("\nBody\n")
+
+    snapshot = runtime.snapshot_active()
+
+    assert snapshot is not None
+    assert snapshot.draft_id == "draft-test"
+    assert snapshot.target_path == "docs/architecture.md"
+    assert snapshot.content == "# Architecture\n\nBody\n"
+    assert snapshot.content_length == len("# Architecture\n\nBody\n")
+    assert snapshot.content_sha256 == hashlib.sha256(
+        "# Architecture\n\nBody\n".encode("utf-8")
+    ).hexdigest()
+
+
+def test_document_draft_runtime_snapshot_uses_utf16_content_length(
+    tmp_path: Path,
+) -> None:
+    events = []
+    runtime = DocumentDraftRuntime(
+        workspace_root=str(tmp_path),
+        approval_provider=ApprovalProvider(ApprovalDecision.deny_once("no")),
+        emit=events.append,
+    )
+
+    runtime.begin_from_tool_result(_declaration())
+    runtime.append_stream_delta("A😀B")
+
+    snapshot = runtime.snapshot_active()
+
+    assert snapshot is not None
+    assert snapshot.content == "A😀B"
+    assert snapshot.content_length == 4
