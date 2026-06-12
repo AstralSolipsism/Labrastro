@@ -1872,19 +1872,17 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             }
 
         def _approval_tool_args(request: ApprovalRequest) -> dict[str, Any]:
+            hidden_keys = {"intent", "content"}
+            if request.tool_name == "draft_document_commit":
+                hidden_keys.add("diff")
             return {
                 key: value
                 for key, value in dict(request.tool_args or {}).items()
-                if key not in {"intent", "content"}
+                if key not in hidden_keys
             }
 
         def _owner_tool_args(request: ApprovalRequest) -> dict[str, Any]:
-            args = _approval_tool_args(request)
-            if request.tool_name == "draft_document_commit":
-                content = request.metadata.get("draft_document_content")
-                if isinstance(content, str):
-                    args["content"] = content
-            return args
+            return _approval_tool_args(request)
 
         def _approval_intent(request: ApprovalRequest) -> str | None:
             if isinstance(request.intent, str) and request.intent.strip():
@@ -1997,6 +1995,31 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             if request.tool_name not in REMOTE_PREVIEW_TOOLS:
                 section = _args_section(request)
                 return ([section] if section else []), None, "preview_unavailable"
+
+            if request.tool_name == "draft_document_commit":
+                draft_args = dict(request.tool_args or {})
+                diff = str(draft_args.get("diff") or "")
+                if diff.strip():
+                    return (
+                        [
+                            {
+                                "id": "diff",
+                                "title": "Proposed file diff",
+                                "kind": "diff",
+                                "content": diff,
+                                "path": draft_args.get("target_path"),
+                                "resolved_path": draft_args.get("target_path"),
+                            }
+                        ],
+                        None,
+                        None,
+                    )
+                raise RemoteToolProtocolError(
+                    tool_name=request.tool_name,
+                    tool_call_id=tool_call_id,
+                    code="DRAFT_DOCUMENT_DIFF_REQUIRED",
+                    message="draft document approval requires a preview diff",
+                )
 
             backend = _remote_backend()
             if backend is None:
@@ -2130,7 +2153,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     "intent": _approval_intent(request),
                     "tool_args": _approval_tool_args(request),
                     "sections": sections,
-                    "preview_unavailable": preview is None or not preview.ok,
+                    "preview_unavailable": bool(preview_error) or not sections,
                     "preview_error": preview_error,
                     **_approval_lifecycle_payload(request),
                     "format": "markdown",
@@ -2309,10 +2332,18 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_STARTED:
                 remote_session.append_event("document_draft_started", event.data)
                 return
-            if event.event_type == AgentEventType.DOCUMENT_DRAFT_DELTA:
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK:
                 if event.data.get("content"):
                     draft_content_emitted["value"] = True
-                remote_session.append_event("document_draft_delta", event.data)
+                remote_session.append_live_event("document_draft_preview_chunk", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_PROGRESS:
+                remote_session.append_event("document_draft_progress", event.data)
+                return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_SNAPSHOT:
+                if event.data.get("content"):
+                    draft_content_emitted["value"] = True
+                remote_session.append_event("document_draft_snapshot", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED:
                 remote_session.append_event("document_draft_commit_requested", event.data)

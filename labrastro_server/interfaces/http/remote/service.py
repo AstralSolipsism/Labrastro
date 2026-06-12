@@ -115,8 +115,9 @@ SessionTraceEventSink = Callable[
 ]
 
 _COALESCED_SESSION_RUN_EVENTS = frozenset(
-    {"assistant_delta", "document_draft_delta", "reasoning_delta", "tool_call_stream"}
+    {"assistant_delta", "reasoning_delta", "tool_call_stream"}
 )
+_LIVE_ONLY_SESSION_RUN_EVENTS = frozenset({"document_draft_preview_chunk"})
 _LIVE_EVENT_FLUSH_INTERVAL_SEC = 0.04
 _LIVE_EVENT_MAX_CONTENT_CHARS = 1024
 
@@ -191,11 +192,18 @@ class _SessionRunEventBuffer:
         "createdAt",
         "draft_id",
         "draftId",
+        "content_length",
+        "content_sha256",
+        "contentLength",
+        "contentSha256",
         "event_id",
         "eventId",
         "format",
+        "final",
         "item_id",
         "itemId",
+        "last_chunk_seq",
+        "lastChunkSeq",
         "message",
         "message_key",
         "path",
@@ -204,6 +212,8 @@ class _SessionRunEventBuffer:
         "session_run_id",
         "sessionId",
         "sessionRunId",
+        "snapshot_kind",
+        "snapshotKind",
         "status",
         "target_path",
         "targetPath",
@@ -228,12 +238,14 @@ class _SessionRunEventBuffer:
         max_events: int,
         max_payload_bytes: int,
         max_total_bytes: int,
+        artifact_excluded_event_types: set[str] | frozenset[str] | None = None,
     ) -> None:
         self.session_run_id = session_run_id
         self.artifact_dir = artifact_root / session_run_id
         self.max_events = max(1, int(max_events or 1))
         self.max_payload_bytes = max(1, int(max_payload_bytes or 1))
         self.max_total_bytes = max(self.max_payload_bytes, int(max_total_bytes or self.max_payload_bytes))
+        self.artifact_excluded_event_types = frozenset(artifact_excluded_event_types or ())
         self._items: list[_BufferedSessionRunEvent] = []
         self._total_bytes = 0
         self._dropped_count = 0
@@ -254,12 +266,13 @@ class _SessionRunEventBuffer:
     def dropped_count(self) -> int:
         return self._dropped_count
 
-    def append(self, event: dict[str, Any]) -> None:
+    def append(self, event: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_event(event)
         size_bytes = self._event_size(normalized)
         self._items.append(_BufferedSessionRunEvent(normalized, size_bytes))
         self._total_bytes += size_bytes
         self._prune()
+        return normalized
 
     def patch_event_metadata(self, event: dict[str, Any]) -> None:
         seq = int(event.get("seq", 0) or 0)
@@ -289,7 +302,11 @@ class _SessionRunEventBuffer:
             for item in self._items
             if int(item.event.get("seq", 0) or 0) > cursor
         ]
-        if self._items and cursor < self.first_available_seq - 1:
+        if (
+            self._items
+            and self._dropped_count > 0
+            and cursor < self.first_available_seq - 1
+        ):
             lost_seq = self.first_available_seq - 1
             events.insert(
                 0,
@@ -323,13 +340,21 @@ class _SessionRunEventBuffer:
         payload = event.get("payload", {})
         if not isinstance(payload, dict):
             payload = {"value": payload}
+        event_type = str(event.get("type") or "")
         original_payload_bytes = json.dumps(
             payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        if len(original_payload_bytes) <= self.max_payload_bytes:
+        should_artifact = (
+            event_type not in self.artifact_excluded_event_types
+            and (
+                len(original_payload_bytes) > self.max_payload_bytes
+                or self._requires_artifact_payload(event_type, payload)
+            )
+        )
+        if not should_artifact:
             return {**event, "payload": payload}
 
         artifact_payload = self._artifact_payload(payload)
@@ -343,20 +368,29 @@ class _SessionRunEventBuffer:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = self.artifact_dir / f"{seq}.json.gz"
         artifact_path.write_bytes(gzip.compress(payload_bytes))
-        preview = payload_bytes[:4096].decode("utf-8", errors="replace")
         envelope = self._artifact_envelope_payload(payload)
         envelope["artifact_ref"] = {
             "type": "session_run_event_payload",
             "path": str(artifact_path),
             "encoding": "json+gzip",
             "bytes": len(payload_bytes),
-            "preview": preview,
+            "preview": self._artifact_preview(event_type, payload_bytes),
             "fields": sorted(str(key) for key in artifact_payload.keys()),
         }
         return {
             **event,
             "payload": envelope,
         }
+
+    @staticmethod
+    def _requires_artifact_payload(event_type: str, payload: dict[str, Any]) -> bool:
+        return event_type == "document_draft_snapshot" and "content" in payload
+
+    @staticmethod
+    def _artifact_preview(event_type: str, payload_bytes: bytes) -> str:
+        if event_type == "document_draft_snapshot":
+            return ""
+        return payload_bytes[:4096].decode("utf-8", errors="replace")
 
     @classmethod
     def _artifact_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +446,40 @@ class _SessionRunEventBuffer:
         )
 
 
+def _hydrate_stream_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    if str(event.get("type") or "") != "document_draft_snapshot":
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return event
+    artifact = payload.get("artifact_ref")
+    if not isinstance(artifact, dict):
+        return event
+    artifact_payload = _read_event_artifact_payload(artifact)
+    if not isinstance(artifact_payload, dict):
+        return event
+    return {
+        **event,
+        "payload": {
+            **payload,
+            **artifact_payload,
+            "artifact_ref": artifact,
+        },
+    }
+
+
+def _read_event_artifact_payload(artifact: dict[str, Any]) -> dict[str, Any] | None:
+    path = artifact.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        raw = gzip.decompress(Path(path).read_bytes())
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 @dataclass
 class _RemoteSessionRun:
     session_run_id: str
@@ -459,6 +527,7 @@ class _RemoteSessionRun:
     trace_persistence_enabled: bool = False
     last_activity_at: float = field(default_factory=time.time)
     _event_buffer: _SessionRunEventBuffer = field(init=False, repr=False)
+    _live_event_buffer: _SessionRunEventBuffer = field(init=False, repr=False)
     _pending_trace_events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
     _pending_live_events: list[_PendingLiveSessionRunEvent] = field(default_factory=list, init=False, repr=False)
     _last_live_flush_at: dict[str, float] = field(default_factory=dict, init=False, repr=False)
@@ -474,6 +543,14 @@ class _RemoteSessionRun:
             max_events=self.max_events,
             max_payload_bytes=self.max_payload_bytes,
             max_total_bytes=self.max_total_bytes,
+        )
+        self._live_event_buffer = _SessionRunEventBuffer(
+            session_run_id=self.session_run_id,
+            artifact_root=self.artifact_root / "_live",
+            max_events=self.max_events,
+            max_payload_bytes=self.max_payload_bytes,
+            max_total_bytes=self.max_total_bytes,
+            artifact_excluded_event_types=_LIVE_ONLY_SESSION_RUN_EVENTS,
         )
 
     @property
@@ -502,6 +579,24 @@ class _RemoteSessionRun:
             else:
                 seq = self._append_event_locked(event_type, normalized_payload)
             self._update_status_for_event_locked(event_type, normalized_payload)
+            self.last_activity_at = now
+            self.cond.notify_all()
+            return seq
+
+    def append_live_event(
+        self, event_type: str, payload: dict[str, Any] | None = None
+    ) -> int:
+        if event_type not in _LIVE_ONLY_SESSION_RUN_EVENTS:
+            raise ValueError(f"unsupported live-only session run event: {event_type}")
+        with self.cond:
+            normalized_payload = _normalize_session_run_payload(
+                event_type,
+                payload if isinstance(payload, dict) else {},
+                self.locale,
+            )
+            now = time.time()
+            self._flush_live_events_locked(now, force=True)
+            seq = self._append_live_only_event_locked(event_type, normalized_payload)
             self.last_activity_at = now
             self.cond.notify_all()
             return seq
@@ -543,8 +638,24 @@ class _RemoteSessionRun:
         locale = payload.get("locale")
         if event_type == "session_run_start" and isinstance(locale, str) and locale:
             self.locale = locale
-        self._persist_or_queue_trace_event(event)
-        self._event_buffer.append(event)
+        durable_event = self._event_buffer.append(event)
+        self._persist_or_queue_trace_event(durable_event)
+        return seq
+
+    def _append_live_only_event_locked(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> int:
+        seq = self.seq_next
+        self.seq_next += 1
+        event = {
+            "session_run_id": self.session_run_id,
+            "seq": seq,
+            "type": event_type,
+            "payload": payload,
+        }
+        self._live_event_buffer.append(event)
         return seq
 
     def _append_approval_resolved_event_locked(self, payload: dict[str, Any]) -> int:
@@ -636,6 +747,39 @@ class _RemoteSessionRun:
             return None
         due_at = min(event.due_at for event in self._pending_live_events)
         return max(0.0, due_at - now)
+
+    def _latest_stream_seq_locked(self) -> int:
+        return max(self._event_buffer.latest_seq, self._live_event_buffer.latest_seq)
+
+    def _first_available_stream_seq_locked(self) -> int:
+        first_values = [
+            seq
+            for seq in (
+                self._event_buffer.first_available_seq,
+                self._live_event_buffer.first_available_seq,
+            )
+            if seq > 0
+        ]
+        return min(first_values) if first_values else 0
+
+    def _events_after_locked(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        durable_events, durable_cursor = self._event_buffer.events_after(cursor)
+        live_events, live_cursor = self._live_event_buffer.events_after(cursor)
+        events = sorted(
+            [*durable_events, *live_events],
+            key=lambda event: int(event.get("seq", 0) or 0),
+        )
+        events = [_hydrate_stream_event_payload(event) for event in events]
+        next_cursor = max(cursor, durable_cursor, live_cursor)
+        if events:
+            next_cursor = max(
+                next_cursor,
+                max(int(event.get("seq", 0) or 0) for event in events),
+            )
+        return events, next_cursor
+
+    def _status_next_cursor_locked(self, cursor: int) -> int:
+        return max(cursor, self._latest_stream_seq_locked())
 
     @staticmethod
     def _live_event_key(event_type: str, payload: dict[str, Any]) -> str:
@@ -750,7 +894,7 @@ class _RemoteSessionRun:
     ) -> tuple[list[dict[str, Any]], bool, int]:
         deadline = time.time() + max(timeout_sec, 0.0)
         with self.cond:
-            while cursor >= self._event_buffer.latest_seq and not self.done:
+            while cursor >= self._latest_stream_seq_locked() and not self.done:
                 now = time.time()
                 if self._flush_live_events_locked(now):
                     break
@@ -760,7 +904,7 @@ class _RemoteSessionRun:
                 live_delay = self._next_live_flush_delay_locked(time.time())
                 wait_timeout = remaining if live_delay is None else min(remaining, live_delay)
                 self.cond.wait(timeout=max(wait_timeout, 0.001))
-            out, next_cursor = self._event_buffer.events_after(cursor)
+            out, next_cursor = self._events_after_locked(cursor)
             self.last_activity_at = time.time()
             return out, self.done, next_cursor
 
@@ -809,11 +953,12 @@ class _RemoteSessionRun:
 
     def cleanup_artifacts(self) -> None:
         self._event_buffer.cleanup_artifacts()
+        self._live_event_buffer.cleanup_artifacts()
 
     def status_payload(self, cursor: int = 0) -> dict[str, Any]:
         cursor = max(0, int(cursor or 0))
         with self.cond:
-            _events, next_cursor = self._event_buffer.events_after(cursor)
+            next_cursor = self._status_next_cursor_locked(cursor)
             return {
                 "ok": True,
                 "session_run_id": self.session_run_id,
@@ -824,9 +969,9 @@ class _RemoteSessionRun:
                 "reconnectable": not self.done,
                 "cursor": cursor,
                 "next_cursor": next_cursor,
-                "first_available_seq": self._event_buffer.first_available_seq,
-                "latest_seq": self._event_buffer.latest_seq,
-                "dropped_count": self._event_buffer.dropped_count,
+                "first_available_seq": self._first_available_stream_seq_locked(),
+                "latest_seq": self._latest_stream_seq_locked(),
+                "dropped_count": self._event_buffer.dropped_count + self._live_event_buffer.dropped_count,
                 "session_id": self.session_id,
                 "mode": self.mode,
                 "workflow_mode": self.workflow_mode,

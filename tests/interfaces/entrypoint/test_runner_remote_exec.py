@@ -2502,7 +2502,7 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
-    def test_runner_stream_chat_forwards_document_draft_delta_as_rendered_content(self) -> None:
+    def test_runner_stream_chat_forwards_document_draft_preview_as_rendered_content(self) -> None:
         workspace = Path(__file__).resolve().parent
 
         def emit(agent: FakeAgent, event: AgentEvent) -> None:
@@ -2510,6 +2510,12 @@ class TestRunnerRemoteExec:
                 handler(event)
 
         def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            import hashlib
+
+            first_chunk = "# Architecture\n"
+            second_chunk = "\nBody\n"
+            final_content = f"{first_chunk}{second_chunk}"
+            final_hash = hashlib.sha256(final_content.encode("utf-8")).hexdigest()
             emit(
                 agent,
                 AgentEvent.document_draft_started(
@@ -2520,21 +2526,46 @@ class TestRunnerRemoteExec:
             )
             emit(
                 agent,
-                AgentEvent.document_draft_delta(
+                AgentEvent.document_draft_preview_chunk(
                     draft_id="draft-1",
                     target_path="docs/architecture.md",
-                    content="# Architecture\n",
+                    chunk_seq=1,
+                    start_offset=0,
+                    content=first_chunk,
                 ),
             )
             emit(
                 agent,
-                AgentEvent.document_draft_delta(
+                AgentEvent.document_draft_preview_chunk(
                     draft_id="draft-1",
                     target_path="docs/architecture.md",
-                    content="\nBody\n",
+                    chunk_seq=2,
+                    start_offset=len(first_chunk),
+                    content=second_chunk,
                 ),
             )
-            return "# Architecture\n\nBody\n"
+            emit(
+                agent,
+                AgentEvent.document_draft_progress(
+                    draft_id="draft-1",
+                    target_path="docs/architecture.md",
+                    content_length=len(final_content),
+                    content_sha256=final_hash,
+                    last_chunk_seq=2,
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.document_draft_snapshot(
+                    draft_id="draft-1",
+                    target_path="docs/architecture.md",
+                    content=final_content,
+                    snapshot_kind="final",
+                    final=True,
+                    last_chunk_seq=2,
+                ),
+            )
+            return final_content
 
         port = _free_port()
         runner = _build_runner_with_fake_agent(
@@ -2569,8 +2600,18 @@ class TestRunnerRemoteExec:
             assert [
                 event["payload"].get("content", "")
                 for event in events
-                if event["type"] == "document_draft_delta"
+                if event["type"] == "document_draft_preview_chunk"
             ] == ["# Architecture\n", "\nBody\n"]
+            assert not [event for event in events if event["type"] == "document_draft_delta"]
+            progress_event = [
+                event for event in events if event["type"] == "document_draft_progress"
+            ][-1]
+            assert progress_event["payload"]["content_length"] == len("# Architecture\n\nBody\n")
+            snapshot_event = [
+                event for event in events if event["type"] == "document_draft_snapshot"
+            ][-1]
+            assert snapshot_event["payload"]["content"] == "# Architecture\n\nBody\n"
+            assert snapshot_event["payload"]["final"] is True
             end_event = [event for event in events if event["type"] == "session_run_end"][-1]
             assert end_event["payload"]["response"] == "# Architecture\n\nBody\n"
             assert end_event["payload"]["response_rendered"] is True
@@ -2719,6 +2760,111 @@ class TestRunnerRemoteExec:
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
                     "approval_id": payload["approval_id"],
+                    "decision": "allow_once",
+                },
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["session_run_id"],
+            )
+            assert any(
+                event["type"] == "session_run_end"
+                and event["payload"].get("response") == "approved"
+                for event in events
+            )
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_draft_approval_uses_runtime_diff_without_body_args(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        preview_calls: list[dict] = []
+
+        def fake_preview(self, peer_id, request, timeout_sec=None):
+            preview_calls.append(
+                {"peer_id": peer_id, "tool_name": request.tool_name, "args": request.args}
+            )
+            raise AssertionError("draft approval must not request a second peer preview")
+
+        monkeypatch.setattr(RelayServer, "send_preview_request", fake_preview)
+        diff = "--- /dev/null\n+++ b/docs/a.md\n+# A\n"
+
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            decision = agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="draft_document_commit",
+                    tool_args={
+                        "target_path": "docs/a.md",
+                        "title": "Draft A",
+                        "diff": diff,
+                    },
+                    tool_source="runtime",
+                    reason="Commit draft document to docs/a.md",
+                    metadata={
+                        "draft_id": "draft-1",
+                    },
+                )
+            )
+            assert decision.approved
+            return "approved"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=[],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "draft"},
+            )
+            _, _cursor, events, _done = _session_run_events_until(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["session_run_id"],
+                lambda event: event["type"] == "approval_request",
+            )
+            approval_payload = next(
+                event["payload"]
+                for event in events
+                if event["type"] == "approval_request"
+            )
+            assert preview_calls == []
+            assert approval_payload["preview_unavailable"] is False
+            assert approval_payload["tool_args"] == {
+                "target_path": "docs/a.md",
+                "title": "Draft A",
+            }
+            assert approval_payload["sections"] == [
+                {
+                    "id": "diff",
+                    "title": "Proposed file diff",
+                    "kind": "diff",
+                    "content": diff,
+                    "path": "docs/a.md",
+                    "resolved_path": "docs/a.md",
+                }
+            ]
+            payload_json = json.dumps(approval_payload, ensure_ascii=False)
+            assert "draft_document_content" not in payload_json
+            assert '"content": "# A' not in payload_json
+
+            _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/approval/reply",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": start_body["session_run_id"],
+                    "approval_id": approval_payload["approval_id"],
                     "decision": "allow_once",
                 },
             )

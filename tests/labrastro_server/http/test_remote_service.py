@@ -387,8 +387,27 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
     session.append_event("session_run_start", {"prompt": "hi"})
     session.append_event("assistant_delta", {"content": "live-coalesced"})
     session.append_event(
-        "document_draft_delta",
-        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "draft"},
+        "document_draft_progress",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content_length": 5,
+            "content_sha256": "progress-sha",
+            "last_chunk_seq": 1,
+        },
+    )
+    session.append_event(
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content": "draft",
+            "content_length": 5,
+            "content_sha256": "snapshot-sha",
+            "snapshot_kind": "final",
+            "final": True,
+            "last_chunk_seq": 1,
+        },
     )
     session.append_event("tool_call_stream", {"tool_call_id": "tool-1", "content": "live"})
     assert persisted == []
@@ -403,20 +422,22 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
     assert [event["type"] for event in persisted] == [
         "session_run_start",
         "assistant_delta",
-        "document_draft_delta",
+        "document_draft_progress",
+        "document_draft_snapshot",
         "tool_call_stream",
         "remote_peer_ready",
         "assistant_message",
         "session_run_end",
     ]
-    assert [event["session_id"] for event in persisted] == ["session-1"] * 7
+    assert [event["session_id"] for event in persisted] == ["session-1"] * 8
     event_by_type = {event["type"]: event for event in session.events}
     assert event_by_type["assistant_delta"]["session_event_seq"] == 2
-    assert event_by_type["document_draft_delta"]["session_event_seq"] == 3
-    assert event_by_type["tool_call_stream"]["session_event_seq"] == 4
-    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 5
-    assert event_by_type["assistant_message"]["session_event_seq"] == 6
-    assert event_by_type["session_run_end"]["session_event_seq"] == 7
+    assert event_by_type["document_draft_progress"]["session_event_seq"] == 3
+    assert event_by_type["document_draft_snapshot"]["session_event_seq"] == 4
+    assert event_by_type["tool_call_stream"]["session_event_seq"] == 5
+    assert event_by_type["remote_peer_ready"]["session_event_seq"] == 6
+    assert event_by_type["assistant_message"]["session_event_seq"] == 7
+    assert event_by_type["session_run_end"]["session_event_seq"] == 8
 
 
 def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: Path) -> None:
@@ -487,7 +508,314 @@ def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -
     assert events[0]["payload"]["content"] == "BC"
 
 
-def test_remote_session_run_session_coalesces_fast_document_draft_delta_events(
+def test_remote_session_run_document_draft_preview_chunk_is_live_only(
+    tmp_path: Path,
+) -> None:
+    persisted: list[dict] = []
+
+    def sink(
+        session_id: str,
+        event_type: str,
+        payload: dict,
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        persisted.append(
+            {
+                "session_id": session_id,
+                "type": event_type,
+                "payload": payload,
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return len(persisted)
+
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        trace_event_sink=sink,
+    )
+    session.enable_trace_persistence("session-1")
+
+    session.append_live_event(
+        "document_draft_preview_chunk",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "chunk_seq": 1,
+            "start_offset": 0,
+            "end_offset": 1,
+            "content": "A",
+            "content_sha256": "sha-a",
+        },
+    )
+
+    events, _done, _cursor = session.wait_events(0, 0)
+    assert [event["type"] for event in events] == ["document_draft_preview_chunk"]
+    assert events[0]["payload"]["content"] == "A"
+    assert persisted == []
+    assert session.events == []
+
+
+def test_remote_session_run_document_draft_preview_chunk_keeps_large_body_without_artifact(
+    tmp_path: Path,
+) -> None:
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        max_payload_bytes=32,
+    )
+    content = "live preview body " * 16
+
+    session.append_live_event(
+        "document_draft_preview_chunk",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "chunk_seq": 1,
+            "start_offset": 0,
+            "end_offset": len(content),
+            "content": content,
+            "content_sha256": "sha-a",
+        },
+    )
+
+    events, _done, _cursor = session.wait_events(0, 0)
+
+    assert [event["type"] for event in events] == ["document_draft_preview_chunk"]
+    payload = events[0]["payload"]
+    assert payload["content"] == content
+    assert "artifact_ref" not in payload
+    assert session.events == []
+
+
+def test_remote_session_run_hydrates_large_document_draft_snapshot_for_stream(
+    tmp_path: Path,
+) -> None:
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        max_payload_bytes=128,
+    )
+    content = "# Architecture\n\n" + ("large body\n" * 64)
+
+    session.append_event(
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content": content,
+            "content_length": len(content),
+            "content_sha256": "snapshot-sha",
+            "snapshot_kind": "final",
+            "final": True,
+            "last_chunk_seq": 7,
+            "status": "streaming",
+        },
+    )
+
+    stored_payload = session.events[-1]["payload"]
+    assert "artifact_ref" in stored_payload
+    assert "content" not in stored_payload
+
+    events, _done, _cursor = session.wait_events(0, 0)
+
+    payload = events[-1]["payload"]
+    assert payload["content"] == content
+    assert payload["content_length"] == len(content)
+    assert payload["content_sha256"] == "snapshot-sha"
+    assert payload["snapshot_kind"] == "final"
+    assert payload["final"] is True
+    assert payload["last_chunk_seq"] == 7
+    assert payload["draft_id"] == "draft-1"
+    assert payload["target_path"] == "docs/a.md"
+    assert "artifact_ref" in payload
+    assert payload["artifact_ref"]["preview"] == ""
+
+
+def test_remote_session_run_persists_document_draft_snapshot_trace_without_body(
+    tmp_path: Path,
+) -> None:
+    persisted: list[dict] = []
+
+    def sink(
+        session_id: str,
+        event_type: str,
+        payload: dict,
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        persisted.append(
+            {
+                "session_id": session_id,
+                "type": event_type,
+                "payload": payload,
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return len(persisted)
+
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        trace_event_sink=sink,
+    )
+    session.enable_trace_persistence("session-1")
+    content = "# Architecture\n\nTrace must not store this body."
+
+    session.append_event(
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content": content,
+            "content_length": len(content),
+            "content_sha256": "snapshot-sha",
+            "snapshot_kind": "checkpoint",
+            "last_chunk_seq": 3,
+        },
+    )
+
+    assert len(persisted) == 1
+    trace_payload = persisted[0]["payload"]
+    assert "content" not in trace_payload
+    assert trace_payload["content_length"] == len(content)
+    assert trace_payload["content_sha256"] == "snapshot-sha"
+    artifact = trace_payload["artifact_ref"]
+    assert artifact["encoding"] == "json+gzip"
+    assert artifact["preview"] == ""
+    assert content not in json.dumps(trace_payload, ensure_ascii=False)
+    with gzip.open(Path(artifact["path"]), "rt", encoding="utf-8") as fh:
+        assert json.load(fh) == {"content": content}
+
+    stored_payload = session.events[-1]["payload"]
+    assert "content" not in stored_payload
+    assert stored_payload["artifact_ref"] == artifact
+    assert content not in json.dumps(stored_payload, ensure_ascii=False)
+
+    events, _done, _cursor = session.wait_events(0, 0)
+    assert events[-1]["payload"]["content"] == content
+    assert events[-1]["payload"]["artifact_ref"] == artifact
+
+
+def test_remote_session_run_flushes_pending_document_draft_snapshot_trace_without_body(
+    tmp_path: Path,
+) -> None:
+    persisted: list[dict] = []
+
+    def sink(
+        session_id: str,
+        event_type: str,
+        payload: dict,
+        session_run_id: str | None,
+        session_run_seq: int | None,
+        source: str,
+        replayable: bool,
+    ) -> int:
+        persisted.append(
+            {
+                "session_id": session_id,
+                "type": event_type,
+                "payload": payload,
+                "session_run_id": session_run_id,
+                "session_run_seq": session_run_seq,
+                "source": source,
+                "replayable": replayable,
+            }
+        )
+        return len(persisted)
+
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        trace_event_sink=sink,
+    )
+    content = "# Architecture\n\nPending trace must not store this body."
+
+    session.append_event(
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content": content,
+            "content_length": len(content),
+            "content_sha256": "snapshot-sha",
+            "snapshot_kind": "checkpoint",
+            "last_chunk_seq": 3,
+        },
+    )
+    assert persisted == []
+
+    session.enable_trace_persistence("session-1")
+
+    assert len(persisted) == 1
+    trace_payload = persisted[0]["payload"]
+    assert "content" not in trace_payload
+    assert trace_payload["content_length"] == len(content)
+    artifact = trace_payload["artifact_ref"]
+    assert artifact["preview"] == ""
+    assert content not in json.dumps(trace_payload, ensure_ascii=False)
+    with gzip.open(Path(artifact["path"]), "rt", encoding="utf-8") as fh:
+        assert json.load(fh) == {"content": content}
+
+
+def test_remote_session_run_status_does_not_hydrate_large_document_draft_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        max_payload_bytes=128,
+    )
+    content = "# Architecture\n\n" + ("large body\n" * 64)
+    session.append_event(
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content": content,
+            "content_length": len(content),
+            "content_sha256": "snapshot-sha",
+            "snapshot_kind": "final",
+            "final": True,
+            "last_chunk_seq": 7,
+            "status": "streaming",
+        },
+    )
+    assert "artifact_ref" in session.events[-1]["payload"]
+
+    def fail_hydration(_artifact: dict) -> None:
+        raise AssertionError("status_payload must not hydrate artifact payloads")
+
+    monkeypatch.setattr(
+        "labrastro_server.interfaces.http.remote.service._read_event_artifact_payload",
+        fail_hydration,
+    )
+
+    status = session.status_payload(0)
+
+    assert status["next_cursor"] == 1
+    assert status["latest_seq"] == 1
+
+
+def test_remote_session_run_interleaves_live_and_durable_events_without_false_loss(
     tmp_path: Path,
 ) -> None:
     session = _RemoteSessionRun(
@@ -496,27 +824,37 @@ def test_remote_session_run_session_coalesces_fast_document_draft_delta_events(
         artifact_root=tmp_path,
     )
 
-    session.append_event(
-        "document_draft_delta",
-        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "A"},
+    session.append_live_event(
+        "document_draft_preview_chunk",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "chunk_seq": 1,
+            "start_offset": 0,
+            "end_offset": 1,
+            "content": "A",
+            "content_sha256": "sha-a",
+        },
     )
+    session.append_event(
+        "document_draft_progress",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/a.md",
+            "content_length": 1,
+            "content_sha256": "sha-a",
+            "last_chunk_seq": 1,
+        },
+    )
+
     events, _done, cursor = session.wait_events(0, 0)
-    assert [event["payload"]["content"] for event in events] == ["A"]
 
-    session.append_event(
-        "document_draft_delta",
-        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "B"},
-    )
-    session.append_event(
-        "document_draft_delta",
-        {"draft_id": "draft-1", "target_path": "docs/a.md", "content": "C"},
-    )
-    events, _done, cursor = session.wait_events(cursor, 0)
-    assert events == []
-
-    events, _done, _cursor = session.wait_events(cursor, 0.2)
-    assert [event["type"] for event in events] == ["document_draft_delta"]
-    assert events[0]["payload"]["content"] == "BC"
+    assert [event["type"] for event in events] == [
+        "document_draft_preview_chunk",
+        "document_draft_progress",
+    ]
+    assert [event["seq"] for event in events] == [1, 2]
+    assert cursor == 2
 
 
 def _raw_request(
