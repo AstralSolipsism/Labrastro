@@ -232,6 +232,63 @@ def test_parse_config_accepts_provider_stream_recovery_policy() -> None:
     assert recovery.fallback_models == [{"provider": "backup", "model": "backup-model"}]
 
 
+def test_parse_config_accepts_provider_stream_liveness_policy() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "providers": {
+                "items": {
+                    "zenmux": {
+                        "type": "openai_chat",
+                        "compat": "zenmux",
+                        "api_key": "sk-test",
+                        "base_url": "https://gateway.example/v1",
+                        "stream_liveness": {
+                            "wall_time_sec": 900,
+                            "idle_time_sec": 45,
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+    liveness = config.providers.items["zenmux"].stream_liveness
+    assert liveness.wall_time_sec == 900
+    assert liveness.idle_time_sec == 45
+
+
+def test_parse_config_preserves_invalid_provider_stream_liveness_values_for_validation() -> None:
+    config = ConfigLoader()._parse_config(
+        {
+            "providers": {
+                "items": {
+                    "zenmux": {
+                        "type": "openai_chat",
+                        "compat": "zenmux",
+                        "api_key": "sk-test",
+                        "base_url": "https://gateway.example/v1",
+                        "stream_liveness": {
+                            "wall_time_sec": 0,
+                            "idle_time_sec": 0,
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+    assert config.providers.items["zenmux"].stream_liveness.wall_time_sec == 0
+    assert config.providers.items["zenmux"].stream_liveness.idle_time_sec == 0
+    assert (
+        "providers.items[zenmux].stream_liveness.wall_time_sec must be positive"
+        in config.validate()
+    )
+    assert (
+        "providers.items[zenmux].stream_liveness.idle_time_sec must be positive"
+        in config.validate()
+    )
+
+
 def test_provider_config_to_dict_round_trips_through_config_loader() -> None:
     provider = ProviderConfig(
         id="custom",

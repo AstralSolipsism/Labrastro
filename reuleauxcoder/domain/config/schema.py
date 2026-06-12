@@ -37,6 +37,7 @@ CONFIG_SCHEMA = {
                 "max_retries": "int (default: 3)",
                 "api_features": "dict of booleans (optional)",
                 "stream_recovery": "dict (optional, provider stream retry/continue policy)",
+                "stream_liveness": "dict (optional, provider stream liveness limits: wall_time_sec, idle_time_sec)",
                 "models": "list (optional, cached/discovered provider model metadata)",
                 "extra": "dict (optional, provider-specific settings)",
             }

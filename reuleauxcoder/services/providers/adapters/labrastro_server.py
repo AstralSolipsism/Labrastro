@@ -17,6 +17,7 @@ from reuleauxcoder.domain.providers.models import (
 )
 from reuleauxcoder.services.providers.stream_supervisor import (
     ProviderStreamInterruptedError,
+    StreamLivenessLimits,
     StreamSupervisor,
 )
 
@@ -91,6 +92,7 @@ class LabrastroServerProvider:
                 provider_id=self.config.id,
                 provider_type=self.config.type,
                 params=request_params,
+                liveness_limits=StreamLivenessLimits.from_config(self.config),
                 partial_response_factory=partial_response,
             )
 

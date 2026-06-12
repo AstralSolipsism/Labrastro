@@ -61,6 +61,7 @@ PROVIDER_CONFIG_FIELDS: tuple[str, ...] = (
     "max_retries",
     "api_features",
     "stream_recovery",
+    "stream_liveness",
     "extra",
 )
 MODEL_PROFILE_CONFIG_FIELDS: tuple[str, ...] = (
@@ -703,6 +704,33 @@ class StreamRecoveryConfig:
 
 
 @dataclass
+class StreamLivenessConfig:
+    """Provider stream liveness limits."""
+
+    wall_time_sec: float = 600.0
+    idle_time_sec: float = 120.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "wall_time_sec": self.wall_time_sec,
+            "idle_time_sec": self.idle_time_sec,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "StreamLivenessConfig":
+        if not isinstance(d, dict):
+            return cls()
+        return cls(
+            wall_time_sec=(
+                float(d["wall_time_sec"]) if "wall_time_sec" in d else 600.0
+            ),
+            idle_time_sec=(
+                float(d["idle_time_sec"]) if "idle_time_sec" in d else 120.0
+            ),
+        )
+
+
+@dataclass
 class ProviderConfig:
     """Server-side LLM provider configuration."""
 
@@ -719,6 +747,7 @@ class ProviderConfig:
         default_factory=lambda: ProviderApiFeatures.defaults_for("openai_chat")
     )
     stream_recovery: StreamRecoveryConfig = field(default_factory=StreamRecoveryConfig)
+    stream_liveness: StreamLivenessConfig = field(default_factory=StreamLivenessConfig)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -733,6 +762,7 @@ class ProviderConfig:
             "max_retries": self.max_retries,
             "api_features": self.api_features.to_dict(),
             "stream_recovery": self.stream_recovery.to_dict(),
+            "stream_liveness": self.stream_liveness.to_dict(),
             "extra": dict(self.extra),
         }
         return data
@@ -771,6 +801,7 @@ class ProviderConfig:
                 d.get("api_features"), provider_type=provider_type
             ),
             stream_recovery=StreamRecoveryConfig.from_dict(d.get("stream_recovery")),
+            stream_liveness=StreamLivenessConfig.from_dict(d.get("stream_liveness")),
             extra=dict(raw_extra) if isinstance(raw_extra, dict) else {},
         )
 
@@ -2700,6 +2731,14 @@ class Config:
             if provider.stream_recovery.max_continue_attempts < 0:
                 errors.append(
                     f"providers.items[{provider_id}].stream_recovery.max_continue_attempts must be non-negative"
+                )
+            if provider.stream_liveness.wall_time_sec < 1:
+                errors.append(
+                    f"providers.items[{provider_id}].stream_liveness.wall_time_sec must be positive"
+                )
+            if provider.stream_liveness.idle_time_sec < 1:
+                errors.append(
+                    f"providers.items[{provider_id}].stream_liveness.idle_time_sec must be positive"
                 )
 
         if self.active_mode and self.active_mode not in self.modes:

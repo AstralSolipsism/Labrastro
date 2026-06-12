@@ -85,6 +85,29 @@ class StreamLivenessLimits:
     wall_time_sec: float = 600.0
     idle_time_sec: float = 120.0
 
+    @classmethod
+    def from_config(cls, config: Any) -> "StreamLivenessLimits":
+        first_class = getattr(config, "stream_liveness", None)
+        if first_class is not None:
+            if hasattr(first_class, "to_dict"):
+                return cls.from_dict(first_class.to_dict())
+            if isinstance(first_class, dict):
+                return cls.from_dict(first_class)
+        return cls()
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "StreamLivenessLimits":
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            wall_time_sec=(
+                float(raw["wall_time_sec"]) if "wall_time_sec" in raw else 600.0
+            ),
+            idle_time_sec=(
+                float(raw["idle_time_sec"]) if "idle_time_sec" in raw else 120.0
+            ),
+        )
+
 
 class StreamLivenessError(TimeoutError):
     """Raised when a provider stream violates runtime liveness limits."""
@@ -241,12 +264,18 @@ class StreamSupervisor:
 
     def _next_wait_timeout(self) -> float:
         now = time.time()
-        wall_remaining = self.liveness_limits.wall_time_sec - (now - self.started_at)
+        wall_remaining = (
+            self.liveness_limits.wall_time_sec - (now - self.started_at)
+            if self.last_event_at is None
+            else self.liveness_limits.idle_time_sec
+        )
         last_event = self.last_event_at or self.started_at
         idle_remaining = self.liveness_limits.idle_time_sec - (now - last_event)
         return max(0.001, min(0.5, wall_remaining, idle_remaining))
 
     def _check_wall_time(self) -> None:
+        if self.last_event_at is not None:
+            return
         elapsed = time.time() - self.started_at
         if elapsed > self.liveness_limits.wall_time_sec:
             raise StreamLivenessError(

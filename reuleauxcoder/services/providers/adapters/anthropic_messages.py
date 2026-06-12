@@ -16,7 +16,10 @@ from reuleauxcoder.services.providers.compat import (
     apply_anthropic_reasoning_effort,
     deepseek_anthropic_budget_is_provider_managed,
 )
-from reuleauxcoder.services.providers.stream_supervisor import StreamSupervisor
+from reuleauxcoder.services.providers.stream_supervisor import (
+    StreamLivenessLimits,
+    StreamSupervisor,
+)
 from reuleauxcoder.services.providers.tool_call_delta import (
     emit_tool_call_delta,
     tool_arguments_preview,
@@ -432,6 +435,7 @@ class AnthropicMessagesProvider:
             provider_id=self.config.id,
             provider_type=self.config.type,
             params=params,
+            liveness_limits=StreamLivenessLimits.from_config(self.config),
             partial_response_factory=lambda: _build_response(
                 stream_status="interrupted"
             ),

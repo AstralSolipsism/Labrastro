@@ -31,6 +31,7 @@ from reuleauxcoder.services.providers.compat import (
 )
 from reuleauxcoder.services.providers.stream_supervisor import (
     ProviderStreamInterruptedError,
+    StreamLivenessLimits,
     StreamSupervisor,
 )
 from reuleauxcoder.services.providers.tool_call_delta import (
@@ -654,6 +655,7 @@ class OpenAIChatProvider:
                 attempts=retry_attempts,
                 stream_options_enabled=debug_stream_options_enabled,
                 debug_http_chunks=debug_http_chunks,
+                liveness_limits=StreamLivenessLimits.from_config(self.config),
                 partial_response_factory=lambda: _build_response(
                     stream_status="interrupted"
                 ),

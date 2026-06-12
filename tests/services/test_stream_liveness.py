@@ -35,6 +35,36 @@ def test_stream_supervisor_interrupts_idle_stream_without_waiting_for_generator(
     assert exc_info.value.partial_response.stream_status == "interrupted"
 
 
+def test_stream_supervisor_does_not_interrupt_active_stream_at_wall_time() -> None:
+    def active_stream():
+        for index in range(5):
+            time.sleep(0.02)
+            yield f"chunk-{index}"
+
+    supervisor = StreamSupervisor(
+        provider_id="test",
+        provider_type="test",
+        params={},
+        partial_response_factory=ProviderResponse,
+        liveness_limits=StreamLivenessLimits(wall_time_sec=0.03, idle_time_sec=0.2),
+    )
+    chunks: list[str] = []
+
+    supervisor.consume(active_stream(), lambda _index, chunk: chunks.append(chunk))
+
+    assert chunks == [f"chunk-{index}" for index in range(5)]
+
+
+def test_stream_liveness_limits_preserve_explicit_zero_values() -> None:
+    limits = StreamLivenessLimits.from_dict({
+        "wall_time_sec": 0,
+        "idle_time_sec": 0,
+    })
+
+    assert limits.wall_time_sec == 0
+    assert limits.idle_time_sec == 0
+
+
 def test_tool_argument_delta_enforces_transport_size_limit() -> None:
     request = ProviderRequest(
         model="demo",
