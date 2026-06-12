@@ -273,7 +273,7 @@ def test_agent_loop_reuses_skill_catalog_expansion_within_turn_without_reexecuti
     assert len(agent.lifecycle_dispatcher.contexts) == 1
 
 
-def test_agent_loop_routes_document_draft_stream_to_draft_delta_not_assistant_delta(
+def test_agent_loop_routes_document_draft_stream_to_preview_chunk_not_assistant_delta(
     tmp_path,
 ) -> None:
     declaration = "\n".join(
@@ -312,19 +312,120 @@ def test_agent_loop_routes_document_draft_stream_to_draft_delta_not_assistant_de
 
     assert result == "# Architecture\n\nBody\n"
     event_types = [event.event_type.value for event in agent._events]
-    assert "document_draft_delta" in event_types
+    assert "document_draft_preview_chunk" in event_types
+    assert "document_draft_progress" in event_types
+    assert "document_draft_snapshot" in event_types
+    assert "document_draft_delta" not in event_types
     assert "stream_token" not in event_types
-    draft_deltas = [
+    preview_chunks = [
         event.data
         for event in agent._events
-        if event.event_type.value == "document_draft_delta"
+        if event.event_type.value == "document_draft_preview_chunk"
     ]
-    assert [delta["content"] for delta in draft_deltas] == [
-        "# Architecture\n",
-        "\nBody\n",
+    snapshots = [
+        event.data
+        for event in agent._events
+        if event.event_type.value == "document_draft_snapshot"
     ]
-    assert all(delta["draft_id"] == "draft-test" for delta in draft_deltas)
+    assert "".join(chunk["content"] for chunk in preview_chunks) == "# Architecture\n\nBody\n"
+    assert all(chunk["draft_id"] == "draft-test" for chunk in preview_chunks)
+    assert snapshots[-1]["content"] == "# Architecture\n\nBody\n"
+    assert snapshots[-1]["final"] is True
     assert loop.last_response_streamed is True
+
+
+def test_agent_loop_batches_tiny_document_draft_stream_tokens(tmp_path) -> None:
+    declaration = "\n".join(
+        [
+            "Draft document declared: Architecture",
+            "draft_id: draft-test",
+            "target_path: docs/architecture.md",
+            "Continue the document body in assistant markdown stream.",
+        ]
+    )
+    content = "0123456789" * 90
+    agent = _RunAgentStub(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="draft_document_begin",
+                        arguments={"target_path": "docs/architecture.md"},
+                    ),
+                ],
+            ),
+            LLMResponse(content=content, tokens=list(content)),
+        ]
+    )
+    agent.runtime_workspace_root = str(tmp_path)
+    agent._executor = SimpleNamespace(
+        execute=lambda _tool_call, index=0: declaration,  # noqa: ARG005
+        execute_parallel=agent._execute_tools,
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    result = loop.run()
+
+    preview_chunks = [
+        event.data
+        for event in agent._events
+        if event.event_type.value == "document_draft_preview_chunk"
+    ]
+    assert result == content
+    assert "".join(chunk["content"] for chunk in preview_chunks) == content
+    assert len(preview_chunks) < len(content) // 50
+
+
+def test_agent_loop_flushes_document_draft_before_interrupt_cancel(tmp_path) -> None:
+    declaration = "\n".join(
+        [
+            "Draft document declared: Architecture",
+            "draft_id: draft-test",
+            "target_path: docs/architecture.md",
+            "Continue the document body in assistant markdown stream.",
+        ]
+    )
+    content = "partial draft body"
+    agent = _RunAgentStub(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="draft_document_begin",
+                        arguments={"target_path": "docs/architecture.md"},
+                    ),
+                ],
+            ),
+            LLMResponse(
+                content=content,
+                tokens=list(content),
+                stream_status="interrupted",
+                interruption={"message": "provider stream exceeded wall time limit (600s)"},
+                recovery={"attempted": True, "failed": True},
+            ),
+        ]
+    )
+    agent.runtime_workspace_root = str(tmp_path)
+    agent._executor = SimpleNamespace(
+        execute=lambda _tool_call, index=0: declaration,  # noqa: ARG005
+        execute_parallel=agent._execute_tools,
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    result = loop.run()
+
+    event_types = [event.event_type.value for event in agent._events]
+    snapshots = [
+        event.data
+        for event in agent._events
+        if event.event_type.value == "document_draft_snapshot"
+    ]
+    assert result == content
+    assert snapshots[-1]["content"] == content
+    assert snapshots[-1]["final"] is True
+    assert event_types.index("document_draft_snapshot") < event_types.index("document_draft_cancelled")
 
 
 def test_agent_loop_runtime_workspace_root_falls_back_to_working_directory() -> None:
@@ -517,7 +618,20 @@ def test_stream_interruption_payload_keeps_transport_message_diagnostic_only() -
     )
 
     assert payload["notice_code"] == "provider_stream_interrupted"
-    assert payload["message_key"] == "provider_stream_interrupted.recovering"
+    assert payload["message_key"] == "provider_stream.interrupted_can_continue"
     assert "message" not in payload
     assert payload["diagnostic_message"] == "peer closed connection without sending complete message body"
     assert payload["diagnostic_path"] == "logs/llm-error.json"
+
+
+def test_stream_interruption_payload_uses_recovering_key_only_for_successful_recovery() -> None:
+    payload = AgentLoop._stream_interruption_payload(
+        LLMResponse(
+            content="complete",
+            stream_status="completed",
+            interruption={"message": "peer closed connection"},
+            recovery={"attempted": True, "failed": False},
+        )
+    )
+
+    assert payload["message_key"] == "provider_stream_interrupted.recovering"

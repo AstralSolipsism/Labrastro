@@ -17,6 +17,7 @@ from reuleauxcoder.domain.agent.runtime_budget import (
     runtime_budget_int,
 )
 from reuleauxcoder.domain.agent.document_draft import DocumentDraftRuntime
+from reuleauxcoder.domain.agent.document_draft_stream import DocumentDraftLiveStream
 from reuleauxcoder.domain.agent.runtime_boundary import (
     runtime_agent_run_id,
     runtime_execution_target,
@@ -530,6 +531,11 @@ class AgentLoop:
         interruption = dict(response.interruption or {})
         recovery = dict(response.recovery or {})
         raw_message = str(interruption.get("message") or "").strip()
+        recovered = (
+            response.stream_status == "completed"
+            and bool(recovery.get("attempted"))
+            and not recovery.get("failed")
+        )
         return {
             "stream_status": response.stream_status,
             "recoverable": bool(interruption.get("recoverable", True)),
@@ -538,7 +544,11 @@ class AgentLoop:
             "partial_kind": interruption.get("partial_kind"),
             "retry_action": interruption.get("retry_action"),
             "notice_code": "provider_stream_interrupted",
-            "message_key": "provider_stream_interrupted.recovering",
+            "message_key": (
+                "provider_stream_interrupted.recovering"
+                if recovered
+                else "provider_stream.interrupted_can_continue"
+            ),
             "diagnostic_message": raw_message,
             "diagnostic_path": interruption.get("diagnostic_path"),
             "recovery": recovery,
@@ -551,10 +561,15 @@ class AgentLoop:
         payload = self._stream_interruption_payload(response)
         self.agent._emit_event(AgentEvent.provider_stream_interrupted(payload))
         recovery = payload.get("recovery")
-        if isinstance(recovery, dict) and recovery.get("attempted"):
+        recovered = (
+            response.stream_status == "completed"
+            and isinstance(recovery, dict)
+            and bool(recovery.get("attempted"))
+            and not recovery.get("failed")
+        )
+        if recovered:
             self.agent._emit_event(AgentEvent.provider_stream_recovering(payload))
-            if response.stream_status == "completed" and not recovery.get("failed"):
-                self.agent._emit_event(AgentEvent.provider_stream_recovered(payload))
+            self.agent._emit_event(AgentEvent.provider_stream_recovered(payload))
 
     def _emit_apply_patch_stream_delta(
         self,
@@ -643,12 +658,32 @@ class AgentLoop:
             approval_provider=getattr(self.agent, "approval_provider", None),
             emit=self.agent._emit_event,
         )
+        draft_stream = DocumentDraftLiveStream()
+
+        def _emit_draft_stream_events(events: list[AgentEvent]) -> None:
+            for event in events:
+                self.agent._emit_event(event)
+
+        def _flush_active_draft(
+            snapshot_kind: str,
+            *,
+            final: bool = True,
+        ) -> None:
+            _emit_draft_stream_events(
+                draft_stream.flush(
+                    draft_runtime.active,
+                    snapshot_kind=snapshot_kind,
+                    final=final,
+                )
+            )
 
         for round_num in range(self.agent.max_rounds):
             if self.agent.stop_requested():
+                _flush_active_draft("cancelled")
                 draft_runtime.cancel_active("stopped by cancellation request")
                 return "(stopped by cancellation request)"
             if budget_result := self._budget_stop_result():
+                _flush_active_draft("cancelled")
                 draft_runtime.cancel_active(budget_result)
                 return budget_result
 
@@ -667,12 +702,8 @@ class AgentLoop:
                 draft = draft_runtime.active
                 if draft is not None and draft.status == "streaming":
                     draft_runtime.append_stream_delta(token)
-                    self.agent._emit_event(
-                        AgentEvent.document_draft_delta(
-                            draft_id=draft.draft_id,
-                            target_path=draft.target_path,
-                            content=token,
-                        )
+                    _emit_draft_stream_events(
+                        draft_stream.append(draft, token)
                     )
                     return
                 self.agent._emit_event(AgentEvent.stream_token(token))
@@ -736,6 +767,7 @@ class AgentLoop:
                 self.agent._emit_event(AgentEvent.reasoning_token(resp.reasoning_content))
             if budget_result := self._budget_stop_result():
                 self.last_response_streamed = streamed_output
+                _flush_active_draft("cancelled")
                 draft_runtime.cancel_active(budget_result)
                 return budget_result
 
@@ -744,6 +776,7 @@ class AgentLoop:
                 self.last_run_interrupted = True
                 self.last_interruption_payload = self._stream_interruption_payload(resp)
                 self.agent.state.messages.append(resp.message)
+                _flush_active_draft("interrupted")
                 draft_runtime.cancel_active("provider stream interrupted")
                 return resp.content
 
@@ -751,6 +784,7 @@ class AgentLoop:
             if not resp.tool_calls:
                 self.last_response_streamed = streamed_output
                 self.agent.state.messages.append(resp.message)
+                _flush_active_draft("final")
                 draft_runtime.commit_active()
                 return resp.content
 
@@ -759,6 +793,8 @@ class AgentLoop:
             self.agent.state.messages.append(resp.message)
 
             if self.agent.stop_requested():
+                _flush_active_draft("cancelled")
+                draft_runtime.cancel_active("stopped by cancellation request")
                 return "(stopped by cancellation request)"
 
             def refresh_assistant_tool_call_message() -> None:
@@ -786,6 +822,8 @@ class AgentLoop:
                 if self.agent.approval_provider is not None:
                     for tool_index, tc in enumerate(resp.tool_calls):
                         if self.agent.stop_requested():
+                            _flush_active_draft("cancelled")
+                            draft_runtime.cancel_active("stopped by cancellation request")
                             return "(stopped by cancellation request)"
                         result = self.agent._executor.execute(tc, index=tool_index)
                         if tc.name == "draft_document_begin":
@@ -802,6 +840,8 @@ class AgentLoop:
                 else:
                     # No interactive approval needed: keep parallel execution.
                     if self.agent.stop_requested():
+                        _flush_active_draft("cancelled")
+                        draft_runtime.cancel_active("stopped by cancellation request")
                         return "(stopped by cancellation request)"
                     results = self.agent._executor.execute_parallel(resp.tool_calls)
                     refresh_assistant_tool_call_message()
@@ -825,9 +865,11 @@ class AgentLoop:
             self._emit_usage_update()
 
         if budget_result := self._budget_stop_result():
+            _flush_active_draft("cancelled")
             draft_runtime.cancel_active(budget_result)
             return budget_result
         if max_turns_result := self._max_turns_stop_result():
+            _flush_active_draft("cancelled")
             draft_runtime.cancel_active(max_turns_result)
             return max_turns_result
 
@@ -879,8 +921,10 @@ class AgentLoop:
             self.last_run_interrupted = True
             self.last_interruption_payload = self._stream_interruption_payload(summary_resp)
             self.agent.state.messages.append(summary_resp.message)
+            _flush_active_draft("interrupted")
             draft_runtime.cancel_active("provider stream interrupted")
             return summary_resp.content
         self.agent.state.messages.append(summary_resp.message)
+        _flush_active_draft("final")
         draft_runtime.commit_active()
         return summary_resp.content or "(reached maximum tool-call rounds)"
