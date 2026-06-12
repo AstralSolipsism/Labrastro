@@ -235,17 +235,70 @@ owner。
 
 ```text
 draft_document_begin
-  -> assistant_delta captures visible body
+  -> assistant stream is captured by DocumentDraftRuntime as the single source
+  -> document_draft_preview_chunk feeds VS Code Markdown preview live-only
+  -> document_draft_progress/document_draft_snapshot record durable metadata/checkpoints
   -> draft runtime requests owner.preview_document_commit
   -> owner returns add-only preview for a new target
-  -> approval binds to plan_id / plan_hash
+  -> approval displays diff/path/title only; full body stays out of approval metadata/tool args
+  -> remote owner commit carries preview expected_state from backend state
   -> owner.commit_document creates the target if it still does not exist
   -> fileChange completed
 ```
 
+#### Draft Live Preview Hot Path Contract
+
+`draft_document` 的实时预览是同一份服务端正文的显示副本，不是第二份正文源，也不是
+session history 的正文回放机制。
+
+运行时合同：
+
+- `DocumentDraftRuntime` 必须增量维护正文长度和正文 hash；普通 token append 不得每次拼接完整正文。
+- `DocumentDraftLiveStream` 只根据增量长度、pending 长度、时间阈值和字符阈值决定是否发事件。
+- preview/progress/snapshot 的首次时间阈值从出现待发送内容开始计时；不能等第一次 flush 后才开始计时。
+- `document_draft_preview_chunk` 是 live-only 事件，不持久化、不投影到 ChatView 历史正文。
+- `document_draft_progress` 和 `document_draft_snapshot` 是 durable 事件；progress 不带正文，snapshot 用于校准和最终一致性。
+- raw `document_draft_snapshot.content` 只能存在于运行时事件和当前 stream view；进入 durable buffer、trace persistence、pending trace、status/list/load、session projection 前必须先投影成 envelope + artifact。
+- `wait_events` / 当前 stream 消费者可以 hydrate snapshot artifact，继续向 `DraftDocumentProvider` 暴露单一 `content` 合同；其他重路径不得 hydrate。
+- artifact envelope 必须保留 `draft_id`、`target_path`、`content_length`、`content_sha256`、`snapshot_kind`、`final`、`last_chunk_seq`，但 `artifact_ref.preview` 不得携带正文片段。
+- 前端遇到 offset gap、sequence gap、hash mismatch 或缺少可消费正文的 snapshot 时，只能停止盲拼并等待下一次有效 snapshot。
+
+传输和投影合同：
+
+- `content_length`、`start_offset`、`end_offset` 使用 UTF-16 code units，与 VS Code /
+  TypeScript 字符串 offset 对齐；它不是用户感知字符数，也不是 Python `len(str)`。
+- Python 端所有 draft 协议长度必须通过同一个 helper 计算；TypeScript 端通过显式
+  `draftTextUnits()` 校验。若未来要展示“字符数”，必须新增 display 字段，禁止复用
+  `content_length`。
+- `DraftDocumentProvider` 是长正文进入 VS Code 主编辑区的唯一前端入口。
+- ChatView、session projection、status payload、approval payload 只允许接收草稿元数据；
+  不得接收或保留 snapshot `content`、正文型 artifact preview。ChatView event view
+  还必须剥离 snapshot `artifact_ref`，因为 ChatView 不负责正文恢复。
+- session projection 不得从 snapshot `content` 反推 `contentLength`；缺少显式
+  `content_length` 时只能保持未知，不能读取正文兜底。
+- `_RemoteSessionRun.append_event()` 必须先构建 durable event view，再把这个 view
+  交给 trace；trace 不得在 artifact 化前接触 raw snapshot。
+- `document_draft_preview_chunk` 是 live-only 热路径事件，即使超过普通 payload
+  artifact 阈值，也必须以带 `content` 的原文事件进入当前 stream，不能变成无正文
+  envelope。
+- 旧 `document_draft_delta` 不再是生产事件名；不得作为兼容事件、测试 fixture 或
+  前端备用正文通道重新引入。
+
 远端模式下，draft commit 的正文可以通过 server-to-peer 内部协议发送给 owner 生成
 plan；这不是模型工具参数，也不能进入 LLM tool schema。禁止把 peer path 当成本机
 path 直接调用 `FileMutationService.commit_document`。
+
+approval/commit 正文所有权合同：
+
+- `DocumentDraftRuntime` 持有提交正文，审批请求只带 `target_path`、`title`、diff 展示
+  信息和 workspace owner 元数据。
+- `draft_document_content` 不是合法 approval metadata 字段，不能通过
+  `_owner_tool_args()` 或通用 approval payload 回灌。
+- 远端 `RemoteRelayToolBackend.preview_document_commit()` 必须保存 peer preview 返回的
+  `ToolMutationPreviewState`；随后 `commit_document()` 只能从 backend 内部状态把它带入
+  execute 的 `expected_state`。
+- `apply_patch` 继续使用 peer approval preview + `remember_approved_preview()`；draft
+  commit 不得为了审批展示二次要求 peer preview，也不得因此要求审批 metadata 携带正文。
 
 ### Parser and Owner Parity
 
@@ -337,7 +390,8 @@ Patch grammar 目标形态：
 - `target_path` 必须是相对 workspace root 的文本文件路径。
 - `format` 初始只允许 `markdown`。
 - 工具返回 `draft_id` 后，下一段 assistant 正文流被运行时绑定到该 draft。
-- UI 通过现有 `assistant_delta` 实时展示正文。
+- UI 通过 `document_draft_preview_chunk` 和 `document_draft_snapshot` 在 VS Code Markdown
+  preview 中展示正文；ChatView 只展示草稿状态和计数。
 - assistant 正文完成后，运行时生成目标文件 diff，并进入 draft commit 阶段。
 - draft commit 是文件变更，必须使用 fileChange diff 和审批链路。
 - 用户批准后，运行时内部 commit 到 `target_path`。
