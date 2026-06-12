@@ -118,6 +118,36 @@ def test_document_draft_runtime_decline_does_not_apply_patch(tmp_path: Path) -> 
     assert events[-1].data["status"] == "declined"
 
 
+def test_document_draft_runtime_rejects_existing_target_before_approval(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "docs" / "architecture.md"
+    target.parent.mkdir()
+    target.write_text("existing\n", encoding="utf-8")
+    events = []
+    provider = ApprovalProvider(ApprovalDecision.allow_once("ok"))
+    runtime = DocumentDraftRuntime(
+        workspace_root=str(tmp_path),
+        approval_provider=provider,
+        emit=events.append,
+    )
+
+    runtime.begin_from_tool_result(_declaration())
+    runtime.append_stream_delta("# Replacement\n")
+    runtime.commit_active()
+
+    assert provider.requests == []
+    assert target.read_text(encoding="utf-8") == "existing\n"
+    assert [event.event_type for event in events] == [
+        AgentEventType.DOCUMENT_DRAFT_STARTED,
+        AgentEventType.DOCUMENT_DRAFT_FAILED,
+        AgentEventType.FILE_CHANGE_COMPLETED,
+    ]
+    assert events[-1].data["status"] == "failed"
+    assert "already exists" in events[-1].data["error"]
+    assert "apply_patch" in events[-1].data["error"]
+
+
 def test_document_draft_runtime_commits_through_workspace_owner(tmp_path: Path) -> None:
     events = []
     owner = RecordingMutationBackend()

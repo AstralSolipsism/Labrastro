@@ -15,14 +15,17 @@ class DraftDocumentBeginTool(Tool):
     name = "draft_document_begin"
     description = (
         "Declare that the next assistant markdown stream is a long document draft "
-        "for a target workspace path. Do not pass document content as tool arguments."
+        "for a new target workspace path. Do not pass document content as tool "
+        "arguments. Use apply_patch to modify existing files."
     )
     parameters = {
         "type": "object",
         "properties": {
             "target_path": {
                 "type": "string",
-                "description": "Workspace-relative markdown target path for the draft.",
+                "description": (
+                    "Workspace-relative markdown target path for a new draft file."
+                ),
             },
             "title": {
                 "type": "string",

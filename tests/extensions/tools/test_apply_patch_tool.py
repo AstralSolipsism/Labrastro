@@ -212,6 +212,29 @@ def test_file_mutation_plan_describes_all_operations(tmp_path: Path) -> None:
     assert [change.path for change in result.changes] == ["one.txt", "two.txt"]
 
 
+def test_document_commit_rejects_existing_target(tmp_path: Path) -> None:
+    target = tmp_path / "docs" / "architecture.md"
+    target.parent.mkdir()
+    target.write_text("existing\n", encoding="utf-8")
+    service = FileMutationService(tmp_path)
+
+    preview = service.preview_document_commit("docs/architecture.md", "# New\n")
+
+    assert preview.status == "failed"
+    assert preview.error is not None
+    assert "already exists" in preview.error
+    assert "apply_patch" in preview.error
+    assert target.read_text(encoding="utf-8") == "existing\n"
+
+    result = service.commit_document("docs/architecture.md", "# New\n")
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "already exists" in result.error
+    assert "apply_patch" in result.error
+    assert target.read_text(encoding="utf-8") == "existing\n"
+
+
 def test_draft_document_begin_rejects_content_argument(tmp_path: Path) -> None:
     tool = DraftDocumentBeginTool(backend=_backend(tmp_path))
 

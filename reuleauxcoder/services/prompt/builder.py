@@ -91,7 +91,7 @@ def _rules_block() -> PromptBlock:
         order=30,
         body="""1. **Read before file changes.** Always inspect the relevant file context before modifying it.
 2. **Use apply_patch for file mutations.** Add, update, delete, and move text files only through apply_patch.
-3. **Use draft_document_begin for long markdown documents.** Declare the target first, then stream the document body as assistant markdown; never pass long document content as tool arguments.
+3. **Use draft_document_begin for new long markdown documents.** Declare a new target first, then stream the document body as assistant markdown; never pass long document content as tool arguments. Use apply_patch to modify existing documents.
 4. **Do not write project files through shell.** Shell is for commands, tests, builds, git, and environment checks, not manual source/docs/config edits.
 5. **Verify your work.** After making changes, run relevant tests or commands to confirm correctness.
 6. **Be concise.** Show code over prose. Explain only what's necessary.

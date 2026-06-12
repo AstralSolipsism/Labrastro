@@ -314,9 +314,14 @@ class FileMutationService:
             raise FileMutationError("document content must be a string")
         if _is_binary_text(content):
             raise FileMutationError("document content appears to be binary")
-        old_content = _read_existing_text(path)
-        diff = _unified_diff(old_content or "", content, target_path)
-        kind: FileChangeKind = "update" if old_content is not None else "add"
+        if path.exists():
+            raise FileMutationError(
+                "draft document target already exists; "
+                f"use apply_patch to modify existing files: {target_path}"
+            )
+        old_content = None
+        diff = _unified_diff("", content, target_path)
+        kind: FileChangeKind = "add"
         change = FileChange(
             path=target_path,
             kind=kind,
