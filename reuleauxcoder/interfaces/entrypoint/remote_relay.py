@@ -1748,6 +1748,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         )
         renderer = CLIRenderer(console_override=ansi_console)
         assistant_content_emitted = {"value": False}
+        draft_content_emitted = {"value": False}
         reasoning_content_emitted = {"value": False}
         session_run_interrupted_emitted = {"value": False}
         active_tool_calls_by_name: dict[str, list[str]] = {}
@@ -1832,7 +1833,10 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         def _append_final_assistant(response: str | None = None) -> None:
             if assistant_content_emitted["value"]:
                 return
-            content = "".join(assistant_stream_parts) or (response if response else "")
+            content = "".join(assistant_stream_parts)
+            if not content and draft_content_emitted["value"]:
+                return
+            content = content or (response if response else "")
             if not content:
                 return
             remote_session.append_event(
@@ -2305,6 +2309,11 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_STARTED:
                 remote_session.append_event("document_draft_started", event.data)
                 return
+            if event.event_type == AgentEventType.DOCUMENT_DRAFT_DELTA:
+                if event.data.get("content"):
+                    draft_content_emitted["value"] = True
+                remote_session.append_event("document_draft_delta", event.data)
+                return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED:
                 remote_session.append_event("document_draft_commit_requested", event.data)
                 return
@@ -2413,7 +2422,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     "session_run_end",
                     {
                         "response": result,
-                        "response_rendered": assistant_content_emitted["value"],
+                        "response_rendered": assistant_content_emitted["value"]
+                        or draft_content_emitted["value"],
                     },
                 )
         except RemoteToolProtocolError as exc:

@@ -2502,6 +2502,81 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
+    def test_runner_stream_chat_forwards_document_draft_delta_as_rendered_content(self) -> None:
+        workspace = Path(__file__).resolve().parent
+
+        def emit(agent: FakeAgent, event: AgentEvent) -> None:
+            for handler in list(agent._event_handlers):
+                handler(event)
+
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            emit(
+                agent,
+                AgentEvent.document_draft_started(
+                    draft_id="draft-1",
+                    target_path="docs/architecture.md",
+                    title="Architecture",
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.document_draft_delta(
+                    draft_id="draft-1",
+                    target_path="docs/architecture.md",
+                    content="# Architecture\n",
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.document_draft_delta(
+                    draft_id="draft-1",
+                    target_path="docs/architecture.md",
+                    content="\nBody\n",
+                ),
+            )
+            return "# Architecture\n\nBody\n"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}", chat_behavior=chat_behavior
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(workspace),
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "draft"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url, peer_token, start_body["session_run_id"]
+            )
+
+            assert "".join(
+                event["payload"].get("content", "")
+                for event in events
+                if event["type"] == "assistant_delta"
+            ) == ""
+            assert [
+                event["payload"].get("content", "")
+                for event in events
+                if event["type"] == "assistant_message"
+            ] == []
+            assert [
+                event["payload"].get("content", "")
+                for event in events
+                if event["type"] == "document_draft_delta"
+            ] == ["# Architecture\n", "\nBody\n"]
+            end_event = [event for event in events if event["type"] == "session_run_end"][-1]
+            assert end_event["payload"]["response"] == "# Architecture\n\nBody\n"
+            assert end_event["payload"]["response_rendered"] is True
+        finally:
+            runner.cleanup(ctx.agent)
+
     def test_runner_stream_chat_forwards_context_ui_events(
         self, tmp_path: Path
     ) -> None:
