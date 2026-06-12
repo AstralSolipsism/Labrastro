@@ -173,3 +173,108 @@ def test_agent_event_error_contains_message() -> None:
     event = AgentEvent.error("boom")
     assert event.event_type is AgentEventType.ERROR
     assert event.error_message == "boom"
+
+
+def test_agent_event_document_draft_preview_chunk_is_live_only_payload() -> None:
+    import hashlib
+
+    event = AgentEvent.document_draft_preview_chunk(
+        draft_id="draft-1",
+        target_path="docs/architecture.md",
+        chunk_seq=3,
+        start_offset=12,
+        content="正文片段",
+    )
+
+    assert event.event_type is AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK
+    assert event.data == {
+        "draft_id": "draft-1",
+        "target_path": "docs/architecture.md",
+        "chunk_seq": 3,
+        "start_offset": 12,
+        "end_offset": 16,
+        "content": "正文片段",
+        "content_sha256": hashlib.sha256("正文片段".encode("utf-8")).hexdigest(),
+        "status": "streaming",
+    }
+
+
+def test_agent_event_document_draft_preview_chunk_uses_utf16_offsets() -> None:
+    import hashlib
+
+    event = AgentEvent.document_draft_preview_chunk(
+        draft_id="draft-1",
+        target_path="docs/architecture.md",
+        chunk_seq=1,
+        start_offset=1,
+        content="😀B",
+    )
+
+    assert event.event_type is AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK
+    assert event.data["start_offset"] == 1
+    assert event.data["end_offset"] == 4
+    assert event.data["content_sha256"] == hashlib.sha256(
+        "😀B".encode("utf-8")
+    ).hexdigest()
+
+
+def test_agent_event_document_draft_progress_has_no_body_content() -> None:
+    event = AgentEvent.document_draft_progress(
+        draft_id="draft-1",
+        target_path="docs/architecture.md",
+        content_length=7998,
+        content_sha256="sha",
+        last_chunk_seq=42,
+    )
+
+    assert event.event_type is AgentEventType.DOCUMENT_DRAFT_PROGRESS
+    assert event.data == {
+        "draft_id": "draft-1",
+        "target_path": "docs/architecture.md",
+        "content_length": 7998,
+        "content_sha256": "sha",
+        "last_chunk_seq": 42,
+        "status": "streaming",
+    }
+    assert "content" not in event.data
+
+
+def test_agent_event_document_draft_snapshot_carries_consistent_body_hash() -> None:
+    import hashlib
+
+    content = "# Architecture\n\n正文\n"
+    event = AgentEvent.document_draft_snapshot(
+        draft_id="draft-1",
+        target_path="docs/architecture.md",
+        content=content,
+        snapshot_kind="interrupted",
+        final=True,
+        last_chunk_seq=7,
+    )
+
+    assert event.event_type is AgentEventType.DOCUMENT_DRAFT_SNAPSHOT
+    assert event.data == {
+        "draft_id": "draft-1",
+        "target_path": "docs/architecture.md",
+        "content_length": len(content),
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content": content,
+        "snapshot_kind": "interrupted",
+        "final": True,
+        "last_chunk_seq": 7,
+        "status": "streaming",
+    }
+
+
+def test_agent_event_document_draft_snapshot_uses_utf16_content_length() -> None:
+    content = "A😀B"
+    event = AgentEvent.document_draft_snapshot(
+        draft_id="draft-1",
+        target_path="docs/architecture.md",
+        content=content,
+        snapshot_kind="final",
+        final=True,
+        last_chunk_seq=1,
+    )
+
+    assert event.data["content_length"] == 4

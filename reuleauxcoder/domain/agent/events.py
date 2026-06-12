@@ -1,8 +1,11 @@
 """Agent events - event types for telemetry and hooks."""
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Any
+
+from reuleauxcoder.domain.agent.document_draft_text import draft_text_units
 from enum import Enum
 
 from reuleauxcoder.domain.agent.tool_diagnostics import (
@@ -30,7 +33,9 @@ class AgentEventType(Enum):
     FILE_CHANGE_COMPLETED = "file_change_completed"
     TURN_DIFF_UPDATED = "turn_diff_updated"
     DOCUMENT_DRAFT_STARTED = "document_draft_started"
-    DOCUMENT_DRAFT_DELTA = "document_draft_delta"
+    DOCUMENT_DRAFT_PREVIEW_CHUNK = "document_draft_preview_chunk"
+    DOCUMENT_DRAFT_PROGRESS = "document_draft_progress"
+    DOCUMENT_DRAFT_SNAPSHOT = "document_draft_snapshot"
     DOCUMENT_DRAFT_COMMIT_REQUESTED = "document_draft_commit_requested"
     DOCUMENT_DRAFT_COMMITTED = "document_draft_committed"
     DOCUMENT_DRAFT_FAILED = "document_draft_failed"
@@ -361,20 +366,77 @@ class AgentEvent:
         )
 
     @classmethod
-    def document_draft_delta(
+    def document_draft_preview_chunk(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        chunk_seq: int,
+        start_offset: int,
+        content: str,
+    ) -> "AgentEvent":
+        end_offset = int(start_offset) + draft_text_units(content)
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "chunk_seq": int(chunk_seq),
+                "start_offset": int(start_offset),
+                "end_offset": end_offset,
+                "content": content,
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "status": "streaming",
+            },
+        )
+
+    @classmethod
+    def document_draft_progress(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        content_length: int,
+        content_sha256: str,
+        last_chunk_seq: int,
+        status: str = "streaming",
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DOCUMENT_DRAFT_PROGRESS,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "content_length": int(content_length),
+                "content_sha256": content_sha256,
+                "last_chunk_seq": int(last_chunk_seq),
+                "status": status,
+            },
+        )
+
+    @classmethod
+    def document_draft_snapshot(
         cls,
         *,
         draft_id: str,
         target_path: str,
         content: str,
+        snapshot_kind: str,
+        final: bool,
+        last_chunk_seq: int,
+        status: str = "streaming",
     ) -> "AgentEvent":
         return cls(
-            event_type=AgentEventType.DOCUMENT_DRAFT_DELTA,
+            event_type=AgentEventType.DOCUMENT_DRAFT_SNAPSHOT,
             data={
                 "draft_id": draft_id,
                 "target_path": target_path,
                 "content": content,
-                "status": "streaming",
+                "content_length": draft_text_units(content),
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "snapshot_kind": snapshot_kind,
+                "final": bool(final),
+                "last_chunk_seq": int(last_chunk_seq),
+                "status": status,
             },
         )
 
