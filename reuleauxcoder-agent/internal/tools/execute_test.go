@@ -441,6 +441,100 @@ func TestPreviewApplyPatchRejectsDuplicateContext(t *testing.T) {
 	}
 }
 
+func TestPreviewDraftDocumentCommitRejectsExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "docs", "architecture.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("existing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	preview := Preview(protocol.ToolPreviewRequest{
+		ToolName: "draft_document_commit",
+		Args: map[string]any{
+			"target_path": "docs/architecture.md",
+			"content":     "# Replacement\n",
+		},
+	}, dir)
+
+	if preview.OK {
+		t.Fatalf("preview unexpectedly succeeded: %#v", preview)
+	}
+	if !strings.Contains(preview.ErrorMessage, "already exists") || !strings.Contains(preview.ErrorMessage, "apply_patch") {
+		t.Fatalf("error = %q, want existing-target apply_patch guidance", preview.ErrorMessage)
+	}
+	if got := readFileForTest(t, target); got != "existing\n" {
+		t.Fatalf("failed preview changed file, got %q", got)
+	}
+}
+
+func TestExecuteDraftDocumentCommitRejectsExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "docs", "architecture.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("existing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName: "draft_document_commit",
+		Args: map[string]any{
+			"target_path": "docs/architecture.md",
+			"content":     "# Replacement\n",
+		},
+	}, dir, nil)
+
+	if result.OK || result.ErrorCode != "REMOTE_TOOL_ERROR" {
+		t.Fatalf("result = %#v, want REMOTE_TOOL_ERROR", result)
+	}
+	if !strings.Contains(result.ErrorMessage, "already exists") || !strings.Contains(result.ErrorMessage, "apply_patch") {
+		t.Fatalf("error = %q, want existing-target apply_patch guidance", result.ErrorMessage)
+	}
+	if got := readFileForTest(t, target); got != "existing\n" {
+		t.Fatalf("failed execute changed file, got %q", got)
+	}
+}
+
+func TestPreviewAndExecuteDraftDocumentCommitCreatesNewFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "docs", "architecture.md")
+	args := map[string]any{
+		"target_path": "docs/architecture.md",
+		"content":     "# Architecture\n",
+	}
+
+	preview := Preview(protocol.ToolPreviewRequest{
+		ToolName: "draft_document_commit",
+		Args:     args,
+	}, dir)
+	if !preview.OK {
+		t.Fatalf("preview failed: %s", preview.ErrorMessage)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("preview should not create target, stat err=%v", err)
+	}
+
+	result := Execute(protocol.ExecToolRequest{
+		ToolName:      "draft_document_commit",
+		Args:          args,
+		ExpectedState: expectedStateFromPreview(preview),
+	}, dir, nil)
+
+	if !result.OK {
+		t.Fatalf("execute failed: %#v", result)
+	}
+	if !strings.Contains(result.Result, "Committed document docs/architecture.md") {
+		t.Fatalf("result = %q, want committed document message", result.Result)
+	}
+	if got := readFileForTest(t, target); got != "# Architecture\n" {
+		t.Fatalf("created content = %q", got)
+	}
+}
+
 func TestExecuteFallsBackWhenRequestedCWDIsStale(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("hello\n"), 0o644); err != nil {

@@ -867,10 +867,10 @@ func buildDocumentCommitMutations(args map[string]any, cwd string, expectedState
 			return nil, fmt.Errorf("stale preview: %s", stale)
 		}
 	}
-	kind := "add"
 	if oldState.exists {
-		kind = "update"
+		return nil, fmt.Errorf("draft document target already exists; use apply_patch to modify existing files: %s", targetPath)
 	}
+	kind := "add"
 	mutation := fileMutation{
 		kind:         kind,
 		filePath:     targetPath,
