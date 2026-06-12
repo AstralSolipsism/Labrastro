@@ -753,7 +753,12 @@ def test_document_draft_events_reduce_into_single_status_part() -> None:
     assert part["status"] == "committed"
 
 
-def test_document_draft_delta_updates_count_without_assistant_text() -> None:
+def test_document_draft_preview_chunk_is_not_projected_and_snapshot_updates_metadata() -> None:
+    import hashlib
+
+    preview_content = "# Architecture\n\n| A | B |\n"
+    final_content = f"{preview_content}| 1 | 2 |\n"
+    final_hash = hashlib.sha256(final_content.encode("utf-8")).hexdigest()
     document = _session_run_start(None, "生成文档", 1)
     document = _session_run_event(
         document,
@@ -768,33 +773,107 @@ def test_document_draft_delta_updates_count_without_assistant_text() -> None:
     )
     document = _session_run_event(
         document,
-        "document_draft_delta",
+        "document_draft_preview_chunk",
         {
             "draft_id": "draft-1",
             "target_path": "docs/architecture.md",
-            "content": "# Architecture\n",
+            "chunk_seq": 1,
+            "start_offset": 0,
+            "end_offset": len(preview_content),
+            "content": preview_content,
+            "content_sha256": hashlib.sha256(preview_content.encode("utf-8")).hexdigest(),
         },
         3,
     )
+
+    parts_after_preview = _assistant_parts(document)
+    assert len(parts_after_preview) == 1
+    assert parts_after_preview[0]["type"] == "document_draft"
+    assert "contentLength" not in parts_after_preview[0]
+    assert "# Architecture" not in str(document["turns"][0]["assistantMessages"])
+
     document = _session_run_event(
         document,
-        "document_draft_delta",
+        "document_draft_progress",
         {
             "draft_id": "draft-1",
             "target_path": "docs/architecture.md",
-            "content": "\nBody\n",
+            "content_length": len(preview_content),
+            "content_sha256": hashlib.sha256(preview_content.encode("utf-8")).hexdigest(),
+            "last_chunk_seq": 1,
+            "status": "streaming",
         },
         4,
+    )
+    document = _session_run_event(
+        document,
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/architecture.md",
+            "content": final_content,
+            "content_length": len(final_content),
+            "content_sha256": final_hash,
+            "snapshot_kind": "final",
+            "final": True,
+            "last_chunk_seq": 2,
+            "status": "streaming",
+        },
+        5,
     )
 
     parts = _assistant_parts(document)
     assert len(parts) == 1
     assert parts[0]["type"] == "document_draft"
     assert parts[0]["draftId"] == "draft-1"
-    assert parts[0]["contentLength"] == len("# Architecture\n\nBody\n")
+    assert parts[0]["contentLength"] == len(final_content)
+    assert parts[0]["contentSha256"] == final_hash
+    assert parts[0]["lastChunkSeq"] == 2
+    assert parts[0]["snapshotKind"] == "final"
+    assert parts[0]["snapshotFinal"] is True
     rendered = str(document["turns"][0]["assistantMessages"])
     assert "# Architecture" not in rendered
-    assert "Body" not in rendered
+    assert "| 1 | 2 |" not in rendered
+
+
+def test_document_draft_snapshot_without_explicit_length_does_not_infer_from_body() -> None:
+    import hashlib
+
+    content = "A😀B"
+    document = _session_run_start(None, "生成文档", 1)
+    document = _session_run_event(
+        document,
+        "document_draft_started",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/architecture.md",
+            "title": "Architecture",
+            "format": "markdown",
+        },
+        2,
+    )
+    document = _session_run_event(
+        document,
+        "document_draft_snapshot",
+        {
+            "draft_id": "draft-1",
+            "target_path": "docs/architecture.md",
+            "content": content,
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "snapshot_kind": "final",
+            "final": True,
+            "last_chunk_seq": 2,
+            "status": "streaming",
+        },
+        3,
+    )
+
+    parts = _assistant_parts(document)
+    assert len(parts) == 1
+    assert parts[0]["type"] == "document_draft"
+    assert "contentLength" not in parts[0]
+    rendered = str(document["turns"][0]["assistantMessages"])
+    assert content not in rendered
 
 
 def test_session_run_end_finalizes_existing_stream_without_duplicate_when_response_not_rendered() -> None:
