@@ -37,6 +37,7 @@ class RemoteRelayToolBackend(ToolBackend):
         super().__init__(context or ExecutionContext(execution_target="remote_peer"))
         self.relay_server = relay_server
         self.ui_bus = ui_bus
+        self._pending_preview_states: dict[str, ToolMutationPreviewState] = {}
         self._approved_preview_states: dict[str, ToolMutationPreviewState] = {}
         self.execution_target = "remote_peer"
         self.path_space = "remote_peer_workspace"
@@ -159,41 +160,63 @@ class RemoteRelayToolBackend(ToolBackend):
         target_path: str,
         content: str,
     ) -> FileMutationResult:
-        return self._preview_mutation_tool(
+        args = {"target_path": target_path, "content": content}
+        key = self._request_key("draft_document_commit", args)
+        self._pending_preview_states.pop(key, None)
+        result, state = self._preview_mutation_tool_with_state(
             "draft_document_commit",
-            {"target_path": target_path, "content": content},
+            args,
         )
+        if state is not None and not state.is_empty():
+            self._pending_preview_states[key] = state
+        return result
 
     def commit_document(
         self,
         target_path: str,
         content: str,
     ) -> FileMutationResult:
-        return self._exec_mutation_tool(
-            "draft_document_commit",
-            {"target_path": target_path, "content": content},
-        )
+        args = {"target_path": target_path, "content": content}
+        key = self._request_key("draft_document_commit", args)
+        state = self._pending_preview_states.pop(key, None)
+        if state is not None and not state.is_empty():
+            self._approved_preview_states[key] = state
+        return self._exec_mutation_tool("draft_document_commit", args)
 
     def _preview_mutation_tool(
         self,
         tool_name: str,
         args: dict[str, Any],
     ) -> FileMutationResult:
+        result, _state = self._preview_mutation_tool_with_state(tool_name, args)
+        return result
+
+    def _preview_mutation_tool_with_state(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> tuple[FileMutationResult, ToolMutationPreviewState | None]:
         preview = self.preview_tool(tool_name, args)
         if not preview.ok:
             message = preview.error_message or preview.error_code or "remote preview failed"
-            return FileMutationResult(
-                status="failed",
-                message=f"Error: {message}",
-                error=message,
+            return (
+                FileMutationResult(
+                    status="failed",
+                    message=f"Error: {message}",
+                    error=message,
+                ),
+                None,
             )
-        return FileMutationResult(
-            status="in_progress",
-            changes=_changes_from_preview(preview),
-            diff=preview.diff,
-            message=f"Preview {tool_name}",
-            plan_id=str(preview.meta.get("plan_id") or "") or None,
-            plan_hash=str(preview.meta.get("plan_hash") or "") or None,
+        return (
+            FileMutationResult(
+                status="in_progress",
+                changes=_changes_from_preview(preview),
+                diff=preview.diff,
+                message=f"Preview {tool_name}",
+                plan_id=str(preview.meta.get("plan_id") or "") or None,
+                plan_hash=str(preview.meta.get("plan_hash") or "") or None,
+            ),
+            ToolMutationPreviewState.from_preview(preview),
         )
 
     def _exec_mutation_tool(

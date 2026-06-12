@@ -468,6 +468,95 @@ class TestRemoteBackendDispatch:
         finally:
             srv.stop()
 
+    def test_remote_backend_carries_document_preview_state_to_commit_without_approval_args(
+        self,
+    ) -> None:
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import (
+                RegisterRequest,
+                RelayEnvelope,
+                ToolPreviewResult,
+            )
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                    features=["tool_preview"],
+                )
+            )
+            backend = RemoteRelayToolBackend(
+                relay_server=srv,
+                context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+            )
+            backend.preview_tool = lambda _tool_name, _args: ToolPreviewResult(
+                ok=True,
+                diff="--- /dev/null\n+++ b/docs/a.md\n+# A\n",
+                meta={
+                    "plan_hash": "plan-hash",
+                    "operations": [
+                        {
+                            "path": "docs/a.md",
+                            "old_exists": False,
+                        }
+                    ],
+                },
+            )
+
+            preview = backend.preview_document_commit("docs/a.md", "# A\n")
+
+            assert preview.status == "in_progress"
+
+            import threading
+            import time
+
+            holder: dict[str, object] = {}
+
+            def run_commit() -> None:
+                holder["result"] = backend.commit_document("docs/a.md", "# A\n")
+
+            t = threading.Thread(target=run_commit)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            assert env.payload["tool_name"] == "draft_document_commit"
+            assert env.payload["args"] == {
+                "target_path": "docs/a.md",
+                "content": "# A\n",
+            }
+            assert env.payload["expected_state"]["plan_hash"] == "plan-hash"
+            assert env.payload["expected_state"]["operations"] == [
+                {
+                    "path": "docs/a.md",
+                    "old_exists": False,
+                }
+            ]
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="Committed document docs/a.md").to_dict(),
+                ),
+            )
+            t.join(timeout=2)
+
+            result = holder["result"]
+            assert result.status == "completed"
+        finally:
+            srv.stop()
+
     def test_remote_backend_does_not_send_empty_expected_state(self) -> None:
         srv = RelayServer()
         received: list[tuple[str, object]] = []
