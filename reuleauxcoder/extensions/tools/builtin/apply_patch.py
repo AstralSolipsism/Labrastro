@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import os
 
-from reuleauxcoder.domain.files import LocalWorkspaceMutationBackend
+from reuleauxcoder.domain.files import (
+    APPLY_PATCH_PARAMETER_DESCRIPTION,
+    APPLY_PATCH_TOOL_DESCRIPTION,
+    FileMutationError,
+    LocalWorkspaceMutationBackend,
+    apply_patch_contract_error_message,
+    validate_apply_patch_contract,
+)
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
@@ -16,16 +23,13 @@ PATCH_ARGUMENT_CHARS_LIMIT = 64 * 1024
 @register_tool
 class ApplyPatchTool(Tool):
     name = "apply_patch"
-    description = (
-        "Apply a structured text patch to workspace files. Use this as the only "
-        "file mutation protocol for adding, updating, deleting, or moving text files."
-    )
+    description = APPLY_PATCH_TOOL_DESCRIPTION
     parameters = {
         "type": "object",
         "properties": {
             "patch": {
                 "type": "string",
-                "description": "Patch text using the *** Begin Patch grammar.",
+                "description": APPLY_PATCH_PARAMETER_DESCRIPTION,
             },
         },
         "required": ["patch"],
@@ -46,6 +50,10 @@ class ApplyPatchTool(Tool):
             )
         if "\x00" in patch:
             return "Error: apply_patch does not accept binary patch content"
+        try:
+            validate_apply_patch_contract(patch)
+        except FileMutationError as exc:
+            return apply_patch_contract_error_message(str(exc))
         return None
 
     def execute(self, patch: str) -> str:

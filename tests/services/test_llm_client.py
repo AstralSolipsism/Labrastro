@@ -2,6 +2,7 @@
 
 import pytest
 
+from reuleauxcoder.domain.config.models import ProviderConfig
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.hooks.base import TransformHook
 from reuleauxcoder.domain.hooks.lifecycle import (
@@ -17,9 +18,17 @@ from reuleauxcoder.domain.llm.models import (
     LLMResponse,
     ToolCall,
 )
+from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventLevel
 from reuleauxcoder.services.llm.client import LLM, _merge_hook_request_overrides
+from reuleauxcoder.services.llm.outbound_contract import (
+    build_outbound_contract_snapshot,
+)
+from reuleauxcoder.services.providers.adapters.anthropic_messages import (
+    convert_chat_tools_to_anthropic_tools,
+)
 from reuleauxcoder.services.llm.sanitizer import sanitize_messages_for_llm
+from reuleauxcoder.services.prompt.builder import system_prompt
 
 
 def _lifecycle_dispatcher_from_hook_registry(
@@ -399,6 +408,189 @@ def _set_fake_call_with_retry(llm: LLM, func):
         return func(params)
 
     llm._provider.call_with_retry = _wrapped
+
+
+def _apply_patch_contract_messages_and_tools() -> tuple[list[dict], list[dict]]:
+    tool = ApplyPatchTool()
+    return (
+        [{"role": "system", "content": system_prompt([tool])}],
+        [tool.schema()],
+    )
+
+
+def _assert_outbound_apply_patch_contract_visible(snapshot: dict) -> None:
+    assert snapshot["apply_patch_exposed"] is True
+    assert snapshot["prompt_contract_visible"] is True
+    assert snapshot["tool_description_contract_visible"] is True
+    assert snapshot["patch_parameter_contract_visible"] is True
+    assert snapshot["missing_contract_markers"] == []
+    assert snapshot["failure_reasons"] == []
+    assert snapshot["contract_hash"]
+
+
+def test_llm_outbound_openai_chat_request_validates_apply_patch_contract() -> None:
+    captured: dict = {}
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+    )
+
+    def _fake_call_with_retry(params):
+        captured["params"] = params
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=1, completion_tokens=1)),
+            ]
+        )
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+    messages, tools = _apply_patch_contract_messages_and_tools()
+
+    response = llm.chat(messages, tools=tools)
+
+    assert response.content == "Hello"
+    params = captured["params"]
+    assert "*** Add File:" in params["messages"][0]["content"]
+    apply_patch_tool = next(
+        tool
+        for tool in params["tools"]
+        if tool.get("function", {}).get("name") == "apply_patch"
+    )
+    assert "*** Update File:" in apply_patch_tool["function"]["description"]
+    patch_description = apply_patch_tool["function"]["parameters"]["properties"][
+        "patch"
+    ]["description"]
+    assert "*** Delete File:" in patch_description
+    snapshot = response.provider_extra["outbound_contract_snapshot"]
+    assert snapshot["provider_type"] == "openai_chat"
+    _assert_outbound_apply_patch_contract_visible(snapshot)
+
+
+def test_llm_outbound_openai_chat_blocks_apply_patch_without_prompt_contract() -> None:
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+    )
+
+    def _fake_call_with_retry(_params):
+        raise AssertionError("provider should not be called when contract is missing")
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+    tool = ApplyPatchTool()
+
+    with pytest.raises(
+        RuntimeError, match="apply_patch outbound contract is incomplete"
+    ):
+        llm.chat(
+            [{"role": "system", "content": "No patch contract here."}],
+            tools=[tool.schema()],
+        )
+
+
+def test_llm_outbound_openai_responses_request_validates_apply_patch_contract(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test",
+        provider_config=ProviderConfig(
+            id="responses",
+            type="openai_responses",
+            api_key="sk-test",
+            base_url="https://example.com/v1",
+            max_retries=0,
+        ),
+    )
+
+    class _FakeResponses:
+        def create(self, **params):
+            captured["params"] = params
+            return iter(())
+
+    assert llm._provider is not None
+    monkeypatch.setattr(llm._provider.client, "responses", _FakeResponses())
+    messages, tools = _apply_patch_contract_messages_and_tools()
+
+    response = llm.chat(messages, tools=tools)
+
+    assert response.content == ""
+    params = captured["params"]
+    developer_item = next(
+        item for item in params["input"] if item.get("role") == "developer"
+    )
+    assert "*** Begin Patch" in developer_item["content"]
+    apply_patch_tool = next(
+        tool for tool in params["tools"] if tool.get("name") == "apply_patch"
+    )
+    assert "*** Move to:" in apply_patch_tool["description"]
+    patch_description = apply_patch_tool["parameters"]["properties"]["patch"][
+        "description"
+    ]
+    assert "draft_document_begin" in patch_description
+    snapshot = response.provider_extra["outbound_contract_snapshot"]
+    assert snapshot["provider_type"] == "openai_responses"
+    _assert_outbound_apply_patch_contract_visible(snapshot)
+
+
+def test_llm_outbound_anthropic_snapshot_uses_same_apply_patch_contract_rules() -> None:
+    messages, tools = _apply_patch_contract_messages_and_tools()
+
+    snapshot = build_outbound_contract_snapshot(
+        "anthropic_messages",
+        {
+            "system": messages[0]["content"],
+            "messages": [],
+            "tools": convert_chat_tools_to_anthropic_tools(tools),
+        },
+    )
+
+    assert snapshot["provider_type"] == "anthropic_messages"
+    _assert_outbound_apply_patch_contract_visible(snapshot)
+
+
+def test_llm_debug_trace_records_outbound_contract_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test-12345678",
+        base_url="https://example.com/v1",
+        debug_trace=True,
+        ui_bus=ui_bus,
+    )
+
+    def _fake_call_with_retry(_params):
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=1, completion_tokens=1)),
+            ]
+        )
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+    messages, tools = _apply_patch_contract_messages_and_tools()
+
+    response = llm.chat(
+        messages,
+        tools=tools,
+        session_id="session_test",
+        trace_id="trace_contract",
+    )
+
+    debug_events = [event for event in seen if event.level == UIEventLevel.DEBUG]
+    trace_path = debug_events[-1].data.get("trace_path")
+    payload = json.loads(open(trace_path, encoding="utf-8").read())
+    snapshot = payload["request"]["outbound_contract_snapshot"]
+    assert snapshot == response.provider_extra["outbound_contract_snapshot"]
+    _assert_outbound_apply_patch_contract_visible(snapshot)
 
 
 def test_llm_chat_applies_project_context_hook_to_provider_request(

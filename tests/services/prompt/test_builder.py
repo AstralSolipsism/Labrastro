@@ -1,5 +1,7 @@
 ﻿from reuleauxcoder.services.prompt.builder import system_prompt
 
+from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
+
 
 class _Tool:
     def __init__(self, name: str, description: str):
@@ -65,3 +67,19 @@ def test_system_prompt_includes_clickable_markdown_link_guidance() -> None:
     assert "# Markdown Formatting" in prompt
     assert "`[`label`](relative/path.ext:line)`" in prompt
     assert "Do not invent links" in prompt
+
+
+def test_system_prompt_exposes_apply_patch_contract() -> None:
+    prompt = system_prompt([ApplyPatchTool()])
+
+    assert "# Tools" in prompt
+    assert "JSON function wrapper" in prompt
+    assert "*** Add File:" in prompt
+    assert "*** Update File:" in prompt
+    assert "*** Delete File:" in prompt
+    assert "Add File content lines must start with +" in prompt
+    assert "Do not use *** File:" in prompt
+    assert "Do not use" in prompt and "*** Action:" in prompt
+    assert "unified diff" in prompt
+    assert "C:foo.txt" in prompt
+    assert "draft_document_begin" in prompt

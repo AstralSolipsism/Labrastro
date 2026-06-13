@@ -8,6 +8,13 @@ from reuleauxcoder.domain.files.file_mutation_service import (
     MutationOperationState,
     MutationPlan,
 )
+from reuleauxcoder.domain.files.apply_patch_contract import (
+    APPLY_PATCH_CONTRACT_TEXT,
+    APPLY_PATCH_PARAMETER_DESCRIPTION,
+    APPLY_PATCH_TOOL_DESCRIPTION,
+    apply_patch_contract_error_message,
+    validate_apply_patch_contract,
+)
 from reuleauxcoder.domain.files.patch_argument_stream_decoder import (
     PatchArgumentStreamDecoder,
     PatchArgumentStreamError,
@@ -22,10 +29,15 @@ __all__ = [
     "FileMutationError",
     "FileMutationResult",
     "FileMutationService",
+    "APPLY_PATCH_CONTRACT_TEXT",
+    "APPLY_PATCH_PARAMETER_DESCRIPTION",
+    "APPLY_PATCH_TOOL_DESCRIPTION",
     "LocalWorkspaceMutationBackend",
     "MutationOperationState",
     "MutationPlan",
     "PatchArgumentStreamDecoder",
     "PatchArgumentStreamError",
     "WorkspaceMutationBackend",
+    "apply_patch_contract_error_message",
+    "validate_apply_patch_contract",
 ]
