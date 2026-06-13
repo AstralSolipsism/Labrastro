@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from reuleauxcoder.domain.files.file_mutation_service import (
     FileMutationResult,
@@ -33,6 +33,8 @@ class WorkspaceMutationBackend(Protocol):
         target_path: str,
         content: str,
     ) -> FileMutationResult: ...
+
+    def save_candidate(self, candidate: dict[str, Any]) -> FileMutationResult: ...
 
 
 class LocalWorkspaceMutationBackend:
@@ -68,3 +70,6 @@ class LocalWorkspaceMutationBackend:
         content: str,
     ) -> FileMutationResult:
         return self.service.commit_document(target_path, content)
+
+    def save_candidate(self, candidate: dict[str, Any]) -> FileMutationResult:
+        return self.service.save_candidate(candidate)

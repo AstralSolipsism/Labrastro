@@ -7,7 +7,7 @@ import difflib
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import time
 from typing import Literal
 import uuid
@@ -48,7 +48,9 @@ class FileMutationResult:
     error: str | None = None
     duration_ms: int = 0
     plan_id: str | None = None
-    plan_hash: str | None = None
+    candidate_hash: str | None = None
+    preview_identity: dict[str, object] = field(default_factory=dict)
+    approved_save_candidate: dict[str, object] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -63,18 +65,17 @@ class FileMutationResult:
             "error": self.error,
             "duration_ms": self.duration_ms,
             "plan_id": self.plan_id,
-            "plan_hash": self.plan_hash,
+            "candidate_hash": self.candidate_hash,
+            "preview_identity": dict(self.preview_identity),
+            "approved_save_candidate": dict(self.approved_save_candidate),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class MutationOperationState:
+class MutationOperationDescriptor:
     kind: FileChangeKind
     path: str
     resolved_path: str
-    old_exists: bool
-    old_sha256: str | None = None
-    old_size: int | None = None
     move_path: str | None = None
     move_resolved_path: str | None = None
 
@@ -83,12 +84,7 @@ class MutationOperationState:
             "kind": self.kind,
             "path": self.path,
             "resolved_path": self.resolved_path,
-            "old_exists": self.old_exists,
         }
-        if self.old_sha256 is not None:
-            payload["old_sha256"] = self.old_sha256
-        if self.old_size is not None:
-            payload["old_size"] = self.old_size
         if self.move_path:
             payload["move_path"] = self.move_path
         if self.move_resolved_path:
@@ -99,19 +95,17 @@ class MutationOperationState:
 @dataclass(frozen=True, slots=True)
 class MutationPlan:
     plan_id: str
-    plan_hash: str
     tool_name: str
     workspace_id: str
     execution_target: str
     path_space: str
-    operations: tuple[MutationOperationState, ...]
+    operations: tuple[MutationOperationDescriptor, ...]
     changes: tuple[FileChange, ...]
     diff: str
 
     def to_dict(self) -> dict[str, object]:
         return {
             "plan_id": self.plan_id,
-            "plan_hash": self.plan_hash,
             "tool_name": self.tool_name,
             "workspace_id": self.workspace_id,
             "execution_target": self.execution_target,
@@ -163,6 +157,10 @@ class FileMutationService:
         started_at = time.time()
         try:
             planned = self._plan_text_patch(patch)
+            candidate = _approved_save_candidate_from_plan(
+                planned,
+                args={"patch": patch},
+            )
             return FileMutationResult(
                 status="in_progress",
                 changes=planned.changes,
@@ -170,7 +168,9 @@ class FileMutationService:
                 message=_format_success_message(list(planned.changes)),
                 duration_ms=_elapsed_ms(started_at),
                 plan_id=planned.plan.plan_id,
-                plan_hash=planned.plan.plan_hash,
+                candidate_hash=str(candidate.get("candidate_hash") or "") or None,
+                preview_identity=_dict_value(candidate.get("preview_identity")),
+                approved_save_candidate=candidate,
             )
         except Exception as exc:
             return FileMutationResult(
@@ -185,6 +185,10 @@ class FileMutationService:
         try:
             planned = self._plan_text_patch(patch)
             _apply_planned_operations_transactionally(planned.operations)
+            candidate = _approved_save_candidate_from_plan(
+                planned,
+                args={"patch": patch},
+            )
 
             return FileMutationResult(
                 status="completed",
@@ -193,7 +197,9 @@ class FileMutationService:
                 message=_format_success_message(list(planned.changes)),
                 duration_ms=_elapsed_ms(started_at),
                 plan_id=planned.plan.plan_id,
-                plan_hash=planned.plan.plan_hash,
+                candidate_hash=str(candidate.get("candidate_hash") or "") or None,
+                preview_identity=_dict_value(candidate.get("preview_identity")),
+                approved_save_candidate=candidate,
             )
         except Exception as exc:
             return FileMutationResult(
@@ -263,6 +269,10 @@ class FileMutationService:
                 content,
             )
             _apply_planned_operations_transactionally(planned.operations)
+            candidate = _approved_save_candidate_from_plan(
+                planned,
+                args={"target_path": target_path, "content": content},
+            )
             return FileMutationResult(
                 status="completed",
                 changes=planned.changes,
@@ -270,7 +280,9 @@ class FileMutationService:
                 message=f"Committed document {target_path}",
                 duration_ms=_elapsed_ms(started_at),
                 plan_id=planned.plan.plan_id,
-                plan_hash=planned.plan.plan_hash,
+                candidate_hash=str(candidate.get("candidate_hash") or "") or None,
+                preview_identity=_dict_value(candidate.get("preview_identity")),
+                approved_save_candidate=candidate,
             )
         except Exception as exc:
             return FileMutationResult(
@@ -287,6 +299,10 @@ class FileMutationService:
                 target_path,
                 content,
             )
+            candidate = _approved_save_candidate_from_plan(
+                planned,
+                args={"target_path": target_path, "content": content},
+            )
             return FileMutationResult(
                 status="in_progress",
                 changes=planned.changes,
@@ -294,7 +310,59 @@ class FileMutationService:
                 message=f"Preview document commit {target_path}",
                 duration_ms=_elapsed_ms(started_at),
                 plan_id=planned.plan.plan_id,
-                plan_hash=planned.plan.plan_hash,
+                candidate_hash=str(candidate.get("candidate_hash") or "") or None,
+                preview_identity=_dict_value(candidate.get("preview_identity")),
+                approved_save_candidate=candidate,
+            )
+        except Exception as exc:
+            return FileMutationResult(
+                status="failed",
+                error=str(exc),
+                message=f"Error: {exc}",
+                duration_ms=_elapsed_ms(started_at),
+            )
+
+    def save_candidate(self, candidate: dict[str, object]) -> FileMutationResult:
+        started_at = time.time()
+        try:
+            _validate_save_candidate(candidate)
+            operations = _candidate_operations(candidate)
+            planned_operations = []
+            for operation in operations:
+                path = self._resolve_workspace_path(operation["path"])
+                move_path = (
+                    self._resolve_workspace_path(operation.get("move_path"))
+                    if operation.get("move_path")
+                    else None
+                )
+                patch_operation = _PatchOperation(
+                    kind=operation["kind"],
+                    path=operation["path"],
+                    move_path=operation.get("move_path"),
+                )
+                planned_operations.append(
+                    (
+                        patch_operation,
+                        path,
+                        move_path,
+                        None,
+                        operation.get("new_content"),
+                    )
+                )
+            _apply_planned_operations_transactionally(tuple(planned_operations))
+            changes = _candidate_changes(candidate)
+            diff = str(candidate.get("diff") or "")
+            preview_identity = _dict_value(candidate.get("preview_identity"))
+            return FileMutationResult(
+                status="completed",
+                changes=changes,
+                diff=diff,
+                message=_format_success_message(list(changes)),
+                duration_ms=_elapsed_ms(started_at),
+                plan_id=str(candidate.get("plan_id") or "") or None,
+                candidate_hash=str(candidate.get("candidate_hash") or "") or None,
+                preview_identity=preview_identity,
+                approved_save_candidate=dict(candidate),
             )
         except Exception as exc:
             return FileMutationResult(
@@ -352,29 +420,18 @@ class FileMutationService:
         changes: tuple[FileChange, ...],
         diff: str,
     ) -> MutationPlan:
-        operation_states = tuple(
-            _operation_state(operation, path, move_path, old_content)
-            for operation, path, move_path, old_content, _new_content in planned_operations
+        operation_descriptors = tuple(
+            _operation_descriptor(operation, path, move_path)
+            for operation, path, move_path, _old_content, _new_content in planned_operations
         )
         plan_id = f"mutation-{uuid.uuid4().hex}"
-        hash_payload = {
-            "tool_name": tool_name,
-            "workspace_id": str(self.workspace_root),
-            "execution_target": self.execution_target,
-            "path_space": self.path_space,
-            "operations": [item.to_dict() for item in operation_states],
-            "changes": [item.to_dict() for item in changes],
-            "diff": diff,
-        }
-        plan_hash = _stable_sha256(hash_payload)
         return MutationPlan(
             plan_id=plan_id,
-            plan_hash=plan_hash,
             tool_name=tool_name,
             workspace_id=str(self.workspace_root),
             execution_target=self.execution_target,
             path_space=self.path_space,
-            operations=operation_states,
+            operations=operation_descriptors,
             changes=changes,
             diff=diff,
         )
@@ -383,8 +440,17 @@ class FileMutationService:
         if not isinstance(file_path, str) or not file_path.strip():
             raise FileMutationError("file path must be a non-empty string")
         candidate = Path(file_path)
-        if candidate.is_absolute():
+        if (
+            candidate.is_absolute()
+            or PurePosixPath(file_path).is_absolute()
+            or PureWindowsPath(file_path).is_absolute()
+            or file_path.startswith(("/", "\\"))
+        ):
             raise FileMutationError(f"absolute paths are not allowed: {file_path}")
+        if PureWindowsPath(file_path).drive:
+            raise FileMutationError(
+                f"drive-relative paths are not allowed: {file_path}"
+            )
         if any(part == ".." for part in candidate.parts):
             raise FileMutationError(f"path traversal is not allowed: {file_path}")
         resolved = (self.workspace_root / candidate).resolve()
@@ -410,6 +476,148 @@ class FileMutationService:
                 return old_content
             return _apply_update_hunks(old_content, operation.lines, operation.path)
         raise FileMutationError(f"unsupported patch operation: {operation.kind}")
+
+
+def _approved_save_candidate_from_plan(
+    planned: _PlannedPatch,
+    *,
+    args: dict[str, object],
+) -> dict[str, object]:
+    plan = planned.plan
+    operations: list[dict[str, object]] = []
+    for operation, _path, _move_path, _old_content, new_content in planned.operations:
+        item: dict[str, object] = {
+            "kind": operation.kind,
+            "path": operation.path,
+        }
+        if operation.move_path:
+            item["move_path"] = operation.move_path
+        if operation.kind != "delete":
+            item["new_content"] = new_content or ""
+        operations.append(item)
+    args_hash = _stable_sha256(args)
+    identity_payload: dict[str, object] = {
+        "plan_id": plan.plan_id,
+        "tool_name": plan.tool_name,
+        "workspace_id": plan.workspace_id,
+        "execution_target": plan.execution_target,
+        "path_space": plan.path_space,
+        "args_hash": args_hash,
+        "operations": [
+            {
+                key: value
+                for key, value in operation.items()
+                if key in {"kind", "path", "move_path"}
+            }
+            for operation in operations
+        ],
+    }
+    candidate_hash = _stable_sha256(identity_payload)
+    base: dict[str, object] = {
+        "plan_id": plan.plan_id,
+        "tool_name": plan.tool_name,
+        "workspace_id": plan.workspace_id,
+        "execution_target": plan.execution_target,
+        "path_space": plan.path_space,
+        "args_hash": args_hash,
+        "operations": operations,
+        "changes": [change.to_dict() for change in planned.changes],
+        "diff": planned.diff,
+    }
+    preview_identity = {
+        "plan_id": plan.plan_id,
+        "candidate_hash": candidate_hash,
+        "tool_name": plan.tool_name,
+        "workspace_id": plan.workspace_id,
+        "execution_target": plan.execution_target,
+        "path_space": plan.path_space,
+        "args_hash": args_hash,
+    }
+    return {
+        **base,
+        "candidate_hash": candidate_hash,
+        "preview_identity": preview_identity,
+    }
+
+
+def _validate_save_candidate(candidate: dict[str, object]) -> None:
+    if not isinstance(candidate, dict) or not candidate:
+        raise FileMutationError("approved_save_candidate is required")
+    preview_identity = candidate.get("preview_identity")
+    if not isinstance(preview_identity, dict) or not preview_identity:
+        raise FileMutationError("approved_save_candidate preview_identity is required")
+    for key in (
+        "plan_id",
+        "candidate_hash",
+        "tool_name",
+        "workspace_id",
+        "execution_target",
+        "path_space",
+        "args_hash",
+    ):
+        if not str(preview_identity.get(key) or "").strip():
+            raise FileMutationError(
+                f"approved_save_candidate preview_identity.{key} is required"
+            )
+
+
+def _candidate_operations(candidate: dict[str, object]) -> list[dict[str, str]]:
+    if not isinstance(candidate, dict) or not candidate:
+        raise FileMutationError("approved_save_candidate is required")
+    raw_operations = candidate.get("operations")
+    if not isinstance(raw_operations, list) or not raw_operations:
+        raise FileMutationError("approved_save_candidate operations are required")
+    operations: list[dict[str, str]] = []
+    for raw in raw_operations:
+        if not isinstance(raw, dict):
+            raise FileMutationError("approved_save_candidate operation must be an object")
+        kind = str(raw.get("kind") or "")
+        if kind not in {"add", "update", "delete", "move"}:
+            raise FileMutationError(f"unsupported approved_save_candidate operation: {kind}")
+        path = str(raw.get("path") or "").strip()
+        if not path:
+            raise FileMutationError("approved_save_candidate operation path is required")
+        item: dict[str, str] = {"kind": kind, "path": path}
+        move_path = str(raw.get("move_path") or "").strip()
+        if move_path:
+            item["move_path"] = move_path
+        if kind != "delete":
+            if "new_content" not in raw:
+                raise FileMutationError(
+                    "approved_save_candidate operation new_content is required"
+                )
+            item["new_content"] = str(raw.get("new_content") or "")
+        operations.append(item)
+    return operations
+
+
+def _candidate_changes(candidate: dict[str, object]) -> tuple[FileChange, ...]:
+    raw_changes = candidate.get("changes")
+    if not isinstance(raw_changes, list):
+        return ()
+    changes: list[FileChange] = []
+    for raw in raw_changes:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("kind") or "")
+        if kind not in {"add", "update", "delete", "move"}:
+            continue
+        path = str(raw.get("path") or "")
+        if not path:
+            continue
+        changes.append(
+            FileChange(
+                path=path,
+                kind=kind,
+                diff=str(raw.get("diff") or ""),
+                move_path=str(raw.get("move_path") or "") or None,
+            )
+        )
+    return tuple(changes)
+
+
+def _dict_value(value: object) -> dict[str, object]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _parse_patch(patch: str) -> tuple[_PatchOperation, ...]:
@@ -567,15 +775,15 @@ def _apply_planned_operations_transactionally(
     try:
         for operation, path, move_path, _old_content, new_content in operations:
             if operation.kind == "delete":
-                path.unlink()
+                _delete_file_if_present(path)
                 continue
             if operation.kind == "move":
                 assert move_path is not None
                 assert new_content is not None
                 move_path.parent.mkdir(parents=True, exist_ok=True)
                 _write_text(move_path, new_content)
-                if path != move_path and path.exists():
-                    path.unlink()
+                if path != move_path:
+                    _delete_file_if_present(path)
                 continue
             assert new_content is not None
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -583,6 +791,14 @@ def _apply_planned_operations_transactionally(
     except Exception:
         _restore_snapshots(snapshots)
         raise
+
+
+def _delete_file_if_present(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise FileMutationError(f"{path} is not a file")
+    path.unlink()
 
 
 def _snapshot_touched_paths(
@@ -622,24 +838,17 @@ def _restore_snapshots(snapshots: tuple[_PathSnapshot, ...]) -> None:
             snapshot.path.unlink()
 
 
-def _operation_state(
+def _operation_descriptor(
     operation: _PatchOperation,
     path: Path,
     move_path: Path | None,
-    old_content: str | None,
-) -> MutationOperationState:
-    old_bytes = path.read_bytes() if old_content is not None and path.exists() else None
-    return MutationOperationState(
+) -> MutationOperationDescriptor:
+    return MutationOperationDescriptor(
         kind=operation.kind,
         path=operation.path,
         move_path=operation.move_path,
         resolved_path=str(path),
         move_resolved_path=str(move_path) if move_path is not None else None,
-        old_exists=old_content is not None,
-        old_sha256=hashlib.sha256(old_bytes).hexdigest()
-        if old_bytes is not None
-        else None,
-        old_size=len(old_bytes) if old_bytes is not None else None,
     )
 
 

@@ -49,6 +49,123 @@ def test_agent_event_tool_call_delta_contains_preview() -> None:
     }
 
 
+def test_agent_event_tool_arguments_state_events_are_stable() -> None:
+    complete = AgentEvent.tool_arguments_complete(
+        "apply_patch",
+        tool_call_id="call-1",
+        index=0,
+        tool_source="builtin",
+    )
+    valid = AgentEvent.tool_arguments_valid(
+        "apply_patch",
+        tool_call_id="call-1",
+        index=0,
+        tool_source="builtin",
+    )
+    invalid = AgentEvent.tool_arguments_invalid(
+        "apply_patch",
+        tool_call_id="call-1",
+        index=0,
+        message="bad patch",
+        code="preflight_failed",
+        retry_hint="Use *** Update File: <path>.",
+    )
+
+    assert complete.event_type is AgentEventType.TOOL_ARGUMENTS_COMPLETE
+    assert complete.data == {
+        "tool_name": "apply_patch",
+        "tool_call_id": "call-1",
+        "index": 0,
+        "status": "complete",
+        "tool_source": "builtin",
+    }
+    assert valid.event_type is AgentEventType.TOOL_ARGUMENTS_VALID
+    assert valid.data["status"] == "valid"
+    assert invalid.event_type is AgentEventType.TOOL_ARGUMENTS_INVALID
+    assert invalid.data == {
+        "tool_name": "apply_patch",
+        "tool_call_id": "call-1",
+        "index": 0,
+        "status": "invalid",
+        "message": "bad patch",
+        "code": "preflight_failed",
+        "retry_hint": "Use *** Update File: <path>.",
+    }
+
+
+def test_agent_event_mutation_preview_candidate_events_are_stable() -> None:
+    previewing = AgentEvent.mutation_previewing(
+        "apply_patch",
+        item_id="file-change:call-1",
+        tool_call_id="call-1",
+        index=0,
+    )
+    ready = AgentEvent.mutation_preview_ready(
+        "apply_patch",
+        item_id="file-change:call-1",
+        tool_call_id="call-1",
+        changes=[{"path": "src/app.py", "kind": "update"}],
+        index=0,
+    )
+    failed = AgentEvent.mutation_preview_failed(
+        "apply_patch",
+        item_id="file-change:call-1",
+        tool_call_id="call-1",
+        error="patch context does not match file",
+        index=0,
+    )
+
+    assert previewing.event_type is AgentEventType.MUTATION_PREVIEWING
+    assert previewing.data == {
+        "tool_name": "apply_patch",
+        "tool_call_id": "call-1",
+        "item_id": "file-change:call-1",
+        "index": 0,
+        "status": "previewing",
+    }
+    assert ready.event_type is AgentEventType.MUTATION_PREVIEW_READY
+    assert ready.data["changes"] == [{"path": "src/app.py", "kind": "update"}]
+    assert ready.data["status"] == "ready"
+    assert failed.event_type is AgentEventType.MUTATION_PREVIEW_FAILED
+    assert failed.data["status"] == "failed"
+    assert failed.data["error"] == "patch context does not match file"
+
+
+def test_agent_event_draft_recovery_state_events_are_stable() -> None:
+    stalled = AgentEvent.draft_body_stalled(
+        draft_id="draft-1",
+        target_path="docs/a.md",
+        content_length=42,
+        content_sha256="abc",
+        last_chunk_seq=3,
+        reason="stream interrupted",
+    )
+    recoverable = AgentEvent.draft_interrupted_recoverable(
+        draft_id="draft-1",
+        target_path="docs/a.md",
+        content_length=42,
+        content_sha256="abc",
+        last_chunk_seq=3,
+        reason="stream interrupted",
+    )
+
+    assert stalled.event_type is AgentEventType.DRAFT_BODY_STALLED
+    assert stalled.data == {
+        "draft_id": "draft-1",
+        "target_path": "docs/a.md",
+        "status": "stalled",
+        "content_length": 42,
+        "content_sha256": "abc",
+        "last_chunk_seq": 3,
+        "reason": "stream interrupted",
+    }
+    assert "content" not in stalled.data
+    assert recoverable.event_type is AgentEventType.DRAFT_INTERRUPTED_RECOVERABLE
+    assert recoverable.data["status"] == "recoverable"
+    assert recoverable.data["recovery_action"] == "continue"
+    assert "content" not in recoverable.data
+
+
 def test_agent_event_tool_call_end_keeps_full_long_result_with_preview() -> None:
     result = "x" * 600
     event = AgentEvent.tool_call_end("read_file", result, index=3)
@@ -184,6 +301,7 @@ def test_agent_event_document_draft_preview_chunk_is_live_only_payload() -> None
         chunk_seq=3,
         start_offset=12,
         content="正文片段",
+        flush_latency_ms=125,
     )
 
     assert event.event_type is AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK
@@ -195,6 +313,7 @@ def test_agent_event_document_draft_preview_chunk_is_live_only_payload() -> None
         "end_offset": 16,
         "content": "正文片段",
         "content_sha256": hashlib.sha256("正文片段".encode("utf-8")).hexdigest(),
+        "flush_latency_ms": 125,
         "status": "streaming",
     }
 

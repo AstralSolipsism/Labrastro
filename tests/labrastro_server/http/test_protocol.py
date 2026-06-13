@@ -43,7 +43,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     REMOTE_ENDPOINTS,
     SessionModelSwitchRequest,
     SessionListRequest,
-    ToolMutationPreviewState,
     ToolPreviewRequest,
     ToolPreviewResult,
     ToolStreamChunk,
@@ -581,7 +580,6 @@ class TestExecToolRequest:
             args={"command": "ls"},
             cwd="/tmp",
             timeout_sec=60,
-            expected_state=ToolMutationPreviewState(old_sha256="abc"),
             permission_context={
                 "agent_id": "main_chat",
                 "decision": {"action": "allow", "authorized": True},
@@ -593,7 +591,7 @@ class TestExecToolRequest:
         assert restored.args == {"command": "ls"}
         assert restored.cwd == "/tmp"
         assert restored.timeout_sec == 60
-        assert restored.expected_state == ToolMutationPreviewState(old_sha256="abc")
+        assert ("expected" + "_state") not in d
         assert restored.permission_context == {
             "agent_id": "main_chat",
             "decision": {"action": "allow", "authorized": True},
@@ -604,45 +602,41 @@ class TestExecToolRequest:
         assert req.args == {}
         assert req.cwd is None
         assert req.timeout_sec == 30
-        assert req.expected_state is None
         assert req.permission_context == {}
 
-    def test_expected_state_ignores_preview_mtime(self) -> None:
-        state = ToolMutationPreviewState.from_preview(
-            ToolPreviewResult(
-                ok=True,
-                resolved_path="/repo/a.txt",
-                old_sha256="abc",
-                old_exists=True,
-                old_size=10,
-                old_mtime_ns=123,
-            )
+    def test_roundtrip_save_candidate_fields(self) -> None:
+        preview_identity = {
+            "plan_id": "plan-1",
+            "candidate_hash": "candidate-1",
+            "tool_name": "apply_patch",
+            "workspace_id": "/repo",
+            "execution_target": "remote_peer",
+            "path_space": "remote_peer_workspace",
+            "args_hash": "args-1",
+        }
+        candidate = {
+            "tool_name": "apply_patch",
+            "preview_identity": preview_identity,
+            "operations": [
+                {
+                    "kind": "update",
+                    "path": "a.txt",
+                    "new_content": "new\n",
+                }
+            ],
+        }
+        req = ExecToolRequest(
+            tool_name="apply_patch",
+            args={},
+            cwd="/repo",
+            preview_identity=preview_identity,
+            approved_save_candidate=candidate,
         )
 
-        assert state == ToolMutationPreviewState(
-            resolved_path="/repo/a.txt",
-            old_sha256="abc",
-            old_exists=True,
-            old_size=10,
-        )
-        assert state is not None
-        assert "old_mtime_ns" not in state.to_dict()
+        restored = ExecToolRequest.from_dict(req.to_dict())
 
-    def test_expected_state_treats_empty_operations_as_empty(self) -> None:
-        assert ToolMutationPreviewState.from_dict({"operations": []}) is None
-
-        state = ToolMutationPreviewState.from_preview(
-            ToolPreviewResult(ok=True, meta={"operations": []})
-        )
-
-        assert state is None
-
-    def test_expected_state_keeps_false_old_exists(self) -> None:
-        state = ToolMutationPreviewState.from_dict({"old_exists": False})
-
-        assert state == ToolMutationPreviewState(old_exists=False)
-        assert state is not None
-        assert not state.is_empty()
+        assert restored.preview_identity == preview_identity
+        assert restored.approved_save_candidate == candidate
 
 
 class TestExecToolResult:
@@ -688,10 +682,6 @@ class TestToolPreview:
                 }
             ],
             resolved_path="/repo/a.txt",
-            old_sha256="abc",
-            old_exists=True,
-            old_size=10,
-            old_mtime_ns=123,
             diff="diff",
             original_text="old",
             modified_text="new",
@@ -703,10 +693,6 @@ class TestToolPreview:
         assert restored.ok is True
         assert restored.sections[0]["kind"] == "diff"
         assert restored.resolved_path == "/repo/a.txt"
-        assert restored.old_sha256 == "abc"
-        assert restored.old_exists is True
-        assert restored.old_size == 10
-        assert restored.old_mtime_ns == 123
         assert restored.original_text == "old"
         assert restored.modified_text == "new"
         assert restored.meta["mode"] == "preview"

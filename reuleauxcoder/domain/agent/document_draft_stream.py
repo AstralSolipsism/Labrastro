@@ -55,6 +55,10 @@ class DocumentDraftLiveStream:
         self._last_snapshot_length = 0
         self._last_chunk_seq = 0
 
+    @property
+    def last_chunk_seq(self) -> int:
+        return self._last_chunk_seq
+
     def append(
         self,
         draft: DocumentDraft,
@@ -178,6 +182,7 @@ class DocumentDraftLiveStream:
         start_offset = self._pending_preview_start_offset
         if start_offset is None:
             start_offset = max(0, _draft_content_length(draft) - draft_text_units(content))
+        flush_latency_ms = int(self._elapsed(self._pending_preview_started_at, now) * 1000)
         self._last_chunk_seq += 1
         self._pending_preview_parts = []
         self._pending_preview_start_offset = None
@@ -190,6 +195,7 @@ class DocumentDraftLiveStream:
             chunk_seq=self._last_chunk_seq,
             start_offset=start_offset,
             content=content,
+            flush_latency_ms=flush_latency_ms,
         )
 
     def _progress_event(self, draft: DocumentDraft, now: float) -> AgentEvent:

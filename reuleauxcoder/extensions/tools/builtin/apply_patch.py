@@ -23,6 +23,7 @@ PATCH_ARGUMENT_CHARS_LIMIT = 64 * 1024
 @register_tool
 class ApplyPatchTool(Tool):
     name = "apply_patch"
+    uses_workspace_mutation_candidate = True
     description = APPLY_PATCH_TOOL_DESCRIPTION
     parameters = {
         "type": "object",
@@ -67,6 +68,14 @@ class ApplyPatchTool(Tool):
         validation_error = self.preflight_validate(patch=patch)
         if validation_error:
             return validation_error
+        preview_text_patch = getattr(self.backend, "preview_text_patch", None)
+        save_candidate = getattr(self.backend, "save_candidate", None)
+        if callable(preview_text_patch) and callable(save_candidate):
+            preview = preview_text_patch(patch)
+            if preview.status == "failed" or preview.error:
+                return preview.message
+            result = save_candidate(preview.approved_save_candidate)
+            return _format_mutation_result(result)
         return self.backend.exec_tool("apply_patch", {"patch": patch})
 
     @backend_handler("local")
@@ -74,9 +83,16 @@ class ApplyPatchTool(Tool):
         workspace_root = getattr(getattr(self.backend, "context", None), "workspace_root", None)
         cwd = getattr(getattr(self.backend, "context", None), "cwd", None)
         mutation_backend = LocalWorkspaceMutationBackend(workspace_root or cwd or os.getcwd())
-        result = mutation_backend.apply_text_patch(patch)
-        if not result.ok:
-            return result.message
-        if result.diff:
-            return f"{result.message}\n{result.diff}"
+        preview = mutation_backend.preview_text_patch(patch)
+        if preview.status == "failed" or preview.error:
+            return preview.message
+        result = mutation_backend.save_candidate(preview.approved_save_candidate)
+        return _format_mutation_result(result)
+
+
+def _format_mutation_result(result) -> str:
+    if not result.ok:
         return result.message
+    if result.diff:
+        return f"{result.message}\n{result.diff}"
+    return result.message

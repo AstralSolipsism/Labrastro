@@ -161,6 +161,10 @@ def apply_session_event(
     elif event_type in {
         "output",
         "tool_call_delta",
+        "tool_arguments_complete",
+        "tool_arguments_valid",
+        "tool_arguments_invalid",
+        "mutation_preview_failed",
         "tool_call_stream",
         "tool_call_start",
         "tool_call_end",
@@ -170,6 +174,7 @@ def apply_session_event(
     }:
         _apply_tool_or_output_event(doc, event_type, payload, meta)
     elif event_type in {
+        "mutation_preview_ready",
         "file_change_started",
         "file_change_patch_updated",
         "file_change_approval_requested",
@@ -186,6 +191,8 @@ def apply_session_event(
         "document_draft_committed",
         "document_draft_failed",
         "document_draft_cancelled",
+        "draft_body_stalled",
+        "draft_interrupted_recoverable",
     }:
         _apply_document_draft_event(doc, event_type, payload, meta)
     elif event_type == "runtime_status":
@@ -720,7 +727,7 @@ def _apply_tool_or_output_event(
 
     if event_type == "tool_call_delta":
         index = _number(payload, "index") or 0
-        tool_call_id = _tool_call_id(payload) or f"preparing:{_string(payload, 'session_run_id') or 'pending'}:{index}"
+        tool_call_id = _tool_event_identity(payload)
         _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
             "status": "preparing",
             "toolCallId": tool_call_id,
@@ -730,6 +737,49 @@ def _apply_tool_or_output_event(
             if _string(payload, "arguments_preview")
             else None,
             "preparingIndex": index,
+        }, meta)
+    elif event_type in {"tool_arguments_complete", "tool_arguments_valid"}:
+        tool_call_id = _tool_event_identity(payload)
+        _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
+            "status": "preparing",
+            "toolCallId": tool_call_id,
+            "source": _string(payload, "tool_source"),
+            "preparingIndex": _number(payload, "index"),
+            "resultMeta": {"argument_status": _string(payload, "status")},
+        }, meta)
+    elif event_type == "tool_arguments_invalid":
+        tool_call_id = _tool_event_identity(payload)
+        message = _string(payload, "message") or "Tool arguments are invalid"
+        _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
+            "status": "protocol_error",
+            "toolCallId": tool_call_id,
+            "source": _string(payload, "tool_source"),
+            "preparingIndex": _number(payload, "index"),
+            "output": message,
+            "outputFormat": "plain",
+            "resultMeta": {
+                "argument_status": "invalid",
+                "message": message,
+                "retry_hint": _string(payload, "retry_hint"),
+            },
+        }, meta)
+    elif event_type == "mutation_preview_failed":
+        tool_call_id = _tool_event_identity(payload)
+        error = _string(payload, "error") or "Mutation preview failed"
+        _upsert_tool_part(doc, str(payload.get("tool_name") or "tool"), {
+            "status": "protocol_error",
+            "toolCallId": tool_call_id,
+            "source": _string(payload, "tool_source"),
+            "preparingIndex": _number(payload, "index"),
+            "output": error,
+            "outputFormat": "plain",
+            "resultMeta": {
+                "argument_status": "valid",
+                "preview_status": "failed",
+                "failure_code": _string(payload, "failure_code"),
+                "error": error,
+                "retry_hint": _string(payload, "retry_hint"),
+            },
         }, meta)
     elif event_type == "tool_call_stream":
         tool_call_id = _tool_call_id(payload)
@@ -940,6 +990,8 @@ def _file_change_status(
         return "in_progress"
     if event_type == "file_change_approval_resolved":
         return "declined" if _string(payload, "decision") != "allow_once" else "in_progress"
+    if event_type == "mutation_preview_ready":
+        return "in_progress"
     if event_type == "file_change_completed":
         return "completed"
     return str(existing.get("status") or "in_progress")
@@ -997,7 +1049,12 @@ def _apply_document_draft_event(
         "error": _string(payload, "error") or None,
         "reason": _string(payload, "reason") or None,
     }
-    if event_type in {"document_draft_progress", "document_draft_snapshot"}:
+    if event_type in {
+        "document_draft_progress",
+        "document_draft_snapshot",
+        "draft_body_stalled",
+        "draft_interrupted_recoverable",
+    }:
         content_length = _number(payload, "content_length")
         if content_length is None:
             content_length = _number(payload, "contentLength")
@@ -1052,7 +1109,16 @@ def _upsert_document_draft_part(
 
 def _document_draft_status(payload: dict[str, Any], event_type: str) -> str:
     raw = _string(payload, "status")
-    allowed = {"declared", "streaming", "committing", "committed", "cancelled", "failed"}
+    allowed = {
+        "declared",
+        "streaming",
+        "committing",
+        "committed",
+        "cancelled",
+        "failed",
+        "stalled",
+        "recoverable",
+    }
     if raw in allowed:
         return raw
     mapping = {
@@ -1063,6 +1129,8 @@ def _document_draft_status(payload: dict[str, Any], event_type: str) -> str:
         "document_draft_committed": "committed",
         "document_draft_failed": "failed",
         "document_draft_cancelled": "cancelled",
+        "draft_body_stalled": "stalled",
+        "draft_interrupted_recoverable": "recoverable",
     }
     return mapping.get(event_type, "streaming")
 
@@ -1636,6 +1704,16 @@ def _has_notice_level(doc: dict[str, Any], level: str) -> bool:
 
 def _tool_call_id(payload: dict[str, Any]) -> str:
     return _string(payload, "tool_call_id") or _string(payload, "toolCallId")
+
+
+def _tool_event_identity(payload: dict[str, Any]) -> str:
+    tool_call_id = _tool_call_id(payload)
+    if tool_call_id:
+        return tool_call_id
+    index = _number(payload, "index")
+    if index is None:
+        index = 0
+    return f"preparing:{_string(payload, 'session_run_id') or 'pending'}:{index}"
 
 
 def _tool_output_format(payload: dict[str, Any], tool_name: str, tool_source: str = "") -> str:

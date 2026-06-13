@@ -150,6 +150,7 @@ def test_document_draft_live_stream_flushes_first_preview_by_interval_before_cha
     assert preview["content"] == "ab"
     assert preview["start_offset"] == 0
     assert preview["end_offset"] == 2
+    assert preview["flush_latency_ms"] == 110
 
 
 def test_document_draft_live_stream_emits_first_progress_by_interval_before_char_threshold() -> None:

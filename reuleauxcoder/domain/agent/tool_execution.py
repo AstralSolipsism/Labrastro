@@ -4,7 +4,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 import concurrent.futures
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
+import json
 import re
 import threading
 
@@ -87,6 +89,26 @@ class _LifecycleOutputRecord:
     handler_type: str
 
 
+@dataclass(slots=True)
+class _MutationPreviewOutcome:
+    status: str
+    tool_name: str
+    tool_call_id: str | None
+    item_id: str
+    changes: list[dict] = field(default_factory=list)
+    diff: str = ""
+    plan_id: str | None = None
+    preview_identity: dict = field(default_factory=dict)
+    approved_save_candidate: dict = field(default_factory=dict)
+    error: str | None = None
+    failure_code: str | None = None
+    retry_hint: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready" and self.error is None
+
+
 def _meta_has_approval_denied(meta: dict | None) -> bool:
     diagnostics = (meta or {}).get("tool_diagnostics")
     if not isinstance(diagnostics, list):
@@ -107,6 +129,8 @@ class ToolExecutor:
         self._budget_lock = self._runtime_budget_lock()
         self._file_change_started_item_ids: set[str] = set()
         self._file_change_changes_by_item_id: dict[str, list[dict]] = {}
+        self._mutation_preview_outcomes_by_item_id: dict[str, _MutationPreviewOutcome] = {}
+        self._anonymous_tool_invocation_seq = 0
 
     def _runtime_budget_lock(self) -> threading.Lock:
         lock = getattr(self.agent, "runtime_budget_lock", None)
@@ -186,8 +210,10 @@ class ToolExecutor:
         tool: object | None = None,
         index: int | None = None,
         meta: dict | None = None,
+        emit_file_change: bool = True,
     ) -> None:
-        self._emit_apply_patch_file_change_completed(tc, result, index=index, meta=meta)
+        if emit_file_change:
+            self._emit_apply_patch_file_change_completed(tc, result, index=index, meta=meta)
         self.agent._emit_event(
             AgentEvent.tool_call_end(
                 tc.name,
@@ -206,7 +232,7 @@ class ToolExecutor:
         tool: object | None = None,
         index: int | None = None,
     ) -> None:
-        self._emit_apply_patch_file_change_started(tc, index=index)
+        self._emit_apply_patch_file_change_started(tc, tool=tool, index=index)
         self.agent._emit_event(
             AgentEvent.tool_call_start(
                 tc.name,
@@ -217,23 +243,100 @@ class ToolExecutor:
             )
         )
 
-    @staticmethod
-    def _file_change_item_id(tc: "ToolCall", index: int | None = None) -> str:
-        stable = tc.id or (f"index-{index}" if index is not None else "pending")
+    def _emit_tool_arguments_complete(
+        self,
+        tc: "ToolCall",
+        *,
+        tool: object | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.agent._emit_event(
+            AgentEvent.tool_arguments_complete(
+                tc.name,
+                tool_call_id=tc.id,
+                tool_source=self._tool_source(tool),
+                index=index,
+            )
+        )
+
+    def _emit_tool_arguments_valid(
+        self,
+        tc: "ToolCall",
+        *,
+        tool: object | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.agent._emit_event(
+            AgentEvent.tool_arguments_valid(
+                tc.name,
+                tool_call_id=tc.id,
+                tool_source=self._tool_source(tool),
+                index=index,
+            )
+        )
+
+    def _emit_tool_arguments_invalid(
+        self,
+        tc: "ToolCall",
+        message: str,
+        *,
+        tool: object | None = None,
+        index: int | None = None,
+        code: str | None = None,
+        retry_hint: str | None = None,
+    ) -> None:
+        self.agent._emit_event(
+            AgentEvent.tool_arguments_invalid(
+                tc.name,
+                tool_call_id=tc.id,
+                tool_source=self._tool_source(tool),
+                index=index,
+                message=message,
+                code=code,
+                retry_hint=retry_hint,
+            )
+        )
+
+    def _file_change_item_id(self, tc: "ToolCall", index: int | None = None) -> str:
+        stable = tc.id or (
+            f"index-{index}:{self._tool_invocation_cache_key(tc)}:args-{self._tool_args_hash(tc.arguments)}"
+            if index is not None
+            else f"pending:{self._tool_invocation_cache_key(tc)}:args-{self._tool_args_hash(tc.arguments)}"
+        )
         return f"file-change:{stable}"
+
+    @staticmethod
+    def _apply_patch_preview_required(
+        tc: "ToolCall",
+        tool: object | None = None,
+    ) -> bool:
+        if tc.name != "apply_patch":
+            return False
+        arguments = tc.arguments if isinstance(tc.arguments, dict) else {}
+        if isinstance(arguments.get("patch"), str):
+            return True
+        parameters = getattr(tool, "parameters", None)
+        if not isinstance(parameters, dict):
+            return False
+        properties = parameters.get("properties")
+        return isinstance(properties, dict) and "patch" in properties
 
     def _emit_apply_patch_file_change_started(
         self,
         tc: "ToolCall",
         *,
+        tool: object | None = None,
         index: int | None = None,
     ) -> str | None:
-        if tc.name != "apply_patch":
+        if not self._apply_patch_preview_required(tc, tool):
             return None
         item_id = self._file_change_item_id(tc, index)
         if item_id in self._file_change_started_item_ids:
             return item_id
-        changes = self._preview_apply_patch_changes(tc)
+        outcome = self._ensure_apply_patch_preview_outcome(tc, tool=tool, index=index)
+        if outcome is None or not outcome.ready:
+            return None
+        changes = outcome.changes
         self._file_change_started_item_ids.add(item_id)
         self._file_change_changes_by_item_id[item_id] = changes
         self.agent._emit_event(
@@ -319,23 +422,313 @@ class ToolExecutor:
             )
         )
 
-    def _preview_apply_patch_changes(self, tc: "ToolCall") -> list[dict]:
+    def _ensure_apply_patch_preview_outcome(
+        self,
+        tc: "ToolCall",
+        *,
+        tool: object | None = None,
+        index: int | None = None,
+    ) -> _MutationPreviewOutcome | None:
+        if not self._apply_patch_preview_required(tc, tool):
+            return None
+        item_id = self._file_change_item_id(tc, index)
+        cache_key = self._mutation_preview_cache_key(tc, tool=tool, index=index)
+        existing = self._mutation_preview_outcomes_by_item_id.get(cache_key)
+        if existing is not None:
+            return existing
+        self.agent._emit_event(
+            AgentEvent.mutation_previewing(
+                tc.name,
+                item_id=item_id,
+                tool_call_id=tc.id,
+                index=index,
+            )
+        )
+        result = self._preview_apply_patch_result(tc)
+        if str(getattr(result, "status", "") or "") == "failed" or getattr(result, "error", None):
+            error = str(
+                getattr(result, "error", None)
+                or getattr(result, "message", None)
+                or "apply_patch semantic preview failed"
+            )
+            outcome = _MutationPreviewOutcome(
+                status="failed",
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+                item_id=item_id,
+                error=error,
+                failure_code="semantic_preview_failed",
+                retry_hint=self._apply_patch_semantic_retry_hint(error),
+            )
+            self._mutation_preview_outcomes_by_item_id[cache_key] = outcome
+            self.agent._emit_event(
+                AgentEvent.mutation_preview_failed(
+                    tc.name,
+                    item_id=item_id,
+                    tool_call_id=tc.id,
+                    error=error,
+                    failure_code=outcome.failure_code,
+                    retry_hint=outcome.retry_hint,
+                    index=index,
+                )
+            )
+            return outcome
+        changes = [change.to_dict() for change in getattr(result, "changes", ()) or ()]
+        preview_identity = self._preview_identity_from_preview_result(result)
+        approved_save_candidate = self._approved_save_candidate_from_preview_result(
+            result
+        )
+        missing_save_candidate = self._missing_mutation_save_candidate_fields(
+            preview_identity,
+            approved_save_candidate,
+        )
+        if missing_save_candidate:
+            error = (
+                "apply_patch preview missing required approved_save_candidate fields: "
+                + ", ".join(missing_save_candidate)
+            )
+            outcome = _MutationPreviewOutcome(
+                status="failed",
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+                item_id=item_id,
+                error=error,
+                failure_code="preview_save_candidate_missing",
+                retry_hint=(
+                    "Build a fresh apply_patch preview that includes preview_identity "
+                    "and approved_save_candidate before approval or execution."
+                ),
+            )
+            self._mutation_preview_outcomes_by_item_id[cache_key] = outcome
+            self.agent._emit_event(
+                AgentEvent.mutation_preview_failed(
+                    tc.name,
+                    item_id=item_id,
+                    tool_call_id=tc.id,
+                    error=error,
+                    failure_code=outcome.failure_code,
+                    retry_hint=outcome.retry_hint,
+                    index=index,
+                )
+            )
+            return outcome
+        outcome = _MutationPreviewOutcome(
+            status="ready",
+            tool_name=tc.name,
+            tool_call_id=tc.id,
+            item_id=item_id,
+            changes=changes,
+            diff=str(getattr(result, "diff", "") or ""),
+            plan_id=getattr(result, "plan_id", None),
+            preview_identity=preview_identity,
+            approved_save_candidate=approved_save_candidate,
+        )
+        self._mutation_preview_outcomes_by_item_id[cache_key] = outcome
+        self.agent._emit_event(
+            AgentEvent.mutation_preview_ready(
+                tc.name,
+                item_id=item_id,
+                tool_call_id=tc.id,
+                changes=changes,
+                index=index,
+            )
+        )
+        return outcome
+
+    def _mutation_preview_cache_key(
+        self,
+        tc: "ToolCall",
+        *,
+        tool: object | None,
+        index: int | None,
+    ) -> str:
+        backend = getattr(self.agent, "workspace_mutation_backend", None) or getattr(
+            tool, "backend", None
+        )
+        context = getattr(backend, "context", None)
+        identity = {
+            "tool_name": tc.name,
+            "args_hash": self._tool_args_hash(tc.arguments),
+            "invocation_id": self._tool_invocation_cache_key(tc),
+            "tool_call_id": tc.id or "",
+            "index": index,
+            "workspace_id": str(
+                getattr(backend, "workspace_id", "")
+                or runtime_workspace_root(self.agent)
+                or runtime_working_directory(self.agent)
+                or ""
+            ),
+            "execution_target": str(
+                getattr(backend, "execution_target", "")
+                or getattr(context, "execution_target", "")
+                or "local"
+            ),
+            "path_space": str(getattr(backend, "path_space", "") or ""),
+        }
+        return self._stable_identity_hash(identity)
+
+    def _tool_invocation_cache_key(self, tc: "ToolCall") -> str:
+        if tc.id:
+            return str(tc.id)
+        existing = getattr(tc, "_labrastro_invocation_cache_key", None)
+        if isinstance(existing, str) and existing:
+            return existing
+        self._anonymous_tool_invocation_seq += 1
+        value = f"anonymous:{self._anonymous_tool_invocation_seq}"
+        try:
+            setattr(tc, "_labrastro_invocation_cache_key", value)
+        except Exception:
+            return f"{value}:object:{id(tc):x}"
+        return value
+
+    @classmethod
+    def _tool_args_hash(cls, args: object) -> str:
+        return cls._stable_identity_hash(args if isinstance(args, dict) else {})
+
+    @staticmethod
+    def _stable_identity_hash(value: object) -> str:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _preview_identity_from_preview_result(result) -> dict:
+        raw = getattr(result, "preview_identity", None)
+        if isinstance(raw, dict) and raw:
+            return dict(raw)
+        candidate = getattr(result, "approved_save_candidate", None)
+        if isinstance(candidate, dict) and isinstance(candidate.get("preview_identity"), dict):
+            return dict(candidate["preview_identity"])
+        return {}
+
+    @staticmethod
+    def _approved_save_candidate_from_preview_result(result) -> dict:
+        raw = getattr(result, "approved_save_candidate", None)
+        if isinstance(raw, dict) and raw:
+            return dict(raw)
+        return {}
+
+    @staticmethod
+    def _missing_mutation_save_candidate_fields(
+        preview_identity: dict,
+        approved_save_candidate: dict,
+    ) -> list[str]:
+        missing: list[str] = []
+        if not isinstance(preview_identity, dict) or not preview_identity:
+            missing.append("preview_identity")
+        else:
+            for key in (
+                "plan_id",
+                "candidate_hash",
+                "tool_name",
+                "workspace_id",
+                "execution_target",
+                "path_space",
+                "args_hash",
+            ):
+                if not str(preview_identity.get(key) or "").strip():
+                    missing.append(f"preview_identity.{key}")
+        if not isinstance(approved_save_candidate, dict) or not approved_save_candidate:
+            missing.append("approved_save_candidate")
+        elif approved_save_candidate.get("preview_identity") != preview_identity:
+            missing.append("approved_save_candidate.preview_identity")
+        operations = (
+            approved_save_candidate.get("operations")
+            if isinstance(approved_save_candidate, dict)
+            else None
+        )
+        if not isinstance(operations, list) or not operations:
+            missing.append("approved_save_candidate.operations")
+        return missing
+
+    @staticmethod
+    def _apply_patch_semantic_retry_hint(error: str) -> str:
+        return (
+            "Fix the patch so it applies to the current workspace state, then retry "
+            "with the same apply_patch grammar. Do not use *** File:, *** Action:, "
+            "unified diff headers, shell writes, or a parallel file mutation protocol."
+        )
+
+    def _preview_apply_patch_result(self, tc: "ToolCall"):
         patch = tc.arguments.get("patch") if isinstance(tc.arguments, dict) else None
         if not isinstance(patch, str) or not patch.strip():
-            return []
+            return LocalWorkspaceMutationBackend(None).preview_text_patch("")
         mutation_backend = getattr(self.agent, "workspace_mutation_backend", None)
         preview_text_patch = getattr(mutation_backend, "preview_text_patch", None)
         if callable(preview_text_patch):
-            result = preview_text_patch(patch)
-        else:
-            workspace_root = (
-                runtime_workspace_root(self.agent)
-                or runtime_working_directory(self.agent)
-            )
-            result = LocalWorkspaceMutationBackend(workspace_root).preview_text_patch(patch)
-        if result.changes:
-            return [change.to_dict() for change in result.changes]
-        return []
+            return preview_text_patch(patch)
+        workspace_root = (
+            runtime_workspace_root(self.agent)
+            or runtime_working_directory(self.agent)
+        )
+        return LocalWorkspaceMutationBackend(workspace_root).preview_text_patch(patch)
+
+    @staticmethod
+    def _should_save_approved_mutation_candidate(
+        tc: "ToolCall",
+        tool: object | None,
+        preview_outcome: _MutationPreviewOutcome | None,
+    ) -> bool:
+        return (
+            tc.name == "apply_patch"
+            and preview_outcome is not None
+            and preview_outcome.ready
+            and bool(preview_outcome.approved_save_candidate)
+            and bool(getattr(tool, "uses_workspace_mutation_candidate", False))
+        )
+
+    def _save_approved_mutation_candidate(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+        preview_outcome: _MutationPreviewOutcome | None,
+    ) -> str:
+        if preview_outcome is None or not preview_outcome.approved_save_candidate:
+            return "Error: apply_patch approved_save_candidate is required"
+        candidate = dict(preview_outcome.approved_save_candidate)
+        save_backend = self._workspace_mutation_save_backend(tool)
+        save_candidate = getattr(save_backend, "save_candidate", None)
+        if not callable(save_candidate):
+            return "Error: workspace mutation backend does not support save_candidate"
+        result = save_candidate(candidate)
+        return self._format_file_mutation_result(result)
+
+    def _workspace_mutation_save_backend(self, tool: object | None):
+        seen: set[int] = set()
+        for backend in (
+            getattr(self.agent, "workspace_mutation_backend", None),
+            getattr(tool, "backend", None),
+        ):
+            if backend is None:
+                continue
+            backend_id = id(backend)
+            if backend_id in seen:
+                continue
+            seen.add(backend_id)
+            if callable(getattr(backend, "save_candidate", None)):
+                return backend
+        workspace_root = (
+            runtime_workspace_root(self.agent)
+            or runtime_working_directory(self.agent)
+        )
+        return LocalWorkspaceMutationBackend(workspace_root)
+
+    @staticmethod
+    def _format_file_mutation_result(result) -> str:
+        ok = bool(getattr(result, "ok", False))
+        message = str(getattr(result, "message", "") or "")
+        diff = str(getattr(result, "diff", "") or "")
+        error = getattr(result, "error", None)
+        if not ok:
+            return message or f"Error: {error or 'workspace mutation save failed'}"
+        if diff:
+            return f"{message}\n{diff}" if message else diff
+        return message or "Applied patch"
 
     @staticmethod
     def _sync_tool_call(target: "ToolCall", source: "ToolCall") -> "ToolCall":
@@ -373,6 +766,7 @@ class ToolExecutor:
             tool=tool,
             index=index,
             meta=self._diagnostics_meta([diagnostic]),
+            emit_file_change=False,
         )
         return message
 
@@ -536,6 +930,7 @@ class ToolExecutor:
             tool=tool,
             index=index,
             meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+            emit_file_change=False,
         )
         return message
 
@@ -547,6 +942,7 @@ class ToolExecutor:
         validation_context: dict,
         validation_meta: dict | None,
         *,
+        preview_outcome: _MutationPreviewOutcome | None = None,
         index: int | None = None,
     ) -> str | None:
         provider = self.agent.approval_provider
@@ -590,6 +986,17 @@ class ToolExecutor:
                 reason=decision.reason,
                 index=index,
             )
+            approval_metadata = {
+                "tool_call_id": tc.id,
+                "permission": decision.to_dict(),
+            }
+            if preview_outcome is not None and preview_outcome.ready:
+                approval_metadata["preview_identity"] = dict(
+                    preview_outcome.preview_identity
+                )
+                approval_metadata["approved_save_candidate"] = dict(
+                    preview_outcome.approved_save_candidate
+                )
             decision_result = provider.request_approval(
                 ApprovalRequest(
                     tool_name=tc.name,
@@ -599,10 +1006,7 @@ class ToolExecutor:
                     else "unknown",
                     reason=decision.reason,
                     intent=approval_intent,
-                    metadata={
-                        "tool_call_id": tc.id,
-                        "permission": decision.to_dict(),
-                    },
+                    metadata=approval_metadata,
                 )
             )
         except (KeyboardInterrupt, EOFError):
@@ -639,6 +1043,12 @@ class ToolExecutor:
             index=index,
         )
         if decision_result.approved:
+            confirmed_candidate = self._confirmed_approved_save_candidate(
+                decision_result,
+                preview_outcome,
+            )
+            if confirmed_candidate is not None and preview_outcome is not None:
+                preview_outcome.approved_save_candidate = confirmed_candidate
             return None
         message = decision_result.reason or f"Tool '{tc.name}' denied by approval provider"
         decision_diagnostics = [
@@ -673,6 +1083,22 @@ class ToolExecutor:
             meta=self._merge_meta(validation_meta, failure_meta),
         )
         return message
+
+    @staticmethod
+    def _confirmed_approved_save_candidate(
+        decision_result,
+        preview_outcome: _MutationPreviewOutcome | None,
+    ) -> dict | None:
+        decision_meta = getattr(decision_result, "meta", None)
+        if isinstance(decision_meta, dict):
+            raw_candidate = decision_meta.get("approved_save_candidate")
+            if not isinstance(raw_candidate, dict) or not raw_candidate:
+                raw_candidate = decision_meta.get("save_candidate")
+            if isinstance(raw_candidate, dict) and raw_candidate:
+                return dict(raw_candidate)
+        if preview_outcome is not None and preview_outcome.approved_save_candidate:
+            return dict(preview_outcome.approved_save_candidate)
+        return None
 
     def _request_lifecycle_pre_tool_approval(
         self,
@@ -1381,6 +1807,7 @@ class ToolExecutor:
                 tool=tool,
                 index=index,
                 meta=self._diagnostics_meta([diagnostic]),
+                emit_file_change=False,
             )
             return lifecycle_result.blocked_message
 
@@ -1411,6 +1838,7 @@ class ToolExecutor:
                     tool=tool,
                     index=index,
                     meta=self._diagnostics_meta([diagnostic]),
+                    emit_file_change=False,
                 )
                 return internal_lifecycle.message
             if isinstance(internal_lifecycle.context, BeforeToolExecuteContext):
@@ -1446,10 +1874,12 @@ class ToolExecutor:
                 tool=tool,
                 index=index,
                 meta=self._diagnostics_meta([diagnostic]),
+                emit_file_change=False,
             )
             return message
 
         final_validation_context = self._tool_argument_context(tool_call, tool)
+        self._emit_tool_arguments_complete(tool_call, tool=tool, index=index)
         argument_error = getattr(tool_call, "argument_error", None)
         if argument_error:
             parse_validation = {
@@ -1485,12 +1915,20 @@ class ToolExecutor:
                 validation=parse_validation,
             )
             message = self._bad_arguments_message(tool_call.name, str(argument_error))
+            self._emit_tool_arguments_invalid(
+                tool_call,
+                message,
+                tool=tool,
+                index=index,
+                code="preflight_type_error",
+            )
             self._emit_tool_end(
                 tool_call,
                 message,
                 tool=tool,
                 index=index,
                 meta=self._diagnostics_meta(parse_diagnostics),
+                emit_file_change=False,
             )
             return message
 
@@ -1521,12 +1959,19 @@ class ToolExecutor:
                     final_validation.final_issues,
                 ),
             )
+            self._emit_tool_arguments_invalid(
+                tool_call,
+                message,
+                tool=tool,
+                index=index,
+            )
             self._emit_tool_end(
                 tool_call,
                 message,
                 tool=tool,
                 index=index,
                 meta=validation_meta,
+                emit_file_change=False,
             )
             return message
         tool_call.arguments = final_validation.arguments
@@ -1547,12 +1992,19 @@ class ToolExecutor:
                 repairable=True,
             )
             self._record_lifecycle_diagnostics([diagnostic], final_validation_context)
+            self._emit_tool_arguments_invalid(
+                tool_call,
+                message,
+                tool=tool,
+                index=index,
+            )
             self._emit_tool_end(
                 tool_call,
                 message,
                 tool=tool,
                 index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+                emit_file_change=False,
             )
             return message
         if preflight_error:
@@ -1566,14 +2018,52 @@ class ToolExecutor:
                 repairable=True,
             )
             self._record_lifecycle_diagnostics([diagnostic], final_validation_context)
+            self._emit_tool_arguments_invalid(
+                tool_call,
+                str(preflight_error),
+                tool=tool,
+                index=index,
+                code="preflight_failed",
+            )
             self._emit_tool_end(
                 tool_call,
                 preflight_error,
                 tool=tool,
                 index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
+                emit_file_change=False,
             )
             return preflight_error
+        self._emit_tool_arguments_valid(tool_call, tool=tool, index=index)
+        preview_outcome = self._ensure_apply_patch_preview_outcome(
+            tool_call,
+            tool=tool,
+            index=index,
+        )
+        if preview_outcome is not None and not preview_outcome.ready:
+            message = f"Error: {preview_outcome.error or 'apply_patch semantic preview failed'}"
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREFLIGHT,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code=preview_outcome.failure_code or "semantic_preview_failed",
+                message=preview_outcome.error or message,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                repairable=True,
+            )
+            self._record_lifecycle_diagnostics([diagnostic], final_validation_context)
+            self._emit_tool_end(
+                tool_call,
+                message,
+                tool=tool,
+                index=index,
+                meta=self._merge_meta(
+                    validation_meta,
+                    self._diagnostics_meta([diagnostic]),
+                ),
+                emit_file_change=False,
+            )
+            return message
 
         if lifecycle_result is not None and lifecycle_result.approval_message is not None:
             lifecycle_approval_context = self._tool_argument_context(tool_call, tool)
@@ -1615,6 +2105,7 @@ class ToolExecutor:
                 permission_decision,
                 transformed_validation_context,
                 validation_meta,
+                preview_outcome=preview_outcome,
                 index=index,
             )
             if approval_message is not None:
@@ -1669,7 +2160,18 @@ class ToolExecutor:
                         on_wait=_emit_shell_runtime,
                     )
                 with shell_context:
-                    result = tool.execute(**tool_call.arguments)
+                    if self._should_save_approved_mutation_candidate(
+                        tool_call,
+                        tool,
+                        preview_outcome,
+                    ):
+                        result = self._save_approved_mutation_candidate(
+                            tool_call,
+                            tool,
+                            preview_outcome,
+                        )
+                    else:
+                        result = tool.execute(**tool_call.arguments)
             finally:
                 if callable(restore_lifecycle_context):
                     try:

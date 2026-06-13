@@ -23,6 +23,12 @@ class AgentEventType(Enum):
     STREAM_TOKEN = "stream_token"
     REASONING_TOKEN = "reasoning_token"
     TOOL_CALL_DELTA = "tool_call_delta"
+    TOOL_ARGUMENTS_COMPLETE = "tool_arguments_complete"
+    TOOL_ARGUMENTS_VALID = "tool_arguments_valid"
+    TOOL_ARGUMENTS_INVALID = "tool_arguments_invalid"
+    MUTATION_PREVIEWING = "mutation_previewing"
+    MUTATION_PREVIEW_READY = "mutation_preview_ready"
+    MUTATION_PREVIEW_FAILED = "mutation_preview_failed"
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_PROTOCOL_ERROR = "tool_call_protocol_error"
@@ -40,6 +46,8 @@ class AgentEventType(Enum):
     DOCUMENT_DRAFT_COMMITTED = "document_draft_committed"
     DOCUMENT_DRAFT_FAILED = "document_draft_failed"
     DOCUMENT_DRAFT_CANCELLED = "document_draft_cancelled"
+    DRAFT_BODY_STALLED = "draft_body_stalled"
+    DRAFT_INTERRUPTED_RECOVERABLE = "draft_interrupted_recoverable"
     LIFECYCLE_HOOK = "lifecycle_hook"
     PROVIDER_STREAM_INTERRUPTED = "provider_stream_interrupted"
     PROVIDER_STREAM_RECOVERING = "provider_stream_recovering"
@@ -164,6 +172,160 @@ class AgentEvent:
             tool_name=name,
             tool_call_id=tool_call_id or None,
             data=payload,
+        )
+
+    @classmethod
+    def tool_arguments_complete(
+        cls,
+        tool_name: str,
+        *,
+        tool_call_id: str | None = None,
+        index: int | None = None,
+        tool_source: str | None = None,
+    ) -> "AgentEvent":
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id or "",
+            **({"index": index} if index is not None else {}),
+            "status": "complete",
+            **({"tool_source": tool_source} if tool_source else {}),
+        }
+        return cls(
+            event_type=AgentEventType.TOOL_ARGUMENTS_COMPLETE,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+        )
+
+    @classmethod
+    def tool_arguments_valid(
+        cls,
+        tool_name: str,
+        *,
+        tool_call_id: str | None = None,
+        index: int | None = None,
+        tool_source: str | None = None,
+    ) -> "AgentEvent":
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id or "",
+            **({"index": index} if index is not None else {}),
+            "status": "valid",
+            **({"tool_source": tool_source} if tool_source else {}),
+        }
+        return cls(
+            event_type=AgentEventType.TOOL_ARGUMENTS_VALID,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+        )
+
+    @classmethod
+    def tool_arguments_invalid(
+        cls,
+        tool_name: str,
+        *,
+        tool_call_id: str | None = None,
+        index: int | None = None,
+        message: str,
+        code: str | None = None,
+        retry_hint: str | None = None,
+        tool_source: str | None = None,
+    ) -> "AgentEvent":
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id or "",
+            **({"index": index} if index is not None else {}),
+            "status": "invalid",
+            "message": message,
+            **({"code": code} if code else {}),
+            **({"retry_hint": retry_hint} if retry_hint else {}),
+            **({"tool_source": tool_source} if tool_source else {}),
+        }
+        return cls(
+            event_type=AgentEventType.TOOL_ARGUMENTS_INVALID,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+            error_message=message,
+        )
+
+    @classmethod
+    def mutation_previewing(
+        cls,
+        tool_name: str,
+        *,
+        item_id: str,
+        tool_call_id: str | None = None,
+        index: int | None = None,
+    ) -> "AgentEvent":
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id or "",
+            "item_id": item_id,
+            **({"index": index} if index is not None else {}),
+            "status": "previewing",
+        }
+        return cls(
+            event_type=AgentEventType.MUTATION_PREVIEWING,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+        )
+
+    @classmethod
+    def mutation_preview_ready(
+        cls,
+        tool_name: str,
+        *,
+        item_id: str,
+        tool_call_id: str | None = None,
+        changes: list[dict[str, Any]] | None = None,
+        index: int | None = None,
+    ) -> "AgentEvent":
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id or "",
+            "item_id": item_id,
+            "changes": list(changes or []),
+            **({"index": index} if index is not None else {}),
+            "status": "ready",
+        }
+        return cls(
+            event_type=AgentEventType.MUTATION_PREVIEW_READY,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+        )
+
+    @classmethod
+    def mutation_preview_failed(
+        cls,
+        tool_name: str,
+        *,
+        item_id: str,
+        tool_call_id: str | None = None,
+        error: str,
+        failure_code: str | None = None,
+        retry_hint: str | None = None,
+        index: int | None = None,
+    ) -> "AgentEvent":
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id or "",
+            "item_id": item_id,
+            **({"index": index} if index is not None else {}),
+            "status": "failed",
+            "error": error,
+            **({"failure_code": failure_code} if failure_code else {}),
+            **({"retry_hint": retry_hint} if retry_hint else {}),
+        }
+        return cls(
+            event_type=AgentEventType.MUTATION_PREVIEW_FAILED,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            data=payload,
+            error_message=error,
         )
 
     @classmethod
@@ -374,20 +536,24 @@ class AgentEvent:
         chunk_seq: int,
         start_offset: int,
         content: str,
+        flush_latency_ms: int | None = None,
     ) -> "AgentEvent":
         end_offset = int(start_offset) + draft_text_units(content)
+        payload: dict[str, Any] = {
+            "draft_id": draft_id,
+            "target_path": target_path,
+            "chunk_seq": int(chunk_seq),
+            "start_offset": int(start_offset),
+            "end_offset": end_offset,
+            "content": content,
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "status": "streaming",
+        }
+        if flush_latency_ms is not None:
+            payload["flush_latency_ms"] = max(0, int(flush_latency_ms))
         return cls(
             event_type=AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK,
-            data={
-                "draft_id": draft_id,
-                "target_path": target_path,
-                "chunk_seq": int(chunk_seq),
-                "start_offset": int(start_offset),
-                "end_offset": end_offset,
-                "content": content,
-                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                "status": "streaming",
-            },
+            data=payload,
         )
 
     @classmethod
@@ -512,6 +678,63 @@ class AgentEvent:
                 "target_path": target_path,
                 "status": "cancelled",
                 "reason": reason,
+            },
+        )
+
+    @classmethod
+    def draft_body_stalled(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        content_length: int,
+        content_sha256: str,
+        last_chunk_seq: int | None = None,
+        reason: str = "",
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DRAFT_BODY_STALLED,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "status": "stalled",
+                "content_length": int(content_length),
+                "content_sha256": content_sha256,
+                **(
+                    {"last_chunk_seq": int(last_chunk_seq)}
+                    if last_chunk_seq is not None
+                    else {}
+                ),
+                **({"reason": reason} if reason else {}),
+            },
+        )
+
+    @classmethod
+    def draft_interrupted_recoverable(
+        cls,
+        *,
+        draft_id: str,
+        target_path: str,
+        content_length: int,
+        content_sha256: str,
+        last_chunk_seq: int | None = None,
+        reason: str = "",
+    ) -> "AgentEvent":
+        return cls(
+            event_type=AgentEventType.DRAFT_INTERRUPTED_RECOVERABLE,
+            data={
+                "draft_id": draft_id,
+                "target_path": target_path,
+                "status": "recoverable",
+                "content_length": int(content_length),
+                "content_sha256": content_sha256,
+                **(
+                    {"last_chunk_seq": int(last_chunk_seq)}
+                    if last_chunk_seq is not None
+                    else {}
+                ),
+                **({"reason": reason} if reason else {}),
+                "recovery_action": "continue",
             },
         )
 

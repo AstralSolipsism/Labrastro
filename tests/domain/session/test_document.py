@@ -633,6 +633,221 @@ def test_live_session_run_events_reduce_into_canonical_transcript_blocks() -> No
     assert document["stats"]["runStatus"] == "done"
 
 
+def test_tool_contract_state_events_reduce_into_tool_and_file_parts() -> None:
+    document = _session_run_start(None, "修改文件", 1)
+    events = [
+        (
+            "tool_arguments_complete",
+            {
+                "index": 0,
+                "tool_call_id": "call-1",
+                "tool_name": "apply_patch",
+                "status": "complete",
+            },
+        ),
+        (
+            "tool_arguments_valid",
+            {
+                "index": 0,
+                "tool_call_id": "call-1",
+                "tool_name": "apply_patch",
+                "status": "valid",
+            },
+        ),
+        (
+            "mutation_preview_ready",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "tool_name": "apply_patch",
+                "changes": [
+                    {
+                        "path": "src/app.py",
+                        "kind": "add",
+                        "diff": "--- /dev/null\n+++ b/src/app.py\n+print('ok')",
+                    }
+                ],
+                "status": "ready",
+            },
+        ),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=index,
+            session_run_id="run-1",
+            session_run_seq=index,
+        )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert parts[0]["type"] == "tool"
+    assert parts[0]["tool"] == "apply_patch"
+    assert parts[0]["toolCallId"] == "call-1"
+    assert parts[0]["status"] == "preparing"
+    assert parts[0]["resultMeta"]["argument_status"] == "valid"
+    assert parts[1]["type"] == "file_change"
+    assert parts[1]["itemId"] == "file-change:call-1"
+    assert parts[1]["toolCallId"] == "call-1"
+    assert parts[1]["status"] == "in_progress"
+    assert parts[1]["path"] == "src/app.py"
+    assert parts[1]["addedLines"] == 1
+
+
+def test_mutation_preview_failed_reduces_to_tool_error_without_file_change_part() -> None:
+    document = _session_run_start(None, "修改文件", 1)
+    events = [
+        (
+            "tool_arguments_valid",
+            {
+                "index": 0,
+                "tool_call_id": "call-1",
+                "tool_name": "apply_patch",
+                "status": "valid",
+            },
+        ),
+        (
+            "mutation_preview_failed",
+            {
+                "item_id": "file-change:call-1",
+                "tool_call_id": "call-1",
+                "tool_name": "apply_patch",
+                "status": "failed",
+                "error": "file does not exist: missing.py",
+                "failure_code": "semantic_preview_failed",
+                "retry_hint": "Update an existing workspace-relative file.",
+            },
+        ),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=index,
+            session_run_id="run-1",
+            session_run_seq=index,
+        )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert [part["type"] for part in parts] == ["tool"]
+    assert parts[0]["tool"] == "apply_patch"
+    assert parts[0]["toolCallId"] == "call-1"
+    assert parts[0]["status"] == "protocol_error"
+    assert "file does not exist: missing.py" in parts[0]["output"]
+    assert parts[0]["resultMeta"]["preview_status"] == "failed"
+
+
+def test_mutation_preview_failed_without_tool_call_id_uses_preparing_identity() -> None:
+    document = _session_run_start(None, "修改文件", 1)
+    events = [
+        (
+            "tool_arguments_valid",
+            {
+                "index": 0,
+                "tool_name": "apply_patch",
+                "status": "valid",
+            },
+        ),
+        (
+            "mutation_preview_failed",
+            {
+                "index": 0,
+                "item_id": "file-change:index-0",
+                "tool_name": "apply_patch",
+                "status": "failed",
+                "error": "file does not exist: missing.py",
+                "failure_code": "semantic_preview_failed",
+                "retry_hint": "Update an existing workspace-relative file.",
+            },
+        ),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=index,
+            session_run_id="run-1",
+            session_run_seq=index,
+        )
+
+    parts = document["turns"][0]["assistantMessages"][0]["parts"]
+    assert [part["type"] for part in parts] == ["tool"]
+    assert parts[0]["tool"] == "apply_patch"
+    assert parts[0]["toolCallId"] == "preparing:run-1:0"
+    assert parts[0]["status"] == "protocol_error"
+    assert "file does not exist: missing.py" in parts[0]["output"]
+    assert parts[0]["resultMeta"]["preview_status"] == "failed"
+
+
+def test_draft_recovery_events_reduce_into_recoverable_document_part() -> None:
+    document = _session_run_start(None, "写长文档", 1)
+    events = [
+        (
+            "document_draft_started",
+            {
+                "draft_id": "draft-1",
+                "target_path": "docs/a.md",
+                "title": "ADR",
+                "format": "markdown",
+            },
+        ),
+        (
+            "draft_body_stalled",
+            {
+                "draft_id": "draft-1",
+                "target_path": "docs/a.md",
+                "status": "stalled",
+                "content_length": 12,
+                "content_sha256": "abc",
+                "last_chunk_seq": 2,
+                "reason": "provider stream interrupted",
+            },
+        ),
+        (
+            "draft_interrupted_recoverable",
+            {
+                "draft_id": "draft-1",
+                "target_path": "docs/a.md",
+                "status": "recoverable",
+                "content_length": 12,
+                "content_sha256": "abc",
+                "last_chunk_seq": 2,
+                "reason": "provider stream interrupted",
+                "recovery_action": "continue",
+            },
+        ),
+    ]
+
+    for index, (event_type, payload) in enumerate(events, start=2):
+        document = apply_session_event(
+            document,
+            session_id="session-1",
+            event_type=event_type,
+            payload=payload,
+            session_event_seq=index,
+            session_run_id="run-1",
+            session_run_seq=index,
+        )
+
+    part = document["turns"][0]["assistantMessages"][0]["parts"][0]
+    assert part["type"] == "document_draft"
+    assert part["draftId"] == "draft-1"
+    assert part["status"] == "recoverable"
+    assert part["contentLength"] == 12
+    assert part["contentSha256"] == "abc"
+    assert part["lastChunkSeq"] == 2
+    assert part["reason"] == "provider stream interrupted"
+
+
 def test_file_change_events_reduce_into_single_replayable_part() -> None:
     document = _session_run_start(None, "修改文件", 1)
     changes = [

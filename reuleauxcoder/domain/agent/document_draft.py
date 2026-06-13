@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from reuleauxcoder.domain.agent.events import AgentEvent
 from reuleauxcoder.domain.agent.document_draft_text import draft_text_units
-from reuleauxcoder.domain.approval import ApprovalRequest
+from reuleauxcoder.domain.approval import ApprovalDecision, ApprovalRequest
 from reuleauxcoder.domain.files import (
     LocalWorkspaceMutationBackend,
     WorkspaceMutationBackend,
@@ -68,6 +68,18 @@ class DocumentDraftSnapshot:
     content_length: int
     content_sha256: str
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "draft_id": self.draft_id,
+            "target_path": self.target_path,
+            "title": self.title,
+            "format": self.format,
+            "status": self.status,
+            "content": self.content,
+            "content_length": self.content_length,
+            "content_sha256": self.content_sha256,
+        }
+
     @classmethod
     def from_draft(cls, draft: DocumentDraft) -> "DocumentDraftSnapshot":
         content = draft.content
@@ -77,6 +89,26 @@ class DocumentDraftSnapshot:
             title=draft.title,
             format=draft.format,
             status=draft.status,
+            content=content,
+            content_length=draft_text_units(content),
+            content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        )
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "DocumentDraftSnapshot" | None:
+        if not isinstance(value, dict):
+            return None
+        draft_id = str(value.get("draft_id") or "").strip()
+        target_path = str(value.get("target_path") or "").strip()
+        content = str(value.get("content") or "")
+        if not draft_id or not target_path:
+            return None
+        return cls(
+            draft_id=draft_id,
+            target_path=target_path,
+            title=str(value.get("title") or target_path),
+            format=str(value.get("format") or "markdown"),
+            status=str(value.get("status") or "interrupted"),
             content=content,
             content_length=draft_text_units(content),
             content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -130,6 +162,63 @@ class DocumentDraftRuntime:
             return None
         return DocumentDraftSnapshot.from_draft(self.active)
 
+    def restore_checkpoint(
+        self,
+        checkpoint: DocumentDraftSnapshot | dict[str, Any] | None,
+    ) -> DocumentDraft | None:
+        if checkpoint is None:
+            return None
+        snapshot = (
+            checkpoint
+            if isinstance(checkpoint, DocumentDraftSnapshot)
+            else DocumentDraftSnapshot.from_dict(checkpoint)
+        )
+        if snapshot is None:
+            return None
+        draft = DocumentDraft(
+            draft_id=snapshot.draft_id,
+            target_path=snapshot.target_path,
+            title=snapshot.title,
+            format=snapshot.format,
+            body_parts=[snapshot.content],
+        )
+        draft.status = "streaming"
+        self.active = draft
+        return draft
+
+    def interrupt_active(
+        self,
+        reason: str,
+        *,
+        last_chunk_seq: int | None = None,
+    ) -> DocumentDraftSnapshot | None:
+        draft = self.active
+        if draft is None:
+            return None
+        snapshot = DocumentDraftSnapshot.from_draft(draft)
+        draft.status = "interrupted"
+        self.emit(
+            AgentEvent.draft_body_stalled(
+                draft_id=draft.draft_id,
+                target_path=draft.target_path,
+                content_length=snapshot.content_length,
+                content_sha256=snapshot.content_sha256,
+                last_chunk_seq=last_chunk_seq,
+                reason=reason,
+            )
+        )
+        self.emit(
+            AgentEvent.draft_interrupted_recoverable(
+                draft_id=draft.draft_id,
+                target_path=draft.target_path,
+                content_length=snapshot.content_length,
+                content_sha256=snapshot.content_sha256,
+                last_chunk_seq=last_chunk_seq,
+                reason=reason,
+            )
+        )
+        return snapshot
+
     def commit_active(self) -> None:
         draft = self.active
         if draft is None or draft.status != "streaming":
@@ -176,9 +265,9 @@ class DocumentDraftRuntime:
                 reason=f"Commit draft document to {draft.target_path}",
             )
         )
-        decision = self._request_commit_approval(draft, preview.diff)
-        if decision != "allow_once":
-            reason = "draft document commit was not approved"
+        decision = self._request_commit_approval(draft, preview)
+        if not decision.approved:
+            reason = decision.reason or "draft document commit was not approved"
             self.emit(
                 AgentEvent.file_change_approval_resolved(
                     item_id=item_id,
@@ -212,7 +301,8 @@ class DocumentDraftRuntime:
                 decision="allow_once",
             )
         )
-        result = mutation_backend.commit_document(draft.target_path, content)
+        approved_candidate = _confirmed_save_candidate(decision, preview)
+        result = mutation_backend.save_candidate(approved_candidate)
         result_changes = [change.to_dict() for change in result.changes] or changes
         if result.status == "completed":
             self.emit(
@@ -269,24 +359,32 @@ class DocumentDraftRuntime:
         draft.status = "failed"
         self.active = None
 
-    def _request_commit_approval(self, draft: DocumentDraft, diff: str) -> str:
+    def _request_commit_approval(
+        self,
+        draft: DocumentDraft,
+        preview,
+    ) -> ApprovalDecision:
         provider = self.approval_provider
         request_approval = getattr(provider, "request_approval", None)
         if not callable(request_approval):
-            return "deny_once"
+            return ApprovalDecision.deny_once("draft document commit requires approval")
         decision = request_approval(
             ApprovalRequest(
                 tool_name="draft_document_commit",
                 tool_args={
                     "target_path": draft.target_path,
                     "title": draft.title,
-                    "diff": diff,
+                    "diff": preview.diff,
                 },
                 tool_source="runtime",
                 reason=f"Commit draft document to {draft.target_path}",
                 intent="Review the generated document diff before it is written.",
                 metadata={
                     "draft_id": draft.draft_id,
+                    "preview_identity": dict(preview.preview_identity or {}),
+                    "approved_save_candidate": dict(
+                        preview.approved_save_candidate or {}
+                    ),
                     "runtime_workspace_root": self.workspace_root,
                     "workspace_mutation_owner": {
                         "workspace_id": str(
@@ -302,7 +400,23 @@ class DocumentDraftRuntime:
                 },
             )
         )
-        return str(getattr(decision, "mode", "deny_once") or "deny_once")
+        if isinstance(decision, ApprovalDecision):
+            return decision
+        return ApprovalDecision.deny_once("invalid approval decision")
+
+
+def _confirmed_save_candidate(
+    decision: ApprovalDecision,
+    preview,
+) -> dict[str, Any]:
+    decision_meta = decision.meta if isinstance(decision.meta, dict) else {}
+    raw_candidate = decision_meta.get("approved_save_candidate")
+    if isinstance(raw_candidate, dict) and raw_candidate:
+        return dict(raw_candidate)
+    preview_candidate = getattr(preview, "approved_save_candidate", None)
+    if isinstance(preview_candidate, dict) and preview_candidate:
+        return dict(preview_candidate)
+    return {}
 
 
 _DRAFT_FIELD_RE = re.compile(r"^(draft_id|target_path):\s*(.+?)\s*$")

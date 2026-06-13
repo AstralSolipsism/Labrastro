@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
@@ -13,7 +16,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ExecToolRequest,
     ExecToolResult,
     RemoteMCPToolInfo,
-    ToolMutationPreviewState,
 )
 from labrastro_server.relay.server import RelayServer
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
@@ -26,6 +28,56 @@ from reuleauxcoder.extensions.tools.builtin.list_file import ListFileTool
 from reuleauxcoder.extensions.tools.builtin.lsp import LspTool
 from reuleauxcoder.extensions.tools.builtin.read import ReadFileTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
+
+
+_CONTRACT_FIXTURE = Path(__file__).parents[2] / "fixtures" / "apply_patch_contract.json"
+
+
+def _load_patch_contract_fixture() -> dict:
+    return json.loads(_CONTRACT_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _patch_text(item: dict) -> str:
+    return "\n".join(item["patch"])
+
+
+def _approved_candidate(tool_name: str = "apply_patch") -> dict:
+    if tool_name == "draft_document_commit":
+        operations = [{"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}]
+        diff = "--- /dev/null\n+++ b/docs/a.md\n+# A\n"
+    else:
+        operations = [{"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}]
+        diff = "+# A\n"
+    preview_identity = {
+        "plan_id": f"{tool_name}-plan",
+        "candidate_hash": f"{tool_name}-candidate",
+        "tool_name": tool_name,
+        "workspace_id": "/tmp",
+        "execution_target": "remote_peer",
+        "path_space": "remote_peer_workspace",
+        "args_hash": f"{tool_name}-args",
+    }
+    return {
+        "plan_id": preview_identity["plan_id"],
+        "tool_name": tool_name,
+        "workspace_id": "/tmp",
+        "execution_target": "remote_peer",
+        "path_space": "remote_peer_workspace",
+        "args_hash": preview_identity["args_hash"],
+        "operations": operations,
+        "changes": [{"path": "docs/a.md", "kind": "add", "diff": diff}],
+        "diff": diff,
+        "candidate_hash": preview_identity["candidate_hash"],
+        "preview_identity": preview_identity,
+    }
+
+
+def _preview_meta(tool_name: str = "apply_patch") -> dict:
+    candidate = _approved_candidate(tool_name)
+    return {
+        "preview_identity": candidate["preview_identity"],
+        "approved_save_candidate": candidate,
+    }
 
 
 class TestRemoteBackendDispatch:
@@ -69,7 +121,7 @@ class TestRemoteBackendDispatch:
             result = tool.execute(
                 patch="*** Begin Patch\n*** Add File: foo.txt\n+bar\n*** End Patch\n"
             )
-            assert "no remote peer" in result.lower()
+            assert "no online peer" in result.lower()
         finally:
             srv.stop()
 
@@ -385,6 +437,149 @@ class TestRemoteBackendDispatch:
         finally:
             srv.stop()
 
+    def test_remote_backend_carries_apply_patch_save_candidate_to_execute(self) -> None:
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import (
+                RegisterRequest,
+                RelayEnvelope,
+            )
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                    features=["tool_preview"],
+                )
+            )
+            backend = RemoteRelayToolBackend(
+                relay_server=srv,
+                context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+            )
+            patch = "*** Begin Patch\n*** Add File: docs/a.md\n+# A\n*** End Patch"
+            backend.remember_approved_candidate(
+                "apply_patch",
+                {"patch": patch},
+                _approved_candidate("apply_patch"),
+            )
+
+            import threading
+            import time
+
+            holder: dict[str, object] = {}
+
+            def run_patch() -> None:
+                holder["result"] = backend.exec_tool("apply_patch", {"patch": patch})
+
+            t = threading.Thread(target=run_patch)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            assert env.payload["tool_name"] == "apply_patch"
+            assert env.payload["args"] == {"patch": patch}
+            assert ("expected" + "_state") not in env.payload
+            assert env.payload["preview_identity"]["tool_name"] == "apply_patch"
+            assert env.payload["approved_save_candidate"]["operations"] == [
+                {"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}
+            ]
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="Applied patch").to_dict(),
+                ),
+            )
+            t.join(timeout=2)
+
+            assert holder["result"] == "Applied patch"
+        finally:
+            srv.stop()
+
+    def test_remote_backend_carries_apply_patch_save_candidate_without_manual_approval_memory(self) -> None:
+        from labrastro_server.interfaces.http.remote.protocol import (
+            ExecToolResult,
+            RegisterRequest,
+            RelayEnvelope,
+            ToolPreviewResult,
+        )
+
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                    features=["tool_preview"],
+                )
+            )
+            backend = RemoteRelayToolBackend(
+                relay_server=srv,
+                context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+            )
+            backend.preview_tool = lambda _tool_name, _args: ToolPreviewResult(
+                ok=True,
+                sections=[{"path": "docs/a.md", "change_kind": "add"}],
+                meta=_preview_meta("apply_patch"),
+            )
+            patch = "*** Begin Patch\n*** Add File: docs/a.md\n+# A\n*** End Patch"
+
+            preview = backend.preview_text_patch(patch)
+            assert preview.status == "in_progress"
+
+            import threading
+            import time
+
+            holder: dict[str, object] = {}
+
+            def run_patch() -> None:
+                holder["result"] = backend.apply_text_patch(patch)
+
+            t = threading.Thread(target=run_patch)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            try:
+                assert ("expected" + "_state") not in env.payload
+                assert env.payload["preview_identity"]["tool_name"] == "apply_patch"
+                assert env.payload["approved_save_candidate"]["operations"] == [
+                    {"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}
+                ]
+            finally:
+                srv.handle_inbound(
+                    resp.peer_id,
+                    RelayEnvelope(
+                        type="tool_result",
+                        request_id=env.request_id,
+                        peer_id=resp.peer_id,
+                        payload=ExecToolResult(ok=True, result="Applied patch").to_dict(),
+                    ),
+                )
+            t.join(timeout=2)
+
+            assert holder["result"].status == "completed"
+        finally:
+            srv.stop()
+
     def test_remote_backend_commits_document_through_peer_owner(self) -> None:
         srv = RelayServer()
         received: list[tuple[str, object]] = []
@@ -411,18 +606,10 @@ class TestRemoteBackendDispatch:
                 relay_server=srv,
                 context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
             )
-            backend.remember_approved_preview(
+            backend.remember_approved_candidate(
                 "draft_document_commit",
                 {"target_path": "docs/a.md", "content": "# A\n"},
-                ToolMutationPreviewState(
-                    plan_hash="plan-hash",
-                    operations=[
-                        {
-                            "path": "docs/a.md",
-                            "old_exists": False,
-                        }
-                    ],
-                ),
+                _approved_candidate("draft_document_commit"),
             )
 
             import threading
@@ -440,16 +627,11 @@ class TestRemoteBackendDispatch:
             assert len(received) == 1
             env = received[0][1]
             assert env.payload["tool_name"] == "draft_document_commit"
-            assert env.payload["args"] == {
-                "target_path": "docs/a.md",
-                "content": "# A\n",
-            }
-            assert env.payload["expected_state"]["plan_hash"] == "plan-hash"
-            assert env.payload["expected_state"]["operations"] == [
-                {
-                    "path": "docs/a.md",
-                    "old_exists": False,
-                }
+            assert env.payload["args"] == {}
+            assert ("expected" + "_state") not in env.payload
+            assert env.payload["preview_identity"]["tool_name"] == "draft_document_commit"
+            assert env.payload["approved_save_candidate"]["operations"] == [
+                {"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}
             ]
             srv.handle_inbound(
                 resp.peer_id,
@@ -468,7 +650,52 @@ class TestRemoteBackendDispatch:
         finally:
             srv.stop()
 
-    def test_remote_backend_carries_document_preview_state_to_commit_without_approval_args(
+    def test_remote_backend_maps_semantic_apply_patch_preview_failures_from_shared_fixture(
+        self,
+    ) -> None:
+        from labrastro_server.interfaces.http.remote.protocol import ToolPreviewResult
+
+        backend = RemoteRelayToolBackend(relay_server=RelayServer())
+        contract = _load_patch_contract_fixture()
+
+        for item in contract["semantic_invalid"]:
+            backend.preview_tool = lambda _tool_name, _args, item=item: ToolPreviewResult(
+                ok=False,
+                error_code="REMOTE_TOOL_ERROR",
+                error_message=item["error_contains"],
+            )
+
+            result = backend.preview_text_patch(_patch_text(item))
+
+            assert result.status == "failed", item["name"]
+            assert result.error is not None
+            assert item["error_contains"] in result.error
+
+    def test_remote_backend_rejects_mutation_preview_without_required_save_candidate(
+        self,
+    ) -> None:
+        from labrastro_server.interfaces.http.remote.protocol import ToolPreviewResult
+
+        backend = RemoteRelayToolBackend(relay_server=RelayServer())
+        backend.preview_tool = lambda _tool_name, _args: ToolPreviewResult(
+            ok=True,
+            sections=[{"path": "docs/a.md", "change_kind": "add"}],
+            meta={},
+        )
+
+        apply_result = backend.preview_text_patch(
+            "*** Begin Patch\n*** Add File: docs/a.md\n+# A\n*** End Patch"
+        )
+        draft_result = backend.preview_document_commit("docs/a.md", "# A\n")
+
+        for result in (apply_result, draft_result):
+            assert result.status == "failed"
+            assert result.error is not None
+            assert "approved_save_candidate" in result.error
+            assert "preview_identity" in result.error
+            assert "operations" in result.error
+
+    def test_remote_backend_carries_document_save_candidate_to_commit_without_approval_args(
         self,
     ) -> None:
         srv = RelayServer()
@@ -500,15 +727,7 @@ class TestRemoteBackendDispatch:
             backend.preview_tool = lambda _tool_name, _args: ToolPreviewResult(
                 ok=True,
                 diff="--- /dev/null\n+++ b/docs/a.md\n+# A\n",
-                meta={
-                    "plan_hash": "plan-hash",
-                    "operations": [
-                        {
-                            "path": "docs/a.md",
-                            "old_exists": False,
-                        }
-                    ],
-                },
+                meta=_preview_meta("draft_document_commit"),
             )
 
             preview = backend.preview_document_commit("docs/a.md", "# A\n")
@@ -530,16 +749,11 @@ class TestRemoteBackendDispatch:
             assert len(received) == 1
             env = received[0][1]
             assert env.payload["tool_name"] == "draft_document_commit"
-            assert env.payload["args"] == {
-                "target_path": "docs/a.md",
-                "content": "# A\n",
-            }
-            assert env.payload["expected_state"]["plan_hash"] == "plan-hash"
-            assert env.payload["expected_state"]["operations"] == [
-                {
-                    "path": "docs/a.md",
-                    "old_exists": False,
-                }
+            assert env.payload["args"] == {}
+            assert ("expected" + "_state") not in env.payload
+            assert env.payload["preview_identity"]["tool_name"] == "draft_document_commit"
+            assert env.payload["approved_save_candidate"]["operations"] == [
+                {"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}
             ]
             srv.handle_inbound(
                 resp.peer_id,
@@ -557,7 +771,7 @@ class TestRemoteBackendDispatch:
         finally:
             srv.stop()
 
-    def test_remote_backend_does_not_send_empty_expected_state(self) -> None:
+    def test_remote_backend_does_not_send_empty_save_candidate(self) -> None:
         srv = RelayServer()
         received: list[tuple[str, object]] = []
 
@@ -567,10 +781,7 @@ class TestRemoteBackendDispatch:
         srv._send_fn = mock_send
         srv.start()
         try:
-            from labrastro_server.interfaces.http.remote.protocol import (
-                RegisterRequest,
-                RelayEnvelope,
-            )
+            from labrastro_server.interfaces.http.remote.protocol import RegisterRequest
 
             resp = srv._on_register(
                 RegisterRequest(
@@ -583,41 +794,12 @@ class TestRemoteBackendDispatch:
                 relay_server=srv,
                 context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
             )
-            backend.remember_approved_preview(
-                "draft_document_commit",
-                {"target_path": "docs/a.md", "content": "# A\n"},
-                ToolMutationPreviewState(operations=[]),
-            )
+            result = backend.save_candidate({})
 
-            import threading
-            import time
-
-            holder: dict[str, object] = {}
-
-            def run_commit() -> None:
-                holder["result"] = backend.commit_document("docs/a.md", "# A\n")
-
-            t = threading.Thread(target=run_commit)
-            t.start()
-            time.sleep(0.1)
-
-            assert len(received) == 1
-            env = received[0][1]
-            assert env.payload["tool_name"] == "draft_document_commit"
-            assert env.payload["expected_state"] == {}
-            srv.handle_inbound(
-                resp.peer_id,
-                RelayEnvelope(
-                    type="tool_result",
-                    request_id=env.request_id,
-                    peer_id=resp.peer_id,
-                    payload=ExecToolResult(ok=True, result="Committed document docs/a.md").to_dict(),
-                ),
-            )
-            t.join(timeout=2)
-
-            result = holder["result"]
-            assert result.status == "completed"
+            assert received == []
+            assert result.status == "failed"
+            assert result.error is not None
+            assert "approved_save_candidate" in result.error
         finally:
             srv.stop()
 

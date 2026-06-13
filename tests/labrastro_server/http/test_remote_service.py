@@ -465,6 +465,27 @@ def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: 
     )
 
 
+def test_remote_session_run_adds_server_enqueue_latency_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "labrastro_server.interfaces.http.remote.service.time.time",
+        lambda: 10.25,
+    )
+    session = _RemoteSessionRun(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    session.append_event("stream_observability", {"emitted_at": 10.0})
+
+    payload = session.events[0]["payload"]
+    assert payload["server_enqueued_at"] == 10.25
+    assert payload["server_enqueue_latency_ms"] == 250
+
+
 def test_remote_session_run_uses_english_notice_for_english_locale(tmp_path: Path) -> None:
     session = _RemoteSessionRun(
         session_run_id="run-1",
@@ -964,8 +985,6 @@ class TestRemoteRelayHTTPService:
                             }
                         ],
                         resolved_path="/repo/a.txt",
-                        old_sha256="abc",
-                        old_exists=True,
                     ).to_dict(),
                 ),
             )
@@ -992,8 +1011,6 @@ class TestRemoteRelayHTTPService:
             assert result.ok is True
             assert result.sections[0]["kind"] == "diff"
             assert result.resolved_path == "/repo/a.txt"
-            assert result.old_sha256 == "abc"
-            assert result.old_exists is True
         finally:
             relay.stop()
 
@@ -4779,10 +4796,79 @@ class TestRemoteRelayHTTPService:
                     {"peer_token": peer_token},
                 )
                 assert status == 200
+                if expected_name == "apply_patch":
+                    assert poll_body["type"] == "preview_tool"
+                    assert poll_body["payload"]["tool_name"] == expected_name
+                    for key, value in kwargs.items():
+                        assert poll_body["payload"]["args"][key] == value
+                    preview_identity = {
+                        "plan_id": "remote-contract-plan",
+                        "candidate_hash": "remote-contract-candidate",
+                        "tool_name": "apply_patch",
+                        "workspace_id": "/tmp/peer",
+                        "execution_target": "remote_peer",
+                        "path_space": "remote_peer_workspace",
+                        "args_hash": "remote-contract-args",
+                    }
+                    status, preview_body = _json_request(
+                        "POST",
+                        f"{service.base_url}/remote/result",
+                        {
+                            "peer_token": peer_token,
+                            "request_id": poll_body["request_id"],
+                            "type": "tool_preview_result",
+                            "payload": ToolPreviewResult(
+                                ok=True,
+                                sections=[
+                                    {
+                                        "id": "diff",
+                                        "kind": "diff",
+                                        "content": "--- a/demo.txt\n+++ b/demo.txt\n-old\n+new\n",
+                                        "resolved_path": "/tmp/peer/demo.txt",
+                                    }
+                                ],
+                                meta={
+                                    "preview_identity": preview_identity,
+                                    "approved_save_candidate": {
+                                        "tool_name": "apply_patch",
+                                        "preview_identity": preview_identity,
+                                        "operations": [
+                                            {
+                                                "kind": "update",
+                                                "path": "demo.txt",
+                                                "new_content": "new\n",
+                                            }
+                                        ],
+                                    },
+                                },
+                            ).to_dict(),
+                        },
+                    )
+                    assert status == 200
+                    assert preview_body["ok"] is True
+                    status, poll_body = _json_request(
+                        "POST",
+                        f"{service.base_url}/remote/poll",
+                        {"peer_token": peer_token},
+                    )
+                    assert status == 200
                 assert poll_body["type"] == "exec_tool"
                 assert poll_body["payload"]["tool_name"] == expected_name
-                for key, value in kwargs.items():
-                    assert poll_body["payload"]["args"][key] == value
+                if expected_name == "apply_patch":
+                    assert poll_body["payload"]["args"] == {}
+                    assert poll_body["payload"]["preview_identity"]["plan_id"] == (
+                        "remote-contract-plan"
+                    )
+                    assert poll_body["payload"]["approved_save_candidate"]["operations"] == [
+                        {
+                            "kind": "update",
+                            "path": "demo.txt",
+                            "new_content": "new\n",
+                        }
+                    ]
+                else:
+                    for key, value in kwargs.items():
+                        assert poll_body["payload"]["args"][key] == value
 
                 status, result_body = _json_request(
                     "POST",
@@ -5066,7 +5152,12 @@ class TestRemoteRelayHTTPService:
                 if event["type"] == "approval_resolved"
             ]
             assert len(resolved_events) == 1
-            assert resolved_events[0]["payload"] == {
+            payload = resolved_events[0]["payload"]
+            assert payload["server_enqueued_at"] > 0
+            assert {
+                key: payload[key]
+                for key in ("approval_id", "tool_call_id", "decision", "reason")
+            } == {
                 "approval_id": "approval-disconnect",
                 "tool_call_id": "call-disconnect",
                 "decision": "deny_once",
@@ -5475,14 +5566,24 @@ class TestRemoteRelayHTTPService:
             error_event = [
                 event for event in stream_body["events"] if event["type"] == "error"
             ][-1]
-            assert error_event["payload"] == {
+            error_payload = error_event["payload"]
+            assert error_payload["server_enqueued_at"] > 0
+            assert {
+                key: error_payload[key]
+                for key in ("message", "code")
+            } == {
                 "message": "remote peer registration missing host_info_min.shell",
                 "code": "session_run_handler_failed",
             }
             failed_event = [
                 event for event in stream_body["events"] if event["type"] == "session_run_failed"
             ][-1]
-            assert failed_event["payload"] == {
+            failed_payload = failed_event["payload"]
+            assert failed_payload["server_enqueued_at"] > 0
+            assert {
+                key: failed_payload[key]
+                for key in ("message", "code", "recoverable")
+            } == {
                 "message": "remote peer registration missing host_info_min.shell",
                 "code": "session_run_handler_failed",
                 "recoverable": False,
@@ -6063,7 +6164,12 @@ class TestRemoteRelayHTTPService:
                 if event["type"] == "approval_resolved"
             ]
             assert len(resolved_events) == 1
-            assert resolved_events[0]["payload"] == {
+            payload = resolved_events[0]["payload"]
+            assert payload["server_enqueued_at"] > 0
+            assert {
+                key: payload[key]
+                for key in ("approval_id", "tool_call_id", "decision", "reason")
+            } == {
                 "approval_id": "approval-cancel",
                 "tool_call_id": "call-cancel",
                 "decision": "deny_once",
@@ -6787,7 +6893,12 @@ class TestRemoteRelayHTTPService:
                 if event["type"] == "user_input_resolved"
             ]
             assert resolved_events
-            assert resolved_events[0]["payload"] == {
+            payload = resolved_events[0]["payload"]
+            assert payload["server_enqueued_at"] > 0
+            assert {
+                key: payload[key]
+                for key in ("input_id", "kind", "action", "content", "reason")
+            } == {
                 "input_id": input_id,
                 "kind": "mcp_elicitation",
                 "action": "accept",
@@ -6972,7 +7083,12 @@ class TestRemoteRelayHTTPService:
                 if event["type"] == "user_input_resolved"
             ]
             assert len(resolved_events) == 1
-            assert resolved_events[0]["payload"] == {
+            payload = resolved_events[0]["payload"]
+            assert payload["server_enqueued_at"] > 0
+            assert {
+                key: payload[key]
+                for key in ("input_id", "kind", "action", "content", "reason")
+            } == {
                 "input_id": "mcp-elicitation-cancel",
                 "kind": "mcp_elicitation",
                 "action": "cancel",
@@ -7037,7 +7153,12 @@ class TestRemoteRelayHTTPService:
                 if event["type"] == "approval_resolved"
             ]
             assert len(resolved_events) == 1
-            assert resolved_events[0]["payload"] == {
+            payload = resolved_events[0]["payload"]
+            assert payload["server_enqueued_at"] > 0
+            assert {
+                key: payload[key]
+                for key in ("approval_id", "tool_call_id", "decision", "reason")
+            } == {
                 "approval_id": "approval-done",
                 "tool_call_id": "call-done",
                 "decision": "deny_once",

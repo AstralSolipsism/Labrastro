@@ -5,7 +5,7 @@ from reuleauxcoder.domain.files.file_mutation_service import (
     FileMutationError,
     FileMutationResult,
     FileMutationService,
-    MutationOperationState,
+    MutationOperationDescriptor,
     MutationPlan,
 )
 from reuleauxcoder.domain.files.apply_patch_contract import (
@@ -33,7 +33,7 @@ __all__ = [
     "APPLY_PATCH_PARAMETER_DESCRIPTION",
     "APPLY_PATCH_TOOL_DESCRIPTION",
     "LocalWorkspaceMutationBackend",
-    "MutationOperationState",
+    "MutationOperationDescriptor",
     "MutationPlan",
     "PatchArgumentStreamDecoder",
     "PatchArgumentStreamError",

@@ -1,6 +1,7 @@
 ﻿from types import SimpleNamespace
 import time
 
+from reuleauxcoder.domain.approval import ApprovalDecision
 from reuleauxcoder.domain.agent.events import AgentEventType
 from reuleauxcoder.domain.agent.loop import AgentLoop
 from reuleauxcoder.domain.hooks.lifecycle import (
@@ -9,6 +10,7 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookOutput,
 )
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
+from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
 from reuleauxcoder.services.prompt.builder import system_prompt
 
 
@@ -52,6 +54,14 @@ class _AgentStub:
     def get_active_tools(self):
         return [_Tool("read_file", "Read file")]
 
+    def get_tool(self, name: str):
+        for tool in self.get_active_tools():
+            if tool.name == name:
+                return tool
+        if name == "apply_patch":
+            return _Tool("apply_patch", "Patch files")
+        return None
+
     def get_blocked_tools(self):
         return []
 
@@ -76,10 +86,16 @@ class _SequenceLLM:
     def __init__(self, responses: list[LLMResponse]) -> None:
         self.responses = list(responses)
         self.calls = 0
+        self.call_kwargs: list[dict] = []
 
     def chat(self, **kwargs) -> LLMResponse:  # noqa: ARG002
         self.calls += 1
+        self.call_kwargs.append(kwargs)
         response = self.responses.pop(0)
+        on_tool_call_delta = kwargs.get("on_tool_call_delta")
+        if callable(on_tool_call_delta):
+            for delta in response.provider_extra.get("tool_call_deltas", []):
+                on_tool_call_delta(delta)
         on_token = kwargs.get("on_token")
         if callable(on_token):
             for token in response.tokens:
@@ -133,6 +149,45 @@ class _RunAgentStub(_AgentStub):
         for tool_call in tool_calls:
             self.executed_tool_calls.append(tool_call)
         return ["tool-ok" for _ in tool_calls]
+
+
+class _ApplyPatchRunAgentStub(_RunAgentStub):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        super().__init__(responses)
+        self._apply_patch_tool = ApplyPatchTool()
+
+    def get_active_tools(self):
+        return [self._apply_patch_tool]
+
+    def get_tool(self, name: str):
+        if name == "apply_patch":
+            return self._apply_patch_tool
+        return super().get_tool(name)
+
+
+def test_agent_loop_passes_model_visible_apply_patch_contract_to_llm_chat() -> None:
+    agent = _ApplyPatchRunAgentStub([LLMResponse(content="done")])
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    result = loop.run()
+
+    assert result == "done"
+    assert agent.llm.call_kwargs
+    call = agent.llm.call_kwargs[0]
+    system_content = call["messages"][0]["content"]
+    assert "JSON function wrapper" in system_content
+    assert "*** Add File:" in system_content
+    assert "Do not use *** File:" in system_content
+    apply_patch_schema = next(
+        tool
+        for tool in call["tools"]
+        if tool.get("function", {}).get("name") == "apply_patch"
+    )
+    assert "*** Update File:" in apply_patch_schema["function"]["description"]
+    patch_description = apply_patch_schema["function"]["parameters"]["properties"][
+        "patch"
+    ]["description"]
+    assert "draft_document_begin" in patch_description
 
 
 def test_system_prompt_no_longer_contains_runtime_environment_block() -> None:
@@ -334,6 +389,41 @@ def test_agent_loop_routes_document_draft_stream_to_preview_chunk_not_assistant_
     assert loop.last_response_streamed is True
 
 
+def test_agent_loop_keeps_apply_patch_argument_delta_out_of_file_change_stream() -> None:
+    agent = _RunAgentStub(
+        [
+            LLMResponse(
+                content="done",
+                provider_extra={
+                    "tool_call_deltas": [
+                        {
+                            "index": 0,
+                            "tool_call_id": "call_patch",
+                            "tool_name": "apply_patch",
+                            "arguments_delta": (
+                                '{"patch":"*** Begin Patch\\n'
+                                "*** Update File: src/app.py\\n"
+                                "@@\\n-old"
+                            ),
+                            "arguments_preview": '{"patch":"*** Begin Patch...',
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    result = loop.run()
+
+    assert result == "done"
+    event_types = [event.event_type.value for event in agent._events]
+    assert "tool_call_delta" in event_types
+    assert "file_change_started" not in event_types
+    assert "file_change_patch_updated" not in event_types
+    assert "file_change_completed" not in event_types
+
+
 def test_agent_loop_batches_tiny_document_draft_stream_tokens(tmp_path) -> None:
     declaration = "\n".join(
         [
@@ -425,7 +515,63 @@ def test_agent_loop_flushes_document_draft_before_interrupt_cancel(tmp_path) -> 
     assert result == content
     assert snapshots[-1]["content"] == content
     assert snapshots[-1]["final"] is True
-    assert event_types.index("document_draft_snapshot") < event_types.index("document_draft_cancelled")
+    assert "draft_body_stalled" in event_types
+    assert "draft_interrupted_recoverable" in event_types
+    assert "document_draft_cancelled" not in event_types
+    checkpoint = getattr(agent, "pending_document_draft_checkpoint", None)
+    assert checkpoint["draft_id"] == "draft-test"
+    assert checkpoint["target_path"] == "docs/architecture.md"
+    assert checkpoint["content"] == content
+
+
+def test_agent_loop_resumes_document_draft_from_interrupted_checkpoint(tmp_path) -> None:
+    declaration = "\n".join(
+        [
+            "Draft document declared: Architecture",
+            "draft_id: draft-test",
+            "target_path: docs/architecture.md",
+            "Continue the document body in assistant markdown stream.",
+        ]
+    )
+    first_part = "# Architecture\n"
+    second_part = "\nContinued\n"
+    agent = _RunAgentStub(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="draft_document_begin",
+                        arguments={"target_path": "docs/architecture.md"},
+                    ),
+                ],
+            ),
+            LLMResponse(
+                content=first_part,
+                tokens=[first_part],
+                stream_status="interrupted",
+                interruption={"message": "provider stream interrupted"},
+            ),
+        ]
+    )
+    agent.runtime_workspace_root = str(tmp_path)
+    agent.approval_provider = SimpleNamespace(
+        request_approval=lambda _request: ApprovalDecision.allow_once("ok")
+    )
+    agent._executor = SimpleNamespace(
+        execute=lambda _tool_call, index=0: declaration,  # noqa: ARG005
+        execute_parallel=agent._execute_tools,
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    assert loop.run() == first_part
+    agent.llm.responses.append(LLMResponse(content=second_part, tokens=[second_part]))
+
+    assert loop.run() == second_part
+
+    assert (tmp_path / "docs" / "architecture.md").read_text() == first_part + second_part
+    assert getattr(agent, "pending_document_draft_checkpoint", None) is None
+    assert all(tool_call.name != "apply_patch" for tool_call in agent.executed_tool_calls)
 
 
 def test_agent_loop_runtime_workspace_root_falls_back_to_working_directory() -> None:

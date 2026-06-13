@@ -20,13 +20,11 @@ from reuleauxcoder.domain.agent.document_draft import DocumentDraftRuntime
 from reuleauxcoder.domain.agent.document_draft_stream import DocumentDraftLiveStream
 from reuleauxcoder.domain.agent.runtime_boundary import (
     runtime_agent_run_id,
-    runtime_execution_target,
     runtime_workspace_root,
     runtime_working_directory,
 )
 from reuleauxcoder.domain.approval import ApprovalRequest
 from reuleauxcoder.domain.files import (
-    LocalWorkspaceMutationBackend,
     PatchArgumentStreamDecoder,
     PatchArgumentStreamError,
 )
@@ -87,8 +85,31 @@ class AgentLoop:
             getattr(self.agent, "runtime_execution_target", "local") or "local"
         )
         if execution_target == "remote_peer":
-            return self._remote_peer_runtime_context()
-        return self._local_runtime_context(execution_target)
+            lines = self._remote_peer_runtime_context()
+        else:
+            lines = self._local_runtime_context(execution_target)
+        return lines + self._draft_checkpoint_context()
+
+    def _draft_checkpoint_context(self) -> list[str]:
+        checkpoint = getattr(self.agent, "pending_document_draft_checkpoint", None)
+        if not isinstance(checkpoint, dict):
+            return []
+        draft_id = str(checkpoint.get("draft_id") or "").strip()
+        target_path = str(checkpoint.get("target_path") or "").strip()
+        content_length = checkpoint.get("content_length")
+        if not draft_id or not target_path:
+            return []
+        return [
+            (
+                "- Active draft checkpoint: "
+                f"draft_id={draft_id}, target_path={target_path}, "
+                f"content_length={content_length if content_length is not None else 0}"
+            ),
+            (
+                "- Continue the draft body from the checkpoint using assistant "
+                "markdown stream; do not send the existing draft body through apply_patch."
+            ),
+        ]
 
     def _local_runtime_context(self, execution_target: str) -> list[str]:
         uname = platform.uname()
@@ -574,27 +595,15 @@ class AgentLoop:
     def _emit_apply_patch_stream_delta(
         self,
         decoders: dict[str, PatchArgumentStreamDecoder],
-        buffers: dict[str, str],
-        started_items: set[str],
         *,
         index: int,
         tool_call_id: str | None,
         arguments_delta: str,
     ) -> None:
-        item_id = f"file-change:{tool_call_id or f'index-{index}'}"
-        if item_id not in started_items:
-            started_items.add(item_id)
-            self.agent._emit_event(
-                AgentEvent.file_change_started(
-                    item_id=item_id,
-                    tool_call_id=tool_call_id,
-                    changes=[],
-                )
-            )
         key = tool_call_id or f"index:{index}"
         decoder = decoders.setdefault(key, PatchArgumentStreamDecoder())
         try:
-            patch_delta = decoder.push_delta(arguments_delta)
+            decoder.push_delta(arguments_delta)
         except PatchArgumentStreamError as exc:
             self.agent._emit_event(
                 AgentEvent.tool_call_protocol_error(
@@ -604,38 +613,6 @@ class AgentLoop:
                     message=str(exc),
                 )
             )
-            self.agent._emit_event(
-                AgentEvent.file_change_completed(
-                    item_id=item_id,
-                    tool_call_id=tool_call_id,
-                    changes=[],
-                    status="failed",
-                    error=str(exc),
-                )
-            )
-            return
-        if not patch_delta:
-            return
-        next_patch = f"{buffers.get(key, '')}{patch_delta}"
-        buffers[key] = next_patch
-        self.agent._emit_event(
-            AgentEvent.file_change_patch_updated(
-                item_id=item_id,
-                tool_call_id=tool_call_id,
-                changes=self._preview_stream_patch_changes(next_patch),
-                patch_delta=patch_delta,
-                patch_preview=next_patch[-2000:],
-            )
-        )
-
-    def _preview_stream_patch_changes(self, patch: str) -> list[dict[str, Any]]:
-        if runtime_execution_target(self.agent) == "remote_peer":
-            return []
-        workspace_root = runtime_workspace_root(self.agent) or runtime_working_directory(self.agent)
-        result = LocalWorkspaceMutationBackend(workspace_root).preview_text_patch(patch)
-        if result.changes:
-            return [change.to_dict() for change in result.changes]
-        return []
 
     def run(self) -> str:
         """Run the conversation loop."""
@@ -659,6 +636,9 @@ class AgentLoop:
             emit=self.agent._emit_event,
         )
         draft_stream = DocumentDraftLiveStream()
+        draft_runtime.restore_checkpoint(
+            getattr(self.agent, "pending_document_draft_checkpoint", None)
+        )
 
         def _emit_draft_stream_events(events: list[AgentEvent]) -> None:
             for event in events:
@@ -693,8 +673,6 @@ class AgentLoop:
             streamed_reasoning = False
             self._inject_pending_follow_ups()
             patch_decoders: dict[str, PatchArgumentStreamDecoder] = {}
-            patch_buffers: dict[str, str] = {}
-            started_file_changes: set[str] = set()
 
             def _on_token(token: str) -> None:
                 nonlocal streamed_output
@@ -736,8 +714,6 @@ class AgentLoop:
                 if raw_name == "apply_patch":
                     self._emit_apply_patch_stream_delta(
                         patch_decoders,
-                        patch_buffers,
-                        started_file_changes,
                         index=index,
                         tool_call_id=tool_call_id,
                         arguments_delta=arguments_delta,
@@ -777,7 +753,16 @@ class AgentLoop:
                 self.last_interruption_payload = self._stream_interruption_payload(resp)
                 self.agent.state.messages.append(resp.message)
                 _flush_active_draft("interrupted")
-                draft_runtime.cancel_active("provider stream interrupted")
+                checkpoint = draft_runtime.interrupt_active(
+                    "provider stream interrupted",
+                    last_chunk_seq=draft_stream.last_chunk_seq,
+                )
+                if checkpoint is not None:
+                    setattr(
+                        self.agent,
+                        "pending_document_draft_checkpoint",
+                        checkpoint.to_dict(),
+                    )
                 return resp.content
 
             # No tool calls -> done
@@ -786,6 +771,8 @@ class AgentLoop:
                 self.agent.state.messages.append(resp.message)
                 _flush_active_draft("final")
                 draft_runtime.commit_active()
+                if draft_runtime.active is None:
+                    setattr(self.agent, "pending_document_draft_checkpoint", None)
                 return resp.content
 
             # Tool calls -> execute
@@ -807,7 +794,8 @@ class AgentLoop:
                 tc = resp.tool_calls[0]
                 result = self.agent._executor.execute(tc, index=0)
                 if tc.name == "draft_document_begin":
-                    draft_runtime.begin_from_tool_result(result)
+                    if draft_runtime.begin_from_tool_result(result) is not None:
+                        setattr(self.agent, "pending_document_draft_checkpoint", None)
                 refresh_assistant_tool_call_message()
                 self.agent.state.messages.append(
                     {
@@ -827,7 +815,8 @@ class AgentLoop:
                             return "(stopped by cancellation request)"
                         result = self.agent._executor.execute(tc, index=tool_index)
                         if tc.name == "draft_document_begin":
-                            draft_runtime.begin_from_tool_result(result)
+                            if draft_runtime.begin_from_tool_result(result) is not None:
+                                setattr(self.agent, "pending_document_draft_checkpoint", None)
                         refresh_assistant_tool_call_message()
                         self.agent.state.messages.append(
                             {
@@ -847,7 +836,8 @@ class AgentLoop:
                     refresh_assistant_tool_call_message()
                     for tc, result in zip(resp.tool_calls, results):
                         if tc.name == "draft_document_begin":
-                            draft_runtime.begin_from_tool_result(result)
+                            if draft_runtime.begin_from_tool_result(result) is not None:
+                                setattr(self.agent, "pending_document_draft_checkpoint", None)
                         self.agent.state.messages.append(
                             {
                                 "role": "tool",

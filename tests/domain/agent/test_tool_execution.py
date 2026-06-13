@@ -1,5 +1,7 @@
 ﻿"""Tests for ToolExecutor, including CWD sync behaviour."""
 
+import json
+from pathlib import Path
 import time
 import threading
 from types import SimpleNamespace
@@ -30,6 +32,55 @@ from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
+
+
+_CONTRACT_FIXTURE = Path(__file__).parents[2] / "fixtures" / "apply_patch_contract.json"
+
+
+def _load_patch_contract_fixture() -> dict:
+    return json.loads(_CONTRACT_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _patch_text(item: dict) -> str:
+    return "\n".join(item["patch"])
+
+
+def _write_fixture_files(root: Path, setup: dict[str, str]) -> None:
+    for relative_path, content in setup.items():
+        target = root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, newline="")
+
+
+def _remote_apply_patch_candidate(plan_id: str = "plan-1") -> dict:
+    preview_identity = {
+        "plan_id": plan_id,
+        "candidate_hash": f"{plan_id}-candidate",
+        "tool_name": "apply_patch",
+        "workspace_id": "/tmp",
+        "execution_target": "remote_peer",
+        "path_space": "remote_peer_workspace",
+        "args_hash": f"{plan_id}-args",
+    }
+    return {
+        "plan_id": plan_id,
+        "tool_name": "apply_patch",
+        "workspace_id": "/tmp",
+        "execution_target": "remote_peer",
+        "path_space": "remote_peer_workspace",
+        "args_hash": preview_identity["args_hash"],
+        "operations": [
+            {
+                "kind": "add",
+                "path": "docs/a.md",
+                "new_content": "# A\n",
+            }
+        ],
+        "changes": [{"path": "docs/a.md", "kind": "add", "diff": "+# A\n"}],
+        "diff": "+# A\n",
+        "candidate_hash": preview_identity["candidate_hash"],
+        "preview_identity": preview_identity,
+    }
 
 
 class _ShellToolStub:
@@ -315,7 +366,16 @@ def test_after_tool_legacy_context_includes_runtime_boundaries() -> None:
     tc = ToolCall(
         id="call_write",
         name="apply_patch",
-        arguments={"patch": "*** Begin Patch\n*** End Patch"},
+        arguments={
+            "patch": "\n".join(
+                [
+                    "*** Begin Patch",
+                    "*** Add File: notes.md",
+                    "+hello",
+                    "*** End Patch",
+                ]
+            )
+        },
     )
     executor.execute(tc)
 
@@ -1062,6 +1122,610 @@ def test_tool_executor_preflight_failure_emits_end_only_with_index_and_diagnosti
     diagnostics = tool_events[0].data["meta"]["tool_diagnostics"]
     assert diagnostics[0]["code"] == "preflight_failed"
     assert diagnostics[0]["severity"] == "error"
+
+
+def test_apply_patch_contract_preflight_failure_does_not_emit_file_change_or_approval() -> None:
+    class ApprovalProvider:
+        requests = []
+
+        def request_approval(self, request):  # noqa: ARG002
+            raise AssertionError("invalid apply_patch must not request approval")
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(ApplyPatchTool())
+            self.events = []
+            self.approval_provider = ApprovalProvider()
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            raise AssertionError("invalid apply_patch must stop before permission")
+
+    agent = RecordingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call_invalid_patch",
+            name="apply_patch",
+            arguments={
+                "patch": "\n".join(
+                    [
+                        "*** Begin Patch",
+                        "*** File: src/app.py",
+                        "*** Action: Update",
+                        "@@",
+                        "-old",
+                        "+new",
+                        "*** End Patch",
+                    ]
+                )
+            },
+        ),
+        index=5,
+    )
+
+    assert "unexpected patch line: *** File: src/app.py" in result
+    assert "*** Update File:" in result
+    assert "*** File:" in result
+    assert agent.approval_provider.requests == []
+    assert [
+        event.event_type
+        for event in agent.events
+        if event.event_type
+        in {
+            AgentEventType.TOOL_ARGUMENTS_COMPLETE,
+            AgentEventType.TOOL_ARGUMENTS_INVALID,
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.TOOL_CALL_END,
+            AgentEventType.FILE_CHANGE_STARTED,
+            AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED,
+            AgentEventType.FILE_CHANGE_COMPLETED,
+        }
+    ] == [
+        AgentEventType.TOOL_ARGUMENTS_COMPLETE,
+        AgentEventType.TOOL_ARGUMENTS_INVALID,
+        AgentEventType.TOOL_CALL_END,
+    ]
+    diagnostics = agent.events[-1].data["meta"]["tool_diagnostics"]
+    assert diagnostics[0]["code"] == "preflight_failed"
+
+
+def test_apply_patch_valid_preview_candidate_precedes_file_change_started(tmp_path) -> None:
+    class CaptureTool:
+        name = "apply_patch"
+        description = "Write a file"
+        parameters = ApplyPatchTool.parameters
+        tool_source = "builtin"
+
+        def execute(self, **kwargs) -> str:  # noqa: ARG002
+            return "Applied patch"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            super().__init__(CaptureTool())
+            self.events = []
+            self.runtime_workspace_root = str(tmp_path)
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Add File: src/app.py",
+            "+print('ok')",
+            "*** End Patch",
+        ]
+    )
+    agent = RecordingAgent()
+
+    result = ToolExecutor(agent).execute(
+        ToolCall(id="call_valid_patch", name="apply_patch", arguments={"patch": patch}),
+        index=6,
+    )
+
+    assert result == "Applied patch"
+    event_types = [
+        event.event_type
+        for event in agent.events
+        if event.event_type
+        in {
+            AgentEventType.TOOL_ARGUMENTS_COMPLETE,
+            AgentEventType.TOOL_ARGUMENTS_VALID,
+            AgentEventType.MUTATION_PREVIEWING,
+            AgentEventType.MUTATION_PREVIEW_READY,
+            AgentEventType.FILE_CHANGE_STARTED,
+            AgentEventType.TOOL_CALL_START,
+            AgentEventType.FILE_CHANGE_COMPLETED,
+            AgentEventType.TOOL_CALL_END,
+        }
+    ]
+    assert event_types == [
+        AgentEventType.TOOL_ARGUMENTS_COMPLETE,
+        AgentEventType.TOOL_ARGUMENTS_VALID,
+        AgentEventType.MUTATION_PREVIEWING,
+        AgentEventType.MUTATION_PREVIEW_READY,
+        AgentEventType.FILE_CHANGE_STARTED,
+        AgentEventType.TOOL_CALL_START,
+        AgentEventType.FILE_CHANGE_COMPLETED,
+        AgentEventType.TOOL_CALL_END,
+    ]
+    preview_ready = next(
+        event for event in agent.events
+        if event.event_type is AgentEventType.MUTATION_PREVIEW_READY
+    )
+    assert preview_ready.data["item_id"] == "file-change:call_valid_patch"
+    assert preview_ready.data["changes"][0]["path"] == "src/app.py"
+
+
+def test_apply_patch_preview_identity_tracks_current_args_without_tool_call_id(tmp_path) -> None:
+    class CaptureTool:
+        name = "apply_patch"
+        description = "Write a file"
+        parameters = ApplyPatchTool.parameters
+        tool_source = "builtin"
+
+        def __init__(self) -> None:
+            self.executions: list[dict] = []
+
+        def execute(self, **kwargs) -> str:
+            self.executions.append(dict(kwargs))
+            return "Applied patch"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            self.tool = CaptureTool()
+            super().__init__(self.tool)
+            self.events = []
+            self.runtime_workspace_root = str(tmp_path)
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+    agent = RecordingAgent()
+    executor = ToolExecutor(agent)
+    patch_a = "*** Begin Patch\n*** Add File: a.txt\n+A\n*** End Patch"
+    patch_b = "*** Begin Patch\n*** Add File: b.txt\n+B\n*** End Patch"
+
+    assert executor.execute(
+        ToolCall(id=None, name="apply_patch", arguments={"patch": patch_a}),
+        index=0,
+    ) == "Applied patch"
+    assert executor.execute(
+        ToolCall(id=None, name="apply_patch", arguments={"patch": patch_b}),
+        index=0,
+    ) == "Applied patch"
+    assert executor.execute(
+        ToolCall(id=None, name="apply_patch", arguments={"patch": patch_a}),
+        index=0,
+    ) == "Applied patch"
+
+    preview_ready = [
+        event for event in agent.events
+        if event.event_type is AgentEventType.MUTATION_PREVIEW_READY
+    ]
+    file_change_started = [
+        event for event in agent.events
+        if event.event_type is AgentEventType.FILE_CHANGE_STARTED
+    ]
+    assert [event.data["changes"][0]["path"] for event in preview_ready] == [
+        "a.txt",
+        "b.txt",
+        "a.txt",
+    ]
+    assert [event.data["changes"][0]["path"] for event in file_change_started] == [
+        "a.txt",
+        "b.txt",
+        "a.txt",
+    ]
+    assert preview_ready[0].data["item_id"] != preview_ready[1].data["item_id"]
+    assert preview_ready[0].data["item_id"] != preview_ready[2].data["item_id"]
+
+
+def test_apply_patch_preview_ready_requires_save_candidate_before_approval_or_execute(tmp_path) -> None:
+    from reuleauxcoder.domain.files import FileChange, FileMutationResult
+
+    class CaptureTool:
+        name = "apply_patch"
+        description = "Write a file"
+        parameters = ApplyPatchTool.parameters
+        tool_source = "builtin"
+
+        def __init__(self) -> None:
+            self.executions: list[dict] = []
+
+        def execute(self, **kwargs) -> str:
+            self.executions.append(dict(kwargs))
+            return "should not execute"
+
+        def preflight_validate(self, **kwargs) -> None:  # noqa: ARG002
+            return None
+
+    class MissingCandidateBackend:
+        workspace_id = str(tmp_path)
+        execution_target = "remote_peer"
+        path_space = "remote_peer_workspace"
+
+        def preview_text_patch(self, patch: str) -> FileMutationResult:  # noqa: ARG002
+            return FileMutationResult(
+                status="in_progress",
+                changes=(FileChange(path="a.txt", kind="add", diff="+A"),),
+                diff="+A",
+                message="Preview apply_patch",
+            )
+
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.allow_once("approved")
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self) -> None:
+            self.tool = CaptureTool()
+            super().__init__(self.tool)
+            self.events = []
+            self.approval_provider = ApprovalProvider()
+            self.workspace_mutation_backend = MissingCandidateBackend()
+            self.runtime_workspace_root = str(tmp_path)
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason="review apply_patch",
+            )
+
+    agent = RecordingAgent()
+    result = ToolExecutor(agent).execute(
+        ToolCall(
+            id="call_empty_state",
+            name="apply_patch",
+            arguments={"patch": "*** Begin Patch\n*** Add File: a.txt\n+A\n*** End Patch"},
+        ),
+        index=0,
+    )
+
+    assert "approved_save_candidate" in result
+    assert agent.approval_provider.requests == []
+    assert agent.tool.executions == []
+    assert AgentEventType.FILE_CHANGE_STARTED not in [
+        event.event_type for event in agent.events
+    ]
+
+
+def test_apply_patch_remote_permission_allow_carries_save_candidate_to_execute() -> None:
+    from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
+    from labrastro_server.interfaces.http.remote.protocol import (
+        ExecToolResult,
+        RegisterRequest,
+        RelayEnvelope,
+        ToolPreviewResult,
+    )
+    from labrastro_server.relay.server import RelayServer
+    from reuleauxcoder.extensions.tools.backend import ExecutionContext
+
+    srv = RelayServer()
+    received: list[tuple[str, object]] = []
+    preview_calls: list[dict] = []
+
+    def mock_send(peer_id: str, envelope: object) -> None:
+        received.append((peer_id, envelope))
+
+    srv._send_fn = mock_send
+    srv.start()
+    try:
+        resp = srv._on_register(
+            RegisterRequest(
+                bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                cwd="/tmp",
+                features=["tool_preview"],
+            )
+        )
+
+        class PreviewingRemoteBackend(RemoteRelayToolBackend):
+            def preview_tool(self, tool_name, args):
+                preview_calls.append({"tool_name": tool_name, "args": dict(args)})
+                candidate = _remote_apply_patch_candidate("tool-executor-plan")
+                return ToolPreviewResult(
+                    ok=True,
+                    sections=[{"path": "docs/a.md", "change_kind": "add"}],
+                    meta={
+                        "preview_identity": candidate["preview_identity"],
+                        "approved_save_candidate": candidate,
+                    },
+                )
+
+        backend = PreviewingRemoteBackend(
+            relay_server=srv,
+            context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+        )
+        tool = ApplyPatchTool(backend=backend)
+
+        class RecordingAgent(_AgentStub):
+            def __init__(self) -> None:
+                super().__init__(tool)
+                self.events = []
+                self.workspace_mutation_backend = backend
+
+            def _emit_event(self, event) -> None:
+                self.events.append(event)
+
+            def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+                return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
+
+        agent = RecordingAgent()
+        patch = "*** Begin Patch\n*** Add File: docs/a.md\n+# A\n*** End Patch"
+
+        import threading
+        import time
+
+        holder: dict[str, object] = {}
+
+        def run_execute() -> None:
+            holder["result"] = ToolExecutor(agent).execute(
+                ToolCall(
+                    id="call_remote_direct_allow",
+                    name="apply_patch",
+                    arguments={"patch": patch},
+                ),
+                index=0,
+            )
+
+        t = threading.Thread(target=run_execute)
+        t.start()
+        time.sleep(0.1)
+
+        assert preview_calls == [{"tool_name": "apply_patch", "args": {"patch": patch}}]
+        assert len(received) == 1
+        env = received[0][1]
+        try:
+            assert ("expected" + "_state") not in env.payload
+            assert env.payload["preview_identity"]["plan_id"] == "tool-executor-plan"
+            assert env.payload["approved_save_candidate"]["operations"] == [
+                {"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}
+            ]
+        finally:
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="Applied patch").to_dict(),
+                ),
+            )
+        t.join(timeout=2)
+
+        assert holder["result"] == "Applied patch"
+        assert any(
+            event.event_type is AgentEventType.MUTATION_PREVIEW_READY
+            for event in agent.events
+        )
+    finally:
+        srv.stop()
+
+
+def test_apply_patch_remote_approval_allow_carries_save_candidate_to_execute() -> None:
+    from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
+    from labrastro_server.interfaces.http.remote.protocol import (
+        ExecToolResult,
+        RegisterRequest,
+        RelayEnvelope,
+        ToolPreviewResult,
+    )
+    from labrastro_server.relay.server import RelayServer
+    from reuleauxcoder.extensions.tools.backend import ExecutionContext
+
+    srv = RelayServer()
+    received: list[tuple[str, object]] = []
+    preview_calls: list[dict] = []
+
+    def mock_send(peer_id: str, envelope: object) -> None:
+        received.append((peer_id, envelope))
+
+    srv._send_fn = mock_send
+    srv.start()
+    try:
+        resp = srv._on_register(
+            RegisterRequest(
+                bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                cwd="/tmp",
+                features=["tool_preview"],
+            )
+        )
+
+        class PreviewingRemoteBackend(RemoteRelayToolBackend):
+            def preview_tool(self, tool_name, args):
+                preview_calls.append({"tool_name": tool_name, "args": dict(args)})
+                candidate = _remote_apply_patch_candidate("approval-plan")
+                return ToolPreviewResult(
+                    ok=True,
+                    sections=[{"path": "docs/a.md", "change_kind": "add"}],
+                    meta={
+                        "preview_identity": candidate["preview_identity"],
+                        "approved_save_candidate": candidate,
+                    },
+                )
+
+        class ApprovalProvider:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def request_approval(self, request):
+                self.requests.append(request)
+                candidate = json.loads(
+                    json.dumps(request.metadata["approved_save_candidate"])
+                )
+                candidate["operations"][0]["new_content"] = "# Approved\n"
+                return ApprovalDecision.allow_once(
+                    "approved",
+                    meta={"approved_save_candidate": candidate},
+                )
+
+        backend = PreviewingRemoteBackend(
+            relay_server=srv,
+            context=ExecutionContext(peer_id=resp.peer_id, cwd="/tmp"),
+        )
+        tool = ApplyPatchTool(backend=backend)
+
+        class RecordingAgent(_AgentStub):
+            def __init__(self) -> None:
+                super().__init__(tool)
+                self.events = []
+                self.approval_provider = ApprovalProvider()
+                self.workspace_mutation_backend = backend
+
+            def _emit_event(self, event) -> None:
+                self.events.append(event)
+
+            def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+                return PermissionDecision(
+                    action=PermissionAction.REQUIRE_APPROVAL,
+                    authorized=True,
+                    reason="review apply_patch",
+                )
+
+        agent = RecordingAgent()
+        patch = "*** Begin Patch\n*** Add File: docs/a.md\n+# A\n*** End Patch"
+
+        import threading
+        import time
+
+        holder: dict[str, object] = {}
+
+        def run_execute() -> None:
+            holder["result"] = ToolExecutor(agent).execute(
+                ToolCall(
+                    id="call_remote_approval_allow",
+                    name="apply_patch",
+                    arguments={"patch": patch},
+                ),
+                index=0,
+            )
+
+        t = threading.Thread(target=run_execute)
+        t.start()
+        time.sleep(0.1)
+
+        assert preview_calls == [{"tool_name": "apply_patch", "args": {"patch": patch}}]
+        assert len(agent.approval_provider.requests) == 1
+        approval_request = agent.approval_provider.requests[0]
+        assert approval_request.metadata["preview_identity"]["plan_id"] == "approval-plan"
+        assert approval_request.metadata["approved_save_candidate"]["operations"] == [
+            {"kind": "add", "path": "docs/a.md", "new_content": "# A\n"}
+        ]
+        assert len(received) == 1
+        env = received[0][1]
+        try:
+            assert ("expected" + "_state") not in env.payload
+            assert env.payload["preview_identity"]["plan_id"] == "approval-plan"
+            assert env.payload["approved_save_candidate"]["operations"] == [
+                {"kind": "add", "path": "docs/a.md", "new_content": "# Approved\n"}
+            ]
+        finally:
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="Applied patch").to_dict(),
+                ),
+            )
+        t.join(timeout=2)
+
+        assert holder["result"] == "Applied patch"
+    finally:
+        srv.stop()
+
+
+def test_apply_patch_semantic_preview_failures_stop_before_approval_execute_and_file_change(tmp_path) -> None:
+    class RecordingApplyPatchTool(ApplyPatchTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.executions: list[dict] = []
+
+        def execute(self, **kwargs) -> str:
+            self.executions.append(dict(kwargs))
+            raise AssertionError("semantic preview failures must not execute")
+
+    class ApprovalProvider:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return ApprovalDecision.deny_once("approval should not be requested")
+
+    class RecordingAgent(_AgentStub):
+        def __init__(self, workspace: Path) -> None:
+            self.tool = RecordingApplyPatchTool()
+            super().__init__(self.tool)
+            self.events = []
+            self.approval_provider = ApprovalProvider()
+            self.runtime_workspace_root = str(workspace)
+
+        def _emit_event(self, event) -> None:
+            self.events.append(event)
+
+        def evaluate_tool_permission(self, tool, *, tool_call=None, action="execute"):  # noqa: ARG002
+            return PermissionDecision(
+                action=PermissionAction.REQUIRE_APPROVAL,
+                authorized=True,
+                reason="apply_patch requires approval",
+            )
+
+    contract = _load_patch_contract_fixture()
+    for item in contract["semantic_invalid"]:
+        workspace = tmp_path / item["name"]
+        workspace.mkdir(parents=True)
+        _write_fixture_files(workspace, item["setup"])
+        agent = RecordingAgent(workspace)
+
+        result = ToolExecutor(agent).execute(
+            ToolCall(
+                id=f"call_{item['name']}",
+                name="apply_patch",
+                arguments={"patch": _patch_text(item)},
+            ),
+            index=7,
+        )
+
+        event_types = [event.event_type for event in agent.events]
+        assert item["error_contains"] in result, item["name"]
+        assert agent.approval_provider.requests == [], item["name"]
+        assert agent.tool.executions == [], item["name"]
+        assert AgentEventType.TOOL_ARGUMENTS_VALID in event_types
+        assert AgentEventType.MUTATION_PREVIEW_FAILED in event_types
+        assert AgentEventType.MUTATION_PREVIEW_READY not in event_types
+        assert AgentEventType.FILE_CHANGE_STARTED not in event_types
+        assert AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED not in event_types
+        assert AgentEventType.TOOL_CALL_START not in event_types
+        preview_failed = next(
+            event for event in agent.events
+            if event.event_type is AgentEventType.MUTATION_PREVIEW_FAILED
+        )
+        assert item["error_contains"] in preview_failed.data["error"]
 
 
 def test_tool_executor_approval_deny_emits_end_only_with_index_and_failure_meta() -> None:

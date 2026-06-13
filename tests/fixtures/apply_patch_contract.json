@@ -1,0 +1,235 @@
+{
+  "valid": [
+    {
+      "name": "add_file",
+      "setup": {},
+      "patch": [
+        "*** Begin Patch",
+        "*** Add File: notes.md",
+        "+# Notes",
+        "+",
+        "+Hello",
+        "*** End Patch"
+      ],
+      "expected_changes": [
+        { "path": "notes.md", "kind": "add" }
+      ]
+    },
+    {
+      "name": "update_file",
+      "setup": {
+        "src/app.py": "print(\"Hi\")\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: src/app.py",
+        "@@",
+        "-print(\"Hi\")",
+        "+print(\"Hello\")",
+        "*** End Patch"
+      ],
+      "expected_changes": [
+        { "path": "src/app.py", "kind": "update" }
+      ]
+    },
+    {
+      "name": "delete_file",
+      "setup": {
+        "obsolete.txt": "old\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Delete File: obsolete.txt",
+        "*** End Patch"
+      ],
+      "expected_changes": [
+        { "path": "obsolete.txt", "kind": "delete" }
+      ]
+    },
+    {
+      "name": "move_file",
+      "setup": {
+        "src/old.py": "name = \"old\"\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: src/old.py",
+        "*** Move to: src/new.py",
+        "@@",
+        "-name = \"old\"",
+        "+name = \"new\"",
+        "*** End Patch"
+      ],
+      "expected_changes": [
+        { "path": "src/old.py", "kind": "move", "move_path": "src/new.py" }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "file_action_headers",
+      "setup": {
+        "src/app.py": "old\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** File: src/app.py",
+        "*** Action: Update",
+        "@@",
+        "-old",
+        "+new",
+        "*** End Patch"
+      ],
+      "error_contains": "unexpected patch line: *** File: src/app.py"
+    },
+    {
+      "name": "unified_diff_headers",
+      "setup": {
+        "src/app.py": "old\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "--- a/src/app.py",
+        "+++ b/src/app.py",
+        "@@",
+        "-old",
+        "+new",
+        "*** End Patch"
+      ],
+      "error_contains": "unexpected patch line: --- a/src/app.py"
+    },
+    {
+      "name": "missing_end_patch",
+      "setup": {
+        "src/app.py": "old\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: src/app.py",
+        "@@",
+        "-old",
+        "+new"
+      ],
+      "error_contains": "patch must end with *** End Patch"
+    },
+    {
+      "name": "add_file_without_plus",
+      "setup": {},
+      "patch": [
+        "*** Begin Patch",
+        "*** Add File: bad.txt",
+        "missing-plus",
+        "*** End Patch"
+      ],
+      "error_contains": "Add File lines must start with +"
+    },
+    {
+      "name": "update_without_hunk",
+      "setup": {
+        "src/app.py": "old\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: src/app.py",
+        "-old",
+        "+new",
+        "*** End Patch"
+      ],
+      "error_contains": "Update File hunks must start with @@"
+    },
+    {
+      "name": "absolute_path",
+      "setup": {},
+      "patch": [
+        "*** Begin Patch",
+        "*** Add File: /tmp/outside.txt",
+        "+bad",
+        "*** End Patch"
+      ],
+      "error_contains": "absolute paths are not allowed: /tmp/outside.txt"
+    }
+  ],
+  "path_invalid": [
+    {
+      "name": "windows_drive_relative_path",
+      "setup": {},
+      "patch": [
+        "*** Begin Patch",
+        "*** Add File: C:foo.txt",
+        "+bad",
+        "*** End Patch"
+      ],
+      "error_contains": "drive-relative paths are not allowed: C:foo.txt"
+    }
+  ],
+  "semantic_invalid": [
+    {
+      "name": "update_missing_file",
+      "setup": {},
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: missing.py",
+        "@@",
+        "-print(1)",
+        "+print(2)",
+        "*** End Patch"
+      ],
+      "error_contains": "file does not exist: missing.py"
+    },
+    {
+      "name": "context_mismatch",
+      "setup": {
+        "src/app.py": "print(\"existing\")\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: src/app.py",
+        "@@",
+        "-line that is not in file",
+        "+replacement",
+        "*** End Patch"
+      ],
+      "error_contains": "patch context does not match file"
+    },
+    {
+      "name": "add_existing_file",
+      "setup": {
+        "existing.md": "already here\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Add File: existing.md",
+        "+new content",
+        "*** End Patch"
+      ],
+      "error_contains": "file already exists: existing.md"
+    },
+    {
+      "name": "delete_missing_file",
+      "setup": {},
+      "patch": [
+        "*** Begin Patch",
+        "*** Delete File: missing.txt",
+        "*** End Patch"
+      ],
+      "error_contains": "file does not exist: missing.txt"
+    },
+    {
+      "name": "move_target_exists",
+      "setup": {
+        "src/old.py": "old\n",
+        "src/existing.py": "target\n"
+      },
+      "patch": [
+        "*** Begin Patch",
+        "*** Update File: src/old.py",
+        "*** Move to: src/existing.py",
+        "@@",
+        "-old",
+        "+new",
+        "*** End Patch"
+      ],
+      "error_contains": "move target already exists: src/existing.py"
+    }
+  ]
+}

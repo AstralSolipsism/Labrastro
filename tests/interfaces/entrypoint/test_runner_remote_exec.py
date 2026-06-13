@@ -84,6 +84,53 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _remote_preview_meta(
+    tool_name: str,
+    *,
+    target_path: str,
+    new_content: str,
+    kind: str = "update",
+) -> dict:
+    preview_identity = {
+        "plan_id": f"{tool_name}-plan",
+        "candidate_hash": f"{tool_name}-candidate",
+        "tool_name": tool_name,
+        "workspace_id": "remote-peer-workspace",
+        "execution_target": "remote_peer",
+        "path_space": "remote_peer_workspace",
+        "args_hash": f"{tool_name}-args",
+    }
+    candidate = {
+        "plan_id": preview_identity["plan_id"],
+        "candidate_hash": preview_identity["candidate_hash"],
+        "tool_name": tool_name,
+        "workspace_id": preview_identity["workspace_id"],
+        "execution_target": preview_identity["execution_target"],
+        "path_space": preview_identity["path_space"],
+        "args_hash": preview_identity["args_hash"],
+        "preview_identity": preview_identity,
+        "operations": [
+            {
+                "kind": kind,
+                "path": target_path,
+                "new_content": new_content,
+            }
+        ],
+        "changes": [
+            {
+                "path": target_path,
+                "kind": kind,
+                "diff": "--- a/demo.txt\n+++ b/demo.txt\n-peer\n+host\n",
+            }
+        ],
+        "diff": "--- a/demo.txt\n+++ b/demo.txt\n-peer\n+host\n",
+    }
+    return {
+        "preview_identity": preview_identity,
+        "approved_save_candidate": candidate,
+    }
+
+
 def test_chat_locale_prompt_append_maps_supported_locales() -> None:
     assert _chat_locale_prompt_append("zh-CN") == (
         "语言要求：所有用户可见的生成内容都必须使用简体中文，包括助手回复、"
@@ -2412,6 +2459,56 @@ class TestRunnerRemoteExec:
             )
             emit(
                 agent,
+                AgentEvent.tool_arguments_complete(
+                    "read_file",
+                    tool_call_id="call-read-1",
+                    index=0,
+                    tool_source="builtin",
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.tool_arguments_valid(
+                    "read_file",
+                    tool_call_id="call-read-1",
+                    index=0,
+                    tool_source="builtin",
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.mutation_preview_ready(
+                    "apply_patch",
+                    item_id="file-change:call-write-1",
+                    tool_call_id="call-write-1",
+                    changes=[{"path": "main.py", "kind": "update"}],
+                    index=1,
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.tool_arguments_invalid(
+                    "apply_patch",
+                    tool_call_id="call-bad-patch",
+                    index=2,
+                    message="Error: invalid apply_patch contract",
+                    code="preflight_failed",
+                ),
+            )
+            emit(
+                agent,
+                AgentEvent.mutation_preview_failed(
+                    "apply_patch",
+                    item_id="file-change:call-semantic-fail",
+                    tool_call_id="call-semantic-fail",
+                    error="file does not exist: missing.py",
+                    failure_code="semantic_preview_failed",
+                    retry_hint="Update an existing workspace-relative file.",
+                    index=3,
+                ),
+            )
+            emit(
+                agent,
                 AgentEvent.tool_call_end(
                     "read_file",
                     long_result,
@@ -2480,10 +2577,45 @@ class TestRunnerRemoteExec:
             assert len(tool_call_delta["payload"].get("arguments_preview", "")) <= 243
             assert tool_call_delta["payload"].get("status") == "preparing"
             assert "arguments_delta" not in tool_call_delta["payload"]
+            observability = [
+                event["payload"]
+                for event in events
+                if event["type"] == "stream_observability"
+            ]
+            assert observability
+            latest_observability = observability[-1]
+            assert latest_observability["schema"] == "stream_observability.v1"
+            assert latest_observability["provider_output_count"] == 1
+            assert latest_observability["provider_reasoning_count"] == 1
+            assert latest_observability["provider_tool_delta_count"] == 1
+            assert latest_observability["last_body_chunk_at"] > 0
+            assert latest_observability["last_reasoning_chunk_at"] > 0
+            assert latest_observability["last_tool_delta_at"] > 0
+            assert latest_observability["patch_syntax_error_count"] == 1
+            assert latest_observability["patch_syntax_error_codes"] == {
+                "preflight_failed": 1
+            }
+            assert latest_observability["patch_semantic_error_count"] == 1
+            assert latest_observability["patch_semantic_error_codes"] == {
+                "semantic_preview_failed": 1
+            }
+            assert latest_observability["server_enqueue_latency_ms"] >= 0
             assert any(
                 event["type"] == "tool_call_start"
                 and event["payload"].get("tool_name") == "read_file"
                 and event["payload"].get("index") == 0
+                for event in events
+            )
+            assert any(
+                event["type"] == "tool_arguments_valid"
+                and event["payload"].get("tool_name") == "read_file"
+                and event["payload"].get("tool_call_id") == "call-read-1"
+                for event in events
+            )
+            assert any(
+                event["type"] == "mutation_preview_ready"
+                and event["payload"].get("item_id") == "file-change:call-write-1"
+                and event["payload"].get("changes") == [{"path": "main.py", "kind": "update"}]
                 for event in events
             )
             assert any(
@@ -2697,8 +2829,11 @@ class TestRunnerRemoteExec:
                     }
                 ],
                 resolved_path=str(tmp_path / "demo.txt"),
-                old_sha256="peer-sha",
-                old_exists=True,
+                meta=_remote_preview_meta(
+                    "apply_patch",
+                    target_path="demo.txt",
+                    new_content="host\n",
+                ),
             )
 
         monkeypatch.setattr(RelayServer, "send_preview_request", fake_preview)
@@ -3173,6 +3308,73 @@ class TestRunnerRemoteExec:
             ]
             assert failed_events[0]["payload"]["code"] == "REMOTE_PREVIEW_EMPTY"
             assert failed_events[0]["payload"]["tool_diagnostics"][0]["stage"] == "chat"
+        finally:
+            runner.cleanup(ctx.agent)
+
+    def test_runner_remote_write_approval_requires_preview_save_candidate(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        def fake_preview(self, peer_id, request, timeout_sec=None):
+            return ToolPreviewResult(
+                ok=True,
+                sections=[
+                    {
+                        "id": "diff",
+                        "title": "Proposed file diff",
+                        "kind": "diff",
+                        "content": "--- a/demo.txt\n+++ b/demo.txt\n-old\n+new\n",
+                        "resolved_path": str(tmp_path / "demo.txt"),
+                    }
+                ],
+            )
+
+        monkeypatch.setattr(RelayServer, "send_preview_request", fake_preview)
+
+        def chat_behavior(agent: FakeAgent, _prompt: str) -> str:
+            agent.approval_provider.request_approval(
+                ApprovalRequest(
+                    tool_name="apply_patch",
+                    tool_args={"file_path": "demo.txt", "content": "host\n"},
+                    tool_source="builtin",
+                    reason="confirm write",
+                    metadata={"tool_call_id": "call-write-missing-candidate"},
+                )
+            )
+            return "unexpected"
+
+        port = _free_port()
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+            load_tools=lambda backend: [SimpleNamespace(name="apply_patch", backend=backend)],
+        )
+        ctx = runner.initialize()
+        try:
+            _, peer_token = _register_peer(
+                runner._relay_http_service.base_url,
+                runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+                str(tmp_path),
+                features=["tool_preview"],
+            )
+            _, start_body = _json_request(
+                "POST",
+                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "write"},
+            )
+            events = _collect_stream_events(
+                runner._relay_http_service.base_url,
+                peer_token,
+                start_body["session_run_id"],
+            )
+
+            assert not any(event["type"] == "approval_request" for event in events)
+            protocol_events = [
+                event for event in events if event["type"] == "tool_call_protocol_error"
+            ]
+            assert protocol_events
+            payload = protocol_events[0]["payload"]
+            assert payload["code"] == "REMOTE_PREVIEW_SAVE_CANDIDATE_REQUIRED"
+            assert "approved_save_candidate" in payload["message"]
         finally:
             runner.cleanup(ctx.agent)
 

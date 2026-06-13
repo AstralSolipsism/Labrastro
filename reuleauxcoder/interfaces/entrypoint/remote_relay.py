@@ -7,6 +7,7 @@ import hashlib
 import json
 import inspect
 from pathlib import Path
+import time
 import uuid
 from typing import Any, Callable
 
@@ -75,7 +76,6 @@ from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
-    ToolMutationPreviewState,
     ToolPreviewResult,
 )
 from labrastro_server.relay.server import RelayServer
@@ -1755,6 +1755,77 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         assistant_stream_parts: list[str] = []
         reasoning_stream_parts: list[str] = []
         context_event_bus = UIEventBus()
+        stream_observability: dict[str, Any] = {
+            "schema": "stream_observability.v1",
+            "provider_output_count": 0,
+            "provider_reasoning_count": 0,
+            "provider_tool_delta_count": 0,
+            "draft_preview_chunk_count": 0,
+            "patch_syntax_error_count": 0,
+            "patch_syntax_error_codes": {},
+            "patch_semantic_error_count": 0,
+            "patch_semantic_error_codes": {},
+        }
+        last_stream_observability_emit_at = {"value": 0.0}
+
+        def _agent_event_payload(event: AgentEvent, payload: dict[str, Any]) -> dict[str, Any]:
+            return {**dict(payload), "emitted_at": event.timestamp}
+
+        def _append_agent_event(
+            event: AgentEvent,
+            event_type: str,
+            payload: dict[str, Any],
+            *,
+            live_only: bool = False,
+        ) -> None:
+            data = _agent_event_payload(event, payload)
+            if live_only:
+                remote_session.append_live_event(event_type, data)
+                return
+            remote_session.append_event(event_type, data)
+
+        def _emit_stream_observability(reason: str, *, force: bool = False) -> None:
+            now = time.time()
+            if not force and now - last_stream_observability_emit_at["value"] < 1.0:
+                return
+            last_stream_observability_emit_at["value"] = now
+            remote_session.append_event(
+                "stream_observability",
+                {
+                    **stream_observability,
+                    "reason": reason,
+                    "emitted_at": now,
+                },
+            )
+
+        def _record_patch_syntax_error(payload: dict[str, Any]) -> None:
+            if str(payload.get("tool_name") or "") != "apply_patch":
+                return
+            code = str(payload.get("code") or "patch_syntax_error").strip() or "patch_syntax_error"
+            codes = stream_observability.setdefault("patch_syntax_error_codes", {})
+            if not isinstance(codes, dict):
+                codes = {}
+                stream_observability["patch_syntax_error_codes"] = codes
+            codes[code] = int(codes.get(code, 0) or 0) + 1
+            stream_observability["patch_syntax_error_count"] = (
+                int(stream_observability.get("patch_syntax_error_count", 0) or 0) + 1
+            )
+
+        def _record_patch_semantic_error(payload: dict[str, Any]) -> None:
+            if str(payload.get("tool_name") or "") != "apply_patch":
+                return
+            code = (
+                str(payload.get("failure_code") or payload.get("code") or "semantic_preview_failed").strip()
+                or "semantic_preview_failed"
+            )
+            codes = stream_observability.setdefault("patch_semantic_error_codes", {})
+            if not isinstance(codes, dict):
+                codes = {}
+                stream_observability["patch_semantic_error_codes"] = codes
+            codes[code] = int(codes.get(code, 0) or 0) + 1
+            stream_observability["patch_semantic_error_count"] = (
+                int(stream_observability.get("patch_semantic_error_count", 0) or 0) + 1
+            )
 
         def _append_context_event(event) -> None:
             if event.kind != UIEventKind.CONTEXT:
@@ -1946,10 +2017,41 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 )
             return f"### {title}\n\n{content}"
 
-        def _preview_state(
+        def _preview_save_candidate(preview: ToolPreviewResult) -> dict[str, Any]:
+            candidate = preview.meta.get("approved_save_candidate")
+            if not isinstance(candidate, dict) or not candidate:
+                candidate = preview.meta.get("save_candidate")
+            return dict(candidate) if isinstance(candidate, dict) else {}
+
+        def _missing_preview_save_candidate_fields(
+            tool_name: str,
             preview: ToolPreviewResult,
-        ) -> ToolMutationPreviewState | None:
-            return ToolMutationPreviewState.from_preview(preview)
+        ) -> list[str]:
+            candidate = _preview_save_candidate(preview)
+            if not candidate:
+                return ["approved_save_candidate"]
+            missing: list[str] = []
+            identity = candidate.get("preview_identity")
+            if not isinstance(identity, dict) or not identity:
+                missing.append("preview_identity")
+            else:
+                for key in (
+                    "plan_id",
+                    "candidate_hash",
+                    "tool_name",
+                    "workspace_id",
+                    "execution_target",
+                    "path_space",
+                    "args_hash",
+                ):
+                    if not str(identity.get(key) or "").strip():
+                        missing.append(f"preview_identity.{key}")
+            if candidate.get("tool_name") != tool_name:
+                missing.append("approved_save_candidate.tool_name")
+            operations = candidate.get("operations")
+            if not isinstance(operations, list) or not operations:
+                missing.append("approved_save_candidate.operations")
+            return missing
 
         def _preview_failure_reason(preview: ToolPreviewResult) -> str:
             code = str(preview.error_code or "REMOTE_PREVIEW_FAILED")
@@ -2043,6 +2145,21 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             preview = backend.preview_tool(request.tool_name, _owner_tool_args(request))
             if not preview.ok:
                 return [], preview, _preview_failure_reason(preview)
+            missing_candidate_fields = _missing_preview_save_candidate_fields(
+                request.tool_name,
+                preview,
+            )
+            if missing_candidate_fields and (preview.sections or preview.diff.strip()):
+                raise RemoteToolProtocolError(
+                    tool_name=request.tool_name,
+                    tool_call_id=tool_call_id,
+                    code="REMOTE_PREVIEW_SAVE_CANDIDATE_REQUIRED",
+                    message=(
+                        "remote peer preview must include approved_save_candidate "
+                        "before approval: "
+                        + ", ".join(missing_candidate_fields)
+                    ),
+                )
             if preview.sections:
                 return preview.sections, preview, None
             if preview.diff.strip():
@@ -2184,10 +2301,10 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 if decision == "allow_once":
                     backend = _remote_backend()
                     if backend is not None and preview is not None and preview.ok:
-                        backend.remember_approved_preview(
+                        backend.remember_approved_candidate(
                             request.tool_name,
                             _owner_tool_args(request),
-                            _preview_state(preview),
+                            _preview_save_candidate(preview),
                         )
                     return ApprovalDecision.allow_once(reason)
                 denial_diagnostic = tool_diagnostic_from_failure(
@@ -2237,7 +2354,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
 
         def _on_agent_event(event: AgentEvent) -> None:
             if event.event_type == AgentEventType.SESSION_RUN_START:
-                remote_session.append_event(
+                _append_agent_event(
+                    event,
                     "session_run_start",
                     {
                         "prompt": event.data.get("user_input") or prompt,
@@ -2255,51 +2373,71 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 content = event.data.get("token", "")
                 if content:
                     assistant_stream_parts.append(str(content))
-                    remote_session.append_event(
+                    stream_observability["provider_output_count"] = (
+                        int(stream_observability.get("provider_output_count", 0) or 0) + 1
+                    )
+                    stream_observability["last_body_chunk_at"] = event.timestamp
+                    _append_agent_event(
+                        event,
                         "assistant_delta",
                         {"format": "markdown", "content": content},
                     )
+                    _emit_stream_observability("assistant_delta")
                 return
             if event.event_type == AgentEventType.REASONING_TOKEN:
                 content = event.data.get("token", "")
                 if content:
                     reasoning_stream_parts.append(str(content))
-                    remote_session.append_event(
+                    stream_observability["provider_reasoning_count"] = (
+                        int(stream_observability.get("provider_reasoning_count", 0) or 0) + 1
+                    )
+                    stream_observability["last_reasoning_chunk_at"] = event.timestamp
+                    _append_agent_event(
+                        event,
                         "reasoning_delta",
                         {"format": "markdown", "content": content},
                     )
+                    _emit_stream_observability("reasoning_delta")
                 return
             if event.event_type == AgentEventType.USAGE_UPDATE:
-                remote_session.append_event("usage_update", event.data)
+                _append_agent_event(event, "usage_update", event.data)
                 return
             if event.event_type == AgentEventType.RUNTIME_STATUS:
-                remote_session.append_event("runtime_status", event.data)
+                _append_agent_event(event, "runtime_status", event.data)
                 return
             if event.event_type == AgentEventType.LIFECYCLE_HOOK:
-                remote_session.append_event("lifecycle_hook", event.data)
+                _append_agent_event(event, "lifecycle_hook", event.data)
                 return
             if event.event_type == AgentEventType.SESSION_RUN_END:
                 response = event.data.get("response", "")
                 if event.data.get("render_response", True) and response:
                     _append_final_stream_content(str(response))
+                _emit_stream_observability("session_run_end", force=True)
                 return
             if event.event_type == AgentEventType.PROVIDER_STREAM_INTERRUPTED:
-                remote_session.append_event("provider_stream_interrupted", event.data)
+                _append_agent_event(event, "provider_stream_interrupted", event.data)
+                _emit_stream_observability("provider_stream_interrupted", force=True)
                 return
             if event.event_type == AgentEventType.PROVIDER_STREAM_RECOVERING:
-                remote_session.append_event("provider_stream_recovering", event.data)
+                _append_agent_event(event, "provider_stream_recovering", event.data)
                 return
             if event.event_type == AgentEventType.PROVIDER_STREAM_RECOVERED:
-                remote_session.append_event("provider_stream_recovered", event.data)
+                _append_agent_event(event, "provider_stream_recovered", event.data)
                 return
             if event.event_type == AgentEventType.SESSION_RUN_INTERRUPTED:
                 session_run_interrupted_emitted["value"] = True
                 remote_session.register_recovery(dict(event.data))
                 _append_final_stream_content()
-                remote_session.append_event("session_run_interrupted", event.data)
+                _append_agent_event(event, "session_run_interrupted", event.data)
+                _emit_stream_observability("session_run_interrupted", force=True)
                 return
             if event.event_type == AgentEventType.TOOL_CALL_DELTA:
-                remote_session.append_event(
+                stream_observability["provider_tool_delta_count"] = (
+                    int(stream_observability.get("provider_tool_delta_count", 0) or 0) + 1
+                )
+                stream_observability["last_tool_delta_at"] = event.timestamp
+                _append_agent_event(
+                    event,
                     "tool_call_delta",
                     {
                         "index": event.data.get("index", 0),
@@ -2313,56 +2451,93 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "started_at": event.timestamp,
                     },
                 )
+                _emit_stream_observability("tool_call_delta")
+                return
+            if event.event_type in {
+                AgentEventType.TOOL_ARGUMENTS_COMPLETE,
+                AgentEventType.TOOL_ARGUMENTS_VALID,
+                AgentEventType.TOOL_ARGUMENTS_INVALID,
+                AgentEventType.MUTATION_PREVIEWING,
+                AgentEventType.MUTATION_PREVIEW_READY,
+                AgentEventType.MUTATION_PREVIEW_FAILED,
+            }:
+                if event.event_type == AgentEventType.TOOL_ARGUMENTS_INVALID:
+                    _record_patch_syntax_error(event.data)
+                    _emit_stream_observability("patch_syntax_error", force=True)
+                if event.event_type == AgentEventType.MUTATION_PREVIEW_FAILED:
+                    _record_patch_semantic_error(event.data)
+                    _emit_stream_observability("patch_semantic_error", force=True)
+                _append_agent_event(event, event.event_type.value, event.data)
                 return
             if event.event_type == AgentEventType.FILE_CHANGE_STARTED:
-                remote_session.append_event("file_change_started", event.data)
+                _append_agent_event(event, "file_change_started", event.data)
                 return
             if event.event_type == AgentEventType.FILE_CHANGE_PATCH_UPDATED:
-                remote_session.append_event("file_change_patch_updated", event.data)
+                _append_agent_event(event, "file_change_patch_updated", event.data)
                 return
             if event.event_type == AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED:
-                remote_session.append_event("file_change_approval_requested", event.data)
+                _append_agent_event(event, "file_change_approval_requested", event.data)
                 return
             if event.event_type == AgentEventType.FILE_CHANGE_APPROVAL_RESOLVED:
-                remote_session.append_event("file_change_approval_resolved", event.data)
+                _append_agent_event(event, "file_change_approval_resolved", event.data)
                 return
             if event.event_type == AgentEventType.FILE_CHANGE_COMPLETED:
-                remote_session.append_event("file_change_completed", event.data)
+                _append_agent_event(event, "file_change_completed", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_STARTED:
-                remote_session.append_event("document_draft_started", event.data)
+                _append_agent_event(event, "document_draft_started", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_PREVIEW_CHUNK:
                 if event.data.get("content"):
                     draft_content_emitted["value"] = True
-                remote_session.append_live_event("document_draft_preview_chunk", event.data)
+                stream_observability["draft_preview_chunk_count"] = (
+                    int(stream_observability.get("draft_preview_chunk_count", 0) or 0) + 1
+                )
+                if event.data.get("flush_latency_ms") is not None:
+                    stream_observability["last_draft_preview_flush_latency_ms"] = event.data.get(
+                        "flush_latency_ms"
+                    )
+                _append_agent_event(
+                    event,
+                    "document_draft_preview_chunk",
+                    event.data,
+                    live_only=True,
+                )
+                _emit_stream_observability("document_draft_preview_chunk")
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_PROGRESS:
-                remote_session.append_event("document_draft_progress", event.data)
+                _append_agent_event(event, "document_draft_progress", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_SNAPSHOT:
                 if event.data.get("content"):
                     draft_content_emitted["value"] = True
-                remote_session.append_event("document_draft_snapshot", event.data)
+                _append_agent_event(event, "document_draft_snapshot", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_COMMIT_REQUESTED:
-                remote_session.append_event("document_draft_commit_requested", event.data)
+                _append_agent_event(event, "document_draft_commit_requested", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_COMMITTED:
-                remote_session.append_event("document_draft_committed", event.data)
+                _append_agent_event(event, "document_draft_committed", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_FAILED:
-                remote_session.append_event("document_draft_failed", event.data)
+                _append_agent_event(event, "document_draft_failed", event.data)
                 return
             if event.event_type == AgentEventType.DOCUMENT_DRAFT_CANCELLED:
-                remote_session.append_event("document_draft_cancelled", event.data)
+                _append_agent_event(event, "document_draft_cancelled", event.data)
+                return
+            if event.event_type == AgentEventType.DRAFT_BODY_STALLED:
+                _append_agent_event(event, "draft_body_stalled", event.data)
+                return
+            if event.event_type == AgentEventType.DRAFT_INTERRUPTED_RECOVERABLE:
+                _append_agent_event(event, "draft_interrupted_recoverable", event.data)
                 return
             if event.event_type == AgentEventType.TOOL_CALL_START:
                 if event.tool_name and event.tool_call_id:
                     active_tool_calls_by_name.setdefault(event.tool_name, []).append(
                         event.tool_call_id
                     )
-                remote_session.append_event(
+                _append_agent_event(
+                    event,
                     "tool_call_start",
                     {
                         "tool_name": event.tool_name,
@@ -2387,7 +2562,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     candidates = active_tool_calls_by_name.get(event.tool_name)
                     if candidates and event.tool_call_id in candidates:
                         candidates.remove(event.tool_call_id)
-                remote_session.append_event(
+                _append_agent_event(
+                    event,
                     "tool_call_end",
                     {
                         "tool_name": event.tool_name,
@@ -2410,12 +2586,14 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 )
                 return
             elif event.event_type == AgentEventType.ERROR:
-                remote_session.append_event(
-                    "error", {"message": event.error_message or "unknown error"}
+                _append_agent_event(
+                    event,
+                    "error",
+                    {"message": event.error_message or "unknown error"},
                 )
                 return
             elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
-                remote_session.append_event("delegated_run_completed", event.data)
+                _append_agent_event(event, "delegated_run_completed", event.data)
                 return
 
         previous_approval = peer_agent.approval_provider

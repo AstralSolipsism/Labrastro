@@ -154,6 +154,33 @@ def _normalize_session_run_payload(
     return normalized
 
 
+def _payload_with_server_enqueue_metrics(
+    payload: dict[str, Any],
+    now: float,
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized.setdefault("server_enqueued_at", now)
+    emitted_at = _optional_float_metric(
+        normalized.get("emitted_at")
+        if normalized.get("emitted_at") is not None
+        else normalized.get("created_at")
+    )
+    if emitted_at is not None:
+        normalized.setdefault(
+            "server_enqueue_latency_ms",
+            max(0, int(round((now - emitted_at) * 1000))),
+        )
+    return normalized
+
+
+def _optional_float_metric(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 @dataclass
 class _PendingLiveSessionRunEvent:
     key: str
@@ -198,8 +225,14 @@ class _SessionRunEventBuffer:
         "contentSha256",
         "event_id",
         "eventId",
+        "emitted_at",
+        "emittedAt",
+        "draft_preview_chunk_count",
+        "draftPreviewChunkCount",
         "format",
         "final",
+        "flush_latency_ms",
+        "flushLatencyMs",
         "item_id",
         "itemId",
         "last_chunk_seq",
@@ -207,7 +240,34 @@ class _SessionRunEventBuffer:
         "message",
         "message_key",
         "path",
+        "patch_syntax_error_count",
+        "patch_syntax_error_codes",
+        "patchSyntaxErrorCount",
+        "patchSyntaxErrorCodes",
+        "patch_semantic_error_count",
+        "patch_semantic_error_codes",
+        "patchSemanticErrorCount",
+        "patchSemanticErrorCodes",
+        "provider_output_count",
+        "provider_reasoning_count",
+        "provider_tool_delta_count",
+        "providerOutputCount",
+        "providerReasoningCount",
+        "providerToolDeltaCount",
         "reason",
+        "last_body_chunk_at",
+        "lastBodyChunkAt",
+        "last_reasoning_chunk_at",
+        "lastReasoningChunkAt",
+        "last_tool_delta_at",
+        "lastToolDeltaAt",
+        "last_draft_preview_flush_latency_ms",
+        "lastDraftPreviewFlushLatencyMs",
+        "server_enqueued_at",
+        "serverEnqueuedAt",
+        "server_enqueue_latency_ms",
+        "serverEnqueueLatencyMs",
+        "schema",
         "session_id",
         "session_run_id",
         "sessionId",
@@ -626,6 +686,7 @@ class _RemoteSessionRun:
     def _append_event_locked(self, event_type: str, payload: dict[str, Any]) -> int:
         seq = self.seq_next
         self.seq_next += 1
+        payload = _payload_with_server_enqueue_metrics(payload, time.time())
         event = {
             "session_run_id": self.session_run_id,
             "seq": seq,
@@ -649,6 +710,7 @@ class _RemoteSessionRun:
     ) -> int:
         seq = self.seq_next
         self.seq_next += 1
+        payload = _payload_with_server_enqueue_metrics(payload, time.time())
         event = {
             "session_run_id": self.session_run_id,
             "seq": seq,

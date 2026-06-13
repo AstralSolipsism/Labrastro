@@ -58,9 +58,9 @@ func ExecuteWithContext(
 	case "read_file":
 		result = readFile(req.Args, cwd)
 	case "apply_patch":
-		result = applyPatch(req.Args, cwd, req.ExpectedState)
+		result = applyPatch(req.ApprovedSaveCandidate, cwd)
 	case "draft_document_commit":
-		result = draftDocumentCommit(req.Args, cwd, req.ExpectedState)
+		result = draftDocumentCommit(req.ApprovedSaveCandidate, cwd)
 	case "glob":
 		result = globFiles(req.Args, cwd)
 	case "grep":
@@ -93,7 +93,7 @@ func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPr
 			ErrorMessage: fmt.Sprintf("tool %q does not support preview", req.ToolName),
 		}
 	}
-	mutations, err := buildMutationPlan(req.ToolName, req.Args, cwd, nil)
+	mutations, err := buildMutationPlan(req.ToolName, req.Args, cwd)
 	if err != nil {
 		return protocol.ToolPreviewResult{
 			OK:           false,
@@ -137,18 +137,11 @@ func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPr
 		}
 	}
 	first := mutations[0]
-	oldExists := first.oldState.exists
-	oldSize := first.oldState.size
-	oldMTimeNS := first.oldState.mtimeNS
 	originalText, modifiedText := previewTexts(first.oldContent, first.newContent)
 	result := protocol.ToolPreviewResult{
 		OK:           true,
 		Sections:     sections,
 		ResolvedPath: first.resolvedPath,
-		OldSHA256:    first.oldState.sha256,
-		OldExists:    &oldExists,
-		OldSize:      &oldSize,
-		OldMTimeNS:   &oldMTimeNS,
 		Diff:         combinedDiff.String(),
 		OriginalText: originalText,
 		ModifiedText: modifiedText,
@@ -159,10 +152,17 @@ func Preview(req protocol.ToolPreviewRequest, currentCWD string) protocol.ToolPr
 	if result.Meta == nil {
 		result.Meta = map[string]any{}
 	}
-	operations := mutationOperationStates(mutations)
 	result.Meta["plan_id"] = fmt.Sprintf("mutation-%x", sha256.Sum256([]byte(time.Now().String()+first.resolvedPath)))[:41]
-	result.Meta["plan_hash"] = mutationPlanHash(req.ToolName, operations, combinedDiff.String())
-	result.Meta["operations"] = operationStatesAsMaps(operations)
+	candidate := approvedSaveCandidateFromMutations(
+		req.ToolName,
+		req.Args,
+		cwd,
+		result.Meta["plan_id"].(string),
+		mutations,
+		combinedDiff.String(),
+	)
+	result.Meta["preview_identity"] = candidate["preview_identity"]
+	result.Meta["approved_save_candidate"] = candidate
 	return result
 }
 
@@ -564,12 +564,15 @@ func (m fileMutation) diffTitle() string {
 	}
 }
 
-func applyPatch(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
-	mutations, err := buildMutationPlan("apply_patch", args, cwd, expectedState)
+func applyPatch(candidate map[string]any, cwd string) protocol.ExecToolResult {
+	if missing := missingRequiredApprovedSaveCandidate("apply_patch", candidate); len(missing) > 0 {
+		return errorResult(
+			"REMOTE_TOOL_APPROVED_SAVE_CANDIDATE_REQUIRED",
+			"mutation execute missing required approved_save_candidate fields: "+strings.Join(missing, ", "),
+		)
+	}
+	mutations, err := mutationsFromApprovedSaveCandidate(candidate, cwd)
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "stale preview: ") {
-			return errorResult("REMOTE_TOOL_STALE_PREVIEW", strings.TrimPrefix(err.Error(), "stale preview: "))
-		}
 		return errorResult("REMOTE_TOOL_ERROR", err.Error())
 	}
 	if err := applyMutationsTransactionally(mutations); err != nil {
@@ -577,21 +580,22 @@ func applyPatch(args map[string]any, cwd string, expectedState *protocol.ToolMut
 	}
 	var result strings.Builder
 	result.WriteString(fmt.Sprintf("Applied patch (%d file changes)", len(mutations)))
-	for _, mutation := range mutations {
-		if mutation.diff != "" {
-			result.WriteString("\n")
-			result.WriteString(mutation.diff)
-		}
+	if diff := stringFromMap(candidate, "diff"); diff != "" {
+		result.WriteString("\n")
+		result.WriteString(diff)
 	}
 	return protocol.ExecToolResult{OK: true, Result: result.String()}
 }
 
-func draftDocumentCommit(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) protocol.ExecToolResult {
-	mutations, err := buildMutationPlan("draft_document_commit", args, cwd, expectedState)
+func draftDocumentCommit(candidate map[string]any, cwd string) protocol.ExecToolResult {
+	if missing := missingRequiredApprovedSaveCandidate("draft_document_commit", candidate); len(missing) > 0 {
+		return errorResult(
+			"REMOTE_TOOL_APPROVED_SAVE_CANDIDATE_REQUIRED",
+			"mutation execute missing required approved_save_candidate fields: "+strings.Join(missing, ", "),
+		)
+	}
+	mutations, err := mutationsFromApprovedSaveCandidate(candidate, cwd)
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "stale preview: ") {
-			return errorResult("REMOTE_TOOL_STALE_PREVIEW", strings.TrimPrefix(err.Error(), "stale preview: "))
-		}
 		return errorResult("REMOTE_TOOL_ERROR", err.Error())
 	}
 	if err := applyMutationsTransactionally(mutations); err != nil {
@@ -602,6 +606,107 @@ func draftDocumentCommit(args map[string]any, cwd string, expectedState *protoco
 		target = mutations[0].filePath
 	}
 	return protocol.ExecToolResult{OK: true, Result: fmt.Sprintf("Committed document %s", target)}
+}
+
+func missingRequiredApprovedSaveCandidate(toolName string, candidate map[string]any) []string {
+	if candidate == nil {
+		return []string{"approved_save_candidate", "preview_identity", "operations"}
+	}
+	var missing []string
+	if strings.TrimSpace(stringFromMap(candidate, "tool_name")) != toolName {
+		missing = append(missing, "tool_name")
+	}
+	identity, _ := candidate["preview_identity"].(map[string]any)
+	if len(identity) == 0 {
+		missing = append(missing, "preview_identity")
+	} else {
+		for _, key := range []string{
+			"plan_id",
+			"candidate_hash",
+			"tool_name",
+			"workspace_id",
+			"execution_target",
+			"path_space",
+			"args_hash",
+		} {
+			if strings.TrimSpace(stringFromMap(identity, key)) == "" {
+				missing = append(missing, "preview_identity."+key)
+			}
+		}
+	}
+	if _, ok := candidateOperations(candidate); !ok {
+		missing = append(missing, "operations")
+	}
+	return missing
+}
+
+func mutationsFromApprovedSaveCandidate(candidate map[string]any, cwd string) ([]fileMutation, error) {
+	operations, ok := candidateOperations(candidate)
+	if !ok {
+		return nil, fmt.Errorf("approved_save_candidate operations are required")
+	}
+	mutations := make([]fileMutation, 0, len(operations))
+	for _, operation := range operations {
+		kind := strings.TrimSpace(stringFromMap(operation, "kind"))
+		filePath := strings.TrimSpace(stringFromMap(operation, "path"))
+		if filePath == "" {
+			return nil, fmt.Errorf("approved_save_candidate operation path is required")
+		}
+		resolved, err := resolveWorkspaceRelativePath(cwd, filePath)
+		if err != nil {
+			return nil, err
+		}
+		mutation := fileMutation{
+			kind:         kind,
+			filePath:     filePath,
+			movePath:     strings.TrimSpace(stringFromMap(operation, "move_path")),
+			resolvedPath: resolved,
+			newContent:   stringFromMap(operation, "new_content"),
+			diff:         stringFromMap(candidate, "diff"),
+			lineCount:    countLines(stringFromMap(operation, "new_content")),
+		}
+		switch kind {
+		case "add", "update":
+			if _, ok := operation["new_content"]; !ok {
+				return nil, fmt.Errorf("approved_save_candidate operation new_content is required")
+			}
+		case "delete":
+		case "move":
+			if mutation.movePath == "" {
+				return nil, fmt.Errorf("approved_save_candidate move operation move_path is required")
+			}
+			if _, ok := operation["new_content"]; !ok {
+				return nil, fmt.Errorf("approved_save_candidate operation new_content is required")
+			}
+			mutation.moveResolvedPath, err = resolveWorkspaceRelativePath(cwd, mutation.movePath)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported approved_save_candidate operation %q", kind)
+		}
+		mutations = append(mutations, mutation)
+	}
+	return mutations, nil
+}
+
+func candidateOperations(candidate map[string]any) ([]map[string]any, bool) {
+	raw, ok := candidate["operations"].([]any)
+	if !ok || len(raw) == 0 {
+		if typed, ok := candidate["operations"].([]map[string]any); ok && len(typed) > 0 {
+			return typed, true
+		}
+		return nil, false
+	}
+	operations := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		operation, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		operations = append(operations, operation)
+	}
+	return operations, len(operations) > 0
 }
 
 type filePathSnapshot struct {
@@ -626,7 +731,7 @@ func applyMutationsTransactionally(mutations []fileMutation) error {
 func applyMutations(mutations []fileMutation) error {
 	for _, mutation := range mutations {
 		if mutation.kind == "delete" {
-			if err := os.Remove(mutation.resolvedPath); err != nil {
+			if err := removeFileIfPresent(mutation.resolvedPath); err != nil {
 				return err
 			}
 			continue
@@ -642,12 +747,29 @@ func applyMutations(mutations []fileMutation) error {
 			return err
 		}
 		if mutation.kind == "move" && filepath.Clean(mutation.resolvedPath) != filepath.Clean(target) {
-			if err := os.Remove(mutation.resolvedPath); err != nil {
+			if err := removeFileIfPresent(mutation.resolvedPath); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func removeFileIfPresent(path string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if stat.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	if !stat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a file", path)
+	}
+	return os.Remove(path)
 }
 
 func snapshotMutationPaths(mutations []fileMutation) ([]filePathSnapshot, error) {
@@ -672,6 +794,9 @@ func snapshotMutationPaths(mutations []fileMutation) ([]filePathSnapshot, error)
 		}
 		if stat.IsDir() {
 			return fmt.Errorf("%s is a directory", clean)
+		}
+		if !stat.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a file", clean)
 		}
 		data, err := os.ReadFile(clean)
 		if err != nil {
@@ -727,18 +852,18 @@ func lspTool(args map[string]any, cwd string) protocol.ExecToolResult {
 	return protocol.ExecToolResult{OK: true, Result: result}
 }
 
-func buildMutationPlan(toolName string, args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) ([]fileMutation, error) {
+func buildMutationPlan(toolName string, args map[string]any, cwd string) ([]fileMutation, error) {
 	switch toolName {
 	case "apply_patch":
-		return buildPatchMutations(args, cwd, expectedState)
+		return buildPatchMutations(args, cwd)
 	case "draft_document_commit":
-		return buildDocumentCommitMutations(args, cwd, expectedState)
+		return buildDocumentCommitMutations(args, cwd)
 	default:
 		return nil, fmt.Errorf("unsupported mutation tool %q", toolName)
 	}
 }
 
-func buildPatchMutations(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) ([]fileMutation, error) {
+func buildPatchMutations(args map[string]any, cwd string) ([]fileMutation, error) {
 	patch, ok := args["patch"].(string)
 	if !ok || strings.TrimSpace(patch) == "" {
 		return nil, fmt.Errorf("patch must be a non-empty string")
@@ -748,7 +873,7 @@ func buildPatchMutations(args map[string]any, cwd string, expectedState *protoco
 		return nil, err
 	}
 	mutations := make([]fileMutation, 0, len(operations))
-	for index, op := range operations {
+	for _, op := range operations {
 		resolved, err := resolveWorkspaceRelativePath(cwd, op.path)
 		if err != nil {
 			return nil, err
@@ -756,15 +881,6 @@ func buildPatchMutations(args map[string]any, cwd string, expectedState *protoco
 		oldContent, oldState, err := readFileSnapshot(resolved)
 		if err != nil {
 			return nil, err
-		}
-		if expected := expectedOperationState(expectedState, index); expected != nil {
-			if stale := validateExpectedOperationState(expected, oldState, resolved); stale != "" {
-				return nil, fmt.Errorf("stale preview: %s", stale)
-			}
-		} else if expectedState != nil && len(expectedState.Operations) == 0 && index == 0 {
-			if stale := validateExpectedState(expectedState, oldState, resolved); stale != "" {
-				return nil, fmt.Errorf("stale preview: %s", stale)
-			}
 		}
 		mutation := fileMutation{
 			kind:         op.kind,
@@ -832,13 +948,10 @@ func buildPatchMutations(args map[string]any, cwd string, expectedState *protoco
 		mutation.lineCount = countLines(mutation.newContent)
 		mutations = append(mutations, mutation)
 	}
-	if stale := validateExpectedPlanHash("apply_patch", expectedState, mutations); stale != "" {
-		return nil, fmt.Errorf("stale preview: %s", stale)
-	}
 	return mutations, nil
 }
 
-func buildDocumentCommitMutations(args map[string]any, cwd string, expectedState *protocol.ToolMutationPreviewState) ([]fileMutation, error) {
+func buildDocumentCommitMutations(args map[string]any, cwd string) ([]fileMutation, error) {
 	targetPath, ok := args["target_path"].(string)
 	if !ok || strings.TrimSpace(targetPath) == "" {
 		return nil, fmt.Errorf("target_path must be a non-empty string")
@@ -858,15 +971,6 @@ func buildDocumentCommitMutations(args map[string]any, cwd string, expectedState
 	if err != nil {
 		return nil, err
 	}
-	if expected := expectedOperationState(expectedState, 0); expected != nil {
-		if stale := validateExpectedOperationState(expected, oldState, resolved); stale != "" {
-			return nil, fmt.Errorf("stale preview: %s", stale)
-		}
-	} else if expectedState != nil && len(expectedState.Operations) == 0 {
-		if stale := validateExpectedState(expectedState, oldState, resolved); stale != "" {
-			return nil, fmt.Errorf("stale preview: %s", stale)
-		}
-	}
 	if oldState.exists {
 		return nil, fmt.Errorf("draft document target already exists; use apply_patch to modify existing files: %s", targetPath)
 	}
@@ -882,9 +986,6 @@ func buildDocumentCommitMutations(args map[string]any, cwd string, expectedState
 		lineCount:    countLines(content),
 	}
 	mutations := []fileMutation{mutation}
-	if stale := validateExpectedPlanHash("draft_document_commit", expectedState, mutations); stale != "" {
-		return nil, fmt.Errorf("stale preview: %s", stale)
-	}
 	return mutations, nil
 }
 
@@ -1085,7 +1186,10 @@ func resolveWorkspaceRelativePath(cwd, path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("file path must be a non-empty string")
 	}
-	if filepath.IsAbs(path) {
+	if isContractDriveRelativePath(path) {
+		return "", fmt.Errorf("drive-relative paths are not allowed: %s", path)
+	}
+	if isContractAbsolutePath(path) {
 		return "", fmt.Errorf("absolute paths are not allowed: %s", path)
 	}
 	clean := filepath.Clean(path)
@@ -1111,6 +1215,34 @@ func resolveWorkspaceRelativePath(cwd, path string) (string, error) {
 		return "", fmt.Errorf("path escapes workspace root: %s", path)
 	}
 	return resolved, nil
+}
+
+func isContractAbsolutePath(path string) bool {
+	if filepath.IsAbs(path) || strings.HasPrefix(path, "/") || strings.HasPrefix(path, "\\") {
+		return true
+	}
+	if len(path) >= 3 {
+		drive := path[0]
+		if path[1] == ':' && (path[2] == '\\' || path[2] == '/') &&
+			((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')) {
+			return true
+		}
+	}
+	return strings.HasPrefix(path, "//") || strings.HasPrefix(path, "\\\\")
+}
+
+func isContractDriveRelativePath(path string) bool {
+	if len(path) < 2 || path[1] != ':' {
+		return false
+	}
+	drive := path[0]
+	if !((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')) {
+		return false
+	}
+	if len(path) == 2 {
+		return true
+	}
+	return path[2] != '\\' && path[2] != '/'
 }
 
 func resolveMutationPathThroughSymlinks(root, rel string) (string, error) {
@@ -1173,123 +1305,107 @@ func readFileSnapshot(path string) (string, fileState, error) {
 	}, nil
 }
 
-func expectedOperationState(expected *protocol.ToolMutationPreviewState, index int) *protocol.ToolMutationOperationState {
-	if expected == nil || len(expected.Operations) == 0 || index < 0 || index >= len(expected.Operations) {
-		return nil
-	}
-	return &expected.Operations[index]
-}
-
-func validateExpectedOperationState(expected *protocol.ToolMutationOperationState, current fileState, resolvedPath string) string {
-	if expected == nil {
-		return ""
-	}
-	if expected.ResolvedPath != "" && filepath.Clean(expected.ResolvedPath) != filepath.Clean(resolvedPath) {
-		return fmt.Sprintf("approved preview targeted %s, current execution targets %s", expected.ResolvedPath, resolvedPath)
-	}
-	if expected.OldExists != nil && *expected.OldExists != current.exists {
-		return "file changed since approval preview was generated"
-	}
-	if current.exists && expected.OldSHA256 != "" && expected.OldSHA256 != current.sha256 {
-		return "file content changed since approval preview was generated"
-	}
-	if expected.OldSize != nil && current.exists && *expected.OldSize != current.size {
-		return "file size changed since approval preview was generated"
-	}
-	return ""
-}
-
-func validateExpectedPlanHash(toolName string, expected *protocol.ToolMutationPreviewState, mutations []fileMutation) string {
-	if expected == nil || expected.PlanHash == "" || len(expected.Operations) == 0 {
-		return ""
-	}
-	currentHash := mutationPlanHash(toolName, mutationOperationStates(mutations), combinedMutationDiff(mutations))
-	if expected.PlanHash != currentHash {
-		return "approved preview plan no longer matches current file state"
-	}
-	return ""
-}
-
-func validateExpectedState(expected *protocol.ToolMutationPreviewState, current fileState, resolvedPath string) string {
-	if expected == nil {
-		return ""
-	}
-	if expected.ResolvedPath != "" && filepath.Clean(expected.ResolvedPath) != filepath.Clean(resolvedPath) {
-		return fmt.Sprintf("approved preview targeted %s, current execution targets %s", expected.ResolvedPath, resolvedPath)
-	}
-	if expected.OldExists != nil && *expected.OldExists != current.exists {
-		return "file changed since approval preview was generated"
-	}
-	if current.exists && expected.OldSHA256 != "" && expected.OldSHA256 != current.sha256 {
-		return "file content changed since approval preview was generated"
-	}
-	if expected.OldSize != nil && current.exists && *expected.OldSize != current.size {
-		return "file size changed since approval preview was generated"
-	}
-	return ""
-}
-
-func mutationOperationStates(mutations []fileMutation) []protocol.ToolMutationOperationState {
-	states := make([]protocol.ToolMutationOperationState, 0, len(mutations))
+func approvedSaveCandidateFromMutations(
+	toolName string,
+	args map[string]any,
+	cwd string,
+	planID string,
+	mutations []fileMutation,
+	diff string,
+) map[string]any {
+	operations := make([]map[string]any, 0, len(mutations))
+	identityOperations := make([]map[string]any, 0, len(mutations))
 	for _, mutation := range mutations {
-		oldExists := mutation.oldState.exists
-		oldSize := mutation.oldState.size
-		state := protocol.ToolMutationOperationState{
-			Kind:             mutation.kind,
-			Path:             mutation.filePath,
-			MovePath:         mutation.movePath,
-			ResolvedPath:     mutation.resolvedPath,
-			MoveResolvedPath: mutation.moveResolvedPath,
-			OldExists:        &oldExists,
+		operation := map[string]any{
+			"kind": mutation.kind,
+			"path": mutation.filePath,
 		}
-		if mutation.oldState.exists {
-			state.OldSHA256 = mutation.oldState.sha256
-			state.OldSize = &oldSize
+		identityOperation := map[string]any{
+			"kind": mutation.kind,
+			"path": mutation.filePath,
 		}
-		states = append(states, state)
+		if mutation.movePath != "" {
+			operation["move_path"] = mutation.movePath
+			identityOperation["move_path"] = mutation.movePath
+		}
+		if mutation.kind != "delete" {
+			operation["new_content"] = mutation.newContent
+		}
+		operations = append(operations, operation)
+		identityOperations = append(identityOperations, identityOperation)
 	}
-	return states
+	argsHash := stableJSONHash(args)
+	identityPayload := map[string]any{
+		"plan_id":          planID,
+		"tool_name":        toolName,
+		"workspace_id":     cwd,
+		"execution_target": "remote_peer",
+		"path_space":       "remote_peer_workspace",
+		"args_hash":        argsHash,
+		"operations":       identityOperations,
+	}
+	candidateHash := stableJSONHash(identityPayload)
+	previewIdentity := map[string]any{
+		"plan_id":          planID,
+		"candidate_hash":   candidateHash,
+		"tool_name":        toolName,
+		"workspace_id":     cwd,
+		"execution_target": "remote_peer",
+		"path_space":       "remote_peer_workspace",
+		"args_hash":        argsHash,
+	}
+	changes := make([]map[string]any, 0, len(mutations))
+	for _, mutation := range mutations {
+		change := map[string]any{
+			"kind": mutation.kind,
+			"path": mutation.filePath,
+			"diff": mutation.diff,
+		}
+		if mutation.movePath != "" {
+			change["move_path"] = mutation.movePath
+		}
+		changes = append(changes, change)
+	}
+	return map[string]any{
+		"plan_id":          planID,
+		"tool_name":        toolName,
+		"workspace_id":     cwd,
+		"execution_target": "remote_peer",
+		"path_space":       "remote_peer_workspace",
+		"args_hash":        argsHash,
+		"operations":       operations,
+		"changes":          changes,
+		"diff":             diff,
+		"candidate_hash":   candidateHash,
+		"preview_identity": previewIdentity,
+	}
 }
 
-func operationStatesAsMaps(states []protocol.ToolMutationOperationState) []map[string]any {
-	items := make([]map[string]any, 0, len(states))
-	for _, state := range states {
-		item := map[string]any{
-			"kind":          state.Kind,
-			"path":          state.Path,
-			"resolved_path": state.ResolvedPath,
-			"old_exists":    state.OldExists,
-		}
-		if state.MovePath != "" {
-			item["move_path"] = state.MovePath
-		}
-		if state.MoveResolvedPath != "" {
-			item["move_resolved_path"] = state.MoveResolvedPath
-		}
-		if state.OldSHA256 != "" {
-			item["old_sha256"] = state.OldSHA256
-		}
-		if state.OldSize != nil {
-			item["old_size"] = state.OldSize
-		}
-		items = append(items, item)
-	}
-	return items
-}
-
-func mutationPlanHash(toolName string, operations []protocol.ToolMutationOperationState, diff string) string {
-	payload := map[string]any{
-		"tool_name":  toolName,
-		"operations": operationStatesAsMaps(operations),
-		"diff":       diff,
-	}
-	data, err := json.Marshal(payload)
+func stableJSONHash(value any) string {
+	data, err := json.Marshal(value)
 	if err != nil {
-		sum := sha256.Sum256([]byte(fmt.Sprintf("%#v", payload)))
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%#v", value)))
 		return fmt.Sprintf("%x", sum)
 	}
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum)
+}
+
+func stringFromMap(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value := values[key]
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", typed)
+	}
 }
 
 func combinedMutationDiff(mutations []fileMutation) string {
