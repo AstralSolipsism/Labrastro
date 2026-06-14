@@ -525,7 +525,6 @@ class CapabilityPackageConfig:
     state: dict[str, Any] = field(default_factory=dict)
     source_snapshot: dict[str, Any] = field(default_factory=dict)
     manifest: dict[str, Any] = field(default_factory=dict)
-    update_candidate: dict[str, Any] = field(default_factory=dict)
     rollback: dict[str, Any] = field(default_factory=dict)
     upstream_version: str = ""
     last_update: dict[str, Any] = field(default_factory=dict)
@@ -594,9 +593,6 @@ class CapabilityPackageConfig:
             manifest=dict(data.get("manifest") or {})
             if isinstance(data.get("manifest"), dict)
             else {},
-            update_candidate=dict(data.get("update_candidate") or {})
-            if isinstance(data.get("update_candidate"), dict)
-            else {},
             rollback=dict(data.get("rollback") or {})
             if isinstance(data.get("rollback"), dict)
             else {},
@@ -650,8 +646,6 @@ class CapabilityPackageConfig:
             result["source_snapshot"] = dict(self.source_snapshot)
         if self.manifest:
             result["manifest"] = dict(self.manifest)
-        if self.update_candidate:
-            result["update_candidate"] = dict(self.update_candidate)
         if self.rollback:
             result["rollback"] = dict(self.rollback)
         if self.upstream_version:
@@ -703,6 +697,7 @@ class ResolvedCapabilitySet:
     skill_roots: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
     builtin_tool_grants: list[str] = field(default_factory=list)
+    tool_specs: list[dict[str, Any]] = field(default_factory=list)
     credential_refs: list[str] = field(default_factory=list)
     prompt_fragments: list[dict[str, Any]] = field(default_factory=list)
 
@@ -716,6 +711,7 @@ class ResolvedCapabilitySet:
             "skill_roots": list(self.skill_roots),
             "mcp_servers": list(self.mcp_servers),
             "builtin_tool_grants": list(self.builtin_tool_grants),
+            "tool_specs": [dict(item) for item in self.tool_specs],
             "credential_refs": list(self.credential_refs),
             "prompt_fragments": [dict(item) for item in self.prompt_fragments],
         }
@@ -734,9 +730,9 @@ def resolve_capability_refs(
     mcp_servers: list[str] = []
     mcp_tools: list[str] = []
     skills: list[str] = []
-    tools: list[str] = []
     credentials: list[str] = []
     builtin_tool_grants: list[str] = []
+    tool_specs: list[dict[str, Any]] = []
     prompt_fragments: list[dict[str, Any]] = []
     environment_requirements: list[dict[str, Any]] = []
     execution_policies: list[dict[str, Any]] = []
@@ -778,11 +774,22 @@ def resolve_capability_refs(
             )
             if component.kind in {"mcp", "mcp_server"}:
                 mcp_servers.append(component.name)
-                tools.append(component.registry_path or f"mcp:{component.name}")
                 overlay_mcp_servers[component.name] = _mcp_overlay_config(component)
             elif component.kind == "mcp_tool":
-                mcp_tools.append(component.name)
-                tools.append(component.registry_path or f"mcp_tool:{component.name}")
+                target_tool_ref = str(component.registry_path or "").strip()
+                if not _is_server_scoped_mcp_tool_ref(target_tool_ref):
+                    raise ValueError(
+                        f"mcp_tool component '{component.id}' must define registry_path as mcp:<server>:<tool>"
+                    )
+                mcp_tools.append(target_tool_ref)
+                tool_specs.append(
+                    _capability_tool_spec(
+                        package=package,
+                        component=component,
+                        source_type="mcp_tool",
+                        target_tool_ref=target_tool_ref,
+                    )
+                )
             elif component.kind == "skill":
                 skills.append(component.name)
                 path_hint = str(component.config.get("path_hint") or "").strip()
@@ -790,7 +797,15 @@ def resolve_capability_refs(
                     overlay_skill_roots.append(path_hint)
             elif component.kind == "builtin_tool":
                 builtin_tool_grants.append(component.name)
-                tools.append(component.registry_path or f"builtin:{component.name}")
+                target_tool_ref = component.registry_path or f"builtin:{component.name}"
+                tool_specs.append(
+                    _capability_tool_spec(
+                        package=package,
+                        component=component,
+                        source_type="builtin_tool",
+                        target_tool_ref=target_tool_ref,
+                    )
+                )
             elif component.kind == "credential":
                 credentials.append(component.name)
             elif component.kind == "prompt_fragment":
@@ -805,11 +820,11 @@ def resolve_capability_refs(
                     if component.name and value:
                         overlay_env[component.name] = value
     effective_capabilities = {
-        "tools": _dedupe_strings(tools),
         "mcp_servers": _dedupe_strings(mcp_servers),
         "mcp_tools": _dedupe_strings(mcp_tools),
         "skills": _dedupe_strings(skills),
         "builtin_tool_grants": _dedupe_strings(builtin_tool_grants),
+        "tool_specs": _dedupe_tool_specs(tool_specs),
         "environment_requirements": _dedupe_requirements(environment_requirements),
         "prompt_fragments": _dedupe_components(prompt_fragments),
         "env": dict(overlay_env),
@@ -821,12 +836,12 @@ def resolve_capability_refs(
         "packages": resolved_packages,
         "components": _dedupe_components(resolved_components),
         "contributions": _dedupe_components(resolved_contributions),
-        "tools": effective_capabilities["tools"],
         "mcp_servers": _dedupe_strings(mcp_servers),
         "mcp_tools": effective_capabilities["mcp_tools"],
         "skills": _dedupe_strings(skills),
         "skill_roots": _dedupe_strings(overlay_skill_roots),
         "builtin_tool_grants": effective_capabilities["builtin_tool_grants"],
+        "tool_specs": effective_capabilities["tool_specs"],
         "environment_requirements": effective_capabilities["environment_requirements"],
         "prompt_fragments": effective_capabilities["prompt_fragments"],
         "credentials": effective_capabilities["credentials"],
@@ -841,6 +856,7 @@ def resolve_capability_refs(
             "skill_roots": _dedupe_strings(overlay_skill_roots),
             "env": overlay_env,
             "environment_requirements": effective_capabilities["environment_requirements"],
+            "tool_specs": effective_capabilities["tool_specs"],
         },
     }
 
@@ -853,6 +869,11 @@ def _split_component_id(component_id: str) -> tuple[str, str]:
     if sep and kind in CAPABILITY_COMPONENT_KINDS:
         return kind, name
     return "", str(component_id)
+
+
+def _is_server_scoped_mcp_tool_ref(value: str) -> bool:
+    parts = str(value or "").strip().split(":", 2)
+    return len(parts) == 3 and parts[0] == "mcp" and bool(parts[1]) and bool(parts[2])
 
 
 def _string_dict_list(value: Any) -> list[dict[str, str]]:
@@ -1113,6 +1134,89 @@ def _component_execution_policy(
         "risk_level": component.risk_level or package.risk_level,
         "access": component.access,
     }
+
+
+def _capability_tool_spec(
+    *,
+    package: CapabilityPackageConfig,
+    component: CapabilityComponentConfig,
+    source_type: str,
+    target_tool_ref: str,
+) -> dict[str, Any]:
+    policy = _component_execution_policy(component, package=package)
+    config = dict(component.config or {})
+    input_schema = config.get("input_schema") or config.get("parameters")
+    if not isinstance(input_schema, dict):
+        input_schema = {"type": "object", "properties": {}}
+    description = (
+        str(component.description or "").strip()
+        or str(component.summary or "").strip()
+        or str(package.description or "").strip()
+        or f"Capability tool {component.name}"
+    )
+    tool_id = f"capability:{package.id}:{component.id}"
+    metadata = {
+        "package_id": package.id,
+        "component_id": component.id,
+        "source_type": source_type,
+        "target_tool_ref": target_tool_ref,
+        "execution_policy": policy.get("policy", "inherit"),
+        "risk_level": policy.get("risk_level", ""),
+        "access": policy.get("access", ""),
+    }
+    return {
+        "tool_id": tool_id,
+        "name": component.name,
+        "namespace": "capability",
+        "description": description,
+        "input_schema": dict(input_schema),
+        "output_schema": None,
+        "output_strategy": "text",
+        "risk": "capability",
+        "exposure": "deferred",
+        "search_text": "\n".join(
+            item
+            for item in (
+                component.name,
+                component.display_name,
+                description,
+                package.name,
+                package.description,
+                target_tool_ref,
+            )
+            if str(item or "").strip()
+        ),
+        "search_keywords": [component.name, package.id, source_type],
+        "permission": {"policy": str(policy.get("policy") or "inherit")},
+        "mutation": {
+            "modifies_files": False,
+            "preview_required": False,
+            "approved_save_candidate_required": False,
+        },
+        "execution": {
+            "executor_ref": target_tool_ref,
+            "backend_dispatch": True,
+            "supports_parallel": False,
+        },
+        "provider_surface": "function",
+        "source_type": source_type,
+        "target_tool_ref": target_tool_ref,
+        "metadata": {key: value for key, value in metadata.items() if value not in ("", None)},
+    }
+
+
+def _dedupe_tool_specs(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        tool_id = str(value.get("tool_id") or "").strip()
+        if not tool_id or tool_id in seen:
+            continue
+        seen.add(tool_id)
+        result.append(dict(value))
+    return result
 
 
 def _dedupe_policy_records(values: list[dict[str, Any]]) -> list[dict[str, Any]]:

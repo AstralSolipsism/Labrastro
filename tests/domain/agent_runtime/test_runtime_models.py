@@ -224,7 +224,21 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert resolved["skills"] == ["code-review"]
     assert resolved["environment_requirements"][0]["id"] == "envreq:executable:gitnexus"
     assert resolved["environment_requirements"][0]["kind"] == "executable"
-    assert resolved["tools"] == ["mcp:github", "builtin:fetch_capabilities"]
+    assert "tools" not in resolved
+    assert [item["tool_id"] for item in resolved["tool_specs"]] == [
+        "capability:docs:builtin_tool:fetch_capabilities",
+    ]
+    assert resolved["effective_capabilities"]["tool_specs"] == resolved["tool_specs"]
+    assert resolved["capability_overlay"]["tool_specs"] == resolved["tool_specs"]
+    assert all(item.get("source_type") != "mcp_server" for item in resolved["tool_specs"])
+    assert all(item.get("target_tool_ref") != "mcp:github" for item in resolved["tool_specs"])
+    fetch_tool_spec = resolved["tool_specs"][0]
+    assert fetch_tool_spec["name"] == "fetch_capabilities"
+    assert fetch_tool_spec["namespace"] == "capability"
+    assert fetch_tool_spec["source_type"] == "builtin_tool"
+    assert fetch_tool_spec["target_tool_ref"] == "builtin:fetch_capabilities"
+    assert fetch_tool_spec["permission"]["policy"] == "allow"
+    assert fetch_tool_spec["metadata"]["component_id"] == "builtin_tool:fetch_capabilities"
     assert resolved["credentials"] == ["DOCS_TOKEN"]
     assert [component["id"] for component in resolved["components"]] == [
         "mcp:github",
@@ -242,7 +256,7 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert resolved["capability_overlay"]["env"] == {"GITNEXUS_HOME": ".gitnexus"}
     assert resolved["capability_overlay"]["environment_requirements"][0]["id"] == "envreq:executable:gitnexus"
     assert resolved["capability_overlay"]["mcp"]["servers"]["github"]["command"] == "github-mcp-server"
-    assert resolved["effective_capabilities"]["tools"] == resolved["tools"]
+    assert "tools" not in resolved["effective_capabilities"]
     assert resolved["effective_capabilities"]["credentials"] == ["DOCS_TOKEN"]
     assert resolved["effective_capabilities"]["summaries"] == [
         "Fetch documentation evidence for capability package drafts."

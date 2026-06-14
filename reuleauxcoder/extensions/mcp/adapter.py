@@ -3,16 +3,22 @@
 import asyncio
 import concurrent.futures
 import contextvars
+from dataclasses import replace
 
 from reuleauxcoder.extensions.mcp.client import MCPClient
 from reuleauxcoder.extensions.mcp.models import MCPToolInfo
 from reuleauxcoder.extensions.mcp.timeouts import MCP_TOOL_CALL_TIMEOUT_SEC
 from reuleauxcoder.extensions.tools.base import Tool
+from reuleauxcoder.extensions.tools.spec import ToolExposure, ToolRisk, ToolSpec
 
 
 class MCPTool(Tool):
     """Wraps an MCP tool as an internal Tool instance."""
 
+    namespace = "mcp"
+    risk = ToolRisk.CAPABILITY
+    exposure = ToolExposure.DEFERRED
+    permission_policy = "capability"
     tool_source = "mcp"
 
     def __init__(
@@ -30,6 +36,27 @@ class MCPTool(Tool):
                 f"mcp_tool_{tool_info.server_name}_{tool_info.name}_lifecycle_context",
                 default=None,
             )
+        )
+
+    def tool_spec(self) -> ToolSpec:
+        spec = super().tool_spec()
+        server_name = str(self.server_name or "default").strip() or "default"
+        tool_name = str(self._tool_info.name or self.name).strip()
+        tool_id = f"mcp:{server_name}:{tool_name}"
+        metadata = {
+            **dict(spec.metadata),
+            "tool_id": tool_id,
+            "server_name": server_name,
+            "source_type": "local_mcp",
+        }
+        return replace(
+            spec,
+            search_keywords=tuple(
+                item
+                for item in ("mcp", "local", server_name, tool_name)
+                if item
+            ),
+            metadata=metadata,
         )
 
     def bind_lifecycle_context(self, context: dict):

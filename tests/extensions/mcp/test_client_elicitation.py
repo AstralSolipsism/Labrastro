@@ -9,6 +9,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from labrastro_server.interfaces.http.remote.service import _RemoteSessionRun
+from reuleauxcoder.domain.agent.agent import Agent
+from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
+from reuleauxcoder.domain.config.models import ApprovalConfig, Config
+from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.extensions.mcp.adapter import MCPTool
 from reuleauxcoder.extensions.mcp.client import MCPClient, MCP_PROTOCOL_VERSION
 from reuleauxcoder.extensions.mcp.models import MCPToolInfo
@@ -18,6 +22,11 @@ from reuleauxcoder.extensions.mcp.timeouts import (
     MCP_TOOL_CALL_REQUEST_TIMEOUT_SEC,
     MCP_TOOL_CALL_TIMEOUT_SEC,
 )
+from reuleauxcoder.extensions.tools.builtin.capability_execute import (
+    CapabilityExecuteTool,
+)
+from reuleauxcoder.extensions.tools.builtin.tool_search import ToolSearchTool
+from reuleauxcoder.extensions.tools.spec import ToolExposure, ToolRisk
 from reuleauxcoder.interfaces.entrypoint.runner import AppRunner
 from reuleauxcoder.interfaces.events import UIEventBus
 
@@ -353,6 +362,144 @@ def test_mcp_tool_passes_bound_lifecycle_context_to_client_call() -> None:
                 "lifecycle_context": context,
             }
         ]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_mcp_tool_spec_is_deferred_and_server_scoped() -> None:
+    tool = MCPTool(
+        SimpleNamespace(),
+        MCPToolInfo(
+            name="search",
+            description="Search docs",
+            input_schema={"type": "object"},
+            server_name="docs",
+        ),
+        asyncio.new_event_loop(),
+    )
+    try:
+        spec = tool.tool_spec()
+    finally:
+        tool._loop.close()
+
+    assert spec.exposure == ToolExposure.DEFERRED
+    assert spec.risk == ToolRisk.CAPABILITY
+    assert spec.metadata["tool_id"] == "mcp:docs:search"
+    assert spec.metadata["server_name"] == "docs"
+    assert spec.metadata["source_type"] == "local_mcp"
+    assert set(spec.search_keywords) >= {"mcp", "local", "docs", "search"}
+
+
+def test_local_mcp_tools_are_searchable_and_executable_by_tool_id() -> None:
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, Any],
+            *,
+            lifecycle_context: dict[str, Any] | None = None,
+        ) -> str:
+            self.calls.append(
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "lifecycle_context": lifecycle_context,
+                }
+            )
+            return f"{name}:{arguments['query']}"
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    while not loop.is_running():
+        time.sleep(0.01)
+
+    try:
+        client = _FakeClient()
+        docs_tool = MCPTool(
+            client,
+            MCPToolInfo(
+                name="search",
+                description="Search docs",
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+                server_name="docs",
+            ),
+            loop,
+        )
+        github_tool = MCPTool(
+            client,
+            MCPToolInfo(
+                name="search",
+                description="Search repositories",
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+                server_name="github",
+            ),
+            loop,
+        )
+        agent = Agent(
+            llm=SimpleNamespace(),
+            tools=[
+                ToolSearchTool(),
+                CapabilityExecuteTool(),
+                docs_tool,
+                github_tool,
+            ],
+            config=Config(approval=ApprovalConfig(default_mode="allow")),
+        )
+        executor = ToolExecutor(agent)
+
+        assert [
+            item["function"]["name"]
+            for item in agent.tool_exposure_plan().direct_provider_schemas()
+        ] == ["capability_execute", "tool_search"]
+        assert agent.tool_route_plan().get_executor_by_id("mcp:docs:search") is docs_tool
+        assert (
+            agent.tool_route_plan().get_executor_by_id("mcp:github:search")
+            is github_tool
+        )
+
+        search_result = executor.execute(
+            ToolCall(
+                id="search-local-mcp",
+                name="tool_search",
+                arguments={"query": "docs", "max_results": 5},
+            )
+        )
+        search_payload = json.loads(search_result)
+        assert [item["tool_id"] for item in search_payload["results"]] == [
+            "mcp:docs:search"
+        ]
+
+        execute_result = executor.execute(
+            ToolCall(
+                id="exec-local-mcp",
+                name="capability_execute",
+                arguments={
+                    "tool_id": "mcp:docs:search",
+                    "arguments": {"query": "hooks"},
+                },
+            )
+        )
+
+        assert execute_result == "search:hooks"
+        assert client.calls[0]["name"] == "search"
+        assert client.calls[0]["arguments"] == {"query": "hooks"}
+        assert client.calls[0]["lifecycle_context"]["tool_call_id"] == (
+            "exec-local-mcp:mcp:docs:search"
+        )
+        assert client.calls[0]["lifecycle_context"]["tool_name"] == "search"
+        assert client.calls[0]["lifecycle_context"]["mcp_server"] == "docs"
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
@@ -910,7 +1057,11 @@ while True:
     assert request_events[-1]["payload"]["session_run_id"] == "run-live"
     assert request_events[-1]["payload"]["tool_call_id"] == "tool-call-live"
     resolved_events = [event for event in events if event["type"] == "user_input_resolved"]
-    assert resolved_events[-1]["payload"] == {
+    resolved_payload = resolved_events[-1]["payload"]
+    assert {
+        key: resolved_payload[key]
+        for key in ("input_id", "kind", "action", "content", "reason")
+    } == {
         "input_id": request_events[-1]["payload"]["input_id"],
         "kind": "mcp_elicitation",
         "action": "accept",
