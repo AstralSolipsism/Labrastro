@@ -35,6 +35,12 @@ from labrastro_server.services.capability_package_ingest import (
     CapabilitySourceEvidence,
     extract_capability_draft_field_patches,
 )
+from labrastro_server.services.capability_install_candidates import (
+    CapabilityInstallCandidate,
+    CapabilityInstallCandidateBuildResult,
+    build_install_candidate,
+    existing_mcp_server_names,
+)
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRecord,
     ArtifactType,
@@ -114,23 +120,24 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "claimed_title": "能力包生成任务已被 sandbox worker 接收",
         "session_ready_title": "能力包执行环境已就绪",
         "session_ready_with_workdir_title": "能力包执行环境已就绪：{workdir}",
-        "completed_title": "能力包草案生成完成",
-        "failed_title": "能力包草案生成失败",
-        "cancelled_title": "能力包草案生成已取消",
-        "blocked_title": "能力包草案生成被阻断",
-        "start_draft": "开始生成能力包草案",
+        "completed_title": "能力安装候选生成完成",
+        "failed_title": "能力安装候选生成失败",
+        "cancelled_title": "能力安装候选生成已取消",
+        "blocked_title": "能力安装候选生成被阻断",
+        "start_draft": "开始生成能力安装候选",
         "ingest_bound": "能力包生成任务已进入 capability_packager",
         "revision_bound": "能力包修改任务已进入 capability_packager",
-        "draft_ready": "能力包草案 {package_id} 已生成",
-        "revision_approval_reason": "收到修改意见，重新生成草案。",
+        "draft_ready": "能力安装候选 {package_id} 已生成",
+        "candidate_ready": "能力安装候选 {package_id} 已生成",
+        "revision_approval_reason": "收到修改意见，重新生成候选。",
         "install_title": "安装能力包 {package_id}",
-        "revision_ack": "已收到修改意见，重新生成能力包草案。",
-        "revision_requested": "收到修改意见，重新生成能力包草案",
+        "revision_ack": "已收到修改意见，重新生成能力安装候选。",
+        "revision_requested": "收到修改意见，重新生成能力安装候选",
         "revision_requested_with_text": "收到修改意见：{instruction}",
         "install_cancelled": "已取消安装能力包 {package_id}。",
         "install_completed": "能力包 {package_id} 已安装完成。",
         "source_empty": "未能从仓库或文档中抓取到可用于能力包生成的资料。",
-        "source_partial": "部分在线资料读取失败，已继续使用可读取内容生成草案。",
+        "source_partial": "部分在线资料读取失败，已继续使用可读取内容生成候选。",
         "approval_package_title": "能力包",
         "approval_name": "名称",
         "approval_risk": "风险",
@@ -149,16 +156,17 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "approval_deny": "取消",
         "tool_read_source": "读取能力包来源",
         "tool_extract_evidence": "提取能力包证据",
-        "materialize_draft": "组装并校验能力包草案",
+        "materialize_draft": "组装内部字段并校验候选来源",
+        "materialize_candidate": "生成并校验能力安装候选",
         "skill_content_unresolved": "无法定位能力包 Skill 内容",
         "command_evidence_missing": "能力包依赖命令缺少来源证据",
         "source_discovery_incomplete": "能力包来源探索不完整",
         "field_generation_incomplete": "能力包字段生成不完整",
-        "draft_generation_interrupted": "能力包草案生成中断",
-        "draft_field_missing": "能力包草案缺少必要字段",
-        "model_output_incomplete": "模型输出不完整，未能形成能力包草案",
-        "draft_not_produced": "未生成可安装的能力包草案",
-        "draft_invalid": "能力包草案未通过校验",
+        "draft_generation_interrupted": "能力安装候选生成中断",
+        "draft_field_missing": "能力安装候选缺少必要字段",
+        "model_output_incomplete": "模型输出不完整，未能形成能力安装候选",
+        "draft_not_produced": "未生成可安装的能力安装候选",
+        "draft_invalid": "能力安装候选未通过校验",
         "output_truncated_marker": "\n... 内容已从主时间线省略，请打开原始事件查看完整内容 ...\n",
     },
     "en": {
@@ -166,23 +174,24 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "claimed_title": "Capability package generation task accepted by sandbox worker",
         "session_ready_title": "Capability package execution environment ready",
         "session_ready_with_workdir_title": "Capability package execution environment ready: {workdir}",
-        "completed_title": "Capability package draft generation completed",
-        "failed_title": "Capability package draft generation failed",
-        "cancelled_title": "Capability package draft generation cancelled",
-        "blocked_title": "Capability package draft generation blocked",
-        "start_draft": "Starting capability package draft generation",
+        "completed_title": "Capability install candidate generation completed",
+        "failed_title": "Capability install candidate generation failed",
+        "cancelled_title": "Capability install candidate generation cancelled",
+        "blocked_title": "Capability install candidate generation blocked",
+        "start_draft": "Starting capability install candidate generation",
         "ingest_bound": "Capability package generation task entered capability_packager",
         "revision_bound": "Capability package revision task entered capability_packager",
-        "draft_ready": "Capability package draft {package_id} is ready",
-        "revision_approval_reason": "Received revision feedback; regenerating draft.",
+        "draft_ready": "Capability install candidate {package_id} is ready",
+        "candidate_ready": "Capability install candidate {package_id} is ready",
+        "revision_approval_reason": "Received revision feedback; regenerating candidate.",
         "install_title": "Install capability package {package_id}",
-        "revision_ack": "Received revision feedback; regenerating the capability package draft.",
-        "revision_requested": "Revision feedback received; regenerating capability package draft",
+        "revision_ack": "Received revision feedback; regenerating the capability install candidate.",
+        "revision_requested": "Revision feedback received; regenerating capability install candidate",
         "revision_requested_with_text": "Revision feedback received: {instruction}",
         "install_cancelled": "Cancelled installing capability package {package_id}.",
         "install_completed": "Capability package {package_id} installed.",
         "source_empty": "No usable material could be fetched from the repository or documentation for capability package generation.",
-        "source_partial": "Some online material could not be read; continuing with the readable content to generate the draft.",
+        "source_partial": "Some online material could not be read; continuing with the readable content to generate the candidate.",
         "approval_package_title": "Capability package",
         "approval_name": "Name",
         "approval_risk": "Risk",
@@ -201,16 +210,17 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "approval_deny": "Cancel",
         "tool_read_source": "Reading capability package source",
         "tool_extract_evidence": "Extracting capability package evidence",
-        "materialize_draft": "Assembling and validating capability package draft",
+        "materialize_draft": "Assembling internal fields and validating candidate source",
+        "materialize_candidate": "Building and validating capability install candidate",
         "skill_content_unresolved": "Could not resolve capability package Skill content",
         "command_evidence_missing": "Capability package dependency commands lack source evidence",
         "source_discovery_incomplete": "Capability package source discovery is incomplete",
         "field_generation_incomplete": "Capability package field generation is incomplete",
-        "draft_generation_interrupted": "Capability package draft generation was interrupted",
-        "draft_field_missing": "Capability package draft is missing required fields",
-        "model_output_incomplete": "Model output was incomplete and did not form a capability package draft",
-        "draft_not_produced": "No installable capability package draft was produced",
-        "draft_invalid": "Capability package draft did not pass validation",
+        "draft_generation_interrupted": "Capability install candidate generation was interrupted",
+        "draft_field_missing": "Capability install candidate is missing required fields",
+        "model_output_incomplete": "Model output was incomplete and did not form a capability install candidate",
+        "draft_not_produced": "No installable capability install candidate was produced",
+        "draft_invalid": "Capability install candidate did not pass validation",
         "output_truncated_marker": "\n... output omitted from the main timeline; open raw events for the complete content ...\n",
     },
 }
@@ -920,7 +930,7 @@ class CapabilityDraftValidator:
 
 
 class CapabilityPackageInstaller:
-    """Install confirmed drafts into capability package and component config."""
+    """Install confirmed candidates into capability package and component config."""
 
     def __init__(self, *, skill_install_root: str | Path | None = None) -> None:
         self.skill_install_root = Path(
@@ -930,38 +940,102 @@ class CapabilityPackageInstaller:
         ).expanduser()
         self.skill_file_operations: list[CapabilityPackageSkillFileOperation] = []
 
-    def install_draft(
+    def install_candidate(
         self,
         data: dict[str, Any],
-        raw_draft: dict[str, Any],
-        *,
-        package_id: str = "",
+        raw_candidate: dict[str, Any] | CapabilityInstallCandidate,
     ) -> CapabilityPackageInstallResult:
         self.skill_file_operations = []
-        resolved_package_id = str(
-            package_id or raw_draft.get("id") or raw_draft.get("package_id") or ""
-        ).strip()
+        candidate = (
+            raw_candidate
+            if isinstance(raw_candidate, CapabilityInstallCandidate)
+            else CapabilityInstallCandidate.from_dict(raw_candidate)
+        )
+        if candidate.operation != "install":
+            raise CapabilityPackageIngestError(
+                "capability_install_candidate_operation_mismatch",
+                (
+                    "capability install candidate operation must be install for "
+                    f"install_candidate: {candidate.operation}"
+                ),
+            )
+        resolved_package_id = str(candidate.package_id or "").strip()
         if not resolved_package_id:
             raise CapabilityPackageIngestError(
                 "capability_package_id_required",
                 "capability package id is required",
             )
-        draft = CapabilityPackageDraft.from_dict(resolved_package_id, raw_draft)
-        package_hooks = _pending_lifecycle_hooks(
-            draft.hooks,
-            owner_id=resolved_package_id,
-            source="capability_package",
-        )
-        component_specs = [
-            self.component_from_draft(resolved_package_id, item, draft.source.to_dict())
-            for item in draft.components
-        ]
+        component_specs: list[CapabilityComponentConfig] = []
+        for item in candidate.components:
+            component_id = str(item.get("id") or "").strip()
+            if not component_id:
+                raise CapabilityPackageIngestError(
+                    "capability_candidate_component_id_required",
+                    "capability install candidate component id is required",
+                )
+            component_specs.append(
+                CapabilityComponentConfig.from_dict(component_id, item)
+            )
         _apply_skill_related_requirement_footprints(component_specs)
         if not component_specs:
             raise CapabilityPackageIngestError(
                 "capability_package_components_required",
-                "capability package draft must contain at least one component",
+                "capability install candidate must contain at least one component",
             )
+        return self._install_component_specs(
+            data,
+            resolved_package_id=resolved_package_id,
+            component_specs=component_specs,
+            name=candidate.display_name or resolved_package_id,
+            description=candidate.description,
+            source=CapabilityPackageConfig.from_dict(
+                resolved_package_id,
+                {"source": candidate.source},
+            ).source,
+            install_plan=candidate.install_plan,
+            usage=candidate.usage,
+            effective_capabilities=candidate.effective_capabilities,
+            evidence=[
+                {str(key): str(value) for key, value in item.items()}
+                for item in candidate.evidence
+            ],
+            credentials=candidate.credentials,
+            credential_requirements=candidate.credential_requirements,
+            credential_bindings=candidate.credential_bindings,
+            risk_level=candidate.risk_level,
+            notes=[
+                f"candidate_id:{candidate.candidate_id}",
+                f"candidate_hash:{candidate.candidate_hash}",
+            ],
+            hooks=candidate.hooks,
+            state={
+                "candidate_id": candidate.candidate_id,
+                "candidate_hash": candidate.candidate_hash,
+                "operation": candidate.operation,
+            },
+        )
+
+    def _install_component_specs(
+        self,
+        data: dict[str, Any],
+        *,
+        resolved_package_id: str,
+        component_specs: list[CapabilityComponentConfig],
+        name: str,
+        description: str,
+        source: Any,
+        install_plan: list[str],
+        usage: list[str],
+        effective_capabilities: list[str],
+        evidence: list[dict[str, str]],
+        credentials: list[str],
+        credential_requirements: list[dict[str, Any]],
+        credential_bindings: list[dict[str, Any]],
+        risk_level: str,
+        notes: list[str],
+        hooks: list[dict[str, Any]],
+        state: dict[str, Any] | None = None,
+    ) -> CapabilityPackageInstallResult:
 
         components = data.setdefault("capability_components", {})
         if not isinstance(components, dict):
@@ -990,6 +1064,11 @@ class CapabilityPackageInstaller:
                     existing.kind != component.kind
                     or existing.name != component.name
                     or _stable_json(existing.config) != _stable_json(component.config)
+                    or existing.registry_path != component.registry_path
+                    or existing.access != component.access
+                    or existing.risk_level != component.risk_level
+                    or existing.execution_policy != component.execution_policy
+                    or _stable_json(existing.hooks) != _stable_json(component.hooks)
                 ):
                     raise CapabilityPackageIngestError(
                         "capability_component_conflict",
@@ -1016,23 +1095,24 @@ class CapabilityPackageInstaller:
 
         package = CapabilityPackageConfig(
             id=resolved_package_id,
-            name=draft.name or resolved_package_id,
-            description=draft.description,
-            source=draft.source,
+            name=name or resolved_package_id,
+            description=description,
+            source=source,
             components=_unique_strings(component_ids),
             enabled=False,
             status="installed",
-            install_plan=draft.install_plan,
-            usage=draft.usage,
-            effective_capabilities=draft.effective_capabilities,
-            evidence=draft.evidence,
-            credentials=draft.credentials,
-            credential_requirements=draft.credential_requirements,
-            credential_bindings=draft.credential_bindings,
-            risk_level=draft.risk_level,
-            notes=draft.notes,
+            install_plan=install_plan,
+            usage=usage,
+            effective_capabilities=effective_capabilities,
+            evidence=evidence,
+            credentials=credentials,
+            credential_requirements=credential_requirements,
+            credential_bindings=credential_bindings,
+            risk_level=risk_level,
+            notes=notes,
             runtime_footprint=aggregate_runtime_footprint(installed_component_footprints),
-            hooks=package_hooks,
+            state=state or {},
+            hooks=hooks,
         )
         packages[resolved_package_id] = package.to_dict()
         data["capability_packages"] = packages
@@ -1084,6 +1164,23 @@ class CapabilityPackageInstaller:
                 if field_name in item and field_name not in config:
                     config[field_name] = item[field_name]
         component_id = str(item.get("id") or "").strip()
+        component_registry_path = str(item.get("registry_path") or "").strip()
+        if kind == "mcp_tool":
+            registry_path = str(
+                item.get("registry_path") or config.get("registry_path") or ""
+            ).strip()
+            if not _is_mcp_tool_registry_path(registry_path):
+                raise ValueError(
+                    "mcp_tool component requires registry_path mcp:<server>:<tool>"
+                )
+            if not component_id:
+                component_id = registry_path
+            elif component_id != registry_path:
+                raise ValueError(
+                    "mcp_tool component id must match registry_path mcp:<server>:<tool>"
+                )
+            component_registry_path = registry_path
+            config["registry_path"] = registry_path
         if not component_id:
             if kind == "environment_requirement":
                 requirement_kind = resolve_environment_requirement_kind(
@@ -1158,7 +1255,7 @@ class CapabilityPackageInstaller:
             access=access,
             risk_level=str(item.get("risk") or item.get("risk_level") or "").strip().lower(),
             execution_policy=execution_policy,
-            registry_path=str(item.get("registry_path") or "").strip(),
+            registry_path=component_registry_path,
             source_path=str(item.get("source_path") or "").strip(),
             hooks=_pending_lifecycle_hooks(
                 raw_hooks,
@@ -1330,6 +1427,100 @@ class CapabilityPackageInstaller:
         return path
 
 
+def build_capability_install_candidate_from_draft(
+    data: dict[str, Any],
+    raw_draft: dict[str, Any],
+    source_bundle: dict[str, Any] | None = None,
+    *,
+    operation: str = "install",
+    agent_run_id: str = "",
+    skill_install_root: str | Path | None = None,
+) -> CapabilityInstallCandidateBuildResult:
+    package_id = str(
+        raw_draft.get("id") or raw_draft.get("package_id") or ""
+    ).strip()
+    if not package_id:
+        return CapabilityInstallCandidateBuildResult(
+            status="blocked",
+            messages=["draft.id is required"],
+            reason="draft_invalid",
+        )
+    evidence_bundle = EvidenceBundle.from_dict(
+        source_bundle if isinstance(source_bundle, dict) else None
+    )
+    validation = CapabilityDraftValidator().validate(raw_draft, evidence_bundle)
+    if not validation.ok or validation.draft is None:
+        return CapabilityInstallCandidateBuildResult(
+            status="blocked",
+            messages=validation.messages,
+            reason="draft_invalid",
+        )
+    draft = validation.draft
+    installer = CapabilityPackageInstaller(skill_install_root=skill_install_root)
+    try:
+        package_hooks = _pending_lifecycle_hooks(
+            draft.hooks,
+            owner_id=package_id,
+            source="capability_package",
+        )
+        component_specs = [
+            installer.component_from_draft(package_id, item, draft.source.to_dict())
+            for item in draft.components
+        ]
+        _apply_skill_related_requirement_footprints(component_specs)
+    except CapabilityPackageIngestError as exc:
+        return CapabilityInstallCandidateBuildResult(
+            status="blocked",
+            messages=[exc.message],
+            reason=exc.error,
+        )
+    except Exception as exc:
+        return CapabilityInstallCandidateBuildResult(
+            status="blocked",
+            messages=[str(exc)],
+            reason="candidate_component_materialization_failed",
+        )
+    return build_install_candidate(
+        operation=operation,
+        package_id=package_id,
+        display_name=draft.name or package_id,
+        description=draft.description,
+        source=draft.source.to_dict(),
+        components=component_specs,
+        install_plan=draft.install_plan,
+        usage=draft.usage,
+        effective_capabilities=draft.effective_capabilities,
+        evidence=[dict(item) for item in draft.evidence],
+        credentials=draft.credentials,
+        credential_requirements=draft.credential_requirements,
+        credential_bindings=draft.credential_bindings,
+        risk_level=draft.risk_level,
+        hooks=package_hooks,
+        runtime_footprint=aggregate_runtime_footprint(
+            [component.runtime_footprint for component in component_specs]
+        ),
+        evidence_map=_candidate_evidence_map(draft),
+        diagnostics={
+            "source": "capability_candidate_materializer",
+            "draft_id": draft.id,
+            "component_count": len(component_specs),
+        },
+        source_bundle=source_bundle if isinstance(source_bundle, dict) else {},
+        agent_run_id=agent_run_id,
+        existing_mcp_servers=existing_mcp_server_names(data),
+    )
+
+
+def _candidate_evidence_map(draft: CapabilityPackageDraft) -> dict[str, Any]:
+    evidence = [dict(item) for item in draft.evidence]
+    result: dict[str, Any] = {}
+    for component in draft.components:
+        component_id = str(component.get("id") or component.get("name") or "").strip()
+        if component_id:
+            result[component_id] = {"evidence": evidence}
+    return result
+
+
 class CapabilityPackageIngestService:
     """Orchestrate source collection and package-drafting AgentRuns."""
 
@@ -1398,7 +1589,7 @@ class CapabilityPackageIngestService:
                 f"AgentRun not found: {task_id}",
                 status=HTTPStatus.NOT_FOUND,
             ) from exc
-        draft = _extract_draft(agent_run.get("output"))
+        draft: dict[str, Any] | None = None
         diagnostic_events_loader = getattr(
             self.packager_runner,
             "diagnostic_events",
@@ -1418,13 +1609,6 @@ class CapabilityPackageIngestService:
                 diagnostic_events_loaded = True
             return diagnostic_events
 
-        if draft is None:
-            for event in reversed(_load_diagnostic_events() or display_events):
-                payload = event.get("payload")
-                if isinstance(payload, dict):
-                    draft = _extract_draft(payload.get("text") or payload.get("output"))
-                    if draft is not None:
-                        break
         metadata = agent_run.get("metadata") if isinstance(agent_run, dict) else {}
         materialization = _capability_materialization_evidence(
             task_id=task_id,
@@ -1583,11 +1767,10 @@ class CapabilityPackageSessionRunService:
                 completed = self._completed_draft_status(session, agent_run_id)
                 if completed is None:
                     return
-                draft, source_bundle = completed
+                draft, source_bundle, candidate = completed
                 revision = self._request_install_approval(
                     session,
-                    draft,
-                    source_bundle,
+                    candidate,
                     agent_run_id,
                     follow_up_queue=follow_up_queue,
                     follow_up_lock=follow_up_lock,
@@ -1701,7 +1884,7 @@ class CapabilityPackageSessionRunService:
         self,
         session: Any,
         agent_run_id: str,
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
         status = CapabilityPackageIngestService(self.runtime_control_plane).status(agent_run_id)
         task = status.get("agent_run") if isinstance(status.get("agent_run"), dict) else {}
         task_status = str(task.get("status") or "").strip()
@@ -1745,7 +1928,10 @@ class CapabilityPackageSessionRunService:
                     status.get("source_bundle") if isinstance(status.get("source_bundle"), dict) else {},
                 )
             )
-            result_type = str(failure.get("result_type") or "invalid_capability_package_draft")
+            result_type = str(
+                failure.get("result_type")
+                or "capability_install_candidate_source_invalid"
+            )
             title = str(
                 failure.get("title")
                 or _capability_text(
@@ -1807,16 +1993,93 @@ class CapabilityPackageSessionRunService:
             ),
         )
         session.append_event(
+            "workflow_step",
+            _capability_workflow_step_event(
+                _capability_text(locale, "materialize_candidate"),
+                "materialize_candidate",
+                {
+                    "phase": "capability_install_candidate_materialization",
+                    "agent_run_id": agent_run_id,
+                },
+                status="running",
+            ),
+        )
+        candidate_result = self.admin_manager.build_capability_install_candidate(
+            {
+                "draft": draft,
+                "source_bundle": source_bundle,
+                "agent_run_id": agent_run_id,
+                "operation": "install",
+            }
+        )
+        if not getattr(candidate_result, "ok", False):
+            payload = getattr(candidate_result, "payload", {})
+            message = (
+                str(payload.get("message") or payload.get("error") or "")
+                if isinstance(payload, dict)
+                else ""
+            ).strip() or "capability install candidate could not be generated"
+            session.append_event(
+                "workflow_step",
+                _capability_workflow_step_event(
+                    message,
+                    "materialize_candidate",
+                    {
+                        "phase": "capability_install_candidate_blocked",
+                        "agent_run_id": agent_run_id,
+                        "result": payload if isinstance(payload, dict) else {},
+                    },
+                    status="error",
+                ),
+            )
+            session.append_event("error", {"message": message, "code": "capability_install_candidate_blocked"})
+            session.append_event(
+                "session_run_failed",
+                {
+                    "message": message,
+                    "code": "capability_install_candidate_blocked",
+                    "recoverable": False,
+                },
+            )
+            return None
+        candidate_payload = (
+            candidate_result.payload.get("candidate")
+            if isinstance(getattr(candidate_result, "payload", {}), dict)
+            else None
+        )
+        if not isinstance(candidate_payload, dict):
+            session.append_event(
+                "session_run_failed",
+                {
+                    "message": "capability install candidate missing from generation result",
+                    "code": "capability_install_candidate_missing",
+                    "recoverable": False,
+                },
+            )
+            return None
+        session.append_event(
+            "workflow_step",
+            _capability_workflow_step_event(
+                _capability_text(locale, "materialize_candidate"),
+                "materialize_candidate",
+                {
+                    "phase": "capability_install_candidate_materialization",
+                    "agent_run_id": agent_run_id,
+                    "candidate_id": str(candidate_payload.get("candidate_id") or ""),
+                    "candidate_hash": str(candidate_payload.get("candidate_hash") or ""),
+                },
+                status="done",
+            ),
+        )
+        session.append_event(
             "workflow_artifact",
-            _capability_package_artifact_event_payload(
-                draft,
-                source_bundle,
+            _capability_install_candidate_artifact_event_payload(
+                candidate_payload,
                 agent_run_id,
-                validation,
                 locale=locale,
             ),
         )
-        return draft, source_bundle
+        return draft, source_bundle, candidate_payload
 
     def _start_revision_ingest(
         self,
@@ -1918,22 +2181,23 @@ class CapabilityPackageSessionRunService:
     def _request_install_approval(
         self,
         session: Any,
-        draft: dict[str, Any],
-        source_bundle: Any,
+        candidate: dict[str, Any],
         agent_run_id: str,
         *,
         follow_up_queue: list[dict[str, Any]],
         follow_up_lock: threading.Lock,
         active_approval_id: dict[str, str],
     ) -> dict[str, Any] | None:
-        package_id = str(draft.get("id") or "capability-package").strip()
+        package_id = str(candidate.get("package_id") or "capability-package").strip()
+        candidate_id = str(candidate.get("candidate_id") or "").strip()
+        candidate_hash = str(candidate.get("candidate_hash") or "").strip()
         approval_id = f"capability-package-install:{session.session_run_id}:{agent_run_id}:{package_id}"
         tool_call_id = f"capability-package-install:{agent_run_id or session.session_run_id}"
         locale = _session_locale(session)
-        approval_payload = _capability_install_decision_payload(
+        approval_payload = _capability_install_candidate_decision_payload(
             approval_id,
             tool_call_id,
-            draft,
+            candidate,
             agent_run_id,
             locale=locale,
         )
@@ -2038,11 +2302,12 @@ class CapabilityPackageSessionRunService:
                 extra={"package_id": package_id, "agent_run_id": agent_run_id},
             ),
         )
-        install_payload = {
-            "draft": draft,
-            "source_bundle": source_bundle if isinstance(source_bundle, dict) else {},
-        }
-        result = self.admin_manager.accept_capability_package_draft(install_payload)
+        result = self.admin_manager.apply_capability_install_candidate(
+            {
+                "candidate_id": candidate_id,
+                "candidate_hash": candidate_hash,
+            }
+        )
         if not getattr(result, "ok", False):
             payload = getattr(result, "payload", {})
             message = (
@@ -2580,26 +2845,31 @@ def _truncate_single_line(value: str, max_chars: int) -> str:
     return f"{text[:max_chars - 1]}…"
 
 
-def _capability_package_artifact_event_payload(
-    draft: dict[str, Any],
-    source_bundle: dict[str, Any],
+def _capability_install_candidate_artifact_event_payload(
+    candidate: dict[str, Any],
     agent_run_id: str,
-    validation: dict[str, Any] | None,
     *,
     locale: str,
 ) -> dict[str, Any]:
-    artifact = _capability_package_review(
-        draft,
-        source_bundle,
-        agent_run_id,
-        validation if isinstance(validation, dict) else {},
-    )
-    package_id = str(artifact.get("package_id") or "capability-package").strip()
-    title = _capability_text(locale, "draft_ready", package_id=package_id)
+    review = candidate.get("review") if isinstance(candidate.get("review"), dict) else {}
+    package_id = str(
+        candidate.get("package_id")
+        or review.get("package_id")
+        or "capability-package"
+    ).strip()
+    title = _capability_text(locale, "candidate_ready", package_id=package_id)
+    artifact = {
+        **dict(review),
+        "package_id": package_id,
+        "candidate_id": str(candidate.get("candidate_id") or ""),
+        "candidate_hash": str(candidate.get("candidate_hash") or ""),
+        "operation": str(candidate.get("operation") or "install"),
+        "status": str(candidate.get("status") or "ready"),
+    }
     return {
         "lane": "primary",
         "workflow": CAPABILITY_INGEST_WORKFLOW,
-        "artifact_type": "capability_package_draft",
+        "artifact_type": "capability_install_candidate",
         "title": title,
         "message": title,
         "summary": str(artifact.get("description") or ""),
@@ -2608,127 +2878,7 @@ def _capability_package_artifact_event_payload(
     }
 
 
-def _capability_package_review(
-    draft: dict[str, Any],
-    source_bundle: dict[str, Any],
-    agent_run_id: str,
-    validation: dict[str, Any],
-) -> dict[str, Any]:
-    public_draft = _public_capability_package_draft(draft)
-    package_id = str(public_draft.get("id") or "capability-package").strip()
-    components = _capability_review_components(public_draft)
-    capabilities = [
-        _capability_component_review_item(item)
-        for item in components
-        if str(item.get("kind") or item.get("type") or "").strip() in CAPABILITY_COMPONENT_KINDS
-    ]
-    dependencies = [
-        _capability_component_review_item(item)
-        for item in components
-        if str(item.get("kind") or item.get("type") or "").strip() not in CAPABILITY_COMPONENT_KINDS
-    ]
-    source = source_bundle.get("source") if isinstance(source_bundle.get("source"), dict) else {}
-    source_summary = _source_bundle_summary(source_bundle)
-    install_plan = _string_values(public_draft.get("install_plan"))
-    usage = _string_values(public_draft.get("usage"))
-    evidence = [
-        {
-            key: value
-            for key, value in item.items()
-            if key in {"title", "source", "url", "path", "excerpt", "summary"}
-        }
-        for item in _dict_list(public_draft.get("evidence"))
-    ]
-    credentials = _string_values(public_draft.get("credentials"))
-    risks = _capability_review_risks(public_draft, validation)
-    return {
-        "package_id": package_id,
-        "id": package_id,
-        "name": str(public_draft.get("name") or package_id),
-        "description": str(public_draft.get("description") or ""),
-        "source": source,
-        "source_summary": source_summary,
-        "components": components,
-        "capabilities": capabilities,
-        "dependencies": dependencies,
-        "runtime_footprint": aggregate_runtime_footprint(
-            _runtime_footprints_from_draft(package_id, public_draft)
-        ),
-        "install_plan": install_plan,
-        "usage": usage,
-        "evidence": evidence,
-        "credentials": credentials,
-        "risks": risks,
-        "validation": validation,
-        "diagnostic_ref": f"agent-run:{agent_run_id}",
-    }
-
-
-def _capability_component_review_item(component: dict[str, Any]) -> dict[str, Any]:
-    config = component.get("config") if isinstance(component.get("config"), dict) else {}
-    component_id = str(component.get("id") or component.get("name") or "").strip()
-    name = str(component.get("name") or config.get("name") or component_id).strip()
-    return {
-        "id": component_id,
-        "name": name,
-        "display_name": str(component.get("display_name") or config.get("display_name") or name).strip(),
-        "kind": str(component.get("kind") or component.get("type") or "").strip(),
-        "summary": str(
-            component.get("summary")
-            or config.get("summary")
-            or component.get("description")
-            or config.get("description")
-            or ""
-        ).strip(),
-    }
-
-
-def _capability_review_components(public_draft: dict[str, Any]) -> list[dict[str, Any]]:
-    direct = [
-        dict(item)
-        for item in public_draft.get("components", [])
-        if isinstance(item, dict)
-    ]
-    contributions = public_draft.get("contributions")
-    if not isinstance(contributions, dict):
-        return direct
-    sections = [
-        "skills",
-        "mcp_servers",
-        "builtin_tools",
-        "prompt_fragments",
-        "credential_refs",
-        "environment_requirements",
-    ]
-    contributed: list[dict[str, Any]] = []
-    for section in sections:
-        value = contributions.get(section)
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            if isinstance(item, dict):
-                contributed.append(dict(item))
-    return [*direct, *contributed]
-
-
-def _capability_review_risks(
-    public_draft: dict[str, Any],
-    validation: dict[str, Any],
-) -> list[str]:
-    risks: list[str] = []
-    risk_level = str(public_draft.get("risk_level") or "").strip()
-    if risk_level:
-        risks.append(f"risk_level: {risk_level}")
-    messages = validation.get("messages")
-    if isinstance(messages, list):
-        risks.extend(str(item).strip() for item in messages if str(item).strip())
-    warnings = validation.get("warnings")
-    if isinstance(warnings, list):
-        risks.extend(str(item).strip() for item in warnings if str(item).strip())
-    return _unique_strings(risks)
-
-
-def _public_capability_package_draft(draft: dict[str, Any]) -> dict[str, Any]:
+def _public_internal_capability_source(draft: dict[str, Any]) -> dict[str, Any]:
     public = deepcopy(draft)
 
     def scrub(item: Any) -> Any:
@@ -2791,6 +2941,11 @@ def _apply_skill_related_requirement_footprints(
             )
 
 
+def _is_mcp_tool_registry_path(value: str) -> bool:
+    parts = str(value or "").strip().split(":", 2)
+    return len(parts) == 3 and parts[0] == "mcp" and bool(parts[1]) and bool(parts[2])
+
+
 def _runtime_footprints_from_draft(
     package_id: str,
     draft: dict[str, Any],
@@ -2838,32 +2993,26 @@ def _string_values(value: Any) -> list[str]:
     return [str(value).strip()]
 
 
-def _capability_install_decision_payload(
+def _capability_install_candidate_decision_payload(
     approval_id: str,
     tool_call_id: str,
-    draft: dict[str, Any],
+    candidate: dict[str, Any],
     agent_run_id: str,
     *,
     locale: str,
 ) -> dict[str, Any]:
-    package_id = str(draft.get("id") or "capability-package").strip()
-    components = [
-        dict(item)
-        for item in draft.get("components", [])
-        if isinstance(item, dict)
-    ]
-    capabilities = [
-        str(item.get("name") or item.get("id") or "")
-        for item in components
-        if str(item.get("kind") or "") in CAPABILITY_COMPONENT_KINDS
-    ]
-    dependencies = [
-        str(item.get("name") or item.get("id") or "")
-        for item in components
-        if str(item.get("kind") or "") not in CAPABILITY_COMPONENT_KINDS
-    ]
-    runtime_footprint = aggregate_runtime_footprint(
-        _runtime_footprints_from_draft(package_id, draft)
+    review = candidate.get("review") if isinstance(candidate.get("review"), dict) else {}
+    package_id = str(
+        candidate.get("package_id")
+        or review.get("package_id")
+        or "capability-package"
+    ).strip()
+    candidate_id = str(candidate.get("candidate_id") or "").strip()
+    candidate_hash = str(candidate.get("candidate_hash") or "").strip()
+    runtime_footprint = (
+        review.get("runtime_footprint")
+        if isinstance(review.get("runtime_footprint"), dict)
+        else {}
     )
     sections = [
         {
@@ -2872,12 +3021,13 @@ def _capability_install_decision_payload(
                 {"label": "ID", "value": package_id},
                 {
                     "label": _capability_text(locale, "approval_name"),
-                    "value": str(draft.get("name") or package_id),
+                    "value": str(review.get("name") or candidate.get("display_name") or package_id),
                 },
                 {
                     "label": _capability_text(locale, "approval_risk"),
-                    "value": str(draft.get("risk_level") or "unrated"),
+                    "value": str(candidate.get("risk_level") or "unrated"),
                 },
+                {"label": "Candidate", "value": candidate_id},
             ],
         },
         {
@@ -2885,12 +3035,26 @@ def _capability_install_decision_payload(
             "items": [
                 {
                     "label": _capability_text(locale, "approval_capabilities"),
-                    "value": ", ".join(_unique_strings(capabilities))
+                    "value": ", ".join(
+                        _unique_strings(
+                            [
+                                str(item.get("name") or item.get("id") or "")
+                                for item in _dict_list(review.get("capabilities"))
+                            ]
+                        )
+                    )
                     or _capability_text(locale, "approval_none"),
                 },
                 {
                     "label": _capability_text(locale, "approval_dependencies"),
-                    "value": ", ".join(_unique_strings(dependencies))
+                    "value": ", ".join(
+                        _unique_strings(
+                            [
+                                str(item.get("name") or item.get("id") or "")
+                                for item in _dict_list(review.get("dependencies"))
+                            ]
+                        )
+                    )
                     or _capability_text(locale, "approval_none"),
                 },
             ],
@@ -2922,11 +3086,7 @@ def _capability_install_decision_payload(
             ],
         },
     ]
-    install_plan = [
-        str(item)
-        for item in draft.get("install_plan", [])
-        if str(item).strip()
-    ] if isinstance(draft.get("install_plan"), list) else []
+    install_plan = _string_values(review.get("install_plan"))
     if install_plan:
         sections.append(
             {
@@ -2937,15 +3097,9 @@ def _capability_install_decision_payload(
                 ],
             }
         )
-    review = _capability_package_review(
-        draft,
-        {"source": draft.get("source") if isinstance(draft.get("source"), dict) else {}},
-        agent_run_id,
-        {},
-    )
     intent = _capability_text(locale, "approval_intent", package_id=package_id)
     content = str(
-        draft.get("description")
+        review.get("description")
         or _capability_text(locale, "approval_content", package_id=package_id)
     )
     return {
@@ -2955,7 +3109,12 @@ def _capability_install_decision_payload(
         "status": "pending",
         "title": intent,
         "summary": content,
-        "review": review,
+        "review": {
+            **dict(review),
+            "candidate_id": candidate_id,
+            "candidate_hash": candidate_hash,
+            "operation": str(candidate.get("operation") or "install"),
+        },
         "actions": [
             {
                 "id": "allow_once",
@@ -2971,7 +3130,12 @@ def _capability_install_decision_payload(
         "approval_id": approval_id,
         "tool_call_id": tool_call_id,
         "tool_name": CapabilityPackageSessionRunService.INSTALL_TOOL_NAME,
-        "tool_args": {"package_id": package_id, "agent_run_id": agent_run_id},
+        "tool_args": {
+            "package_id": package_id,
+            "agent_run_id": agent_run_id,
+            "candidate_id": candidate_id,
+            "candidate_hash": candidate_hash,
+        },
         "intent": intent,
         "content": content,
         "sections": sections,
@@ -2993,7 +3157,7 @@ def _render_packager_prompt(
     revision_block = ""
     if revision_text or isinstance(revision_draft, dict):
         current_draft_json = json.dumps(
-            _public_capability_package_draft(revision_draft or {}),
+            _public_internal_capability_source(revision_draft or {}),
             ensure_ascii=False,
             indent=2,
         )
@@ -3054,7 +3218,7 @@ def _render_packager_prompt(
             '    {"field_path": "risk_level", "value": "low|medium|high", "source_refs": []}\n'
             "  ]\n"
             "}\n"
-            "Do not produce a complete final draft JSON as the primary output; complete draft JSON is accepted only as a legacy fallback.\n"
+            "Do not produce a complete final draft JSON; field patches are the only accepted draft protocol.\n"
             "服务端会按 field_path 组装最终草案。需要填的字段包括：id、name、description、source、runtime_footprint、"
             "source_inventory、materialization_plan、contributions.skills、contributions.mcp_servers、"
             "contributions.builtin_tools、contributions.prompt_fragments、contributions.credential_refs、"
@@ -3154,8 +3318,7 @@ def _render_packager_prompt(
         '    {"field_path": "risk_level", "value": "low|medium|high", "source_refs": []}\n'
         "  ]\n"
         "}\n"
-        "Do not produce a complete final draft JSON as the primary output; "
-        "complete draft JSON is accepted only as a legacy fallback.\n"
+        "Do not produce a complete final draft JSON; field patches are the only accepted draft protocol.\n"
         "The backend assembles the final draft by field_path. Fill these fields: id, name, "
         "description, source, runtime_footprint, source_inventory, materialization_plan, "
         "contributions.skills, contributions.mcp_servers, contributions.builtin_tools, "
@@ -3528,10 +3691,7 @@ def _is_capability_materialization_event(event: dict[str, Any]) -> bool:
         return False
     if _capability_draft_field_patches_from_event(event):
         return True
-    return any(
-        _extract_draft(payload.get(field_name)) is not None
-        for field_name in ("text", "output")
-    )
+    return False
 
 
 def _capability_draft_field_patches(

@@ -1,4 +1,4 @@
-"""Capability package upstream update candidate helpers."""
+"""Capability package upstream transition helpers."""
 
 from __future__ import annotations
 
@@ -43,15 +43,15 @@ _LIST_MANIFEST_DIFF_SECTIONS = {
 
 
 @dataclass(frozen=True)
-class CapabilityPackageUpdatePayload:
-    candidate_snapshot: dict[str, Any]
-    candidate_manifest: dict[str, Any]
-    candidate_id: str = ""
+class CapabilityPackageTransitionPayload:
+    next_source_snapshot: dict[str, Any]
+    next_manifest: dict[str, Any]
+    transition_id: str = ""
     impact_summary: str = ""
 
     @property
-    def has_candidate(self) -> bool:
-        return bool(self.candidate_snapshot and self.candidate_manifest)
+    def has_transition(self) -> bool:
+        return bool(self.next_source_snapshot and self.next_manifest)
 
 
 def detect_upstream_version(value: dict[str, Any]) -> str:
@@ -76,36 +76,34 @@ def detect_upstream_version(value: dict[str, Any]) -> str:
     return "unversioned"
 
 
-def normalize_source_snapshot_candidate(value: dict[str, Any] | None) -> dict[str, Any]:
+def normalize_source_snapshot(value: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(value, dict) or not value:
         return {}
     return CapabilitySourceSnapshot.from_dict(value).to_dict()
 
 
-def normalize_update_candidate_payload(
+def normalize_update_transition_payload(
     payload: dict[str, Any] | None,
-) -> CapabilityPackageUpdatePayload:
+) -> CapabilityPackageTransitionPayload:
     value = payload if isinstance(payload, dict) else {}
     raw_snapshot = _first_dict(
         value,
-        "candidate_snapshot",
+        "next_source_snapshot",
         "source_snapshot",
         "snapshot",
     )
     raw_manifest = _first_dict(
         value,
-        "candidate_manifest",
+        "next_manifest",
         "manifest",
         "capability_manifest",
     )
-    return CapabilityPackageUpdatePayload(
-        candidate_snapshot=normalize_source_snapshot_candidate(raw_snapshot),
-        candidate_manifest=CapabilityManifest.from_dict(raw_manifest).to_dict()
+    return CapabilityPackageTransitionPayload(
+        next_source_snapshot=normalize_source_snapshot(raw_snapshot),
+        next_manifest=CapabilityManifest.from_dict(raw_manifest).to_dict()
         if raw_manifest
         else {},
-        candidate_id=str(
-            value.get("candidate_id") or value.get("update_candidate_id") or ""
-        ).strip(),
+        transition_id=str(value.get("transition_id") or "").strip(),
         impact_summary=str(
             value.get("impact_summary") or value.get("change_summary") or ""
         ).strip(),
@@ -171,98 +169,97 @@ def manifest_diff_has_changes(value: dict[str, Any] | None) -> bool:
     return False
 
 
-def build_update_candidate(
+def build_update_transition_patch(
     *,
     package_id: str,
     current_package: dict[str, Any] | None,
-    candidate_snapshot: dict[str, Any],
-    candidate_manifest: dict[str, Any],
-    candidate_id: str = "",
+    next_source_snapshot: dict[str, Any],
+    next_manifest: dict[str, Any],
+    transition_id: str = "",
     impact_summary: str = "",
 ) -> dict[str, Any]:
-    """Build a persisted candidate from a fetched upstream snapshot and manifest."""
+    """Build a backend-owned update transition patch from fetched upstream data."""
 
     current = deepcopy(current_package) if isinstance(current_package, dict) else {}
-    snapshot = normalize_source_snapshot_candidate(candidate_snapshot)
+    snapshot = normalize_source_snapshot(next_source_snapshot)
     manifest = (
-        CapabilityManifest.from_dict(candidate_manifest).to_dict()
-        if isinstance(candidate_manifest, dict)
+        CapabilityManifest.from_dict(next_manifest).to_dict()
+        if isinstance(next_manifest, dict)
         else {}
     )
-    current_snapshot = normalize_source_snapshot_candidate(_dict(current.get("source_snapshot")))
+    current_snapshot = normalize_source_snapshot(_dict(current.get("source_snapshot")))
     current_manifest = _dict(current.get("manifest"))
     snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
-    resolved_candidate_id = (
-        str(candidate_id or "").strip()
+    patch_id = (
+        str(transition_id or "").strip()
         or f"{package_id}:{snapshot_id or detect_upstream_version(snapshot)}"
     )
     return {
-        "candidate_id": resolved_candidate_id,
+        "transition_id": patch_id,
         "package_id": str(package_id),
         "upstream_version": detect_upstream_version(snapshot),
         "source_snapshot": snapshot,
         "manifest": manifest,
         "manifest_diff": manifest_diff(current_manifest, manifest),
-        "rollback_snapshot_id": str(current_snapshot.get("snapshot_id") or "").strip(),
-        "rollback_source_snapshot": current_snapshot,
-        "rollback_manifest": current_manifest,
+        "previous_snapshot_id": str(current_snapshot.get("snapshot_id") or "").strip(),
+        "previous_source_snapshot": current_snapshot,
+        "previous_manifest": current_manifest,
         "impact_summary": str(impact_summary or "").strip(),
         "activation_required": True,
         "state": {"update_state": "candidate_ready"},
     }
 
 
-def apply_update_candidate(
+def apply_update_transition_patch(
     current_package: dict[str, Any],
-    candidate: dict[str, Any],
+    patch: dict[str, Any],
     *,
     activation_approved: bool = False,
 ) -> dict[str, Any]:
-    """Apply a prepared candidate without implicitly activating it."""
+    """Apply a prepared transition patch without implicitly activating it."""
 
     current = deepcopy(current_package) if isinstance(current_package, dict) else {}
     applied = deepcopy(current)
-    candidate_snapshot = normalize_source_snapshot_candidate(
-        _dict(candidate.get("source_snapshot"))
+    next_snapshot = normalize_source_snapshot(
+        _dict(patch.get("source_snapshot"))
     )
-    candidate_manifest = _dict(candidate.get("manifest"))
-    if candidate_snapshot:
-        applied["source_snapshot"] = candidate_snapshot
-    if candidate_manifest:
-        applied["manifest"] = candidate_manifest
-        component_ids = _manifest_component_ids(candidate_manifest)
+    next_manifest = _dict(patch.get("manifest"))
+    if next_snapshot:
+        applied["source_snapshot"] = next_snapshot
+    if next_manifest:
+        applied["manifest"] = next_manifest
+        component_ids = _manifest_component_ids(next_manifest)
         if component_ids:
             applied["components"] = component_ids
     applied["upstream_version"] = str(
-        candidate.get("upstream_version") or detect_upstream_version(candidate_snapshot)
+        patch.get("upstream_version") or detect_upstream_version(next_snapshot)
     )
     applied["status"] = "installed"
     was_active = capability_package_is_active(current)
     applied["enabled"] = bool(was_active and activation_approved)
-    rollback_snapshot = normalize_source_snapshot_candidate(
-        _dict(candidate.get("rollback_source_snapshot"))
-    ) or normalize_source_snapshot_candidate(
+    rollback_snapshot = normalize_source_snapshot(
+        _dict(patch.get("previous_source_snapshot"))
+    ) or normalize_source_snapshot(
         _dict(current.get("source_snapshot"))
     )
-    rollback_manifest = _dict(candidate.get("rollback_manifest")) or _dict(
+    previous_manifest = _dict(patch.get("previous_manifest")) or _dict(
         current.get("manifest")
     )
     rollback: dict[str, Any] = {
         "snapshot_id": str(
-            candidate.get("rollback_snapshot_id")
+            patch.get("previous_snapshot_id")
             or rollback_snapshot.get("snapshot_id")
             or ""
         ).strip(),
         "source_snapshot": rollback_snapshot,
-        "manifest": rollback_manifest,
-        "candidate_id": str(candidate.get("candidate_id") or "").strip(),
+        "manifest": previous_manifest,
+        "transition_id": str(patch.get("transition_id") or "").strip(),
     }
     applied["rollback"] = {key: value for key, value in rollback.items() if value}
-    applied["update_candidate"] = {}
     applied["last_update"] = {
-        "candidate_id": str(candidate.get("candidate_id") or "").strip(),
+        "transition_id": str(patch.get("transition_id") or "").strip(),
         "upstream_version": applied["upstream_version"],
-        "manifest_diff": _dict(candidate.get("manifest_diff")),
+        "manifest_diff": _dict(patch.get("manifest_diff")),
     }
     state = _dict(current.get("state"))
     state.update(
@@ -276,7 +273,7 @@ def apply_update_candidate(
     return applied
 
 
-def rollback_update_candidate(
+def apply_rollback_transition_patch(
     current_package: dict[str, Any],
     *,
     activation_approved: bool = False,
@@ -286,21 +283,20 @@ def rollback_update_candidate(
     current = deepcopy(current_package) if isinstance(current_package, dict) else {}
     rollback = _dict(current.get("rollback"))
     restored = deepcopy(current)
-    rollback_snapshot = normalize_source_snapshot_candidate(
+    rollback_snapshot = normalize_source_snapshot(
         _dict(rollback.get("source_snapshot"))
     )
-    rollback_manifest = _dict(rollback.get("manifest"))
+    restored_manifest = _dict(rollback.get("manifest"))
     if rollback_snapshot:
         restored["source_snapshot"] = rollback_snapshot
         restored["upstream_version"] = detect_upstream_version(rollback_snapshot)
-    if rollback_manifest:
-        restored["manifest"] = rollback_manifest
-        component_ids = _manifest_component_ids(rollback_manifest)
+    if restored_manifest:
+        restored["manifest"] = restored_manifest
+        component_ids = _manifest_component_ids(restored_manifest)
         if component_ids:
             restored["components"] = component_ids
     restored["enabled"] = bool(capability_package_is_active(current) and activation_approved)
     restored["rollback"] = {}
-    restored["update_candidate"] = {}
     state = _dict(current.get("state"))
     state.update(
         {
@@ -323,11 +319,11 @@ def rollback_update_available(current_package: dict[str, Any]) -> bool:
     rollback = _dict(current.get("rollback"))
     if not rollback:
         return False
-    rollback_snapshot = normalize_source_snapshot_candidate(
+    rollback_snapshot = normalize_source_snapshot(
         _dict(rollback.get("source_snapshot"))
     )
-    rollback_manifest = _dict(rollback.get("manifest"))
-    return bool(rollback_snapshot or rollback_manifest)
+    restored_manifest = _dict(rollback.get("manifest"))
+    return bool(rollback_snapshot or restored_manifest)
 
 
 def _items_by_id(value: Any) -> dict[str, dict[str, Any]]:

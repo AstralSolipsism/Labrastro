@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,10 @@ from labrastro_server.services.agent_runtime.session_projection import (
     agent_run_events_to_session_events,
     agent_run_event_to_session_events,
 )
+from labrastro_server.services.capability_install_candidates import (
+    CapabilityInstallCandidate,
+    CapabilityInstallCandidateValidator,
+)
 from labrastro_server.services.capability_packages import (
     CapabilityDraftValidator,
     CapabilityPackagerRunner,
@@ -30,6 +35,7 @@ from labrastro_server.services.capability_packages import (
     CapabilityPackageSessionRunService,
     CapabilitySourceCollector,
     EvidenceBundle,
+    build_capability_install_candidate_from_draft,
 )
 from reuleauxcoder.domain.agent_runtime.models import (
     CapabilityComponentConfig,
@@ -149,6 +155,275 @@ def _capability_patch_stream(
         _capability_patch_json(field_path, value, source_path=source_path)
         for field_path, value in patches
     )
+
+
+def _install_candidate_from_source(
+    installer: CapabilityPackageInstaller,
+    data: dict[str, object],
+    raw_source: dict[str, object],
+    *,
+    package_id: str = "",
+):
+    source = _candidate_source_fixture(raw_source, package_id=package_id)
+    result = build_capability_install_candidate_from_draft(
+        data,
+        source,
+        {"source": source.get("source", {"type": "project_notes"})},
+        skill_install_root=installer.skill_install_root,
+    )
+    if result.candidate is None:
+        raise CapabilityPackageIngestError(
+            result.reason or "capability_install_candidate_blocked",
+            "; ".join(result.messages),
+        )
+    return installer.install_candidate(data, result.candidate)
+
+
+def _candidate_source_fixture(
+    raw_source: dict[str, object],
+    *,
+    package_id: str = "",
+) -> dict[str, object]:
+    source = deepcopy(raw_source)
+    if package_id:
+        source["id"] = package_id
+    source.setdefault("id", "test-package")
+    source.setdefault("source", {"type": "project_notes"})
+    source.setdefault("risk_level", "low")
+    source.setdefault(
+        "evidence",
+        [{"title": "Fixture", "excerpt": _candidate_fixture_evidence_text(source)}],
+    )
+    return source
+
+
+def _candidate_fixture_evidence_text(source: dict[str, object]) -> str:
+    values: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"command", "check", "install", "configure"} and item:
+                    values.append(str(item))
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(source.get("components"))
+    visit(source.get("contributions"))
+    return "; ".join(values) or "Capability package fixture evidence."
+
+
+def test_install_candidate_preserves_mcp_tool_registry_path_from_config() -> None:
+    source = _candidate_source_fixture(
+        {
+            "id": "github-tools",
+            "name": "GitHub Tools",
+            "description": "Use GitHub MCP search.",
+            "components": [
+                {"kind": "mcp_server", "name": "github"},
+                {
+                    "kind": "mcp_tool",
+                    "name": "search",
+                    "config": {"registry_path": "mcp:github:search"},
+                },
+            ],
+        }
+    )
+
+    result = build_capability_install_candidate_from_draft(
+        {},
+        source,
+        {"source": source["source"]},
+    )
+
+    assert result.status == "ready", result.messages
+    assert result.reason != "candidate_validation_failed"
+    assert result.candidate is not None
+    mcp_tool = next(
+        item for item in result.candidate.components if item["kind"] == "mcp_tool"
+    )
+    assert mcp_tool["id"] == "mcp:github:search"
+    assert mcp_tool["registry_path"] == "mcp:github:search"
+
+
+def test_candidate_from_dict_preserves_missing_operation_and_status() -> None:
+    candidate = CapabilityInstallCandidate.from_dict(
+        {
+            "package_id": "review",
+            "components": [],
+        }
+    )
+
+    assert candidate.operation == ""
+    assert candidate.status == ""
+
+
+def test_candidate_from_dict_preserves_unknown_operation_and_status() -> None:
+    candidate = CapabilityInstallCandidate.from_dict(
+        {
+            "operation": "Mystery",
+            "status": "Unexpected",
+            "package_id": "review",
+            "components": [],
+        }
+    )
+
+    assert candidate.operation == "mystery"
+    assert candidate.status == "unexpected"
+
+
+def test_candidate_validator_rejects_invalid_operation_and_status() -> None:
+    candidate = CapabilityInstallCandidate.from_dict(
+        {
+            "package_id": "review",
+            "components": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                }
+            ],
+        }
+    )
+
+    result = CapabilityInstallCandidateValidator().validate(candidate)
+
+    assert result.ok is False
+    assert "candidate.operation is invalid" in result.messages
+    assert "candidate.status is invalid" in result.messages
+
+
+def test_package_installer_rejects_update_candidate(tmp_path: Path) -> None:
+    candidate = CapabilityInstallCandidate(
+        operation="update",
+        package_id="review",
+        display_name="Review",
+        description="Review changes.",
+        components=[
+            {
+                "id": "skill:code-review",
+                "kind": "skill",
+                "name": "code-review",
+                "config": {
+                    "skill_content": (
+                        "---\n"
+                        "name: code-review\n"
+                        "description: Review changes.\n"
+                        "---\n"
+                        "Review.\n"
+                    )
+                },
+            }
+        ],
+    )
+
+    with pytest.raises(CapabilityPackageIngestError) as exc_info:
+        CapabilityPackageInstaller(skill_install_root=tmp_path).install_candidate(
+            {},
+            candidate,
+        )
+
+    assert exc_info.value.error == "capability_install_candidate_operation_mismatch"
+
+
+def test_package_installer_rejects_rollback_candidate(tmp_path: Path) -> None:
+    candidate = CapabilityInstallCandidate(
+        operation="rollback",
+        package_id="review",
+        display_name="Review",
+        description="Review changes.",
+        components=[
+            {
+                "id": "skill:code-review",
+                "kind": "skill",
+                "name": "code-review",
+                "config": {
+                    "skill_content": (
+                        "---\n"
+                        "name: code-review\n"
+                        "description: Review changes.\n"
+                        "---\n"
+                        "Review.\n"
+                    )
+                },
+            }
+        ],
+    )
+
+    with pytest.raises(CapabilityPackageIngestError) as exc_info:
+        CapabilityPackageInstaller(skill_install_root=tmp_path).install_candidate(
+            {},
+            candidate,
+        )
+
+    assert exc_info.value.error == "capability_install_candidate_operation_mismatch"
+
+
+class _CandidateAdminMixin:
+    def build_capability_install_candidate(self, payload: dict[str, object]):
+        source = _candidate_source_fixture(
+            payload.get("draft") if isinstance(payload.get("draft"), dict) else {},
+        )
+        result = build_capability_install_candidate_from_draft(
+            {},
+            source,
+            payload.get("source_bundle") if isinstance(payload.get("source_bundle"), dict) else {},
+            agent_run_id=str(payload.get("agent_run_id") or ""),
+        )
+        if result.candidate is None:
+            return _result(
+                False,
+                {
+                    "error": "capability_install_candidate_not_ready",
+                    "messages": result.messages,
+                    "reason": result.reason,
+                },
+                400,
+            )
+        candidates = getattr(self, "candidates", None)
+        if not isinstance(candidates, dict):
+            candidates = {}
+            setattr(self, "candidates", candidates)
+        candidates[result.candidate.candidate_id] = result.candidate.to_dict()
+        return _result(
+            True,
+            {
+                "ok": True,
+                "candidate": result.candidate.to_dict(),
+                "candidate_id": result.candidate.candidate_id,
+                "candidate_hash": result.candidate.candidate_hash,
+                "review": result.candidate.review,
+            },
+        )
+
+    def apply_capability_install_candidate(self, payload: dict[str, object]):
+        payloads = getattr(self, "payloads", None)
+        if not isinstance(payloads, list):
+            payloads = []
+            setattr(self, "payloads", payloads)
+        payloads.append(dict(payload))
+        return _result(
+            True,
+            {
+                "ok": True,
+                "package_id": str(payload.get("package_id") or "review"),
+                "candidate_id": str(payload.get("candidate_id") or ""),
+                "candidate_hash": str(payload.get("candidate_hash") or ""),
+            },
+        )
+
+
+def _result(ok: bool, payload: dict[str, object], status: int = 200):
+    class Result:
+        pass
+
+    result = Result()
+    result.ok = ok
+    result.status = status
+    result.payload = payload
+    return result
 
 
 def test_agent_run_log_event_projects_as_process_context() -> None:
@@ -1065,7 +1340,7 @@ def test_permission_denied_feedback_projects_through_tool_result_session_event()
     assert payload.get("tool_name") == "apply_patch"
     assert payload.get("tool_call_id") == "call-denied"
     assert "Permission feedback: Use read_file" in payload["tool_result"]
-    lifecycle_audit = payload["meta"]["meta"]["tool_diagnostics"][0]["metadata"][
+    lifecycle_audit = payload["meta"]["tool_diagnostics"][0]["metadata"][
         "permission"
     ]["audit"]["permission_denied_lifecycle"]
     assert lifecycle_audit[0]["hook_id"] == "hook:permission-denied-feedback"
@@ -1154,7 +1429,7 @@ def test_pre_tool_terminal_gate_projects_lifecycle_audit_and_blocked_tool_result
     assert tool_payload.get("tool_name") == "read_file"
     assert tool_payload.get("tool_call_id") == "call-pretool"
     assert tool_payload["tool_result"] == "read_file deferred by lifecycle"
-    diagnostic = tool_payload["meta"]["meta"]["tool_diagnostics"][0]
+    diagnostic = tool_payload["meta"]["tool_diagnostics"][0]
     assert diagnostic["code"] == "lifecycle_pre_tool_denied"
     assert diagnostic["message"] == "read_file deferred by lifecycle"
     assert tool_payload["raw_event_refs"] == [
@@ -1216,7 +1491,7 @@ def test_permission_request_terminal_gate_projects_final_permission_audit() -> N
     assert payload.get("tool_name") == "shell"
     assert payload.get("tool_call_id") == "call-shell"
     assert "shell blocked by lifecycle" in payload["tool_result"]
-    diagnostic = payload["meta"]["meta"]["tool_diagnostics"][0]
+    diagnostic = payload["meta"]["tool_diagnostics"][0]
     permission = diagnostic["metadata"]["permission"]
     assert permission["action"] == "deny"
     assert permission["policy_matched"] == "lifecycle_hook:deny"
@@ -1545,8 +1820,8 @@ def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -
     assert '"field_path": "usage"' in prompt
     assert '"field_path": "evidence"' in prompt
     assert '"field_path": "risk_level"' in prompt
-    assert "Do not produce a complete final draft JSON as the primary output" in prompt
-    assert "complete draft JSON is accepted only as a legacy fallback" in prompt
+    assert "Do not produce a complete final draft JSON; field patches are the only accepted draft protocol." in prompt
+    assert "complete draft JSON is accepted only as a legacy fallback" not in prompt
     assert '"hooks"' in prompt
     assert '"runtime_footprint"' in prompt
     assert '"placement": "server|peer|both"' in prompt
@@ -1821,7 +2096,7 @@ def test_draft_validator_requires_configure_command_evidence() -> None:
 
 def test_package_installer_preserves_environment_requirement_requirements() -> None:
     data: dict[str, object] = {}
-    result = CapabilityPackageInstaller().install_draft(
+    result = _install_candidate_from_source(CapabilityPackageInstaller(),
         data,
         {
             "id": "dotnet-sdk",
@@ -1844,7 +2119,7 @@ def test_package_installer_preserves_environment_requirement_requirements() -> N
 
 def test_package_installer_infers_executable_requirement_from_command() -> None:
     data: dict[str, object] = {}
-    result = CapabilityPackageInstaller().install_draft(
+    result = _install_candidate_from_source(CapabilityPackageInstaller(),
         data,
         {
             "id": "github-cli",
@@ -1867,7 +2142,7 @@ def test_package_installer_infers_executable_requirement_from_command() -> None:
 
 def test_package_installer_writes_component_and_package_runtime_footprint() -> None:
     data: dict[str, object] = {}
-    result = CapabilityPackageInstaller().install_draft(
+    result = _install_candidate_from_source(CapabilityPackageInstaller(),
         data,
         {
             "id": "review",
@@ -1909,7 +2184,7 @@ def test_package_installer_writes_component_and_package_runtime_footprint() -> N
 def test_package_installer_aggregates_skill_runtime_from_environment_refs() -> None:
     data: dict[str, object] = {}
 
-    CapabilityPackageInstaller().install_draft(
+    _install_candidate_from_source(CapabilityPackageInstaller(),
         data,
         {
             "id": "review",
@@ -1952,7 +2227,7 @@ def test_package_installer_materializes_skill_to_canonical_server_path(tmp_path)
     data: dict[str, object] = {}
 
     installer = CapabilityPackageInstaller(skill_install_root=install_root)
-    result = installer.install_draft(
+    result = _install_candidate_from_source(installer,
         data,
         {
             "id": "review",
@@ -2030,7 +2305,7 @@ def test_package_installer_preserves_lifecycle_hooks_for_package_components_and_
     ]
     data: dict[str, object] = {}
 
-    CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+    _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
         data,
         {
             "id": "review",
@@ -2088,7 +2363,7 @@ def test_package_installer_does_not_auto_grant_agent_capability_refs(tmp_path) -
         }
     }
 
-    CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+    _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
         data,
         {
             "id": "review",
@@ -2113,7 +2388,7 @@ def test_package_installer_rejects_invalid_lifecycle_hook_before_config_write(tm
     data: dict[str, object] = {}
 
     with pytest.raises(CapabilityPackageIngestError) as exc_info:
-        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
             data,
             {
                 "id": "review",
@@ -2148,7 +2423,7 @@ def test_package_installer_rejects_internal_lifecycle_handler_before_config_writ
     data: dict[str, object] = {}
 
     with pytest.raises(CapabilityPackageIngestError) as exc_info:
-        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
             data,
             {
                 "id": "review",
@@ -2182,7 +2457,7 @@ def test_package_installer_rejects_legacy_lifecycle_tool_matcher_before_config_w
     legacy_field = "mcp_" + "server"
 
     with pytest.raises(CapabilityPackageIngestError) as exc_info:
-        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
             data,
             {
                 "id": "review",
@@ -2214,7 +2489,7 @@ def test_package_installer_rejects_legacy_lifecycle_tool_matcher_before_config_w
 def test_package_installer_accepts_lifecycle_tool_names_matcher(tmp_path) -> None:
     data: dict[str, object] = {}
 
-    CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+    _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
         data,
         {
             "id": "review",
@@ -2247,7 +2522,7 @@ def test_package_installer_rejects_package_skill_without_installable_content(tmp
     data: dict[str, object] = {}
 
     with pytest.raises(CapabilityPackageIngestError) as exc_info:
-        CapabilityPackageInstaller(skill_install_root=tmp_path).install_draft(
+        _install_candidate_from_source(CapabilityPackageInstaller(skill_install_root=tmp_path),
             data,
             {
                 "id": "review",
@@ -2261,7 +2536,8 @@ def test_package_installer_rejects_package_skill_without_installable_content(tmp
             },
         )
 
-    assert exc_info.value.error == "capability_package_skill_content_required"
+    assert exc_info.value.error == "draft_invalid"
+    assert "skill component 'code-review' requires skill_content" in exc_info.value.message
     assert "code-review" not in data.get("skills", {}).get("items", {})
 
 
@@ -2279,10 +2555,10 @@ def test_package_installer_keeps_shared_skill_path_stable_when_owner_changes(tmp
         ],
     }
 
-    first_result = installer.install_draft(data, {"id": "review-a", **draft})
+    first_result = _install_candidate_from_source(installer, data, {"id": "review-a", **draft})
     installer.apply_skill_file_operations(first_result.skill_file_operations)
     first_path = Path(data["skills"]["items"]["code-review"]["path_hint"])
-    second_result = installer.install_draft(data, {"id": "review-b", **draft})
+    second_result = _install_candidate_from_source(installer, data, {"id": "review-b", **draft})
     installer.apply_skill_file_operations(second_result.skill_file_operations)
     second_path = Path(data["skills"]["items"]["code-review"]["path_hint"])
 
@@ -2320,7 +2596,7 @@ def test_package_installer_delete_cleans_canonical_skill_path(tmp_path) -> None:
     install_root = tmp_path / "skills" / "packages"
     data: dict[str, object] = {}
     installer = CapabilityPackageInstaller(skill_install_root=install_root)
-    result = installer.install_draft(
+    result = _install_candidate_from_source(installer,
         data,
         {
             "id": "review",
@@ -2661,7 +2937,7 @@ def test_ingest_status_restores_source_bundle_from_seed_artifact_when_metadata_m
     assert skill["skill_content"] == "---\nname: code-review\n---\n\nReview code changes."
     assert status["source_bundle"]["documents"][0]["source_document_id"] == source_document_id
     assert status["capability_run_state"]["seed_source_bundle_artifact_id"] == seed_artifact_id
-    assert status["capability_run_state"]["materialization_source"] == "artifact"
+    assert status["capability_run_state"]["materialization_source"] == "seed_artifact"
     assert status["validation"]["ok"] is True
 
 
@@ -4610,8 +4886,8 @@ def test_ingest_status_reports_unsupported_external_install_envreq() -> None:
 def test_capability_package_session_reports_structured_skill_content_failure(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("invalid draft must not install")
 
     control = _control_plane()
@@ -4692,8 +4968,8 @@ def test_capability_package_session_reports_structured_skill_content_failure(
 def test_capability_package_session_reports_incomplete_field_generation_without_approval(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("incomplete field generation must not install")
 
     control = _control_plane()
@@ -4790,8 +5066,8 @@ def test_capability_package_session_reports_incomplete_field_generation_without_
 def test_capability_package_session_reports_interrupted_output_beyond_display_event_window(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("interrupted draft must not install")
 
     control = _control_plane()
@@ -4873,11 +5149,11 @@ def test_capability_package_session_reports_interrupted_output_beyond_display_ev
 def test_capability_package_session_requests_approval_from_patch_stream_with_empty_lists(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
+    class FakeAdminManager(_CandidateAdminMixin):
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
 
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             self.payloads.append(payload)
 
             class Result:
@@ -4969,7 +5245,7 @@ def test_capability_package_session_requests_approval_from_patch_stream_with_emp
         )
     )
     draft_event = next(event for event in session.events if event["type"] == "workflow_artifact")
-    assert draft_event["payload"]["artifact_type"] == "capability_package_draft"
+    assert draft_event["payload"]["artifact_type"] == "capability_install_candidate"
     assert draft_event["payload"]["artifact"]["package_id"] == "review-empty-plan"
     assert approval["tool_name"] == "install_capability_package"
     assert approval["decision_type"] == "capability_package_install"
@@ -4978,18 +5254,16 @@ def test_capability_package_session_requests_approval_from_patch_stream_with_emp
     _wait_for(lambda: session.done)
 
     assert admin.payloads
-    draft = admin.payloads[0]["draft"]  # type: ignore[index]
-    assert draft["id"] == "review-empty-plan"  # type: ignore[index]
-    assert draft["install_plan"] == []  # type: ignore[index]
-    assert draft["usage"] == []  # type: ignore[index]
+    assert admin.payloads[0]["candidate_id"] == approval["tool_args"]["candidate_id"]
+    assert admin.payloads[0]["candidate_hash"] == approval["tool_args"]["candidate_hash"]
 
 
 def test_capability_package_session_run_requests_install_approval_and_installs(tmp_path: Path) -> None:
-    class FakeAdminManager:
+    class FakeAdminManager(_CandidateAdminMixin):
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
 
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             self.payloads.append(payload)
 
             class Result:
@@ -5133,7 +5407,7 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
         )
     )
     draft_event = next(event for event in session.events if event["type"] == "workflow_artifact")
-    assert draft_event["payload"]["artifact_type"] == "capability_package_draft"
+    assert draft_event["payload"]["artifact_type"] == "capability_install_candidate"
     assert draft_event["payload"]["artifact"]["package_id"] == "review"
     assert approval["tool_name"] == "install_capability_package"
     assert approval["tool_call_id"]
@@ -5157,7 +5431,8 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     _wait_for(lambda: session.done)
 
     assert admin.payloads
-    assert admin.payloads[0]["draft"]["id"] == "review"  # type: ignore[index]
+    assert admin.payloads[0]["candidate_id"] == approval["tool_args"]["candidate_id"]
+    assert admin.payloads[0]["candidate_hash"] == approval["tool_args"]["candidate_hash"]
     assert not any(event["type"] in {"tool_call_start", "tool_call_end"} for event in session.events)
     tool_steps = [
         event["payload"]
@@ -5250,7 +5525,7 @@ def test_capability_package_session_process_text_follows_english_locale(tmp_path
         for event in session.events
         if event["type"] == "workflow_step"
     ]
-    assert "Starting capability package draft generation" in messages
+    assert "Starting capability install candidate generation" in messages
     assert "Capability package generation task entered capability_packager" in messages
     assert "Capability package generation task queued" in messages
     assert "Capability package generation task accepted by sandbox worker" in messages
@@ -5299,11 +5574,11 @@ def test_capability_package_session_unknown_failure_uses_session_locale(
 
 
 def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Path) -> None:
-    class FakeAdminManager:
+    class FakeAdminManager(_CandidateAdminMixin):
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
 
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             self.payloads.append(payload)
             raise AssertionError("draft revision should not install the previous approval")
 
@@ -5390,7 +5665,7 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     assert any(
         event["type"] == "approval_resolved"
         and event["payload"].get("approval_id") == first_approval["approval_id"]
-        and event["payload"].get("reason") == "收到修改意见，重新生成草案。"
+        and event["payload"].get("reason") == "收到修改意见，重新生成候选。"
         for event in session.events
     )
     assert any(
@@ -5433,8 +5708,8 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
 
 
 def test_peer_shutdown_keeps_capability_package_session_run_active(tmp_path: Path) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("peer shutdown must not install")
 
     control = _control_plane()
@@ -5497,8 +5772,8 @@ def test_peer_shutdown_keeps_capability_package_session_run_active(tmp_path: Pat
 def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("lease recovery test should stop at approval")
 
     control = _control_plane()
@@ -5575,8 +5850,8 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
 
 
 def test_capability_package_session_cancel_cancels_agent_run(tmp_path: Path) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("cancelled session must not install")
 
     control = _control_plane()
@@ -5621,11 +5896,11 @@ def test_capability_package_session_cancel_cancels_agent_run(tmp_path: Path) -> 
 def test_capability_package_session_cancel_during_install_approval_does_not_append_install_terminal_events(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
+    class FakeAdminManager(_CandidateAdminMixin):
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
 
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             self.payloads.append(payload)
             raise AssertionError("cancelled session must not install")
 
@@ -5726,8 +6001,8 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
 def test_capability_package_session_persists_agent_run_progress_and_failure(
     tmp_path: Path,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("failed draft generation must not install")
 
     persisted: list[dict[str, object]] = []
@@ -5899,17 +6174,15 @@ def test_remote_session_run_replays_pending_trace_events_when_sink_is_attached(
 
     http_service.set_session_trace_event_sink(trace_sink)
 
-    assert persisted == [
-        {
-            "session_id": "session-1",
-            "event_type": "context_event",
-            "payload": {"message": "sink not attached yet", "phase": "late_sink"},
-            "session_run_id": "session-run-late-sink",
-            "session_run_seq": 1,
-            "source": "remote_session_run",
-            "replayable": True,
-        }
-    ]
+    assert len(persisted) == 1
+    assert persisted[0]["session_id"] == "session-1"
+    assert persisted[0]["event_type"] == "context_event"
+    assert persisted[0]["payload"]["message"] == "sink not attached yet"
+    assert persisted[0]["payload"]["phase"] == "late_sink"
+    assert persisted[0]["session_run_id"] == "session-run-late-sink"
+    assert persisted[0]["session_run_seq"] == 1
+    assert persisted[0]["source"] == "remote_session_run"
+    assert persisted[0]["replayable"] is True
 
 
 def test_remote_session_run_does_not_persist_when_sink_is_attached_without_trace_enable(
@@ -5960,25 +6233,23 @@ def test_remote_session_run_does_not_persist_when_sink_is_attached_without_trace
 
     session.enable_trace_persistence("session-1")
 
-    assert persisted == [
-        {
-            "session_id": "session-1",
-            "event_type": "context_event",
-            "payload": {"message": "memory only", "phase": "memory_only"},
-            "session_run_id": "session-run-memory-only",
-            "session_run_seq": 1,
-            "source": "remote_session_run",
-            "replayable": True,
-        }
-    ]
+    assert len(persisted) == 1
+    assert persisted[0]["session_id"] == "session-1"
+    assert persisted[0]["event_type"] == "context_event"
+    assert persisted[0]["payload"]["message"] == "memory only"
+    assert persisted[0]["payload"]["phase"] == "memory_only"
+    assert persisted[0]["session_run_id"] == "session-run-memory-only"
+    assert persisted[0]["session_run_seq"] == 1
+    assert persisted[0]["source"] == "remote_session_run"
+    assert persisted[0]["replayable"] is True
 
 
 def test_capability_package_session_surfaces_source_bundle_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("source warning test should not install")
 
     def fake_fetch(self, **kwargs: object) -> str:
@@ -6051,14 +6322,12 @@ def test_capability_package_session_surfaces_source_bundle_errors(
     )
     session.request_cancel("test_cleanup")
     _wait_for(lambda: session.done)
-
-
 def test_capability_package_session_softens_partial_source_fetch_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("partial source warning test should not install")
 
     def fake_fetch(self, **kwargs: object) -> str:
@@ -6124,7 +6393,7 @@ def test_capability_package_session_softens_partial_source_fetch_errors(
         )
     )
     assert warning["code"] == "network_error"
-    assert warning["content"] == "部分在线资料读取失败，已继续使用可读取内容生成草案。"
+    assert warning["content"] == "部分在线资料读取失败，已继续使用可读取内容生成候选。"
     assert "Remote end closed" not in warning["content"]
     assert warning["source_error"]["message"] == "Remote end closed connection without response"
     assert warning["source_errors"][0]["attempts"] == 3
@@ -6148,8 +6417,8 @@ def test_capability_package_session_surfaces_empty_source_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeAdminManager:
-        def accept_capability_package_draft(self, payload: dict[str, object]):
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
             raise AssertionError("empty evidence test should not install")
 
     def fake_fetch(self, **kwargs: object) -> str:

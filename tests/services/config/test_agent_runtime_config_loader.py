@@ -40,6 +40,27 @@ def _model_config() -> dict:
     }
 
 
+def _apply_install_candidate(
+    manager: RemoteAdminConfigManager,
+    payload: dict[str, object],
+) -> admin_service.AdminConfigResult:
+    built = manager.build_capability_install_candidate(payload)
+    if not built.ok:
+        return built
+    return manager.apply_capability_install_candidate(
+        {
+            "candidate_id": built.payload["candidate_id"],
+            "candidate_hash": built.payload["candidate_hash"],
+        }
+    )
+
+
+def _effective_tool_refs(snapshot: dict, agent_id: str) -> list[str]:
+    effective = snapshot["agents"][agent_id]["effective_capabilities"]
+    assert "tools" not in effective
+    return [item["target_tool_ref"] for item in effective["tool_specs"]]
+
+
 def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     config = ConfigLoader()._parse_config(
         {
@@ -132,6 +153,8 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     assert config.agent_registry.agents["main_chat"].can_delegate is False
     assert "core_builtin_tools" in config.capability_packages
     assert config.capability_packages["core_builtin_tools"].effective_capabilities
+    assert "builtin_tool:tool_search" in config.capability_components
+    assert "builtin_tool:capability_execute" in config.capability_components
     assert "builtin_tool:fetch_capabilities" in config.capability_components
     assert "environment_local" in config.runtime_profiles.profiles
     assert "agent_remote" in config.runtime_profiles.profiles
@@ -247,12 +270,9 @@ def test_default_system_agents_have_explicit_effective_tool_scopes() -> None:
         capability_components=config.capability_components,
     )
 
-    environment_tools = snapshot["agents"]["environment_configurator"][
-        "effective_capabilities"
-    ]["tools"]
-    packager_tools = snapshot["agents"]["capability_packager"][
-        "effective_capabilities"
-    ]["tools"]
+    environment_tools = _effective_tool_refs(snapshot, "environment_configurator")
+    packager_tools = _effective_tool_refs(snapshot, "capability_packager")
+    main_tools = _effective_tool_refs(snapshot, "main_chat")
 
     assert environment_tools == ["builtin:shell"]
     assert "builtin:apply_patch" not in environment_tools
@@ -269,6 +289,8 @@ def test_default_system_agents_have_explicit_effective_tool_scopes() -> None:
     assert "builtin:apply_patch" not in packager_tools
     assert "builtin:apply_patch" not in packager_tools
     assert "builtin:delegate_agent" not in packager_tools
+    assert "builtin:tool_search" in main_tools
+    assert "builtin:capability_execute" in main_tools
 
 
 def test_builtin_capability_packages_are_forced_enabled() -> None:
@@ -310,12 +332,10 @@ def test_builtin_capability_packages_are_forced_enabled() -> None:
         capability_packages=config.capability_packages,
         capability_components=config.capability_components,
     )
-    assert snapshot["agents"]["environment_configurator"]["effective_capabilities"][
-        "tools"
-    ] == ["builtin:shell"]
-    assert snapshot["agents"]["capability_packager"]["effective_capabilities"][
-        "tools"
-    ] == [
+    assert _effective_tool_refs(snapshot, "environment_configurator") == [
+        "builtin:shell"
+    ]
+    assert _effective_tool_refs(snapshot, "capability_packager") == [
         "builtin:fetch_capabilities",
         "builtin:glob",
         "builtin:grep",
@@ -378,12 +398,10 @@ def test_builtin_capability_components_are_forced_enabled_and_restored() -> None
         capability_components=config.capability_components,
     )
 
-    assert snapshot["agents"]["environment_configurator"]["effective_capabilities"][
-        "tools"
-    ] == ["builtin:shell"]
-    assert snapshot["agents"]["capability_packager"]["effective_capabilities"][
-        "tools"
-    ] == [
+    assert _effective_tool_refs(snapshot, "environment_configurator") == [
+        "builtin:shell"
+    ]
+    assert _effective_tool_refs(snapshot, "capability_packager") == [
         "builtin:fetch_capabilities",
         "builtin:glob",
         "builtin:grep",
@@ -740,10 +758,16 @@ def test_agent_run_snapshot_keeps_worker_capabilities_separate_from_main_chat() 
         capability_components=config.capability_components,
     )
 
-    assert "builtin:shell" in snapshot["agents"]["main_chat"]["effective_capabilities"]["tools"]
-    assert snapshot["agents"]["reviewer"]["effective_capabilities"]["tools"] == [
-        "builtin:read_file"
-    ]
+    assert "tools" not in snapshot["agents"]["main_chat"]["effective_capabilities"]
+    assert [
+        item["tool_id"]
+        for item in snapshot["agents"]["main_chat"]["resolved_capabilities"]["tool_specs"]
+    ] == ["capability:repo-admin:builtin_tool:shell"]
+    assert "tools" not in snapshot["agents"]["reviewer"]["effective_capabilities"]
+    assert [
+        item["tool_id"]
+        for item in snapshot["agents"]["reviewer"]["resolved_capabilities"]["tool_specs"]
+    ] == ["capability:review:builtin_tool:read_file"]
 
 
 def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> None:
@@ -1314,7 +1338,8 @@ def test_accept_and_delete_capability_package_manages_shared_components(tmp_path
         },
     }
 
-    first = manager.accept_capability_package_draft(
+    first = _apply_install_candidate(
+        manager,
         {
             "draft": {
                 "id": "review",
@@ -1369,7 +1394,8 @@ def test_accept_and_delete_capability_package_manages_shared_components(tmp_path
     )
     assert installed_path.read_text(encoding="utf-8") == "Review code changes.\n"
 
-    second = manager.accept_capability_package_draft(
+    second = _apply_install_candidate(
+        manager,
         {
             "draft": {
                 "id": "pr",
@@ -1507,7 +1533,8 @@ def test_admin_accept_does_not_write_skill_file_when_config_commit_fails(tmp_pat
         / "SKILL.md"
     )
 
-    result = manager.accept_capability_package_draft(
+    result = _apply_install_candidate(
+        manager,
         {
             "draft": {
                 "id": "review",
@@ -1633,7 +1660,8 @@ def test_capability_package_rejects_materialized_resource_slot_conflicts(tmp_pat
     manager = MemoryAdminManager()
     previous = deepcopy(manager.data)
 
-    skill_conflict = manager.accept_capability_package_draft(
+    skill_conflict = _apply_install_candidate(
+        manager,
         {
             "draft": {
                 "id": "review-a",
@@ -1659,9 +1687,13 @@ def test_capability_package_rejects_materialized_resource_slot_conflicts(tmp_pat
     assert skill_conflict.ok is False
     assert skill_conflict.status == 409
     assert skill_conflict.payload["error"] == "capability_resource_conflict"
-    assert manager.data == previous
+    assert manager.data["capability_packages"] == previous["capability_packages"]
+    assert manager.data["capability_components"] == previous["capability_components"]
+    assert manager.data["skills"] == previous["skills"]
+    assert manager.data["mcp"] == previous["mcp"]
 
-    mcp_conflict = manager.accept_capability_package_draft(
+    mcp_conflict = _apply_install_candidate(
+        manager,
         {
             "draft": {
                 "id": "github-b",
@@ -1684,7 +1716,10 @@ def test_capability_package_rejects_materialized_resource_slot_conflicts(tmp_pat
     assert mcp_conflict.ok is False
     assert mcp_conflict.status == 409
     assert mcp_conflict.payload["error"] == "capability_resource_conflict"
-    assert manager.data == previous
+    assert manager.data["capability_packages"] == previous["capability_packages"]
+    assert manager.data["capability_components"] == previous["capability_components"]
+    assert manager.data["skills"] == previous["skills"]
+    assert manager.data["mcp"] == previous["mcp"]
 
 
 def test_admin_skill_resource_crud_uses_user_lifecycle_and_blocks_package_managed() -> None:
@@ -1788,14 +1823,17 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
             self.calls: list[tuple[dict, dict, str]] = []
             self.skill_file_operations: list[dict] = []
 
-        def install_draft(
+        def install_candidate(
             self,
             data: dict,
-            raw_draft: dict,
-            *,
-            package_id: str = "",
+            raw_candidate: dict,
         ) -> CapabilityPackageInstallResult:
-            self.calls.append((data, raw_draft, package_id))
+            package_id = (
+                str(raw_candidate.get("package_id") or "")
+                if isinstance(raw_candidate, dict)
+                else str(getattr(raw_candidate, "package_id", "") or "")
+            )
+            self.calls.append((data, raw_candidate, package_id))
             data["capability_components"] = {
                 "envreq:executable:gh": {
                     "kind": "environment_requirement",
@@ -1834,7 +1872,8 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
     installer = FakeInstaller()
     monkeypatch.setattr(admin_service, "CapabilityPackageInstaller", lambda **_: installer)
 
-    result = MemoryAdminManager().accept_capability_package_draft(
+    result = _apply_install_candidate(
+        MemoryAdminManager(),
         {
             "draft": {
                 "id": "review",
@@ -1855,7 +1894,7 @@ def test_admin_accept_delegates_to_capability_package_installer(monkeypatch) -> 
     assert result.payload["package_id"] == "review"
 
 
-def test_admin_accept_capability_package_draft_enforces_validation_messages() -> None:
+def test_admin_build_capability_install_candidate_enforces_validation_messages() -> None:
     class MemoryAdminManager(RemoteAdminConfigManager):
         def __init__(self) -> None:
             super().__init__(config_path=None)
@@ -1872,7 +1911,7 @@ def test_admin_accept_capability_package_draft_enforces_validation_messages() ->
             del data, previous_data
             raise AssertionError("invalid drafts must not be committed")
 
-    result = MemoryAdminManager().accept_capability_package_draft(
+    result = MemoryAdminManager().build_capability_install_candidate(
         {
             "draft": {
                 "id": "review",
@@ -1890,13 +1929,14 @@ def test_admin_accept_capability_package_draft_enforces_validation_messages() ->
 
     assert result.ok is False
     assert result.status == 400
-    assert result.payload["error"] == "invalid_capability_package_draft"
+    assert result.payload["error"] == "capability_install_candidate_not_ready"
+    assert result.payload["reason"] == "draft_invalid"
     assert "draft.evidence is required" in result.payload["messages"]
     assert "risk_level is required" in result.payload["messages"]
     assert "envreq:executable:gh command lacks evidence: gh" in result.payload["messages"]
 
 
-def test_admin_accept_capability_package_draft_rejects_skill_without_installable_content() -> None:
+def test_admin_build_capability_install_candidate_rejects_skill_without_installable_content() -> None:
     class MemoryAdminManager(RemoteAdminConfigManager):
         def __init__(self) -> None:
             super().__init__(config_path=None)
@@ -1913,7 +1953,7 @@ def test_admin_accept_capability_package_draft_rejects_skill_without_installable
             del data, previous_data
             raise AssertionError("invalid skill drafts must not be committed")
 
-    result = MemoryAdminManager().accept_capability_package_draft(
+    result = MemoryAdminManager().build_capability_install_candidate(
         {
             "draft": {
                 "id": "review",
@@ -1933,7 +1973,8 @@ def test_admin_accept_capability_package_draft_rejects_skill_without_installable
 
     assert result.ok is False
     assert result.status == 400
-    assert result.payload["error"] == "invalid_capability_package_draft"
+    assert result.payload["error"] == "capability_install_candidate_not_ready"
+    assert result.payload["reason"] == "draft_invalid"
     assert "skill component 'code-review' requires skill_content" in result.payload["messages"]
 
 

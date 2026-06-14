@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from labrastro_server.services.capability_package_updates import (
-    apply_update_candidate,
-    build_update_candidate,
+    apply_rollback_transition_patch,
+    apply_update_transition_patch,
+    build_update_transition_patch,
     detect_upstream_version,
     manifest_diff,
     manifest_diff_has_changes,
-    normalize_update_candidate_payload,
-    rollback_update_candidate,
+    normalize_update_transition_payload,
 )
 
 
@@ -114,8 +114,8 @@ def test_manifest_diff_treats_missing_and_empty_sections_as_equivalent() -> None
     assert manifest_diff_has_changes(diff) is False
 
 
-def test_update_payload_normalizes_source_snapshot_and_manifest_aliases() -> None:
-    payload = normalize_update_candidate_payload(
+def test_transition_payload_normalizes_source_snapshot_and_manifest_aliases() -> None:
+    payload = normalize_update_transition_payload(
         {
             "source_snapshot": {
                 "id": "snap-new",
@@ -129,23 +129,23 @@ def test_update_payload_normalizes_source_snapshot_and_manifest_aliases() -> Non
                     {"from": "skill:waza/read", "to": "shared:executable:gh"}
                 ],
             },
-            "update_candidate_id": "cand-2",
+            "transition_id": "transition-2",
             "change_summary": "new read dependency",
         }
     )
 
-    assert payload.has_candidate is True
-    assert payload.candidate_snapshot["snapshot_id"] == "snap-new"
-    assert payload.candidate_snapshot["source_ref"] == "main"
-    assert payload.candidate_snapshot["commit_sha"] == "2222222"
-    assert payload.candidate_snapshot["upstream_version"] == "v2.0.0"
-    assert payload.candidate_manifest["components"] == [{"id": "skill:waza/read"}]
-    assert payload.candidate_id == "cand-2"
+    assert payload.has_transition is True
+    assert payload.next_source_snapshot["snapshot_id"] == "snap-new"
+    assert payload.next_source_snapshot["source_ref"] == "main"
+    assert payload.next_source_snapshot["commit_sha"] == "2222222"
+    assert payload.next_source_snapshot["upstream_version"] == "v2.0.0"
+    assert payload.next_manifest["components"] == [{"id": "skill:waza/read"}]
+    assert payload.transition_id == "transition-2"
     assert payload.impact_summary == "new read dependency"
 
 
-def test_update_candidate_keeps_upstream_snapshot_and_rollback_pointer() -> None:
-    candidate = build_update_candidate(
+def test_update_transition_patch_keeps_upstream_snapshot_and_rollback_pointer() -> None:
+    patch = build_update_transition_patch(
         package_id="waza",
         current_package={
             "source_snapshot": {
@@ -155,12 +155,12 @@ def test_update_candidate_keeps_upstream_snapshot_and_rollback_pointer() -> None
             },
             "manifest": {"components": [{"id": "skill:waza/read"}]},
         },
-        candidate_snapshot={
+        next_source_snapshot={
             "snapshot_id": "snap-new",
             "source_ref": "main",
             "commit_sha": "2222222",
         },
-        candidate_manifest={
+        next_manifest={
             "components": [
                 {"id": "skill:waza/read"},
                 {"id": "skill:waza/write"},
@@ -168,16 +168,16 @@ def test_update_candidate_keeps_upstream_snapshot_and_rollback_pointer() -> None
         },
     )
 
-    assert candidate["package_id"] == "waza"
-    assert candidate["upstream_version"] == "main@2222222"
-    assert candidate["source_snapshot"]["snapshot_id"] == "snap-new"
-    assert candidate["rollback_snapshot_id"] == "snap-old"
-    assert candidate["manifest_diff"]["added_components"] == ["skill:waza/write"]
-    assert candidate["state"]["update_state"] == "candidate_ready"
+    assert patch["package_id"] == "waza"
+    assert patch["upstream_version"] == "main@2222222"
+    assert patch["source_snapshot"]["snapshot_id"] == "snap-new"
+    assert patch["previous_snapshot_id"] == "snap-old"
+    assert patch["manifest_diff"]["added_components"] == ["skill:waza/write"]
+    assert patch["state"]["update_state"] == "candidate_ready"
 
 
-def test_apply_update_candidate_does_not_auto_activate_without_approval() -> None:
-    updated = apply_update_candidate(
+def test_apply_update_transition_patch_does_not_auto_activate_without_approval() -> None:
+    updated = apply_update_transition_patch(
         {
             "enabled": True,
             "status": "installed",
@@ -190,7 +190,7 @@ def test_apply_update_candidate_does_not_auto_activate_without_approval() -> Non
             "manifest": {"components": [{"id": "skill:waza/write"}]},
             "manifest_diff": {"added_components": ["skill:waza/write"]},
             "upstream_version": "v2.0.0",
-            "rollback_snapshot_id": "snap-old",
+            "previous_snapshot_id": "snap-old",
         },
         activation_approved=False,
     )
@@ -203,8 +203,8 @@ def test_apply_update_candidate_does_not_auto_activate_without_approval() -> Non
     assert updated["state"]["update_state"] == "rollback_available"
 
 
-def test_apply_update_candidate_keeps_active_package_only_with_explicit_approval() -> None:
-    updated = apply_update_candidate(
+def test_apply_update_transition_patch_keeps_active_package_only_with_explicit_approval() -> None:
+    updated = apply_update_transition_patch(
         {"enabled": True, "status": "installed"},
         {"source_snapshot": {"snapshot_id": "snap-new"}, "manifest": {}},
         activation_approved=True,
@@ -214,8 +214,8 @@ def test_apply_update_candidate_keeps_active_package_only_with_explicit_approval
     assert updated["state"]["activation_state"] == "active"
 
 
-def test_apply_update_candidate_uses_projected_activation_not_enabled_flag() -> None:
-    updated = apply_update_candidate(
+def test_apply_update_transition_patch_uses_projected_activation_not_enabled_flag() -> None:
+    updated = apply_update_transition_patch(
         {
             "enabled": True,
             "status": "installed",
@@ -229,8 +229,8 @@ def test_apply_update_candidate_uses_projected_activation_not_enabled_flag() -> 
     assert updated["state"]["activation_state"] == "inactive"
 
 
-def test_rollback_update_candidate_uses_projected_activation_not_enabled_flag() -> None:
-    restored = rollback_update_candidate(
+def test_apply_rollback_transition_patch_uses_projected_activation_not_enabled_flag() -> None:
+    restored = apply_rollback_transition_patch(
         {
             "enabled": True,
             "status": "installed",
@@ -251,8 +251,8 @@ def test_rollback_update_candidate_uses_projected_activation_not_enabled_flag() 
     assert restored["state"]["activation_state"] == "inactive"
 
 
-def test_rollback_update_candidate_clears_consumed_rollback_metadata() -> None:
-    restored = rollback_update_candidate(
+def test_apply_rollback_transition_patch_clears_consumed_rollback_metadata() -> None:
+    restored = apply_rollback_transition_patch(
         {
             "enabled": False,
             "status": "installed",

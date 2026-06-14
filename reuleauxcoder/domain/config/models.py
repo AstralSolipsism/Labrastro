@@ -235,6 +235,16 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
         "registry_path": "builtin:apply_patch",
         "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
+    "builtin_tool:capability_execute": {
+        "kind": "builtin_tool",
+        "name": "capability_execute",
+        "description": "Execute a registered deferred capability tool by tool_id.",
+        "access": "both",
+        "risk_level": "medium",
+        "execution_policy": "allow",
+        "registry_path": "builtin:capability_execute",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
     "builtin_tool:draft_document_begin": {
         "kind": "builtin_tool",
         "name": "draft_document_begin",
@@ -332,6 +342,16 @@ DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
             DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID,
             DEFAULT_ENVIRONMENT_CAPABILITY_PACKAGE_ID,
         ],
+    },
+    "builtin_tool:tool_search": {
+        "kind": "builtin_tool",
+        "name": "tool_search",
+        "description": "Search registered deferred capability tools.",
+        "access": "read",
+        "risk_level": "low",
+        "execution_policy": "allow",
+        "registry_path": "builtin:tool_search",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
 }
 BUILTIN_TOOL_COMPONENT_FORCED_FIELDS: tuple[str, ...] = (

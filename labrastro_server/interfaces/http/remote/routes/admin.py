@@ -536,12 +536,21 @@ class RemoteAdminRoutes:
                     return
                 self._send_json(HTTPStatus.OK, result)
                 return
-            if path == "/remote/admin/capability-packages/drafts/accept":
+            if path == "/remote/admin/capability-packages/candidates/build":
                 result = self._run_admin_config_mutation(
                     principal,
                     path,
                     payload,
-                    lambda: self.service.admin_manager.accept_capability_package_draft(payload),
+                    lambda: self.service.admin_manager.build_capability_install_candidate(payload),
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/candidates/apply":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.apply_capability_install_candidate(payload),
                 )
                 self._send_json(result.status, result.payload)
                 return
@@ -586,6 +595,17 @@ class RemoteAdminRoutes:
                     path,
                     payload,
                     lambda: self.service.admin_manager.apply_capability_package_update(
+                        payload
+                    ),
+                )
+                self._send_json(result.status, result.payload)
+                return
+            if path == "/remote/admin/capability-packages/updates/rollback/prepare":
+                result = self._run_admin_config_mutation(
+                    principal,
+                    path,
+                    payload,
+                    lambda: self.service.admin_manager.prepare_capability_package_rollback(
                         payload
                     ),
                 )
@@ -903,11 +923,13 @@ class RemoteAdminRoutes:
             "/remote/admin/models/record",
             "/remote/admin/models/delete",
             "/remote/admin/models/activate",
-            "/remote/admin/capability-packages/drafts/accept",
+            "/remote/admin/capability-packages/candidates/build",
+            "/remote/admin/capability-packages/candidates/apply",
             "/remote/admin/capability-packages/delete",
             "/remote/admin/capability-packages/enable",
             "/remote/admin/capability-packages/updates/prepare",
             "/remote/admin/capability-packages/updates/apply",
+            "/remote/admin/capability-packages/updates/rollback/prepare",
             "/remote/admin/capability-packages/updates/rollback",
             "/remote/admin/environment-requirements/record",
             "/remote/admin/environment-requirements/delete",

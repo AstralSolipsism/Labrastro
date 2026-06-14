@@ -53,23 +53,31 @@ from reuleauxcoder.domain.config.models import (
     infer_provider_compat,
 )
 from labrastro_server.services.capability_packages import (
-    CapabilityDraftValidator,
     CapabilityPackageIngestError,
     CapabilityPackageInstaller,
-    EvidenceBundle,
+    build_capability_install_candidate_from_draft,
+)
+from labrastro_server.services.capability_install_candidates import (
+    CapabilityInstallCandidate,
+    build_install_candidate,
+    existing_mcp_server_names,
+    load_candidate_snapshot,
+    mark_candidate_status,
+    save_candidate_snapshot,
+    verify_candidate_hash,
 )
 from labrastro_server.services.capability_package_credentials import (
     public_credential_package_projection,
 )
 from labrastro_server.services.capability_package_updates import (
-    apply_update_candidate,
-    build_update_candidate,
+    apply_rollback_transition_patch,
+    apply_update_transition_patch,
+    build_update_transition_patch,
     detect_upstream_version,
     manifest_diff_has_changes,
     manifest_diff,
-    normalize_update_candidate_payload,
+    normalize_update_transition_payload,
     rollback_update_available,
-    rollback_update_candidate,
 )
 from labrastro_server.services.agent_runtime.runtime_policy import (
     validate_runtime_profile_model_request_origin,
@@ -89,6 +97,7 @@ from reuleauxcoder.domain.capability_packages import (
     package_managed_component_enabled,
 )
 from reuleauxcoder.domain.runtime_footprint import (
+    aggregate_runtime_footprint,
     normalize_runtime_footprint,
     runtime_footprint_for_skill,
 )
@@ -156,10 +165,10 @@ SETTINGS_UI_ACTIONS: tuple[dict[str, Any], ...] = (
         "triggers": [{"kind": "button", "value": "startCapabilityPackageIngest"}],
     },
     {
-        "id": "settings.capability_packages.accept_draft",
+        "id": "settings.capability_packages.apply_candidate",
         "feature_id": "capability_packages",
-        "description": "Accept a generated capability package draft.",
-        "triggers": [{"kind": "button", "value": "acceptCapabilityPackageDraft"}],
+        "description": "Apply an approved capability install candidate.",
+        "triggers": [{"kind": "button", "value": "applyCapabilityInstallCandidate"}],
     },
 )
 
@@ -1928,49 +1937,162 @@ class RemoteAdminConfigManager:
             )
         return None
 
-    def accept_capability_package_draft(self, payload: dict[str, Any]) -> AdminConfigResult:
+    def build_capability_install_candidate(
+        self,
+        payload: dict[str, Any],
+    ) -> AdminConfigResult:
         raw_draft = payload.get("draft")
         if not isinstance(raw_draft, dict):
-            raw_draft = payload
-        package_id = str(
-            raw_draft.get("id") or payload.get("package_id") or payload.get("id") or ""
-        ).strip()
-        if not package_id:
-            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
-        source_bundle = payload.get("source_bundle")
-        validation = CapabilityDraftValidator().validate(
-            raw_draft,
-            EvidenceBundle.from_dict(source_bundle if isinstance(source_bundle, dict) else None),
+            return AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_source_required"},
+                400,
+            )
+        source_bundle = (
+            payload.get("source_bundle")
+            if isinstance(payload.get("source_bundle"), dict)
+            else {}
         )
-        if not validation.ok:
+        operation = str(payload.get("operation") or "install").strip().lower()
+        if operation != "install":
             return AdminConfigResult(
                 False,
                 {
-                    "error": "invalid_capability_package_draft",
-                    "messages": validation.messages,
-                    "message": "; ".join(validation.messages),
+                    "error": "capability_install_candidate_operation_mismatch",
+                    "expected_operation": "install",
+                    "operation": operation,
                 },
                 400,
             )
-
+        agent_run_id = str(payload.get("agent_run_id") or "").strip()
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
+            result = build_capability_install_candidate_from_draft(
+                data,
+                raw_draft,
+                source_bundle,
+                operation="install",
+                agent_run_id=agent_run_id,
+                skill_install_root=self._capability_package_skill_install_root(),
+            )
+            if result.candidate is None or result.status != "ready":
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "capability_install_candidate_not_ready",
+                        "status": result.status,
+                        "messages": result.messages,
+                        "reason": result.reason,
+                    },
+                    400,
+                )
+            candidate = save_candidate_snapshot(data, result.candidate, status="ready")
+            transaction_error = self._commit_config(data, previous_data)
+            if transaction_error:
+                return transaction_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "candidate": candidate.to_dict(),
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_hash": candidate.candidate_hash,
+                    "review": candidate.review,
+                },
+            )
+
+    def apply_capability_install_candidate(
+        self,
+        payload: dict[str, Any],
+    ) -> AdminConfigResult:
+        candidate_id = str(
+            payload.get("candidate_id") or payload.get("candidateId") or ""
+        ).strip()
+        candidate_hash = str(
+            payload.get("candidate_hash") or payload.get("candidateHash") or ""
+        ).strip()
+        if not candidate_id:
+            return AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_id_required"},
+                400,
+            )
+        if not candidate_hash:
+            return AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_hash_required"},
+                400,
+            )
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            candidate = load_candidate_snapshot(data, candidate_id)
+            if candidate is None:
+                return AdminConfigResult(
+                    False,
+                    {"error": "capability_install_candidate_not_found"},
+                    404,
+                )
+            if not verify_candidate_hash(candidate, candidate_hash):
+                return AdminConfigResult(
+                    False,
+                    {"error": "capability_install_candidate_hash_mismatch"},
+                    409,
+                )
+            if candidate.operation != "install":
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "capability_install_candidate_operation_mismatch",
+                        "expected_operation": "install",
+                        "operation": candidate.operation,
+                        "candidate_id": candidate.candidate_id,
+                        "package_id": candidate.package_id,
+                    },
+                    409,
+                )
+            if candidate.status not in {"ready", "approved"}:
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "capability_install_candidate_not_executable",
+                        "status": candidate.status,
+                    },
+                    409,
+                )
+            mark_candidate_status(data, candidate_id, "approved")
             installer = CapabilityPackageInstaller(
                 skill_install_root=self._capability_package_skill_install_root()
             )
             try:
-                install_result = installer.install_draft(
-                    data,
-                    raw_draft,
-                    package_id=package_id,
+                package_id = candidate.package_id
+                packages = data.get("capability_packages", {})
+                previous_package = (
+                    packages.get(package_id)
+                    if isinstance(packages, dict)
+                    else {}
                 )
+                previous_component_ids = _package_component_ids(
+                    previous_package if isinstance(previous_package, dict) else {}
+                )
+                install_result = installer.install_candidate(data, candidate)
                 self._sync_capability_components_from_package_manifest(
                     data,
                     install_result.package_id,
                     install_result.package.to_dict(),
-                    previous_component_ids=install_result.component_ids,
+                    previous_component_ids=previous_component_ids
+                    or install_result.component_ids,
                     installer=installer,
+                )
+                mark_candidate_status(
+                    data,
+                    candidate_id,
+                    "applied",
+                    details={
+                        "package_id": install_result.package_id,
+                        "component_ids": install_result.component_ids,
+                    },
                 )
             except CapabilityPackageIngestError as exc:
                 return AdminConfigResult(
@@ -1981,7 +2103,10 @@ class RemoteAdminConfigManager:
             except Exception as exc:
                 return AdminConfigResult(
                     False,
-                    {"error": "invalid_capability_package_draft", "message": str(exc)},
+                    {
+                        "error": "capability_install_candidate_apply_failed",
+                        "message": str(exc),
+                    },
                     400,
                 )
             transaction_error = self._commit_capability_package_config_and_files(
@@ -1996,6 +2121,8 @@ class RemoteAdminConfigManager:
                 True,
                 {
                     "ok": True,
+                    "candidate_id": candidate_id,
+                    "candidate_hash": candidate_hash,
                     "package_id": install_result.package_id,
                     "capability_package": install_result.package.to_dict(),
                     "components": [
@@ -2234,15 +2361,15 @@ class RemoteAdminConfigManager:
         raw_package = packages.get(package_id) if isinstance(packages, dict) else None
         if not isinstance(raw_package, dict):
             return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
-        update_payload = normalize_update_candidate_payload(payload)
-        if update_payload.has_candidate:
-            candidate = build_update_candidate(
+        transition_payload = normalize_update_transition_payload(payload)
+        if transition_payload.has_transition:
+            transition_patch = build_update_transition_patch(
                 package_id=package_id,
                 current_package=raw_package,
-                candidate_snapshot=update_payload.candidate_snapshot,
-                candidate_manifest=update_payload.candidate_manifest,
-                candidate_id=update_payload.candidate_id,
-                impact_summary=update_payload.impact_summary,
+                next_source_snapshot=transition_payload.next_source_snapshot,
+                next_manifest=transition_payload.next_manifest,
+                transition_id=transition_payload.transition_id,
+                impact_summary=transition_payload.impact_summary,
             )
             current_snapshot = (
                 raw_package.get("source_snapshot")
@@ -2255,11 +2382,11 @@ class RemoteAdminConfigManager:
                     "ok": True,
                     "package_id": package_id,
                     "current_version": detect_upstream_version(current_snapshot),
-                    "candidate_version": candidate["upstream_version"],
+                    "next_version": transition_patch["upstream_version"],
                     "update_available": manifest_diff_has_changes(
-                        candidate["manifest_diff"]
+                        transition_patch["manifest_diff"]
                     ),
-                    "update_candidate": candidate,
+                    "transition_preview": transition_patch,
                 },
             )
         current_snapshot = (
@@ -2285,11 +2412,11 @@ class RemoteAdminConfigManager:
             return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
         if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS:
             return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
-        update_payload = normalize_update_candidate_payload(payload)
-        if not update_payload.candidate_snapshot:
-            return AdminConfigResult(False, {"error": "candidate_snapshot_required"}, 400)
-        if not update_payload.candidate_manifest:
-            return AdminConfigResult(False, {"error": "candidate_manifest_required"}, 400)
+        transition_payload = normalize_update_transition_payload(payload)
+        if not transition_payload.next_source_snapshot:
+            return AdminConfigResult(False, {"error": "next_source_snapshot_required"}, 400)
+        if not transition_payload.next_manifest:
+            return AdminConfigResult(False, {"error": "next_manifest_required"}, 400)
         with self._lock:
             previous_data = self._load_data()
             data = deepcopy(previous_data)
@@ -2300,16 +2427,53 @@ class RemoteAdminConfigManager:
             raw_package = packages.get(package_id)
             if not isinstance(raw_package, dict):
                 return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
-            candidate = build_update_candidate(
+            transition_patch = build_update_transition_patch(
                 package_id=package_id,
                 current_package=raw_package,
-                candidate_snapshot=update_payload.candidate_snapshot,
-                candidate_manifest=update_payload.candidate_manifest,
-                candidate_id=update_payload.candidate_id,
-                impact_summary=update_payload.impact_summary,
+                next_source_snapshot=transition_payload.next_source_snapshot,
+                next_manifest=transition_payload.next_manifest,
+                transition_id=transition_payload.transition_id,
+                impact_summary=transition_payload.impact_summary,
+            )
+            candidate_result = self._build_package_transition_candidate(
+                data,
+                package_id=package_id,
+                operation="update",
+                package_data=raw_package,
+                package_patch=transition_patch,
+            )
+            if candidate_result.candidate is None or candidate_result.status != "ready":
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "capability_install_candidate_not_ready",
+                        "status": candidate_result.status,
+                        "messages": candidate_result.messages,
+                        "reason": candidate_result.reason,
+                    },
+                    400,
+                )
+            saved_candidate = save_candidate_snapshot(
+                data,
+                candidate_result.candidate,
+                status="ready",
             )
             package_data = dict(raw_package)
-            package_data["update_candidate"] = candidate
+            last_update = (
+                dict(package_data.get("last_update"))
+                if isinstance(package_data.get("last_update"), dict)
+                else {}
+            )
+            last_update.update(
+                {
+                    "operation": "update",
+                    "candidate_id": saved_candidate.candidate_id,
+                    "candidate_hash": saved_candidate.candidate_hash,
+                    "upstream_version": transition_patch.get("upstream_version"),
+                    "manifest_diff": transition_patch.get("manifest_diff"),
+                }
+            )
+            package_data["last_update"] = last_update
             state = (
                 dict(package_data.get("state"))
                 if isinstance(package_data.get("state"), dict)
@@ -2327,7 +2491,9 @@ class RemoteAdminConfigManager:
                 {
                     "ok": True,
                     "package_id": package_id,
-                    "update_candidate": candidate,
+                    "candidate": saved_candidate.to_dict(),
+                    "candidate_id": saved_candidate.candidate_id,
+                    "candidate_hash": saved_candidate.candidate_hash,
                     "capability_package": package.to_dict(),
                     **self.read_server_settings(),
                 },
@@ -2350,20 +2516,18 @@ class RemoteAdminConfigManager:
             raw_package = packages.get(package_id)
             if not isinstance(raw_package, dict):
                 return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
-            raw_candidate = (
-                payload.get("candidate")
-                if isinstance(payload.get("candidate"), dict)
-                else raw_package.get("update_candidate")
+            candidate, error = self._load_verified_transition_candidate(
+                data,
+                payload,
+                expected_package_id=package_id,
+                expected_operation="update",
             )
-            if not isinstance(raw_candidate, dict) or not raw_candidate:
-                return AdminConfigResult(False, {"error": "update_candidate_required"}, 400)
-            requested_candidate_id = str(payload.get("candidate_id") or "").strip()
-            candidate_id = str(raw_candidate.get("candidate_id") or "").strip()
-            if requested_candidate_id and candidate_id and requested_candidate_id != candidate_id:
-                return AdminConfigResult(False, {"error": "update_candidate_mismatch"}, 409)
-            updated_package = apply_update_candidate(
+            if error is not None:
+                return error
+            transition_patch = candidate.package_patch
+            updated_package = apply_update_transition_patch(
                 raw_package,
-                raw_candidate,
+                transition_patch,
                 activation_approved=_bool_field(payload, "activation_approved", False),
             )
             previous_component_ids = _package_component_ids(raw_package)
@@ -2381,6 +2545,12 @@ class RemoteAdminConfigManager:
                 previous_component_ids=previous_component_ids,
                 installer=installer,
             )
+            mark_candidate_status(
+                data,
+                candidate.candidate_id,
+                "applied",
+                details={"package_id": package_id, "operation": "update"},
+            )
             transaction_error = self._commit_capability_package_config_and_files(
                 data,
                 previous_data,
@@ -2393,7 +2563,96 @@ class RemoteAdminConfigManager:
                 True,
                 {
                     "ok": True,
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_hash": candidate.candidate_hash,
                     "package_id": package_id,
+                    "capability_package": packages[package_id],
+                    **self.read_server_settings(),
+                },
+            )
+
+    def prepare_capability_package_rollback(
+        self, payload: dict[str, Any]
+    ) -> AdminConfigResult:
+        package_id = str(payload.get("package_id") or payload.get("id") or "").strip()
+        if not package_id:
+            return AdminConfigResult(False, {"error": "capability_package_id_required"}, 400)
+        if package_id in BUILTIN_CAPABILITY_PACKAGE_IDS:
+            return AdminConfigResult(False, {"error": "builtin_capability_package"}, 400)
+        with self._lock:
+            previous_data = self._load_data()
+            data = deepcopy(previous_data)
+            packages = data.get("capability_packages", {})
+            if not isinstance(packages, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            raw_package = packages.get(package_id)
+            if not isinstance(raw_package, dict):
+                return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            if not rollback_update_available(raw_package):
+                return AdminConfigResult(False, {"error": "rollback_not_available"}, 400)
+            rollback_patch = {
+                "rollback": dict(raw_package.get("rollback"))
+                if isinstance(raw_package.get("rollback"), dict)
+                else {},
+                "current_source_snapshot": dict(raw_package.get("source_snapshot"))
+                if isinstance(raw_package.get("source_snapshot"), dict)
+                else {},
+                "current_manifest": dict(raw_package.get("manifest"))
+                if isinstance(raw_package.get("manifest"), dict)
+                else {},
+            }
+            candidate_result = self._build_package_transition_candidate(
+                data,
+                package_id=package_id,
+                operation="rollback",
+                package_data=raw_package,
+                package_patch=rollback_patch,
+            )
+            if candidate_result.candidate is None or candidate_result.status != "ready":
+                return AdminConfigResult(
+                    False,
+                    {
+                        "error": "capability_install_candidate_not_ready",
+                        "status": candidate_result.status,
+                        "messages": candidate_result.messages,
+                        "reason": candidate_result.reason,
+                    },
+                    400,
+                )
+            saved_candidate = save_candidate_snapshot(
+                data,
+                candidate_result.candidate,
+                status="ready",
+            )
+            package_data = dict(raw_package)
+            last_update = (
+                dict(package_data.get("last_update"))
+                if isinstance(package_data.get("last_update"), dict)
+                else {}
+            )
+            last_update.update(
+                {
+                    "operation": "rollback",
+                    "candidate_id": saved_candidate.candidate_id,
+                    "candidate_hash": saved_candidate.candidate_hash,
+                }
+            )
+            package_data["last_update"] = last_update
+            packages[package_id] = CapabilityPackageConfig.from_dict(
+                package_id,
+                package_data,
+            ).to_dict()
+            reload_error = self._commit_config(data, previous_data)
+            if reload_error:
+                return reload_error
+            return AdminConfigResult(
+                True,
+                {
+                    "ok": True,
+                    "package_id": package_id,
+                    "candidate": saved_candidate.to_dict(),
+                    "candidate_id": saved_candidate.candidate_id,
+                    "candidate_hash": saved_candidate.candidate_hash,
                     "capability_package": packages[package_id],
                     **self.read_server_settings(),
                 },
@@ -2416,9 +2675,33 @@ class RemoteAdminConfigManager:
             raw_package = packages.get(package_id)
             if not isinstance(raw_package, dict):
                 return AdminConfigResult(False, {"error": "capability_package_not_found"}, 404)
+            candidate, error = self._load_verified_transition_candidate(
+                data,
+                payload,
+                expected_package_id=package_id,
+                expected_operation="rollback",
+            )
+            if error is not None:
+                return error
+            expected_rollback = (
+                candidate.package_patch.get("rollback")
+                if isinstance(candidate.package_patch.get("rollback"), dict)
+                else {}
+            )
+            current_rollback = (
+                raw_package.get("rollback")
+                if isinstance(raw_package.get("rollback"), dict)
+                else {}
+            )
+            if _stable_json(expected_rollback) != _stable_json(current_rollback):
+                return AdminConfigResult(
+                    False,
+                    {"error": "capability_install_candidate_stale"},
+                    409,
+                )
             if not rollback_update_available(raw_package):
                 return AdminConfigResult(False, {"error": "rollback_not_available"}, 400)
-            updated_package = rollback_update_candidate(
+            updated_package = apply_rollback_transition_patch(
                 raw_package,
                 activation_approved=_bool_field(payload, "activation_approved", False),
             )
@@ -2437,6 +2720,12 @@ class RemoteAdminConfigManager:
                 previous_component_ids=previous_component_ids,
                 installer=installer,
             )
+            mark_candidate_status(
+                data,
+                candidate.candidate_id,
+                "applied",
+                details={"package_id": package_id, "operation": "rollback"},
+            )
             transaction_error = self._commit_capability_package_config_and_files(
                 data,
                 previous_data,
@@ -2449,11 +2738,150 @@ class RemoteAdminConfigManager:
                 True,
                 {
                     "ok": True,
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_hash": candidate.candidate_hash,
                     "package_id": package_id,
                     "capability_package": packages[package_id],
                     **self.read_server_settings(),
                 },
             )
+
+    def _build_package_transition_candidate(
+        self,
+        data: dict[str, Any],
+        *,
+        package_id: str,
+        operation: str,
+        package_data: dict[str, Any],
+        package_patch: dict[str, Any],
+    ) -> Any:
+        manifest = self._candidate_transition_manifest(operation, package_patch)
+        component_specs = [
+            CapabilityComponentConfig.from_dict(component_id, item)
+            for component_id, item in _manifest_component_items(manifest).items()
+        ]
+        return build_install_candidate(
+            operation=operation,
+            package_id=package_id,
+            display_name=str(package_data.get("name") or package_id),
+            description=str(package_data.get("description") or ""),
+            source=(
+                dict(package_data.get("source"))
+                if isinstance(package_data.get("source"), dict)
+                else {}
+            ),
+            components=component_specs,
+            install_plan=_string_values(package_data.get("install_plan")),
+            usage=_string_values(package_data.get("usage")),
+            effective_capabilities=_string_values(
+                package_data.get("effective_capabilities")
+            ),
+            evidence=_dict_list_payload(package_data.get("evidence")),
+            credentials=_string_values(package_data.get("credentials")),
+            credential_requirements=_dict_list_payload(
+                package_data.get("credential_requirements")
+            ),
+            credential_bindings=_dict_list_payload(package_data.get("credential_bindings")),
+            risk_level=str(package_data.get("risk_level") or "").strip().lower(),
+            runtime_footprint=aggregate_runtime_footprint(
+                [component.runtime_footprint for component in component_specs]
+            ),
+            package_patch=package_patch,
+            diagnostics={
+                "source": "capability_package_transition",
+                "operation": operation,
+            },
+            existing_mcp_servers=existing_mcp_server_names(data),
+        )
+
+    def _candidate_transition_manifest(
+        self,
+        operation: str,
+        package_patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        if operation == "rollback":
+            rollback = (
+                package_patch.get("rollback")
+                if isinstance(package_patch.get("rollback"), dict)
+                else {}
+            )
+            manifest = rollback.get("manifest") if isinstance(rollback, dict) else {}
+            return dict(manifest) if isinstance(manifest, dict) else {}
+        manifest = package_patch.get("manifest")
+        return dict(manifest) if isinstance(manifest, dict) else {}
+
+    def _load_verified_transition_candidate(
+        self,
+        data: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        expected_package_id: str,
+        expected_operation: str,
+    ) -> tuple[CapabilityInstallCandidate, AdminConfigResult | None]:
+        candidate_id = str(
+            payload.get("candidate_id") or payload.get("candidateId") or ""
+        ).strip()
+        candidate_hash = str(
+            payload.get("candidate_hash") or payload.get("candidateHash") or ""
+        ).strip()
+        if not candidate_id:
+            return CapabilityInstallCandidate.from_dict({}), AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_id_required"},
+                400,
+            )
+        if not candidate_hash:
+            return CapabilityInstallCandidate.from_dict({}), AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_hash_required"},
+                400,
+            )
+        candidate = load_candidate_snapshot(data, candidate_id)
+        if candidate is None:
+            return CapabilityInstallCandidate.from_dict({}), AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_not_found"},
+                404,
+            )
+        if candidate.operation != expected_operation:
+            return candidate, AdminConfigResult(
+                False,
+                {
+                    "error": "capability_install_candidate_operation_mismatch",
+                    "expected_operation": expected_operation,
+                    "operation": candidate.operation,
+                    "candidate_id": candidate.candidate_id,
+                    "package_id": candidate.package_id,
+                },
+                409,
+            )
+        if candidate.package_id != expected_package_id:
+            return candidate, AdminConfigResult(
+                False,
+                {
+                    "error": "capability_install_candidate_package_mismatch",
+                    "package_id": expected_package_id,
+                    "candidate_package_id": candidate.package_id,
+                },
+                409,
+            )
+        if not verify_candidate_hash(candidate, candidate_hash):
+            return candidate, AdminConfigResult(
+                False,
+                {"error": "capability_install_candidate_hash_mismatch"},
+                409,
+            )
+        if candidate.status not in {"ready", "approved"}:
+            return candidate, AdminConfigResult(
+                False,
+                {
+                    "error": "capability_install_candidate_not_executable",
+                    "status": candidate.status,
+                },
+                409,
+            )
+        mark_candidate_status(data, candidate_id, "approved")
+        return candidate, None
 
     def _sync_capability_components_from_package_manifest(
         self,
@@ -4860,6 +5288,16 @@ def _string_values(value: Any) -> list[str]:
     if value is None or value == "":
         return []
     return [str(value)]
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _bool_field(payload: dict[str, Any], field_name: str, default: Any) -> bool:

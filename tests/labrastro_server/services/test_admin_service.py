@@ -37,10 +37,64 @@ class FailingCommitAdminManager(MemoryAdminManager):
         )
 
 
+def _apply_install_candidate(
+    manager: RemoteAdminConfigManager,
+    payload: dict[str, object],
+) -> AdminConfigResult:
+    built = manager.build_capability_install_candidate(payload)
+    if not built.ok:
+        return built
+    return manager.apply_capability_install_candidate(
+        {
+            "candidate_id": built.payload["candidate_id"],
+            "candidate_hash": built.payload["candidate_hash"],
+        }
+    )
+
+
+def _apply_prepared_update(
+    manager: RemoteAdminConfigManager,
+    payload: dict[str, object],
+    *,
+    activation_approved: bool,
+) -> AdminConfigResult:
+    prepared = manager.prepare_capability_package_update(payload)
+    if not prepared.ok:
+        return prepared
+    return manager.apply_capability_package_update(
+        {
+            "package_id": payload.get("package_id"),
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+            "activation_approved": activation_approved,
+        }
+    )
+
+
+def _apply_prepared_rollback(
+    manager: RemoteAdminConfigManager,
+    payload: dict[str, object],
+    *,
+    activation_approved: bool,
+) -> AdminConfigResult:
+    prepared = manager.prepare_capability_package_rollback(payload)
+    if not prepared.ok:
+        return prepared
+    return manager.rollback_capability_package_update(
+        {
+            "package_id": payload.get("package_id"),
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+            "activation_approved": activation_approved,
+        }
+    )
+
+
 def test_accept_capability_package_installs_without_activation(tmp_path: Path) -> None:
     manager = MemoryAdminManager(tmp_path / "config.yaml")
 
-    result = manager.accept_capability_package_draft(
+    result = _apply_install_candidate(
+        manager,
         {
             "package_id": "review",
             "draft": {
@@ -89,7 +143,8 @@ def test_accept_capability_package_rolls_back_config_when_skill_file_write_fails
     manager = MemoryAdminManager(tmp_path / "config.yaml")
     (tmp_path / "skills").write_text("not a directory", encoding="utf-8")
 
-    result = manager.accept_capability_package_draft(
+    result = _apply_install_candidate(
+        manager,
         {
             "package_id": "review",
             "draft": {
@@ -212,12 +267,12 @@ def test_prepare_capability_package_update_records_candidate_without_activation(
     result = manager.prepare_capability_package_update(
         {
             "package_id": "waza",
-            "candidate_snapshot": {
+            "next_source_snapshot": {
                 "snapshot_id": "snap-new",
                 "source_ref": "main",
                 "commit_sha": "2222222",
             },
-            "candidate_manifest": {
+            "next_manifest": {
                 "components": [
                     {"id": "skill:waza/read"},
                     {"id": "skill:waza/write"},
@@ -231,10 +286,11 @@ def test_prepare_capability_package_update_records_candidate_without_activation(
     assert package["enabled"] is True
     assert package["state"]["activation_state"] == "active"
     assert package["state"]["update_state"] == "candidate_ready"
-    assert package["update_candidate"]["upstream_version"] == "main@2222222"
-    assert package["update_candidate"]["manifest_diff"]["added_components"] == [
+    assert package["last_update"]["upstream_version"] == "main@2222222"
+    assert package["last_update"]["manifest_diff"]["added_components"] == [
         "skill:waza/write"
     ]
+    assert result.payload["candidate_id"] in manager.data["capability_install_candidates"]
 
 
 def test_prepare_capability_package_update_accepts_alias_payload(
@@ -272,25 +328,25 @@ def test_prepare_capability_package_update_accepts_alias_payload(
                     {"id": "skill:waza/write"},
                 ]
             },
-            "update_candidate_id": "cand-alias",
+            "transition_id": "transition-alias",
         }
     )
 
     assert result.ok is True
     package = manager.data["capability_packages"]["waza"]
     assert package["enabled"] is True
-    candidate = package["update_candidate"]
-    assert candidate["candidate_id"] == "cand-alias"
-    assert candidate["upstream_version"] == "v2.0.0"
-    assert candidate["source_snapshot"]["snapshot_id"] == "snap-new"
-    assert candidate["source_snapshot"]["source_ref"] == "main"
-    assert candidate["source_snapshot"]["commit_sha"] == "2222222"
-    assert candidate["manifest_diff"]["added_components"] == ["skill:waza/write"]
+    candidate = manager.data["capability_install_candidates"][result.payload["candidate_id"]]
+    assert result.payload["candidate_id"] == "capability-candidate:update:waza:" + result.payload["candidate_hash"][:16]
+    assert candidate["package_patch"]["upstream_version"] == "v2.0.0"
+    assert candidate["package_patch"]["source_snapshot"]["snapshot_id"] == "snap-new"
+    assert candidate["package_patch"]["source_snapshot"]["source_ref"] == "main"
+    assert candidate["package_patch"]["source_snapshot"]["commit_sha"] == "2222222"
+    assert candidate["package_patch"]["manifest_diff"]["added_components"] == ["skill:waza/write"]
     assert package["state"]["activation_state"] == "active"
     assert package["state"]["update_state"] == "candidate_ready"
 
 
-def test_apply_capability_package_update_candidate_does_not_auto_activate(
+def test_apply_prepared_capability_package_update_does_not_auto_activate(
     tmp_path: Path,
 ) -> None:
     manager = MemoryAdminManager(tmp_path / "config.yaml")
@@ -305,63 +361,344 @@ def test_apply_capability_package_update_candidate_does_not_auto_activate(
                 "manifest": {
                     "components": [
                         {
-                            "id": "skill:waza/read",
+                            "id": "skill:waza-read",
                             "kind": "skill",
                             "name": "waza-read",
                             "config": {"skill_content": old_content},
                         }
                     ]
                 },
-                "update_candidate": {
-                    "candidate_id": "cand-1",
-                    "source_snapshot": {
-                        "snapshot_id": "snap-new",
-                        "source_ref": "main",
-                        "commit_sha": "2222222",
-                    },
-                    "manifest": {
-                        "components": [
-                            {
-                                "id": "skill:waza/write",
-                                "kind": "skill",
-                                "name": "waza-write",
-                                "config": {"skill_content": new_content},
-                            }
-                        ]
-                    },
-                    "manifest_diff": {
-                        "added_components": ["skill:waza/write"],
-                        "removed_components": ["skill:waza/read"],
-                    },
-                    "upstream_version": "main@2222222",
-                    "rollback_snapshot_id": "snap-old",
-                    "rollback_source_snapshot": {"snapshot_id": "snap-old"},
-                    "rollback_manifest": {
-                        "components": [
-                            {
-                                "id": "skill:waza/read",
-                                "kind": "skill",
-                                "name": "waza-read",
-                                "config": {"skill_content": old_content},
-                            }
-                        ]
-                    },
-                },
+                "components": ["skill:waza-read"],
             }
         }
     }
 
-    result = manager.apply_capability_package_update(
-        {"package_id": "waza", "activation_approved": False}
+    result = _apply_prepared_update(
+        manager,
+        {
+            "package_id": "waza",
+            "next_source_snapshot": {
+                "snapshot_id": "snap-new",
+                "source_ref": "main",
+                "commit_sha": "2222222",
+            },
+            "next_manifest": {
+                "components": [
+                    {
+                        "id": "skill:waza-write",
+                        "kind": "skill",
+                        "name": "waza-write",
+                        "config": {"skill_content": new_content},
+                    }
+                ]
+            },
+        },
+        activation_approved=False,
     )
 
     assert result.ok is True
     package = manager.data["capability_packages"]["waza"]
     assert package["enabled"] is False
-    assert package["components"] == ["skill:waza/write"]
+    assert package["components"] == ["skill:waza-write"]
     assert package["state"]["activation_state"] == "inactive"
     assert package["state"]["update_state"] == "rollback_available"
     assert package["rollback"]["snapshot_id"] == "snap-old"
+
+
+def test_apply_capability_package_update_rejects_candidate_for_other_package(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "docs": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {"snapshot_id": "docs-old"},
+                "manifest": {"components": [{"id": "skill:docs-read"}]},
+                "components": ["skill:docs-read"],
+            },
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {"snapshot_id": "waza-old"},
+                "manifest": {"components": [{"id": "skill:waza-read"}]},
+                "components": ["skill:waza-read"],
+            },
+        }
+    }
+    prepared = manager.prepare_capability_package_update(
+        {
+            "package_id": "docs",
+            "next_source_snapshot": {"snapshot_id": "docs-new"},
+            "next_manifest": {"components": [{"id": "skill:docs-write"}]},
+        }
+    )
+    assert prepared.ok is True
+    data_after_prepare = deepcopy(manager.data)
+
+    result = manager.apply_capability_package_update(
+        {
+            "package_id": "waza",
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+            "activation_approved": True,
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_package_mismatch"
+    assert result.payload["package_id"] == "waza"
+    assert result.payload["candidate_package_id"] == "docs"
+    assert manager.data == data_after_prepare
+
+
+def test_build_install_candidate_rejects_update_operation(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+
+    result = manager.build_capability_install_candidate(
+        {
+            "operation": "update",
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 400
+    assert result.payload["error"] == "capability_install_candidate_operation_mismatch"
+    assert result.payload["expected_operation"] == "install"
+    assert result.payload["operation"] == "update"
+    assert "capability_install_candidates" not in manager.data
+
+
+def test_build_install_candidate_rejects_rollback_operation(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+
+    result = manager.build_capability_install_candidate(
+        {
+            "operation": "rollback",
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 400
+    assert result.payload["error"] == "capability_install_candidate_operation_mismatch"
+    assert result.payload["expected_operation"] == "install"
+    assert result.payload["operation"] == "rollback"
+    assert "capability_install_candidates" not in manager.data
+
+
+def test_apply_install_candidate_rejects_prepared_update_candidate(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {"snapshot_id": "snap-old"},
+                "manifest": {"components": [{"id": "skill:waza-read"}]},
+                "components": ["skill:waza-read"],
+            }
+        }
+    }
+    prepared = manager.prepare_capability_package_update(
+        {
+            "package_id": "waza",
+            "next_source_snapshot": {"snapshot_id": "snap-new"},
+            "next_manifest": {"components": [{"id": "skill:waza-write"}]},
+        }
+    )
+    assert prepared.ok is True
+    data_after_prepare = deepcopy(manager.data)
+
+    result = manager.apply_capability_install_candidate(
+        {
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_operation_mismatch"
+    assert result.payload["expected_operation"] == "install"
+    assert result.payload["operation"] == "update"
+    assert result.payload["candidate_id"] == prepared.payload["candidate_id"]
+    assert result.payload["package_id"] == "waza"
+    assert manager.data == data_after_prepare
+
+
+def test_apply_install_candidate_rejects_missing_status_snapshot(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    built = manager.build_capability_install_candidate(
+        {
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+    assert built.ok is True
+    candidate = manager.data["capability_install_candidates"][built.payload["candidate_id"]]
+    candidate.pop("status", None)
+    data_after_corruption = deepcopy(manager.data)
+
+    result = manager.apply_capability_install_candidate(
+        {
+            "candidate_id": built.payload["candidate_id"],
+            "candidate_hash": built.payload["candidate_hash"],
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_not_executable"
+    assert result.payload["status"] == ""
+    assert manager.data == data_after_corruption
+
+
+def test_apply_install_candidate_rejects_unknown_status_snapshot(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    built = manager.build_capability_install_candidate(
+        {
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+    assert built.ok is True
+    candidate = manager.data["capability_install_candidates"][built.payload["candidate_id"]]
+    candidate["status"] = "mystery"
+    data_after_corruption = deepcopy(manager.data)
+
+    result = manager.apply_capability_install_candidate(
+        {
+            "candidate_id": built.payload["candidate_id"],
+            "candidate_hash": built.payload["candidate_hash"],
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_not_executable"
+    assert result.payload["status"] == "mystery"
+    assert manager.data == data_after_corruption
+
+
+def test_apply_update_rejects_missing_status_snapshot(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {"snapshot_id": "snap-old"},
+                "manifest": {"components": [{"id": "skill:waza-read"}]},
+                "components": ["skill:waza-read"],
+            }
+        }
+    }
+    prepared = manager.prepare_capability_package_update(
+        {
+            "package_id": "waza",
+            "next_source_snapshot": {"snapshot_id": "snap-new"},
+            "next_manifest": {"components": [{"id": "skill:waza-write"}]},
+        }
+    )
+    assert prepared.ok is True
+    candidate = manager.data["capability_install_candidates"][prepared.payload["candidate_id"]]
+    candidate.pop("status", None)
+    data_after_corruption = deepcopy(manager.data)
+
+    result = manager.apply_capability_package_update(
+        {
+            "package_id": "waza",
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+            "activation_approved": True,
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_not_executable"
+    assert result.payload["status"] == ""
+    assert manager.data == data_after_corruption
 
 
 def test_apply_capability_package_update_converges_materialized_resources(
@@ -400,36 +737,6 @@ def test_apply_capability_package_update_converges_materialized_resources(
                     ]
                 },
                 "components": ["skill:waza-read"],
-                "update_candidate": {
-                    "candidate_id": "cand-1",
-                    "source_snapshot": {"snapshot_id": "snap-new"},
-                    "manifest": {
-                        "components": [
-                            {
-                                "id": "skill:waza-write",
-                                "kind": "skill",
-                                "name": "waza-write",
-                                "config": {"skill_content": new_content},
-                            }
-                        ]
-                    },
-                    "manifest_diff": {
-                        "added_components": ["skill:waza-write"],
-                        "removed_components": ["skill:waza-read"],
-                    },
-                    "rollback_snapshot_id": "snap-old",
-                    "rollback_source_snapshot": {"snapshot_id": "snap-old"},
-                    "rollback_manifest": {
-                        "components": [
-                            {
-                                "id": "skill:waza-read",
-                                "kind": "skill",
-                                "name": "waza-read",
-                                "config": {"skill_content": old_content},
-                            }
-                        ]
-                    },
-                },
             }
         },
         "capability_components": {
@@ -457,8 +764,23 @@ def test_apply_capability_package_update_converges_materialized_resources(
         },
     }
 
-    result = manager.apply_capability_package_update(
-        {"package_id": "waza", "activation_approved": True}
+    result = _apply_prepared_update(
+        manager,
+        {
+            "package_id": "waza",
+            "next_source_snapshot": {"snapshot_id": "snap-new"},
+            "next_manifest": {
+                "components": [
+                    {
+                        "id": "skill:waza-write",
+                        "kind": "skill",
+                        "name": "waza-write",
+                        "config": {"skill_content": new_content},
+                    }
+                ]
+            },
+        },
+        activation_approved=True,
     )
 
     assert result.ok is True
@@ -561,8 +883,10 @@ def test_rollback_capability_package_update_converges_materialized_resources(
         },
     }
 
-    result = manager.rollback_capability_package_update(
-        {"package_id": "waza", "activation_approved": True}
+    result = _apply_prepared_rollback(
+        manager,
+        {"package_id": "waza"},
+        activation_approved=True,
     )
 
     assert result.ok is True
@@ -600,7 +924,7 @@ def test_rollback_capability_package_update_rejects_empty_rollback_metadata(
         }
     }
 
-    result = manager.rollback_capability_package_update({"package_id": "waza"})
+    result = manager.prepare_capability_package_rollback({"package_id": "waza"})
 
     assert result.ok is False
     assert result.status == 400
@@ -629,7 +953,7 @@ def test_rollback_capability_package_update_rejects_consumed_rollback(
         }
     }
 
-    result = manager.rollback_capability_package_update({"package_id": "waza"})
+    result = manager.prepare_capability_package_rollback({"package_id": "waza"})
 
     assert result.ok is False
     assert result.status == 400
@@ -640,6 +964,262 @@ def test_rollback_capability_package_update_rejects_consumed_rollback(
     assert manager.data["capability_packages"]["waza"]["state"]["update_state"] == (
         "current"
     )
+
+
+def test_rollback_capability_package_update_rejects_candidate_for_other_package(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "docs": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"update_state": "rollback_available"},
+                "source_snapshot": {"snapshot_id": "docs-new"},
+                "manifest": {"components": [{"id": "skill:docs-write"}]},
+                "components": ["skill:docs-write"],
+                "rollback": {
+                    "snapshot_id": "docs-old",
+                    "source_snapshot": {"snapshot_id": "docs-old"},
+                    "manifest": {"components": [{"id": "skill:docs-read"}]},
+                },
+            },
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"update_state": "rollback_available"},
+                "source_snapshot": {"snapshot_id": "waza-new"},
+                "manifest": {"components": [{"id": "skill:waza-write"}]},
+                "components": ["skill:waza-write"],
+                "rollback": {
+                    "snapshot_id": "waza-old",
+                    "source_snapshot": {"snapshot_id": "waza-old"},
+                    "manifest": {"components": [{"id": "skill:waza-read"}]},
+                },
+            },
+        }
+    }
+    prepared = manager.prepare_capability_package_rollback({"package_id": "docs"})
+    assert prepared.ok is True
+    data_after_prepare = deepcopy(manager.data)
+
+    result = manager.rollback_capability_package_update(
+        {
+            "package_id": "waza",
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+            "activation_approved": True,
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_package_mismatch"
+    assert result.payload["package_id"] == "waza"
+    assert result.payload["candidate_package_id"] == "docs"
+    assert manager.data == data_after_prepare
+
+
+def test_apply_install_candidate_rejects_prepared_rollback_candidate(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"update_state": "rollback_available"},
+                "source_snapshot": {"snapshot_id": "snap-new"},
+                "manifest": {"components": [{"id": "skill:waza-write"}]},
+                "components": ["skill:waza-write"],
+                "rollback": {
+                    "snapshot_id": "snap-old",
+                    "source_snapshot": {"snapshot_id": "snap-old"},
+                    "manifest": {"components": [{"id": "skill:waza-read"}]},
+                },
+            }
+        }
+    }
+    prepared = manager.prepare_capability_package_rollback({"package_id": "waza"})
+    assert prepared.ok is True
+    data_after_prepare = deepcopy(manager.data)
+
+    result = manager.apply_capability_install_candidate(
+        {
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_operation_mismatch"
+    assert result.payload["expected_operation"] == "install"
+    assert result.payload["operation"] == "rollback"
+    assert result.payload["candidate_id"] == prepared.payload["candidate_id"]
+    assert result.payload["package_id"] == "waza"
+    assert manager.data == data_after_prepare
+
+
+def test_apply_rollback_rejects_missing_status_snapshot(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "waza": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"update_state": "rollback_available"},
+                "source_snapshot": {"snapshot_id": "snap-new"},
+                "manifest": {"components": [{"id": "skill:waza-write"}]},
+                "components": ["skill:waza-write"],
+                "rollback": {
+                    "snapshot_id": "snap-old",
+                    "source_snapshot": {"snapshot_id": "snap-old"},
+                    "manifest": {"components": [{"id": "skill:waza-read"}]},
+                },
+            }
+        }
+    }
+    prepared = manager.prepare_capability_package_rollback({"package_id": "waza"})
+    assert prepared.ok is True
+    candidate = manager.data["capability_install_candidates"][prepared.payload["candidate_id"]]
+    candidate.pop("status", None)
+    data_after_corruption = deepcopy(manager.data)
+
+    result = manager.rollback_capability_package_update(
+        {
+            "package_id": "waza",
+            "candidate_id": prepared.payload["candidate_id"],
+            "candidate_hash": prepared.payload["candidate_hash"],
+            "activation_approved": True,
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_not_executable"
+    assert result.payload["status"] == ""
+    assert manager.data == data_after_corruption
+
+
+def test_apply_update_rejects_install_candidate(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "review": {
+                "enabled": True,
+                "status": "installed",
+                "source_snapshot": {"snapshot_id": "snap-old"},
+                "manifest": {"components": [{"id": "skill:old-review"}]},
+                "components": ["skill:old-review"],
+            }
+        }
+    }
+    built = manager.build_capability_install_candidate(
+        {
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+    assert built.ok is True
+    data_after_build = deepcopy(manager.data)
+
+    result = manager.apply_capability_package_update(
+        {
+            "package_id": "review",
+            "candidate_id": built.payload["candidate_id"],
+            "candidate_hash": built.payload["candidate_hash"],
+            "activation_approved": True,
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_operation_mismatch"
+    assert result.payload["expected_operation"] == "update"
+    assert result.payload["operation"] == "install"
+    assert manager.data == data_after_build
+
+
+def test_apply_rollback_rejects_install_candidate(tmp_path: Path) -> None:
+    manager = MemoryAdminManager(tmp_path / "config.yaml")
+    manager.data = {
+        "capability_packages": {
+            "review": {
+                "enabled": True,
+                "status": "installed",
+                "state": {"update_state": "rollback_available"},
+                "source_snapshot": {"snapshot_id": "snap-new"},
+                "manifest": {"components": [{"id": "skill:new-review"}]},
+                "components": ["skill:new-review"],
+                "rollback": {
+                    "snapshot_id": "snap-old",
+                    "source_snapshot": {"snapshot_id": "snap-old"},
+                    "manifest": {"components": [{"id": "skill:old-review"}]},
+                },
+            }
+        }
+    }
+    built = manager.build_capability_install_candidate(
+        {
+            "draft": {
+                "id": "review",
+                "name": "Review",
+                "components": [
+                    {
+                        "kind": "skill",
+                        "name": "code-review",
+                        "skill_content": (
+                            "---\n"
+                            "name: code-review\n"
+                            "description: Review changes.\n"
+                            "---\n"
+                            "Review.\n"
+                        ),
+                    }
+                ],
+                "evidence": [{"title": "fixture", "excerpt": "review"}],
+                "risk_level": "low",
+            },
+        }
+    )
+    assert built.ok is True
+    data_after_build = deepcopy(manager.data)
+
+    result = manager.rollback_capability_package_update(
+        {
+            "package_id": "review",
+            "candidate_id": built.payload["candidate_id"],
+            "candidate_hash": built.payload["candidate_hash"],
+            "activation_approved": True,
+        }
+    )
+
+    assert result.ok is False
+    assert result.status == 409
+    assert result.payload["error"] == "capability_install_candidate_operation_mismatch"
+    assert result.payload["expected_operation"] == "rollback"
+    assert result.payload["operation"] == "install"
+    assert manager.data == data_after_build
 
 
 def test_check_capability_package_update_does_not_report_no_diff_candidate(
@@ -665,18 +1245,18 @@ def test_check_capability_package_update_does_not_report_no_diff_candidate(
     result = manager.check_capability_package_update(
         {
             "package_id": "waza",
-            "candidate_snapshot": {
+            "next_source_snapshot": {
                 "snapshot_id": "snap-old",
                 "source_ref": "main",
                 "commit_sha": "1111111",
             },
-            "candidate_manifest": {"components": [{"id": "skill:waza/read"}]},
+            "next_manifest": {"components": [{"id": "skill:waza/read"}]},
         }
     )
 
     assert result.ok is True
     assert result.payload["update_available"] is False
-    assert result.payload["update_candidate"]["manifest_diff"]["added_components"] == []
+    assert result.payload["transition_preview"]["manifest_diff"]["added_components"] == []
 
 
 def test_server_settings_projects_capability_package_credential_bindings(
@@ -787,7 +1367,8 @@ def test_accept_capability_package_preserves_credential_requirements(
 ) -> None:
     manager = MemoryAdminManager(tmp_path / "config.yaml")
 
-    result = manager.accept_capability_package_draft(
+    result = _apply_install_candidate(
+        manager,
         {
             "package_id": "github-tools",
             "draft": {
