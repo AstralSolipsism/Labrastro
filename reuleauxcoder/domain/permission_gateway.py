@@ -363,35 +363,20 @@ class PermissionGateway:
         effective = request.effective_capabilities or {}
         target = request.target
         candidates = _target_candidates(target)
-        tools = _string_set(effective.get("tools"))
-        builtin_tools = _string_set(effective.get("builtin_tools"))
+        tool_spec_match = _tool_spec_match(effective.get("tool_specs"), target, candidates)
+        if tool_spec_match:
+            return tool_spec_match
         if target.tool_source in {"builtin", "builtin_tool"} or target.kind in {
             "builtin",
             "builtin_tool",
             "tool",
         }:
-            for candidate in candidates:
-                if candidate in tools:
-                    return candidate
-            if target.name in builtin_tools:
-                return f"builtin_tool:{target.name}"
-            for value in tools:
-                if _tool_name_from_registry_path(value) == target.name:
-                    return value
             return ""
 
         if target.tool_source == "mcp" or target.kind in {"mcp", "mcp_tool"}:
-            servers = _string_set(effective.get("mcp_servers"))
-            mcp_tools = _string_set(effective.get("mcp_tools"))
-            if target.mcp_server and target.mcp_server in servers:
-                return f"mcp:{target.mcp_server}"
-            if target.name in mcp_tools:
-                return f"mcp_tool:{target.name}"
-            if target.mcp_tool and target.mcp_tool in mcp_tools:
-                return f"mcp_tool:{target.mcp_tool}"
-            for candidate in candidates:
-                if candidate in tools:
-                    return candidate
+            server = str(target.mcp_server or "").strip()
+            if server and server in _string_set(effective.get("mcp_servers")):
+                return f"mcp:{server}"
             return ""
 
         if (
@@ -404,18 +389,12 @@ class PermissionGateway:
             )
             if requirement_match:
                 return requirement_match
-            for candidate in candidates:
-                if candidate in tools:
-                    return candidate
             return ""
 
         if target.kind == "skill":
             skills = _string_set(effective.get("skills"))
             return f"skill:{target.name}" if target.name in skills else ""
 
-        for candidate in candidates:
-            if candidate in tools:
-                return candidate
         return ""
 
     def _evaluate_execution_policy(
@@ -425,7 +404,10 @@ class PermissionGateway:
         capability_matched: str,
         warnings: list[str],
     ) -> PermissionDecision | None:
-        policy = self._matching_execution_policy(request)
+        policy = self._matching_execution_policy(
+            request,
+            capability_matched=capability_matched,
+        )
         if policy is None:
             return None
         policy_value = str(policy.get("policy") or "").strip().lower()
@@ -552,18 +534,26 @@ class PermissionGateway:
         return None
 
     def _matching_execution_policy(
-        self, request: PermissionRequest
+        self,
+        request: PermissionRequest,
+        *,
+        capability_matched: str = "",
     ) -> dict[str, Any] | None:
         policies = request.effective_capabilities.get("execution_policies", [])
-        if not isinstance(policies, list):
-            return None
         candidates = _target_candidates(request.target)
-        for policy in policies:
-            if not isinstance(policy, dict):
-                continue
-            target = str(policy.get("target") or "").strip()
-            if target and target in candidates:
-                return policy
+        if isinstance(policies, list):
+            for policy in policies:
+                if not isinstance(policy, dict):
+                    continue
+                target = str(policy.get("target") or "").strip()
+                if target and target in candidates:
+                    return policy
+        tool_policy = _tool_spec_execution_policy(
+            request.effective_capabilities.get("tool_specs"),
+            capability_matched,
+        )
+        if tool_policy is not None:
+            return tool_policy
         return None
 
     def _evaluate_lifecycle_outputs(
@@ -678,16 +668,96 @@ def _string_set(value: Any) -> set[str]:
     return {str(item).strip() for item in value if str(item).strip()}
 
 
-def _tool_name_from_registry_path(value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if ":" not in text:
-        return text
-    prefix, suffix = text.split(":", 1)
-    if prefix in {"builtin", "tool", "builtin_tool"}:
-        return suffix.strip()
-    return text
+def _tool_spec_match(
+    value: Any,
+    target: PermissionTarget,
+    candidates: set[str],
+) -> str:
+    for spec in _tool_spec_items(value):
+        tool_id = str(spec.get("tool_id") or "").strip()
+        target_ref = str(spec.get("target_tool_ref") or "").strip()
+        metadata = spec.get("metadata")
+        if isinstance(metadata, dict) and not target_ref:
+            target_ref = str(metadata.get("target_tool_ref") or "").strip()
+        source_type = str(
+            spec.get("source_type")
+            or (metadata.get("source_type") if isinstance(metadata, dict) else "")
+            or ""
+        ).strip()
+        name = str(spec.get("name") or "").strip()
+        if _is_mcp_target(target) or source_type in {"mcp_tool", "local_mcp", "remote_mcp"}:
+            possible = _mcp_tool_spec_candidates(
+                tool_id=tool_id,
+                target_ref=target_ref,
+                metadata=metadata if isinstance(metadata, dict) else {},
+                name=name,
+                target=target,
+            )
+            if candidates.intersection(possible):
+                return tool_id or target_ref or name
+            continue
+        possible = {tool_id, target_ref, name}
+        if source_type == "builtin_tool" and name:
+            possible.update({f"builtin:{name}", f"builtin_tool:{name}"})
+        if candidates.intersection({item for item in possible if item}):
+            return tool_id or target_ref or name
+    return ""
+
+
+def _mcp_tool_spec_candidates(
+    *,
+    tool_id: str,
+    target_ref: str,
+    metadata: dict[str, Any],
+    name: str,
+    target: PermissionTarget,
+) -> set[str]:
+    values = {tool_id, target_ref}
+    server_name = str(
+        metadata.get("server_name")
+        or metadata.get("mcp_server")
+        or ""
+    ).strip()
+    if server_name and name:
+        values.add(f"mcp:{server_name}:{name}")
+    return {value for value in values if value}
+
+
+def _tool_spec_execution_policy(
+    value: Any,
+    capability_matched: str,
+) -> dict[str, Any] | None:
+    if not capability_matched:
+        return None
+    for spec in _tool_spec_items(value):
+        tool_id = str(spec.get("tool_id") or "").strip()
+        if tool_id != capability_matched:
+            continue
+        permission = spec.get("permission")
+        policy = (
+            str(permission.get("policy") or "").strip()
+            if isinstance(permission, dict)
+            else ""
+        )
+        if not policy or policy == "inherit":
+            return None
+        metadata = spec.get("metadata")
+        return {
+            "target": tool_id,
+            "target_type": "capability_tool_spec",
+            "policy": policy,
+            "risk_level": str(metadata.get("risk_level") or "")
+            if isinstance(metadata, dict)
+            else "",
+            "source_type": str(spec.get("source_type") or ""),
+        }
+    return None
+
+
+def _tool_spec_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 def _source_flow(source: str) -> str:
@@ -711,6 +781,8 @@ def _approval_tool_source(target: PermissionTarget) -> ToolSource:
 
 
 def _target_candidates(target: PermissionTarget) -> set[str]:
+    if _is_mcp_target(target):
+        return _mcp_target_candidates(target)
     values = {
         str(target.name or "").strip(),
         str(target.registry_path or "").strip(),
@@ -725,16 +797,28 @@ def _target_candidates(target: PermissionTarget) -> set[str]:
             "tool",
         }:
             values.update({f"builtin:{name}", f"builtin_tool:{name}"})
-        if target.tool_source == "mcp" or kind in {"mcp", "mcp_tool"}:
-            values.add(f"mcp_tool:{name}")
         if kind == "environment_requirement" or target.tool_source == "environment_requirement":
             values.add(f"envreq:executable:{name}")
         if kind == "skill":
             values.add(f"skill:{name}")
-    if target.mcp_server:
-        values.add(f"mcp:{target.mcp_server}")
-    if target.mcp_tool:
-        values.add(f"mcp_tool:{target.mcp_tool}")
+    return {value for value in values if value}
+
+
+def _is_mcp_target(target: PermissionTarget) -> bool:
+    return target.tool_source == "mcp" or target.kind in {"mcp", "mcp_tool"}
+
+
+def _mcp_target_candidates(target: PermissionTarget) -> set[str]:
+    values = {
+        str(target.registry_path or "").strip(),
+        str(target.component_id or "").strip(),
+    }
+    server = str(target.mcp_server or "").strip()
+    tool = str(target.mcp_tool or target.name or "").strip()
+    if server:
+        values.add(f"mcp:{server}")
+        if tool:
+            values.add(f"mcp:{server}:{tool}")
     return {value for value in values if value}
 
 

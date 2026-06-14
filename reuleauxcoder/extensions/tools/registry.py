@@ -8,6 +8,8 @@ from typing import Optional
 
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool
+from reuleauxcoder.extensions.tools.catalog import ToolCatalog, ToolExposurePlan
+from reuleauxcoder.extensions.tools.spec import ToolExposure, ToolSpec
 
 _BUILTIN_TOOL_PACKAGE = "reuleauxcoder.extensions.tools.builtin"
 _TOOL_CLASSES: list[type[Tool]] = []
@@ -36,13 +38,37 @@ def _import_builtin_tool_modules() -> None:
 def iter_tool_classes() -> tuple[type[Tool], ...]:
     """Return registered tool classes."""
     _import_builtin_tool_modules()
-    return tuple(_TOOL_CLASSES)
+    return tuple(sorted(_TOOL_CLASSES, key=lambda tool_cls: tool_cls.name))
 
 
 def build_tools(backend: ToolBackend | None = None) -> list[Tool]:
     """Instantiate all registered tool classes with the provided backend."""
     effective_backend = backend or LocalToolBackend()
     return [tool_cls(backend=effective_backend) for tool_cls in iter_tool_classes()]
+
+
+def build_tool_catalog(backend: ToolBackend | None = None) -> ToolCatalog:
+    """Build the canonical catalog for registered builtin tools."""
+    return ToolCatalog.from_tools(build_tools(backend=backend))
+
+
+def build_tool_exposure_plan(
+    backend: ToolBackend | None = None,
+) -> ToolExposurePlan:
+    """Build the exposure plan for registered builtin tools."""
+    return build_tool_catalog(backend=backend).exposure_plan()
+
+
+def build_tool_specs(
+    backend: ToolBackend | None = None,
+    *,
+    exposure: ToolExposure | None = None,
+) -> tuple[ToolSpec, ...]:
+    """Build the stable canonical catalog for registered tools."""
+    specs = tuple(entry.spec for entry in build_tool_catalog(backend=backend).entries)
+    if exposure is not None:
+        specs = tuple(spec for spec in specs if spec.exposure == exposure)
+    return tuple(sorted(specs, key=lambda spec: (spec.namespace, spec.name)))
 
 
 def get_tool(name: str, backend: ToolBackend | None = None) -> Optional[Tool]:

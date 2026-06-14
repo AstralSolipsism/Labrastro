@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from reuleauxcoder.extensions.tools.base import Tool
+from reuleauxcoder.extensions.tools.spec import ToolExposure, ToolRisk
 from labrastro_server.services.collaboration.service import IssueAssignmentService
 
 
@@ -13,6 +14,10 @@ class MentionAgentTool(Tool):
     """Tool for proposing Agent collaboration through mention records."""
 
     name = "mention_agent"
+    namespace = "collaboration"
+    risk = ToolRisk.CAPABILITY
+    exposure = ToolExposure.HIDDEN
+    permission_policy = "capability"
     description = (
         "Parse or record an @agent mention for issue/task collaboration. This "
         "tool can create mention and assignment records, but it cannot dispatch "

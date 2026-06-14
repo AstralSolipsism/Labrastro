@@ -41,6 +41,8 @@ from reuleauxcoder.domain.permission_gateway import (
     PermissionTarget,
 )
 from reuleauxcoder.infrastructure.platform import get_platform_info
+from reuleauxcoder.extensions.tools.capability import CapabilityToolReference
+from reuleauxcoder.extensions.tools.catalog import ToolCatalog, ToolExposurePlan
 from reuleauxcoder.services.prompt.builder import system_prompt
 
 
@@ -94,6 +96,13 @@ def _lifecycle_terminal_message(output_dict: dict) -> str:
     if user_message:
         return user_message
     return _lifecycle_reason_text(output_dict.get("reason"))
+
+
+def _is_executable_capability_tool_spec(item: dict) -> bool:
+    source_type = str(item.get("source_type") or "").strip()
+    if source_type in {"mcp", "mcp_server"}:
+        return False
+    return True
 
 
 def _terminal_lifecycle_resolution(
@@ -373,6 +382,36 @@ class Agent:
         """Return tools hidden/blocked by current mode."""
         return [tool for tool in self.tools if not self.is_tool_authorized(tool)]
 
+    def tool_catalog(self, *, active_only: bool = False) -> ToolCatalog:
+        """Build the canonical catalog for this agent's registered tools."""
+        tools = self.get_active_tools() if active_only else list(self.tools)
+        return ToolCatalog.from_tools([*tools, *self._resolved_capability_tools()])
+
+    def tool_exposure_plan(self) -> ToolExposurePlan:
+        """Return the model exposure plan for authorized tools."""
+        return self.tool_catalog(active_only=True).exposure_plan()
+
+    def tool_route_plan(self) -> ToolExposurePlan:
+        """Return the executor route plan for all registered tools."""
+        return self.tool_catalog(active_only=False).exposure_plan()
+
+    def get_model_callable_tool(self, name: str) -> Optional["Tool"]:
+        """Return a directly exposed tool callable from model tool calls."""
+        return self.tool_exposure_plan().get_model_callable_tool(name)
+
+    def _resolved_capability_tools(self) -> list[CapabilityToolReference]:
+        resolved = getattr(self, "resolved_capabilities", None)
+        if not isinstance(resolved, dict):
+            resolved = {}
+        raw_specs = resolved.get("tool_specs")
+        if not isinstance(raw_specs, list):
+            raw_specs = []
+        return [
+            CapabilityToolReference(item)
+            for item in raw_specs
+            if isinstance(item, dict) and _is_executable_capability_tool_spec(item)
+        ]
+
     def capability_tool_policy_enabled(self) -> bool:
         """Return whether effective_capabilities is an active tool boundary."""
 
@@ -499,6 +538,20 @@ class Agent:
                 tool_source="skill",
                 registry_path=f"skill:{tool_name}" if tool_name else "",
                 component_id=f"skill:{tool_name}" if tool_name else "",
+            )
+        if tool_source == "capability":
+            spec = tool.tool_spec()
+            metadata = dict(getattr(spec, "metadata", {}) or {})
+            return PermissionTarget(
+                kind="capability_tool",
+                name=tool_name,
+                tool_source="capability",
+                registry_path=str(
+                    metadata.get("target_tool_ref")
+                    or metadata.get("tool_id")
+                    or ""
+                ),
+                component_id=str(metadata.get("component_id") or ""),
             )
         return PermissionTarget(
             kind="builtin_tool",
@@ -1113,10 +1166,7 @@ class Agent:
 
     def get_tool(self, name: str) -> Optional["Tool"]:
         """Look up a tool by name."""
-        for t in self.tools:
-            if t.name == name:
-                return t
-        return None
+        return self.tool_route_plan().get_executor(name)
 
     def chat(self, user_input: str, *, clear_stop_request: bool = True) -> str:
         """Process one user message."""
