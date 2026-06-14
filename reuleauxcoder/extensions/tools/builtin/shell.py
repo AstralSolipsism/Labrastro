@@ -9,6 +9,7 @@ import subprocess
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
+from reuleauxcoder.extensions.tools.spec import ToolRisk
 from reuleauxcoder.infrastructure.platform import ShellType, get_platform_info
 
 
@@ -27,6 +28,8 @@ GENERIC_INTENTS = {
 @register_tool
 class ShellTool(Tool):
     name = "shell"
+    risk = ToolRisk.COMMAND_EXECUTION
+    permission_policy = "command_execution"
     description = (
         "Execute a shell command. Returns stdout, stderr, and exit code. "
         "Use this for running tests, installing packages, git operations, etc."

@@ -15,6 +15,7 @@ from reuleauxcoder.domain.files import (
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
+from reuleauxcoder.extensions.tools.spec import ToolOutputStrategy, ToolRisk
 
 
 PATCH_ARGUMENT_CHARS_LIMIT = 64 * 1024
@@ -24,6 +25,12 @@ PATCH_ARGUMENT_CHARS_LIMIT = 64 * 1024
 class ApplyPatchTool(Tool):
     name = "apply_patch"
     uses_workspace_mutation_candidate = True
+    risk = ToolRisk.FILE_MUTATION
+    output_strategy = ToolOutputStrategy.MUTATION_RESULT
+    permission_policy = "file_mutation"
+    mutates_files = True
+    preview_required = True
+    approved_save_candidate_required = True
     description = APPLY_PATCH_TOOL_DESCRIPTION
     parameters = {
         "type": "object",

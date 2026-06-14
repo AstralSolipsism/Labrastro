@@ -39,6 +39,7 @@ from reuleauxcoder.domain.hooks.lifecycle_policy import (
     lifecycle_output_requests_approval,
 )
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
+from reuleauxcoder.extensions.tools.spec import ProviderSurface, ToolExposure
 
 
 class AgentLoop:
@@ -435,7 +436,34 @@ class AgentLoop:
 
     def _tool_schemas(self) -> list[dict]:
         """Get tool schemas for LLM."""
-        return [t.schema() for t in self.agent.get_active_tools()]
+        exposure_plan = getattr(self.agent, "tool_exposure_plan", None)
+        if callable(exposure_plan):
+            return exposure_plan().direct_provider_schemas()
+        specs = []
+        for tool in self.agent.get_active_tools():
+            spec = tool.tool_spec()
+            if (
+                spec.exposure == ToolExposure.DIRECT
+                and spec.provider_surface == ProviderSurface.FUNCTION
+            ):
+                specs.append(spec)
+        return [
+            spec.to_openai_chat_tool()
+            for spec in sorted(specs, key=lambda item: (item.namespace, item.name))
+        ]
+
+    def _tool_exposure_metadata(self) -> dict:
+        exposure_plan = getattr(self.agent, "tool_exposure_plan", None)
+        if not callable(exposure_plan):
+            return {}
+        plan = exposure_plan()
+        return {
+            "direct_tool_names": [entry.name for entry in plan.direct],
+            "direct_tool_count": len(plan.direct),
+            "deferred_tool_count": len(plan.deferred),
+            "hidden_tool_count": len(plan.hidden),
+            "hosted_tool_count": len(plan.hosted),
+        }
 
     def _inject_pending_follow_ups(self) -> None:
         consume = getattr(self.agent, "consume_follow_ups", None)
@@ -733,6 +761,7 @@ class AgentLoop:
                     "round_index": round_num,
                     "active_mode": self.agent.active_mode,
                     "pending_tool_calls": len(self.agent._collect_pending_tool_calls()),
+                    "tool_exposure": self._tool_exposure_metadata(),
                 },
             )
 

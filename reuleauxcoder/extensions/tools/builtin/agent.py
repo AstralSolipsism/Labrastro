@@ -23,11 +23,14 @@ from reuleauxcoder.domain.permission_gateway import PermissionGateway
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
+from reuleauxcoder.extensions.tools.spec import ToolRisk
 
 
 @register_tool
 class DelegateAgentTool(Tool):
     name = "delegate_agent"
+    risk = ToolRisk.CAPABILITY
+    permission_policy = "capability"
     description = (
         "Delegate work to a configured persistent Agent. "
         "The target must be an AgentConfig id from the server Agent Registry. "

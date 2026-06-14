@@ -20,6 +20,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
+from reuleauxcoder.extensions.tools.spec import ToolOutputStrategy, ToolRisk
 
 
 DEFAULT_MAX_CHARS = 50_000
@@ -60,6 +61,9 @@ GITHUB_REFS = ["HEAD", "main", "master"]
 @register_tool
 class FetchCapabilitiesTool(Tool):
     name = "fetch_capabilities"
+    risk = ToolRisk.CAPABILITY
+    output_strategy = ToolOutputStrategy.JSON
+    permission_policy = "capability"
     description = (
         "Fetch read-only capability documentation from a URL and return structured "
         "sections, links, code blocks, and source evidence. Use this before creating "

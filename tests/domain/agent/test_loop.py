@@ -11,6 +11,17 @@ from reuleauxcoder.domain.hooks.lifecycle import (
 )
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
 from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
+from reuleauxcoder.extensions.tools.catalog import ToolCatalog
+from reuleauxcoder.extensions.tools.spec import (
+    ProviderSurface,
+    ToolExecutionSpec,
+    ToolExposure,
+    ToolMutationSpec,
+    ToolOutputStrategy,
+    ToolPermissionSpec,
+    ToolRisk,
+    ToolSpec,
+)
 from reuleauxcoder.services.prompt.builder import system_prompt
 
 
@@ -21,6 +32,47 @@ class _Tool:
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name}}
+
+    def tool_spec(self) -> ToolSpec:
+        return _loop_tool_spec(self.name, self.description)
+
+
+class _LoopSpecOnlyTool:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        exposure: ToolExposure = ToolExposure.DIRECT,
+    ):
+        self.name = name
+        self.description = description
+        self.exposure = exposure
+
+    def tool_spec(self) -> ToolSpec:
+        return _loop_tool_spec(self.name, self.description, self.exposure)
+
+
+def _loop_tool_spec(
+    name: str,
+    description: str,
+    exposure: ToolExposure = ToolExposure.DIRECT,
+) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        namespace="test",
+        description=description,
+        input_schema={"type": "object", "properties": {}},
+        output_schema=None,
+        output_strategy=ToolOutputStrategy.TEXT,
+        risk=ToolRisk.READ_ONLY,
+        exposure=exposure,
+        search_text=f"{name}\n{description}",
+        search_keywords=(),
+        permission=ToolPermissionSpec(policy="read_only"),
+        mutation=ToolMutationSpec(),
+        execution=ToolExecutionSpec(executor_ref=f"test.{name}"),
+        provider_surface=ProviderSurface.FUNCTION,
+    )
 
 
 class _AgentStub:
@@ -188,6 +240,71 @@ def test_agent_loop_passes_model_visible_apply_patch_contract_to_llm_chat() -> N
         "patch"
     ]["description"]
     assert "draft_document_begin" in patch_description
+
+
+def test_agent_loop_builds_model_visible_tool_schemas_from_sorted_direct_specs() -> None:
+    agent = SimpleNamespace(
+        get_active_tools=lambda: [
+            _LoopSpecOnlyTool("zeta", "last"),
+            _LoopSpecOnlyTool("internal_save", "hidden", ToolExposure.HIDDEN),
+            _LoopSpecOnlyTool("alpha", "first"),
+        ]
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    schemas = loop._tool_schemas()
+
+    assert [schema["function"]["name"] for schema in schemas] == ["alpha", "zeta"]
+    assert schemas[0]["function"]["description"] == "first"
+
+
+def test_agent_loop_reads_model_visible_schemas_from_exposure_plan() -> None:
+    plan = ToolCatalog.from_tools(
+        [
+            _LoopSpecOnlyTool("zeta", "last"),
+            _LoopSpecOnlyTool("capability_docs", "deferred", ToolExposure.DEFERRED),
+            _LoopSpecOnlyTool("alpha", "first"),
+        ]
+    ).exposure_plan()
+
+    def _unexpected_active_tool_scan():
+        raise AssertionError("AgentLoop must read the exposure plan")
+
+    agent = SimpleNamespace(
+        tool_exposure_plan=lambda: plan,
+        get_active_tools=_unexpected_active_tool_scan,
+    )
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    schemas = loop._tool_schemas()
+
+    assert [schema["function"]["name"] for schema in schemas] == ["alpha", "zeta"]
+
+
+def test_agent_loop_passes_tool_exposure_metadata_to_llm_request() -> None:
+    plan = ToolCatalog.from_tools(
+        [
+            _LoopSpecOnlyTool("tool_search", "search"),
+            _LoopSpecOnlyTool("capability_execute", "execute"),
+            _LoopSpecOnlyTool("capability_docs", "deferred", ToolExposure.DEFERRED),
+        ]
+    ).exposure_plan()
+    agent = _RunAgentStub([LLMResponse(content="done")])
+    agent.tool_exposure_plan = lambda: plan
+
+    loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
+
+    result = loop.run()
+
+    assert result == "done"
+    metadata = agent.llm.call_kwargs[0]["metadata"]
+    assert metadata["tool_exposure"] == {
+        "direct_tool_names": ["capability_execute", "tool_search"],
+        "direct_tool_count": 2,
+        "deferred_tool_count": 1,
+        "hidden_tool_count": 0,
+        "hosted_tool_count": 0,
+    }
 
 
 def test_system_prompt_no_longer_contains_runtime_environment_block() -> None:

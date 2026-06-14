@@ -131,11 +131,13 @@ class AgentEvent:
         tool_call_id: str | None = None,
         tool_source: str | None = None,
         index: int | None = None,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         """Create a tool call start event."""
         data = {
             **({"tool_source": tool_source} if tool_source else {}),
             **({"index": index} if index is not None else {}),
+            **(dict(tool_metadata) if tool_metadata else {}),
         }
         return cls(
             event_type=AgentEventType.TOOL_CALL_START,
@@ -338,6 +340,7 @@ class AgentEvent:
         tool_source: str | None = None,
         index: int | None = None,
         meta: dict[str, Any] | None = None,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         """Create a tool call end event."""
         return cls(
@@ -348,6 +351,7 @@ class AgentEvent:
             data={
                 **({"tool_source": tool_source} if tool_source else {}),
                 **({"index": index} if index is not None else {}),
+                **(dict(tool_metadata) if tool_metadata else {}),
                 **(
                     {"tool_result_preview": result[:500]}
                     if len(result) > 500

@@ -8,11 +8,14 @@ import uuid
 from reuleauxcoder.extensions.tools.backend import LocalToolBackend, ToolBackend
 from reuleauxcoder.extensions.tools.base import Tool, backend_handler
 from reuleauxcoder.extensions.tools.registry import register_tool
+from reuleauxcoder.extensions.tools.spec import ToolRisk
 
 
 @register_tool
 class DraftDocumentBeginTool(Tool):
     name = "draft_document_begin"
+    risk = ToolRisk.DOCUMENT_DRAFT
+    permission_policy = "document_draft"
     description = (
         "Declare that the next assistant markdown stream is a long document draft "
         "for a new target workspace path. Do not pass document content as tool "

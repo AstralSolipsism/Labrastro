@@ -1,7 +1,7 @@
 """Tool execution - handles tool calls."""
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 import concurrent.futures
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -68,6 +68,7 @@ from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.domain.memory.runtime import memory_metadata_from_agent
 from reuleauxcoder.extensions.tools.registry import get_tool
+from reuleauxcoder.extensions.tools.spec import ToolExposure
 from reuleauxcoder.services.llm.diagnostics import persist_tool_diagnostic_event
 
 
@@ -131,6 +132,7 @@ class ToolExecutor:
         self._file_change_changes_by_item_id: dict[str, list[dict]] = {}
         self._mutation_preview_outcomes_by_item_id: dict[str, _MutationPreviewOutcome] = {}
         self._anonymous_tool_invocation_seq = 0
+        self._tool_result_meta_by_call_identity: dict[int, dict[str, Any]] = {}
 
     def _runtime_budget_lock(self) -> threading.Lock:
         lock = getattr(self.agent, "runtime_budget_lock", None)
@@ -202,6 +204,278 @@ class ToolExecutor:
     def _tool_source(tool: object | None) -> str:
         return getattr(tool, "tool_source", "builtin" if tool is not None else "unknown")
 
+    @staticmethod
+    def _enum_payload_value(value: object) -> str:
+        text = getattr(value, "value", value)
+        return str(text or "").strip()
+
+    def _tool_event_metadata(self, tool: object | None) -> dict[str, Any]:
+        if tool is None:
+            return {}
+        tool_spec = getattr(tool, "tool_spec", None)
+        if not callable(tool_spec):
+            return {}
+        try:
+            spec = tool_spec()
+        except Exception:
+            return {}
+        metadata = getattr(spec, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        namespace = str(getattr(spec, "namespace", "") or "").strip()
+        name = str(getattr(spec, "name", "") or "").strip()
+        tool_id = str(metadata.get("tool_id") or "").strip()
+        if not tool_id and namespace and name:
+            tool_id = f"{namespace}:{name}"
+        risk = self._enum_payload_value(getattr(spec, "risk", ""))
+        exposure = self._enum_payload_value(getattr(spec, "exposure", ""))
+        payload: dict[str, Any] = {}
+        if tool_id:
+            payload["tool_id"] = tool_id
+        if risk:
+            payload["risk"] = risk
+        if exposure:
+            payload["exposure"] = exposure
+        return payload
+
+    def _record_tool_result_meta(
+        self,
+        tool_call: "ToolCall",
+        key: str,
+        value: dict[str, Any],
+    ) -> None:
+        if not isinstance(value, dict):
+            return
+        meta = self._tool_result_meta_by_call_identity.setdefault(id(tool_call), {})
+        meta[key] = dict(value)
+
+    def _consume_tool_result_meta(self, tool_call: "ToolCall") -> dict[str, Any] | None:
+        return self._tool_result_meta_by_call_identity.pop(id(tool_call), None)
+
+    def _resolve_model_tool(self, name: str) -> tuple[object | None, object | None, bool]:
+        exposure_plan = getattr(self.agent, "tool_exposure_plan", None)
+        route_plan = getattr(self.agent, "tool_route_plan", None)
+        if callable(exposure_plan) and callable(route_plan):
+            plan = exposure_plan()
+            routes = route_plan()
+            return (
+                plan.get_model_callable_tool(name),
+                routes.get_executor(name),
+                True,
+            )
+        tool = self.agent.get_tool(name)
+        if tool is None:
+            tool = get_tool(name)
+        return tool, tool, False
+
+    def _return_tool_not_directly_exposed(
+        self,
+        tc: "ToolCall",
+        *,
+        tool: object | None,
+        index: int | None = None,
+    ) -> str:
+        message = f"Error: tool '{tc.name}' is not directly exposed to the model"
+        diagnostic = tool_diagnostic_from_failure(
+            stage=ToolDiagnosticStage.PREFLIGHT,
+            kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+            code="tool_not_directly_exposed",
+            message=message,
+            tool_name=tc.name,
+            tool_call_id=tc.id,
+        )
+        context = self._tool_argument_context(tc, tool)
+        self._record_lifecycle_diagnostics([diagnostic], context)
+        self._emit_tool_end(
+            tc,
+            message,
+            tool=tool,
+            index=index,
+            meta=self._diagnostics_meta([diagnostic]),
+            emit_file_change=False,
+        )
+        return message
+
+    def _execute_tool_search(self, tool_call: "ToolCall") -> str:
+        arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        query = str(arguments.get("query") or "").strip()
+        try:
+            max_results = int(arguments.get("max_results") or 8)
+        except (TypeError, ValueError):
+            max_results = 8
+        max_results = max(1, min(max_results, 20))
+        route_plan = self.agent.tool_exposure_plan()
+        terms = [item for item in re.split(r"\s+", query.lower()) if item]
+        scored: list[tuple[int, str, object]] = []
+        for entry in route_plan.deferred:
+            score = self._tool_search_score(entry, terms)
+            if terms and score <= 0:
+                continue
+            scored.append((score, entry.tool_id, entry))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        entries = [entry for _score, _tool_id, entry in scored[:max_results]]
+        discovered = getattr(self.agent, "_discovered_capability_tool_ids", None)
+        if not isinstance(discovered, set):
+            discovered = set()
+        discovered.update(entry.tool_id for entry in entries)
+        setattr(self.agent, "_discovered_capability_tool_ids", discovered)
+        self._record_tool_result_meta(
+            tool_call,
+            "search_trace",
+            {
+                "query": query,
+                "result_count": len(entries),
+                "tool_ids": [entry.tool_id for entry in entries],
+            },
+        )
+        return json.dumps(
+            {
+                "query": query,
+                "results": [
+                    self._tool_search_result_from_entry(entry) for entry in entries
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _tool_search_score(entry: object, terms: list[str]) -> int:
+        spec = getattr(entry, "spec", None)
+        haystack = "\n".join(
+            str(part or "")
+            for part in (
+                getattr(entry, "tool_id", ""),
+                getattr(entry, "name", ""),
+                getattr(spec, "description", ""),
+                getattr(spec, "search_text", ""),
+                " ".join(getattr(spec, "search_keywords", ()) or ()),
+            )
+        ).lower()
+        if not terms:
+            return 1
+        return sum(1 for term in terms if term in haystack)
+
+    def _tool_search_result_from_entry(self, entry: object) -> dict:
+        spec = entry.spec
+        metadata = dict(getattr(spec, "metadata", {}) or {})
+        target_tool_ref = str(metadata.get("target_tool_ref") or "").strip()
+        if not target_tool_ref:
+            target_tool_ref = str(getattr(spec.execution, "executor_ref", "") or "")
+        return {
+            "tool_id": entry.tool_id,
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": dict(spec.input_schema),
+            "risk": spec.risk.value,
+            "permission": {"policy": spec.permission.policy},
+            "mutation": {
+                "modifies_files": spec.mutation.modifies_files,
+                "preview_required": spec.mutation.preview_required,
+                "approved_save_candidate_required": (
+                    spec.mutation.approved_save_candidate_required
+                ),
+            },
+            "target_tool_ref": target_tool_ref,
+            "source_type": str(metadata.get("source_type") or ""),
+        }
+
+    def _execute_capability_execute(
+        self,
+        tool_call: "ToolCall",
+        *,
+        index: int | None,
+    ) -> str:
+        arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        tool_id = str(arguments.get("tool_id") or "").strip()
+        raw_target_arguments = arguments.get("arguments")
+        if not tool_id:
+            return "Error: capability_execute requires tool_id"
+        if not isinstance(raw_target_arguments, dict):
+            return "Error: capability_execute arguments must be an object"
+        exposure_plan = self.agent.tool_exposure_plan()
+        entry = exposure_plan.executor_routes_by_id.get(tool_id)
+        if entry is None:
+            return (
+                f"Error: capability tool_id '{tool_id}' is not available "
+                "in the active tool exposure plan"
+            )
+        if entry.spec.exposure != ToolExposure.DEFERRED:
+            return f"Error: capability tool_id '{tool_id}' is not a deferred capability tool"
+        route_plan = self.agent.tool_route_plan()
+        target_tool = self._capability_target_executor(entry, route_plan)
+        if target_tool is None:
+            return f"Error: capability tool_id '{tool_id}' has no registered executor"
+        target_name = str(getattr(target_tool, "name", "") or entry.name)
+        target_metadata = self._tool_event_metadata(target_tool)
+        self._record_tool_result_meta(
+            tool_call,
+            "execute_trace",
+            {
+                "tool_id": tool_id,
+                "target_tool_name": target_name,
+                "target_tool_id": str(target_metadata.get("tool_id") or entry.tool_id),
+                "target_exposure": str(
+                    target_metadata.get("exposure")
+                    or self._enum_payload_value(entry.spec.exposure)
+                ),
+            },
+        )
+        nested_call_id = f"{tool_call.id or 'capability_execute'}:{tool_id}"
+        nested_call = ToolCall(
+            id=nested_call_id,
+            name=target_name,
+            arguments=dict(raw_target_arguments),
+        )
+        return self._execute_resolved_tool(nested_call, target_tool, index=index)
+
+    def _capability_target_executor(
+        self,
+        entry: object,
+        route_plan: object,
+    ) -> object | None:
+        tool = entry.tool
+        if str(getattr(tool, "tool_source", "") or "") != "capability":
+            return tool
+        refs = self._capability_target_refs(entry)
+        for ref in refs:
+            target_entry = route_plan.executor_routes_by_id.get(ref)
+            if target_entry is not None and target_entry.tool is not tool:
+                return target_entry.tool
+            target_name = self._tool_name_from_capability_target_ref(ref)
+            if target_name:
+                target_tool = route_plan.get_executor(target_name)
+                if target_tool is not None and target_tool is not tool:
+                    return target_tool
+                target_tool = get_tool(target_name)
+                if target_tool is not None:
+                    return target_tool
+        return None
+
+    @staticmethod
+    def _capability_target_refs(entry: object) -> list[str]:
+        spec = entry.spec
+        metadata = dict(getattr(spec, "metadata", {}) or {})
+        refs = [
+            metadata.get("target_tool_ref"),
+            metadata.get("executor_ref"),
+            getattr(spec.execution, "executor_ref", ""),
+        ]
+        return [
+            str(ref).strip()
+            for ref in refs
+            if str(ref or "").strip()
+        ]
+
+    @staticmethod
+    def _tool_name_from_capability_target_ref(ref: str) -> str:
+        text = str(ref or "").strip()
+        if ":" not in text:
+            return ""
+        prefix, name = text.split(":", 1)
+        if prefix in {"builtin", "builtin_tool", "tool"}:
+            return name.strip()
+        return ""
+
     def _emit_tool_end(
         self,
         tc: "ToolCall",
@@ -222,6 +496,7 @@ class ToolExecutor:
                 tool_source=self._tool_source(tool),
                 index=index,
                 meta=meta,
+                tool_metadata=self._tool_event_metadata(tool),
             )
         )
 
@@ -240,6 +515,7 @@ class ToolExecutor:
                 tool_call_id=tc.id,
                 tool_source=self._tool_source(tool),
                 index=index,
+                tool_metadata=self._tool_event_metadata(tool),
             )
         )
 
@@ -1754,15 +2030,42 @@ class ToolExecutor:
 
     def execute(self, tc: "ToolCall", *, index: int | None = None) -> str:
         """Execute a single tool call."""
-        tool = self.agent.get_tool(tc.name)
-        if tool is None:
-            tool = get_tool(tc.name)
+        return self._execute_tool_call(tc, index=index)
+
+    def _execute_resolved_tool(
+        self,
+        tc: "ToolCall",
+        tool: object,
+        *,
+        index: int | None = None,
+    ) -> str:
+        """Execute an already routed tool through the normal execution pipeline."""
+        return self._execute_tool_call(tc, index=index, resolved_tool=tool)
+
+    def _execute_tool_call(
+        self,
+        tc: "ToolCall",
+        *,
+        index: int | None = None,
+        resolved_tool: object | None = None,
+    ) -> str:
+        tool, routed_tool, has_exposure_plan = (
+            self._resolve_model_tool(tc.name)
+            if resolved_tool is None
+            else (resolved_tool, resolved_tool, True)
+        )
         budget_error = self._consume_tool_call_budget()
         if budget_error is not None:
             return self._return_budget_error(
                 tc,
                 budget_error,
                 tool=tool,
+                index=index,
+            )
+        if has_exposure_plan and tool is None and routed_tool is not None:
+            return self._return_tool_not_directly_exposed(
+                tc,
+                tool=routed_tool,
                 index=index,
             )
         suppress_lifecycle = bool(
@@ -1851,10 +2154,17 @@ class ToolExecutor:
         tool_call = self._sync_tool_call(tc, tool_call)
         before_context.tool_call = tool_call
 
-        # First check agent's tools, then fall back to global registry
-        tool = self.agent.get_tool(tool_call.name)
-        if tool is None:
-            tool = get_tool(tool_call.name)
+        tool, routed_tool, has_exposure_plan = (
+            self._resolve_model_tool(tool_call.name)
+            if resolved_tool is None
+            else (resolved_tool, resolved_tool, True)
+        )
+        if has_exposure_plan and tool is None and routed_tool is not None:
+            return self._return_tool_not_directly_exposed(
+                tool_call,
+                tool=routed_tool,
+                index=index,
+            )
 
         if tool is None:
             message = f"Error: unknown tool '{tool_call.name}'"
@@ -2160,7 +2470,14 @@ class ToolExecutor:
                         on_wait=_emit_shell_runtime,
                     )
                 with shell_context:
-                    if self._should_save_approved_mutation_candidate(
+                    if resolved_tool is None and tool_call.name == "tool_search":
+                        result = self._execute_tool_search(tool_call)
+                    elif resolved_tool is None and tool_call.name == "capability_execute":
+                        result = self._execute_capability_execute(
+                            tool_call,
+                            index=index,
+                        )
+                    elif self._should_save_approved_mutation_candidate(
                         tool_call,
                         tool,
                         preview_outcome,
@@ -2250,12 +2567,13 @@ class ToolExecutor:
                     [result_diagnostic],
                     execution_context,
                 )
+            gateway_meta = self._consume_tool_result_meta(tool_call)
             self._emit_tool_end(
                 tool_call,
                 after_context.result,
                 tool=tool,
                 index=index,
-                meta=self._merge_meta(validation_meta, result_meta),
+                meta=self._merge_meta(validation_meta, gateway_meta, result_meta),
             )
             return after_context.result
         except TypeError as e:

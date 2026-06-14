@@ -19,8 +19,13 @@ from labrastro_server.interfaces.http.remote.protocol import (
 )
 from labrastro_server.relay.server import RelayServer
 from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
+from reuleauxcoder.domain.agent.agent import Agent
+from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
+from reuleauxcoder.domain.config.models import ApprovalConfig, Config
+from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.extensions.tools.backend import ExecutionContext
 from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
+from reuleauxcoder.extensions.tools.builtin.capability_execute import CapabilityExecuteTool
 from reuleauxcoder.extensions.tools.builtin.draft_document import DraftDocumentBeginTool
 from reuleauxcoder.extensions.tools.builtin.glob import GlobTool
 from reuleauxcoder.extensions.tools.builtin.grep import GrepTool
@@ -28,6 +33,7 @@ from reuleauxcoder.extensions.tools.builtin.list_file import ListFileTool
 from reuleauxcoder.extensions.tools.builtin.lsp import LspTool
 from reuleauxcoder.extensions.tools.builtin.read import ReadFileTool
 from reuleauxcoder.extensions.tools.builtin.shell import ShellTool
+from reuleauxcoder.extensions.tools.builtin.tool_search import ToolSearchTool
 
 
 _CONTRACT_FIXTURE = Path(__file__).parents[2] / "fixtures" / "apply_patch_contract.json"
@@ -335,6 +341,11 @@ class TestRemoteBackendDispatch:
                     server_name="docs",
                 ),
             )
+            spec = tool.tool_spec()
+            assert spec.exposure.value == "deferred"
+            assert spec.risk.value == "capability"
+            assert spec.metadata["tool_id"] == "mcp:docs:search"
+            assert spec.metadata["server_name"] == "docs"
 
             import threading
             import time
@@ -356,6 +367,102 @@ class TestRemoteBackendDispatch:
                 "agent_id": "reviewer",
                 "decision": {"action": "allow", "authorized": True},
             }
+            assert env.payload["tool_name"] == "mcp"
+            assert env.payload["args"]["server_name"] == "docs"
+            assert env.payload["args"]["tool_name"] == "search"
+            assert env.payload["args"]["arguments"] == {"query": "hello"}
+            srv.handle_inbound(
+                resp.peer_id,
+                RelayEnvelope(
+                    type="tool_result",
+                    request_id=env.request_id,
+                    peer_id=resp.peer_id,
+                    payload=ExecToolResult(ok=True, result="mcp-ok").to_dict(),
+                ),
+            )
+            t.join(timeout=2)
+            assert holder["result"] == "mcp-ok"
+        finally:
+            srv.stop()
+
+    def test_remote_peer_mcp_tool_is_searched_and_executed_through_capability_gateway(self) -> None:
+        srv = RelayServer()
+        received: list[tuple[str, object]] = []
+
+        def mock_send(peer_id: str, envelope: object) -> None:
+            received.append((peer_id, envelope))
+
+        srv._send_fn = mock_send
+        srv.start()
+        try:
+            from labrastro_server.interfaces.http.remote.protocol import RegisterRequest
+
+            resp = srv._on_register(
+                RegisterRequest(
+                    bootstrap_token=srv.issue_bootstrap_token(ttl_sec=60),
+                    cwd="/tmp",
+                )
+            )
+            backend = RemoteRelayToolBackend(relay_server=srv)
+            backend.context.peer_id = resp.peer_id
+            tool = RemotePeerMCPTool(
+                backend,
+                RemoteMCPToolInfo(
+                    name="search",
+                    description="Search docs",
+                    input_schema={"type": "object"},
+                    server_name="docs",
+                ),
+            )
+            agent = Agent(
+                llm=object(),
+                tools=[ToolSearchTool(), CapabilityExecuteTool(), tool],
+                config=Config(approval=ApprovalConfig(default_mode="allow")),
+            )
+            executor = ToolExecutor(agent)
+
+            search_result = json.loads(
+                executor.execute(
+                    ToolCall(
+                        id="search-remote-mcp",
+                        name="tool_search",
+                        arguments={"query": "docs search"},
+                    )
+                )
+            )
+            assert [item["tool_id"] for item in search_result["results"]] == [
+                "mcp:docs:search"
+            ]
+            assert [item["function"]["name"] for item in agent.tool_exposure_plan().direct_provider_schemas()] == [
+                "capability_execute",
+                "tool_search",
+            ]
+
+            import threading
+            import time
+            from labrastro_server.interfaces.http.remote.protocol import RelayEnvelope
+
+            holder: dict[str, object] = {}
+
+            def run_tool() -> None:
+                holder["result"] = executor.execute(
+                    ToolCall(
+                        id="exec-remote-mcp",
+                        name="capability_execute",
+                        arguments={
+                            "tool_id": "mcp:docs:search",
+                            "arguments": {"query": "hello"},
+                        },
+                    )
+                )
+
+            t = threading.Thread(target=run_tool)
+            t.start()
+            time.sleep(0.1)
+
+            assert len(received) == 1
+            env = received[0][1]
+            assert env.payload["tool_call_id"] == "exec-remote-mcp:mcp:docs:search"
             assert env.payload["tool_name"] == "mcp"
             assert env.payload["args"]["server_name"] == "docs"
             assert env.payload["args"]["tool_name"] == "search"
