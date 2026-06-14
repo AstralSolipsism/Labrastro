@@ -8416,9 +8416,9 @@ class TestRemoteRelayHTTPService:
         )
         service.start()
         try:
-            status, body = _json_request(
+            status, built = _json_request(
                 "POST",
-                f"{service.base_url}/remote/admin/capability-packages/drafts/accept",
+                f"{service.base_url}/remote/admin/capability-packages/candidates/build",
                 {
                     "package_id": "review",
                     "draft": {
@@ -8443,6 +8443,16 @@ class TestRemoteRelayHTTPService:
                 },
                 headers=TEST_ADMIN_HEADERS,
             )
+            assert status == 200
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/candidates/apply",
+                {
+                    "candidate_id": built["candidate_id"],
+                    "candidate_hash": built["candidate_hash"],
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
 
             assert status == 200
             state = body["capability_package"]["state"]
@@ -8455,7 +8465,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_admin_capability_package_update_candidate_routes(
+    def test_admin_capability_package_update_transition_routes(
         self, tmp_path: Path
     ) -> None:
         config_path = tmp_path / "config.host.yaml"
@@ -8471,7 +8481,24 @@ class TestRemoteRelayHTTPService:
                             "source_ref": "main",
                             "commit_sha": "1111111",
                         },
-                        "manifest": {"components": [{"id": "skill:waza/read"}]},
+                        "manifest": {
+                            "components": [
+                                {
+                                    "id": "skill:waza/read",
+                                    "kind": "skill",
+                                    "name": "waza-read",
+                                    "config": {
+                                        "skill_content": (
+                                            "---\n"
+                                            "name: waza-read\n"
+                                            "description: Read Waza.\n"
+                                            "---\n"
+                                            "Read.\n"
+                                        )
+                                    },
+                                }
+                            ]
+                        },
                         "components": ["skill:waza/read"],
                     }
                 }
@@ -8489,12 +8516,12 @@ class TestRemoteRelayHTTPService:
         try:
             update_payload = {
                 "package_id": "waza",
-                "candidate_snapshot": {
+                "next_source_snapshot": {
                     "snapshot_id": "snap-new",
                     "source_ref": "main",
                     "commit_sha": "2222222",
                 },
-                "candidate_manifest": {
+                "next_manifest": {
                     "components": [
                         {
                             "id": "skill:waza/read",
@@ -8534,8 +8561,8 @@ class TestRemoteRelayHTTPService:
                 headers=TEST_ADMIN_HEADERS,
             )
             assert check_status == 200
-            assert check_body["update_candidate"]["upstream_version"] == "main@2222222"
-            assert check_body["update_candidate"]["manifest_diff"]["added_components"] == [
+            assert check_body["transition_preview"]["upstream_version"] == "main@2222222"
+            assert check_body["transition_preview"]["manifest_diff"]["added_components"] == [
                 "skill:waza/write"
             ]
 
@@ -8553,7 +8580,12 @@ class TestRemoteRelayHTTPService:
             apply_status, apply_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/capability-packages/updates/apply",
-                {"package_id": "waza", "activation_approved": False},
+                {
+                    "package_id": "waza",
+                    "candidate_id": prepare_body["candidate_id"],
+                    "candidate_hash": prepare_body["candidate_hash"],
+                    "activation_approved": False,
+                },
                 headers=TEST_ADMIN_HEADERS,
             )
             assert apply_status == 200
@@ -8562,6 +8594,28 @@ class TestRemoteRelayHTTPService:
             assert applied["state"]["activation_state"] == "inactive"
             assert applied["state"]["update_state"] == "rollback_available"
             assert applied["rollback"]["snapshot_id"] == "snap-old"
+
+            rollback_prepare_status, rollback_prepare_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/updates/rollback/prepare",
+                {"package_id": "waza"},
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert rollback_prepare_status == 200
+            rollback_status, rollback_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/capability-packages/updates/rollback",
+                {
+                    "package_id": "waza",
+                    "candidate_id": rollback_prepare_body["candidate_id"],
+                    "candidate_hash": rollback_prepare_body["candidate_hash"],
+                    "activation_approved": True,
+                },
+                headers=TEST_ADMIN_HEADERS,
+            )
+            assert rollback_status == 200
+            rolled_back = rollback_body["settings"]["capability_packages"]["waza"]
+            assert rolled_back["state"]["update_state"] == "current"
         finally:
             service.stop()
             relay.stop()

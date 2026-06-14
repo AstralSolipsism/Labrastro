@@ -636,6 +636,9 @@ class ReuleauxCoderExecutorBackend:
         effective = permission_context.get("effective_capabilities")
         if not isinstance(effective, dict):
             effective = metadata.get("effective_capabilities")
+        resolved = permission_context.get("resolved_capabilities")
+        if not isinstance(resolved, dict):
+            resolved = metadata.get("resolved_capabilities")
         budget = normalize_runtime_budget(request.budget)
 
         if agent_id:
@@ -677,6 +680,8 @@ class ReuleauxCoderExecutorBackend:
         if isinstance(effective, dict):
             setattr(agent, "effective_capabilities", effective)
             setattr(agent, "enforce_effective_capabilities", True)
+        if isinstance(resolved, dict):
+            setattr(agent, "resolved_capabilities", resolved)
 
     @staticmethod
     def _agent_chat(agent: Any, prompt: str) -> str:

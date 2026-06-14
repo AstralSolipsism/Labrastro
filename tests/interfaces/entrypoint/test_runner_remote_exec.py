@@ -1485,7 +1485,16 @@ class TestRunnerRemoteExec:
     def test_runner_stream_chat_emits_startup_event(self) -> None:
         workspace = Path(__file__).resolve().parent
         port = _free_port()
-        runner = _build_runner_with_fake_agent(f"127.0.0.1:{port}")
+        seen_agents: list[FakeAgent] = []
+
+        def chat_behavior(agent: FakeAgent, prompt: str) -> str:
+            seen_agents.append(agent)
+            return f"ok:{prompt}"
+
+        runner = _build_runner_with_fake_agent(
+            f"127.0.0.1:{port}",
+            chat_behavior=chat_behavior,
+        )
         ctx = runner.initialize()
         try:
             assert runner._relay_server is not None
@@ -1515,7 +1524,18 @@ class TestRunnerRemoteExec:
             assert payload["model"]
             assert payload["main_agent_id"] == "main_chat"
             assert payload["agent_config_id"] == "main_chat"
-            assert "builtin:fetch_capabilities" in payload["effective_capabilities"]["tools"]
+            assert "tools" not in payload["effective_capabilities"]
+            assert any(
+                item.get("target_tool_ref") == "builtin:fetch_capabilities"
+                for item in payload["effective_capabilities"]["tool_specs"]
+            )
+            assert seen_agents
+            resolved = getattr(seen_agents[0], "resolved_capabilities", {})
+            assert "tools" not in resolved
+            assert any(
+                item.get("target_tool_ref") == "builtin:fetch_capabilities"
+                for item in resolved["tool_specs"]
+            )
             assert not any(
                 event["type"] == "output"
                 and "REMOTE PEER READY" in event["payload"].get("content", "")

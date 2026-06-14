@@ -1146,6 +1146,8 @@ class AgentRunControlPlane:
         resolved = _dict_from(raw_agent.get("resolved_capabilities"))
         effective = _dict_from(raw_agent.get("effective_capabilities"))
         overlay = _dict_from(resolved.get("capability_overlay"))
+        if resolved:
+            metadata.setdefault("resolved_capabilities", resolved)
         if overlay:
             metadata.setdefault("capability_overlay", overlay)
         if effective:
@@ -1163,6 +1165,7 @@ class AgentRunControlPlane:
                 "runtime_profile_id": runtime_profile_id
                 or str(raw_agent.get("runtime_profile") or ""),
                 "effective_capabilities": effective,
+                "resolved_capabilities": resolved,
             },
         )
         return metadata

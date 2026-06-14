@@ -1274,6 +1274,77 @@ def test_permission_request_terminal_gate_projects_final_permission_audit() -> N
     assert "private-data" not in str(permission)
 
 
+def test_tool_projection_preserves_canonical_tool_spec_metadata() -> None:
+    projected_start = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 8,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "tool_search",
+                    "tool_call_id": "search-1",
+                    "input": {"query": "docs"},
+                    "tool_id": "builtin:tool_search",
+                    "risk": "read_only",
+                    "exposure": "direct",
+                },
+            },
+        }
+    )
+    projected_end = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 9,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "data": {
+                    "tool_name": "tool_search",
+                    "tool_call_id": "search-1",
+                    "output": "{\"results\":[]}",
+                    "tool_id": "builtin:tool_search",
+                    "risk": "read_only",
+                    "exposure": "direct",
+                    "meta": {
+                        "search_trace": {
+                            "query": "docs",
+                            "result_count": 1,
+                            "tool_ids": ["capability:docs:lookup"],
+                        },
+                    },
+                },
+            },
+        }
+    )
+
+    assert projected_start[0][0] == "tool_call_start"
+    assert projected_start[0][1] == {
+        "agent_run_id": "agent-run-1",
+        "agent_id": "agent",
+        "workflow": "agent_run",
+        "raw_event_refs": [
+            {"agent_run_id": "agent-run-1", "seq": 8, "type": "tool_use"}
+        ],
+        "tool_name": "tool_search",
+        "tool_call_id": "search-1",
+        "tool_args": {"query": "docs"},
+        "tool_id": "builtin:tool_search",
+        "risk": "read_only",
+        "exposure": "direct",
+    }
+    assert projected_end[0][0] == "tool_call_end"
+    assert projected_end[0][1]["tool_id"] == "builtin:tool_search"
+    assert projected_end[0][1]["risk"] == "read_only"
+    assert projected_end[0][1]["exposure"] == "direct"
+    assert projected_end[0][1]["meta"]["search_trace"] == {
+        "query": "docs",
+        "result_count": 1,
+        "tool_ids": ["capability:docs:lookup"],
+    }
+
+
 def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
@@ -1437,6 +1508,7 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
                 }
             ],
         },
+        "resolved_capabilities": {},
     }
     assert control.get_agent_run(task.id).status.value == "dispatched"
 
@@ -1947,10 +2019,12 @@ def test_default_system_agent_runs_carry_effective_capability_boundaries() -> No
         task_id="task-default-packager",
     )
 
-    assert environment_task.metadata["effective_capabilities"]["tools"] == [
-        "builtin:shell"
-    ]
-    assert packager_task.metadata["effective_capabilities"]["tools"] == [
+    assert "tools" not in environment_task.metadata["effective_capabilities"]
+    assert "tools" not in packager_task.metadata["effective_capabilities"]
+    assert [
+        item["target_tool_ref"]
+        for item in packager_task.metadata["effective_capabilities"]["tool_specs"]
+    ] == [
         "builtin:fetch_capabilities",
         "builtin:glob",
         "builtin:grep",

@@ -348,6 +348,7 @@ def agent_run_event_to_session_events(
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
                     "tool_args": tool_args,
+                    **_tool_identity_payload(tool_data),
                 },
             )
         ]
@@ -367,6 +368,15 @@ def agent_run_event_to_session_events(
             _without_large_output_fields(tool_data),
             marker=labels.output_truncation_marker,
         )
+        nested_meta = tool_data.get("meta")
+        if isinstance(nested_meta, dict):
+            public_tool_data.pop("meta", None)
+            public_tool_data.update(
+                _public_payload(
+                    nested_meta,
+                    marker=labels.output_truncation_marker,
+                )
+            )
         public_tool_data.update(output_meta)
         permission = _project_permission_audit(
             tool_data,
@@ -382,6 +392,7 @@ def agent_run_event_to_session_events(
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
                     "tool_result": projected_output,
+                    **_tool_identity_payload(tool_data),
                     "meta": public_tool_data,
                 },
             )
@@ -538,6 +549,20 @@ def _without_large_output_fields(data: dict[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in data.items()
         if key not in {"output", "content", "text", "result"}
+    }
+
+
+def _tool_identity_payload(data: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "tool_id": data.get("tool_id", data.get("toolId")),
+        "risk": data.get("risk"),
+        "exposure": data.get("exposure"),
+        "capability_name": data.get("capability_name", data.get("capabilityName")),
+    }
+    return {
+        key: str(value).strip()
+        for key, value in fields.items()
+        if value is not None and str(value).strip()
     }
 
 

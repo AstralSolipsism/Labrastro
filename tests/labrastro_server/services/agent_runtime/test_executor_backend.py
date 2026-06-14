@@ -1163,6 +1163,38 @@ def test_reuleauxcoder_backend_binds_permission_context_to_agent() -> None:
             workdir="/workspace/repo",
             runtime_profile_id="codex",
             metadata={
+                "resolved_capabilities": {
+                    "tool_specs": [
+                        {
+                            "tool_id": "capability:review:builtin_tool:read_file",
+                            "name": "read_file",
+                            "namespace": "capability",
+                            "description": "Read files through review capability.",
+                            "input_schema": {"type": "object", "properties": {}},
+                            "output_schema": None,
+                            "output_strategy": "text",
+                            "risk": "capability",
+                            "exposure": "deferred",
+                            "search_text": "read_file review",
+                            "search_keywords": ["read_file"],
+                            "permission": {"policy": "allow"},
+                            "mutation": {
+                                "modifies_files": False,
+                                "preview_required": False,
+                                "approved_save_candidate_required": False,
+                            },
+                            "execution": {
+                                "executor_ref": "builtin:read_file",
+                                "backend_dispatch": True,
+                                "supports_parallel": False,
+                            },
+                            "provider_surface": "function",
+                            "metadata": {
+                                "tool_id": "capability:review:builtin_tool:read_file"
+                            },
+                        }
+                    ]
+                },
                 "permission_context": {
                     "agent_id": "reviewer",
                     "source": "taskflow",
@@ -1190,6 +1222,9 @@ def test_reuleauxcoder_backend_binds_permission_context_to_agent() -> None:
         "tools": ["builtin:read_file"],
         "execution_policies": [],
     }
+    assert getattr(agent, "resolved_capabilities")["tool_specs"][0]["tool_id"] == (
+        "capability:review:builtin_tool:read_file"
+    )
     assert getattr(agent, "enforce_effective_capabilities") is True
 
 

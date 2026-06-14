@@ -342,7 +342,7 @@ def _runtime_config_with_chat_agent_prompt(
     )
 
 
-def _effective_capabilities_for_agent(config: Config, agent_id: str) -> dict[str, Any]:
+def _capability_projection_for_agent(config: Config, agent_id: str) -> dict[str, Any]:
     snapshot = build_agent_run_snapshot(
         agent_registry=config.agent_registry,
         runtime_profiles=config.runtime_profiles,
@@ -353,8 +353,7 @@ def _effective_capabilities_for_agent(config: Config, agent_id: str) -> dict[str
     agent = snapshot.get("agents", {}).get(agent_id)
     if not isinstance(agent, dict):
         return {}
-    effective = agent.get("effective_capabilities")
-    return effective if isinstance(effective, dict) else {}
+    return agent
 
 
 def switch_session_model(
@@ -1134,7 +1133,22 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             return None
         setattr(peer_agent, "agent_config_id", agent_id)
         setattr(peer_agent, "main_agent_id", agent_id)
-        setattr(peer_agent, "effective_capabilities", _effective_capabilities_for_agent(current_config, agent_id))
+        capability_projection = _capability_projection_for_agent(
+            current_config,
+            agent_id,
+        )
+        resolved_capabilities = capability_projection.get("resolved_capabilities")
+        effective_capabilities = capability_projection.get("effective_capabilities")
+        setattr(
+            peer_agent,
+            "resolved_capabilities",
+            resolved_capabilities if isinstance(resolved_capabilities, dict) else {},
+        )
+        setattr(
+            peer_agent,
+            "effective_capabilities",
+            effective_capabilities if isinstance(effective_capabilities, dict) else {},
+        )
         setattr(peer_agent, "enforce_effective_capabilities", True)
         setattr(peer_agent, "capability_catalog", runner.build_capability_catalog(current_config, agent_id))
         if not getattr(peer_agent, "session_model_overridden", False):

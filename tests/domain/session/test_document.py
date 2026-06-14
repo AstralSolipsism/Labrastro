@@ -134,8 +134,8 @@ def test_workflow_artifact_event_persists_primary_artifact() -> None:
         event_type="workflow_artifact",
         payload={
             "workflow": "capability_package_ingest",
-            "artifact_type": "capability_package_draft",
-            "title": "能力包草案 review 已生成",
+            "artifact_type": "capability_install_candidate",
+            "title": "能力安装候选 review 已生成",
             "artifact": {
                 "package_id": "review",
                 "description": "Review package",
@@ -151,7 +151,7 @@ def test_workflow_artifact_event_persists_primary_artifact() -> None:
     assert part["type"] == "workflow_artifact"
     assert part["lane"] == "primary"
     assert part["workflow"] == "capability_package_ingest"
-    assert part["artifactType"] == "capability_package_draft"
+    assert part["artifactType"] == "capability_install_candidate"
     assert part["artifact"]["package_id"] == "review"
     assert part["artifact"]["validation"]["ok"] is True
     assert part["rawEventRefs"] == [{"agent_run_id": "agent-run-1", "seq": 20, "type": "result"}]
