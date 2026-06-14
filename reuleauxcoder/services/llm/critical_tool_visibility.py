@@ -1,4 +1,4 @@
-"""Validate model-visible tool contracts at the final LLM outbound boundary."""
+"""Debug critical tool model-visible content at the final LLM boundary."""
 
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ from typing import Any
 from reuleauxcoder.domain.files import APPLY_PATCH_CONTRACT_TEXT
 
 
-class OutboundContractError(RuntimeError):
-    """Raised when the final provider payload violates a model-visible contract."""
+class CriticalToolVisibilityError(RuntimeError):
+    """Raised when a critical tool loses required model-visible guidance."""
 
     def __init__(self, snapshot: dict[str, Any]):
         self.snapshot = dict(snapshot)
         reasons = snapshot.get("failure_reasons")
         reason_text = "; ".join(str(item) for item in reasons or [])
         super().__init__(
-            "apply_patch outbound contract is incomplete"
+            "critical tool visibility check failed"
             + (f": {reason_text}" if reason_text else "")
         )
 
@@ -39,10 +39,10 @@ _APPLY_PATCH_CONTRACT_MARKERS: tuple[tuple[str, str], ...] = (
 )
 
 
-def build_outbound_contract_snapshot(
+def build_critical_tool_visibility_snapshot(
     provider_type: str, params: dict[str, Any]
 ) -> dict[str, Any]:
-    """Build a redacted contract-visibility snapshot from final provider params."""
+    """Build a redacted visibility snapshot for critical model-visible tools."""
 
     normalized = _normalize_provider_payload(provider_type, params)
     tools = normalized["tools"]
@@ -83,16 +83,18 @@ def build_outbound_contract_snapshot(
             )
 
     return {
-        "schema": "llm_outbound_contract.v1",
+        "schema": "llm_critical_tool_visibility.v1",
+        "scope": "critical_tools_only",
         "provider_type": str(provider_type or ""),
         "tool_count": len(tools),
+        "checked_tools": ["apply_patch"],
         "apply_patch_exposed": apply_patch_exposed,
         "prompt_contract_visible": apply_patch_exposed and not prompt_missing,
         "tool_description_contract_visible": apply_patch_exposed
         and not tool_description_missing,
         "patch_parameter_contract_visible": apply_patch_exposed
         and not patch_parameter_missing,
-        "contract_hash": _contract_hash(),
+        "critical_contract_hashes": {"apply_patch": _apply_patch_contract_hash()},
         "missing_contract_markers": sorted(
             set(prompt_missing + tool_description_missing + patch_parameter_missing)
         ),
@@ -105,16 +107,16 @@ def build_outbound_contract_snapshot(
     }
 
 
-def validate_outbound_contract_snapshot(snapshot: dict[str, Any]) -> None:
-    """Fail fast when an exposed apply_patch tool lost its model-visible contract."""
+def validate_critical_tool_visibility_snapshot(snapshot: dict[str, Any]) -> None:
+    """Fail fast when a critical exposed tool lost required visible guidance."""
 
     if not snapshot.get("apply_patch_exposed"):
         return
     if snapshot.get("failure_reasons"):
-        raise OutboundContractError(snapshot)
+        raise CriticalToolVisibilityError(snapshot)
 
 
-def _contract_hash() -> str:
+def _apply_patch_contract_hash() -> str:
     return hashlib.sha256(
         APPLY_PATCH_CONTRACT_TEXT.encode("utf-8")
     ).hexdigest()

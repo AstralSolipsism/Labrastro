@@ -72,6 +72,44 @@ def test_prompt_renderer_does_not_render_raw_secret_values() -> None:
     assert "sk-should-not-render" not in str(rendered.files)
 
 
+def test_prompt_renderer_does_not_render_full_capability_tool_specs() -> None:
+    renderer_module = _prompt_renderer()
+
+    context = renderer_module.CanonicalAgentContext(
+        agent_id="reviewer",
+        agent_name="Reviewer",
+        capability_refs=["review"],
+        resolved_capabilities={
+            "packages": [{"id": "review", "name": "Review"}],
+            "tool_specs": [
+                {
+                    "tool_id": "capability:review:builtin_tool:read_file",
+                    "name": "read_file",
+                    "namespace": "capability",
+                    "description": "Read file capability",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "Path to the file",
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    rendered = renderer_module.ExecutorPromptRenderer().render("codex", context)
+    text = rendered.files["AGENTS.md"]
+
+    assert "Review" in text
+    assert "capability:review:builtin_tool:read_file" not in text
+    assert "input_schema" not in text
+    assert "file_path" not in text
+
+
 def test_platform_mcp_policy_allows_only_agent_declared_servers() -> None:
     policy_module = _policy()
 

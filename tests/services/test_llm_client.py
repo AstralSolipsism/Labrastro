@@ -21,8 +21,8 @@ from reuleauxcoder.domain.llm.models import (
 from reuleauxcoder.extensions.tools.builtin.apply_patch import ApplyPatchTool
 from reuleauxcoder.interfaces.events import UIEventBus, UIEventLevel
 from reuleauxcoder.services.llm.client import LLM, _merge_hook_request_overrides
-from reuleauxcoder.services.llm.outbound_contract import (
-    build_outbound_contract_snapshot,
+from reuleauxcoder.services.llm.critical_tool_visibility import (
+    build_critical_tool_visibility_snapshot,
 )
 from reuleauxcoder.services.providers.adapters.anthropic_messages import (
     convert_chat_tools_to_anthropic_tools,
@@ -418,14 +418,18 @@ def _apply_patch_contract_messages_and_tools() -> tuple[list[dict], list[dict]]:
     )
 
 
-def _assert_outbound_apply_patch_contract_visible(snapshot: dict) -> None:
+def _assert_critical_apply_patch_visibility(snapshot: dict) -> None:
+    assert snapshot["schema"] == "llm_critical_tool_visibility.v1"
+    assert snapshot["scope"] == "critical_tools_only"
+    assert snapshot["checked_tools"] == ["apply_patch"]
     assert snapshot["apply_patch_exposed"] is True
     assert snapshot["prompt_contract_visible"] is True
     assert snapshot["tool_description_contract_visible"] is True
     assert snapshot["patch_parameter_contract_visible"] is True
     assert snapshot["missing_contract_markers"] == []
     assert snapshot["failure_reasons"] == []
-    assert snapshot["contract_hash"]
+    assert snapshot["critical_contract_hashes"]["apply_patch"]
+    assert "contract_text" not in snapshot
 
 
 def test_llm_outbound_openai_chat_request_validates_apply_patch_contract() -> None:
@@ -463,9 +467,10 @@ def test_llm_outbound_openai_chat_request_validates_apply_patch_contract() -> No
         "patch"
     ]["description"]
     assert "*** Delete File:" in patch_description
-    snapshot = response.provider_extra["outbound_contract_snapshot"]
+    snapshot = response.provider_extra["critical_tool_visibility_snapshot"]
+    assert "outbound_" + "contract_snapshot" not in response.provider_extra
     assert snapshot["provider_type"] == "openai_chat"
-    _assert_outbound_apply_patch_contract_visible(snapshot)
+    _assert_critical_apply_patch_visibility(snapshot)
 
 
 def test_llm_outbound_openai_chat_blocks_apply_patch_without_prompt_contract() -> None:
@@ -482,7 +487,7 @@ def test_llm_outbound_openai_chat_blocks_apply_patch_without_prompt_contract() -
     tool = ApplyPatchTool()
 
     with pytest.raises(
-        RuntimeError, match="apply_patch outbound contract is incomplete"
+        RuntimeError, match="critical tool visibility check failed"
     ):
         llm.chat(
             [{"role": "system", "content": "No patch contract here."}],
@@ -531,15 +536,16 @@ def test_llm_outbound_openai_responses_request_validates_apply_patch_contract(
         "description"
     ]
     assert "draft_document_begin" in patch_description
-    snapshot = response.provider_extra["outbound_contract_snapshot"]
+    snapshot = response.provider_extra["critical_tool_visibility_snapshot"]
+    assert "outbound_" + "contract_snapshot" not in response.provider_extra
     assert snapshot["provider_type"] == "openai_responses"
-    _assert_outbound_apply_patch_contract_visible(snapshot)
+    _assert_critical_apply_patch_visibility(snapshot)
 
 
 def test_llm_outbound_anthropic_snapshot_uses_same_apply_patch_contract_rules() -> None:
     messages, tools = _apply_patch_contract_messages_and_tools()
 
-    snapshot = build_outbound_contract_snapshot(
+    snapshot = build_critical_tool_visibility_snapshot(
         "anthropic_messages",
         {
             "system": messages[0]["content"],
@@ -549,10 +555,10 @@ def test_llm_outbound_anthropic_snapshot_uses_same_apply_patch_contract_rules() 
     )
 
     assert snapshot["provider_type"] == "anthropic_messages"
-    _assert_outbound_apply_patch_contract_visible(snapshot)
+    _assert_critical_apply_patch_visibility(snapshot)
 
 
-def test_llm_debug_trace_records_outbound_contract_snapshot(
+def test_llm_debug_trace_records_critical_tool_visibility_snapshot(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -588,9 +594,171 @@ def test_llm_debug_trace_records_outbound_contract_snapshot(
     debug_events = [event for event in seen if event.level == UIEventLevel.DEBUG]
     trace_path = debug_events[-1].data.get("trace_path")
     payload = json.loads(open(trace_path, encoding="utf-8").read())
-    snapshot = payload["request"]["outbound_contract_snapshot"]
-    assert snapshot == response.provider_extra["outbound_contract_snapshot"]
-    _assert_outbound_apply_patch_contract_visible(snapshot)
+    snapshot = payload["request"]["critical_tool_visibility_snapshot"]
+    assert "outbound_" + "contract_snapshot" not in payload["request"]
+    assert snapshot == response.provider_extra["critical_tool_visibility_snapshot"]
+    _assert_critical_apply_patch_visibility(snapshot)
+
+
+def test_llm_response_records_top_level_tool_request_snapshot() -> None:
+    captured: dict = {}
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+    )
+
+    def _fake_call_with_retry(params):
+        captured["params"] = params
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=1, completion_tokens=1)),
+            ]
+        )
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+    messages, tools = _apply_patch_contract_messages_and_tools()
+
+    response = llm.chat(
+        messages,
+        tools=tools,
+        metadata={"tool_exposure": {"deferred_tool_count": 7}},
+    )
+
+    snapshot = response.provider_extra["tool_request_snapshot"]
+    assert snapshot["schema"] == "llm_tool_request.v1"
+    assert snapshot["provider_type"] == "openai_chat"
+    assert snapshot["top_level_tool_names"] == ["apply_patch"]
+    assert snapshot["top_level_tool_count"] == 1
+    assert snapshot["top_level_tools_hash"]
+    assert snapshot["deferred_tool_count"] == 7
+    assert "tool_request_snapshot" not in captured["params"]
+
+
+def test_llm_tool_request_snapshot_records_gateway_history_without_contract_payloads() -> None:
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+    )
+
+    def _fake_call_with_retry(params):
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=1, completion_tokens=1)),
+            ]
+        )
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+    messages = [
+        {"role": "user", "content": "find docs"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "search-1",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "arguments": "{\"query\":\"docs\"}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "search-1",
+            "name": "tool_search",
+            "content": json.dumps(
+                {
+                    "query": "docs",
+                    "results": [
+                        {
+                            "tool_id": "capability:docs:lookup",
+                            "description": "large model-visible contract omitted",
+                        }
+                    ],
+                }
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "exec-1",
+                    "type": "function",
+                    "function": {
+                        "name": "capability_execute",
+                        "arguments": (
+                            "{\"tool_id\":\"capability:docs:lookup\","
+                            "\"arguments\":{\"query\":\"cache\"}}"
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "exec-1",
+            "name": "capability_execute",
+            "content": "docs result",
+        },
+    ]
+
+    response = llm.chat(messages, tools=[])
+
+    snapshot = response.provider_extra["tool_request_snapshot"]
+    assert snapshot["gateway_call_count"] == 2
+    assert snapshot["tool_search_call_count"] == 1
+    assert snapshot["capability_execute_call_count"] == 1
+    assert snapshot["search_hit_count"] == 1
+    assert snapshot["search_hit_tool_ids"] == ["capability:docs:lookup"]
+    assert "large model-visible contract omitted" not in json.dumps(snapshot)
+
+
+def test_llm_debug_trace_records_top_level_tool_request_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ui_bus = UIEventBus()
+    seen = []
+    ui_bus.subscribe(seen.append, replay_history=False)
+    llm = LLM(
+        model="demo-model",
+        api_key="sk-test-12345678",
+        base_url="https://example.com/v1",
+        debug_trace=True,
+        ui_bus=ui_bus,
+    )
+
+    def _fake_call_with_retry(_params):
+        return iter(
+            [
+                _FakeChunk(content="Hello"),
+                _FakeChunk(usage=_FakeUsage(prompt_tokens=1, completion_tokens=1)),
+            ]
+        )
+
+    _set_fake_call_with_retry(llm, _fake_call_with_retry)
+    messages, tools = _apply_patch_contract_messages_and_tools()
+
+    response = llm.chat(
+        messages,
+        tools=tools,
+        session_id="session_test",
+        trace_id="trace_tools",
+    )
+
+    debug_events = [event for event in seen if event.level == UIEventLevel.DEBUG]
+    trace_path = debug_events[-1].data.get("trace_path")
+    payload = json.loads(open(trace_path, encoding="utf-8").read())
+    snapshot = payload["request"]["tool_request_snapshot"]
+    assert snapshot == response.provider_extra["tool_request_snapshot"]
+    assert snapshot["top_level_tool_names"] == ["apply_patch"]
 
 
 def test_llm_chat_applies_project_context_hook_to_provider_request(

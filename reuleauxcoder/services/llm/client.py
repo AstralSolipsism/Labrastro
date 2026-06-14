@@ -32,9 +32,12 @@ from reuleauxcoder.services.llm.diagnostics import (
     persist_llm_error_diagnostic,
     snapshot_messages,
 )
-from reuleauxcoder.services.llm.outbound_contract import (
-    build_outbound_contract_snapshot,
-    validate_outbound_contract_snapshot,
+from reuleauxcoder.services.llm.critical_tool_visibility import (
+    build_critical_tool_visibility_snapshot,
+    validate_critical_tool_visibility_snapshot,
+)
+from reuleauxcoder.services.llm.tool_request_diagnostics import (
+    build_tool_request_snapshot,
 )
 from reuleauxcoder.services.llm.sanitizer import (
     DEFAULT_REASONING_REPLAY_PLACEHOLDER,
@@ -779,14 +782,22 @@ class LLM:
             before_context.metadata = dict(request.metadata)
             final_messages = list(request.messages)
             final_metadata = dict(before_context.metadata)
-            outbound_contract_snapshot = build_outbound_contract_snapshot(
+            critical_tool_visibility_snapshot = build_critical_tool_visibility_snapshot(
                 self.provider_type,
                 params,
             )
-            validate_outbound_contract_snapshot(outbound_contract_snapshot)
-            request.metadata["outbound_contract_snapshot"] = dict(
-                outbound_contract_snapshot
+            validate_critical_tool_visibility_snapshot(
+                critical_tool_visibility_snapshot
             )
+            tool_request_snapshot = build_tool_request_snapshot(
+                self.provider_type,
+                params,
+                metadata=dict(request.metadata),
+            )
+            request.metadata["critical_tool_visibility_snapshot"] = dict(
+                critical_tool_visibility_snapshot
+            )
+            request.metadata["tool_request_snapshot"] = dict(tool_request_snapshot)
             final_metadata = dict(request.metadata)
             if self.debug_trace:
                 request.metadata["llm_debug_trace"] = True
@@ -810,8 +821,11 @@ class LLM:
                     partial=provider_response,
                     policy=StreamRecoveryPolicy.from_config(self.provider_config),
                 )
-            provider_response.provider_extra["outbound_contract_snapshot"] = dict(
-                outbound_contract_snapshot
+            provider_response.provider_extra["critical_tool_visibility_snapshot"] = dict(
+                critical_tool_visibility_snapshot
+            )
+            provider_response.provider_extra["tool_request_snapshot"] = dict(
+                tool_request_snapshot
             )
             response = provider_response.to_llm_response()
             params = dict(response.provider_extra.get("request_params") or params)
@@ -868,9 +882,12 @@ class LLM:
                             response.provider_extra.get("stream_options_enabled")
                         ),
                         "tool_count": len(params.get("tools") or []),
-                        "outbound_contract_snapshot": dict(
-                            response.provider_extra.get("outbound_contract_snapshot")
+                        "critical_tool_visibility_snapshot": dict(
+                            response.provider_extra.get("critical_tool_visibility_snapshot")
                             or {}
+                        ),
+                        "tool_request_snapshot": dict(
+                            response.provider_extra.get("tool_request_snapshot") or {}
                         ),
                         "reasoning_effort": params.get("reasoning_effort")
                         or (params.get("reasoning") or {}).get("effort"),
