@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, List
 import concurrent.futures
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
@@ -110,6 +110,45 @@ class _MutationPreviewOutcome:
         return self.status == "ready" and self.error is None
 
 
+@dataclass(frozen=True, slots=True)
+class CapabilityTargetContext:
+    gateway_tool_name: str
+    parent_tool_call_id: str
+    target_tool_call_id: str
+    target_tool_id: str
+    target_tool_name: str
+    target_arguments: dict[str, Any]
+    target_exposure: str
+    target_risk: str
+    target_permission_policy: str
+
+    def as_event_metadata(self) -> dict[str, Any]:
+        return {
+            "gateway_tool_name": self.gateway_tool_name,
+            "parent_tool_call_id": self.parent_tool_call_id,
+            "target_tool_call_id": self.target_tool_call_id,
+            "target_tool_id": self.target_tool_id,
+            "target_tool_name": self.target_tool_name,
+            "target_arguments": dict(self.target_arguments),
+            "target_exposure": self.target_exposure,
+            "target_risk": self.target_risk,
+            "target_permission_policy": self.target_permission_policy,
+        }
+
+    def as_execute_trace(self) -> dict[str, Any]:
+        return {
+            "gateway_tool_name": self.gateway_tool_name,
+            "parent_tool_call_id": self.parent_tool_call_id,
+            "target_tool_call_id": self.target_tool_call_id,
+            "tool_id": self.target_tool_id,
+            "target_tool_id": self.target_tool_id,
+            "target_tool_name": self.target_tool_name,
+            "target_exposure": self.target_exposure,
+            "target_risk": self.target_risk,
+            "target_permission_policy": self.target_permission_policy,
+        }
+
+
 def _meta_has_approval_denied(meta: dict | None) -> bool:
     diagnostics = (meta or {}).get("tool_diagnostics")
     if not isinstance(diagnostics, list):
@@ -133,6 +172,7 @@ class ToolExecutor:
         self._mutation_preview_outcomes_by_item_id: dict[str, _MutationPreviewOutcome] = {}
         self._anonymous_tool_invocation_seq = 0
         self._tool_result_meta_by_call_identity: dict[int, dict[str, Any]] = {}
+        self._capability_target_context_by_call_id: dict[str, CapabilityTargetContext] = {}
 
     def _runtime_budget_lock(self) -> threading.Lock:
         lock = getattr(self.agent, "runtime_budget_lock", None)
@@ -236,6 +276,25 @@ class ToolExecutor:
         if exposure:
             payload["exposure"] = exposure
         return payload
+
+    def _tool_event_metadata_for_call(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+    ) -> dict[str, Any]:
+        metadata = self._tool_event_metadata(tool)
+        target_context = self._capability_target_context(tc)
+        if target_context is None:
+            return metadata
+        metadata.update(
+            {
+                "tool_id": target_context.target_tool_id,
+                "risk": target_context.target_risk,
+                "exposure": target_context.target_exposure,
+                "capability_target": target_context.as_event_metadata(),
+            }
+        )
+        return metadata
 
     def _record_tool_result_meta(
         self,
@@ -357,27 +416,64 @@ class ToolExecutor:
 
     def _tool_search_result_from_entry(self, entry: object) -> dict:
         spec = entry.spec
-        metadata = dict(getattr(spec, "metadata", {}) or {})
-        target_tool_ref = str(metadata.get("target_tool_ref") or "").strip()
-        if not target_tool_ref:
-            target_tool_ref = str(getattr(spec.execution, "executor_ref", "") or "")
+        input_schema = dict(spec.input_schema)
         return {
             "tool_id": entry.tool_id,
+            "call_via": "capability_execute",
             "name": spec.name,
             "description": spec.description,
-            "input_schema": dict(spec.input_schema),
+            "input_schema": input_schema,
+            "call_template": {
+                "tool_id": entry.tool_id,
+                "arguments": self._tool_search_call_template_arguments(input_schema),
+            },
             "risk": spec.risk.value,
             "permission": {"policy": spec.permission.policy},
-            "mutation": {
-                "modifies_files": spec.mutation.modifies_files,
-                "preview_required": spec.mutation.preview_required,
-                "approved_save_candidate_required": (
-                    spec.mutation.approved_save_candidate_required
-                ),
-            },
-            "target_tool_ref": target_tool_ref,
-            "source_type": str(metadata.get("source_type") or ""),
         }
+
+    @classmethod
+    def _tool_search_call_template_arguments(cls, schema: dict[str, Any]) -> dict:
+        if schema.get("type") != "object":
+            return {}
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return {}
+        required = schema.get("required")
+        if not isinstance(required, list):
+            return {}
+        arguments: dict[str, Any] = {}
+        for name in required:
+            if not isinstance(name, str):
+                continue
+            property_schema = properties.get(name)
+            if not isinstance(property_schema, dict):
+                continue
+            template = cls._tool_search_template_for_schema(property_schema)
+            if template is not None:
+                arguments[name] = template
+        return arguments
+
+    @classmethod
+    def _tool_search_template_for_schema(cls, schema: dict[str, Any]) -> Any:
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and enum_values:
+            return "<one of: " + " | ".join(str(value) for value in enum_values) + ">"
+        schema_type = schema.get("type")
+        if schema_type == "string":
+            return "<string>"
+        if schema_type in {"number", "integer"}:
+            return 0
+        if schema_type == "boolean":
+            return False
+        if schema_type == "array":
+            item_schema = schema.get("items")
+            if not isinstance(item_schema, dict):
+                return []
+            item_template = cls._tool_search_template_for_schema(item_schema)
+            return [] if item_template is None else [item_template]
+        if schema_type == "object":
+            return cls._tool_search_call_template_arguments(schema)
+        return None
 
     def _execute_capability_execute(
         self,
@@ -405,28 +501,57 @@ class ToolExecutor:
         target_tool = self._capability_target_executor(entry, route_plan)
         if target_tool is None:
             return f"Error: capability tool_id '{tool_id}' has no registered executor"
-        target_name = str(getattr(target_tool, "name", "") or entry.name)
-        target_metadata = self._tool_event_metadata(target_tool)
+        target_name = str(entry.name or getattr(target_tool, "name", "") or "")
+        target_tool_id = str(entry.tool_id)
+        target_exposure = self._enum_payload_value(entry.spec.exposure)
+        target_risk = self._enum_payload_value(entry.spec.risk)
+        permission = getattr(entry.spec, "permission", None)
+        target_permission_policy = str(getattr(permission, "policy", "") or "")
+        nested_call_id = self._capability_target_call_id(tool_call, tool_id)
+        target_arguments = dict(raw_target_arguments)
+        target_context = CapabilityTargetContext(
+            gateway_tool_name="capability_execute",
+            parent_tool_call_id=str(tool_call.id or "capability_execute"),
+            target_tool_call_id=nested_call_id,
+            target_tool_id=target_tool_id,
+            target_tool_name=target_name,
+            target_arguments=target_arguments,
+            target_exposure=target_exposure,
+            target_risk=target_risk,
+            target_permission_policy=target_permission_policy,
+        )
+        self._capability_target_context_by_call_id[nested_call_id] = target_context
         self._record_tool_result_meta(
             tool_call,
             "execute_trace",
-            {
-                "tool_id": tool_id,
-                "target_tool_name": target_name,
-                "target_tool_id": str(target_metadata.get("tool_id") or entry.tool_id),
-                "target_exposure": str(
-                    target_metadata.get("exposure")
-                    or self._enum_payload_value(entry.spec.exposure)
-                ),
-            },
+            target_context.as_execute_trace(),
         )
-        nested_call_id = f"{tool_call.id or 'capability_execute'}:{tool_id}"
         nested_call = ToolCall(
             id=nested_call_id,
             name=target_name,
-            arguments=dict(raw_target_arguments),
+            arguments=target_arguments,
         )
-        return self._execute_resolved_tool(nested_call, target_tool, index=index)
+        try:
+            return self._execute_resolved_tool(nested_call, target_tool, index=index)
+        finally:
+            self._capability_target_context_by_call_id.pop(nested_call_id, None)
+
+    @staticmethod
+    def _capability_target_call_id(tool_call: "ToolCall", tool_id: str) -> str:
+        return f"{tool_call.id or 'capability_execute'}:{tool_id}"
+
+    def _tool_permission_policy(self, tool: object | None) -> str:
+        if tool is None:
+            return ""
+        tool_spec = getattr(tool, "tool_spec", None)
+        if not callable(tool_spec):
+            return ""
+        try:
+            spec = tool_spec()
+        except Exception:
+            return ""
+        permission = getattr(spec, "permission", None)
+        return str(getattr(permission, "policy", "") or "")
 
     def _capability_target_executor(
         self,
@@ -487,7 +612,14 @@ class ToolExecutor:
         emit_file_change: bool = True,
     ) -> None:
         if emit_file_change:
-            self._emit_apply_patch_file_change_completed(tc, result, index=index, meta=meta)
+            self._emit_apply_patch_file_change_completed(
+                tc,
+                result,
+                tool=tool,
+                index=index,
+                meta=meta,
+            )
+        tool_metadata = self._tool_event_metadata_for_call(tc, tool)
         self.agent._emit_event(
             AgentEvent.tool_call_end(
                 tc.name,
@@ -496,7 +628,7 @@ class ToolExecutor:
                 tool_source=self._tool_source(tool),
                 index=index,
                 meta=meta,
-                tool_metadata=self._tool_event_metadata(tool),
+                tool_metadata=tool_metadata,
             )
         )
 
@@ -508,6 +640,7 @@ class ToolExecutor:
         index: int | None = None,
     ) -> None:
         self._emit_apply_patch_file_change_started(tc, tool=tool, index=index)
+        tool_metadata = self._tool_event_metadata_for_call(tc, tool)
         self.agent._emit_event(
             AgentEvent.tool_call_start(
                 tc.name,
@@ -515,8 +648,124 @@ class ToolExecutor:
                 tool_call_id=tc.id,
                 tool_source=self._tool_source(tool),
                 index=index,
-                tool_metadata=self._tool_event_metadata(tool),
+                tool_metadata=tool_metadata,
             )
+        )
+
+    def _capability_target_event_metadata(self, tc: "ToolCall") -> dict[str, Any]:
+        context = self._capability_target_context(tc)
+        if context is None:
+            return {}
+        return {"capability_target": context.as_event_metadata()}
+
+    def _capability_target_diagnostic_metadata(
+        self,
+        tc: "ToolCall",
+    ) -> dict[str, Any]:
+        return self._capability_target_event_metadata(tc)
+
+    def _capability_target_context(
+        self,
+        tc: "ToolCall",
+    ) -> CapabilityTargetContext | None:
+        return self._capability_target_context_by_call_id.get(str(tc.id or ""))
+
+    def _sync_capability_target_arguments(
+        self,
+        tc: "ToolCall",
+        arguments: dict[str, Any],
+    ) -> None:
+        context = self._capability_target_context(tc)
+        if context is None:
+            return
+        self._capability_target_context_by_call_id[str(tc.id or "")] = replace(
+            context,
+            target_arguments=dict(arguments),
+        )
+
+    def _emit_capability_target_start_if_needed(
+        self,
+        tc: "ToolCall",
+        tool: object | None,
+        *,
+        index: int | None,
+        already_emitted: bool,
+    ) -> bool:
+        if already_emitted or self._capability_target_context(tc) is None:
+            return already_emitted
+        self._emit_tool_start(tc, tool=tool, index=index)
+        return True
+
+    def _bad_arguments_message_for_call(
+        self,
+        tool_call: "ToolCall",
+        tool: object | None,
+        detail: str,
+    ) -> str:
+        context = self._capability_target_context(tool_call)
+        if context is None:
+            return self._bad_arguments_message(tool_call.name, detail)
+        schema = getattr(tool, "parameters", None)
+        template = {
+            "tool_id": context.target_tool_id,
+            "arguments": self._tool_search_call_template_arguments(
+                schema if isinstance(schema, dict) else {}
+            ),
+        }
+        return "\n".join(
+            [
+                f"Error: bad arguments for target tool {context.target_tool_name}",
+                f"tool_id: {context.target_tool_id}",
+                "",
+                detail,
+                "",
+                "Retry by calling capability_execute with:",
+                json.dumps(template, ensure_ascii=False, indent=2),
+            ]
+        )
+
+    def _preview_failure_message_for_call(
+        self,
+        tool_call: "ToolCall",
+        detail: str,
+    ) -> str:
+        context = self._capability_target_context(tool_call)
+        if context is None:
+            return f"Error: {detail or 'apply_patch semantic preview failed'}"
+        return "\n".join(
+            [
+                f"Error: target tool '{context.target_tool_name}' semantic preview failed",
+                f"tool_id: {context.target_tool_id}",
+                f"Reason: {detail or 'apply_patch semantic preview failed'}",
+            ]
+        )
+
+    def _preflight_error_message_for_call(
+        self,
+        tool_call: "ToolCall",
+        tool: object | None,
+        detail: str,
+    ) -> str:
+        context = self._capability_target_context(tool_call)
+        if context is None:
+            return detail
+        schema = getattr(tool, "parameters", None)
+        template = {
+            "tool_id": context.target_tool_id,
+            "arguments": self._tool_search_call_template_arguments(
+                schema if isinstance(schema, dict) else {}
+            ),
+        }
+        return "\n".join(
+            [
+                f"Error: preflight failed for target tool {context.target_tool_name}",
+                f"tool_id: {context.target_tool_id}",
+                "",
+                detail,
+                "",
+                "Retry by calling capability_execute with:",
+                json.dumps(template, ensure_ascii=False, indent=2),
+            ]
         )
 
     def _emit_tool_arguments_complete(
@@ -620,6 +869,7 @@ class ToolExecutor:
                 item_id=item_id,
                 tool_call_id=tc.id,
                 changes=changes,
+                tool_metadata=self._tool_event_metadata_for_call(tc, tool),
             )
         )
         return item_id
@@ -629,12 +879,17 @@ class ToolExecutor:
         tc: "ToolCall",
         result: str,
         *,
+        tool: object | None = None,
         index: int | None = None,
         meta: dict | None = None,
     ) -> None:
         if tc.name != "apply_patch":
             return
-        item_id = self._emit_apply_patch_file_change_started(tc, index=index)
+        item_id = self._emit_apply_patch_file_change_started(
+            tc,
+            tool=tool,
+            index=index,
+        )
         if item_id is None:
             return
         failure_kind = str((meta or {}).get("failure_kind") or "")
@@ -652,6 +907,7 @@ class ToolExecutor:
                 changes=self._file_change_changes_by_item_id.get(item_id, []),
                 status=status,
                 error=text_result if status in {"failed", "declined"} else None,
+                tool_metadata=self._tool_event_metadata_for_call(tc, tool),
             )
         )
 
@@ -660,9 +916,14 @@ class ToolExecutor:
         tc: "ToolCall",
         *,
         reason: str | None,
+        tool: object | None = None,
         index: int | None = None,
     ) -> str | None:
-        item_id = self._emit_apply_patch_file_change_started(tc, index=index)
+        item_id = self._emit_apply_patch_file_change_started(
+            tc,
+            tool=tool,
+            index=index,
+        )
         if item_id is None:
             return None
         approval_id = f"approval:{tc.id or item_id}"
@@ -672,6 +933,7 @@ class ToolExecutor:
                 approval_id=approval_id,
                 tool_call_id=tc.id,
                 reason=reason or "",
+                tool_metadata=self._tool_event_metadata_for_call(tc, tool),
             )
         )
         return approval_id
@@ -683,9 +945,14 @@ class ToolExecutor:
         approval_id: str | None,
         decision: str,
         reason: str | None,
+        tool: object | None = None,
         index: int | None = None,
     ) -> None:
-        item_id = self._emit_apply_patch_file_change_started(tc, index=index)
+        item_id = self._emit_apply_patch_file_change_started(
+            tc,
+            tool=tool,
+            index=index,
+        )
         if item_id is None:
             return
         self.agent._emit_event(
@@ -695,8 +962,26 @@ class ToolExecutor:
                 decision=decision,
                 tool_call_id=tc.id,
                 reason=reason or "",
+                tool_metadata=self._tool_event_metadata_for_call(tc, tool),
             )
         )
+
+    def _capability_target_preview_payloads(
+        self,
+        tc: "ToolCall",
+        preview_identity: dict,
+        approved_save_candidate: dict,
+    ) -> tuple[dict, dict]:
+        context = self._capability_target_context(tc)
+        if context is None:
+            return preview_identity, approved_save_candidate
+        target_payload = context.as_event_metadata()
+        target_preview_identity = dict(preview_identity)
+        target_preview_identity["capability_target"] = target_payload
+        target_candidate = dict(approved_save_candidate)
+        target_candidate["preview_identity"] = target_preview_identity
+        target_candidate["capability_target"] = target_payload
+        return target_preview_identity, target_candidate
 
     def _ensure_apply_patch_preview_outcome(
         self,
@@ -718,7 +1003,7 @@ class ToolExecutor:
                 item_id=item_id,
                 tool_call_id=tc.id,
                 index=index,
-                tool_metadata=self._tool_event_metadata(tool),
+                tool_metadata=self._tool_event_metadata_for_call(tc, tool),
             )
         )
         result = self._preview_apply_patch_result(tc)
@@ -747,7 +1032,7 @@ class ToolExecutor:
                     failure_code=outcome.failure_code,
                     retry_hint=outcome.retry_hint,
                     index=index,
-                    tool_metadata=self._tool_event_metadata(tool),
+                    tool_metadata=self._tool_event_metadata_for_call(tc, tool),
                 )
             )
             return outcome
@@ -755,6 +1040,11 @@ class ToolExecutor:
         preview_identity = self._preview_identity_from_preview_result(result)
         approved_save_candidate = self._approved_save_candidate_from_preview_result(
             result
+        )
+        preview_identity, approved_save_candidate = self._capability_target_preview_payloads(
+            tc,
+            preview_identity,
+            approved_save_candidate,
         )
         missing_save_candidate = self._missing_mutation_save_candidate_fields(
             preview_identity,
@@ -787,7 +1077,7 @@ class ToolExecutor:
                     failure_code=outcome.failure_code,
                     retry_hint=outcome.retry_hint,
                     index=index,
-                    tool_metadata=self._tool_event_metadata(tool),
+                    tool_metadata=self._tool_event_metadata_for_call(tc, tool),
                 )
             )
             return outcome
@@ -810,7 +1100,7 @@ class ToolExecutor:
                 tool_call_id=tc.id,
                 changes=changes,
                 index=index,
-                tool_metadata=self._tool_event_metadata(tool),
+                tool_metadata=self._tool_event_metadata_for_call(tc, tool),
             )
         )
         return outcome
@@ -1060,6 +1350,23 @@ class ToolExecutor:
             return None
         return {"tool_diagnostics": [diagnostic_to_dict(item) for item in diagnostics]}
 
+    def _diagnostics_with_capability_target(
+        self,
+        tool_call: "ToolCall",
+        diagnostics: list[ToolDiagnostic | dict],
+    ) -> list[dict]:
+        target_metadata = self._capability_target_diagnostic_metadata(tool_call)
+        if not target_metadata:
+            return [diagnostic_to_dict(item) for item in diagnostics]
+        enriched: list[dict] = []
+        for item in diagnostics:
+            payload = diagnostic_to_dict(item)
+            metadata = dict(payload.get("metadata") or {})
+            metadata.update(target_metadata)
+            payload["metadata"] = metadata
+            enriched.append(payload)
+        return enriched
+
     @classmethod
     def _validation_meta(
         cls,
@@ -1094,7 +1401,7 @@ class ToolExecutor:
     def _tool_argument_context(self, tc: "ToolCall", tool: object | None) -> dict:
         llm = getattr(self.agent, "llm", None)
         provider_config = getattr(llm, "provider_config", None)
-        return {
+        context = {
             "session_id": getattr(self.agent, "current_session_id", None),
             "round_index": getattr(self.agent.state, "current_round", None),
             "tool": tc.name,
@@ -1106,6 +1413,10 @@ class ToolExecutor:
             "compat": getattr(provider_config, "compat", None),
             "model": getattr(llm, "model", None),
         }
+        target_context = self._capability_target_context(tc)
+        if target_context is not None:
+            context["capability_target"] = target_context.as_event_metadata()
+        return context
 
     def _evaluate_permission(
         self,
@@ -1155,6 +1466,30 @@ class ToolExecutor:
         feedback = self._permission_denied_lifecycle_feedback(decision)
         return f"{message}{feedback}"
 
+    def _permission_block_message_for_call(
+        self,
+        decision: PermissionDecision,
+        tool_call: "ToolCall",
+    ) -> str:
+        context = self._capability_target_context(tool_call)
+        if context is None:
+            return self._permission_block_message(decision, tool_call.name)
+        reason = decision.reason or "blocked by permission gateway"
+        if decision.action == PermissionAction.BLOCKED_REVIEW:
+            message = (
+                f"Error: target tool '{context.target_tool_name}' blocked pending review\n"
+                f"tool_id: {context.target_tool_id}\n"
+                f"Reason: {reason}"
+            )
+        else:
+            message = (
+                f"Error: target tool '{context.target_tool_name}' denied by permission gateway\n"
+                f"tool_id: {context.target_tool_id}\n"
+                f"Reason: {reason}"
+            )
+        feedback = self._permission_denied_lifecycle_feedback(decision)
+        return f"{message}{feedback}"
+
     @staticmethod
     def _permission_denied_lifecycle_feedback(decision: PermissionDecision) -> str:
         audit = decision.audit if isinstance(decision.audit, dict) else {}
@@ -1192,7 +1527,11 @@ class ToolExecutor:
         index: int | None = None,
         validation_meta: dict | None = None,
     ) -> str:
-        message = self._permission_block_message(decision, tc.name)
+        message = self._permission_block_message_for_call(decision, tc)
+        metadata = {"permission": decision.to_dict()}
+        target_context = self._capability_target_context(tc)
+        if target_context is not None:
+            metadata["capability_target"] = target_context.as_event_metadata()
         diagnostic = tool_diagnostic_from_failure(
             stage=ToolDiagnosticStage.PREFLIGHT,
             kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
@@ -1200,7 +1539,7 @@ class ToolExecutor:
             message=message,
             tool_name=tc.name,
             tool_call_id=tc.id,
-            metadata={"permission": decision.to_dict()},
+            metadata=metadata,
         )
         context = self._tool_argument_context(tc, tool)
         self._record_lifecycle_diagnostics([diagnostic], context)
@@ -1236,10 +1575,12 @@ class ToolExecutor:
                 approval_id=self._emit_apply_patch_approval_requested(
                     tc,
                     reason=decision.reason,
+                    tool=tool,
                     index=index,
                 ),
                 decision="deny_once",
                 reason=message,
+                tool=tool,
                 index=index,
             )
             diagnostic = tool_diagnostic_from_failure(
@@ -1249,6 +1590,7 @@ class ToolExecutor:
                 message=message,
                 tool_name=tc.name,
                 tool_call_id=tc.id,
+                metadata=self._capability_target_diagnostic_metadata(tc),
             )
             self._record_lifecycle_diagnostics([diagnostic], validation_context)
             self._emit_tool_end(
@@ -1264,12 +1606,14 @@ class ToolExecutor:
             file_change_approval_id = self._emit_apply_patch_approval_requested(
                 tc,
                 reason=decision.reason,
+                tool=tool,
                 index=index,
             )
             approval_metadata = {
                 "tool_call_id": tc.id,
                 "permission": decision.to_dict(),
             }
+            approval_metadata.update(self._capability_target_event_metadata(tc))
             if preview_outcome is not None and preview_outcome.ready:
                 approval_metadata["preview_identity"] = dict(
                     preview_outcome.preview_identity
@@ -1296,6 +1640,7 @@ class ToolExecutor:
                 approval_id=locals().get("file_change_approval_id"),
                 decision="deny_once",
                 reason=message,
+                tool=tool,
                 index=index,
             )
             diagnostic = tool_diagnostic_from_failure(
@@ -1305,6 +1650,7 @@ class ToolExecutor:
                 message=message,
                 tool_name=tc.name,
                 tool_call_id=tc.id,
+                metadata=self._capability_target_diagnostic_metadata(tc),
             )
             self._record_lifecycle_diagnostics([diagnostic], validation_context)
             self._emit_tool_end(
@@ -1320,6 +1666,7 @@ class ToolExecutor:
             approval_id=file_change_approval_id,
             decision=decision_result.mode,
             reason=decision_result.reason,
+            tool=tool,
             index=index,
         )
         if decision_result.approved:
@@ -1328,7 +1675,14 @@ class ToolExecutor:
                 preview_outcome,
             )
             if confirmed_candidate is not None and preview_outcome is not None:
-                preview_outcome.approved_save_candidate = confirmed_candidate
+                (
+                    preview_outcome.preview_identity,
+                    preview_outcome.approved_save_candidate,
+                ) = self._capability_target_preview_payloads(
+                    tc,
+                    preview_outcome.preview_identity,
+                    confirmed_candidate,
+                )
             return None
         message = decision_result.reason or f"Tool '{tc.name}' denied by approval provider"
         decision_diagnostics = [
@@ -1345,8 +1699,13 @@ class ToolExecutor:
                     message=message,
                     tool_name=tc.name,
                     tool_call_id=tc.id,
+                    metadata=self._capability_target_diagnostic_metadata(tc),
                 ).to_dict()
             ]
+        decision_diagnostics = self._diagnostics_with_capability_target(
+            tc,
+            decision_diagnostics,
+        )
         self._record_lifecycle_diagnostics(decision_diagnostics, validation_context)
         failure_meta = {
             "failure_kind": decision_result.meta.get(
@@ -1422,16 +1781,19 @@ class ToolExecutor:
                 ),
                 tool_name=tc.name,
                 tool_call_id=tc.id,
+                metadata=self._capability_target_diagnostic_metadata(tc),
             )
             self._emit_apply_patch_approval_resolved(
                 tc,
                 approval_id=self._emit_apply_patch_approval_requested(
                     tc,
                     reason=message,
+                    tool=tool,
                     index=index,
                 ),
                 decision="deny_once",
                 reason=diagnostic.message,
+                tool=tool,
                 index=index,
             )
             self._record_lifecycle_diagnostics([diagnostic], validation_context)
@@ -1449,6 +1811,7 @@ class ToolExecutor:
             file_change_approval_id = self._emit_apply_patch_approval_requested(
                 tc,
                 reason=message,
+                tool=tool,
                 index=index,
             )
             decision_result = request_approval(
@@ -1462,6 +1825,7 @@ class ToolExecutor:
                         "tool_call_id": tc.id,
                         "lifecycle_event": "PreToolUse",
                         "lifecycle_hooks": list(lifecycle_hooks or []),
+                        **self._capability_target_event_metadata(tc),
                     },
                 )
             )
@@ -1472,6 +1836,7 @@ class ToolExecutor:
                 approval_id=locals().get("file_change_approval_id"),
                 decision="deny_once",
                 reason=message,
+                tool=tool,
                 index=index,
             )
             diagnostic = tool_diagnostic_from_failure(
@@ -1481,6 +1846,7 @@ class ToolExecutor:
                 message=message,
                 tool_name=tc.name,
                 tool_call_id=tc.id,
+                metadata=self._capability_target_diagnostic_metadata(tc),
             )
             self._record_lifecycle_diagnostics([diagnostic], validation_context)
             self._emit_tool_end(
@@ -1496,6 +1862,7 @@ class ToolExecutor:
             approval_id=file_change_approval_id,
             decision=decision_result.mode,
             reason=decision_result.reason,
+            tool=tool,
             index=index,
         )
 
@@ -1517,8 +1884,13 @@ class ToolExecutor:
                     message=message,
                     tool_name=tc.name,
                     tool_call_id=tc.id,
+                    metadata=self._capability_target_diagnostic_metadata(tc),
                 ).to_dict()
             ]
+        decision_diagnostics = self._diagnostics_with_capability_target(
+            tc,
+            decision_diagnostics,
+        )
         self._record_lifecycle_diagnostics(decision_diagnostics, validation_context)
         failure_meta = {
             "failure_kind": decision_result.meta.get(
@@ -2192,6 +2564,7 @@ class ToolExecutor:
             )
             return message
 
+        tool_start_emitted = False
         final_validation_context = self._tool_argument_context(tool_call, tool)
         self._emit_tool_arguments_complete(tool_call, tool=tool, index=index)
         argument_error = getattr(tool_call, "argument_error", None)
@@ -2229,6 +2602,12 @@ class ToolExecutor:
                 validation=parse_validation,
             )
             message = self._bad_arguments_message(tool_call.name, str(argument_error))
+            tool_start_emitted = self._emit_capability_target_start_if_needed(
+                tool_call,
+                tool,
+                index=index,
+                already_emitted=tool_start_emitted,
+            )
             self._emit_tool_arguments_invalid(
                 tool_call,
                 message,
@@ -2259,19 +2638,31 @@ class ToolExecutor:
             final_validation,
             tool_call_id=tool_call.id,
         )
-        self._persist_tool_diagnostics(
-            final_validation_diagnostics,
-            final_validation_context,
-            validation=final_validation,
-        )
-        validation_meta = self._diagnostics_meta(final_validation_diagnostics)
         if not final_validation.final_valid:
-            message = self._bad_arguments_message(
-                tool_call.name,
+            self._persist_tool_diagnostics(
+                final_validation_diagnostics,
+                final_validation_context,
+                validation=final_validation,
+            )
+            validation_meta = self._diagnostics_meta(
+                self._diagnostics_with_capability_target(
+                    tool_call,
+                    final_validation_diagnostics,
+                )
+            )
+            message = self._bad_arguments_message_for_call(
+                tool_call,
+                tool,
                 format_tool_argument_retry_message(
                     tool_call.name,
                     final_validation.final_issues,
                 ),
+            )
+            tool_start_emitted = self._emit_capability_target_start_if_needed(
+                tool_call,
+                tool,
+                index=index,
+                already_emitted=tool_start_emitted,
             )
             self._emit_tool_arguments_invalid(
                 tool_call,
@@ -2289,6 +2680,25 @@ class ToolExecutor:
             )
             return message
         tool_call.arguments = final_validation.arguments
+        self._sync_capability_target_arguments(tool_call, tool_call.arguments)
+        final_validation_context = self._tool_argument_context(tool_call, tool)
+        self._persist_tool_diagnostics(
+            final_validation_diagnostics,
+            final_validation_context,
+            validation=final_validation,
+        )
+        validation_meta = self._diagnostics_meta(
+            self._diagnostics_with_capability_target(
+                tool_call,
+                final_validation_diagnostics,
+            )
+        )
+        tool_start_emitted = self._emit_capability_target_start_if_needed(
+            tool_call,
+            tool,
+            index=index,
+            already_emitted=tool_start_emitted,
+        )
 
         try:
             preflight_error = (
@@ -2322,11 +2732,16 @@ class ToolExecutor:
             )
             return message
         if preflight_error:
+            preflight_message = self._preflight_error_message_for_call(
+                tool_call,
+                tool,
+                str(preflight_error),
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.PREFLIGHT,
                 kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
                 code="preflight_failed",
-                message=str(preflight_error),
+                message=preflight_message,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
                 repairable=True,
@@ -2334,20 +2749,20 @@ class ToolExecutor:
             self._record_lifecycle_diagnostics([diagnostic], final_validation_context)
             self._emit_tool_arguments_invalid(
                 tool_call,
-                str(preflight_error),
+                preflight_message,
                 tool=tool,
                 index=index,
                 code="preflight_failed",
             )
             self._emit_tool_end(
                 tool_call,
-                preflight_error,
+                preflight_message,
                 tool=tool,
                 index=index,
                 meta=self._merge_meta(validation_meta, self._diagnostics_meta([diagnostic])),
                 emit_file_change=False,
             )
-            return preflight_error
+            return preflight_message
         self._emit_tool_arguments_valid(tool_call, tool=tool, index=index)
         preview_outcome = self._ensure_apply_patch_preview_outcome(
             tool_call,
@@ -2355,15 +2770,19 @@ class ToolExecutor:
             index=index,
         )
         if preview_outcome is not None and not preview_outcome.ready:
-            message = f"Error: {preview_outcome.error or 'apply_patch semantic preview failed'}"
+            message = self._preview_failure_message_for_call(
+                tool_call,
+                preview_outcome.error or "apply_patch semantic preview failed",
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.PREFLIGHT,
                 kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
                 code=preview_outcome.failure_code or "semantic_preview_failed",
-                message=preview_outcome.error or message,
+                message=message,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
                 repairable=True,
+                metadata=self._capability_target_diagnostic_metadata(tool_call),
             )
             self._record_lifecycle_diagnostics([diagnostic], final_validation_context)
             self._emit_tool_end(
@@ -2425,7 +2844,8 @@ class ToolExecutor:
             if approval_message is not None:
                 return approval_message
         execution_context = self._tool_argument_context(tool_call, tool)
-        self._emit_tool_start(tool_call, tool=tool, index=index)
+        if not tool_start_emitted:
+            self._emit_tool_start(tool_call, tool=tool, index=index)
         backend = getattr(tool, "backend", None)
         context = getattr(backend, "context", None)
         backend_id = getattr(backend, "backend_id", None)

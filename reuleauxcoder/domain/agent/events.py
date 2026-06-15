@@ -409,12 +409,14 @@ class AgentEvent:
         tool_call_id: str | None = None,
         changes: list[dict[str, Any]] | None = None,
         status: str = "in_progress",
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         payload = {
             "item_id": item_id,
             "tool_call_id": tool_call_id or "",
             "changes": list(changes or []),
             "status": status,
+            **(dict(tool_metadata) if tool_metadata else {}),
         }
         return cls(
             event_type=AgentEventType.FILE_CHANGE_STARTED,
@@ -454,6 +456,7 @@ class AgentEvent:
         approval_id: str,
         tool_call_id: str | None = None,
         reason: str = "",
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         return cls(
             event_type=AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED,
@@ -464,6 +467,7 @@ class AgentEvent:
                 "tool_call_id": tool_call_id or "",
                 "reason": reason,
                 "status": "awaiting_approval",
+                **(dict(tool_metadata) if tool_metadata else {}),
             },
         )
 
@@ -476,6 +480,7 @@ class AgentEvent:
         decision: str,
         tool_call_id: str | None = None,
         reason: str = "",
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         return cls(
             event_type=AgentEventType.FILE_CHANGE_APPROVAL_RESOLVED,
@@ -487,6 +492,7 @@ class AgentEvent:
                 "decision": decision,
                 "reason": reason,
                 "status": "approved" if decision == "allow_once" else "declined",
+                **(dict(tool_metadata) if tool_metadata else {}),
             },
         )
 
@@ -500,12 +506,14 @@ class AgentEvent:
         status: str,
         error: str | None = None,
         duration_ms: int | None = None,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         payload: dict[str, Any] = {
             "item_id": item_id,
             "tool_call_id": tool_call_id or "",
             "changes": list(changes or []),
             "status": status,
+            **(dict(tool_metadata) if tool_metadata else {}),
         }
         if error:
             payload["error"] = error
