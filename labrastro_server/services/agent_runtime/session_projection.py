@@ -348,7 +348,10 @@ def agent_run_event_to_session_events(
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
                     "tool_args": tool_args,
-                    **_tool_identity_payload(tool_data),
+                    **_tool_identity_payload(
+                        tool_data,
+                        marker=labels.output_truncation_marker,
+                    ),
                 },
             )
         ]
@@ -392,7 +395,10 @@ def agent_run_event_to_session_events(
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
                     "tool_result": projected_output,
-                    **_tool_identity_payload(tool_data),
+                    **_tool_identity_payload(
+                        tool_data,
+                        marker=labels.output_truncation_marker,
+                    ),
                     "meta": public_tool_data,
                 },
             )
@@ -552,7 +558,38 @@ def _without_large_output_fields(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _tool_identity_payload(data: dict[str, Any]) -> dict[str, Any]:
+def _tool_identity_payload(data: dict[str, Any], *, marker: str) -> dict[str, Any]:
+    capability_target = _capability_target_payload(data)
+    if capability_target:
+        public_capability_target = _public_payload(capability_target, marker=marker)
+        fields = {
+            "tool_id": capability_target.get("target_tool_id")
+            or data.get("tool_id", data.get("toolId")),
+            "risk": capability_target.get("target_risk") or data.get("risk"),
+            "exposure": capability_target.get("target_exposure")
+            or data.get("exposure"),
+            "capability_name": data.get(
+                "capability_name",
+                data.get("capabilityName"),
+            ),
+            "target_tool_id": capability_target.get("target_tool_id"),
+            "target_tool_name": capability_target.get("target_tool_name"),
+            "target_tool_call_id": capability_target.get("target_tool_call_id"),
+            "parent_tool_call_id": capability_target.get("parent_tool_call_id"),
+            "gateway_tool_name": capability_target.get("gateway_tool_name"),
+            "target_exposure": capability_target.get("target_exposure"),
+            "target_risk": capability_target.get("target_risk"),
+            "target_permission_policy": capability_target.get(
+                "target_permission_policy"
+            ),
+        }
+        payload = {
+            key: str(value).strip()
+            for key, value in fields.items()
+            if value is not None and str(value).strip()
+        }
+        payload["capability_target"] = public_capability_target
+        return payload
     fields = {
         "tool_id": data.get("tool_id", data.get("toolId")),
         "risk": data.get("risk"),
@@ -564,6 +601,17 @@ def _tool_identity_payload(data: dict[str, Any]) -> dict[str, Any]:
         for key, value in fields.items()
         if value is not None and str(value).strip()
     }
+
+
+def _capability_target_payload(data: dict[str, Any]) -> dict[str, Any]:
+    raw = data.get("capability_target", data.get("capabilityTarget"))
+    if not isinstance(raw, dict):
+        meta = data.get("meta")
+        if isinstance(meta, dict):
+            raw = meta.get("capability_target", meta.get("capabilityTarget"))
+    if not isinstance(raw, dict):
+        return {}
+    return dict(raw)
 
 
 def _public_payload(data: dict[str, Any], *, marker: str) -> dict[str, Any]:
@@ -1047,10 +1095,16 @@ def _prefixed_projection_meta(prefix: str, meta: dict[str, Any]) -> dict[str, An
 
 
 def _tool_name(data: dict[str, Any]) -> str:
+    capability_target = _capability_target_payload(data)
+    if capability_target.get("target_tool_name"):
+        return str(capability_target["target_tool_name"])
     return str(data.get("tool_name") or data.get("name") or data.get("tool") or "tool")
 
 
 def _tool_call_id(data: dict[str, Any], agent_run_id: str, seq: Any) -> str:
+    capability_target = _capability_target_payload(data)
+    if capability_target.get("target_tool_call_id"):
+        return str(capability_target["target_tool_call_id"])
     return str(data.get("tool_call_id") or data.get("id") or f"{agent_run_id}:tool:{seq}")
 
 

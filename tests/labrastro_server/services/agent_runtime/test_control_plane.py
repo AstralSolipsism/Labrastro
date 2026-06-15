@@ -1345,6 +1345,208 @@ def test_tool_projection_preserves_canonical_tool_spec_metadata() -> None:
     }
 
 
+def test_session_projection_preserves_capability_target_context() -> None:
+    capability_target = {
+        "gateway_tool_name": "capability_execute",
+        "parent_tool_call_id": "exec-target",
+        "target_tool_call_id": "exec-target:capability:docs:lookup",
+        "target_tool_id": "capability:docs:lookup",
+        "target_tool_name": "docs_lookup",
+        "target_arguments": {"query": "cache"},
+        "target_exposure": "deferred",
+        "target_risk": "read_only",
+        "target_permission_policy": "read_only",
+    }
+    projected_start = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 10,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "docs_lookup",
+                    "tool_call_id": "exec-target:capability:docs:lookup",
+                    "input": {"query": "cache"},
+                    "tool_id": "capability:docs:lookup",
+                    "risk": "read_only",
+                    "exposure": "deferred",
+                    "capability_target": capability_target,
+                },
+            },
+        }
+    )
+    projected_end = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 11,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "data": {
+                    "tool_name": "docs_lookup",
+                    "tool_call_id": "exec-target:capability:docs:lookup",
+                    "output": "docs_lookup:cache",
+                    "tool_id": "capability:docs:lookup",
+                    "risk": "read_only",
+                    "exposure": "deferred",
+                    "capability_target": capability_target,
+                    "meta": {"tool_diagnostics": []},
+                },
+            },
+        }
+    )
+
+    start_payload = projected_start[0][1]
+    assert start_payload["capability_target"] == capability_target
+    assert start_payload["target_tool_id"] == "capability:docs:lookup"
+    assert start_payload["target_tool_name"] == "docs_lookup"
+    assert start_payload["parent_tool_call_id"] == "exec-target"
+    assert start_payload["raw_event_refs"] == [
+        {"agent_run_id": "agent-run-1", "seq": 10, "type": "tool_use"}
+    ]
+    end_payload = projected_end[0][1]
+    assert end_payload["capability_target"] == capability_target
+    assert end_payload["target_tool_id"] == "capability:docs:lookup"
+    assert end_payload["target_tool_name"] == "docs_lookup"
+    assert end_payload["parent_tool_call_id"] == "exec-target"
+    assert end_payload["meta"]["capability_target"] == capability_target
+    assert end_payload["raw_event_refs"] == [
+        {"agent_run_id": "agent-run-1", "seq": 11, "type": "tool_result"}
+    ]
+
+
+def test_session_projection_truncates_capability_target_arguments() -> None:
+    long_patch = "*** Begin Patch\n" + ("+line\n" * 1200) + "*** End Patch"
+    capability_target = {
+        "gateway_tool_name": "capability_execute",
+        "parent_tool_call_id": "exec-target",
+        "target_tool_call_id": "exec-target:capability:docs:workspace_patch",
+        "target_tool_id": "capability:docs:workspace_patch",
+        "target_tool_name": "apply_patch",
+        "target_arguments": {"patch": long_patch},
+        "target_exposure": "deferred",
+        "target_risk": "file_mutation",
+        "target_permission_policy": "workspace_write",
+    }
+
+    projected = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 12,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "apply_patch",
+                    "tool_call_id": "exec-target:capability:docs:workspace_patch",
+                    "input": {"patch": long_patch},
+                    "tool_id": "capability:docs:workspace_patch",
+                    "risk": "file_mutation",
+                    "exposure": "deferred",
+                    "capability_target": capability_target,
+                },
+            },
+        }
+    )
+
+    payload = projected[0][1]
+    public_target = payload["capability_target"]
+    public_patch = public_target["target_arguments"]["patch"]
+    assert payload["target_tool_id"] == "capability:docs:workspace_patch"
+    assert payload["target_tool_name"] == "apply_patch"
+    assert payload["target_tool_call_id"] == (
+        "exec-target:capability:docs:workspace_patch"
+    )
+    assert public_patch != long_patch
+    assert "output omitted from the main timeline" in public_patch
+    assert "target_arguments.patch" in public_target["truncated_fields"]
+    assert public_target["full_payload_source"] == "raw_event"
+
+
+def test_session_projection_uses_target_identity_for_deferred_tool_events() -> None:
+    capability_target = {
+        "gateway_tool_name": "capability_execute",
+        "parent_tool_call_id": "exec-target",
+        "target_tool_call_id": "exec-target:capability:docs:lookup",
+        "target_tool_id": "capability:docs:lookup",
+        "target_tool_name": "docs_lookup",
+        "target_arguments": {"query": "cache"},
+        "target_exposure": "deferred",
+        "target_risk": "read_only",
+        "target_permission_policy": "read_only",
+    }
+
+    projected = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 12,
+            "type": "tool_use",
+            "payload": {
+                "type": "tool_use",
+                "data": {
+                    "tool_name": "capability_execute",
+                    "tool_call_id": "exec-target:capability:docs:lookup",
+                    "input": {"query": "cache"},
+                    "tool_id": "builtin:capability_execute",
+                    "risk": "capability",
+                    "exposure": "direct",
+                    "capability_target": capability_target,
+                },
+            },
+        }
+    )
+
+    payload = projected[0][1]
+    assert payload["tool_name"] == "docs_lookup"
+    assert payload["tool_id"] == "capability:docs:lookup"
+    assert payload["risk"] == "read_only"
+    assert payload["exposure"] == "deferred"
+    assert payload["capability_target"]["gateway_tool_name"] == "capability_execute"
+
+
+def test_session_projection_keeps_capability_execute_as_gateway_detail_only() -> None:
+    projected = agent_run_event_to_session_events(
+        {
+            "agent_run_id": "agent-run-1",
+            "seq": 13,
+            "type": "tool_result",
+            "payload": {
+                "type": "tool_result",
+                "data": {
+                    "tool_name": "capability_execute",
+                    "tool_call_id": "exec-target",
+                    "output": "docs_lookup:cache",
+                    "tool_id": "builtin:capability_execute",
+                    "risk": "capability",
+                    "exposure": "direct",
+                    "meta": {
+                        "execute_trace": {
+                            "gateway_tool_name": "capability_execute",
+                            "parent_tool_call_id": "exec-target",
+                            "target_tool_call_id": "exec-target:capability:docs:lookup",
+                            "tool_id": "capability:docs:lookup",
+                            "target_tool_id": "capability:docs:lookup",
+                            "target_tool_name": "docs_lookup",
+                            "target_exposure": "deferred",
+                            "target_risk": "read_only",
+                            "target_permission_policy": "read_only",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    payload = projected[0][1]
+    assert payload["tool_name"] == "capability_execute"
+    assert payload["tool_id"] == "builtin:capability_execute"
+    assert payload["risk"] == "capability"
+    assert payload["exposure"] == "direct"
+    assert payload["meta"]["execute_trace"]["target_tool_id"] == "capability:docs:lookup"
+    assert "capability_target" not in payload
+
+
 def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
@@ -2021,16 +2223,13 @@ def test_default_system_agent_runs_carry_effective_capability_boundaries() -> No
 
     assert "tools" not in environment_task.metadata["effective_capabilities"]
     assert "tools" not in packager_task.metadata["effective_capabilities"]
-    assert [
-        item["target_tool_ref"]
-        for item in packager_task.metadata["effective_capabilities"]["tool_specs"]
-    ] == [
-        "builtin:fetch_capabilities",
-        "builtin:glob",
-        "builtin:grep",
-        "builtin:list_file",
-        "builtin:read_file",
-    ]
+    assert environment_task.metadata["effective_capabilities"][
+        "builtin_tool_grants"
+    ] == ["shell"]
+    assert packager_task.metadata["effective_capabilities"][
+        "builtin_tool_grants"
+    ] == ["fetch_capabilities", "glob", "grep", "list_file", "read_file"]
+    assert packager_task.metadata["effective_capabilities"]["tool_specs"] == []
     assert packager_task.metadata["worker_kind"] == "sandbox_worker"
 
 
