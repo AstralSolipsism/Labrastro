@@ -2213,7 +2213,7 @@ class CapabilityPackageSessionRunService:
                 _capability_text(locale, "revision_approval_reason"),
             )
         try:
-            decision, reason = session.wait_approval(approval_id)
+            decision, reason, _resolution_meta = session.wait_approval(approval_id)
         finally:
             with follow_up_lock:
                 if active_approval_id.get("value") == approval_id:

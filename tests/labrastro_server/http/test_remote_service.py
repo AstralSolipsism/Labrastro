@@ -6110,7 +6110,7 @@ class TestRemoteRelayHTTPService:
             session.register_approval(approval_id, payload)
             session.append_event("approval_request", payload)
             approval_ready.set()
-            decision, resolution_reason = session.wait_approval(approval_id, timeout_sec=2)
+            decision, resolution_reason, _resolution_meta = session.wait_approval(approval_id, timeout_sec=2)
             session.append_event(
                 "approval_resolved",
                 {
@@ -6644,10 +6644,15 @@ class TestRemoteRelayHTTPService:
                 "approval_request",
                 approval_payload,
             )
-            decision, reason = session.wait_approval(approval_id, timeout_sec=2)
+            decision, reason, resolution_meta = session.wait_approval(approval_id, timeout_sec=2)
             session.append_event(
                 "approval_resolved",
-                {"approval_id": approval_id, "decision": decision, "reason": reason},
+                {
+                    "approval_id": approval_id,
+                    "decision": decision,
+                    "reason": reason,
+                    "approved_save_candidate": resolution_meta.get("approved_save_candidate"),
+                },
             )
 
         service = RemoteRelayHTTPService(
@@ -6715,6 +6720,16 @@ class TestRemoteRelayHTTPService:
                     "approval_id": approval_id,
                     "decision": "allow_once",
                     "reason": "ok",
+                    "approved_save_candidate": {
+                        "tool_name": "apply_patch",
+                        "operations": [
+                            {
+                                "kind": "update",
+                                "path": "src/app.py",
+                                "new_content": "edited",
+                            }
+                        ],
+                    },
                 },
             )
             assert status == 200
@@ -6733,6 +6748,16 @@ class TestRemoteRelayHTTPService:
             ]
             assert resolved_events
             assert resolved_events[0]["payload"]["decision"] == "allow_once"
+            assert resolved_events[0]["payload"]["approved_save_candidate"] == {
+                "tool_name": "apply_patch",
+                "operations": [
+                    {
+                        "kind": "update",
+                        "path": "src/app.py",
+                        "new_content": "edited",
+                    }
+                ],
+            }
             assert resolved_body["done"] is True
 
             status, duplicate_reply_body = _json_request(
@@ -6791,6 +6816,119 @@ class TestRemoteRelayHTTPService:
                 assert exc.code == 404
                 body = json.loads(exc.read().decode("utf-8"))
                 assert body["error"] == "approval_not_found"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_approval_reply_ignores_save_candidate_for_denied_decision(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        seen: dict[str, object] = {}
+
+        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
+            approval_id = "approval-deny"
+            approval_payload = {
+                "approval_id": approval_id,
+                "tool_call_id": "call-deny",
+                "tool_name": "shell",
+                "tool_source": "builtin",
+                "reason": "need approval",
+                "tool_args": {"command": "echo hi"},
+                "sections": [{"id": "command", "kind": "text", "content": "echo hi"}],
+                "content": "approve echo hi",
+            }
+            session.register_approval(approval_id, approval_payload)
+            session.append_event("approval_request", approval_payload)
+            decision, reason, resolution_meta = session.wait_approval(approval_id, timeout_sec=2)
+            resolution_meta = dict(resolution_meta or {})
+            seen["resolution_meta"] = resolution_meta
+            event_payload = {
+                "approval_id": approval_id,
+                "decision": decision,
+                "reason": reason,
+            }
+            if isinstance(resolution_meta.get("approved_save_candidate"), dict):
+                event_payload["approved_save_candidate"] = resolution_meta[
+                    "approved_save_candidate"
+                ]
+            session.append_event("approval_resolved", event_payload)
+
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            session_run_events_handler=session_run_events_handler,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "/tmp/peer",
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "deny me"},
+            )
+            session_run_id = start_body["session_run_id"]
+            stream_body = _session_run_events_first_body(
+                service.base_url,
+                peer_token,
+                session_run_id,
+            )
+            approval_events = [
+                event
+                for event in stream_body["events"]
+                if event["type"] == "approval_request"
+            ]
+            assert approval_events
+
+            status, reply_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/approval/reply",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "approval_id": approval_events[0]["payload"]["approval_id"],
+                    "decision": "deny_once",
+                    "reason": "no",
+                    "approved_save_candidate": {
+                        "tool_name": "apply_patch",
+                        "operations": [
+                            {
+                                "kind": "update",
+                                "path": "src/app.py",
+                                "new_content": "should not be approved",
+                            }
+                        ],
+                    },
+                },
+            )
+            assert status == 200
+            assert reply_body["ok"] is True
+
+            resolved_body = _session_run_events_body(
+                service.base_url,
+                peer_token,
+                session_run_id,
+                cursor=stream_body["next_cursor"],
+            )
+            resolved_events = [
+                event
+                for event in resolved_body["events"]
+                if event["type"] == "approval_resolved"
+            ]
+            assert resolved_events
+            assert resolved_events[0]["payload"]["decision"] == "deny_once"
+            assert "approved_save_candidate" not in seen["resolution_meta"]
+            assert "approved_save_candidate" not in resolved_events[0]["payload"]
+            assert resolved_body["done"] is True
         finally:
             service.stop()
             relay.stop()

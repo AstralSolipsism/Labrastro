@@ -12,6 +12,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     CleanupResult,
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
+    ApprovalReplyRequest,
     SessionRunStartRequest,
     SessionRunStartResponse,
     SessionRunStatusRequest,
@@ -346,6 +347,29 @@ class TestChatCommandDispatchProtocol:
             {"type": "error", "payload": {"code": "invalid_chat_command"}}
         ]
         assert restored.error == "invalid_chat_command"
+
+
+class TestApprovalReplyProtocol:
+    def test_roundtrip_preserves_approved_save_candidate(self) -> None:
+        candidate = {
+            "tool_name": "apply_patch",
+            "operations": [
+                {"kind": "update", "path": "src/app.py", "new_content": "edited"}
+            ],
+        }
+        req = ApprovalReplyRequest(
+            peer_token="pt_1",
+            session_run_id="run-1",
+            approval_id="approval-1",
+            decision="allow_once",
+            reason="saved candidate",
+            approved_save_candidate=candidate,
+        )
+
+        restored = ApprovalReplyRequest.from_dict(req.to_dict())
+
+        assert restored.approved_save_candidate == candidate
+        assert restored.to_dict()["approved_save_candidate"] == candidate
 
 
 class TestSessionRunStatusProtocol:

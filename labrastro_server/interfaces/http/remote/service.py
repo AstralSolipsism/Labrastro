@@ -1233,9 +1233,14 @@ class _RemoteSessionRun:
             self.approval_resolutions.pop(approval_id, None)
 
     def resolve_approval(
-        self, approval_id: str, decision: str, reason: str | None
+        self,
+        approval_id: str,
+        decision: str,
+        reason: str | None,
+        meta: dict[str, Any] | None = None,
     ) -> str | None:
         with self.cond:
+            resolution_meta = dict(meta or {})
             waiter = self.approval_waiters.get(approval_id)
             if waiter is None:
                 resolved = self.approval_resolutions.get(approval_id)
@@ -1249,16 +1254,17 @@ class _RemoteSessionRun:
             waiter["done"] = True
             waiter["decision"] = decision
             waiter["reason"] = reason
+            waiter["meta"] = resolution_meta
             waiter["state"] = "resolved"
             self._record_approval_resolution_locked(
-                approval_id, decision, reason, "resolved"
+                approval_id, decision, reason, "resolved", resolution_meta
             )
             self.cond.notify_all()
             return "resolved"
 
     def wait_approval(
         self, approval_id: str, timeout_sec: float | None = None
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, dict[str, Any]]:
         deadline = time.time() + timeout_sec if timeout_sec else None
         with self.cond:
             waiter = self.approval_waiters.setdefault(
@@ -1281,14 +1287,16 @@ class _RemoteSessionRun:
                 self.cond.wait(timeout=remaining)
             decision = str(waiter.get("decision", "deny_once"))
             reason = waiter.get("reason")
+            meta = waiter.get("meta") if isinstance(waiter.get("meta"), dict) else {}
             self._record_approval_resolution_locked(
                 approval_id,
                 decision,
                 reason if isinstance(reason, str) else None,
                 str(waiter.get("state") or "resolved"),
+                dict(meta),
             )
             self.approval_waiters.pop(approval_id, None)
-            return decision, reason if isinstance(reason, str) else None
+            return decision, reason if isinstance(reason, str) else None, dict(meta)
 
     def cancel_pending_approvals(self, reason: str) -> list[dict[str, Any]]:
         with self.cond:
@@ -1310,6 +1318,7 @@ class _RemoteSessionRun:
                 "deny_once",
                 reason,
                 "cancelled",
+                {},
             )
             if waiter.get("registered"):
                 event_payload = self._approval_resolved_event_payload_locked(
@@ -1370,6 +1379,7 @@ class _RemoteSessionRun:
         decision: str,
         reason: str | None,
         state: str,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         if not approval_id:
             return
@@ -1378,6 +1388,7 @@ class _RemoteSessionRun:
             "decision": decision,
             "reason": reason,
             "state": state,
+            "meta": dict(meta or {}),
         }
 
     def register_user_input(

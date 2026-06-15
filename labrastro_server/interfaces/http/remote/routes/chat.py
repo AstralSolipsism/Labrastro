@@ -521,7 +521,17 @@ class RemoteChatRoutes:
         if req.decision not in {"allow_once", "deny_once"}:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_approval_decision")
             return
-        state = session.resolve_approval(req.approval_id, req.decision, req.reason)
+        metadata = (
+            {"approved_save_candidate": req.approved_save_candidate}
+            if req.decision == "allow_once" and req.approved_save_candidate
+            else None
+        )
+        state = session.resolve_approval(
+            req.approval_id,
+            req.decision,
+            req.reason,
+            metadata,
+        )
         if state is None:
             self._send_error(HTTPStatus.NOT_FOUND, "approval_not_found")
             return

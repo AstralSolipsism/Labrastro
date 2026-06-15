@@ -2475,6 +2475,12 @@ class TestRunnerRemoteExec:
                     {"file_path": str(workspace / "decision.md")},
                     tool_call_id="call-read-1",
                     index=0,
+                    tool_metadata={
+                        "tool_id": "builtin:read_file",
+                        "risk": "workspace_read",
+                        "exposure": "direct",
+                        "capability_name": "workspace",
+                    },
                 ),
             )
             emit(
@@ -2503,6 +2509,12 @@ class TestRunnerRemoteExec:
                     tool_call_id="call-write-1",
                     changes=[{"path": "main.py", "kind": "update"}],
                     index=1,
+                    tool_metadata={
+                        "tool_id": "builtin:apply_patch",
+                        "risk": "workspace_write",
+                        "exposure": "direct",
+                        "capability_name": "workspace",
+                    },
                 ),
             )
             emit(
@@ -2525,6 +2537,12 @@ class TestRunnerRemoteExec:
                     failure_code="semantic_preview_failed",
                     retry_hint="Update an existing workspace-relative file.",
                     index=3,
+                    tool_metadata={
+                        "tool_id": "builtin:apply_patch",
+                        "risk": "workspace_write",
+                        "exposure": "direct",
+                        "capability_name": "workspace",
+                    },
                 ),
             )
             emit(
@@ -2533,6 +2551,12 @@ class TestRunnerRemoteExec:
                     "read_file",
                     long_result,
                     tool_call_id="call-read-1",
+                    tool_metadata={
+                        "tool_id": "builtin:read_file",
+                        "risk": "workspace_read",
+                        "exposure": "direct",
+                        "capability_name": "workspace",
+                    },
                 ),
             )
             return "done"
@@ -2624,6 +2648,10 @@ class TestRunnerRemoteExec:
                 event["type"] == "tool_call_start"
                 and event["payload"].get("tool_name") == "read_file"
                 and event["payload"].get("index") == 0
+                and event["payload"].get("tool_id") == "builtin:read_file"
+                and event["payload"].get("risk") == "workspace_read"
+                and event["payload"].get("exposure") == "direct"
+                and event["payload"].get("capability_name") == "workspace"
                 for event in events
             )
             assert any(
@@ -2636,12 +2664,29 @@ class TestRunnerRemoteExec:
                 event["type"] == "mutation_preview_ready"
                 and event["payload"].get("item_id") == "file-change:call-write-1"
                 and event["payload"].get("changes") == [{"path": "main.py", "kind": "update"}]
+                and event["payload"].get("tool_id") == "builtin:apply_patch"
+                and event["payload"].get("risk") == "workspace_write"
+                and event["payload"].get("exposure") == "direct"
+                and event["payload"].get("capability_name") == "workspace"
+                for event in events
+            )
+            assert any(
+                event["type"] == "mutation_preview_failed"
+                and event["payload"].get("item_id") == "file-change:call-semantic-fail"
+                and event["payload"].get("tool_id") == "builtin:apply_patch"
+                and event["payload"].get("risk") == "workspace_write"
+                and event["payload"].get("exposure") == "direct"
+                and event["payload"].get("capability_name") == "workspace"
                 for event in events
             )
             assert any(
                 event["type"] == "tool_call_end"
                 and event["payload"].get("tool_name") == "read_file"
                 and event["payload"].get("tool_result") == long_result
+                and event["payload"].get("tool_id") == "builtin:read_file"
+                and event["payload"].get("risk") == "workspace_read"
+                and event["payload"].get("exposure") == "direct"
+                and event["payload"].get("capability_name") == "workspace"
                 and len(event["payload"].get("tool_result", "")) > 500
                 and ("tool_" + "success") not in event["payload"]
                 for event in events

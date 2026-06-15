@@ -1785,6 +1785,19 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         def _agent_event_payload(event: AgentEvent, payload: dict[str, Any]) -> dict[str, Any]:
             return {**dict(payload), "emitted_at": event.timestamp}
 
+        def _tool_identity_event_payload(event: AgentEvent) -> dict[str, Any]:
+            return {
+                key: str(value).strip()
+                for key, value in {
+                    "tool_id": event.data.get("tool_id") or event.data.get("toolId"),
+                    "risk": event.data.get("risk"),
+                    "exposure": event.data.get("exposure"),
+                    "capability_name": event.data.get("capability_name")
+                    or event.data.get("capabilityName"),
+                }.items()
+                if value is not None and str(value).strip()
+            }
+
         def _append_agent_event(
             event: AgentEvent,
             event_type: str,
@@ -2286,6 +2299,11 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     "sections": sections,
                     "preview_unavailable": bool(preview_error) or not sections,
                     "preview_error": preview_error,
+                    **(
+                        {"approved_save_candidate": _preview_save_candidate(preview)}
+                        if preview is not None and preview.ok and _preview_save_candidate(preview)
+                        else {}
+                    ),
                     **_approval_lifecycle_payload(request),
                     "format": "markdown",
                     "content": "\n\n".join(
@@ -2302,7 +2320,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 }
                 remote_session.register_approval(approval_id, payload)
                 remote_session.append_event("approval_request", payload)
-                decision, reason = remote_session.wait_approval(approval_id)
+                decision, reason, decision_meta = remote_session.wait_approval(approval_id)
+                decision_meta = dict(decision_meta or {})
                 remote_session.append_event(
                     "approval_resolved",
                     {
@@ -2310,17 +2329,26 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "tool_call_id": tool_call_id,
                         "decision": decision,
                         "reason": reason,
+                        **(
+                            {"approved_save_candidate": decision_meta["approved_save_candidate"]}
+                            if decision == "allow_once"
+                            and isinstance(decision_meta.get("approved_save_candidate"), dict)
+                            else {}
+                        ),
                     },
                 )
                 if decision == "allow_once":
                     backend = _remote_backend()
                     if backend is not None and preview is not None and preview.ok:
+                        approved_candidate = decision_meta.get("approved_save_candidate")
                         backend.remember_approved_candidate(
                             request.tool_name,
                             _owner_tool_args(request),
-                            _preview_save_candidate(preview),
+                            dict(approved_candidate)
+                            if isinstance(approved_candidate, dict) and approved_candidate
+                            else _preview_save_candidate(preview),
                         )
-                    return ApprovalDecision.allow_once(reason)
+                    return ApprovalDecision.allow_once(reason, meta=decision_meta)
                 denial_diagnostic = tool_diagnostic_from_failure(
                     stage=ToolDiagnosticStage.APPROVAL,
                     kind=ToolDiagnosticKind.APPROVAL_DENIED,
@@ -2560,6 +2588,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "tool_source": event.data.get("tool_source"),
                         "index": event.data.get("index"),
                         "started_at": event.timestamp,
+                        **_tool_identity_event_payload(event),
                     },
                 )
                 return
@@ -2587,6 +2616,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "index": event.data.get("index"),
                         "meta": event.data.get("meta") or {},
                         "ended_at": event.timestamp,
+                        **_tool_identity_event_payload(event),
                     },
                 )
                 return

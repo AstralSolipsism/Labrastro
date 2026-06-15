@@ -555,24 +555,36 @@ class ApprovalReplyRequest:
     approval_id: str
     decision: str
     reason: str | None = None
+    approved_save_candidate: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
             "approval_id": self.approval_id,
             "decision": self.decision,
             "reason": self.reason,
         }
+        if self.approved_save_candidate:
+            payload["approved_save_candidate"] = dict(self.approved_save_candidate)
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ApprovalReplyRequest":
+        approved_save_candidate = d.get("approved_save_candidate")
+        if not isinstance(approved_save_candidate, dict):
+            approved_save_candidate = d.get("approvedSaveCandidate")
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
             approval_id=d["approval_id"],
             decision=d["decision"],
             reason=d.get("reason"),
+            approved_save_candidate=(
+                dict(approved_save_candidate)
+                if isinstance(approved_save_candidate, dict)
+                else {}
+            ),
         )
 
 @dataclass
