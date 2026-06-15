@@ -58,7 +58,9 @@ def _apply_install_candidate(
 def _effective_tool_refs(snapshot: dict, agent_id: str) -> list[str]:
     effective = snapshot["agents"][agent_id]["effective_capabilities"]
     assert "tools" not in effective
-    return [item["target_tool_ref"] for item in effective["tool_specs"]]
+    refs = [item["target_tool_ref"] for item in effective["tool_specs"]]
+    refs.extend(f"builtin:{name}" for name in effective["builtin_tool_grants"])
+    return refs
 
 
 def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
@@ -759,15 +761,15 @@ def test_agent_run_snapshot_keeps_worker_capabilities_separate_from_main_chat() 
     )
 
     assert "tools" not in snapshot["agents"]["main_chat"]["effective_capabilities"]
-    assert [
-        item["tool_id"]
-        for item in snapshot["agents"]["main_chat"]["resolved_capabilities"]["tool_specs"]
-    ] == ["capability:repo-admin:builtin_tool:shell"]
+    assert snapshot["agents"]["main_chat"]["resolved_capabilities"][
+        "builtin_tool_grants"
+    ] == ["shell"]
+    assert snapshot["agents"]["main_chat"]["resolved_capabilities"]["tool_specs"] == []
     assert "tools" not in snapshot["agents"]["reviewer"]["effective_capabilities"]
-    assert [
-        item["tool_id"]
-        for item in snapshot["agents"]["reviewer"]["resolved_capabilities"]["tool_specs"]
-    ] == ["capability:review:builtin_tool:read_file"]
+    assert snapshot["agents"]["reviewer"]["resolved_capabilities"][
+        "builtin_tool_grants"
+    ] == ["read_file"]
+    assert snapshot["agents"]["reviewer"]["resolved_capabilities"]["tool_specs"] == []
 
 
 def test_config_validate_rejects_agent_referencing_missing_runtime_profile() -> None:

@@ -83,16 +83,16 @@ def test_prompt_renderer_does_not_render_full_capability_tool_specs() -> None:
             "packages": [{"id": "review", "name": "Review"}],
             "tool_specs": [
                 {
-                    "tool_id": "capability:review:builtin_tool:read_file",
-                    "name": "read_file",
+                    "tool_id": "capability:review:lookup",
+                    "name": "lookup",
                     "namespace": "capability",
-                    "description": "Read file capability",
+                    "description": "Lookup review context.",
                     "input_schema": {
                         "type": "object",
                         "properties": {
-                            "file_path": {
+                            "query": {
                                 "type": "string",
-                                "description": "Path to the file",
+                                "description": "Search query.",
                             }
                         },
                     },
@@ -105,9 +105,9 @@ def test_prompt_renderer_does_not_render_full_capability_tool_specs() -> None:
     text = rendered.files["AGENTS.md"]
 
     assert "Review" in text
-    assert "capability:review:builtin_tool:read_file" not in text
+    assert "capability:review:lookup" not in text
     assert "input_schema" not in text
-    assert "file_path" not in text
+    assert "query" not in text
 
 
 def test_platform_mcp_policy_allows_only_agent_declared_servers() -> None:

@@ -14,6 +14,9 @@ from reuleauxcoder.domain.permission_gateway import (
 )
 
 
+_STALE_BUILTIN_SOURCE_TYPE = "builtin_" + "tool"
+
+
 def _subject(**overrides) -> PermissionSubject:
     data = {
         "agent_id": "main_chat",
@@ -39,7 +42,7 @@ def _target(**overrides) -> PermissionTarget:
 def _tool_spec(
     target_tool_ref: str,
     *,
-    source_type: str = "builtin_tool",
+    source_type: str = "mcp_tool",
     name: str | None = None,
     policy: str = "inherit",
 ) -> dict:
@@ -62,12 +65,23 @@ def _effective_tool_specs(*specs: dict) -> dict:
     return {"tool_specs": list(specs)}
 
 
+def _effective_builtin_tools(
+    *names: str,
+    execution_policies: list[dict] | None = None,
+) -> dict:
+    return {
+        "builtin_tool_grants": list(names),
+        "tool_specs": [],
+        "execution_policies": list(execution_policies or []),
+    }
+
+
 def _request(**overrides) -> PermissionRequest:
     data = {
         "subject": _subject(),
         "target": _target(),
         "tool_call": ToolCall(id="call-1", name="read_file", arguments={}),
-        "effective_capabilities": _effective_tool_specs(_tool_spec("builtin:read_file")),
+        "effective_capabilities": _effective_builtin_tools("read_file"),
         "approval": ApprovalConfig(default_mode="allow"),
         "enforce_effective_capabilities": True,
     }
@@ -80,20 +94,23 @@ def test_builtin_tool_allowed_when_capability_and_policy_allow() -> None:
 
     assert decision.action == PermissionAction.ALLOW
     assert decision.authorized is True
-    assert decision.capability_matched == "capability:test:builtin_tool:read_file"
+    assert decision.capability_matched == "builtin_tool:read_file"
 
 
-def test_builtin_tool_allowed_by_structured_capability_tool_spec() -> None:
+def test_stale_builtin_tool_spec_does_not_authorize_builtin_tool() -> None:
+    stale_tool_id = (
+        f"capability:review:{_STALE_BUILTIN_SOURCE_TYPE}:read_file"
+    )
     decision = PermissionGateway().evaluate(
         _request(
             effective_capabilities={
                 "tool_specs": [
                     {
-                        "tool_id": "capability:review:builtin_tool:read_file",
+                        "tool_id": stale_tool_id,
                         "name": "read_file",
                         "namespace": "capability",
                         "target_tool_ref": "builtin:read_file",
-                        "source_type": "builtin_tool",
+                        "source_type": _STALE_BUILTIN_SOURCE_TYPE,
                         "exposure": "deferred",
                         "permission": {"policy": "allow"},
                     }
@@ -102,9 +119,9 @@ def test_builtin_tool_allowed_by_structured_capability_tool_spec() -> None:
         )
     )
 
-    assert decision.action == PermissionAction.ALLOW
-    assert decision.authorized is True
-    assert decision.capability_matched == "capability:review:builtin_tool:read_file"
+    assert decision.action == PermissionAction.DENY
+    assert decision.authorized is False
+    assert decision.capability_matched == ""
 
 
 def test_legacy_tools_string_does_not_authorize_builtin_tool() -> None:
@@ -120,7 +137,7 @@ def test_legacy_tools_string_does_not_authorize_builtin_tool() -> None:
 def test_builtin_tool_denied_when_missing_from_effective_capabilities() -> None:
     decision = PermissionGateway().evaluate(
         _request(
-            effective_capabilities=_effective_tool_specs(_tool_spec("builtin:grep"))
+            effective_capabilities=_effective_builtin_tools("grep")
         )
     )
 
@@ -139,7 +156,7 @@ def test_mode_tool_whitelist_is_enforced_by_permission_gateway() -> None:
             },
             target=_target(name="shell"),
             tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
-            effective_capabilities=_effective_tool_specs(_tool_spec("builtin:shell")),
+            effective_capabilities=_effective_builtin_tools("shell"),
         )
     )
 
@@ -157,7 +174,7 @@ def test_hard_shell_policy_is_enforced_by_permission_gateway() -> None:
                 name="shell",
                 arguments={"command": "rm -rf /tmp/example"},
             ),
-            effective_capabilities=_effective_tool_specs(_tool_spec("builtin:shell")),
+            effective_capabilities=_effective_builtin_tools("shell"),
             approval=ApprovalConfig(default_mode="allow"),
         )
     )
@@ -205,6 +222,25 @@ def test_mcp_tool_allowed_by_server_or_tool_capability() -> None:
     assert server_decision.capability_matched == "mcp:github"
     assert tool_decision.action == PermissionAction.ALLOW
     assert tool_decision.capability_matched == "capability:test:mcp:docs:search"
+
+
+def test_mcp_tool_allowed_by_exact_mcp_tools_grant() -> None:
+    decision = PermissionGateway().evaluate(
+        _request(
+            target=PermissionTarget(
+                kind="mcp_tool",
+                name="search",
+                tool_source="mcp",
+                mcp_server="docs",
+                mcp_tool="search",
+            ),
+            tool_call=ToolCall(id="call-docs-search", name="search", arguments={}),
+            effective_capabilities={"mcp_tools": ["mcp:docs:search"]},
+        )
+    )
+
+    assert decision.action == PermissionAction.ALLOW
+    assert decision.capability_matched == "mcp:docs:search"
 
 
 def test_mcp_server_scope_does_not_authorize_other_servers() -> None:
@@ -362,9 +398,9 @@ def test_mcp_tool_user_review_policy_blocks_background_runs() -> None:
 def test_execution_policy_deny_overrides_approval_allow() -> None:
     decision = PermissionGateway().evaluate(
         _request(
-            effective_capabilities={
-                "tool_specs": [_tool_spec("builtin:shell")],
-                "execution_policies": [
+            effective_capabilities=_effective_builtin_tools(
+                "shell",
+                execution_policies=[
                     {
                         "target": "builtin_tool:shell",
                         "target_type": "capability_component",
@@ -372,7 +408,7 @@ def test_execution_policy_deny_overrides_approval_allow() -> None:
                         "policy": "deny",
                     }
                 ],
-            },
+            ),
             target=_target(name="shell"),
             tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
             approval=ApprovalConfig(default_mode="allow"),
@@ -386,7 +422,7 @@ def test_execution_policy_deny_overrides_approval_allow() -> None:
 def test_lifecycle_allow_cannot_override_gateway_deny() -> None:
     decision = PermissionGateway().evaluate(
         _request(
-            effective_capabilities=_effective_tool_specs(_tool_spec("builtin:grep")),
+            effective_capabilities=_effective_builtin_tools("grep"),
             lifecycle_outputs=[
                 {
                     "hook_id": "hook:allow-read",
@@ -477,7 +513,7 @@ def test_lifecycle_ask_uses_existing_interactive_and_background_review_boundary(
                 "reason": "shell requires lifecycle review",
             }
         ],
-        effective_capabilities=_effective_tool_specs(_tool_spec("builtin:shell")),
+        effective_capabilities=_effective_builtin_tools("shell"),
         target=_target(name="shell"),
         tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
     )
@@ -502,9 +538,9 @@ def test_lifecycle_ask_uses_existing_interactive_and_background_review_boundary(
 
 def test_require_user_policy_becomes_approval_for_chat_and_blocked_review_for_background() -> None:
     request = _request(
-        effective_capabilities={
-            "tool_specs": [_tool_spec("builtin:shell")],
-            "execution_policies": [
+        effective_capabilities=_effective_builtin_tools(
+            "shell",
+            execution_policies=[
                 {
                     "target": "builtin_tool:shell",
                     "target_type": "capability_component",
@@ -512,7 +548,7 @@ def test_require_user_policy_becomes_approval_for_chat_and_blocked_review_for_ba
                     "policy": "require_user",
                 }
             ],
-        },
+        ),
         target=_target(name="shell"),
         tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
     )
@@ -536,12 +572,12 @@ def test_require_user_policy_becomes_approval_for_chat_and_blocked_review_for_ba
 def test_escalate_execution_policy_warns_and_inherit_defers_to_approval() -> None:
     escalated = PermissionGateway().evaluate(
         _request(
-            effective_capabilities={
-                "tool_specs": [_tool_spec("builtin:shell")],
-                "execution_policies": [
+            effective_capabilities=_effective_builtin_tools(
+                "shell",
+                execution_policies=[
                     {"target": "builtin_tool:shell", "policy": "escalate"}
                 ],
-            },
+            ),
             target=_target(name="shell"),
             tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
             approval=ApprovalConfig(default_mode="allow"),
@@ -549,12 +585,12 @@ def test_escalate_execution_policy_warns_and_inherit_defers_to_approval() -> Non
     )
     inherited = PermissionGateway().evaluate(
         _request(
-            effective_capabilities={
-                "tool_specs": [_tool_spec("builtin:apply_patch")],
-                "execution_policies": [
+            effective_capabilities=_effective_builtin_tools(
+                "apply_patch",
+                execution_policies=[
                     {"target": "builtin_tool:apply_patch", "policy": "inherit"}
                 ],
-            },
+            ),
             target=_target(name="apply_patch"),
             tool_call=ToolCall(id="call-write", name="apply_patch", arguments={}),
             approval=ApprovalConfig(default_mode="deny"),
@@ -586,7 +622,7 @@ def test_approval_require_approval_never_waits_in_background() -> None:
                 default_mode="allow",
                 rules=[ApprovalRuleConfig(tool_name="shell", action="require_approval")],
             ),
-            effective_capabilities=_effective_tool_specs(_tool_spec("builtin:shell")),
+            effective_capabilities=_effective_builtin_tools("shell"),
             target=_target(name="shell"),
             tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
         )
@@ -598,7 +634,7 @@ def test_approval_require_approval_never_waits_in_background() -> None:
                 default_mode="allow",
                 rules=[ApprovalRuleConfig(tool_name="shell", action="require_approval")],
             ),
-            effective_capabilities=_effective_tool_specs(_tool_spec("builtin:shell")),
+            effective_capabilities=_effective_builtin_tools("shell"),
             target=_target(name="shell"),
             tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
         )

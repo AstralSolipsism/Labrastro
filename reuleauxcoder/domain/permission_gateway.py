@@ -363,17 +363,21 @@ class PermissionGateway:
         effective = request.effective_capabilities or {}
         target = request.target
         candidates = _target_candidates(target)
-        tool_spec_match = _tool_spec_match(effective.get("tool_specs"), target, candidates)
-        if tool_spec_match:
-            return tool_spec_match
         if target.tool_source in {"builtin", "builtin_tool"} or target.kind in {
             "builtin",
             "builtin_tool",
             "tool",
         }:
-            return ""
+            return _builtin_tool_grant_match(effective, target, candidates)
+
+        tool_spec_match = _tool_spec_match(effective.get("tool_specs"), target, candidates)
+        if tool_spec_match:
+            return tool_spec_match
 
         if target.tool_source == "mcp" or target.kind in {"mcp", "mcp_tool"}:
+            mcp_tool_match = _mcp_tool_grant_match(effective, target)
+            if mcp_tool_match:
+                return mcp_tool_match
             server = str(target.mcp_server or "").strip()
             if server and server in _string_set(effective.get("mcp_servers")):
                 return f"mcp:{server}"
@@ -697,10 +701,36 @@ def _tool_spec_match(
                 return tool_id or target_ref or name
             continue
         possible = {tool_id, target_ref, name}
-        if source_type == "builtin_tool" and name:
-            possible.update({f"builtin:{name}", f"builtin_tool:{name}"})
         if candidates.intersection({item for item in possible if item}):
             return tool_id or target_ref or name
+    return ""
+
+
+def _builtin_tool_grant_match(
+    effective: dict[str, Any],
+    target: PermissionTarget,
+    candidates: set[str],
+) -> str:
+    name = str(target.name or "").strip()
+    if not name:
+        return ""
+    for grant in _string_set(effective.get("builtin_tool_grants")):
+        possible = {grant}
+        if ":" not in grant:
+            possible.update({f"builtin:{grant}", f"builtin_tool:{grant}"})
+        if candidates.intersection(possible):
+            return f"builtin_tool:{name}"
+    return ""
+
+
+def _mcp_tool_grant_match(
+    effective: dict[str, Any],
+    target: PermissionTarget,
+) -> str:
+    candidates = _mcp_target_candidates(target)
+    for grant in _string_set(effective.get("mcp_tools")):
+        if len(grant.split(":")) >= 3 and grant in candidates:
+            return grant
     return ""
 
 

@@ -18,6 +18,9 @@ from reuleauxcoder.extensions.tools.spec import (
 )
 
 
+_STALE_BUILTIN_SOURCE_TYPE = "builtin_" + "tool"
+
+
 class _CatalogTool:
     parameters = {"type": "object", "properties": {}}
 
@@ -67,7 +70,10 @@ def _capability_tool_spec(
     name: str,
     tool_id: str,
     target_tool_ref: str = "",
+    source_type: str = "mcp_tool",
+    component_id: str = "",
 ) -> dict:
+    target_ref = target_tool_ref or tool_id
     return {
         "tool_id": tool_id,
         "name": name,
@@ -92,12 +98,14 @@ def _capability_tool_spec(
             "supports_parallel": False,
         },
         "provider_surface": "function",
-        "source_type": "builtin_tool",
-        "target_tool_ref": target_tool_ref or f"builtin:{name}",
+        "source_type": source_type,
+        "target_tool_ref": target_ref,
         "metadata": {
             "tool_id": tool_id,
             "package_id": "docs",
-            "component_id": f"builtin_tool:{name}",
+            "component_id": component_id or target_ref,
+            "source_type": source_type,
+            "target_tool_ref": target_ref,
         },
     }
 
@@ -155,31 +163,52 @@ def test_tool_executor_executes_direct_tool_through_catalog_route() -> None:
 
 
 def test_agent_catalog_includes_resolved_capability_tool_specs_as_deferred_routes() -> None:
-    direct = _CatalogTool("fetch_capabilities", ToolExposure.DIRECT)
-    agent = _agent_with_tools([direct])
+    agent = _agent_with_tools([])
     agent.resolved_capabilities = {
         "tool_specs": [
             _capability_tool_spec(
-                name="fetch_capabilities",
-                tool_id="capability:docs:builtin_tool:fetch_capabilities",
-                target_tool_ref="builtin:fetch_capabilities",
+                name="docs_search",
+                tool_id="capability:docs:mcp:docs:search",
+                target_tool_ref="mcp:docs:search",
             )
         ]
     }
 
     plan = agent.tool_exposure_plan()
 
-    assert [entry.name for entry in plan.direct] == ["fetch_capabilities"]
+    assert [entry.name for entry in plan.direct] == []
     assert [entry.tool_id for entry in plan.deferred] == [
-        "capability:docs:builtin_tool:fetch_capabilities"
+        "capability:docs:mcp:docs:search"
     ]
-    assert agent.get_model_callable_tool("fetch_capabilities") is direct
-    assert agent.get_tool("fetch_capabilities") is direct
     deferred_tool = agent.tool_route_plan().get_executor_by_id(
-        "capability:docs:builtin_tool:fetch_capabilities"
+        "capability:docs:mcp:docs:search"
     )
     assert deferred_tool is not None
     assert deferred_tool.tool_spec().exposure == ToolExposure.DEFERRED
+
+
+def test_agent_catalog_ignores_stale_builtin_capability_tool_specs() -> None:
+    direct = _CatalogTool("fetch_capabilities", ToolExposure.DIRECT)
+    agent = _agent_with_tools([direct])
+    stale_tool_id = f"capability:docs:{_STALE_BUILTIN_SOURCE_TYPE}:fetch_capabilities"
+    agent.resolved_capabilities = {
+        "tool_specs": [
+            _capability_tool_spec(
+                name="fetch_capabilities",
+                tool_id=stale_tool_id,
+                target_tool_ref="builtin:fetch_capabilities",
+                source_type=_STALE_BUILTIN_SOURCE_TYPE,
+                component_id=f"{_STALE_BUILTIN_SOURCE_TYPE}:fetch_capabilities",
+            )
+        ]
+    }
+
+    plan = agent.tool_route_plan()
+
+    assert [entry.name for entry in agent.tool_exposure_plan().direct] == [
+        "fetch_capabilities"
+    ]
+    assert plan.get_executor_by_id(stale_tool_id) is None
 
 
 def test_agent_catalog_routes_duplicate_deferred_names_only_by_tool_id() -> None:
@@ -209,18 +238,19 @@ def test_agent_catalog_routes_duplicate_deferred_names_only_by_tool_id() -> None
 def test_agent_catalog_does_not_use_effective_capabilities_as_tool_directory() -> None:
     direct = _CatalogTool("fetch_capabilities", ToolExposure.DIRECT)
     agent = _agent_with_tools([direct])
+    stale_tool_id = f"capability:docs:{_STALE_BUILTIN_SOURCE_TYPE}:fetch_capabilities"
     agent.effective_capabilities = {
         "tool_specs": [
             _capability_tool_spec(
                 name="fetch_capabilities",
-                tool_id="capability:docs:builtin_tool:fetch_capabilities",
+                tool_id=stale_tool_id,
                 target_tool_ref="builtin:fetch_capabilities",
+                source_type=_STALE_BUILTIN_SOURCE_TYPE,
+                component_id=f"{_STALE_BUILTIN_SOURCE_TYPE}:fetch_capabilities",
             )
         ]
     }
 
     plan = agent.tool_route_plan()
 
-    assert plan.get_executor_by_id(
-        "capability:docs:builtin_tool:fetch_capabilities"
-    ) is None
+    assert plan.get_executor_by_id(stale_tool_id) is None

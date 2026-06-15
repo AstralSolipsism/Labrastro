@@ -188,6 +188,23 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
                 "registry_path": "builtin:fetch_capabilities",
             },
         ),
+        "mcp:docs:search": models.CapabilityComponentConfig.from_dict(
+            "mcp:docs:search",
+            {
+                "kind": "mcp_tool",
+                "name": "search",
+                "description": "Search documentation.",
+                "registry_path": "mcp:docs:search",
+                "execution_policy": "allow",
+                "config": {
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    }
+                },
+            },
+        ),
     }
     packages = {
         "repo": models.CapabilityPackageConfig.from_dict(
@@ -207,7 +224,7 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
         "docs": models.CapabilityPackageConfig.from_dict(
             "docs",
             {
-                "components": ["builtin_tool:fetch_capabilities"],
+                "components": ["builtin_tool:fetch_capabilities", "mcp:docs:search"],
                 "effective_capabilities": [
                     "Fetch documentation evidence for capability package drafts."
                 ],
@@ -226,31 +243,35 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert resolved["environment_requirements"][0]["kind"] == "executable"
     assert "tools" not in resolved
     assert [item["tool_id"] for item in resolved["tool_specs"]] == [
-        "capability:docs:builtin_tool:fetch_capabilities",
+        "capability:docs:mcp:docs:search",
     ]
+    assert resolved["builtin_tool_grants"] == ["fetch_capabilities"]
+    assert resolved["mcp_tools"] == ["mcp:docs:search"]
     assert resolved["effective_capabilities"]["tool_specs"] == resolved["tool_specs"]
     assert resolved["capability_overlay"]["tool_specs"] == resolved["tool_specs"]
     assert all(item.get("source_type") != "mcp_server" for item in resolved["tool_specs"])
     assert all(item.get("target_tool_ref") != "mcp:github" for item in resolved["tool_specs"])
-    fetch_tool_spec = resolved["tool_specs"][0]
-    assert fetch_tool_spec["name"] == "fetch_capabilities"
-    assert fetch_tool_spec["namespace"] == "capability"
-    assert fetch_tool_spec["source_type"] == "builtin_tool"
-    assert fetch_tool_spec["target_tool_ref"] == "builtin:fetch_capabilities"
-    assert fetch_tool_spec["permission"]["policy"] == "allow"
-    assert fetch_tool_spec["metadata"]["component_id"] == "builtin_tool:fetch_capabilities"
+    docs_search_spec = resolved["tool_specs"][0]
+    assert docs_search_spec["name"] == "search"
+    assert docs_search_spec["namespace"] == "capability"
+    assert docs_search_spec["source_type"] == "mcp_tool"
+    assert docs_search_spec["target_tool_ref"] == "mcp:docs:search"
+    assert docs_search_spec["permission"]["policy"] == "allow"
+    assert docs_search_spec["metadata"]["component_id"] == "mcp:docs:search"
     assert resolved["credentials"] == ["DOCS_TOKEN"]
     assert [component["id"] for component in resolved["components"]] == [
         "mcp:github",
         "skill:code-review",
         "envreq:executable:gitnexus",
         "builtin_tool:fetch_capabilities",
+        "mcp:docs:search",
     ]
     assert resolved["capability_overlay"]["component_ids"] == [
         "mcp:github",
         "skill:code-review",
         "envreq:executable:gitnexus",
         "builtin_tool:fetch_capabilities",
+        "mcp:docs:search",
     ]
     assert resolved["capability_overlay"]["skill_roots"] == ["/skills/code-review"]
     assert resolved["capability_overlay"]["env"] == {"GITNEXUS_HOME": ".gitnexus"}

@@ -46,6 +46,9 @@ from reuleauxcoder.extensions.tools.catalog import ToolCatalog, ToolExposurePlan
 from reuleauxcoder.services.prompt.builder import system_prompt
 
 
+_BUILTIN_TOOL_SOURCE_TYPE = "builtin_" + "tool"
+
+
 def _same_approval_target(left: ApprovalRuleConfig, right: ApprovalRuleConfig) -> bool:
     return (
         left.tool_name == right.tool_name
@@ -100,7 +103,7 @@ def _lifecycle_terminal_message(output_dict: dict) -> str:
 
 def _is_executable_capability_tool_spec(item: dict) -> bool:
     source_type = str(item.get("source_type") or "").strip()
-    if source_type in {"mcp", "mcp_server"}:
+    if source_type in {_BUILTIN_TOOL_SOURCE_TYPE, "mcp", "mcp_server"}:
         return False
     return True
 

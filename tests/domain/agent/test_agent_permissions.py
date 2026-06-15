@@ -54,21 +54,19 @@ class _RecordingPermissionDispatcher:
         return []
 
 
-def _tool_spec(target_tool_ref: str, *, policy: str = "inherit") -> dict:
-    name = target_tool_ref.split(":", 1)[-1]
+def _builtin_tool_name(target_ref: str) -> str:
+    return target_ref.split(":", 1)[-1]
+
+
+def _effective_builtin_tools(
+    *target_refs: str,
+    execution_policies: list[dict] | None = None,
+) -> dict:
     return {
-        "tool_id": f"capability:test:builtin_tool:{name}",
-        "name": name,
-        "namespace": "capability",
-        "target_tool_ref": target_tool_ref,
-        "source_type": "builtin_tool",
-        "exposure": "deferred",
-        "permission": {"policy": policy},
+        "builtin_tool_grants": [_builtin_tool_name(ref) for ref in target_refs],
+        "tool_specs": [],
+        "execution_policies": list(execution_policies or []),
     }
-
-
-def _effective_tool_specs(*target_refs: str) -> dict:
-    return {"tool_specs": [_tool_spec(target_ref) for target_ref in target_refs]}
 
 
 def test_agent_tool_visibility_uses_permission_gateway_for_mode_and_capabilities() -> None:
@@ -97,7 +95,7 @@ def test_agent_tool_visibility_uses_permission_gateway_for_mode_and_capabilities
     setattr(
         agent,
         "effective_capabilities",
-        _effective_tool_specs("builtin:read_file", "builtin:shell"),
+        _effective_builtin_tools("builtin:read_file", "builtin:shell"),
     )
     setattr(agent, "enforce_effective_capabilities", True)
 
@@ -225,7 +223,7 @@ def test_agent_dispatches_permission_request_lifecycle_for_candidate_tool_call()
     )
     setattr(agent, "permission_trigger_source", "chat")
     setattr(agent, "current_session_id", "session-1")
-    setattr(agent, "effective_capabilities", _effective_tool_specs("builtin:shell"))
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:shell"))
     setattr(agent, "enforce_effective_capabilities", True)
 
     decision = agent.evaluate_tool_permission(
@@ -318,7 +316,7 @@ def test_agent_dispatches_permission_denied_lifecycle_after_static_denial() -> N
     setattr(agent, "current_session_id", "session-1")
     setattr(agent, "runtime_agent_run_id", "agent-run-1")
     setattr(agent, "runtime_turn_id", "turn-1")
-    setattr(agent, "effective_capabilities", _effective_tool_specs("builtin:read_file"))
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:read_file"))
     setattr(agent, "enforce_effective_capabilities", True)
 
     decision = agent.evaluate_tool_permission(
@@ -360,7 +358,7 @@ def test_agent_does_not_dispatch_permission_request_for_effective_capability_bou
         lifecycle_dispatcher=dispatcher,
     )
     setattr(agent, "permission_trigger_source", "chat")
-    setattr(agent, "effective_capabilities", _effective_tool_specs("builtin:read_file"))
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:read_file"))
     setattr(agent, "enforce_effective_capabilities", True)
 
     decision = agent.evaluate_tool_permission(
@@ -389,12 +387,12 @@ def test_agent_does_not_dispatch_permission_request_for_execution_policy_deny() 
     setattr(
         agent,
         "effective_capabilities",
-        {
-            "tool_specs": [_tool_spec("builtin:shell")],
-            "execution_policies": [
+        _effective_builtin_tools(
+            "builtin:shell",
+            execution_policies=[
                 {"target": "builtin_tool:shell", "policy": "deny"},
             ],
-        },
+        ),
     )
     setattr(agent, "enforce_effective_capabilities", True)
 
@@ -425,12 +423,12 @@ def test_agent_dispatches_permission_request_for_background_review_candidate() -
     setattr(
         agent,
         "effective_capabilities",
-        {
-            "tool_specs": [_tool_spec("builtin:shell")],
-            "execution_policies": [
+        _effective_builtin_tools(
+            "builtin:shell",
+            execution_policies=[
                 {"target": "builtin_tool:shell", "policy": "require_user"},
             ],
-        },
+        ),
     )
     setattr(agent, "enforce_effective_capabilities", True)
 
@@ -503,7 +501,7 @@ def test_permission_request_lifecycle_exposes_standard_tool_matcher_fields() -> 
     setattr(agent, "current_session_id", "session-1")
     setattr(agent, "runtime_agent_run_id", "agent-run-1")
     setattr(agent, "runtime_turn_id", "turn-1")
-    setattr(agent, "effective_capabilities", _effective_tool_specs("builtin:shell"))
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:shell"))
     setattr(agent, "enforce_effective_capabilities", True)
 
     decision = agent.evaluate_tool_permission(
@@ -538,7 +536,7 @@ def test_permission_request_lifecycle_context_populates_authoritative_fields() -
     setattr(agent, "runtime_agent_run_id", "agent-run-1")
     setattr(agent, "runtime_turn_id", "turn-1")
     setattr(agent, "locale", "zh-CN")
-    setattr(agent, "effective_capabilities", _effective_tool_specs("builtin:shell"))
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:shell"))
     setattr(agent, "enforce_effective_capabilities", True)
 
     decision = agent.evaluate_tool_permission(
@@ -579,7 +577,7 @@ def test_agent_fails_closed_when_permission_request_lifecycle_dispatch_fails() -
         lifecycle_dispatcher=_FailingLifecycleDispatcher(),
     )
     setattr(agent, "permission_trigger_source", "chat")
-    setattr(agent, "effective_capabilities", _effective_tool_specs("builtin:shell"))
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:shell"))
     setattr(agent, "enforce_effective_capabilities", True)
 
     decision = agent.evaluate_tool_permission(

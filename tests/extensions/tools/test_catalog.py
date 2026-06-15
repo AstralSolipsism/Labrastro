@@ -138,26 +138,21 @@ def test_tool_catalog_allows_duplicate_non_direct_names_by_tool_id() -> None:
 
 
 def test_tool_catalog_allows_deferred_capability_to_share_direct_tool_name_by_id() -> None:
-    direct = _SpecTool("fetch_capabilities", ToolExposure.DIRECT, namespace="builtin")
+    direct = _SpecTool("lookup", ToolExposure.DIRECT, namespace="builtin")
     deferred = _SpecTool(
-        "fetch_capabilities",
+        "lookup",
         ToolExposure.DEFERRED,
         namespace="capability",
-        tool_id="capability:docs:builtin_tool:fetch_capabilities",
+        tool_id="capability:docs:lookup",
     )
 
     plan = ToolCatalog.from_tools([deferred, direct]).exposure_plan()
 
-    assert [entry.name for entry in plan.direct] == ["fetch_capabilities"]
-    assert [entry.tool_id for entry in plan.deferred] == [
-        "capability:docs:builtin_tool:fetch_capabilities"
-    ]
-    assert plan.get_model_callable_tool("fetch_capabilities") is direct
-    assert plan.get_executor("fetch_capabilities") is direct
-    assert (
-        plan.get_executor_by_id("capability:docs:builtin_tool:fetch_capabilities")
-        is deferred
-    )
+    assert [entry.name for entry in plan.direct] == ["lookup"]
+    assert [entry.tool_id for entry in plan.deferred] == ["capability:docs:lookup"]
+    assert plan.get_model_callable_tool("lookup") is direct
+    assert plan.get_executor("lookup") is direct
+    assert plan.get_executor_by_id("capability:docs:lookup") is deferred
 
 
 def test_registry_builds_builtin_catalog_and_exposure_plan() -> None:

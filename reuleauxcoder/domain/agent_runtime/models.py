@@ -797,15 +797,6 @@ def resolve_capability_refs(
                     overlay_skill_roots.append(path_hint)
             elif component.kind == "builtin_tool":
                 builtin_tool_grants.append(component.name)
-                target_tool_ref = component.registry_path or f"builtin:{component.name}"
-                tool_specs.append(
-                    _capability_tool_spec(
-                        package=package,
-                        component=component,
-                        source_type="builtin_tool",
-                        target_tool_ref=target_tool_ref,
-                    )
-                )
             elif component.kind == "credential":
                 credentials.append(component.name)
             elif component.kind == "prompt_fragment":
