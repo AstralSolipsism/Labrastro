@@ -99,6 +99,12 @@ def test_agent_event_mutation_preview_candidate_events_are_stable() -> None:
         item_id="file-change:call-1",
         tool_call_id="call-1",
         index=0,
+        tool_metadata={
+            "tool_id": "builtin:apply_patch",
+            "risk": "workspace_write",
+            "exposure": "direct",
+            "capability_name": "workspace",
+        },
     )
     ready = AgentEvent.mutation_preview_ready(
         "apply_patch",
@@ -106,6 +112,12 @@ def test_agent_event_mutation_preview_candidate_events_are_stable() -> None:
         tool_call_id="call-1",
         changes=[{"path": "src/app.py", "kind": "update"}],
         index=0,
+        tool_metadata={
+            "tool_id": "builtin:apply_patch",
+            "risk": "workspace_write",
+            "exposure": "direct",
+            "capability_name": "workspace",
+        },
     )
     failed = AgentEvent.mutation_preview_failed(
         "apply_patch",
@@ -113,6 +125,12 @@ def test_agent_event_mutation_preview_candidate_events_are_stable() -> None:
         tool_call_id="call-1",
         error="patch context does not match file",
         index=0,
+        tool_metadata={
+            "tool_id": "builtin:apply_patch",
+            "risk": "workspace_write",
+            "exposure": "direct",
+            "capability_name": "workspace",
+        },
     )
 
     assert previewing.event_type is AgentEventType.MUTATION_PREVIEWING
@@ -122,12 +140,21 @@ def test_agent_event_mutation_preview_candidate_events_are_stable() -> None:
         "item_id": "file-change:call-1",
         "index": 0,
         "status": "previewing",
+        "tool_id": "builtin:apply_patch",
+        "risk": "workspace_write",
+        "exposure": "direct",
+        "capability_name": "workspace",
     }
     assert ready.event_type is AgentEventType.MUTATION_PREVIEW_READY
     assert ready.data["changes"] == [{"path": "src/app.py", "kind": "update"}]
     assert ready.data["status"] == "ready"
+    assert ready.data["tool_id"] == "builtin:apply_patch"
+    assert ready.data["risk"] == "workspace_write"
+    assert ready.data["exposure"] == "direct"
+    assert ready.data["capability_name"] == "workspace"
     assert failed.event_type is AgentEventType.MUTATION_PREVIEW_FAILED
     assert failed.data["status"] == "failed"
+    assert failed.data["tool_id"] == "builtin:apply_patch"
     assert failed.data["error"] == "patch context does not match file"
 
 

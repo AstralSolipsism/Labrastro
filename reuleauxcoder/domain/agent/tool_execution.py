@@ -718,6 +718,7 @@ class ToolExecutor:
                 item_id=item_id,
                 tool_call_id=tc.id,
                 index=index,
+                tool_metadata=self._tool_event_metadata(tool),
             )
         )
         result = self._preview_apply_patch_result(tc)
@@ -746,6 +747,7 @@ class ToolExecutor:
                     failure_code=outcome.failure_code,
                     retry_hint=outcome.retry_hint,
                     index=index,
+                    tool_metadata=self._tool_event_metadata(tool),
                 )
             )
             return outcome
@@ -785,6 +787,7 @@ class ToolExecutor:
                     failure_code=outcome.failure_code,
                     retry_hint=outcome.retry_hint,
                     index=index,
+                    tool_metadata=self._tool_event_metadata(tool),
                 )
             )
             return outcome
@@ -807,6 +810,7 @@ class ToolExecutor:
                 tool_call_id=tc.id,
                 changes=changes,
                 index=index,
+                tool_metadata=self._tool_event_metadata(tool),
             )
         )
         return outcome

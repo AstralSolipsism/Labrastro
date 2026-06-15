@@ -260,6 +260,7 @@ class AgentEvent:
         item_id: str,
         tool_call_id: str | None = None,
         index: int | None = None,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         payload = {
             "tool_name": tool_name,
@@ -267,6 +268,7 @@ class AgentEvent:
             "item_id": item_id,
             **({"index": index} if index is not None else {}),
             "status": "previewing",
+            **(dict(tool_metadata) if tool_metadata else {}),
         }
         return cls(
             event_type=AgentEventType.MUTATION_PREVIEWING,
@@ -284,6 +286,7 @@ class AgentEvent:
         tool_call_id: str | None = None,
         changes: list[dict[str, Any]] | None = None,
         index: int | None = None,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         payload = {
             "tool_name": tool_name,
@@ -292,6 +295,7 @@ class AgentEvent:
             "changes": list(changes or []),
             **({"index": index} if index is not None else {}),
             "status": "ready",
+            **(dict(tool_metadata) if tool_metadata else {}),
         }
         return cls(
             event_type=AgentEventType.MUTATION_PREVIEW_READY,
@@ -311,6 +315,7 @@ class AgentEvent:
         failure_code: str | None = None,
         retry_hint: str | None = None,
         index: int | None = None,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> "AgentEvent":
         payload = {
             "tool_name": tool_name,
@@ -321,6 +326,7 @@ class AgentEvent:
             "error": error,
             **({"failure_code": failure_code} if failure_code else {}),
             **({"retry_hint": retry_hint} if retry_hint else {}),
+            **(dict(tool_metadata) if tool_metadata else {}),
         }
         return cls(
             event_type=AgentEventType.MUTATION_PREVIEW_FAILED,
