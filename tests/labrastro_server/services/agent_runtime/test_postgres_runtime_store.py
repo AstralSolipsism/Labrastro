@@ -4,6 +4,8 @@ import json
 import os
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from labrastro_server.infrastructure.persistence.db import create_postgres_engine
 from labrastro_server.infrastructure.persistence.migration import run_migrations
@@ -21,6 +23,8 @@ from labrastro_server.services.agent_runtime.session_projection import (
 )
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentCallGrant,
+    AgentRunFeedbackKind,
+    AgentRunFeedbackSource,
     AgentRunRelation,
     AgentRunRelationType,
     AgentRunStatus,
@@ -58,7 +62,6 @@ def _reset_agent_run_tables() -> None:
     database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
     run_migrations(database_url)
     engine = create_postgres_engine(database_url)
-    from sqlalchemy import text
 
     with engine.begin() as conn:
         conn.execute(
@@ -488,6 +491,116 @@ def test_postgres_runtime_store_host_restart_fails_running_task() -> None:
         event.type == "host_recovered_task_failed"
         for event in reloaded.list_events(task.id, after_seq=0)
     )
+
+
+def test_postgres_runtime_store_host_restart_preserves_waiting_task() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="waiting restart smoke",
+        )
+    )
+    control.append_agent_run_feedback(
+        task.id,
+        source=AgentRunFeedbackSource.SYSTEM,
+        kind=AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED,
+        payload={"error": "needs another activation"},
+        requires_activation=True,
+    )
+
+    waiting = control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="draft"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+
+    assert waiting.status == AgentRunStatus.WAITING
+    reloaded = _control()
+    task_detail = reloaded.agent_run_to_dict(task.id)
+    assert task_detail["status"] == "waiting"
+    assert task_detail["failure_reason"] is None
+    assert not [
+        event
+        for event in reloaded.list_events(task.id, after_seq=0)
+        if event.type == "host_recovered_task_failed"
+    ]
+
+
+def test_postgres_claimed_completion_keeps_active_claim_locked_until_completion_write() -> None:
+    database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="claimed completion lock smoke",
+        )
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="pg-worker",
+        executors=["fake"],
+        peer_features=["agent_runs.daemon_worktree"],
+    )
+    assert claim is not None
+    assert control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="pg-worker",
+    )["ok"]
+    assert control._store is not None
+
+    competing_engine = create_postgres_engine(database_url)
+    original_upsert_activation = control._store._upsert_activation_with_conn
+    lock_checked = False
+
+    def upsert_activation_with_lock_probe(conn, activation):
+        nonlocal lock_checked
+        if not lock_checked and activation.id == claim.activation_id:
+            with competing_engine.begin() as probe_conn:
+                probe_conn.execute(text("SET LOCAL lock_timeout = '100ms'"))
+                with pytest.raises(OperationalError) as exc_info:
+                    probe_conn.execute(
+                        text(
+                            """
+                            UPDATE labrastro_agent_run_activation_claims
+                            SET metadata = metadata || CAST(:metadata AS JSONB)
+                            WHERE request_id=:request_id
+                            """
+                        ),
+                        {
+                            "request_id": claim.request_id,
+                            "metadata": json.dumps({"lock_probe": True}),
+                        },
+                    )
+                sqlstate = getattr(exc_info.value.orig, "sqlstate", None) or getattr(
+                    exc_info.value.orig,
+                    "pgcode",
+                    None,
+                )
+                assert sqlstate == "55P03" or "lock timeout" in str(
+                    exc_info.value
+                ).lower()
+            lock_checked = True
+        return original_upsert_activation(conn, activation)
+
+    control._store._upsert_activation_with_conn = upsert_activation_with_lock_probe
+    try:
+        ok, reason, completed = control.complete_claimed_agent_run_activation(
+            task.id,
+            ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+            request_id=claim.request_id,
+            activation_id=claim.activation_id,
+            worker_id="pg-worker",
+        )
+    finally:
+        control._store._upsert_activation_with_conn = original_upsert_activation
+        competing_engine.dispose()
+
+    assert (ok, reason) == (True, "")
+    assert completed is not None
+    assert completed.status == AgentRunStatus.COMPLETED
+    assert lock_checked
 
 
 def test_postgres_runtime_store_terminal_reasons_round_trip() -> None:

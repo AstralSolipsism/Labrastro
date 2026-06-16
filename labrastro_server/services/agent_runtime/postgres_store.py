@@ -1515,7 +1515,7 @@ class PostgresAgentRunStore:
                 text(
                     """
                     SELECT id FROM labrastro_agent_runs
-                    WHERE status IN ('dispatched', 'running', 'waiting')
+                    WHERE status IN ('dispatched', 'running')
                     FOR UPDATE
                     """
                 )
@@ -1806,7 +1806,7 @@ class PostgresAgentRunStore:
         artifacts: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, str, AgentRun | None]:
         with self.engine.begin() as conn:
-            row = self._active_claim(conn, request_id)
+            row = self._active_claim(conn, request_id, for_update=True)
             if row is None:
                 return False, "claim_not_found", None
             ok, reason = self._claim_owner_ok(
@@ -1818,12 +1818,14 @@ class PostgresAgentRunStore:
             )
             if not ok:
                 return False, reason, None
-        return True, "", self.complete_agent_run_activation(
-            task_id,
-            result,
-            activation_id=activation_id,
-            artifacts=artifacts,
-        )
+            completed = self._complete_agent_run_activation_with_conn(
+                conn,
+                task_id,
+                result,
+                activation_id=activation_id,
+                artifacts=artifacts,
+            )
+        return True, "", completed
 
     def complete_agent_run_activation(
         self,
@@ -1833,222 +1835,239 @@ class PostgresAgentRunStore:
         activation_id: str,
         artifacts: list[dict[str, Any]] | None = None,
     ) -> AgentRun:
-        completion_activation_id = str(activation_id or "").strip()
         with self.engine.begin() as conn:
-            task = self._task_from_row(self._task_row(conn, task_id))
-            completion_activation = self._validate_completion_activation_with_conn(
+            return self._complete_agent_run_activation_with_conn(
                 conn,
-                task,
-                completion_activation_id,
-            )
-            expanded_events = [
-                (event, expand_environment_executor_event(task.metadata, event))
-                for event in result.events
-            ]
-            policy_error = str(
-                task.metadata.get("environment_policy_violation") or ""
-            ).strip()
-            for _, expansion in expanded_events:
-                if expansion.policy_error and not policy_error:
-                    policy_error = expansion.policy_error
-            if result.succeeded and not policy_error:
-                required_feedback_kind = conn.execute(
-                    text(
-                        """
-                        SELECT kind
-                        FROM labrastro_agent_run_feedback
-                        WHERE agent_run_id=:task_id
-                          AND requires_activation IS TRUE
-                          AND consumed_by_activation_id IS NULL
-                        ORDER BY created_at ASC, id ASC
-                        LIMIT 1
-                        """
-                    ),
-                    {"task_id": task_id},
-                ).scalar()
-                if task.status == AgentRunStatus.WAITING or required_feedback_kind:
-                    status = "waiting"
-                    issue_status = str(getattr(task, "issue_status", "") or "open")
-                    output = ""
-                    waiting_reason = (
-                        task.waiting_reason
-                        or _waiting_reason_for_required_feedback_kind(
-                            str(required_feedback_kind or "")
-                        )
-                    )
-                    resume_policy = (
-                        task.resume_policy
-                        or (
-                            AgentRunResumePolicy.EXTERNAL_EVENT
-                            if waiting_reason
-                            in {
-                                AgentRunWaitingReason.AGENT_CALL,
-                                AgentRunWaitingReason.SERVER_PROCESSING,
-                            }
-                            else AgentRunResumePolicy.USER_ACTION
-                        )
-                    )
-                else:
-                    status = "completed"
-                    issue_status = (
-                        "in_review" if self._has_open_pr(conn, task_id) else "done"
-                    )
-                    output = result.output
-                    waiting_reason = None
-                    resume_policy = None
-                failure_reason = None
-                cancel_reason = None
-            elif policy_error:
-                status = "blocked"
-                issue_status = "blocked"
-                output = policy_error
-                waiting_reason = None
-                resume_policy = None
-                failure_reason = policy_error
-                cancel_reason = None
-            elif result.status == "cancelled":
-                status = "cancelled"
-                issue_status = "blocked"
-                waiting_reason = None
-                resume_policy = None
-                cancel_reason = (
-                    result.output
-                    or self._cancel_reason(conn, task_id)
-                    or result.error
-                    or "cancelled"
-                )
-                output = result.output or cancel_reason
-                failure_reason = "cancelled"
-            elif result.status == "blocked":
-                status = "blocked"
-                issue_status = "blocked"
-                output = result.output or result.error
-                waiting_reason = None
-                resume_policy = None
-                failure_reason = result.error or result.output or "blocked"
-                cancel_reason = None
-            else:
-                status = "failed"
-                issue_status = "blocked"
-                output = result.output
-                waiting_reason = None
-                resume_policy = None
-                failure_reason = result.error or "agent_error"
-                cancel_reason = None
-            metadata = dict(task.metadata)
-            if policy_error:
-                metadata["environment_policy_violation"] = policy_error
-            conn.execute(
-                text(
-                    """
-                    UPDATE labrastro_agent_runs
-                    SET status=:status,
-                        terminal_result=CAST(:terminal_result AS JSONB),
-                        waiting_reason=:waiting_reason,
-                        resume_policy=:resume_policy,
-                        executor_session_id=COALESCE(:executor_session_id, executor_session_id),
-                        issue_status=:issue_status,
-                        failure_reason=:failure_reason,
-                        cancel_reason=:cancel_reason,
-                        metadata=CAST(:metadata AS JSONB),
-                        completed_at=now(), updated_at=now()
-                    WHERE id=:task_id
-                    """
-                ),
-                {
-                    "task_id": task_id,
-                    "status": status,
-                    "terminal_result": _json({"output": output or ""}),
-                    "waiting_reason": (
-                        waiting_reason.value if waiting_reason is not None else None
-                    ),
-                    "resume_policy": (
-                        resume_policy.value if resume_policy is not None else None
-                    ),
-                    "executor_session_id": result.executor_session_id,
-                    "issue_status": issue_status,
-                    "failure_reason": failure_reason,
-                    "cancel_reason": cancel_reason,
-                    "metadata": _json(metadata),
-                },
-            )
-            if result.executor_session_id:
-                self._upsert_session_with_conn(
-                    conn,
-                    task,
-                    executor_session_id=result.executor_session_id,
-                    metadata=self._session_metadata(task),
-                )
-            for event, expansion in expanded_events:
-                self._append_event(conn, task_id, event.type.value, event.to_dict())
-                for event_type, payload in expansion.events:
-                    self._append_event(conn, task_id, event_type, payload)
-                if expansion.policy_error:
-                    self._append_event(
-                        conn,
-                        task_id,
-                        "blocked",
-                        {"error": expansion.policy_error},
-                    )
-            for artifact in executor_result_artifacts(result, artifacts):
-                self._attach_artifact_with_conn(conn, task_id, **artifact)
-            task = self._task_from_row(self._task_row(conn, task_id))
-            summary = environment_summary_event(
-                task.metadata,
-                status,
-                output=output or "",
-                error=policy_error or result.error or "",
-            )
-            if summary is not None:
-                self._append_event(conn, task_id, summary[0], summary[1])
-            from labrastro_server.services.agent_runtime.control_plane import (
-                _activation_status_for_result,
-                _activation_to_dict,
-                _activation_with_runtime_state,
+                task_id,
+                result,
+                activation_id=activation_id,
+                artifacts=artifacts,
             )
 
-            claim_row = conn.execute(
+    def _complete_agent_run_activation_with_conn(
+        self,
+        conn: Any,
+        task_id: str,
+        result: ExecutorRunResult,
+        *,
+        activation_id: str,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> AgentRun:
+        completion_activation_id = str(activation_id or "").strip()
+        task = self._task_from_row(self._task_row(conn, task_id))
+        completion_activation = self._validate_completion_activation_with_conn(
+            conn,
+            task,
+            completion_activation_id,
+        )
+        expanded_events = [
+            (event, expand_environment_executor_event(task.metadata, event))
+            for event in result.events
+        ]
+        policy_error = str(
+            task.metadata.get("environment_policy_violation") or ""
+        ).strip()
+        for _, expansion in expanded_events:
+            if expansion.policy_error and not policy_error:
+                policy_error = expansion.policy_error
+        if result.succeeded and not policy_error:
+            required_feedback_kind = conn.execute(
                 text(
                     """
-                    SELECT * FROM labrastro_agent_run_activation_claims
-                    WHERE task_id=:task_id AND status='active'
-                    ORDER BY claimed_at DESC
+                    SELECT kind
+                    FROM labrastro_agent_run_feedback
+                    WHERE agent_run_id=:task_id
+                      AND requires_activation IS TRUE
+                      AND consumed_by_activation_id IS NULL
+                    ORDER BY created_at ASC, id ASC
                     LIMIT 1
                     """
                 ),
                 {"task_id": task_id},
-            ).mappings().first()
-            activation = _activation_with_runtime_state(
-                completion_activation,
-                status=_activation_status_for_result(result),
-                request_id=str(claim_row["request_id"]) if claim_row is not None else None,
-                worker_id=str(claim_row["worker_id"]) if claim_row is not None else None,
-                output=output or "",
-                result_payload=result.to_dict(),
+            ).scalar()
+            if task.status == AgentRunStatus.WAITING or required_feedback_kind:
+                status = "waiting"
+                issue_status = str(getattr(task, "issue_status", "") or "open")
+                output = ""
+                waiting_reason = (
+                    task.waiting_reason
+                    or _waiting_reason_for_required_feedback_kind(
+                        str(required_feedback_kind or "")
+                    )
+                )
+                resume_policy = (
+                    task.resume_policy
+                    or (
+                        AgentRunResumePolicy.EXTERNAL_EVENT
+                        if waiting_reason
+                        in {
+                            AgentRunWaitingReason.AGENT_CALL,
+                            AgentRunWaitingReason.SERVER_PROCESSING,
+                        }
+                        else AgentRunResumePolicy.USER_ACTION
+                    )
+                )
+            else:
+                status = "completed"
+                issue_status = (
+                    "in_review" if self._has_open_pr(conn, task_id) else "done"
+                )
+                output = result.output
+                waiting_reason = None
+                resume_policy = None
+            failure_reason = None
+            cancel_reason = None
+        elif policy_error:
+            status = "blocked"
+            issue_status = "blocked"
+            output = policy_error
+            waiting_reason = None
+            resume_policy = None
+            failure_reason = policy_error
+            cancel_reason = None
+        elif result.status == "cancelled":
+            status = "cancelled"
+            issue_status = "blocked"
+            waiting_reason = None
+            resume_policy = None
+            cancel_reason = (
+                result.output
+                or self._cancel_reason(conn, task_id)
+                or result.error
+                or "cancelled"
             )
-            self._upsert_activation_with_conn(conn, activation)
-            self._append_event(
+            output = result.output or cancel_reason
+            failure_reason = "cancelled"
+        elif result.status == "blocked":
+            status = "blocked"
+            issue_status = "blocked"
+            output = result.output or result.error
+            waiting_reason = None
+            resume_policy = None
+            failure_reason = result.error or result.output or "blocked"
+            cancel_reason = None
+        else:
+            status = "failed"
+            issue_status = "blocked"
+            output = result.output
+            waiting_reason = None
+            resume_policy = None
+            failure_reason = result.error or "agent_error"
+            cancel_reason = None
+        metadata = dict(task.metadata)
+        if policy_error:
+            metadata["environment_policy_violation"] = policy_error
+        conn.execute(
+            text(
+                """
+                UPDATE labrastro_agent_runs
+                SET status=:status,
+                    terminal_result=CAST(:terminal_result AS JSONB),
+                    waiting_reason=:waiting_reason,
+                    resume_policy=:resume_policy,
+                    executor_session_id=COALESCE(:executor_session_id, executor_session_id),
+                    issue_status=:issue_status,
+                    failure_reason=:failure_reason,
+                    cancel_reason=:cancel_reason,
+                    metadata=CAST(:metadata AS JSONB),
+                    completed_at=now(), updated_at=now()
+                WHERE id=:task_id
+                """
+            ),
+            {
+                "task_id": task_id,
+                "status": status,
+                "terminal_result": _json({"output": output or ""}),
+                "waiting_reason": (
+                    waiting_reason.value if waiting_reason is not None else None
+                ),
+                "resume_policy": (
+                    resume_policy.value if resume_policy is not None else None
+                ),
+                "executor_session_id": result.executor_session_id,
+                "issue_status": issue_status,
+                "failure_reason": failure_reason,
+                "cancel_reason": cancel_reason,
+                "metadata": _json(metadata),
+            },
+        )
+        if result.executor_session_id:
+            self._upsert_session_with_conn(
                 conn,
-                task_id,
-                "activation_completed",
-                {
-                    "activation_id": activation.id,
-                    "activation": _activation_to_dict(activation),
-                    "result": result.to_dict(),
-                },
+                task,
+                executor_session_id=result.executor_session_id,
+                metadata=self._session_metadata(task),
             )
-            self._append_event(
-                conn,
-                task_id,
-                status,
-                {"result": result.to_dict(), "agent_run": _agent_run_to_dict(task)},
-            )
-            if task.is_terminal:
-                self._append_parent_terminal_event(conn, task)
-            self._release_claims(conn, task_id, status="completed")
-            self._resolve_cancel(conn, task_id)
-            self._resume_from_pending_agent_call_feedback(conn, task_id)
-            return self._task_from_row(self._task_row(conn, task_id))
+        for event, expansion in expanded_events:
+            self._append_event(conn, task_id, event.type.value, event.to_dict())
+            for event_type, payload in expansion.events:
+                self._append_event(conn, task_id, event_type, payload)
+            if expansion.policy_error:
+                self._append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {"error": expansion.policy_error},
+                )
+        for artifact in executor_result_artifacts(result, artifacts):
+            self._attach_artifact_with_conn(conn, task_id, **artifact)
+        task = self._task_from_row(self._task_row(conn, task_id))
+        summary = environment_summary_event(
+            task.metadata,
+            status,
+            output=output or "",
+            error=policy_error or result.error or "",
+        )
+        if summary is not None:
+            self._append_event(conn, task_id, summary[0], summary[1])
+        from labrastro_server.services.agent_runtime.control_plane import (
+            _activation_status_for_result,
+            _activation_to_dict,
+            _activation_with_runtime_state,
+        )
+
+        claim_row = conn.execute(
+            text(
+                """
+                SELECT * FROM labrastro_agent_run_activation_claims
+                WHERE task_id=:task_id AND status='active'
+                ORDER BY claimed_at DESC
+                LIMIT 1
+                """
+            ),
+            {"task_id": task_id},
+        ).mappings().first()
+        activation = _activation_with_runtime_state(
+            completion_activation,
+            status=_activation_status_for_result(result),
+            request_id=str(claim_row["request_id"]) if claim_row is not None else None,
+            worker_id=str(claim_row["worker_id"]) if claim_row is not None else None,
+            output=output or "",
+            result_payload=result.to_dict(),
+        )
+        self._upsert_activation_with_conn(conn, activation)
+        self._append_event(
+            conn,
+            task_id,
+            "activation_completed",
+            {
+                "activation_id": activation.id,
+                "activation": _activation_to_dict(activation),
+                "result": result.to_dict(),
+            },
+        )
+        self._append_event(
+            conn,
+            task_id,
+            status,
+            {"result": result.to_dict(), "agent_run": _agent_run_to_dict(task)},
+        )
+        if task.is_terminal:
+            self._append_parent_terminal_event(conn, task)
+        self._release_claims(conn, task_id, status="completed")
+        self._resolve_cancel(conn, task_id)
+        self._resume_from_pending_agent_call_feedback(conn, task_id)
+        return self._task_from_row(self._task_row(conn, task_id))
 
     def retry_agent_run(
         self,
@@ -3521,12 +3540,20 @@ class PostgresAgentRunStore:
         )
         return ExecutorPromptRenderer().render(executor.value, context)
 
-    def _active_claim(self, conn: Any, request_id: str) -> Any | None:
+    def _active_claim(
+        self,
+        conn: Any,
+        request_id: str,
+        *,
+        for_update: bool = False,
+    ) -> Any | None:
+        lock_clause = " FOR UPDATE" if for_update else ""
         return conn.execute(
             text(
-                """
+                f"""
                 SELECT * FROM labrastro_agent_run_activation_claims
                 WHERE request_id=:request_id AND status='active'
+                {lock_clause}
                 """
             ),
             {"request_id": request_id},
