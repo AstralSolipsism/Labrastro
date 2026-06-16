@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import hmac
@@ -190,7 +190,6 @@ def test_agent_run_complete_creates_github_pr_artifact() -> None:
     runtime = AgentRunControlPlane()
     runtime.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             executor="fake",
@@ -224,7 +223,7 @@ def test_agent_run_complete_creates_github_pr_artifact() -> None:
         peer_token = register_body["payload"]["peer_token"]
         _, claim_body = _json_request(
             "POST",
-            f"{service.base_url}/remote/agent-runs/claim",
+            f"{service.base_url}/remote/agent-run-activations/claim",
             {
                 "peer_token": peer_token,
                 "worker_id": "worker-1",
@@ -235,10 +234,11 @@ def test_agent_run_complete_creates_github_pr_artifact() -> None:
 
         _, complete = _json_request(
             "POST",
-            f"{service.base_url}/remote/agent-runs/complete",
+            f"{service.base_url}/remote/agent-run-activations/complete",
             {
                 "peer_token": peer_token,
                 "request_id": claim["request_id"],
+                "activation_id": claim["activation_id"],
                 "agent_run_id": "task-pr",
                 "worker_id": "worker-1",
                 "status": "completed",

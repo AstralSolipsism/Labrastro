@@ -108,9 +108,15 @@ def test_assignment_dispatch_uses_taskflow_decision_and_agent_run_metadata() -> 
     assert len(agent_runs) == 1
     task = runtime.get_agent_run(agent_runs[0]["id"])
     assert task.agent_id == "docs"
-    assert task.metadata["issue_id"] == issue.id
-    assert task.metadata["assignment_id"] == assignment.id
     assert task.metadata["dispatch_source"] == "assignment"
+    assert "issue_id" not in task.metadata
+    assert "assignment_id" not in task.metadata
+    state = taskflow.get_taskflow_state(issue.taskflow_id or "")
+    project = taskflow.project_service.get_project_state(state.meta.project_id)
+    assert project is not None
+    task_run = next(run for run in project.traceability.task_runs if run.id == dispatched.task_run_id)
+    assert task_run.metadata["issue_id"] == issue.id
+    assert task_run.metadata["assignment_id"] == assignment.id
 
 
 def test_assignment_without_explicit_agent_dispatches_with_default_agent_run() -> None:
@@ -134,7 +140,7 @@ def test_assignment_without_explicit_agent_dispatches_with_default_agent_run() -
     task = runtime.get_agent_run(agent_runs[0]["id"])
     assert task.agent_id == "docs"
     assert task.source.value == "taskflow"
-    assert task.metadata["agent_run_source"] == "taskflow"
+    assert "agent_run_source" not in task.metadata
 
 
 def test_assignment_can_be_reassigned_before_dispatch() -> None:
@@ -185,8 +191,8 @@ def test_mention_resolves_alias_and_creates_assignment_but_not_agent_run() -> No
     assert runtime.list_agent_runs() == []
 
 
-def test_mention_dispatch_preserves_mention_id_in_agent_run_metadata() -> None:
-    service, _taskflow, runtime = _service()
+def test_mention_dispatch_keeps_business_ids_out_of_agent_run_metadata() -> None:
+    service, taskflow, runtime = _service()
     issue = service.create_issue(
         title="Draft guide",
         description="Draft the guide.",
@@ -207,8 +213,15 @@ def test_mention_dispatch_preserves_mention_id_in_agent_run_metadata() -> None:
     assert len(agent_runs) == 1
     task = runtime.get_agent_run(agent_runs[0]["id"])
     assert task.metadata["dispatch_source"] == "mention"
-    assert task.metadata["assignment_id"] == mention.assignment_id
-    assert task.metadata["mention_id"] == mention.id
+    assert "assignment_id" not in task.metadata
+    assert "mention_id" not in task.metadata
+    assert "issue_id" not in task.metadata
+    state = taskflow.get_taskflow_state(issue.taskflow_id or "")
+    project = taskflow.project_service.get_project_state(state.meta.project_id)
+    assert project is not None
+    task_run = next(run for run in project.traceability.task_runs if run.id == dispatched.task_run_id)
+    assert task_run.metadata["assignment_id"] == mention.assignment_id
+    assert task_run.metadata["mention_id"] == mention.id
 
 
 def test_mention_conflict_or_unknown_agent_needs_assignment() -> None:

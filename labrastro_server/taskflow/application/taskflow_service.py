@@ -784,7 +784,7 @@ class TaskflowService:
                     target_type=TraceEntityType.AGENT_RUN,
                     target_id=agent_run_id,
                     relation_type=TraceRelationType.DISPATCHES,
-                    rationale="TaskRun dispatched execution to an AgentRun.",
+                    rationale="TaskRun dispatched execution to a runtime run.",
                 )
             )
 

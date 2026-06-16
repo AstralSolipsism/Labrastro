@@ -1,4 +1,4 @@
-﻿"""ReuleauxCoder executor adapter for Taskflow TaskRuns."""
+"""ReuleauxCoder executor adapter for Taskflow TaskRuns."""
 
 from __future__ import annotations
 
@@ -8,7 +8,16 @@ from labrastro_server.services.agent_runtime.control_plane import AgentRunReques
 from labrastro_server.services.agent_runtime.scheduler import BasicAgentScheduler
 from labrastro_server.taskflow.domain.project_state import TaskRun
 from labrastro_server.taskflow.ports.dispatch import TaskflowDispatchResult
-from reuleauxcoder.domain.agent_runtime.models import AgentConfig, TaskStatus
+from reuleauxcoder.domain.agent_runtime.models import (
+    AGENT_RUN_METADATA_FORBIDDEN_KEYS,
+    AgentConfig,
+    AgentRunStatus,
+)
+
+
+_TASKFLOW_AGENT_RUN_METADATA_ALLOWED = {
+    "dispatch_source",
+}
 
 
 class ReuleauxCoderTaskflowDispatcher:
@@ -88,7 +97,7 @@ class ReuleauxCoderTaskflowDispatcher:
                             (),
                             {
                                 "agent_id": str(row.get("agent_id") or ""),
-                                "status": TaskStatus(str(row.get("status") or "queued")),
+                                "status": AgentRunStatus(str(row.get("status") or "queued")),
                             },
                         )()
                     )
@@ -106,22 +115,21 @@ class ReuleauxCoderTaskflowDispatcher:
         *,
         metadata: dict[str, Any],
     ) -> AgentRunRequest:
-        request_metadata = dict(task_run.metadata)
-        request_metadata.update(metadata)
+        prompt_metadata = {**dict(task_run.metadata), **dict(metadata)}
+        request_metadata = {
+            str(key): value
+            for key, value in dict(metadata).items()
+            if str(key) in _TASKFLOW_AGENT_RUN_METADATA_ALLOWED
+            and str(key) not in AGENT_RUN_METADATA_FORBIDDEN_KEYS
+        }
         request_metadata.setdefault("dispatch_source", "taskflow")
-        request_metadata.setdefault("agent_run_source", "taskflow")
-        request_metadata.setdefault("taskflow_id", request_metadata.get("taskflow_id"))
-        request_metadata.setdefault("task_run_id", task_run.id)
-        request_metadata.setdefault("work_item_id", task_run.work_item_id)
-        request_metadata.setdefault("goal_id", task_run.goal_id)
         prompt = str(
-            request_metadata.get("prompt")
-            or request_metadata.get("work_item_description")
-            or request_metadata.get("work_item_title")
+            prompt_metadata.get("prompt")
+            or prompt_metadata.get("work_item_description")
+            or prompt_metadata.get("work_item_title")
             or task_run.work_item_id
         )
         return AgentRunRequest(
-            issue_id=task_run.work_item_id,
             agent_id=selected_executor_id,
             prompt=prompt,
             source="taskflow",

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import inspect
 from pathlib import Path
@@ -192,7 +192,7 @@ def test_taskflow_core_and_application_do_not_import_executor_or_reuleauxcoder()
         "reuleauxcoder\\",
         "services.agent_runtime",
         "AgentRunRequest",
-        "AgentRunRecord",
+        "AgentRun",
         "AgentConfig",
         "TaskDraftRecord",
     )
@@ -259,6 +259,13 @@ def test_reuleauxcoder_adapter_submits_agent_run_from_task_run_only() -> None:
 
     result = ReuleauxCoderTaskflowDispatcher(runtime).dispatch_task_run(
         task_run,
+        metadata={
+            "issue_id": "issue-1",
+            "assignment_id": "assignment-1",
+            "mention_id": "mention-1",
+            "dispatch_source": "assignment",
+            "custom_business_context": "must stay in taskflow",
+        },
     )
 
     assert result.selected_executor_id == "docs"
@@ -267,9 +274,16 @@ def test_reuleauxcoder_adapter_submits_agent_run_from_task_run_only() -> None:
     agent_run = runtime.get_agent_run(agent_run_id)
     assert agent_run.agent_id == "docs"
     assert agent_run.source.value == "taskflow"
-    assert agent_run.metadata["task_run_id"] == "task-run-1"
-    assert agent_run.metadata["work_item_id"] == "work-1"
-    assert agent_run.metadata["agent_run_source"] == "taskflow"
+    assert "agent_run_source" not in agent_run.metadata
+    assert agent_run.metadata["dispatch_source"] == "assignment"
+    assert "issue_id" not in agent_run.metadata
+    assert "assignment_id" not in agent_run.metadata
+    assert "mention_id" not in agent_run.metadata
+    assert "task_run_id" not in agent_run.metadata
+    assert "work_item_id" not in agent_run.metadata
+    assert "goal_id" not in agent_run.metadata
+    assert "taskflow_id" not in agent_run.metadata
+    assert "custom_business_context" not in agent_run.metadata
     assert "taskflow_task_draft_id" not in agent_run.metadata
 
 
