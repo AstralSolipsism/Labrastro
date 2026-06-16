@@ -612,6 +612,19 @@ class Agent:
             audit=audit,
         )
 
+    @staticmethod
+    def _agent_call_grant_can_satisfy(decision: PermissionDecision) -> bool:
+        if decision.action not in {
+            PermissionAction.REQUIRE_APPROVAL,
+            PermissionAction.BLOCKED_REVIEW,
+        }:
+            return False
+        policy = str(decision.policy_matched or "").strip()
+        return (
+            policy == "approval_policy:require_approval"
+            or policy.startswith("runtime_profile:")
+        )
+
     def _dispatch_agent_lifecycle_event(
         self,
         event_name: str,
@@ -1106,24 +1119,31 @@ class Agent:
             tool_call=tool_call,
             action=action,
         )
-        grant_decision = self._agent_call_grant_decision(request)
-        if grant_decision is not None:
-            return grant_decision
         gateway = PermissionGateway()
         initial_decision = gateway.evaluate(request)
         if not self._should_dispatch_permission_lifecycle(
             request,
             initial_decision,
         ):
-            return self._with_permission_denied_lifecycle_audit(
+            decision = self._with_permission_denied_lifecycle_audit(
                 request,
                 initial_decision,
             )
-
-        lifecycle_outputs = self._permission_lifecycle_outputs(request)
-        if not lifecycle_outputs:
-            return initial_decision
-        return gateway.evaluate(replace(request, lifecycle_outputs=lifecycle_outputs))
+        else:
+            lifecycle_outputs = self._permission_lifecycle_outputs(request)
+            if lifecycle_outputs:
+                decision = gateway.evaluate(
+                    replace(request, lifecycle_outputs=lifecycle_outputs)
+                )
+            else:
+                decision = initial_decision
+        grant_decision = self._agent_call_grant_decision(request)
+        if (
+            grant_decision is not None
+            and self._agent_call_grant_can_satisfy(decision)
+        ):
+            return grant_decision
+        return decision
 
     def _tool_permission_request(
         self,

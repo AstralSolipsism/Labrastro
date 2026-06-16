@@ -29,6 +29,19 @@ class _Tool:
         self.name = name
 
 
+class _GrantedTool(_Tool):
+    def agent_call_grant_context(self, _arguments: dict) -> dict:
+        return {
+            "granted": True,
+            "user_id": "user-1",
+            "scope": "workspace:/repo",
+            "main_agent_id": "planner",
+            "target_agent_id": "researcher",
+            "mode": "persistent",
+            "target_config_version": "version-a",
+        }
+
+
 class _RecordingPermissionDispatcher:
     def __init__(self) -> None:
         self.contexts: list[LifecycleHookEventContext] = []
@@ -178,6 +191,84 @@ def test_manual_agent_requires_approval_by_default() -> None:
     decision = agent.evaluate_tool_permission(_Tool("shell"))
 
     assert decision.action == PermissionAction.REQUIRE_APPROVAL
+
+
+def test_agent_call_grant_satisfies_ordinary_approval_gate() -> None:
+    config = Config(approval=ApprovalConfig(default_mode="require_approval"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_GrantedTool("shell")],
+        config=config,
+    )
+    setattr(agent, "permission_trigger_source", "taskflow")
+    setattr(agent, "permission_interactive", False)
+
+    decision = agent.evaluate_tool_permission(
+        _GrantedTool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.ALLOW
+    assert decision.policy_matched == "agent_call_grant"
+
+
+def test_agent_call_grant_does_not_bypass_mode_tool_whitelist() -> None:
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_GrantedTool("shell")],
+        config=config,
+        available_modes={"review": ModeConfig(name="review", tools=["read_file"])},
+        active_mode="review",
+    )
+
+    decision = agent.evaluate_tool_permission(
+        _GrantedTool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "mode.tool_whitelist"
+
+
+def test_agent_call_grant_does_not_bypass_effective_capabilities() -> None:
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_GrantedTool("shell")],
+        config=config,
+    )
+    setattr(agent, "effective_capabilities", _effective_builtin_tools("builtin:read_file"))
+    setattr(agent, "enforce_effective_capabilities", True)
+
+    decision = agent.evaluate_tool_permission(
+        _GrantedTool("shell"),
+        tool_call=ToolCall(id="call-shell", name="shell", arguments={"command": "pwd"}),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "effective_capabilities"
+
+
+def test_agent_call_grant_does_not_bypass_hard_tool_policy() -> None:
+    config = Config(approval=ApprovalConfig(default_mode="allow"))
+    agent = Agent(
+        llm=SimpleNamespace(),
+        tools=[_GrantedTool("shell")],
+        config=config,
+    )
+
+    decision = agent.evaluate_tool_permission(
+        _GrantedTool("shell"),
+        tool_call=ToolCall(
+            id="call-shell",
+            name="shell",
+            arguments={"command": "rm -rf /tmp/example"},
+        ),
+    )
+
+    assert decision.action == PermissionAction.DENY
+    assert decision.policy_matched == "system_hard_deny"
 
 
 def test_agent_dispatches_permission_request_lifecycle_for_candidate_tool_call() -> None:
