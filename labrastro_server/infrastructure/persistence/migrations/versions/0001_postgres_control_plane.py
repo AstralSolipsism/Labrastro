@@ -98,6 +98,26 @@ def upgrade() -> None:
     )
     op.execute(
         """
+        CREATE TABLE IF NOT EXISTS labrastro_agent_run_activation_steers (
+            id TEXT PRIMARY KEY,
+            activation_id TEXT NOT NULL REFERENCES labrastro_agent_run_activations(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            delivered_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'queued',
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_run_activation_steers_activation
+            ON labrastro_agent_run_activation_steers(activation_id, created_at)
+        """
+    )
+    op.execute(
+        """
         CREATE TABLE IF NOT EXISTS labrastro_agent_run_feedback (
             id TEXT PRIMARY KEY,
             agent_run_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
@@ -168,6 +188,38 @@ def upgrade() -> None:
                 owner_session_run_id, main_agent_run_id, agent_id, thread_key, binding_lifetime
             )
             WHERE status = 'active'
+        """
+    )
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS labrastro_agent_call_grants (
+            user_id TEXT NOT NULL,
+            grant_scope TEXT NOT NULL,
+            main_agent_id TEXT NOT NULL,
+            target_agent_id TEXT NOT NULL,
+            conversation_scope TEXT NOT NULL,
+            capability_scope_hash TEXT NOT NULL,
+            capability_scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+            target_config_version TEXT NOT NULL DEFAULT '',
+            granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            expires_at TIMESTAMPTZ,
+            revoked_at TIMESTAMPTZ,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (
+                user_id, grant_scope, main_agent_id, target_agent_id, conversation_scope,
+                capability_scope_hash, target_config_version
+            )
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_labrastro_agent_call_grants_active
+            ON labrastro_agent_call_grants(
+                user_id, grant_scope, main_agent_id, target_agent_id, conversation_scope
+            )
+            WHERE revoked_at IS NULL
         """
     )
     op.execute(
@@ -345,10 +397,11 @@ def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_artifacts")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_sessions")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_activation_claims")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_call_grants")
+    op.execute("DROP TABLE IF EXISTS labrastro_agent_run_activation_steers")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_feedback")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_thread_bindings")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_relations")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_activations")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_events")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_runs")
-
