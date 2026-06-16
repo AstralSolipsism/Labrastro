@@ -1,4 +1,4 @@
-"""Remote relay bootstrap and peer chat binding helpers."""
+﻿"""Remote relay bootstrap and peer chat binding helpers."""
 
 from __future__ import annotations
 
@@ -2606,8 +2606,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     {"message": event.error_message or "unknown error"},
                 )
                 return
-            elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
-                _append_agent_event(event, "delegated_run_completed", event.data)
+            elif event.event_type == AgentEventType.AGENT_RELATION_COMPLETED:
+                _append_agent_event(event, "agent_relation_completed", event.data)
                 return
 
         previous_approval = peer_agent.approval_provider

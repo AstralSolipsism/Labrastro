@@ -34,14 +34,16 @@ class LabrastroServerProvider:
         self.peer_token = _required_env("LABRASTRO_PEER_TOKEN")
         self.agent_run_id = _required_env("LABRASTRO_AGENT_RUN_ID")
         self.request_id = _required_env("LABRASTRO_AGENT_RUN_REQUEST_ID")
+        self.activation_id = _required_env("LABRASTRO_AGENT_RUN_ACTIVATION_ID")
         self.worker_id = _required_env("LABRASTRO_AGENT_RUN_WORKER_ID")
         self.client = httpx.Client(timeout=_server_origin_timeout(config.timeout_sec))
 
     def build_request_params(self, request: ProviderRequest) -> dict[str, Any]:
         return {
-            "endpoint": "/remote/agent-runs/model-request",
+            "endpoint": "/remote/agent-run-activations/model-request",
             "agent_run_id": self.agent_run_id,
             "request_id": self.request_id,
+            "activation_id": self.activation_id,
             "worker_id": self.worker_id,
             "model": request.model,
             "stream": True,
@@ -53,6 +55,7 @@ class LabrastroServerProvider:
             "peer_token": self.peer_token,
             "agent_run_id": self.agent_run_id,
             "request_id": self.request_id,
+            "activation_id": self.activation_id,
             "worker_id": self.worker_id,
             "model": request.model,
             "messages": list(request.messages),
@@ -67,7 +70,7 @@ class LabrastroServerProvider:
             "metadata": dict(request.metadata),
             "stream": True,
         }
-        url = f"{self.base_url}/remote/agent-runs/model-request"
+        url = f"{self.base_url}/remote/agent-run-activations/model-request"
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_delta_seen = False

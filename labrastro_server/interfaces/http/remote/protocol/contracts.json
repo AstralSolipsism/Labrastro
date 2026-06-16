@@ -312,9 +312,9 @@
       }
     },
     {
-      "name": "agent_runs.claim",
+      "name": "agent_run_activations.claim",
       "method": "POST",
-      "path": "/remote/agent-runs/claim",
+      "path": "/remote/agent-run-activations/claim",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
@@ -352,13 +352,14 @@
       }
     },
     {
-      "name": "agent_runs.complete",
+      "name": "agent_run_activations.complete",
       "method": "POST",
-      "path": "/remote/agent-runs/complete",
+      "path": "/remote/agent-run-activations/complete",
       "auth": "peer_token",
       "request": {
         "peer_token": "pt_contract",
         "request_id": "run_contract",
+        "activation_id": "task_contract:activation:1",
         "agent_run_id": "task_contract",
         "worker_id": "worker_contract",
         "status": "completed",
@@ -377,7 +378,6 @@
       "path": "/remote/admin/agent-runs/submit",
       "auth": "bearer",
       "request": {
-        "issue_id": "manual",
         "agent_id": "default",
         "prompt": "run diagnostics",
         "executor": "codex",

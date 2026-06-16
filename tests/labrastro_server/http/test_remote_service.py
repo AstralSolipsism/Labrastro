@@ -1,4 +1,4 @@
-"""Tests for the HTTP transport adapter around the remote relay host."""
+﻿"""Tests for the HTTP transport adapter around the remote relay host."""
 
 from __future__ import annotations
 
@@ -83,6 +83,10 @@ from reuleauxcoder.interfaces.events import UIEventBus
 
 
 TEST_ADMIN_TOKEN = "test-admin-token"
+
+
+def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
+    return str(control.get_agent_run(task_id).current_activation_id or "")
 
 
 def test_session_run_events_handler_error_payload_preserves_remote_protocol_code() -> None:
@@ -2306,7 +2310,7 @@ class TestRemoteRelayHTTPService:
             assert tools["builtin:fetch_capabilities"]["permission"]["action"] == "allow"
             assert (
                 tools["builtin:fetch_capabilities"]["permission"]["capability_matched"]
-                == "builtin:fetch_capabilities"
+                == "capability:core_builtin_tools:builtin_tool:fetch_capabilities"
             )
             assert tools["capability_package:review"]["source_type"] == "capability_package"
             assert tools["capability_package:review"]["execution_policy"] == "inherit"
@@ -3698,7 +3702,7 @@ class TestRemoteRelayHTTPService:
             assert len(control.list_agent_runs(agent_id="capability_packager")) == 1
             status, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -3714,11 +3718,12 @@ class TestRemoteRelayHTTPService:
 
             status, model_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/model-request",
+                f"{service.base_url}/remote/agent-run-activations/model-request",
                 {
                     "peer_token": peer_token,
                     "agent_run_id": agent_run_id,
                     "request_id": claim["request_id"],
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "messages": [{"role": "user", "content": "hello"}],
                     "parameters": {"max_tokens": 1, "temperature": 0.9},
@@ -3887,13 +3892,14 @@ class TestRemoteRelayHTTPService:
                 "credentials": ["GITHUB_TOKEN"],
                 "risk_level": "low",
             }
-            control.complete_agent_run(
+            control.complete_agent_run_activation(
                 str(agent_run_id),
                 ExecutorRunResult(
                     task_id=str(agent_run_id),
                     status="completed",
                     output=f"```json\n{json.dumps(draft)}\n```",
                 ),
+                activation_id=_current_activation_id(control, str(agent_run_id)),
             )
             approval = wait_for(
                 lambda: next(
@@ -4019,7 +4025,6 @@ class TestRemoteRelayHTTPService:
             peer_token = register_body["payload"]["peer_token"]
             control.submit_agent_run(
                 AgentRunRequest(
-                    issue_id="issue-1",
                     agent_id="capability_packager",
                     prompt="package repo",
                     executor="reuleauxcoder",
@@ -4037,7 +4042,7 @@ class TestRemoteRelayHTTPService:
             )
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -4049,11 +4054,12 @@ class TestRemoteRelayHTTPService:
 
             status, body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/model-request",
+                f"{service.base_url}/remote/agent-run-activations/model-request",
                 {
                     "peer_token": peer_token,
                     "agent_run_id": "task-model-interrupted",
                     "request_id": claim["request_id"],
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": False,
@@ -4135,7 +4141,6 @@ class TestRemoteRelayHTTPService:
             peer_token = register_body["payload"]["peer_token"]
             control.submit_agent_run(
                 AgentRunRequest(
-                    issue_id="issue-1",
                     agent_id="capability_packager",
                     prompt="package repo",
                     executor="reuleauxcoder",
@@ -4157,7 +4162,7 @@ class TestRemoteRelayHTTPService:
             )
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -4169,11 +4174,12 @@ class TestRemoteRelayHTTPService:
 
             status, content_type, raw_body, frames = _sse_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/model-request",
+                f"{service.base_url}/remote/agent-run-activations/model-request",
                 {
                     "peer_token": peer_token,
                     "agent_run_id": "task-model-stream",
                     "request_id": claim["request_id"],
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": True,
@@ -4265,7 +4271,6 @@ class TestRemoteRelayHTTPService:
             peer_token = register_body["payload"]["peer_token"]
             control.submit_agent_run(
                 AgentRunRequest(
-                    issue_id="issue-1",
                     agent_id="capability_packager",
                     prompt="package repo",
                     executor="reuleauxcoder",
@@ -4283,7 +4288,7 @@ class TestRemoteRelayHTTPService:
             )
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -4295,11 +4300,12 @@ class TestRemoteRelayHTTPService:
 
             status, content_type, _raw_body, frames = _sse_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/model-request",
+                f"{service.base_url}/remote/agent-run-activations/model-request",
                 {
                     "peer_token": peer_token,
                     "agent_run_id": "task-model-interrupted",
                     "request_id": claim["request_id"],
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": True,
@@ -4397,7 +4403,6 @@ class TestRemoteRelayHTTPService:
             peer_token = register_body["payload"]["peer_token"]
             control.submit_agent_run(
                 AgentRunRequest(
-                    issue_id="issue-1",
                     agent_id="capability_packager",
                     prompt="package repo",
                     executor="reuleauxcoder",
@@ -4415,7 +4420,7 @@ class TestRemoteRelayHTTPService:
             )
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -4429,6 +4434,7 @@ class TestRemoteRelayHTTPService:
                     "peer_token": peer_token,
                     "agent_run_id": "task-model-disconnect",
                     "request_id": claim["request_id"],
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": True,
@@ -4437,7 +4443,7 @@ class TestRemoteRelayHTTPService:
             sock = socket.create_connection(("127.0.0.1", port), timeout=5)
             sock.settimeout(5)
             sock.sendall(
-                b"POST /remote/agent-runs/model-request HTTP/1.1\r\n"
+                b"POST /remote/agent-run-activations/model-request HTTP/1.1\r\n"
                 b"Host: 127.0.0.1\r\n"
                 b"Accept: text/event-stream\r\n"
                 b"Content-Type: application/json\r\n"
@@ -7573,7 +7579,7 @@ class TestRemoteRelayHTTPService:
 
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -7583,27 +7589,36 @@ class TestRemoteRelayHTTPService:
             claim = claim_body["claim"]
             assert claim is not None
             assert claim["agent_run"]["id"] == "task-http-runtime"
+            assert claim["activation_id"] == "task-http-runtime:activation:1"
+            assert claim["activation"]["agent_run_id"] == "task-http-runtime"
+            assert (
+                claim["executor_request"]["metadata"]["activation_id"]
+                == claim["activation_id"]
+            )
 
             _, heartbeat_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/heartbeat",
+                f"{service.base_url}/remote/agent-run-activations/heartbeat",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
                     "agent_run_id": "task-http-runtime",
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                 },
             )
             assert heartbeat_body["ok"] is True
+            assert heartbeat_body["activation_id"] == claim["activation_id"]
             assert heartbeat_body["cancel_requested"] is False
 
             _, session_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/session",
+                f"{service.base_url}/remote/agent-run-activations/session",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
                     "agent_run_id": "task-http-runtime",
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "workdir": "G:/repo/main/.rcoder/agent-runtime/ws/task/workdir/repo",
                     "branch": "agent/coder/task-http",
@@ -7615,17 +7630,24 @@ class TestRemoteRelayHTTPService:
 
             _, event_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/event",
+                f"{service.base_url}/remote/agent-run-activations/event",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
                     "agent_run_id": "task-http-runtime",
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "type": "text",
                     "text": "hello",
                 },
             )
             assert event_body["ok"] is True
+            text_event = [
+                event
+                for event in control.list_events("task-http-runtime")
+                if event.type == "text"
+            ][0]
+            assert text_event.payload["activation_id"] == claim["activation_id"]
 
             _, admin_events = _json_request(
                 "POST",
@@ -7648,11 +7670,12 @@ class TestRemoteRelayHTTPService:
             try:
                 _json_request(
                     "POST",
-                    f"{service.base_url}/remote/agent-runs/event",
+                    f"{service.base_url}/remote/agent-run-activations/event",
                     {
                         "peer_token": peer_token,
                         "request_id": claim["request_id"],
                         "agent_run_id": "task-http-runtime",
+                        "activation_id": claim["activation_id"],
                         "worker_id": "other-worker",
                         "type": "text",
                         "text": "bad",
@@ -7672,11 +7695,12 @@ class TestRemoteRelayHTTPService:
 
             _, cancelled_heartbeat = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/heartbeat",
+                f"{service.base_url}/remote/agent-run-activations/heartbeat",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
                     "agent_run_id": "task-http-runtime",
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                 },
             )
@@ -7686,11 +7710,12 @@ class TestRemoteRelayHTTPService:
 
             _, complete_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/complete",
+                f"{service.base_url}/remote/agent-run-activations/complete",
                 {
                     "peer_token": peer_token,
                     "request_id": claim["request_id"],
                     "agent_run_id": "task-http-runtime",
+                    "activation_id": claim["activation_id"],
                     "worker_id": "worker-1",
                     "status": "cancelled",
                     "output": "",
@@ -7699,6 +7724,7 @@ class TestRemoteRelayHTTPService:
                         {
                             "request_id": claim["request_id"],
                             "agent_run_id": "task-http-runtime",
+                            "activation_id": claim["activation_id"],
                             "worker_id": "worker-1",
                             "type": "status",
                             "data": {"status": "cancelled"},
@@ -7707,20 +7733,43 @@ class TestRemoteRelayHTTPService:
                 },
             )
             assert complete_body["ok"] is True
+            activation_completed = [
+                event
+                for event in control.list_events("task-http-runtime")
+                if event.type == "activation_completed"
+            ][0]
+            assert activation_completed.payload["activation_id"] == claim["activation_id"]
+
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/agent-runs/retry",
+                    {
+                        "agent_run_id": "task-http-runtime",
+                        "new_agent_run_id": "task-http-runtime-retry",
+                    },
+                    headers=admin_headers,
+                )
+                raise AssertionError("retry must not accept a new AgentRun id")
+            except HTTPError as exc:
+                assert exc.code == 400
 
             _, retry_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/agent-runs/retry",
                 {
                     "agent_run_id": "task-http-runtime",
-                    "new_agent_run_id": "task-http-runtime-retry",
                 },
                 headers=admin_headers,
             )
             assert retry_body["ok"] is True
-            assert retry_body["agent_run"]["id"] == "task-http-runtime-retry"
+            assert retry_body["agent_run"]["id"] == "task-http-runtime"
             assert retry_body["agent_run"]["status"] == "queued"
-            assert retry_body["agent_run"]["metadata"]["retry_of"] == "task-http-runtime"
+            assert (
+                retry_body["agent_run"]["current_activation_id"]
+                == "task-http-runtime:activation:2"
+            )
+            assert "current_activation_input_kind" not in retry_body["agent_run"]["metadata"]
         finally:
             service.stop()
             relay.stop()
@@ -8190,7 +8239,8 @@ class TestRemoteRelayHTTPService:
             assert len(agent_runs) == 1
             task = control.get_agent_run(agent_runs[0]["id"])
             assert task.metadata["dispatch_source"] == "assignment"
-            assert task.metadata["issue_id"] == issue_id
+            assert "issue_id" not in task.metadata
+            assert "assignment_id" not in task.metadata
 
             _, issue_detail = _json_request(
                 "GET",
@@ -8267,7 +8317,6 @@ class TestRemoteRelayHTTPService:
             peer_token = register_body["payload"]["peer_token"]
             control.submit_agent_run(
                 AgentRunRequest(
-                    issue_id="issue-1",
                     agent_id="reviewer",
                     prompt="run remote",
                 ),
@@ -8277,7 +8326,7 @@ class TestRemoteRelayHTTPService:
             with pytest.raises(HTTPError) as invalid_worker_kind:
                 _json_request(
                     "POST",
-                    f"{service.base_url}/remote/agent-runs/claim",
+                    f"{service.base_url}/remote/agent-run-activations/claim",
                     {
                         "peer_token": peer_token,
                         "worker_id": "worker-local",
@@ -8294,7 +8343,7 @@ class TestRemoteRelayHTTPService:
             with pytest.raises(HTTPError) as unregistered_worker_kind:
                 _json_request(
                     "POST",
-                    f"{service.base_url}/remote/agent-runs/claim",
+                    f"{service.base_url}/remote/agent-run-activations/claim",
                     {
                         "peer_token": peer_token,
                         "worker_id": "worker-local",
@@ -9029,7 +9078,7 @@ class TestRemoteRelayHTTPService:
 
             _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/agent-runs/claim",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": "worker-1",
@@ -9378,9 +9427,8 @@ class TestRemoteRelayHTTPService:
                 task = control.get_agent_run("task-go-runtime-worktree")
 
             assert task.status.value == "completed"
-            assert task.output == "hello from fake runtime"
+            assert task.terminal_result["output"] == "hello from fake runtime"
             assert task.workdir is not None
-            assert task.branch_name is not None
             workdir = Path(task.workdir)
             assert (workdir / "tracked.txt").exists()
             assert (workdir / "agent-output.txt").read_text() == "created by fake executor\n"
@@ -9388,17 +9436,18 @@ class TestRemoteRelayHTTPService:
             artifacts = control.artifacts_to_dict("task-go-runtime-worktree")
             artifact_types = {artifact["type"]: artifact for artifact in artifacts}
             assert artifact_types["branch"]["status"] == "pushed"
+            branch_name = str(artifact_types["branch"]["branch_name"] or "")
+            assert branch_name
             assert "pull_request" not in artifact_types
-            assert task.pr_url is None
             pushed = subprocess.run(
-                ["git", "ls-remote", "--heads", "origin", task.branch_name],
+                ["git", "ls-remote", "--heads", "origin", branch_name],
                 cwd=workdir,
                 check=True,
                 timeout=30,
                 capture_output=True,
                 text=True,
             )
-            assert task.branch_name in pushed.stdout
+            assert branch_name in pushed.stdout
             assert not gh_log.exists() or gh_log.read_text(encoding="utf-8") == ""
             events = control.list_events("task-go-runtime-worktree")
             assert any(event.type == "session_pinned" for event in events)

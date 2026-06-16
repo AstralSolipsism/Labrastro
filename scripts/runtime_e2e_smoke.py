@@ -70,7 +70,9 @@ SOURCE_EXCLUDES = [
 REQUIRED_TABLES = [
     "labrastro_agent_runs",
     "labrastro_agent_run_events",
-    "labrastro_agent_run_claims",
+    "labrastro_agent_run_activations",
+    "labrastro_agent_run_feedback",
+    "labrastro_agent_run_activation_claims",
     "labrastro_agent_run_sessions",
     "labrastro_agent_run_artifacts",
     "labrastro_sessions",
@@ -1516,14 +1518,13 @@ class ServerRunner:
                 worker_id=f"smoke-retry-{self.timestamp.lower()}",
             )
 
-            retry_id = f"task-retry-{self.timestamp.lower()}"
             retry = self.admin_json(
                 "/remote/admin/agent-runs/retry",
-                {"agent_run_id": cancel_id, "new_agent_run_id": retry_id},
+                {"agent_run_id": cancel_id},
             )
             if retry.get("ok") is not True:
                 raise RuntimeError(f"retry failed: {retry}")
-            retry_detail = self.poll_task(retry_id, timeout_sec=120)
+            retry_detail = self.poll_task(cancel_id, timeout_sec=120)
             if retry_detail["agent_run"]["status"] != "completed":
                 raise RuntimeError(f"retry AgentRun did not complete: {retry_detail['agent_run']}")
             self.report["tasks"]["retry"] = self.summarize_task(retry_detail)

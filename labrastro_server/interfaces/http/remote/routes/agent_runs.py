@@ -166,7 +166,7 @@ class RemoteAgentRunRoutes:
             },
         )
 
-    def _handle_agent_run_claim(self) -> None:
+    def _handle_agent_run_activation_claim(self) -> None:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
@@ -201,7 +201,7 @@ class RemoteAgentRunRoutes:
                     "worker_kind is not registered for this peer",
                 )
                 return
-        claim = self.service.runtime_control_plane.claim_agent_run(
+        claim = self.service.runtime_control_plane.claim_agent_run_activation(
             worker_id=worker_id,
             worker_kind=worker_kind,
             executors=[str(executor) for executor in executors],
@@ -215,7 +215,7 @@ class RemoteAgentRunRoutes:
             {"claim": claim.to_dict() if claim is not None else None},
         )
 
-    def _handle_agent_run_heartbeat(self) -> None:
+    def _handle_agent_run_activation_heartbeat(self) -> None:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
@@ -227,17 +227,19 @@ class RemoteAgentRunRoutes:
             return
         request_id = str(payload.get("request_id") or "")
         task_id = str(payload.get("agent_run_id") or "")
+        activation_id = str(payload.get("activation_id") or "")
         worker_id = str(payload.get("worker_id") or "")
-        if not request_id or not task_id or not worker_id:
+        if not request_id or not task_id or not activation_id or not worker_id:
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                "request_id_agent_run_id_and_worker_id_required",
+                "request_id_agent_run_id_activation_id_and_worker_id_required",
             )
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
-        response = self.service.runtime_control_plane.heartbeat_agent_run(
+        response = self.service.runtime_control_plane.heartbeat_agent_run_activation(
             request_id=request_id,
             task_id=task_id,
+            activation_id=activation_id,
             worker_id=worker_id,
             peer_id=peer_id,
             lease_sec=(
@@ -248,7 +250,7 @@ class RemoteAgentRunRoutes:
         )
         self._send_json(HTTPStatus.OK, response)
 
-    def _handle_agent_run_session(self) -> None:
+    def _handle_agent_run_activation_session(self) -> None:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
@@ -260,11 +262,12 @@ class RemoteAgentRunRoutes:
             return
         request_id = str(payload.get("request_id") or "")
         task_id = str(payload.get("agent_run_id") or "")
+        activation_id = str(payload.get("activation_id") or "")
         worker_id = str(payload.get("worker_id") or "")
-        if not request_id or not task_id or not worker_id:
+        if not request_id or not task_id or not activation_id or not worker_id:
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                "request_id_agent_run_id_and_worker_id_required",
+                "request_id_agent_run_id_activation_id_and_worker_id_required",
             )
             return
         metadata: dict[str, Any] = {}
@@ -272,9 +275,10 @@ class RemoteAgentRunRoutes:
             if payload.get(key) is not None:
                 metadata[key] = str(payload[key])
         try:
-            ok, reason = self.service.runtime_control_plane.pin_claimed_session(
+            ok, reason = self.service.runtime_control_plane.pin_claimed_activation_session(
                 request_id=request_id,
                 task_id=task_id,
+                activation_id=activation_id,
                 worker_id=worker_id,
                 peer_id=peer_id,
                 workdir=(
@@ -308,7 +312,7 @@ class RemoteAgentRunRoutes:
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True})
 
-    def _handle_agent_run_event(self) -> None:
+    def _handle_agent_run_activation_event(self) -> None:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
@@ -320,12 +324,13 @@ class RemoteAgentRunRoutes:
             return
         task_id = str(payload.get("agent_run_id") or "")
         request_id = str(payload.get("request_id") or "")
+        activation_id = str(payload.get("activation_id") or "")
         worker_id = str(payload.get("worker_id") or "")
         event_type = str(payload.get("type") or "")
-        if not task_id or not event_type or not request_id or not worker_id:
+        if not task_id or not event_type or not request_id or not activation_id or not worker_id:
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                "request_id_agent_run_id_worker_id_and_type_required",
+                "request_id_agent_run_id_activation_id_worker_id_and_type_required",
             )
             return
         data = payload.get("data", {})
@@ -341,6 +346,7 @@ class RemoteAgentRunRoutes:
                 data=dict(data) if isinstance(data, dict) else {},
             ),
             request_id=request_id,
+            activation_id=activation_id,
             worker_id=worker_id,
             peer_id=peer_id,
         )
@@ -355,7 +361,7 @@ class RemoteAgentRunRoutes:
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True})
 
-    def _handle_agent_run_model_request(self) -> None:
+    def _handle_agent_run_activation_model_request(self) -> None:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
@@ -382,6 +388,7 @@ class RemoteAgentRunRoutes:
                 model=prepared.provider_model,
             ),
             request_id=str(prepared.metadata.get("request_id") or ""),
+            activation_id=str(prepared.metadata.get("activation_id") or ""),
             worker_id=str(prepared.metadata.get("worker_id") or ""),
             peer_id=peer_id,
         )
@@ -465,7 +472,7 @@ class RemoteAgentRunRoutes:
 
         threading.Thread(
             target=run_bridge,
-            name="agent-run-model-request",
+            name="agent-run-activation-model-request",
             daemon=True,
         ).start()
         try:
@@ -493,7 +500,7 @@ class RemoteAgentRunRoutes:
         finally:
             stop_event.set()
 
-    def _handle_agent_run_complete(self) -> None:
+    def _handle_agent_run_activation_complete(self) -> None:
         payload = self._read_json()
         peer_token = payload.get("peer_token")
         peer_id = self._verify_peer_token(peer_token)
@@ -505,11 +512,12 @@ class RemoteAgentRunRoutes:
             return
         task_id = str(payload.get("agent_run_id") or "")
         request_id = str(payload.get("request_id") or "")
+        activation_id = str(payload.get("activation_id") or "")
         worker_id = str(payload.get("worker_id") or "")
-        if not task_id or not request_id or not worker_id:
+        if not task_id or not request_id or not activation_id or not worker_id:
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                "request_id_agent_run_id_and_worker_id_required",
+                "request_id_agent_run_id_activation_id_and_worker_id_required",
             )
             return
         raw_events = payload.get("events", [])
@@ -550,10 +558,11 @@ class RemoteAgentRunRoutes:
             ),
         )
         try:
-            ok, reason, completed = self.service.runtime_control_plane.complete_claimed_agent_run(
+            ok, reason, completed = self.service.runtime_control_plane.complete_claimed_agent_run_activation(
                 task_id,
                 result,
                 request_id=request_id,
+                activation_id=activation_id,
                 worker_id=worker_id,
                 peer_id=peer_id,
                 artifacts=[

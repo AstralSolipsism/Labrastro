@@ -2136,23 +2136,23 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/capability-packages/install/result":
                     self._handle_capability_package_install_result()
                     return
-                if parsed.path == "/remote/agent-runs/claim":
-                    self._handle_agent_run_claim()
+                if parsed.path == "/remote/agent-run-activations/claim":
+                    self._handle_agent_run_activation_claim()
                     return
-                if parsed.path == "/remote/agent-runs/event":
-                    self._handle_agent_run_event()
+                if parsed.path == "/remote/agent-run-activations/event":
+                    self._handle_agent_run_activation_event()
                     return
-                if parsed.path == "/remote/agent-runs/model-request":
-                    self._handle_agent_run_model_request()
+                if parsed.path == "/remote/agent-run-activations/model-request":
+                    self._handle_agent_run_activation_model_request()
                     return
-                if parsed.path == "/remote/agent-runs/heartbeat":
-                    self._handle_agent_run_heartbeat()
+                if parsed.path == "/remote/agent-run-activations/heartbeat":
+                    self._handle_agent_run_activation_heartbeat()
                     return
-                if parsed.path == "/remote/agent-runs/session":
-                    self._handle_agent_run_session()
+                if parsed.path == "/remote/agent-run-activations/session":
+                    self._handle_agent_run_activation_session()
                     return
-                if parsed.path == "/remote/agent-runs/complete":
-                    self._handle_agent_run_complete()
+                if parsed.path == "/remote/agent-run-activations/complete":
+                    self._handle_agent_run_activation_complete()
                     return
                 if parsed.path == "/remote/disconnect":
                     self._handle_disconnect()
