@@ -1,4 +1,4 @@
-"""Project AgentRun execution facts into canonical SessionRun events."""
+﻿"""Project AgentRun execution facts into canonical SessionRun events."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class AgentRunSessionProjectionLabels:
     agent_id: str = "agent"
     workflow: str = "agent_run"
     queued_title: str = "AgentRun queued"
-    claimed_title: str = "AgentRun claimed by worker"
+    claimed_title: str = "AgentRun activation claimed by worker"
     session_ready_title: str = "AgentRun execution environment ready"
     session_ready_with_workdir_title: str = "AgentRun execution environment ready: {workdir}"
     log_fallback_title: str = "AgentRun log"
@@ -87,6 +87,140 @@ def agent_run_event_to_session_events(
                         "peer_id": str(data.get("peer_id") or ""),
                         "worker_kind": str(data.get("worker_kind") or ""),
                         "request_id": str(data.get("request_id") or ""),
+                    },
+                ),
+            )
+        ]
+    if event_type == "activation_queued":
+        activation = data.get("activation") if isinstance(data.get("activation"), dict) else {}
+        return [
+            (
+                "context_event",
+                _context_event(
+                    labels,
+                    f"{labels.agent_id} activation queued",
+                    "agent_run_activation_queued",
+                    {
+                        **base,
+                        "activation_id": str(
+                            data.get("activation_id") or activation.get("activation_id") or activation.get("id") or ""
+                        ),
+                        "activation": _public_activation_payload(activation),
+                    },
+                ),
+            )
+        ]
+    if event_type == "activation_completed":
+        activation = data.get("activation") if isinstance(data.get("activation"), dict) else {}
+        return [
+            (
+                "context_event",
+                _context_event(
+                    labels,
+                    f"{labels.agent_id} activation completed",
+                    "agent_run_activation_completed",
+                    {
+                        **base,
+                        "activation_id": str(
+                            data.get("activation_id") or activation.get("activation_id") or activation.get("id") or ""
+                        ),
+                        "activation": _public_activation_payload(activation),
+                    },
+                ),
+            )
+        ]
+    if event_type == "activation_steer_queued":
+        steer = data.get("steer") if isinstance(data.get("steer"), dict) else {}
+        return [
+            (
+                "context_event",
+                _context_event(
+                    labels,
+                    f"{labels.agent_id} activation steer queued",
+                    "agent_run_activation_steer_queued",
+                    {
+                        **base,
+                        "activation_id": str(
+                            data.get("activation_id")
+                            or steer.get("activation_id")
+                            or ""
+                        ),
+                        "steer_id": str(data.get("steer_id") or steer.get("id") or ""),
+                        "steer": _public_steer_payload(steer),
+                    },
+                ),
+            )
+        ]
+    if event_type in {"agent_run_feedback_added", "agent_run_feedback_consumed"}:
+        feedback = data.get("feedback") if isinstance(data.get("feedback"), dict) else {}
+        feedback_id = str(data.get("feedback_id") or feedback.get("id") or "")
+        if event_type == "agent_run_feedback_added" and feedback.get("kind") in {
+            "agent_call_result",
+            "agent_call_failed",
+        }:
+            agent_call = _public_agent_call_payload(
+                feedback.get("payload")
+                if isinstance(feedback.get("payload"), dict)
+                else {}
+            )
+            phase = str(feedback.get("kind") or "")
+            agent_id = str(agent_call.get("agent_id") or labels.agent_id)
+            status = str(agent_call.get("status") or "")
+            return [
+                (
+                    "context_event",
+                    _context_event(
+                        labels,
+                        f"{agent_id} {status}".strip(),
+                        phase,
+                        {
+                            **base,
+                            "feedback_id": feedback_id,
+                            "feedback": _public_feedback_payload(feedback),
+                            "agent_call": agent_call,
+                        },
+                    ),
+                )
+            ]
+        phase = (
+            "agent_run_feedback_consumed"
+            if event_type == "agent_run_feedback_consumed"
+            else "agent_run_feedback_added"
+        )
+        return [
+            (
+                "context_event",
+                _context_event(
+                    labels,
+                    f"{labels.agent_id} feedback {'consumed' if event_type == 'agent_run_feedback_consumed' else 'added'}",
+                    phase,
+                    {
+                        **base,
+                        "feedback_id": feedback_id,
+                        "feedback": _public_feedback_payload(feedback),
+                        "activation_id": str(
+                            data.get("activation_id")
+                            or feedback.get("consumed_by_activation_id")
+                            or ""
+                        ),
+                    },
+                ),
+            )
+        ]
+    if event_type in {"agent_call_result", "agent_call_failed"}:
+        agent_call = _public_agent_call_payload(data)
+        agent_id = str(agent_call.get("agent_id") or labels.agent_id)
+        status = str(agent_call.get("status") or "")
+        return [
+            (
+                "context_event",
+                _context_event(
+                    labels,
+                    f"{agent_id} {status}".strip(),
+                    event_type,
+                    {
+                        **base,
+                        "agent_call": agent_call,
                     },
                 ),
             )
@@ -292,7 +426,7 @@ def agent_run_event_to_session_events(
                 ),
             )
         ]
-    if event_type == "delegated_run_completed":
+    if event_type == "agent_relation_completed":
         child_run_id = str(data.get("agent_run_id") or data.get("run_id") or "")
         child_agent_id = str(data.get("agent_id") or "")
         status = str(data.get("status") or "completed")
@@ -307,8 +441,8 @@ def agent_run_event_to_session_events(
                 "context_event",
                 _context_event(
                     labels,
-                    f"{child_agent_id or 'delegated agent'} {status}",
-                    "delegated_run_completed",
+                    f"{child_agent_id or 'related agent'} {status}",
+                    "agent_relation_completed",
                     {
                         **base,
                         "child_agent_run_id": child_run_id,
@@ -554,7 +688,7 @@ def _without_large_output_fields(data: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in data.items()
-        if key not in {"output", "content", "text", "result"}
+        if key not in {"output", "content", "text", "result", "summary"}
     }
 
 
@@ -602,7 +736,6 @@ def _tool_identity_payload(data: dict[str, Any], *, marker: str) -> dict[str, An
         if value is not None and str(value).strip()
     }
 
-
 def _capability_target_payload(data: dict[str, Any]) -> dict[str, Any]:
     raw = data.get("capability_target", data.get("capabilityTarget"))
     if not isinstance(raw, dict):
@@ -612,6 +745,99 @@ def _capability_target_payload(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
     return dict(raw)
+
+
+def _public_activation_payload(activation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: activation.get(key)
+        for key in (
+            "id",
+            "activation_id",
+            "agent_run_id",
+            "seq",
+            "input_kind",
+            "status",
+            "worker_id",
+            "request_id",
+            "started_at",
+            "ended_at",
+        )
+        if activation.get(key) not in (None, "")
+    }
+
+
+def _public_feedback_payload(feedback: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: feedback.get(key)
+        for key in (
+            "id",
+            "agent_run_id",
+            "source",
+            "kind",
+            "created_at",
+            "consumed_by_activation_id",
+            "visibility",
+            "requires_activation",
+        )
+        if feedback.get(key) not in (None, "")
+    }
+
+
+def _public_steer_payload(steer: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: steer.get(key)
+        for key in (
+            "id",
+            "activation_id",
+            "source",
+            "created_at",
+            "delivered_at",
+            "status",
+        )
+        if steer.get(key) not in (None, "")
+    }
+
+
+def _public_agent_call_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    public = {
+        key: payload.get(key)
+        for key in (
+            "agent_id",
+            "target_agent_run_id",
+            "conversation_scope",
+            "wait",
+            "thread_key",
+            "status",
+            "summary",
+            "error_code",
+            "message",
+        )
+        if payload.get(key) not in (None, "")
+    }
+    evidence_refs = _public_evidence_refs(payload.get("evidence_refs"))
+    if evidence_refs:
+        public["evidence_refs"] = evidence_refs
+    artifact_refs = _public_evidence_refs(payload.get("artifact_refs"))
+    if artifact_refs:
+        public["artifact_refs"] = artifact_refs
+    return public
+
+
+def _public_evidence_refs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    refs: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        public = {
+            key: item.get(key)
+            for key in ("path", "line", "tool_call_id", "artifact_id", "title")
+            if item.get(key) not in (None, "")
+        }
+        if public:
+            refs.append(public)
+    return refs
 
 
 def _public_payload(data: dict[str, Any], *, marker: str) -> dict[str, Any]:

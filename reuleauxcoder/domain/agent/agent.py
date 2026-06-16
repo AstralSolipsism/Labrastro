@@ -575,6 +575,43 @@ class Agent:
             ),
         }
 
+    def _agent_call_grant_decision(
+        self,
+        request: PermissionRequest,
+    ) -> PermissionDecision | None:
+        context = dict(request.metadata.get("agent_call_grant") or {})
+        if not context or not context.get("granted"):
+            return None
+        audit = {
+            "agent_id": request.subject.agent_id,
+            "source": request.subject.trigger_source,
+            "interactive": request.subject.interactive,
+            "target_kind": request.target.kind,
+            "target_name": request.target.name,
+            "tool_source": request.target.tool_source,
+            "runtime_profile_id": request.subject.runtime_profile_id,
+        }
+        if request.subject.session_id:
+            audit["session_id"] = request.subject.session_id
+        if request.subject.task_id:
+            audit["task_id"] = request.subject.task_id
+        if request.target.mcp_server:
+            audit["mcp_server"] = request.target.mcp_server
+        audit["agent_call_grant"] = {
+            "user_id": str(context.get("user_id") or ""),
+            "scope": str(context.get("scope") or ""),
+            "main_agent_id": str(context.get("main_agent_id") or ""),
+            "target_agent_id": str(context.get("target_agent_id") or ""),
+            "mode": str(context.get("mode") or ""),
+            "target_config_version": str(context.get("target_config_version") or ""),
+        }
+        return PermissionDecision(
+            action=PermissionAction.ALLOW,
+            authorized=True,
+            policy_matched="agent_call_grant",
+            audit=audit,
+        )
+
     def _dispatch_agent_lifecycle_event(
         self,
         event_name: str,
@@ -1069,6 +1106,9 @@ class Agent:
             tool_call=tool_call,
             action=action,
         )
+        grant_decision = self._agent_call_grant_decision(request)
+        if grant_decision is not None:
+            return grant_decision
         gateway = PermissionGateway()
         initial_decision = gateway.evaluate(request)
         if not self._should_dispatch_permission_lifecycle(
@@ -1093,6 +1133,10 @@ class Agent:
         action: str,
     ) -> PermissionRequest:
         agent_config = self._current_agent_config()
+        metadata = self._permission_metadata_for_tool(tool)
+        grant_context = getattr(tool, "agent_call_grant_context", None)
+        if tool_call is not None and callable(grant_context):
+            metadata["agent_call_grant"] = grant_context(tool_call.arguments)
         return PermissionRequest(
             subject=self._permission_subject(),
             target=self._permission_target_for_tool(tool),
@@ -1103,7 +1147,7 @@ class Agent:
             runtime_profile=self._runtime_profile_for_agent(agent_config),
             agent_config=agent_config,
             enforce_effective_capabilities=self.capability_tool_policy_enabled(),
-            metadata=self._permission_metadata_for_tool(tool),
+            metadata=metadata,
         )
 
     @staticmethod

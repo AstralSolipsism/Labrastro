@@ -68,7 +68,6 @@ def _control_plane(*, locale: str = "") -> AgentRunControlPlane:
     )
     control.submit_agent_run(
         AgentRunRequest(
-            issue_id="pkg",
             agent_id="capability_packager",
             prompt="package",
             source="capability_ingest",
@@ -76,7 +75,7 @@ def _control_plane(*, locale: str = "") -> AgentRunControlPlane:
         ),
         task_id="run-1",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="sandbox_worker",
         executors=["reuleauxcoder"],
@@ -87,8 +86,13 @@ def _control_plane(*, locale: str = "") -> AgentRunControlPlane:
     return control
 
 
+def _active_claim(control: AgentRunControlPlane):
+    return next(iter(control._claims.values()))
+
+
 def test_model_bridge_validates_claim_and_uses_run_model_binding(monkeypatch, caplog) -> None:
     control = _control_plane()
+    claim = _active_claim(control)
     provider = _Provider()
     monkeypatch.setattr(
         "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
@@ -105,7 +109,8 @@ def test_model_bridge_validates_claim_and_uses_run_model_binding(monkeypatch, ca
     prepared = bridge.prepare(
         {
             "agent_run_id": "run-1",
-            "request_id": next(iter(control._claims)),
+            "request_id": claim.request_id,
+            "activation_id": claim.activation_id,
             "worker_id": "worker-1",
             "messages": [{"role": "user", "content": "hi"}],
             "parameters": {"max_tokens": 1},
@@ -149,6 +154,7 @@ def test_model_bridge_provider_failure_keeps_protocol_diagnostics(monkeypatch) -
             return None
 
     control = _control_plane()
+    claim = _active_claim(control)
     monkeypatch.setattr(
         "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
         lambda _self, _config: _FailingProvider(),
@@ -160,7 +166,8 @@ def test_model_bridge_provider_failure_keeps_protocol_diagnostics(monkeypatch) -
     prepared = bridge.prepare(
         {
             "agent_run_id": "run-1",
-            "request_id": next(iter(control._claims)),
+            "request_id": claim.request_id,
+            "activation_id": claim.activation_id,
             "worker_id": "worker-1",
             "messages": [{"role": "user", "content": "hi"}],
         },
@@ -182,6 +189,7 @@ def test_model_bridge_provider_failure_keeps_protocol_diagnostics(monkeypatch) -
 
 def test_model_bridge_injects_locale_instruction_from_agent_run_metadata(monkeypatch) -> None:
     control = _control_plane(locale="zh-CN")
+    claim = _active_claim(control)
     provider = _Provider()
     monkeypatch.setattr(
         "labrastro_server.services.agent_runtime.model_bridge.ProviderManager.create",
@@ -195,7 +203,8 @@ def test_model_bridge_injects_locale_instruction_from_agent_run_metadata(monkeyp
     prepared = bridge.prepare(
         {
             "agent_run_id": "run-1",
-            "request_id": next(iter(control._claims)),
+            "request_id": claim.request_id,
+            "activation_id": claim.activation_id,
             "worker_id": "worker-1",
             "messages": [{"role": "user", "content": "hi"}],
         },
@@ -213,6 +222,7 @@ def test_model_bridge_injects_locale_instruction_from_agent_run_metadata(monkeyp
 
 def test_model_bridge_rejects_claim_mismatch() -> None:
     control = _control_plane()
+    claim = _active_claim(control)
     bridge = AgentRunModelBridge(
         runtime_control_plane=control,
         admin_manager=_AdminManager(),
@@ -223,6 +233,7 @@ def test_model_bridge_rejects_claim_mismatch() -> None:
             {
                 "agent_run_id": "run-1",
                 "request_id": "claim-missing",
+                "activation_id": claim.activation_id,
                 "worker_id": "worker-1",
                 "messages": [{"role": "user", "content": "hi"}],
             },

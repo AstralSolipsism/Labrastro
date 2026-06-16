@@ -22,7 +22,6 @@ def test_reuleaux_backend_binds_memory_scope_from_executor_request() -> None:
             seen["owner_agent_id"] = getattr(self, "memory_owner_agent_id", None)
             seen["namespace"] = getattr(self, "memory_namespace", None)
             seen["task_id"] = getattr(self, "memory_task_id", None)
-            seen["issue_id"] = getattr(self, "memory_issue_id", None)
             seen["project_id"] = getattr(self, "memory_project_id", None)
             seen["workspace_id"] = getattr(self, "memory_workspace_id", None)
             seen["goal_id"] = getattr(self, "memory_goal_id", None)
@@ -35,7 +34,6 @@ def test_reuleaux_backend_binds_memory_scope_from_executor_request() -> None:
         agent_id="agent-a",
         executor=ExecutorType.REULEAUXCODER,
         prompt="run task",
-        issue_id="issue-1",
         workdir="/workspace/project",
         metadata={
             "project_id": "project-1",
@@ -53,7 +51,6 @@ def test_reuleaux_backend_binds_memory_scope_from_executor_request() -> None:
         "owner_agent_id": "agent-a",
         "namespace": "agent-a",
         "task_id": "task-1",
-        "issue_id": "issue-1",
         "project_id": "project-1",
         "workspace_id": "workspace-1",
         "goal_id": "goal-1",

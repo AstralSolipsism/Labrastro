@@ -74,6 +74,10 @@ class Tool(ABC):
         """
         return None
 
+    def on_preflight_failed(self, *, arguments: dict[str, Any], error: str) -> None:
+        """Optional lifecycle hook invoked when ToolExecutor stops at preflight."""
+        return None
+
     @property
     def backend_id(self) -> str:
         return getattr(self.backend, "backend_id", "local")

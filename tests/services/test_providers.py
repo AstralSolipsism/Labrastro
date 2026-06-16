@@ -1,4 +1,4 @@
-﻿from types import SimpleNamespace
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -109,6 +109,7 @@ def test_labrastro_server_provider_streams_through_agent_run_bridge(monkeypatch)
     monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ACTIVATION_ID", "run-1:activation:1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
 
     class FakeStream:
@@ -180,10 +181,11 @@ def test_labrastro_server_provider_streams_through_agent_run_bridge(monkeypatch)
     assert response.tool_calls[0].arguments == {"path": "README.md"}
     call = fake_client.calls[0]
     assert call["method"] == "POST"
-    assert call["url"] == "http://127.0.0.1:8765/remote/agent-runs/model-request"
+    assert call["url"] == "http://127.0.0.1:8765/remote/agent-run-activations/model-request"
     assert call["json"]["peer_token"] == "peer-token"
     assert call["json"]["agent_run_id"] == "run-1"
     assert call["json"]["request_id"] == "claim-1"
+    assert call["json"]["activation_id"] == "run-1:activation:1"
     assert call["json"]["worker_id"] == "worker-1"
     assert call["json"]["parameters"]["max_tokens"] == 384000
 
@@ -193,6 +195,7 @@ def test_labrastro_server_provider_converts_transport_drop_to_stream_interruptio
     monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ACTIVATION_ID", "run-1:activation:1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
 
     class BrokenStream:
@@ -244,6 +247,7 @@ def test_labrastro_server_provider_uses_interrupted_sse_terminal_as_stream_inter
     monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ACTIVATION_ID", "run-1:activation:1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
 
     class InterruptedStream:
@@ -293,6 +297,7 @@ def test_labrastro_server_provider_does_not_apply_idle_read_timeout(monkeypatch)
     monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ACTIVATION_ID", "run-1:activation:1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
 
     provider = LabrastroServerProvider(
@@ -316,6 +321,7 @@ def test_labrastro_server_llm_is_configured_without_local_api_key(monkeypatch) -
     monkeypatch.setenv("LABRASTRO_PEER_TOKEN", "peer-token")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_ID", "run-1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_REQUEST_ID", "claim-1")
+    monkeypatch.setenv("LABRASTRO_AGENT_RUN_ACTIVATION_ID", "run-1:activation:1")
     monkeypatch.setenv("LABRASTRO_AGENT_RUN_WORKER_ID", "worker-1")
 
     llm = LLM(
@@ -334,6 +340,7 @@ def test_labrastro_server_llm_reports_missing_worker_environment(monkeypatch) ->
         "LABRASTRO_PEER_TOKEN",
         "LABRASTRO_AGENT_RUN_ID",
         "LABRASTRO_AGENT_RUN_REQUEST_ID",
+        "LABRASTRO_AGENT_RUN_ACTIVATION_ID",
         "LABRASTRO_AGENT_RUN_WORKER_ID",
     ):
         monkeypatch.delenv(key, raising=False)

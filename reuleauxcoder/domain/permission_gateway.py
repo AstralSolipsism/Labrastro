@@ -349,12 +349,20 @@ class PermissionGateway:
                 policy_matched="agent.taskflow_eligible",
                 audit={"agent_id": agent_config.id, "source": source},
             )
-        if source == "delegation" and not agent_config.can_delegate:
+        if source == "agent_call_ephemeral" and not agent_config.can_call_ephemeral:
             return PermissionDecision(
                 action=PermissionAction.DENY,
                 authorized=False,
-                reason=f"agent '{agent_config.id}' is not delegable",
-                policy_matched="agent.delegable",
+                reason=f"agent '{agent_config.id}' does not allow ephemeral calls",
+                policy_matched="agent.callable_scopes.ephemeral",
+                audit={"agent_id": agent_config.id, "source": source},
+            )
+        if source == "agent_call_persistent" and not agent_config.can_call_persistent:
+            return PermissionDecision(
+                action=PermissionAction.DENY,
+                authorized=False,
+                reason=f"agent '{agent_config.id}' does not allow persistent calls",
+                policy_matched="agent.callable_scopes.persistent",
                 audit={"agent_id": agent_config.id, "source": source},
             )
         return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
@@ -363,16 +371,16 @@ class PermissionGateway:
         effective = request.effective_capabilities or {}
         target = request.target
         candidates = _target_candidates(target)
+        tool_spec_match = _tool_spec_match(effective.get("tool_specs"), target, candidates)
+        if tool_spec_match:
+            return tool_spec_match
+
         if target.tool_source in {"builtin", "builtin_tool"} or target.kind in {
             "builtin",
             "builtin_tool",
             "tool",
         }:
             return _builtin_tool_grant_match(effective, target, candidates)
-
-        tool_spec_match = _tool_spec_match(effective.get("tool_specs"), target, candidates)
-        if tool_spec_match:
-            return tool_spec_match
 
         if target.tool_source == "mcp" or target.kind in {"mcp", "mcp_tool"}:
             mcp_tool_match = _mcp_tool_grant_match(effective, target)
@@ -689,6 +697,23 @@ def _tool_spec_match(
             or ""
         ).strip()
         name = str(spec.get("name") or "").strip()
+        if target.tool_source in {"builtin", "builtin_tool"} or target.kind in {
+            "builtin",
+            "builtin_tool",
+            "tool",
+        }:
+            if source_type != "builtin_tool":
+                continue
+            metadata_component_id = str(
+                metadata.get("component_id") if isinstance(metadata, dict) else ""
+            ).strip()
+            target_component_id = str(target.component_id or "").strip()
+            if not metadata_component_id or metadata_component_id != target_component_id:
+                continue
+            possible = {tool_id, target_ref, name}
+            if candidates.intersection({item for item in possible if item}):
+                return tool_id or target_ref or name
+            continue
         if _is_mcp_target(target) or source_type in {"mcp_tool", "local_mcp", "remote_mcp"}:
             possible = _mcp_tool_spec_candidates(
                 tool_id=tool_id,

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from labrastro_server.infrastructure.persistence import migration
@@ -42,3 +43,37 @@ def test_run_migrations_widens_alembic_version_column(monkeypatch) -> None:
     assert "VARCHAR(255)" in statements
     assert "ALTER TABLE alembic_version" in statements
     assert "ALTER COLUMN version_num TYPE VARCHAR(255)" in statements
+
+
+def test_agent_run_activation_schema_is_folded_into_initial_baseline() -> None:
+    versions_dir = (
+        Path(__file__).resolve().parents[3]
+        / "labrastro_server"
+        / "infrastructure"
+        / "persistence"
+        / "migrations"
+        / "versions"
+    )
+    baseline_sql = (versions_dir / "0001_postgres_control_plane.py").read_text(
+        encoding="utf-8"
+    )
+    next_revision = (versions_dir / "0002_taskflow_control_plane.py").read_text(
+        encoding="utf-8"
+    )
+
+    for removed_incremental in (
+        "0014_agent_run_activation_steers.py",
+        "0015_agent_call_grants.py",
+        "0016_agent_run_feedback_requires_activation.py",
+    ):
+        assert not (versions_dir / removed_incremental).exists()
+
+    assert 'down_revision = "0001_postgres_control_plane"' in next_revision
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_activations" in baseline_sql
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_feedback" in baseline_sql
+    assert "requires_activation BOOLEAN NOT NULL DEFAULT FALSE" in baseline_sql
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_relations" in baseline_sql
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_thread_bindings" in baseline_sql
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_activation_claims" in baseline_sql
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_activation_steers" in baseline_sql
+    assert "CREATE TABLE IF NOT EXISTS labrastro_agent_call_grants" in baseline_sql

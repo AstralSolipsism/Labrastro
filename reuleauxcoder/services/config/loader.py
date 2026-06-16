@@ -767,7 +767,7 @@ class ConfigLoader:
                     {"tool_name": "apply_patch", "action": "require_approval"},
                     {"tool_name": "draft_document_begin", "action": "require_approval"},
                     {"tool_name": "shell", "action": "require_approval"},
-                    {"tool_name": "delegate_agent", "action": "require_approval"},
+                    {"tool_name": "call_agent", "action": "require_approval"},
                     {"tool_source": "mcp", "action": "require_approval"},
                 ],
             },

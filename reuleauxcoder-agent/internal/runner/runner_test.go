@@ -30,13 +30,14 @@ func TestMain(m *testing.M) {
 		payload := map[string]any{
 			"args": os.Args[1:],
 			"env": map[string]string{
-				"RCODER_CONFIG_PATH":             os.Getenv("RCODER_CONFIG_PATH"),
-				"LABRASTRO_REMOTE_BASE_URL":      os.Getenv("LABRASTRO_REMOTE_BASE_URL"),
-				"LABRASTRO_PEER_TOKEN":           os.Getenv("LABRASTRO_PEER_TOKEN"),
-				"LABRASTRO_AGENT_RUN_ID":         os.Getenv("LABRASTRO_AGENT_RUN_ID"),
-				"LABRASTRO_AGENT_RUN_REQUEST_ID": os.Getenv("LABRASTRO_AGENT_RUN_REQUEST_ID"),
-				"LABRASTRO_AGENT_RUN_WORKER_ID":  os.Getenv("LABRASTRO_AGENT_RUN_WORKER_ID"),
-				"RUNNER_HELPER_CAPTURE_PATH":     capturePath,
+				"RCODER_CONFIG_PATH":                os.Getenv("RCODER_CONFIG_PATH"),
+				"LABRASTRO_REMOTE_BASE_URL":         os.Getenv("LABRASTRO_REMOTE_BASE_URL"),
+				"LABRASTRO_PEER_TOKEN":              os.Getenv("LABRASTRO_PEER_TOKEN"),
+				"LABRASTRO_AGENT_RUN_ID":            os.Getenv("LABRASTRO_AGENT_RUN_ID"),
+				"LABRASTRO_AGENT_RUN_REQUEST_ID":    os.Getenv("LABRASTRO_AGENT_RUN_REQUEST_ID"),
+				"LABRASTRO_AGENT_RUN_ACTIVATION_ID": os.Getenv("LABRASTRO_AGENT_RUN_ACTIVATION_ID"),
+				"LABRASTRO_AGENT_RUN_WORKER_ID":     os.Getenv("LABRASTRO_AGENT_RUN_WORKER_ID"),
+				"RUNNER_HELPER_CAPTURE_PATH":        capturePath,
 			},
 			"config": configContent,
 		}
@@ -318,20 +319,21 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var completed atomic.Bool
-	var completeReq protocol.AgentRunCompleteRequest
+	var completeReq protocol.AgentRunActivationCompleteRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch req.URL.Path {
-		case "/remote/agent-runs/claim":
+		case "/remote/agent-run-activations/claim":
 			if completed.Load() {
-				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
-				Claim: &protocol.AgentRunClaim{
-					RequestID: "claim-1",
-					WorkerID:  "worker-1",
-					AgentRun:  map[string]any{"id": "run-1"},
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{
+				Claim: &protocol.AgentRunActivationClaim{
+					RequestID:    "claim-1",
+					ActivationID: "run-1:activation:1",
+					WorkerID:     "worker-1",
+					AgentRun:     map[string]any{"id": "run-1"},
 					ExecutorRequest: protocol.ExecutorRequest{
 						TaskID:             "run-1",
 						AgentID:            "capability_packager",
@@ -377,9 +379,9 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 					},
 				},
 			})
-		case "/remote/agent-runs/event", "/remote/agent-runs/heartbeat", "/remote/agent-runs/session":
+		case "/remote/agent-run-activations/event", "/remote/agent-run-activations/heartbeat", "/remote/agent-run-activations/session":
 			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
-		case "/remote/agent-runs/complete":
+		case "/remote/agent-run-activations/complete":
 			defer cancel()
 			completed.Store(true)
 			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
@@ -410,7 +412,7 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 	if len(completeReq.Events) != 0 {
 		t.Fatalf("streamed runtime events must not be replayed on complete: %#v", completeReq.Events)
 	}
-	if completeReq.TaskID != "run-1" || completeReq.RequestID != "claim-1" || completeReq.WorkerID != "worker-1" {
+	if completeReq.TaskID != "run-1" || completeReq.RequestID != "claim-1" || completeReq.ActivationID != "run-1:activation:1" || completeReq.WorkerID != "worker-1" {
 		t.Fatalf("complete request identifiers not preserved: %#v", completeReq)
 	}
 
@@ -430,6 +432,7 @@ func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 		capture.Env["LABRASTRO_PEER_TOKEN"] != "peer-token" ||
 		capture.Env["LABRASTRO_AGENT_RUN_ID"] != "run-1" ||
 		capture.Env["LABRASTRO_AGENT_RUN_REQUEST_ID"] != "claim-1" ||
+		capture.Env["LABRASTRO_AGENT_RUN_ACTIVATION_ID"] != "run-1:activation:1" ||
 		capture.Env["LABRASTRO_AGENT_RUN_WORKER_ID"] != "worker-1" {
 		t.Fatalf("server-origin bridge env not injected: %#v", capture.Env)
 	}
@@ -468,20 +471,21 @@ func TestAgentRunLoopCompletesOnlyFailedLiveEvents(t *testing.T) {
 	var failedTextEvents atomic.Int32
 	var forwardedSessionPinned atomic.Bool
 	var sessionPins atomic.Int32
-	var completeReq protocol.AgentRunCompleteRequest
+	var completeReq protocol.AgentRunActivationCompleteRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch req.URL.Path {
-		case "/remote/agent-runs/claim":
+		case "/remote/agent-run-activations/claim":
 			if completed.Load() {
-				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
-				Claim: &protocol.AgentRunClaim{
-					RequestID: "claim-1",
-					WorkerID:  "worker-1",
-					AgentRun:  map[string]any{"id": "run-1"},
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{
+				Claim: &protocol.AgentRunActivationClaim{
+					RequestID:    "claim-1",
+					ActivationID: "run-1:activation:1",
+					WorkerID:     "worker-1",
+					AgentRun:     map[string]any{"id": "run-1"},
 					ExecutorRequest: protocol.ExecutorRequest{
 						TaskID:            "run-1",
 						AgentID:           "capability_packager",
@@ -517,12 +521,15 @@ func TestAgentRunLoopCompletesOnlyFailedLiveEvents(t *testing.T) {
 					},
 				},
 			})
-		case "/remote/agent-runs/event":
-			var event protocol.AgentRunEventReport
+		case "/remote/agent-run-activations/event":
+			var event protocol.AgentRunActivationEventReport
 			if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
 				t.Errorf("decode event request: %v", err)
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
+			}
+			if event.ActivationID != "run-1:activation:1" {
+				t.Errorf("event activation_id = %q", event.ActivationID)
 			}
 			if event.Type == "status" && event.Data["status"] == "session_pinned" {
 				forwardedSessionPinned.Store(true)
@@ -532,12 +539,12 @@ func TestAgentRunLoopCompletesOnlyFailedLiveEvents(t *testing.T) {
 				return
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
-		case "/remote/agent-runs/session":
+		case "/remote/agent-run-activations/session":
 			sessionPins.Add(1)
 			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
-		case "/remote/agent-runs/heartbeat":
+		case "/remote/agent-run-activations/heartbeat":
 			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
-		case "/remote/agent-runs/complete":
+		case "/remote/agent-run-activations/complete":
 			defer cancel()
 			completed.Store(true)
 			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
@@ -568,6 +575,9 @@ func TestAgentRunLoopCompletesOnlyFailedLiveEvents(t *testing.T) {
 	if len(completeReq.Events) != 1 {
 		t.Fatalf("complete events = %#v, want only failed live event", completeReq.Events)
 	}
+	if completeReq.ActivationID != "run-1:activation:1" || completeReq.Events[0].ActivationID != "run-1:activation:1" {
+		t.Fatalf("activation_id not preserved in complete: %#v", completeReq)
+	}
 	if completeReq.Events[0].Type != "text" || completeReq.Events[0].Text != "helper ok" {
 		t.Fatalf("failed live event not preserved: %#v", completeReq.Events[0])
 	}
@@ -591,20 +601,21 @@ func TestAgentRunLoopCompletesFailedPrepareEvents(t *testing.T) {
 	defer cancel()
 	var completed atomic.Bool
 	var failedPrepareEvents atomic.Int32
-	var completeReq protocol.AgentRunCompleteRequest
+	var completeReq protocol.AgentRunActivationCompleteRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch req.URL.Path {
-		case "/remote/agent-runs/claim":
+		case "/remote/agent-run-activations/claim":
 			if completed.Load() {
-				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
-				Claim: &protocol.AgentRunClaim{
-					RequestID: "claim-1",
-					WorkerID:  "worker-1",
-					AgentRun:  map[string]any{"id": "run-1"},
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{
+				Claim: &protocol.AgentRunActivationClaim{
+					RequestID:    "claim-1",
+					ActivationID: "run-1:activation:1",
+					WorkerID:     "worker-1",
+					AgentRun:     map[string]any{"id": "run-1"},
 					ExecutorRequest: protocol.ExecutorRequest{
 						TaskID:             "run-1",
 						AgentID:            "capability_packager",
@@ -644,21 +655,24 @@ func TestAgentRunLoopCompletesFailedPrepareEvents(t *testing.T) {
 					},
 				},
 			})
-		case "/remote/agent-runs/event":
-			var event protocol.AgentRunEventReport
+		case "/remote/agent-run-activations/event":
+			var event protocol.AgentRunActivationEventReport
 			if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
 				t.Errorf("decode event request: %v", err)
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
+			}
+			if event.ActivationID != "run-1:activation:1" {
+				t.Errorf("event activation_id = %q", event.ActivationID)
 			}
 			if event.Type == "status" && event.Data["status"] == "preparing_worktree" && failedPrepareEvents.Add(1) == 1 {
 				http.Error(w, "temporary prepare event failure", http.StatusBadGateway)
 				return
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
-		case "/remote/agent-runs/heartbeat", "/remote/agent-runs/session":
+		case "/remote/agent-run-activations/heartbeat", "/remote/agent-run-activations/session":
 			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
-		case "/remote/agent-runs/complete":
+		case "/remote/agent-run-activations/complete":
 			defer cancel()
 			completed.Store(true)
 			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
@@ -689,6 +703,9 @@ func TestAgentRunLoopCompletesFailedPrepareEvents(t *testing.T) {
 	if len(completeReq.Events) != 1 {
 		t.Fatalf("complete events = %#v, want failed prepare event only", completeReq.Events)
 	}
+	if completeReq.ActivationID != "run-1:activation:1" || completeReq.Events[0].ActivationID != "run-1:activation:1" {
+		t.Fatalf("activation_id not preserved in complete: %#v", completeReq)
+	}
 	if completeReq.Events[0].Type != "status" || completeReq.Events[0].Data["status"] != "preparing_worktree" {
 		t.Fatalf("failed prepare event not preserved: %#v", completeReq.Events[0])
 	}
@@ -706,20 +723,21 @@ func TestAgentRunLoopCompletesFailedPublishEvents(t *testing.T) {
 	defer cancel()
 	var completed atomic.Bool
 	var failedPublishEvents atomic.Int32
-	var completeReq protocol.AgentRunCompleteRequest
+	var completeReq protocol.AgentRunActivationCompleteRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch req.URL.Path {
-		case "/remote/agent-runs/claim":
+		case "/remote/agent-run-activations/claim":
 			if completed.Load() {
-				_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{})
+				_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(protocol.AgentRunClaimResponse{
-				Claim: &protocol.AgentRunClaim{
-					RequestID: "claim-1",
-					WorkerID:  "worker-1",
-					AgentRun:  map[string]any{"id": "run-1"},
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationClaimResponse{
+				Claim: &protocol.AgentRunActivationClaim{
+					RequestID:    "claim-1",
+					ActivationID: "run-1:activation:1",
+					WorkerID:     "worker-1",
+					AgentRun:     map[string]any{"id": "run-1"},
 					ExecutorRequest: protocol.ExecutorRequest{
 						TaskID:             "run-1",
 						AgentID:            "capability_packager",
@@ -760,21 +778,24 @@ func TestAgentRunLoopCompletesFailedPublishEvents(t *testing.T) {
 					},
 				},
 			})
-		case "/remote/agent-runs/event":
-			var event protocol.AgentRunEventReport
+		case "/remote/agent-run-activations/event":
+			var event protocol.AgentRunActivationEventReport
 			if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
 				t.Errorf("decode event request: %v", err)
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
+			}
+			if event.ActivationID != "run-1:activation:1" {
+				t.Errorf("event activation_id = %q", event.ActivationID)
 			}
 			if event.Type == "status" && event.Data["status"] == "branch_pushed" && failedPublishEvents.Add(1) == 1 {
 				http.Error(w, "temporary publish event failure", http.StatusBadGateway)
 				return
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
-		case "/remote/agent-runs/heartbeat", "/remote/agent-runs/session":
+		case "/remote/agent-run-activations/heartbeat", "/remote/agent-run-activations/session":
 			_, _ = w.Write([]byte(`{"ok":true,"cancel_requested":false}`))
-		case "/remote/agent-runs/complete":
+		case "/remote/agent-run-activations/complete":
 			defer cancel()
 			completed.Store(true)
 			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
@@ -804,6 +825,9 @@ func TestAgentRunLoopCompletesFailedPublishEvents(t *testing.T) {
 	}
 	if len(completeReq.Events) != 1 {
 		t.Fatalf("complete events = %#v, want failed publish event only", completeReq.Events)
+	}
+	if completeReq.ActivationID != "run-1:activation:1" || completeReq.Events[0].ActivationID != "run-1:activation:1" {
+		t.Fatalf("activation_id not preserved in complete: %#v", completeReq)
 	}
 	if completeReq.Events[0].Type != "status" || completeReq.Events[0].Data["status"] != "branch_pushed" {
 		t.Fatalf("failed publish event not preserved: %#v", completeReq.Events[0])

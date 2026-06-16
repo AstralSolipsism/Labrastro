@@ -221,6 +221,21 @@ class ToolExecutor:
             return None
         return restore if callable(restore) else None
 
+    def _notify_tool_preflight_failed(
+        self,
+        tool,
+        *,
+        arguments: dict[str, Any],
+        error: str,
+    ) -> None:
+        notify = getattr(tool, "on_preflight_failed", None)
+        if not callable(notify):
+            return
+        try:
+            notify(arguments=arguments, error=error)
+        except Exception:
+            return
+
     def _consume_tool_call_budget(self) -> str | None:
         if limit_message := runtime_budget_limit_message(self.agent):
             return f"Error: {limit_message}"
@@ -2706,6 +2721,11 @@ class ToolExecutor:
             )
         except TypeError as e:
             message = self._bad_arguments_message(tool_call.name, str(e))
+            self._notify_tool_preflight_failed(
+                tool,
+                arguments=tool_call.arguments,
+                error=message,
+            )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.PREFLIGHT,
                 kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
@@ -2736,6 +2756,11 @@ class ToolExecutor:
                 tool_call,
                 tool,
                 str(preflight_error),
+            )
+            self._notify_tool_preflight_failed(
+                tool,
+                arguments=tool_call.arguments,
+                error=preflight_message,
             )
             diagnostic = tool_diagnostic_from_failure(
                 stage=ToolDiagnosticStage.PREFLIGHT,

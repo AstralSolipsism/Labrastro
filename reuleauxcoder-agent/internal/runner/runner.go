@@ -225,7 +225,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 		}
 
 		claimCtx, cancelClaim := context.WithTimeout(ctx, 30*time.Second)
-		claimResp, err := r.client.ClaimAgentRun(claimCtx, protocol.AgentRunClaimRequest{
+		claimResp, err := r.client.ClaimAgentRunActivation(claimCtx, protocol.AgentRunActivationClaimRequest{
 			PeerToken:  peerToken,
 			WorkerID:   workerID,
 			WorkerKind: workerKind,
@@ -242,10 +242,13 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 		}
 
 		claim := claimResp.Claim
+		if strings.TrimSpace(claim.ActivationID) == "" {
+			return fmt.Errorf("agent runtime claim missing activation_id")
+		}
 		req := runtimeRunRequest(claim.ExecutorRequest)
 		taskCtx, taskCancel := context.WithCancel(ctx)
 		r.registerActiveRequest(claim.RequestID, taskCancel)
-		go r.runtimeHeartbeatLoop(taskCtx, peerToken, workerID, claim.RequestID, req.TaskID, taskCancel)
+		go r.runtimeHeartbeatLoop(taskCtx, peerToken, workerID, claim.RequestID, claim.ActivationID, req.TaskID, taskCancel)
 		var result agentruntime.RunResult
 		var runErr error
 		eventsForComplete := []agentruntime.Event{}
@@ -253,7 +256,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 			if !shouldForwardRuntimeEvent(event) {
 				return
 			}
-			if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, event); err != nil {
+			if err := r.sendRuntimeEvent(context.Background(), peerToken, claim.RequestID, claim.ActivationID, workerID, req.TaskID, event); err != nil {
 				log.Printf("agent runtime %s event failed: %v", label, err)
 				eventsForComplete = append(eventsForComplete, event)
 			}
@@ -265,6 +268,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				taskCtx,
 				peerToken,
 				claim.RequestID,
+				claim.ActivationID,
 				workerID,
 				workspaceRoot,
 				runtimeRoot,
@@ -279,6 +283,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				resolved.Options.RemoteBaseURL = r.cfg.Host
 				resolved.Options.PeerToken = peerToken
 				resolved.Options.AgentRunRequestID = claim.RequestID
+				resolved.Options.AgentRunActivationID = claim.ActivationID
 				resolved.Options.AgentRunWorkerID = workerID
 			}
 			sendLiveRuntimeEvent("start", agentruntime.Event{
@@ -321,7 +326,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				for event := range session.Events {
 					if threadID := eventThreadID(event); threadID != "" && threadID != pinnedExecutorSessionID {
 						pinnedExecutorSessionID = threadID
-						if err := r.pinRuntimeSession(context.Background(), peerToken, claim.RequestID, workerID, req.TaskID, "", "", "", "", threadID); err != nil {
+						if err := r.pinRuntimeSession(context.Background(), peerToken, claim.RequestID, claim.ActivationID, workerID, req.TaskID, "", "", "", "", threadID); err != nil {
 							log.Printf("agent runtime executor session pin failed: %v", err)
 						}
 					}
@@ -353,18 +358,19 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 			}
 		}
 		result.Events = eventsForComplete
-		completeReq := protocol.AgentRunCompleteRequest{
-			PeerToken: peerToken,
-			RequestID: claim.RequestID,
-			TaskID:    req.TaskID,
-			WorkerID:  workerID,
-			Status:    result.Status,
-			Output:    result.Output,
-			Error:     result.Error,
-			SessionID: result.ExecutorSessionID,
-			Usage:     runtimeUsage(result.Usage),
-			Artifacts: publishArtifacts,
-			Events:    runtimeEvents(peerToken, claim.RequestID, workerID, req.TaskID, result.Events),
+		completeReq := protocol.AgentRunActivationCompleteRequest{
+			PeerToken:    peerToken,
+			RequestID:    claim.RequestID,
+			ActivationID: claim.ActivationID,
+			TaskID:       req.TaskID,
+			WorkerID:     workerID,
+			Status:       result.Status,
+			Output:       result.Output,
+			Error:        result.Error,
+			SessionID:    result.ExecutorSessionID,
+			Usage:        runtimeUsage(result.Usage),
+			Artifacts:    publishArtifacts,
+			Events:       runtimeEvents(peerToken, claim.RequestID, claim.ActivationID, workerID, req.TaskID, result.Events),
 		}
 		if runErr != nil && completeReq.Error == "" {
 			completeReq.Error = runErr.Error()
@@ -373,7 +379,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 			}
 		}
 		completeCtx, cancelComplete := context.WithTimeout(context.Background(), 30*time.Second)
-		_, completeErr := r.client.CompleteAgentRun(completeCtx, completeReq)
+		_, completeErr := r.client.CompleteAgentRunActivation(completeCtx, completeReq)
 		cancelComplete()
 		if completeErr != nil {
 			return fmt.Errorf("agent runtime complete failed: %w", completeErr)
@@ -381,15 +387,16 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 	}
 }
 
-func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, requestID, taskID string, cancel context.CancelFunc) {
+func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, requestID, activationID, taskID string, cancel context.CancelFunc) {
 	send := func() bool {
 		heartbeatCtx, cancelHeartbeat := context.WithTimeout(context.Background(), 10*time.Second)
-		resp, err := r.client.AgentRunHeartbeat(heartbeatCtx, protocol.AgentRunHeartbeatRequest{
-			PeerToken: peerToken,
-			RequestID: requestID,
-			TaskID:    taskID,
-			WorkerID:  workerID,
-			LeaseSec:  15,
+		resp, err := r.client.AgentRunActivationHeartbeat(heartbeatCtx, protocol.AgentRunActivationHeartbeatRequest{
+			PeerToken:    peerToken,
+			RequestID:    requestID,
+			ActivationID: activationID,
+			TaskID:       taskID,
+			WorkerID:     workerID,
+			LeaseSec:     15,
 		})
 		cancelHeartbeat()
 		if err != nil {
@@ -397,12 +404,12 @@ func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, 
 			return false
 		}
 		if !resp.OK {
-			log.Printf("AgentRun heartbeat rejected agent_run_id=%s reason=%s", taskID, resp.Reason)
+			log.Printf("AgentRun activation heartbeat rejected agent_run_id=%s activation_id=%s reason=%s", taskID, activationID, resp.Reason)
 			cancel()
 			return true
 		}
 		if resp.CancelRequested {
-			log.Printf("AgentRun cancellation requested agent_run_id=%s reason=%s", taskID, resp.Reason)
+			log.Printf("AgentRun activation cancellation requested agent_run_id=%s activation_id=%s reason=%s", taskID, activationID, resp.Reason)
 			cancel()
 			return true
 		}
@@ -437,6 +444,7 @@ func (r *Runner) prepareAgentRunRun(
 	ctx context.Context,
 	peerToken string,
 	requestID string,
+	activationID string,
 	workerID string,
 	workspaceRoot string,
 	runtimeRoot string,
@@ -478,7 +486,7 @@ func (r *Runner) prepareAgentRunRun(
 		if err != nil {
 			return resolved, err
 		}
-		if err := r.pinRuntimeSession(context.Background(), peerToken, requestID, workerID, req.TaskID, worktree.Path, worktree.BranchName, worktree.RepoURL, worktree.CachePath, ""); err != nil {
+		if err := r.pinRuntimeSession(context.Background(), peerToken, requestID, activationID, workerID, req.TaskID, worktree.Path, worktree.BranchName, worktree.RepoURL, worktree.CachePath, ""); err != nil {
 			log.Printf("agent runtime worktree session pin failed: %v", err)
 		}
 		sendLiveRuntimeEvent("worktree", agentruntime.Event{
@@ -597,12 +605,13 @@ func shouldForwardRuntimeEvent(event agentruntime.Event) bool {
 	return !strings.EqualFold(status, "session_pinned")
 }
 
-func (r *Runner) pinRuntimeSession(ctx context.Context, peerToken, requestID, workerID, taskID, workdir, branch, repoURL, cachePath, executorSessionID string) error {
+func (r *Runner) pinRuntimeSession(ctx context.Context, peerToken, requestID, activationID, workerID, taskID, workdir, branch, repoURL, cachePath, executorSessionID string) error {
 	sessionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, err := r.client.PinAgentRunSession(sessionCtx, protocol.AgentRunSessionPinRequest{
+	_, err := r.client.PinAgentRunActivationSession(sessionCtx, protocol.AgentRunActivationSessionPinRequest{
 		PeerToken:         peerToken,
 		RequestID:         requestID,
+		ActivationID:      activationID,
 		TaskID:            taskID,
 		WorkerID:          workerID,
 		Workdir:           workdir,
@@ -614,17 +623,18 @@ func (r *Runner) pinRuntimeSession(ctx context.Context, peerToken, requestID, wo
 	return err
 }
 
-func (r *Runner) sendRuntimeEvent(ctx context.Context, peerToken, requestID, workerID, taskID string, event agentruntime.Event) error {
+func (r *Runner) sendRuntimeEvent(ctx context.Context, peerToken, requestID, activationID, workerID, taskID string, event agentruntime.Event) error {
 	eventCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return r.client.SendAgentRunEvent(eventCtx, protocol.AgentRunEventReport{
-		PeerToken: peerToken,
-		RequestID: requestID,
-		TaskID:    taskID,
-		WorkerID:  workerID,
-		Type:      string(event.Type),
-		Text:      event.Text,
-		Data:      event.Data,
+	return r.client.SendAgentRunActivationEvent(eventCtx, protocol.AgentRunActivationEventReport{
+		PeerToken:    peerToken,
+		RequestID:    requestID,
+		ActivationID: activationID,
+		TaskID:       taskID,
+		WorkerID:     workerID,
+		Type:         string(event.Type),
+		Text:         event.Text,
+		Data:         event.Data,
 	})
 }
 
@@ -635,7 +645,6 @@ func runtimeRunRequest(req protocol.ExecutorRequest) agentruntime.RunRequest {
 		Executor:           req.Executor,
 		Prompt:             req.Prompt,
 		ExecutionLocation:  req.ExecutionLocation,
-		IssueID:            req.IssueID,
 		RuntimeProfileID:   req.RuntimeProfileID,
 		WorkerKind:         req.WorkerKind,
 		ModelRequestOrigin: req.ModelRequestOrigin,
@@ -649,17 +658,18 @@ func runtimeRunRequest(req protocol.ExecutorRequest) agentruntime.RunRequest {
 	}
 }
 
-func runtimeEvents(peerToken, requestID, workerID, taskID string, events []agentruntime.Event) []protocol.AgentRunEventReport {
-	reports := make([]protocol.AgentRunEventReport, 0, len(events))
+func runtimeEvents(peerToken, requestID, activationID, workerID, taskID string, events []agentruntime.Event) []protocol.AgentRunActivationEventReport {
+	reports := make([]protocol.AgentRunActivationEventReport, 0, len(events))
 	for _, event := range events {
-		reports = append(reports, protocol.AgentRunEventReport{
-			PeerToken: peerToken,
-			RequestID: requestID,
-			TaskID:    taskID,
-			WorkerID:  workerID,
-			Type:      string(event.Type),
-			Text:      event.Text,
-			Data:      event.Data,
+		reports = append(reports, protocol.AgentRunActivationEventReport{
+			PeerToken:    peerToken,
+			RequestID:    requestID,
+			ActivationID: activationID,
+			TaskID:       taskID,
+			WorkerID:     workerID,
+			Type:         string(event.Type),
+			Text:         event.Text,
+			Data:         event.Data,
 		})
 	}
 	return reports

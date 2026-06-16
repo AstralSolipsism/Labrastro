@@ -41,8 +41,9 @@ def test_build_tool_specs_is_a_stable_sorted_catalog() -> None:
 def test_builtin_tools_have_explicit_architecture_metadata_matrix() -> None:
     specs = _specs_by_name()
     expected_risk = {
+        "agent_search": ToolRisk.CAPABILITY,
         "apply_patch": ToolRisk.FILE_MUTATION,
-        "delegate_agent": ToolRisk.CAPABILITY,
+        "call_agent": ToolRisk.CAPABILITY,
         "draft_document_begin": ToolRisk.DOCUMENT_DRAFT,
         "fetch_capabilities": ToolRisk.CAPABILITY,
         "glob": ToolRisk.READ_ONLY,
@@ -65,7 +66,8 @@ def test_builtin_tools_have_explicit_architecture_metadata_matrix() -> None:
 
     assert specs["shell"].permission.policy == "command_execution"
     assert specs["draft_document_begin"].permission.policy == "document_draft"
-    assert specs["delegate_agent"].permission.policy == "capability"
+    assert specs["agent_search"].permission.policy == "capability"
+    assert specs["call_agent"].permission.policy == "capability"
     assert specs["fetch_capabilities"].permission.policy == "capability"
 
     read_only_tools = {"glob", "grep", "list_file", "lsp", "read_file"}

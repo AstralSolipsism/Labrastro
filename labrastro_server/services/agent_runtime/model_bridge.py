@@ -7,7 +7,7 @@ from http import HTTPStatus
 import logging
 from typing import Any, Callable
 
-from reuleauxcoder.domain.agent_runtime.models import ModelRequestOrigin, TaskStatus
+from reuleauxcoder.domain.agent_runtime.models import ModelRequestOrigin, AgentRunStatus
 from reuleauxcoder.domain.config.models import ProviderConfig
 from reuleauxcoder.domain.llm.models import ToolCall
 from reuleauxcoder.domain.providers.models import ProviderRequest, ProviderResponse
@@ -21,10 +21,10 @@ from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInt
 
 
 TERMINAL_STATUSES = {
-    TaskStatus.COMPLETED,
-    TaskStatus.FAILED,
-    TaskStatus.CANCELLED,
-    TaskStatus.BLOCKED,
+    AgentRunStatus.COMPLETED,
+    AgentRunStatus.FAILED,
+    AgentRunStatus.CANCELLED,
+    AgentRunStatus.BLOCKED,
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class PreparedAgentRunModelRequest:
 
 
 class AgentRunModelBridge:
-    """Validate a claimed AgentRun and execute its server-origin model request."""
+    """Validate a claimed activation and execute its server-origin model request."""
 
     def __init__(self, *, runtime_control_plane: Any, admin_manager: Any):
         self.runtime_control_plane = runtime_control_plane
@@ -66,6 +66,7 @@ class AgentRunModelBridge:
     ) -> PreparedAgentRunModelRequest:
         task_id = _required_str(payload, "agent_run_id")
         request_id = _required_str(payload, "request_id")
+        activation_id = _required_str(payload, "activation_id")
         worker_id = _required_str(payload, "worker_id")
         try:
             task = self.runtime_control_plane.get_agent_run(task_id)
@@ -75,16 +76,17 @@ class AgentRunModelBridge:
                 "AgentRun not found.",
                 HTTPStatus.NOT_FOUND,
             ) from exc
-        ok, reason = self.runtime_control_plane.validate_claim_owner(
+        ok, reason = self.runtime_control_plane.validate_activation_claim_owner(
             request_id=request_id,
             task_id=task_id,
+            activation_id=activation_id,
             worker_id=worker_id,
             peer_id=peer_id,
         )
         if not ok:
             raise AgentRunModelBridgeError(
                 reason or "claim_owner_mismatch",
-                reason or "AgentRun claim owner mismatch.",
+                reason or "AgentRun activation claim owner mismatch.",
                 HTTPStatus.FORBIDDEN,
             )
         if task.status in TERMINAL_STATUSES:
@@ -150,6 +152,7 @@ class AgentRunModelBridge:
             "agent_run_id": task_id,
             "agent_id": task.agent_id,
             "request_id": request_id,
+            "activation_id": activation_id,
             "worker_id": worker_id,
             "model_request_origin": ModelRequestOrigin.SERVER.value,
             **({"locale": normalized_locale} if normalized_locale else {}),

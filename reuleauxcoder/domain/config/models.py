@@ -150,17 +150,17 @@ DEFAULT_MAIN_CHAT_AGENT: dict[str, Any] = {
     "role": "main_chat",
     "visibility": "user",
     "chat_entrypoint": True,
-    "delegable": False,
+    "callable_scopes": [],
     "taskflow_eligible": False,
     "dispatch": {
-        "profile": "Directly handles the user-facing ChatView conversation and delegates work to configured worker Agents when needed.",
+        "profile": "Directly handles the user-facing ChatView conversation and calls configured worker Agents when needed.",
         "examples": [
             "Answer the user in the ChatView",
             "Use registered chat commands and reference-only mentions",
-            "Delegate bounded background work to a worker Agent",
+            "Call a worker Agent for bounded background work",
         ],
         "avoid": [
-            "Being selected as a delegated worker Agent",
+            "Being selected as a worker Agent",
             "Running as an unattended taskflow worker",
         ],
     },
@@ -171,7 +171,7 @@ DEFAULT_ENVIRONMENT_AGENT: dict[str, Any] = {
     "description": "Checks and configures the local workspace environment from the server manifest.",
     "role": "environment",
     "visibility": "system",
-    "delegable": False,
+    "callable_scopes": [],
     "taskflow_eligible": False,
     "system_flow_only": ["environment_config"],
     "runtime_profile": DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
@@ -195,7 +195,7 @@ DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
     "description": "Reads repositories and documentation to generate reviewable capability package drafts.",
     "role": "capability_packager",
     "visibility": "internal",
-    "delegable": False,
+    "callable_scopes": [],
     "taskflow_eligible": False,
     "system_flow_only": ["capability_ingest"],
     "runtime_profile": DEFAULT_CAPABILITY_PACKAGER_RUNTIME_PROFILE_ID,
@@ -215,14 +215,24 @@ DEFAULT_CAPABILITY_PACKAGER_AGENT: dict[str, Any] = {
     "capability_refs": [DEFAULT_CAPABILITY_PACKAGER_BUILTIN_CAPABILITY_PACKAGE_ID],
 }
 DEFAULT_BUILTIN_TOOL_COMPONENTS: dict[str, dict[str, Any]] = {
-    "builtin_tool:delegate_agent": {
+    "builtin_tool:agent_search": {
         "kind": "builtin_tool",
-        "name": "delegate_agent",
-        "description": "Delegate bounded background work to a configured worker Agent.",
+        "name": "agent_search",
+        "description": "Search callable Agents and return agent_id values for call_agent.",
+        "access": "read",
+        "risk_level": "medium",
+        "execution_policy": "allow",
+        "registry_path": "builtin:agent_search",
+        "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
+    },
+    "builtin_tool:call_agent": {
+        "kind": "builtin_tool",
+        "name": "call_agent",
+        "description": "Invoke a callable Agent by exact agent_id and mode.",
         "access": "write",
         "risk_level": "medium",
         "execution_policy": "inherit",
-        "registry_path": "builtin:delegate_agent",
+        "registry_path": "builtin:call_agent",
         "package_ids": [DEFAULT_CORE_BUILTIN_CAPABILITY_PACKAGE_ID],
     },
     "builtin_tool:apply_patch": {

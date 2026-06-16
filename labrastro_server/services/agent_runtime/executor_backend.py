@@ -72,7 +72,6 @@ class ExecutorRunRequest:
     executor: ExecutorType | str
     prompt: str
     execution_location: ExecutionLocation | str = ExecutionLocation.LOCAL_WORKSPACE
-    issue_id: str | None = None
     runtime_profile_id: str | None = None
     worker_kind: WorkerKind | str | None = None
     model_request_origin: ModelRequestOrigin | str | None = None
@@ -106,7 +105,6 @@ class ExecutorRunRequest:
             "executor": self.executor.value,
             "prompt": self.prompt,
             "execution_location": self.execution_location.value,
-            "issue_id": self.issue_id,
             "runtime_profile_id": self.runtime_profile_id,
             "worker_kind": self.worker_kind.value if self.worker_kind else None,
             "model_request_origin": (
@@ -130,9 +128,6 @@ class ExecutorRunRequest:
             executor=str(data["executor"]),
             prompt=str(data.get("prompt", "") or ""),
             execution_location=str(data.get("execution_location", "local_workspace")),
-            issue_id=(
-                str(data["issue_id"]) if data.get("issue_id") is not None else None
-            ),
             runtime_profile_id=(
                 str(data["runtime_profile_id"])
                 if data.get("runtime_profile_id") is not None
@@ -410,7 +405,6 @@ class ReuleauxCoderExecutorBackend:
             agent_id=session.agent_id,
             executor=session.executor,
             execution_location=session.execution_location,
-            issue_id=session.issue_id,
             workdir=session.workdir,
             branch=session.branch,
             executor_session_id=session.executor_session_id,
@@ -618,7 +612,6 @@ class ReuleauxCoderExecutorBackend:
             goal_id=metadata.get("goal_id"),
             task_id=request.task_id,
             taskflow_id=metadata.get("taskflow_id"),
-            issue_id=request.issue_id,
         )
 
     @staticmethod

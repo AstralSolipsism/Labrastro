@@ -194,11 +194,12 @@ func TestBuildReuleauxCoderInvocationUsesServerOriginConfig(t *testing.T) {
 			},
 		},
 	}, RunOptions{
-		RemoteBaseURL:     "http://127.0.0.1:8765/",
-		PeerToken:         "peer-token",
-		AgentRunRequestID: "claim-1",
-		AgentRunWorkerID:  "worker-1",
-		CustomArgs:        []string{"--config", "/tmp/hijack.yaml", "--debug"},
+		RemoteBaseURL:        "http://127.0.0.1:8765/",
+		PeerToken:            "peer-token",
+		AgentRunRequestID:    "claim-1",
+		AgentRunActivationID: "run-1:activation:1",
+		AgentRunWorkerID:     "worker-1",
+		CustomArgs:           []string{"--config", "/tmp/hijack.yaml", "--debug"},
 	})
 	if err != nil {
 		t.Fatalf("BuildInvocation error: %v", err)
@@ -213,6 +214,7 @@ func TestBuildReuleauxCoderInvocationUsesServerOriginConfig(t *testing.T) {
 	if inv.Env["LABRASTRO_PEER_TOKEN"] != "peer-token" ||
 		inv.Env["LABRASTRO_AGENT_RUN_ID"] != "run-1" ||
 		inv.Env["LABRASTRO_AGENT_RUN_REQUEST_ID"] != "claim-1" ||
+		inv.Env["LABRASTRO_AGENT_RUN_ACTIVATION_ID"] != "run-1:activation:1" ||
 		inv.Env["LABRASTRO_AGENT_RUN_WORKER_ID"] != "worker-1" {
 		t.Fatalf("server-origin env not populated: %#v", inv.Env)
 	}

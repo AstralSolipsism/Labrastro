@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import hmac
@@ -96,7 +96,7 @@ def test_installation_token_provider_caches_token() -> None:
 
 def test_ensure_pr_for_task_creates_pr_from_branch_artifact() -> None:
     control = AgentRunControlPlane()
-    control.submit_agent_run(AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
+    control.submit_agent_run(AgentRunRequest(agent_id="coder", prompt="run"), task_id="task-1")
     control.attach_artifact(
         "task-1",
         type=ArtifactType.BRANCH.value,
@@ -130,14 +130,14 @@ def test_ensure_pr_for_task_creates_pr_from_branch_artifact() -> None:
     artifacts = control.artifacts_to_dict("task-1")
     assert artifacts[-1]["type"] == "pull_request"
     assert artifacts[-1]["status"] == "pr_created"
-    assert control.agent_run_to_dict("task-1")["pr_url"] == "https://github.com/org/repo/pull/7"
+    assert artifacts[-1]["pr_url"] == "https://github.com/org/repo/pull/7"
     assert [event.type for event in control.list_events("task-1")][-1] == "status"
     assert store.get_pull_request("org/repo", 7) is not None
 
 
 def test_ensure_pr_for_task_records_failure_without_failing_task() -> None:
     control = AgentRunControlPlane()
-    control.submit_agent_run(AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
+    control.submit_agent_run(AgentRunRequest(agent_id="coder", prompt="run"), task_id="task-1")
     control.attach_artifact(
         "task-1",
         type="branch",
@@ -168,7 +168,7 @@ def test_ensure_pr_for_task_records_failure_without_failing_task() -> None:
 
 def test_webhook_review_comment_is_idempotent_and_creates_followup_assignment() -> None:
     control = AgentRunControlPlane()
-    control.submit_agent_run(AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"), task_id="task-1")
+    control.submit_agent_run(AgentRunRequest(agent_id="coder", prompt="run"), task_id="task-1")
     taskflow = TaskflowService(dispatcher=ReuleauxCoderTaskflowDispatcher(control))
     collaboration = IssueAssignmentService(taskflow_service=taskflow)
     store = InMemoryGitHubStore()

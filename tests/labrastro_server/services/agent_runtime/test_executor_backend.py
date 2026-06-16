@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib
 import json
@@ -67,7 +67,6 @@ def test_backend_registry_routes_start_resume_and_cancel_by_executor() -> None:
             agent_id="reviewer",
             executor="codex",
             execution_location="remote_server",
-            issue_id="issue-1",
             task_id="task-1",
             executor_session_id="codex-session-1",
         ),
@@ -1221,7 +1220,6 @@ def test_reuleauxcoder_backend_resume_restores_executor_session_id() -> None:
             agent_id="reviewer",
             executor="reuleauxcoder",
             execution_location="local_workspace",
-            issue_id="issue-1",
             task_id="task-1",
             executor_session_id="session-1",
         ),
@@ -1254,7 +1252,6 @@ def test_reuleauxcoder_backend_resume_restores_permission_context() -> None:
             agent_id="reviewer",
             executor="reuleauxcoder",
             execution_location="local_workspace",
-            issue_id="issue-1",
             task_id="task-1",
             workdir="/workspace/repo",
             executor_session_id="session-1",

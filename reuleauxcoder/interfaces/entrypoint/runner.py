@@ -313,9 +313,9 @@ class AppRunner:
 
     @staticmethod
     def _wire_agent_tool_parent(agent: Agent) -> None:
-        """Inject parent agent into the delegation tool if present."""
+        """Inject parent agent into Agent discovery/invocation tools."""
         for tool in agent.tools:
-            if tool.name == "delegate_agent":
+            if tool.name in {"agent_search", "call_agent"}:
                 tool._parent_agent = agent
 
     def _attach_mcp_if_configured(

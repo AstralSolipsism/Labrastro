@@ -12,6 +12,10 @@ from labrastro_server.services.sandbox.provider import (
 )
 
 
+def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
+    return str(control.get_agent_run(task_id).current_activation_id or "")
+
+
 def test_docker_sandbox_provider_builds_room_and_session_in_dry_run() -> None:
     provider = DockerSandboxProvider(
         host_base_url="http://host.docker.internal:8765",
@@ -123,7 +127,6 @@ def test_control_plane_starts_sandbox_session_for_sandbox_worker_run_and_stops_o
 
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="hello",
             metadata={"workspace_root": "G:/repo"},
@@ -144,7 +147,7 @@ def test_control_plane_starts_sandbox_session_for_sandbox_worker_run_and_stops_o
     assert task.metadata["source_workspace_root"] == "G:/repo"
     assert task.metadata["workspace_root"] == "/workspace"
 
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="ssn-run-1",
         worker_kind="sandbox_worker",
         executors=["reuleauxcoder"],
@@ -155,9 +158,10 @@ def test_control_plane_starts_sandbox_session_for_sandbox_worker_run_and_stops_o
     assert claim is not None
     assert claim.task.id == "run-1"
 
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         "run-1",
         ExecutorRunResult(task_id="run-1", status="completed", output="done"),
+        activation_id=_current_activation_id(control, "run-1"),
     )
 
     assert provider.stopped == ["ssn-run-1"]
@@ -182,7 +186,6 @@ def test_control_plane_does_not_start_sandbox_for_server_worker_run() -> None:
 
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="hello",
             metadata={"workspace_root": "G:/repo"},
@@ -215,7 +218,7 @@ def test_control_plane_cancels_sandbox_session_and_marks_agent_run_cancelled() -
     )
 
     control.submit_agent_run(
-        AgentRunRequest(issue_id="manual", agent_id="coder", prompt="hello"),
+        AgentRunRequest(agent_id="coder", prompt="hello"),
         task_id="run-cancel",
     )
 

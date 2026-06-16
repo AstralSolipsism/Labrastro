@@ -97,6 +97,35 @@ def test_builtin_tool_allowed_when_capability_and_policy_allow() -> None:
     assert decision.capability_matched == "builtin_tool:read_file"
 
 
+def test_builtin_tool_allowed_by_structured_capability_tool_spec() -> None:
+    decision = PermissionGateway().evaluate(
+        _request(
+            target=_target(
+                component_id="builtin_tool:read_file",
+                registry_path="builtin:read_file",
+            ),
+            effective_capabilities={
+                "tool_specs": [
+                    {
+                        "tool_id": "capability:review:builtin_tool:read_file",
+                        "name": "read_file",
+                        "namespace": "capability",
+                        "target_tool_ref": "builtin:read_file",
+                        "source_type": "builtin_tool",
+                        "exposure": "deferred",
+                        "permission": {"policy": "allow"},
+                        "metadata": {"component_id": "builtin_tool:read_file"},
+                    }
+                ]
+            }
+        )
+    )
+
+    assert decision.action == PermissionAction.ALLOW
+    assert decision.authorized is True
+    assert decision.capability_matched == "capability:review:builtin_tool:read_file"
+
+
 def test_stale_builtin_tool_spec_does_not_authorize_builtin_tool() -> None:
     stale_tool_id = (
         f"capability:review:{_STALE_BUILTIN_SOURCE_TYPE}:read_file"

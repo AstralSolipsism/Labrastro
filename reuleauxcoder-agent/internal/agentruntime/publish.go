@@ -258,7 +258,6 @@ func defaultPRBody(req RunRequest, workdir, branch string) string {
 		"Agent runtime task completed.",
 		"",
 		"Task: " + req.TaskID,
-		"Issue: " + req.IssueID,
 		"Agent: " + req.AgentID,
 		"Branch: " + branch,
 		"Workdir: " + workdir,

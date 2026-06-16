@@ -1470,13 +1470,13 @@ class AgentLifecycleHookRuntimeAdapter:
                 decision,
                 handler_type="agent",
             )
-        parent_run_id = context.agent_run_id or runtime_agent_run_id(self.agent) or None
+        owner_agent_run_id = context.agent_run_id or runtime_agent_run_id(self.agent) or None
         task_payload = _agent_adapter_child_lifecycle_payload(
             declaration,
             context,
             target_agent_id=target_agent_id,
             prompt=prompt,
-            parent_run_id=parent_run_id,
+            owner_agent_run_id=owner_agent_run_id,
         )
         task_lifecycle_output = _dispatch_agent_adapter_child_lifecycle(
             self.agent,
@@ -1490,26 +1490,33 @@ class AgentLifecycleHookRuntimeAdapter:
             from labrastro_server.services.agent_runtime.control_plane import (
                 AgentRunRequest,
             )
+            from reuleauxcoder.domain.agent_runtime.models import (
+                AgentRunRelation,
+                AgentRunRelationType,
+            )
 
             run = control.submit_agent_run(
                 AgentRunRequest(
-                    issue_id=f"lifecycle:{declaration.id}",
                     agent_id=target_agent_id,
                     prompt=prompt,
                     source="delegation",
-                    parent_run_id=parent_run_id,
-                    delegated_by_run_id=parent_run_id,
                     runtime_profile_id=_string(declaration.technical.get("runtime_profile_id")) or None,
                     budget=_dict_or_empty(declaration.technical.get("budget")),
-                    metadata={
-                        "lifecycle_hook_id": declaration.id,
-                        "lifecycle_event": context.event_name,
-                        "trigger_source": context.source,
-                        "parent_session_id": context.session_run_id,
-                        "parent_turn_id": context.turn_id,
-                        "lifecycle_hook_source": declaration.source,
-                        "lifecycle_handler_type": declaration.handler_type,
-                    },
+                    relation=AgentRunRelation(
+                        id="",
+                        owner_agent_run_id=owner_agent_run_id or "",
+                        related_agent_run_id="",
+                        relation_type=AgentRunRelationType.AGENT_CALL_EPHEMERAL,
+                        metadata={
+                            "lifecycle_hook_id": declaration.id,
+                            "lifecycle_event": context.event_name,
+                            "trigger_source": context.source,
+                            "parent_session_id": context.session_run_id,
+                            "parent_turn_id": context.turn_id,
+                            "lifecycle_hook_source": declaration.source,
+                            "lifecycle_handler_type": declaration.handler_type,
+                        },
+                    ),
                 )
             )
             subagent_payload = dict(task_payload)
@@ -1550,12 +1557,12 @@ def _agent_adapter_child_lifecycle_payload(
     *,
     target_agent_id: str,
     prompt: str,
-    parent_run_id: str | None,
+    owner_agent_run_id: str | None,
 ) -> dict[str, Any]:
     return {
         "agent_id": target_agent_id,
         "task": prompt,
-        "parent_run_id": str(parent_run_id or ""),
+        "owner_agent_run_id": str(owner_agent_run_id or ""),
         "source": "delegation",
         "trigger_source": context.source,
         "parent_session_id": context.session_run_id,
@@ -1583,7 +1590,7 @@ def _dispatch_agent_adapter_child_lifecycle(
         placement="server",
         trigger_source=str(payload.get("trigger_source") or "lifecycle_hook"),
         session_run_id=str(payload.get("parent_session_id") or ""),
-        agent_run_id=str(payload.get("parent_run_id") or runtime_agent_run_id(agent)),
+        agent_run_id=str(payload.get("owner_agent_run_id") or runtime_agent_run_id(agent)),
         turn_id=str(payload.get("parent_turn_id") or ""),
         origin="agent",
         locale=str(getattr(agent, "locale", "") or ""),

@@ -1,4 +1,4 @@
-"""CLI rendering - event-driven UI renderer."""
+﻿"""CLI rendering - event-driven UI renderer."""
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
@@ -139,8 +139,8 @@ class CLIRenderer:
             self._render_tool_start(event.tool_name, event.tool_args)
         elif event.event_type == AgentEventType.TOOL_CALL_END:
             self._render_tool_end(event.tool_name, event.tool_result)
-        elif event.event_type == AgentEventType.DELEGATED_RUN_COMPLETED:
-            self._render_delegated_run_completed(event.data)
+        elif event.event_type == AgentEventType.AGENT_RELATION_COMPLETED:
+            self._render_agent_relation_completed(event.data)
         elif event.event_type == AgentEventType.SESSION_RUN_END:
             self.finalize_response(
                 event.data.get("response", ""),
@@ -251,8 +251,8 @@ class CLIRenderer:
             display = self._compact_tool_output(name, result)
             self.console.print(f"[dim]{_escape_markup(display)}[/dim]")
 
-    def _render_delegated_run_completed(self, data: dict) -> None:
-        """Render a concise delegated AgentRun completion notification."""
+    def _render_agent_relation_completed(self, data: dict) -> None:
+        """Render a concise AgentRun relation completion notification."""
         run_id = data.get("run_id", "?")
         agent_id = data.get("agent_id", "?")
         status = data.get("status", "?")

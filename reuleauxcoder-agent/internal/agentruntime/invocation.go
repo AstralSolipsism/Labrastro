@@ -125,12 +125,14 @@ func buildReuleauxCoderInvocation(req RunRequest, opts RunOptions) (Invocation, 
 		env["LABRASTRO_PEER_TOKEN"] = opts.PeerToken
 		env["LABRASTRO_AGENT_RUN_ID"] = req.TaskID
 		env["LABRASTRO_AGENT_RUN_REQUEST_ID"] = opts.AgentRunRequestID
+		env["LABRASTRO_AGENT_RUN_ACTIVATION_ID"] = opts.AgentRunActivationID
 		env["LABRASTRO_AGENT_RUN_WORKER_ID"] = opts.AgentRunWorkerID
 		for _, key := range []string{
 			"LABRASTRO_REMOTE_BASE_URL",
 			"LABRASTRO_PEER_TOKEN",
 			"LABRASTRO_AGENT_RUN_ID",
 			"LABRASTRO_AGENT_RUN_REQUEST_ID",
+			"LABRASTRO_AGENT_RUN_ACTIVATION_ID",
 			"LABRASTRO_AGENT_RUN_WORKER_ID",
 		} {
 			if strings.TrimSpace(env[key]) == "" {

@@ -1,8 +1,8 @@
 """Runtime projection for Taskflow TaskRuns.
 
 Taskflow owns the planning and authorization boundary. Runtime ownership stays
-with the AgentRun control plane; this service only joins persisted TaskRun trace
-links with the live AgentRun detail when that control plane is available.
+with the agent runtime control plane; this service only joins persisted TaskRun trace
+links with the live agent runtime detail when that control plane is available.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class TaskRunLivenessService:
         if claim_status in self._CLAIMED:
             return self._result(
                 "claimed",
-                reason="AgentRun has an active claim.",
+                reason="Agent runtime run has an active claim.",
                 source="agent_claim",
                 task_status=task_status,
                 agent_status=agent_status,
@@ -109,13 +109,13 @@ class TaskRunLivenessService:
             reason = "TaskRun is marked running."
         elif agent_run_id and not runtime_available:
             state = "runtime_unavailable"
-            reason = runtime_error or "AgentRun exists but runtime detail is unavailable."
+            reason = runtime_error or "Agent runtime run exists but runtime detail is unavailable."
         elif task_status == TaskRunStatus.DISPATCHED.value:
             state = "queued" if task_run.metadata.get("selected_executor_id") else "needs_recovery"
             reason = (
                 "TaskRun has a selected executor and is waiting for runtime updates."
                 if state == "queued"
-                else "TaskRun is dispatched but has no linked AgentRun."
+                else "TaskRun is dispatched but has no linked runtime run."
             )
         elif task_status == TaskRunStatus.PENDING.value:
             if not task_run.dispatch_ref_id:
@@ -168,21 +168,21 @@ class TaskRunLivenessService:
 
     def _reason_for_agent_status(self, state: str, agent_status: str) -> str:
         if state == "blocked":
-            return "AgentRun is blocked."
+            return "Agent runtime run is blocked."
         if state == "waiting_user":
-            return "AgentRun is waiting for user input."
+            return "Agent runtime run is waiting for user input."
         if state == "failed":
-            return "AgentRun failed."
+            return "Agent runtime run failed."
         if state == "completed":
-            return "AgentRun completed."
-        return f"AgentRun status is {agent_status}."
+            return "Agent runtime run completed."
+        return f"Agent runtime run status is {agent_status}."
 
     def _agent_selection_reason(self, task_run: TaskRun) -> str:
         dispatch_result = _dict(task_run.metadata.get("dispatch_result"))
         reason = str(dispatch_result.get("reason") or "").strip()
         if reason:
             return reason
-        return "Dispatch was authorized, but no executor or AgentRun has been selected."
+        return "Dispatch was authorized, but no executor or runtime run has been selected."
 
     def _failure_reason(self, task_run: TaskRun) -> str:
         metadata = task_run.metadata
