@@ -1872,7 +1872,7 @@ class ActivationSteer:
 
 @dataclass
 class ExecutorSession:
-    """Concrete backend context bound to an AgentRun."""
+    """Opaque execution-site reference bound to an AgentRun, not a session kernel."""
 
     id: str
     agent_run_id: str
@@ -1942,7 +1942,7 @@ class AgentRunRelation:
 
 @dataclass
 class AgentThreadBinding:
-    """Long-lived persistent conversation binding to an existing Agent."""
+    """Persistent Agent thread binding; target Agent owns its own runtime session."""
 
     id: str
     owner_session_run_id: str
@@ -2230,7 +2230,7 @@ class TaskArtifact:
 
 @dataclass
 class TaskSessionRef:
-    """Opaque executor session reference bound to a task."""
+    """Opaque executor session/workdir reference used to resume a task activation."""
 
     agent_id: str
     executor: ExecutorType

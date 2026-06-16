@@ -1006,10 +1006,11 @@ class InMemoryPRFlow:
 
 
 class AgentRunControlPlane:
-    """In-memory runtime control plane for tasks, activation claims and artifacts.
+    """In-memory control plane for scheduling executors and recording run lifecycle.
 
     The service is deliberately storage-agnostic. The public methods are the
     contract that a persistent implementation and HTTP relay endpoints can keep.
+    Executor tool systems and provider sessions remain owned by each executor.
     """
 
     def __init__(

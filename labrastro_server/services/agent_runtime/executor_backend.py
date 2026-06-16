@@ -384,7 +384,7 @@ class ExecutorBackendRegistry:
 
 
 class ReuleauxCoderExecutorBackend:
-    """Adapter that exposes the existing in-process ReuleauxCoder agent as a backend."""
+    """Executor adapter for the ReuleauxCoder Agent kernel: LLM, tools, hooks and session."""
 
     executor = ExecutorType.REULEAUXCODER
 
