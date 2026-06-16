@@ -1140,7 +1140,7 @@ def test_external_config_can_declare_wired_subagent_lifecycle_events(
                 "handler_type": "prompt",
                 "handler_ref": "package:delegation/audit",
                 "display_name": f"{event_name} audit",
-                "summary": f"Audits {event_name} around delegated AgentRuns.",
+                "summary": f"Audits {event_name} around related AgentRuns.",
                 "permissions": ["prompt.read"],
             }
         ],
@@ -1306,7 +1306,7 @@ def test_external_config_still_rejects_unwired_subagent_completion_events(
                     "handler_type": "prompt",
                     "handler_ref": "package:delegation/audit",
                     "display_name": f"{event_name} audit",
-                    "summary": f"Audits {event_name} around delegated AgentRuns.",
+                    "summary": f"Audits {event_name} around related AgentRuns.",
                     "permissions": ["prompt.read"],
                 }
             ],
@@ -2686,10 +2686,9 @@ def test_mcp_tool_lifecycle_runtime_adapter_invokes_agent_visible_tool() -> None
     assert results[0].output.diagnostics == [{"code": "mcp_ok"}]
     assert agent.tool.arguments == {"status": "done"}
     assert agent.permission_checks[0][0] == "mcp__audit__record"
-    assert [event.event_type.value for event in agent.events] == [
-        "tool_call_start",
-        "tool_call_end",
-    ]
+    event_types = [event.event_type.value for event in agent.events]
+    assert "tool_arguments_complete" in event_types
+    assert event_types.index("tool_call_start") < event_types.index("tool_call_end")
 
 
 def test_mcp_tool_lifecycle_runtime_adapter_fail_opens_observation_invalid_tool_output() -> None:
@@ -3083,12 +3082,15 @@ def test_agent_lifecycle_runtime_adapter_submits_agent_run_reference() -> None:
     request = agent.agent_run_control_plane.requests[0]
     assert request.agent_id == "reviewer"
     assert request.source.value == "delegation"
-    assert request.parent_run_id == "parent-run"
-    assert request.delegated_by_run_id == "parent-run"
+    assert not hasattr(request, "parent_run_id")
+    assert not hasattr(request, "delegated_by_run_id")
+    assert request.relation is not None
+    assert request.relation.owner_agent_run_id == "parent-run"
+    assert request.relation.relation_type.value == "agent_call_ephemeral"
     assert request.budget == {"token_budget": 5000, "max_turns": 2}
     assert "budget" not in request.metadata
-    assert request.metadata["parent_session_id"] == "session-1"
-    assert request.metadata["parent_turn_id"] == "turn-1"
+    assert request.relation.metadata["parent_session_id"] == "session-1"
+    assert request.relation.metadata["parent_turn_id"] == "turn-1"
 
 
 def _agent_adapter_task_lifecycle_dispatcher(agent, declarations, handler):
@@ -3280,7 +3282,7 @@ def test_agent_lifecycle_runtime_adapter_emits_task_and_subagent_lifecycle_audit
         "SubagentStart",
     ]
     assert contexts[0].payload["agent_id"] == "reviewer"
-    assert contexts[0].payload["parent_run_id"] == "parent-run"
+    assert contexts[0].payload["owner_agent_run_id"] == "parent-run"
     assert contexts[1].payload["child_agent_run_id"] == "child-run"
     lifecycle_events = [
         event.data
@@ -3444,7 +3446,7 @@ def test_agent_lifecycle_runtime_adapter_blocks_runtime_budget_before_submit() -
     assert agent.agent_run_control_plane.requests == []
 
 
-def test_agent_lifecycle_runtime_adapter_uses_executor_task_id_as_parent_run_id() -> None:
+def test_agent_lifecycle_runtime_adapter_uses_executor_task_id_as_owner_agent_run_id() -> None:
     class Run:
         id = "child-run"
         agent_id = "reviewer"
@@ -3491,8 +3493,11 @@ def test_agent_lifecycle_runtime_adapter_uses_executor_task_id_as_parent_run_id(
     dispatcher.dispatch(build_lifecycle_event_context("Stop"))
 
     request = agent.agent_run_control_plane.requests[0]
-    assert request.parent_run_id == "parent-task"
-    assert request.delegated_by_run_id == "parent-task"
+    assert not hasattr(request, "parent_run_id")
+    assert not hasattr(request, "delegated_by_run_id")
+    assert request.relation is not None
+    assert request.relation.owner_agent_run_id == "parent-task"
+    assert request.relation.relation_type.value == "agent_call_ephemeral"
 
 
 def test_agent_lifecycle_runtime_adapter_rejects_unknown_target_agent() -> None:

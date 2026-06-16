@@ -349,12 +349,20 @@ class PermissionGateway:
                 policy_matched="agent.taskflow_eligible",
                 audit={"agent_id": agent_config.id, "source": source},
             )
-        if source == "delegation" and not agent_config.can_delegate:
+        if source == "agent_call_ephemeral" and not agent_config.can_call_ephemeral:
             return PermissionDecision(
                 action=PermissionAction.DENY,
                 authorized=False,
-                reason=f"agent '{agent_config.id}' is not delegable",
-                policy_matched="agent.delegable",
+                reason=f"agent '{agent_config.id}' does not allow ephemeral calls",
+                policy_matched="agent.callable_scopes.ephemeral",
+                audit={"agent_id": agent_config.id, "source": source},
+            )
+        if source == "agent_call_persistent" and not agent_config.can_call_persistent:
+            return PermissionDecision(
+                action=PermissionAction.DENY,
+                authorized=False,
+                reason=f"agent '{agent_config.id}' does not allow persistent calls",
+                policy_matched="agent.callable_scopes.persistent",
                 audit={"agent_id": agent_config.id, "source": source},
             )
         return PermissionDecision(action=PermissionAction.ALLOW, authorized=True)
