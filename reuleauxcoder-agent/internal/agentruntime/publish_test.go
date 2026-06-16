@@ -17,7 +17,6 @@ func TestPublishWorktreeCommitsPushesAndReportsBranchArtifact(t *testing.T) {
 	result := PublishWorktree(context.Background(), RunRequest{
 		TaskID:        "task-publish-create",
 		AgentID:       "coder",
-		IssueID:       "issue-1",
 		PublishPolicy: "branch",
 		Workdir:       worktree.Path,
 		Branch:        worktree.BranchName,

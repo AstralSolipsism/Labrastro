@@ -43,7 +43,6 @@ type RunRequest struct {
 	Executor           string         `json:"executor"`
 	Prompt             string         `json:"prompt"`
 	ExecutionLocation  string         `json:"execution_location,omitempty"`
-	IssueID            string         `json:"issue_id,omitempty"`
 	RuntimeProfileID   string         `json:"runtime_profile_id,omitempty"`
 	WorkerKind         string         `json:"worker_kind,omitempty"`
 	ModelRequestOrigin string         `json:"model_request_origin,omitempty"`
@@ -57,21 +56,22 @@ type RunRequest struct {
 }
 
 type RunOptions struct {
-	Timeout           time.Duration
-	Command           string
-	SystemPrompt      string
-	ExtraArgs         []string
-	CustomArgs        []string
-	Env               map[string]string
-	ApprovalMode      string
-	MCPConfigJSON     []byte
-	RuntimeHome       string
-	SemanticIdleTime  time.Duration
-	EventSink         func(Event)
-	RemoteBaseURL     string
-	PeerToken         string
-	AgentRunRequestID string
-	AgentRunWorkerID  string
+	Timeout              time.Duration
+	Command              string
+	SystemPrompt         string
+	ExtraArgs            []string
+	CustomArgs           []string
+	Env                  map[string]string
+	ApprovalMode         string
+	MCPConfigJSON        []byte
+	RuntimeHome          string
+	SemanticIdleTime     time.Duration
+	EventSink            func(Event)
+	RemoteBaseURL        string
+	PeerToken            string
+	AgentRunRequestID    string
+	AgentRunActivationID string
+	AgentRunWorkerID     string
 }
 
 type RunResult struct {
