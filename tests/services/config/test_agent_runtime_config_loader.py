@@ -150,11 +150,15 @@ def test_parse_config_reads_agent_registry_profiles_and_limits() -> None:
     assert config.capability_components["mcp:github"].name == "github"
     assert "main_chat" in config.agent_registry.agents
     assert config.agent_registry.agents["main_chat"].chat_entrypoint is True
-    assert config.agent_registry.agents["main_chat"].can_delegate is False
+    assert config.agent_registry.agents["main_chat"].can_call_ephemeral is False
+    assert config.agent_registry.agents["main_chat"].can_call_persistent is False
     assert "core_builtin_tools" in config.capability_packages
     assert config.capability_packages["core_builtin_tools"].effective_capabilities
     assert "builtin_tool:tool_search" in config.capability_components
     assert "builtin_tool:capability_execute" in config.capability_components
+    assert "builtin_tool:agent_search" in config.capability_components
+    assert "builtin_tool:call_agent" in config.capability_components
+    assert "builtin_tool:delegate_agent" not in config.capability_components
     assert "builtin_tool:fetch_capabilities" in config.capability_components
     assert "environment_local" in config.runtime_profiles.profiles
     assert "agent_remote" in config.runtime_profiles.profiles
@@ -221,7 +225,8 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     main_agent = config.agent_registry.agents["main_chat"]
     assert main_agent.visibility == "user"
     assert main_agent.chat_entrypoint is True
-    assert main_agent.can_delegate is False
+    assert main_agent.can_call_ephemeral is False
+    assert main_agent.can_call_persistent is False
     assert main_agent.can_run_taskflow is False
     assert main_agent.runtime_profile == "agent_remote"
     assert main_agent.capability_refs == ["core_builtin_tools"]
@@ -231,7 +236,8 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     agent = config.agent_registry.agents["environment_configurator"]
     assert agent.runtime_profile == "environment_local"
     assert agent.visibility == "system"
-    assert agent.can_delegate is False
+    assert agent.can_call_ephemeral is False
+    assert agent.can_call_persistent is False
     assert agent.can_run_taskflow is False
     assert agent.allows_system_flow("environment_config") is True
     assert "environment manifest" in agent.dispatch.profile
@@ -239,7 +245,8 @@ def test_parse_config_injects_environment_configurator_by_default() -> None:
     packager = config.agent_registry.agents["capability_packager"]
     assert packager.runtime_profile == "capability_packager_remote"
     assert packager.visibility == "internal"
-    assert packager.can_delegate is False
+    assert packager.can_call_ephemeral is False
+    assert packager.can_call_persistent is False
     assert packager.can_run_taskflow is False
     assert packager.allows_system_flow("capability_ingest") is True
     assert "structured draft" in packager.dispatch.profile
@@ -289,6 +296,9 @@ def test_default_system_agents_have_explicit_effective_tool_scopes() -> None:
     assert "builtin:apply_patch" not in packager_tools
     assert "builtin:apply_patch" not in packager_tools
     assert "builtin:delegate_agent" not in packager_tools
+    assert "builtin:delegate_agent" not in main_tools
+    assert "builtin:agent_search" in main_tools
+    assert "builtin:call_agent" in main_tools
     assert "builtin:tool_search" in main_tools
     assert "builtin:capability_execute" in main_tools
 

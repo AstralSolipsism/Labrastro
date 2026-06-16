@@ -1,4 +1,4 @@
-"""Workspace config persistence adapter backed by YAML files."""
+﻿"""Workspace config persistence adapter backed by YAML files."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class WorkspaceConfigStore:
         return self._path
 
     def save_active_sub_model_profile(self, profile_name: str) -> Path:
-        """Persist active delegated-run model profile into workspace ``config.yaml``."""
+        """Persist active agent-call model profile into workspace ``config.yaml``."""
         try:
             data = load_yaml_config(self._path)
         except FileNotFoundError:

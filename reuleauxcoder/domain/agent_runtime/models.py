@@ -91,19 +91,6 @@ class AgentRunSource(str, Enum):
     MANUAL = "manual"
 
 
-class TaskStatus(str, Enum):
-    """Task execution lifecycle status."""
-
-    QUEUED = "queued"
-    DISPATCHED = "dispatched"
-    RUNNING = "running"
-    WAITING_APPROVAL = "waiting_approval"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    BLOCKED = "blocked"
-
-
 class ArtifactType(str, Enum):
     """Deliverable type produced by a task."""
 
@@ -214,6 +201,74 @@ CAPABILITY_COMPONENT_KINDS = {
 }
 AGENT_VISIBILITIES = {"user", "system", "internal"}
 EXECUTION_POLICIES = {"allow", "deny", "require_user", "escalate", "inherit"}
+AGENT_CALLABLE_SCOPES = {"ephemeral", "persistent"}
+AGENT_RUN_METADATA_ACTIVATION_KEYS = {
+    "current_activation_id",
+    "current_activation_seq",
+    "current_activation_input_kind",
+    "current_activation_input_payload",
+    "current_activation_prompt",
+    "previous_activation_id",
+}
+AGENT_RUN_METADATA_FORBIDDEN_KEYS = {
+    "agent_run_source",
+    "assignment_id",
+    "branch_name",
+    "call_agent_mode",
+    "called_by_agent_run_id",
+    "comment_id",
+    "created_by_activation_id",
+    "dispatch_decision_id",
+    "issue_id",
+    "lifecycle_event",
+    "lifecycle_handler_type",
+    "lifecycle_hook_id",
+    "lifecycle_hook_source",
+    "mention_id",
+    "parent_session_id",
+    "parent_task_id",
+    "parent_turn_id",
+    "pr_id",
+    "pr_url",
+    "purpose_key",
+    "relation_type",
+    "task_run_id",
+    "trigger_source",
+    "trigger_comment_id",
+    "workflow_id",
+    "workflow_node_id",
+} | AGENT_RUN_METADATA_ACTIVATION_KEYS
+
+
+def _string_choices(
+    value: Any,
+    allowed: set[str],
+    field_name: str,
+    default: list[str] | None = None,
+) -> list[str]:
+    if value is None:
+        return list(default or [])
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise ValueError(f"{field_name} must be a string or list of strings")
+
+    result: list[str] = []
+    for raw_item in values:
+        item = str(raw_item).strip().lower()
+        if not item:
+            continue
+        if item not in allowed:
+            allowed_values = ", ".join(sorted(allowed))
+            raise ValueError(
+                f"{field_name} contains unsupported value {item}; "
+                f"allowed values: {allowed_values}"
+            )
+        if item not in result:
+            result.append(item)
+    return result
 
 
 def _choice(value: Any, allowed: set[str], fallback: str) -> str:
@@ -431,6 +486,7 @@ class CapabilityPackageDraft:
     credentials: list[str] = field(default_factory=list)
     credential_requirements: list[dict[str, Any]] = field(default_factory=list)
     credential_bindings: list[dict[str, Any]] = field(default_factory=list)
+    optional_features: list[dict[str, Any]] = field(default_factory=list)
     risk_level: str = ""
     notes: list[str] = field(default_factory=list)
     hooks: list[dict[str, Any]] = field(default_factory=list)
@@ -468,6 +524,7 @@ class CapabilityPackageDraft:
                     for raw_item in _dict_list(data.get("credential_bindings", []))
                 )
             ],
+            optional_features=_dict_list(data.get("optional_features", [])),
             risk_level=str(data.get("risk_level", "") or ""),
             notes=_string_list(data.get("notes", [])),
             hooks=_dict_list(data.get("hooks", [])),
@@ -493,6 +550,7 @@ class CapabilityPackageDraft:
             "credential_bindings": [
                 dict(item) for item in self.credential_bindings
             ],
+            "optional_features": [dict(item) for item in self.optional_features],
             "risk_level": self.risk_level,
             "notes": list(self.notes),
             "hooks": [dict(item) for item in self.hooks],
@@ -896,6 +954,7 @@ def _string_dict_list(value: Any) -> list[dict[str, str]]:
 _CONTRIBUTION_KIND_BY_SECTION = {
     "skills": "skill",
     "mcp_servers": "mcp_server",
+    "mcp_tools": "mcp_tool",
     "builtin_tools": "builtin_tool",
     "prompt_fragments": "prompt_fragment",
     "credential_refs": "credential",
@@ -1518,6 +1577,464 @@ class AgentMemoryPolicyConfig:
         return result
 
 
+class AgentRunStatus(str, Enum):
+    """Durable lifecycle status for a long-lived AgentRun mainline."""
+
+    QUEUED = "queued"
+    DISPATCHED = "dispatched"
+    RUNNING = "running"
+    WAITING = "waiting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    BLOCKED = "blocked"
+
+
+class AgentRunWaitingReason(str, Enum):
+    """Reason a long-lived AgentRun is waiting for its next activation."""
+
+    SERVER_PROCESSING = "server_processing"
+    USER_APPROVAL = "user_approval"
+    USER_INPUT = "user_input"
+    AGENT_CALL = "agent_call"
+    WORKER_RECONNECT = "worker_reconnect"
+    SCHEDULED_RESUME = "scheduled_resume"
+    ADMIN_ACTION = "admin_action"
+
+
+class AgentRunResumePolicy(str, Enum):
+    """Source allowed to resume a waiting AgentRun."""
+
+    AUTOMATIC = "automatic"
+    USER_ACTION = "user_action"
+    EXTERNAL_EVENT = "external_event"
+    MANUAL_ADMIN = "manual_admin"
+
+
+class AgentRunActivationInputKind(str, Enum):
+    """Structured input source for one AgentRun activation."""
+
+    USER_REQUEST = "user_request"
+    SERVER_FEEDBACK = "server_feedback"
+    USER_FEEDBACK = "user_feedback"
+    USER_APPROVAL = "user_approval"
+    AGENT_FEEDBACK = "agent_feedback"
+    SCHEDULED_RESUME = "scheduled_resume"
+    ADMIN_RESUME = "admin_resume"
+
+
+class AgentRunActivationStatus(str, Enum):
+    """Lifecycle status for a single AgentRun activation."""
+
+    QUEUED = "queued"
+    DISPATCHED = "dispatched"
+    RUNNING = "running"
+    WAITING = "waiting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    BLOCKED = "blocked"
+
+
+class AgentRunFeedbackSource(str, Enum):
+    """Structured feedback source that can resume the same AgentRun."""
+
+    SERVER = "server"
+    USER = "user"
+    AGENT = "agent"
+    SYSTEM = "system"
+    ADMIN = "admin"
+
+
+class AgentRunFeedbackKind(str, Enum):
+    """Structured feedback type consumed by a later activation."""
+
+    CANDIDATE_VALIDATION_FAILED = "candidate_validation_failed"
+    CANDIDATE_READY = "candidate_ready"
+    APPROVAL_RESOLVED = "approval_resolved"
+    USER_MESSAGE = "user_message"
+    AGENT_CALL_RESULT = "agent_call_result"
+    AGENT_CALL_FAILED = "agent_call_failed"
+    ENVIRONMENT_EVENT = "environment_event"
+    RETRY_INSTRUCTION = "retry_instruction"
+
+
+class AgentRunFeedbackVisibility(str, Enum):
+    """Whether feedback is intended for transcript projection."""
+
+    INTERNAL = "internal"
+    USER_VISIBLE = "user_visible"
+    AUDIT_ONLY = "audit_only"
+
+
+class ActivationSteerSource(str, Enum):
+    """Source of same-activation steering input."""
+
+    USER = "user"
+    ADMIN = "admin"
+    SYSTEM = "system"
+
+
+class ActivationSteerStatus(str, Enum):
+    """Delivery state for same-activation steering input."""
+
+    QUEUED = "queued"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AgentRunRelationType(str, Enum):
+    """Relationship between two AgentRun mainlines."""
+
+    AGENT_CALL_EPHEMERAL = "agent_call_ephemeral"
+    AGENT_CALL_PERSISTENT = "agent_call_persistent"
+    FORK = "fork"
+    REVIEW = "review"
+    DIAGNOSTIC_PROBE = "diagnostic_probe"
+
+
+class AgentRunRelationStatus(str, Enum):
+    """Lifecycle status for an AgentRun relation."""
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNAVAILABLE = "unavailable"
+
+
+class AgentThreadBindingLifetime(str, Enum):
+    """Lifetime that controls Agent thread binding cleanup."""
+
+    SESSION = "session"
+    RUN = "run"
+
+
+class AgentThreadBindingStatus(str, Enum):
+    """Lifecycle status for a long-lived Agent thread binding."""
+
+    ACTIVE = "active"
+    CLOSED = "closed"
+    UNAVAILABLE = "unavailable"
+
+
+class AgentThreadWorkdirPolicy(str, Enum):
+    """Workspace policy for an Agent thread binding."""
+
+    INHERIT_MAIN = "inherit_main"
+
+
+class AgentCallableExposure(str, Enum):
+    """How a callable Agent is exposed to the model."""
+
+    DIRECT = "direct"
+    DEFERRED = "deferred"
+    HIDDEN = "hidden"
+    SYSTEM_ONLY = "system-only"
+
+
+class AgentCallableAuthorizationStatus(str, Enum):
+    """Authorization state for invoking a projected Agent."""
+
+    ALLOWED = "allowed"
+    REQUIRES_APPROVAL = "requires_approval"
+    DENIED = "denied"
+    UNAVAILABLE = "unavailable"
+
+
+def _optional_enum(enum_type: type[Enum], value: Any) -> Enum | None:
+    if value is None or value == "":
+        return None
+    return enum_type(_enum_value(value))
+
+
+@dataclass
+class AgentRun:
+    """Long-lived Agent mainline; not a worker claim or single model call."""
+
+    id: str
+    agent_id: str
+    kind: str = "agent_run"
+    owner_session_run_id: str = ""
+    source: AgentRunSource = AgentRunSource.MANUAL
+    trigger_mode: TriggerMode = TriggerMode.ISSUE_TASK
+    status: AgentRunStatus = AgentRunStatus.QUEUED
+    waiting_reason: AgentRunWaitingReason | None = None
+    resume_policy: AgentRunResumePolicy | None = None
+    runtime_profile_id: str | None = None
+    executor: ExecutorType | None = None
+    execution_location: ExecutionLocation | None = None
+    worktree_role: WorktreeRole | None = None
+    publish_policy: PublishPolicy | None = None
+    workdir: str | None = None
+    workspace_ref: str | None = None
+    executor_session_id: str | None = None
+    current_activation_id: str | None = None
+    sandbox_id: str | None = None
+    sandbox_session_id: str | None = None
+    retention_scope: str = "session"
+    cleanup_policy: str = "delete_with_owner_session"
+    terminal_result: dict[str, Any] = field(default_factory=dict)
+    failure_reason: str | None = None
+    cancel_reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.source = AgentRunSource(_enum_value(self.source) or AgentRunSource.MANUAL)
+        self.trigger_mode = TriggerMode(_enum_value(self.trigger_mode))
+        self.status = AgentRunStatus(_enum_value(self.status) or AgentRunStatus.QUEUED)
+        self.waiting_reason = _optional_enum(AgentRunWaitingReason, self.waiting_reason)
+        self.resume_policy = _optional_enum(AgentRunResumePolicy, self.resume_policy)
+        if self.executor is not None:
+            self.executor = ExecutorType(_enum_value(self.executor))
+        if self.execution_location is not None:
+            self.execution_location = ExecutionLocation(
+                _enum_value(self.execution_location)
+            )
+        if self.worktree_role is not None:
+            self.worktree_role = WorktreeRole(_enum_value(self.worktree_role))
+        if self.publish_policy is not None:
+            self.publish_policy = PublishPolicy(_enum_value(self.publish_policy))
+        self.terminal_result = _dict_value(self.terminal_result)
+        self.metadata = _dict_value(self.metadata)
+        forbidden_metadata = sorted(
+            key for key in self.metadata if key in AGENT_RUN_METADATA_FORBIDDEN_KEYS
+        )
+        if forbidden_metadata:
+            raise ValueError(
+                "AgentRun.metadata cannot store taskflow or external business "
+                "identity fields: "
+                + ", ".join(forbidden_metadata)
+            )
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            AgentRunStatus.COMPLETED,
+            AgentRunStatus.FAILED,
+            AgentRunStatus.CANCELLED,
+            AgentRunStatus.BLOCKED,
+        }
+
+
+@dataclass
+class AgentRunActivation:
+    """One wake/execute turn inside a long-lived AgentRun."""
+
+    id: str
+    agent_run_id: str
+    seq: int
+    input_kind: AgentRunActivationInputKind
+    input_payload: dict[str, Any] = field(default_factory=dict)
+    prompt: str = ""
+    status: AgentRunActivationStatus = AgentRunActivationStatus.QUEUED
+    output: str | None = None
+    result_payload: dict[str, Any] = field(default_factory=dict)
+    worker_id: str | None = None
+    request_id: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.seq = int(self.seq)
+        self.input_kind = AgentRunActivationInputKind(_enum_value(self.input_kind))
+        self.status = AgentRunActivationStatus(
+            _enum_value(self.status) or AgentRunActivationStatus.QUEUED
+        )
+        self.input_payload = _dict_value(self.input_payload)
+        self.result_payload = _dict_value(self.result_payload)
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class ActivationSteer:
+    """Same-activation steering input; does not create a new activation."""
+
+    id: str
+    activation_id: str
+    source: ActivationSteerSource
+    payload: dict[str, Any] = field(default_factory=dict)
+    created_at: str | None = None
+    delivered_at: str | None = None
+    status: ActivationSteerStatus = ActivationSteerStatus.QUEUED
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.source = ActivationSteerSource(_enum_value(self.source))
+        self.status = ActivationSteerStatus(
+            _enum_value(self.status) or ActivationSteerStatus.QUEUED
+        )
+        self.payload = _dict_value(self.payload)
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class ExecutorSession:
+    """Concrete backend context bound to an AgentRun."""
+
+    id: str
+    agent_run_id: str
+    agent_id: str
+    executor: ExecutorType
+    execution_location: ExecutionLocation
+    workdir: str | None = None
+    branch: str | None = None
+    sandbox_session_id: str | None = None
+    provider_session_id: str | None = None
+    state_ref: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.executor = ExecutorType(_enum_value(self.executor))
+        self.execution_location = ExecutionLocation(_enum_value(self.execution_location))
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class AgentRunFeedback:
+    """Structured input that can resume the same AgentRun."""
+
+    id: str
+    agent_run_id: str
+    source: AgentRunFeedbackSource
+    kind: AgentRunFeedbackKind
+    payload: dict[str, Any] = field(default_factory=dict)
+    created_at: str | None = None
+    consumed_by_activation_id: str | None = None
+    visibility: AgentRunFeedbackVisibility = AgentRunFeedbackVisibility.INTERNAL
+    requires_activation: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.source = AgentRunFeedbackSource(_enum_value(self.source))
+        self.kind = AgentRunFeedbackKind(_enum_value(self.kind))
+        self.visibility = AgentRunFeedbackVisibility(
+            _enum_value(self.visibility) or AgentRunFeedbackVisibility.INTERNAL
+        )
+        self.requires_activation = _bool_value(self.requires_activation, False)
+        self.payload = _dict_value(self.payload)
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class AgentRunRelation:
+    """Relationship index between AgentRun mainlines."""
+
+    id: str
+    owner_agent_run_id: str
+    related_agent_run_id: str
+    relation_type: AgentRunRelationType
+    relation_scope: str = "session"
+    created_by_activation_id: str | None = None
+    status: AgentRunRelationStatus = AgentRunRelationStatus.ACTIVE
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.relation_type = AgentRunRelationType(_enum_value(self.relation_type))
+        self.status = AgentRunRelationStatus(
+            _enum_value(self.status) or AgentRunRelationStatus.ACTIVE
+        )
+        self.relation_scope = str(self.relation_scope or "session")
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class AgentThreadBinding:
+    """Long-lived persistent conversation binding to an existing Agent."""
+
+    id: str
+    owner_session_run_id: str
+    main_agent_run_id: str
+    agent_id: str
+    target_agent_run_id: str
+    thread_key: str = ""
+    thread_summary: str = ""
+    binding_lifetime: AgentThreadBindingLifetime = AgentThreadBindingLifetime.SESSION
+    workdir_policy: AgentThreadWorkdirPolicy = AgentThreadWorkdirPolicy.INHERIT_MAIN
+    visibility: str = "hidden_from_user_transcript"
+    status: AgentThreadBindingStatus = AgentThreadBindingStatus.ACTIVE
+    cleanup_policy: str = "delete_with_owner_session"
+    created_at: str | None = None
+    updated_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.thread_key = str(self.thread_key or "")
+        self.thread_summary = str(self.thread_summary or "")
+        self.binding_lifetime = AgentThreadBindingLifetime(
+            _enum_value(self.binding_lifetime)
+        )
+        self.workdir_policy = AgentThreadWorkdirPolicy(
+            _enum_value(self.workdir_policy)
+        )
+        self.status = AgentThreadBindingStatus(
+            _enum_value(self.status) or AgentThreadBindingStatus.ACTIVE
+        )
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class AgentCallGrant:
+    """Reusable grant for one main Agent invoking one target Agent scope."""
+
+    user_id: str
+    grant_scope: str
+    main_agent_id: str
+    target_agent_id: str
+    conversation_scope: str
+    capability_scope: dict[str, Any] = field(default_factory=dict)
+    target_config_version: str = ""
+    granted_at: str | None = None
+    expires_at: str | None = None
+    revoked_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        scopes = _string_choices(
+            [self.conversation_scope],
+            AGENT_CALLABLE_SCOPES,
+            "AgentCallGrant.conversation_scope",
+        )
+        self.conversation_scope = scopes[0]
+        self.grant_scope = str(self.grant_scope or "")
+        self.capability_scope = _dict_value(self.capability_scope)
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class AgentCallableProjectionEntry:
+    """Model-visible projection of a callable Agent."""
+
+    agent_id: str
+    display_name: str = ""
+    summary: str = ""
+    exposure: AgentCallableExposure = AgentCallableExposure.DEFERRED
+    callable_scopes: list[str] = field(default_factory=list)
+    authorization_status: AgentCallableAuthorizationStatus = (
+        AgentCallableAuthorizationStatus.UNAVAILABLE
+    )
+    existing_threads: list[dict[str, Any]] = field(default_factory=list)
+    capability_scope: dict[str, Any] = field(default_factory=dict)
+    source: str = "agent_registry"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exposure = AgentCallableExposure(_enum_value(self.exposure))
+        self.callable_scopes = _string_choices(
+            self.callable_scopes,
+            AGENT_CALLABLE_SCOPES,
+            "AgentCallableProjectionEntry.callable_scopes",
+        )
+        self.authorization_status = AgentCallableAuthorizationStatus(
+            _enum_value(self.authorization_status)
+        )
+        self.existing_threads = _dict_list(self.existing_threads)
+        self.capability_scope = _dict_value(self.capability_scope)
+        self.metadata = _dict_value(self.metadata)
+
+
 @dataclass
 class AgentConfig:
     """Server-authoritative Agent configuration."""
@@ -1529,7 +2046,7 @@ class AgentConfig:
     entrypoint: bool = False
     visibility: str = "user"
     chat_entrypoint: bool = False
-    delegable: bool = True
+    callable_scopes: list[str] | None = None
     taskflow_eligible: bool = True
     system_flow_only: list[str] = field(default_factory=list)
     runtime_profile: str = ""
@@ -1548,15 +2065,23 @@ class AgentConfig:
         _reject_plaintext_secret_container(data, owner="agent config")
         removed_fields = [
             key
-            for key in ("capabilities", "mcp", "skills", "dispatch_tags")
+            for key in (
+                "capabilities",
+                "callable_modes",
+                "delegable",
+                "mcp",
+                "skills",
+                "dispatch_tags",
+            )
             if key in data
         ]
         if removed_fields:
             raise ValueError(
                 "agent config fields "
                 + ", ".join(sorted(removed_fields))
-                + " were removed; use dispatch.profile/examples/avoid for "
-                + "Agent routing profile and capability_refs for capability packages"
+                + " were removed; use callable_scopes for Agent invocation scopes, "
+                + "dispatch.profile/examples/avoid for Agent routing profile, "
+                + "and capability_refs for capability packages"
             )
         raw_max = data.get("max_concurrent_tasks")
         max_concurrent_tasks = int(raw_max) if raw_max is not None else None
@@ -1575,7 +2100,12 @@ class AgentConfig:
             entrypoint=entrypoint,
             visibility=visibility,
             chat_entrypoint=chat_entrypoint,
-            delegable=_bool_value(data.get("delegable"), user_visible),
+            callable_scopes=_string_choices(
+                data.get("callable_scopes"),
+                AGENT_CALLABLE_SCOPES,
+                "agent config callable_scopes",
+                default=["ephemeral", "persistent"] if user_visible else [],
+            ),
             taskflow_eligible=_bool_value(data.get("taskflow_eligible"), user_visible),
             system_flow_only=_string_list(data.get("system_flow_only", [])),
             runtime_profile=str(data.get("runtime_profile", "") or ""),
@@ -1587,6 +2117,20 @@ class AgentConfig:
             max_concurrent_tasks=max_concurrent_tasks,
             credential_refs=_string_dict(data.get("credential_refs", {})),
         )
+
+    def __post_init__(self) -> None:
+        self.visibility = _choice(self.visibility, AGENT_VISIBILITIES, "user")
+        if self.callable_scopes is None:
+            default_scopes = (
+                ["ephemeral", "persistent"] if self.visibility == "user" else []
+            )
+            self.callable_scopes = list(default_scopes)
+        else:
+            self.callable_scopes = _string_choices(
+                self.callable_scopes,
+                AGENT_CALLABLE_SCOPES,
+                "agent config callable_scopes",
+            )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -1602,8 +2146,9 @@ class AgentConfig:
             result["entrypoint"] = self.entrypoint
         if self.chat_entrypoint:
             result["chat_entrypoint"] = self.chat_entrypoint
-        if self.delegable != (self.visibility == "user"):
-            result["delegable"] = self.delegable
+        default_scopes = ["ephemeral", "persistent"] if self.visibility == "user" else []
+        if self.callable_scopes != default_scopes:
+            result["callable_scopes"] = list(self.callable_scopes or [])
         if self.taskflow_eligible != (self.visibility == "user"):
             result["taskflow_eligible"] = self.taskflow_eligible
         if self.system_flow_only:
@@ -1635,8 +2180,12 @@ class AgentConfig:
         return self.visibility == "user"
 
     @property
-    def can_delegate(self) -> bool:
-        return self.user_visible and self.delegable
+    def can_call_ephemeral(self) -> bool:
+        return self.user_visible and "ephemeral" in set(self.callable_scopes or [])
+
+    @property
+    def can_call_persistent(self) -> bool:
+        return self.user_visible and "persistent" in set(self.callable_scopes or [])
 
     @property
     def can_run_taskflow(self) -> bool:
@@ -1645,67 +2194,6 @@ class AgentConfig:
     def allows_system_flow(self, flow: str) -> bool:
         return str(flow).strip() in set(self.system_flow_only)
 
-
-@dataclass
-class AgentRunRecord:
-    """One execution attempt by an Agent.
-
-    Chat, delegation, TaskFlow, environment, and manual execution all converge
-    here so every Agent execution has the same durable shape.
-    """
-
-    id: str
-    issue_id: str
-    agent_id: str
-    source: AgentRunSource = AgentRunSource.MANUAL
-    trigger_mode: TriggerMode = TriggerMode.ISSUE_TASK
-    status: TaskStatus = TaskStatus.QUEUED
-    prompt: str = ""
-    runtime_profile_id: str | None = None
-    executor: ExecutorType | None = None
-    execution_location: ExecutionLocation | None = None
-    worktree_role: WorktreeRole | None = None
-    publish_policy: PublishPolicy | None = None
-    output: str | None = None
-    parent_task_id: str | None = None
-    trigger_comment_id: str | None = None
-    branch_name: str | None = None
-    pr_url: str | None = None
-    worker_id: str | None = None
-    executor_session_id: str | None = None
-    workdir: str | None = None
-    sandbox_id: str | None = None
-    sandbox_session_id: str | None = None
-    workspace_ref: str | None = None
-    delegated_by_run_id: str | None = None
-    parent_run_id: str | None = None
-    failure_reason: str | None = None
-    cancel_reason: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.source = AgentRunSource(_enum_value(self.source) or AgentRunSource.MANUAL)
-        self.trigger_mode = TriggerMode(_enum_value(self.trigger_mode))
-        self.status = TaskStatus(_enum_value(self.status))
-        if self.executor is not None:
-            self.executor = ExecutorType(_enum_value(self.executor))
-        if self.execution_location is not None:
-            self.execution_location = ExecutionLocation(
-                _enum_value(self.execution_location)
-            )
-        if self.worktree_role is not None:
-            self.worktree_role = WorktreeRole(_enum_value(self.worktree_role))
-        if self.publish_policy is not None:
-            self.publish_policy = PublishPolicy(_enum_value(self.publish_policy))
-
-    @property
-    def is_terminal(self) -> bool:
-        return self.status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.BLOCKED,
-        }
 
 @dataclass
 class TaskArtifact:
@@ -1747,7 +2235,6 @@ class TaskSessionRef:
     agent_id: str
     executor: ExecutorType
     execution_location: ExecutionLocation
-    issue_id: str
     task_id: str
     workdir: str | None = None
     branch: str | None = None

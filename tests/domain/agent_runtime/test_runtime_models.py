@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib
 
@@ -75,7 +75,7 @@ def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> No
             "runtime_profile": "codex_remote",
             "visibility": "user",
             "chat_entrypoint": False,
-            "delegable": True,
+            "callable_scopes": ["ephemeral", "persistent"],
             "taskflow_eligible": True,
             "dispatch": {
                 "profile": "适合审查代码风险、阅读仓库并指出缺失测试。",
@@ -94,7 +94,8 @@ def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> No
     assert agent.id == "code_reviewer"
     assert agent.visibility == "user"
     assert agent.chat_entrypoint is False
-    assert agent.can_delegate is True
+    assert agent.can_call_ephemeral is True
+    assert agent.can_call_persistent is True
     assert agent.can_run_taskflow is True
     assert agent.runtime_profile == "codex_remote"
     assert agent.dispatch.profile.startswith("适合审查代码风险")
@@ -104,6 +105,166 @@ def test_agent_config_binds_runtime_profile_prompt_dispatch_and_packages() -> No
     assert agent.prompt.agent_md == ".agents/code_reviewer/AGENT.md"
     assert "风险" in agent.prompt.system_append
     assert agent.max_concurrent_tasks == 2
+
+
+def test_agent_config_rejects_removed_delegable_field() -> None:
+    models = _models()
+
+    with pytest.raises(ValueError, match="callable_scopes"):
+        models.AgentConfig.from_dict(
+            "legacy_agent",
+            {
+                "runtime_profile": "codex_remote",
+                "delegable": True,
+            },
+        )
+
+
+def test_agent_config_rejects_removed_callable_modes_field() -> None:
+    models = _models()
+
+    with pytest.raises(ValueError, match="callable_scopes"):
+        models.AgentConfig.from_dict(
+            "legacy_agent",
+            {
+                "runtime_profile": "codex_remote",
+                "callable_modes": ["delegate"],
+            },
+        )
+
+
+def test_agent_run_activation_feedback_models_keep_lifecycle_boundaries() -> None:
+    models = _models()
+
+    run = models.AgentRun(
+        id="run-1",
+        agent_id="reviewer",
+        owner_session_run_id="session-1",
+        status="waiting",
+        waiting_reason="server_processing",
+        resume_policy="automatic",
+        current_activation_id="act-1",
+    )
+    activation = models.AgentRunActivation(
+        id="act-1",
+        agent_run_id="run-1",
+        seq=1,
+        input_kind="user_request",
+        prompt="inspect the repository",
+        worker_id="worker-1",
+        request_id="request-1",
+    )
+    feedback = models.AgentRunFeedback(
+        id="feedback-1",
+        agent_run_id="run-1",
+        source="server",
+        kind="candidate_validation_failed",
+        payload={"field": "components"},
+        requires_activation=True,
+    )
+    relation = models.AgentRunRelation(
+        id="relation-1",
+        owner_agent_run_id="run-1",
+        related_agent_run_id="run-2",
+        relation_type="agent_call_ephemeral",
+        relation_scope="session",
+        created_by_activation_id="act-1",
+    )
+    binding = models.AgentThreadBinding(
+        id="binding-1",
+        owner_session_run_id="session-1",
+        main_agent_run_id="run-1",
+        agent_id="project_researcher",
+        target_agent_run_id="run-2",
+        thread_key="backend",
+        thread_summary="后端调查线程",
+        binding_lifetime="session",
+    )
+
+    assert run.status == models.AgentRunStatus.WAITING
+    assert run.waiting_reason == models.AgentRunWaitingReason.SERVER_PROCESSING
+    assert not hasattr(run, "prompt")
+    assert not hasattr(run, "output")
+    assert not hasattr(run, "worker_id")
+    assert not hasattr(run, "issue_id")
+    assert activation.input_kind == models.AgentRunActivationInputKind.USER_REQUEST
+    assert activation.prompt == "inspect the repository"
+    assert activation.worker_id == "worker-1"
+    assert feedback.kind == models.AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED
+    assert feedback.requires_activation is True
+    assert feedback.payload == {"field": "components"}
+    assert relation.relation_type == models.AgentRunRelationType.AGENT_CALL_EPHEMERAL
+    assert relation.relation_scope == "session"
+    assert binding.target_agent_run_id == "run-2"
+    assert binding.thread_key == "backend"
+    assert binding.binding_lifetime == models.AgentThreadBindingLifetime.SESSION
+
+
+def test_agent_run_rejects_taskflow_business_identity_in_metadata() -> None:
+    models = _models()
+
+    with pytest.raises(ValueError, match="AgentRun.metadata"):
+        models.AgentRun(
+            id="run-1",
+            agent_id="reviewer",
+            metadata={
+                "issue_id": "issue-1",
+                "trigger_comment_id": "comment-1",
+                "assignment_id": "assignment-1",
+            },
+        )
+
+
+def test_agent_run_has_no_record_alias_for_business_identity_metadata() -> None:
+    models = _models()
+
+    with pytest.raises(ValueError, match="AgentRun.metadata"):
+        models.AgentRun(
+            id="run-1",
+            agent_id="reviewer",
+            metadata={"issue_id": "issue-1"},
+        )
+
+
+def test_agent_callable_projection_and_grant_use_agent_id_and_scopes() -> None:
+    models = _models()
+
+    projection = models.AgentCallableProjectionEntry(
+        agent_id="project_researcher",
+        display_name="Project Researcher",
+        exposure="deferred",
+        callable_scopes=["persistent", "ephemeral"],
+        authorization_status="allowed",
+        existing_threads=[
+            {
+                "thread_key": "backend",
+                "summary": "后端调查线程",
+                "status": "active",
+                "binding_id": "binding-1",
+                "pending_results_count": 0,
+            }
+        ],
+        capability_scope={"packages": ["repo-read"]},
+    )
+    grant = models.AgentCallGrant(
+        user_id="user-1",
+        grant_scope="workspace:demo",
+        main_agent_id="main_chat",
+        target_agent_id="project_researcher",
+        conversation_scope="persistent",
+        capability_scope={"packages": ["repo-read"]},
+        target_config_version="v1",
+    )
+
+    assert projection.agent_id == "project_researcher"
+    assert projection.callable_scopes == ["persistent", "ephemeral"]
+    assert projection.authorization_status == (
+        models.AgentCallableAuthorizationStatus.ALLOWED
+    )
+    assert projection.existing_threads[0]["thread_key"] == "backend"
+    assert grant.conversation_scope == "persistent"
+    assert grant.grant_scope == "workspace:demo"
+    assert grant.target_agent_id == "project_researcher"
 
 
 def test_agent_config_rejects_plaintext_secrets() -> None:
@@ -277,6 +438,77 @@ def test_resolve_capability_refs_merges_all_packages() -> None:
     assert "permissions" not in resolved["packages"][1]
 
 
+def test_external_mcp_tools_contribution_maps_to_internal_tool_spec_projection() -> None:
+    models = _models()
+    optional_features = [
+        {
+            "id": "optional:readability",
+            "title": "Readability extraction",
+            "placement": "server",
+            "default_selected": False,
+            "selection_scope": "user",
+        }
+    ]
+    draft = models.CapabilityPackageDraft.from_dict(
+        "github-tools",
+        {
+            "id": "github-tools",
+            "name": "GitHub Tools",
+            "contributions": {
+                "mcp_servers": [
+                    {
+                        "id": "mcp:github",
+                        "kind": "mcp_server",
+                        "name": "github",
+                        "config": {"command": "github-mcp-server"},
+                    }
+                ],
+                "mcp_tools": [
+                    {
+                        "id": "mcp:github:search",
+                        "kind": "mcp_tool",
+                        "name": "search",
+                        "registry_path": "mcp:github:search",
+                    }
+                ],
+            },
+            "optional_features": optional_features,
+            "install_plan": [],
+            "usage": [],
+            "evidence": [],
+            "risk_level": "low",
+        },
+    )
+
+    components = {
+        item["id"]: models.CapabilityComponentConfig.from_dict(item["id"], item)
+        for item in draft.components
+    }
+    packages = {
+        "github-tools": models.CapabilityPackageConfig.from_dict(
+            "github-tools",
+            {
+                "components": [item["id"] for item in draft.components],
+            },
+        )
+    }
+
+    resolved = models.resolve_capability_refs(["github-tools"], packages, components)
+
+    assert draft.optional_features == optional_features
+    assert [item["kind"] for item in draft.components] == ["mcp_server", "mcp_tool"]
+    assert draft.components[1]["id"] == "mcp:github:search"
+    assert draft.components[1]["registry_path"] == "mcp:github:search"
+    assert resolved["mcp_servers"] == ["github"]
+    assert resolved["mcp_tools"] == ["mcp:github:search"]
+    assert "tools" not in resolved
+    assert [item["target_tool_ref"] for item in resolved["tool_specs"]] == [
+        "mcp:github:search"
+    ]
+    assert resolved["tool_specs"][0]["source_type"] == "mcp_tool"
+    assert resolved["effective_capabilities"]["tool_specs"] == resolved["tool_specs"]
+
+
 def test_resolve_capability_refs_uses_activation_state_not_enabled_only() -> None:
     models = _models()
     components = {
@@ -313,12 +545,11 @@ def test_resolve_capability_refs_uses_activation_state_not_enabled_only() -> Non
 def test_task_and_artifact_status_are_independent() -> None:
     models = _models()
 
-    task = models.AgentRunRecord(
+    task = models.AgentRun(
         id="task-1",
-        issue_id="issue-1",
         agent_id="code_reviewer",
         trigger_mode=models.TriggerMode.ISSUE_TASK,
-        status=models.TaskStatus.COMPLETED,
+        status=models.AgentRunStatus.COMPLETED,
     )
     artifact = models.TaskArtifact(
         id="artifact-1",
@@ -330,7 +561,7 @@ def test_task_and_artifact_status_are_independent() -> None:
     )
 
     assert task.is_terminal is True
-    assert task.status == models.TaskStatus.COMPLETED
+    assert task.status == models.AgentRunStatus.COMPLETED
     assert artifact.status == models.ArtifactStatus.PR_REVIEWING
     assert artifact.status != models.ArtifactStatus.MERGED
     assert artifact.requires_user_merge is True
@@ -339,12 +570,11 @@ def test_task_and_artifact_status_are_independent() -> None:
 def test_non_code_task_allows_report_artifact_without_branch_or_pr() -> None:
     models = _models()
 
-    task = models.AgentRunRecord(
+    task = models.AgentRun(
         id="task-2",
-        issue_id="issue-2",
         agent_id="researcher",
         trigger_mode=models.TriggerMode.ISSUE_TASK,
-        status=models.TaskStatus.COMPLETED,
+        status=models.AgentRunStatus.COMPLETED,
     )
     artifact = models.TaskArtifact(
         id="artifact-2",
@@ -354,7 +584,7 @@ def test_non_code_task_allows_report_artifact_without_branch_or_pr() -> None:
         content="调研结论",
     )
 
-    assert task.status == models.TaskStatus.COMPLETED
+    assert task.status == models.AgentRunStatus.COMPLETED
     assert artifact.type == models.ArtifactType.REPORT
     assert artifact.branch_name is None
     assert artifact.pr_url is None
