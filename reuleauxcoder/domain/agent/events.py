@@ -1,4 +1,4 @@
-"""Agent events - event types for telemetry and hooks."""
+﻿"""Agent events - event types for telemetry and hooks."""
 
 import hashlib
 import time
@@ -53,7 +53,7 @@ class AgentEventType(Enum):
     PROVIDER_STREAM_RECOVERING = "provider_stream_recovering"
     PROVIDER_STREAM_RECOVERED = "provider_stream_recovered"
     SESSION_RUN_INTERRUPTED = "session_run_interrupted"
-    DELEGATED_RUN_COMPLETED = "delegated_run_completed"
+    AGENT_RELATION_COMPLETED = "agent_relation_completed"
     # User-visible context compression lifecycle events are currently emitted via
     # UIEventKind.CONTEXT so CLI, remote relay, and webview can share one UI path.
     COMPRESSION_START = "compression_start"
@@ -798,7 +798,7 @@ class AgentEvent:
         )
 
     @classmethod
-    def delegated_run_completed(
+    def agent_relation_completed(
         cls,
         *,
         run_id: str,
@@ -808,9 +808,9 @@ class AgentEvent:
         result: str | None = None,
         error: str | None = None,
     ) -> "AgentEvent":
-        """Create a delegated AgentRun completion event."""
+        """Create an AgentRun relation completion event."""
         return cls(
-            event_type=AgentEventType.DELEGATED_RUN_COMPLETED,
+            event_type=AgentEventType.AGENT_RELATION_COMPLETED,
             data={
                 "run_id": run_id,
                 "agent_id": agent_id,

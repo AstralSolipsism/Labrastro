@@ -1,4 +1,4 @@
-"""Builtin model command extension registration and handlers."""
+﻿"""Builtin model command extension registration and handlers."""
 
 from __future__ import annotations
 
@@ -240,7 +240,7 @@ def _handle_use_sub_model(command, ctx) -> CommandResult:
     setattr(ctx.agent, "active_sub_model_profile", profile_name)
     payload = _refresh_model_view(ctx)
     ctx.ui_bus.success(
-        f"Switched session delegated-run model profile to '{profile_name}' ({profile.model})",
+        f"Switched session agent-call model profile to '{profile_name}' ({profile.model})",
         kind=UIEventKind.MODEL,
         profile_name=profile_name,
         model=profile.model,
@@ -285,7 +285,7 @@ def _handle_set_sub_model(command, ctx) -> CommandResult:
     path = WorkspaceConfigStore().save_active_sub_model_profile(profile_name)
 
     ctx.ui_bus.success(
-        f"Set global delegated-run model profile to '{profile_name}' ({profile.model}) and saved to {path}",
+        f"Set global agent-call model profile to '{profile_name}' ({profile.model}) and saved to {path}",
         kind=UIEventKind.MODEL,
         profile_name=profile_name,
         model=profile.model,
@@ -329,20 +329,22 @@ def _build_model_profiles_payload(config, runtime_state=None) -> dict:
         lines.append(f"- main agent: runtime `{runtime_model or 'unconfigured'}`")
 
     if active_sub:
-        lines.append(f"- delegated run default: `{active_sub}`")
+        lines.append(f"- agent-call default: `{active_sub}`")
     else:
-        lines.append("- delegated run default: inherits main agent runtime")
+        lines.append("- agent-call default: inherits main agent runtime")
 
     lines.append("")
     lines.append("**Commands**")
     lines.append(
         "- `/model <profile>` or `/model use-main <profile>` → switch session main model"
     )
-    lines.append("- `/model use-sub <profile>` → switch session delegated-run model")
+    lines.append("- `/model use-sub <profile>` → switch session agent-call model")
     lines.append("- `/model set-main <profile>` → set global default main model")
-    lines.append("- `/model set-sub <profile>` → set global default delegated-run model")
+    lines.append("- `/model set-sub <profile>` → set global default agent-call model")
     lines.append(
-        "- `delegate_agent(agent_id, task)` → route durable delegated work to the selected AgentConfig"
+        "- `agent_search(query, conversation_scope)` + "
+        "`call_agent(agent_id, request, conversation_scope, wait, thread_key, thread_summary)` "
+        "→ route work to callable AgentConfig entries"
     )
     lines.append("")
 
@@ -467,7 +469,7 @@ def register_actions(registry: ActionRegistry) -> None:
             ActionSpec(
                 action_id="model.use_sub",
                 feature_id="model",
-                description="[session] Use a session delegated-run model profile",
+                description="[session] Use a session agent-call model profile",
                 ui_targets=UI_TARGETS,
                 required_capabilities=TEXT_REQUIRED,
                 triggers=(
@@ -501,7 +503,7 @@ def register_actions(registry: ActionRegistry) -> None:
             ActionSpec(
                 action_id="model.set_sub",
                 feature_id="model",
-                description="[global] Set the global default delegated-run model profile",
+                description="[global] Set the global default agent-call model profile",
                 ui_targets=UI_TARGETS,
                 required_capabilities=TEXT_REQUIRED,
                 triggers=(

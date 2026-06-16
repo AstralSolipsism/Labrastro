@@ -240,8 +240,8 @@ def test_agent_event_file_change_completed_contains_status_and_error() -> None:
     assert event.data["error"] == "patch context does not match file"
 
 
-def test_agent_event_delegated_run_completed_contains_payload() -> None:
-    event = AgentEvent.delegated_run_completed(
+def test_agent_event_agent_relation_completed_contains_payload() -> None:
+    event = AgentEvent.agent_relation_completed(
         run_id="run-1",
         agent_id="researcher",
         task="scan repo",
@@ -249,7 +249,7 @@ def test_agent_event_delegated_run_completed_contains_payload() -> None:
         result="done",
         error=None,
     )
-    assert event.event_type is AgentEventType.DELEGATED_RUN_COMPLETED
+    assert event.event_type is AgentEventType.AGENT_RELATION_COMPLETED
     assert event.data["run_id"] == "run-1"
     assert event.data["agent_id"] == "researcher"
     assert event.data["status"] == "ok"

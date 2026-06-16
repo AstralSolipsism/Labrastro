@@ -1,4 +1,4 @@
-"""Session document reducer used as the UI history authority."""
+﻿"""Session document reducer used as the UI history authority."""
 
 from __future__ import annotations
 
@@ -288,7 +288,7 @@ def apply_session_event(
         "system_event",
         "agent_event",
         "ui_event",
-        "delegated_run_completed",
+        "agent_relation_completed",
         "taskflow_started",
     }:
         _append_part(doc, _part(event_type, "ui_event", meta, {
@@ -1729,7 +1729,7 @@ def _tool_output_format(payload: dict[str, Any], tool_name: str, tool_source: st
         return "terminal"
     normalized_tool = tool_name.lower()
     normalized_source = tool_source.lower()
-    if "mcp" in normalized_source or "agent" in normalized_tool or normalized_tool in {"mcp", "delegate_agent"}:
+    if "mcp" in normalized_source or "agent" in normalized_tool or normalized_tool == "mcp":
         return "markdown"
     return "plain"
 

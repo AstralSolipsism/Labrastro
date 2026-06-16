@@ -146,7 +146,7 @@ def test_use_sub_model_alias_switches_session_sub_model() -> None:
     assert result.payload["active_sub_profile"] == "beta"
     assert any(
         event.level == UIEventLevel.SUCCESS
-        and "session delegated-run model profile" in event.message
+        and "session agent-call model profile" in event.message
         for event in ctx.ui_bus._history
     )
 
@@ -172,6 +172,6 @@ def test_set_sub_model_updates_global_sub_profile(monkeypatch) -> None:
     assert result.payload["active_sub_profile"] == "alpha"
     assert any(
         event.level == UIEventLevel.SUCCESS
-        and "global delegated-run model profile" in event.message
+        and "global agent-call model profile" in event.message
         for event in ctx.ui_bus._history
     )
