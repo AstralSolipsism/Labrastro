@@ -54,7 +54,7 @@ from labrastro_server.services.agent_runtime.model_bridge import (
     provider_response_to_dict,
 )
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
-from reuleauxcoder.domain.agent_runtime.models import WorkerKind
+from reuleauxcoder.domain.agent_runtime.models import AgentRunStatus, WorkerKind
 from reuleauxcoder.interfaces.events import UIEventKind
 from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 
@@ -587,7 +587,7 @@ class RemoteAgentRunRoutes:
         github_pr_service = getattr(self.service, "github_pr_service", None)
         if (
             completed is not None
-            and result.status == "completed"
+            and completed.status == AgentRunStatus.COMPLETED
             and github_pr_service is not None
         ):
             github = github_pr_service.ensure_pr_for_task(task_id).to_dict()

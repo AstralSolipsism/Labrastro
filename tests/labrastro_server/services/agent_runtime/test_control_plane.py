@@ -10,6 +10,7 @@ import pytest
 
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunActivationInputKind,
+    AgentRun,
     AgentCallGrant,
     AgentConfig,
     AgentRunFeedbackKind,
@@ -50,6 +51,54 @@ from labrastro_server.services.agent_runtime.postgres_store import PostgresAgent
 from labrastro_server.services.agent_runtime.runtime_store import (
     runtime_slot_key_for_agent_run,
 )
+
+
+class _FakeSandboxProvider:
+    def __init__(self) -> None:
+        self.stopped_sessions: list[str] = []
+        self.cancelled_sessions: list[str] = []
+
+    def stop_session(self, session_id: str) -> bool:
+        self.stopped_sessions.append(session_id)
+        return True
+
+    def cancel(self, session_id: str) -> bool:
+        self.cancelled_sessions.append(session_id)
+        return True
+
+
+class _WaitingActivationCompletionStore:
+    def __init__(self) -> None:
+        self.task = AgentRun(
+            id="task-store-waiting",
+            agent_id="coder",
+            status=AgentRunStatus.WAITING,
+            sandbox_session_id="sandbox-store",
+            current_activation_id="task-store-waiting:activation:1",
+        )
+
+    def complete_agent_run_activation(
+        self,
+        task_id: str,
+        result: ExecutorRunResult,
+        *,
+        activation_id: str,
+        artifacts: list[dict] | None = None,
+    ) -> AgentRun:
+        return self.task
+
+    def complete_claimed_agent_run_activation(
+        self,
+        task_id: str,
+        result: ExecutorRunResult,
+        *,
+        request_id: str,
+        activation_id: str,
+        worker_id: str,
+        peer_id: str | None = None,
+        artifacts: list[dict] | None = None,
+    ) -> tuple[bool, str, AgentRun | None]:
+        return True, "", self.task
 
 
 def _relation(
@@ -708,6 +757,51 @@ def test_waiting_agent_call_target_first_resumes_after_owner_completion() -> Non
     assert detail["activations"][-1]["input_payload"]["target_agent_run_id"] == child.id
 
 
+def test_agent_call_feedback_resume_keeps_sandbox_session_alive() -> None:
+    sandbox = _FakeSandboxProvider()
+    control = AgentRunControlPlane(max_running_tasks=4, sandbox_provider=sandbox)
+    parent = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="planner",
+            prompt="parent",
+            executor_session_id="executor-parent",
+            sandbox_session_id="sandbox-parent",
+        ),
+        task_id="parent-sandbox-run",
+    )
+    child = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-1",
+        agent_id="researcher",
+        prompt="collect context",
+        thread_key="project-context",
+        thread_summary="Project context research",
+        wait=True,
+    )
+    control.mark_agent_call_waiting(
+        parent.id,
+        target_agent_run_id=child.id,
+        conversation_scope="persistent",
+        thread_key="project-context",
+        wait=True,
+    )
+    control.complete_agent_run_activation(
+        child.id,
+        ExecutorRunResult(task_id=child.id, status="completed", output="context summary"),
+        activation_id=_current_activation_id(control, child.id),
+    )
+
+    resumed = control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="waiting"),
+        activation_id=_current_activation_id(control, parent.id),
+    )
+
+    assert resumed.status == AgentRunStatus.QUEUED
+    assert resumed.sandbox_session_id == "sandbox-parent"
+    assert sandbox.stopped_sessions == []
+
+
 def test_persistent_agent_call_rejects_relation_metadata_override() -> None:
     control = AgentRunControlPlane(max_running_tasks=4)
     parent = control.submit_agent_run(
@@ -1276,6 +1370,99 @@ def test_required_feedback_blocks_successful_agent_run_terminal_state() -> None:
     assert detail["feedback"][0]["id"] == feedback.id
     assert detail["feedback"][0]["requires_activation"] is True
     assert detail["events"][-1]["type"] == "waiting"
+
+
+def test_waiting_activation_completion_keeps_sandbox_session_alive() -> None:
+    sandbox = _FakeSandboxProvider()
+    control = AgentRunControlPlane(sandbox_provider=sandbox)
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor_session_id="executor-feedback",
+            sandbox_session_id="sandbox-feedback",
+        ),
+        task_id="task-feedback-sandbox",
+    )
+    control.append_agent_run_feedback(
+        task.id,
+        source=AgentRunFeedbackSource.SYSTEM,
+        kind=AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED,
+        payload={"error": "missing required field"},
+        requires_activation=True,
+    )
+
+    waiting = control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="draft"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+
+    assert waiting.status == AgentRunStatus.WAITING
+    assert waiting.sandbox_session_id == "sandbox-feedback"
+    assert sandbox.stopped_sessions == []
+
+
+def test_terminal_activation_completion_stops_sandbox_session() -> None:
+    sandbox = _FakeSandboxProvider()
+    control = AgentRunControlPlane(sandbox_provider=sandbox)
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            sandbox_session_id="sandbox-terminal",
+        ),
+        task_id="task-terminal-sandbox",
+    )
+
+    completed = control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+
+    assert completed.status == AgentRunStatus.COMPLETED
+    assert sandbox.stopped_sessions == ["sandbox-terminal"]
+
+
+@pytest.mark.parametrize("completion_path", ["direct", "claimed"])
+def test_store_backed_waiting_activation_completion_keeps_sandbox_session_alive(
+    completion_path: str,
+) -> None:
+    sandbox = _FakeSandboxProvider()
+    control = AgentRunControlPlane(
+        store=_WaitingActivationCompletionStore(),
+        sandbox_provider=sandbox,
+    )
+
+    if completion_path == "direct":
+        completed = control.complete_agent_run_activation(
+            "task-store-waiting",
+            ExecutorRunResult(
+                task_id="task-store-waiting",
+                status="completed",
+                output="waiting",
+            ),
+            activation_id="task-store-waiting:activation:1",
+        )
+    else:
+        ok, reason, completed = control.complete_claimed_agent_run_activation(
+            "task-store-waiting",
+            ExecutorRunResult(
+                task_id="task-store-waiting",
+                status="completed",
+                output="waiting",
+            ),
+            request_id="claim-1",
+            activation_id="task-store-waiting:activation:1",
+            worker_id="worker-1",
+        )
+        assert ok is True
+        assert reason == ""
+
+    assert completed is not None
+    assert completed.status == AgentRunStatus.WAITING
+    assert sandbox.stopped_sessions == []
 
 
 def test_activation_steer_rejects_terminal_agent_run() -> None:

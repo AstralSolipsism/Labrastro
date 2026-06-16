@@ -1417,7 +1417,7 @@ class ServerRunner:
             attempts += 1
             claim = self.http_json(
                 "POST",
-                "/remote/agent-runs/claim",
+                "/remote/agent-run-activations/claim",
                 {
                     "peer_token": peer_token,
                     "worker_id": worker_id,

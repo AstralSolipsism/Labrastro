@@ -56,6 +56,16 @@ def test_required_tables_match_current_taskflow_snapshot_schema() -> None:
     assert "labrastro_taskflow_goals" not in REQUIRED_TABLES
 
 
+def test_runtime_smoke_uses_activation_claim_endpoint() -> None:
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "runtime_e2e_smoke.py"
+    ).read_text(encoding="utf-8")
+
+    legacy_claim_path = '"/remote/agent-runs' + '/claim"'
+    assert '"/remote/agent-run-activations/claim"' in script
+    assert legacy_claim_path not in script
+
+
 def test_source_archive_embeds_deploy_revision(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

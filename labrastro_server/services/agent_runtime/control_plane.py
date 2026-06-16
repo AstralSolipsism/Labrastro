@@ -2449,7 +2449,7 @@ class AgentRunControlPlane:
                 peer_id=peer_id,
                 artifacts=artifacts,
             )
-            if result_value[2] is not None:
+            if result_value[2] is not None and result_value[2].is_terminal:
                 self._stop_sandbox_for_task(result_value[2])
             self.notify_task_available()
             return result_value
@@ -2494,7 +2494,8 @@ class AgentRunControlPlane:
                 activation_id=completion_activation_id,
                 artifacts=artifacts,
             )
-            self._stop_sandbox_for_task(task)
+            if task.is_terminal:
+                self._stop_sandbox_for_task(task)
             self.notify_task_available()
             return task
         with self._lock:
@@ -2648,7 +2649,8 @@ class AgentRunControlPlane:
                 self._append_parent_terminal_event_locked(task)
             self._clear_task_claims_locked(task_id)
             self._cancel_requests.pop(task_id, None)
-            self._stop_sandbox_for_task(task)
+            if task.is_terminal:
+                self._stop_sandbox_for_task(task)
             return task
 
     def retry_agent_run(

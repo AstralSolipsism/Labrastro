@@ -269,6 +269,99 @@ def test_agent_run_complete_creates_github_pr_artifact() -> None:
         relay.stop()
 
 
+def test_agent_run_activation_complete_waiting_state_does_not_create_github_pr() -> None:
+    relay = RelayServer()
+    relay.start()
+    port = _free_port()
+    runtime = AgentRunControlPlane()
+    runtime.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="run",
+            executor="fake",
+            execution_location="daemon_worktree",
+        ),
+        task_id="task-pr-waiting",
+    )
+    runtime.append_agent_run_feedback(
+        "task-pr-waiting",
+        source="system",
+        kind="candidate_validation_failed",
+        payload={"error": "needs revision"},
+        requires_activation=True,
+    )
+    pr_service = PullRequestService(
+        config=GitHubConfig(enabled=True, webhook_secret="secret"),
+        store=InMemoryGitHubStore(),
+        client=FakeGitHubClient(),  # type: ignore[arg-type]
+        runtime_control_plane=runtime,
+    )
+    service = RemoteRelayHTTPService(
+        relay_server=relay,
+        bind=f"127.0.0.1:{port}",
+        runtime_control_plane=runtime,
+        github_pr_service=pr_service,
+    )
+    service.start()
+    try:
+        _, register_body = _json_request(
+            "POST",
+            f"{service.base_url}/remote/register",
+            {
+                "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                "cwd": "/tmp",
+                "features": ["agent_runs.daemon_worktree"],
+            },
+        )
+        peer_token = register_body["payload"]["peer_token"]
+        _, claim_body = _json_request(
+            "POST",
+            f"{service.base_url}/remote/agent-run-activations/claim",
+            {
+                "peer_token": peer_token,
+                "worker_id": "worker-1",
+                "executors": ["fake"],
+            },
+        )
+        claim = claim_body["claim"]
+
+        _, complete = _json_request(
+            "POST",
+            f"{service.base_url}/remote/agent-run-activations/complete",
+            {
+                "peer_token": peer_token,
+                "request_id": claim["request_id"],
+                "activation_id": claim["activation_id"],
+                "agent_run_id": "task-pr-waiting",
+                "worker_id": "worker-1",
+                "status": "completed",
+                "output": "draft",
+                "artifacts": [
+                    {
+                        "type": "branch",
+                        "status": "pushed",
+                        "branch_name": "agent/coder/task-pr-waiting",
+                        "metadata": {
+                            "repo_url": "https://github.com/org/repo.git",
+                            "branch": "agent/coder/task-pr-waiting",
+                            "base_ref": "main",
+                            "pr_enabled": True,
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert complete["ok"] is True
+        assert "github" not in complete
+        assert runtime.agent_run_to_dict("task-pr-waiting")["status"] == "waiting"
+        artifacts = runtime.artifacts_to_dict("task-pr-waiting")
+        assert [artifact["type"] for artifact in artifacts] == ["branch"]
+    finally:
+        service.stop()
+        relay.stop()
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
