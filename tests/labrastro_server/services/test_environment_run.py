@@ -84,7 +84,8 @@ def test_environment_run_uses_default_agent_and_sets_check_metadata() -> None:
             "command": "gitnexus --version",
         }
     ]
-    assert "Check mode" in task.prompt
+    activations = control.load_agent_run_detail(task.id)["activations"]
+    assert "Check mode" in activations[0]["prompt"]
 
 
 def test_environment_run_configure_includes_install_command() -> None:

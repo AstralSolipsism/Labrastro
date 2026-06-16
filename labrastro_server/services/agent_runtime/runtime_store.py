@@ -5,12 +5,14 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from reuleauxcoder.domain.agent_runtime.models import (
+    ActivationSteer,
+    AgentRunFeedback,
     TaskArtifact,
-    AgentRunRecord,
+    AgentRun,
     ExecutionLocation,
     ModelRequestOrigin,
     TaskSessionRef,
-    TaskStatus,
+    AgentRunStatus,
     WorkerKind,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
@@ -27,9 +29,9 @@ RUNTIME_SLOT_KEYS = {
     "model_request_slots",
 }
 RUNNING_AGENT_RUN_STATUSES = {
-    TaskStatus.DISPATCHED,
-    TaskStatus.RUNNING,
-    TaskStatus.WAITING_APPROVAL,
+    AgentRunStatus.DISPATCHED,
+    AgentRunStatus.RUNNING,
+    AgentRunStatus.WAITING,
 }
 
 _WORKTREE_LIFECYCLE_STATUS = {
@@ -46,13 +48,8 @@ _WORKTREE_LIFECYCLE_STATUS = {
 }
 
 
-def parent_agent_run_id(task: AgentRunRecord) -> str:
-    return str(
-        task.parent_run_id
-        or task.parent_task_id
-        or task.delegated_by_run_id
-        or ""
-    )
+def _dict_from(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def artifact_attached_event_payload(artifact: TaskArtifact) -> dict[str, Any]:
@@ -98,40 +95,52 @@ def executor_result_artifacts(
     return combined
 
 
-def delegated_run_completed_payload(task: AgentRunRecord) -> dict[str, Any]:
+def agent_relation_completed_payload(
+    task: AgentRun,
+    *,
+    owner_agent_run_id: str | None = None,
+    task_prompt: str | None = None,
+) -> dict[str, Any]:
     status = task.status.value
+    owner_run_id = str(owner_agent_run_id or "")
     return {
         "run_id": task.id,
         "agent_run_id": task.id,
+        "owner_agent_run_id": owner_run_id,
         "agent_id": task.agent_id,
-        "task": task.prompt,
+        "task": str(task_prompt or ""),
         "status": status,
-        "result": task.output or "",
-        "error": "" if status == TaskStatus.COMPLETED.value else task.failure_reason or "",
+        "result": str(_dict_from(getattr(task, "terminal_result", {})).get("output") or ""),
+        "error": "" if status == AgentRunStatus.COMPLETED.value else task.failure_reason or "",
         "source": task.source.value,
-        "parent_run_id": task.parent_run_id,
-        "parent_task_id": task.parent_task_id,
-        "delegated_by_run_id": task.delegated_by_run_id,
     }
 
 
-def delegated_terminal_lifecycle_events(
-    task: AgentRunRecord,
+def agent_relation_terminal_lifecycle_events(
+    task: AgentRun,
+    *,
+    owner_agent_run_id: str | None = None,
+    relation_metadata: dict[str, Any] | None = None,
+    task_prompt: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    parent_run_id = parent_agent_run_id(task)
-    if not parent_run_id or parent_run_id == task.id:
+    owner_run_id = str(owner_agent_run_id or "")
+    if not owner_run_id or owner_run_id == task.id:
         return []
-    terminal_payload = delegated_run_completed_payload(task)
-    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    terminal_payload = agent_relation_completed_payload(
+        task,
+        owner_agent_run_id=owner_run_id,
+        task_prompt=task_prompt,
+    )
+    metadata = _dict_from(relation_metadata)
     status = terminal_payload["status"]
     level = (
         "info"
-        if status == TaskStatus.COMPLETED.value
+        if status == AgentRunStatus.COMPLETED.value
         else "warning"
-        if status == TaskStatus.CANCELLED.value
+        if status == AgentRunStatus.CANCELLED.value
         else "error"
     )
-    message = f"{task.agent_id or 'delegated agent'} {status}"
+    message = f"{task.agent_id or 'related agent'} {status}"
     payload = {
         **terminal_payload,
         "child_agent_run_id": task.id,
@@ -144,10 +153,10 @@ def delegated_terminal_lifecycle_events(
     return [
         (
             "lifecycle_hook",
-            _delegated_terminal_lifecycle_payload(
+            _agent_relation_terminal_lifecycle_payload(
                 task,
                 event_name=event_name,
-                parent_run_id=parent_run_id,
+                owner_agent_run_id=owner_run_id,
                 level=level,
                 message=message,
                 payload=payload,
@@ -158,7 +167,7 @@ def delegated_terminal_lifecycle_events(
 
 
 def worktree_lifecycle_events(
-    task: AgentRunRecord,
+    task: AgentRun,
     event: ExecutorEvent,
 ) -> list[tuple[str, dict[str, Any]]]:
     if event.type.value != "status":
@@ -232,25 +241,24 @@ def worktree_lifecycle_events(
     ]
 
 
-def _delegated_terminal_lifecycle_payload(
-    task: AgentRunRecord,
+def _agent_relation_terminal_lifecycle_payload(
+    task: AgentRun,
     *,
     event_name: str,
-    parent_run_id: str,
+    owner_agent_run_id: str,
     level: str,
     message: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    metadata = task.metadata if isinstance(task.metadata, dict) else {}
-    session_run_id = str(metadata.get("parent_session_id") or "")
-    turn_id = str(metadata.get("parent_turn_id") or "")
+    session_run_id = str(payload.get("parent_session_id") or "")
+    turn_id = str(payload.get("parent_turn_id") or "")
     hook_id = f"agent_run_control_plane:{event_name}"
     return {
         "phase": "result",
         "event_name": event_name,
         "placement": "server",
         "session_run_id": session_run_id,
-        "agent_run_id": parent_run_id,
+        "agent_run_id": owner_agent_run_id,
         "turn_id": turn_id,
         "trigger_source": task.source.value,
         "hook_id": hook_id,
@@ -261,7 +269,7 @@ def _delegated_terminal_lifecycle_payload(
         "continue_flow": True,
         "diagnostics": [
             {
-                "code": "delegated_agent_run_terminal",
+                "code": "agent_relation_terminal",
                 "message": message,
                 "level": level,
                 "event_name": event_name,
@@ -305,7 +313,7 @@ def runtime_slot_limits(
     }
 
 
-def runtime_slot_key_for_agent_run(task: AgentRunRecord) -> str:
+def runtime_slot_key_for_agent_run(task: AgentRun) -> str:
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
     worker_kind = str(metadata.get("worker_kind") or "").strip()
     if not worker_kind:
@@ -323,7 +331,7 @@ def runtime_slot_key_for_agent_run(task: AgentRunRecord) -> str:
     return "server_agent_run_slots"
 
 
-def agent_run_uses_model_request_slot(task: AgentRunRecord) -> bool:
+def agent_run_uses_model_request_slot(task: AgentRun) -> bool:
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
     origin = str(metadata.get("model_request_origin") or "").strip()
     return origin in {
@@ -333,8 +341,8 @@ def agent_run_uses_model_request_slot(task: AgentRunRecord) -> bool:
 
 
 def runtime_slots_allow_agent_run_claim(
-    running_tasks: list[AgentRunRecord],
-    candidate: AgentRunRecord,
+    running_tasks: list[AgentRun],
+    candidate: AgentRun,
     runtime_snapshot: dict[str, Any],
     *,
     max_running_tasks: int,
@@ -375,9 +383,9 @@ class AgentRunQueueStore(Protocol):
         runtime_snapshot: dict[str, Any] | None = None,
     ) -> None: ...
 
-    def submit_agent_run(self, request: Any, *, task_id: str | None = None) -> AgentRunRecord: ...
+    def submit_agent_run(self, request: Any, *, task_id: str | None = None) -> AgentRun: ...
 
-    def get_agent_run(self, task_id: str) -> AgentRunRecord: ...
+    def get_agent_run(self, task_id: str) -> AgentRun: ...
 
     def agent_run_to_dict(self, task_id: str) -> dict[str, Any]: ...
 
@@ -391,8 +399,8 @@ class AgentRunQueueStore(Protocol):
     ) -> dict[str, Any]: ...
 
 
-class ClaimLeaseStore(Protocol):
-    def claim_agent_run(
+class ActivationLeaseStore(Protocol):
+    def claim_agent_run_activation(
         self,
         *,
         worker_id: str,
@@ -404,21 +412,23 @@ class ClaimLeaseStore(Protocol):
         lease_sec: int = 15,
     ) -> Any | None: ...
 
-    def heartbeat_agent_run(
+    def heartbeat_agent_run_activation(
         self,
         *,
         request_id: str,
         task_id: str,
+        activation_id: str,
         worker_id: str,
         peer_id: str | None = None,
         lease_sec: int | None = None,
     ) -> dict[str, Any]: ...
 
-    def validate_claim_owner(
+    def validate_activation_claim_owner(
         self,
         *,
         request_id: str,
         task_id: str,
+        activation_id: str | None = None,
         worker_id: str,
         peer_id: str | None = None,
     ) -> tuple[bool, str]: ...
@@ -433,6 +443,7 @@ class AgentRunEventLog(Protocol):
         event: ExecutorEvent,
         *,
         request_id: str | None = None,
+        activation_id: str | None = None,
         worker_id: str | None = None,
         peer_id: str | None = None,
     ) -> tuple[bool, str]: ...
@@ -457,11 +468,12 @@ class AgentRunArtifactStore(Protocol):
 class AgentRunSessionStore(Protocol):
     def pin_session(self, task_id: str, session: TaskSessionRef) -> None: ...
 
-    def pin_claimed_session(
+    def pin_claimed_activation_session(
         self,
         *,
         request_id: str,
         task_id: str,
+        activation_id: str,
         worker_id: str,
         peer_id: str | None = None,
         workdir: str | None = None,
@@ -478,6 +490,7 @@ class EnvironmentWorkflow(Protocol):
         event: ExecutorEvent,
         *,
         request_id: str | None = None,
+        activation_id: str | None = None,
         worker_id: str | None = None,
         peer_id: str | None = None,
     ) -> tuple[bool, str]: ...
@@ -489,7 +502,7 @@ class GitHubPRLifecycle(Protocol):
 
 class AgentRunStore(
     AgentRunQueueStore,
-    ClaimLeaseStore,
+    ActivationLeaseStore,
     AgentRunEventLog,
     AgentRunArtifactStore,
     AgentRunSessionStore,
@@ -497,33 +510,104 @@ class AgentRunStore(
     GitHubPRLifecycle,
     Protocol,
 ):
-    def complete_claimed_agent_run(
+    def complete_claimed_agent_run_activation(
         self,
         task_id: str,
         result: ExecutorRunResult,
         *,
         request_id: str,
+        activation_id: str,
         worker_id: str,
         peer_id: str | None = None,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> tuple[bool, str, AgentRunRecord | None]: ...
+    ) -> tuple[bool, str, AgentRun | None]: ...
 
-    def complete_agent_run(
+    def complete_agent_run_activation(
         self,
         task_id: str,
         result: ExecutorRunResult,
         *,
+        activation_id: str,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> AgentRunRecord: ...
+    ) -> AgentRun: ...
 
     def retry_agent_run(
         self,
         task_id: str,
         *,
-        new_agent_run_id: str | None = None,
         resume_session: bool = False,
-    ) -> AgentRunRecord: ...
+    ) -> AgentRun: ...
 
-    def fail_agent_run(self, task_id: str, *, error: str) -> AgentRunRecord: ...
+    def continue_agent_run(
+        self,
+        task_id: str,
+        *,
+        input_kind: Any,
+        input_payload: dict[str, Any],
+        resume_session: bool = False,
+        feedback_id: str | None = None,
+        prompt: str | None = None,
+    ) -> AgentRun: ...
+
+    def append_agent_run_feedback(
+        self,
+        task_id: str,
+        *,
+        source: Any,
+        kind: Any,
+        payload: dict[str, Any],
+        visibility: Any,
+        requires_activation: bool = False,
+        metadata: dict[str, Any] | None = None,
+        feedback_id: str | None = None,
+    ) -> Any: ...
+
+    def append_activation_steer(
+        self,
+        task_id: str,
+        *,
+        source: Any,
+        payload: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        steer_id: str | None = None,
+    ) -> tuple[ActivationSteer, AgentRunFeedback]: ...
+
+    def find_agent_thread_binding(
+        self,
+        *,
+        owner_session_run_id: str,
+        main_agent_run_id: str,
+        agent_id: str,
+        thread_key: str = "",
+        binding_lifetime: str = "session",
+    ) -> Any | None: ...
+
+    def upsert_agent_thread_binding(self, binding: Any) -> None: ...
+
+    def mark_agent_call_waiting(
+        self,
+        task_id: str,
+        *,
+        target_agent_run_id: str,
+        conversation_scope: str,
+        thread_key: str = "",
+        wait: bool = True,
+    ) -> None: ...
+
+    def find_agent_call_grant(
+        self,
+        *,
+        user_id: str,
+        grant_scope: str,
+        main_agent_id: str,
+        target_agent_id: str,
+        conversation_scope: str,
+        capability_scope: dict[str, Any] | None = None,
+        target_config_version: str = "",
+    ) -> Any | None: ...
+
+    def upsert_agent_call_grant(self, grant: Any) -> None: ...
+
+    def fail_agent_run(self, task_id: str, *, error: str) -> AgentRun: ...
 
     def cancel_agent_run(self, task_id: str, *, reason: str = "user_cancelled") -> bool: ...

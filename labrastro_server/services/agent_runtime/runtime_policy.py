@@ -11,7 +11,7 @@ from typing import Any
 
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentConfig,
-    AgentRunRecord,
+    AgentRun,
     AgentRunSource,
     ExecutionLocation,
     ExecutorType,
@@ -193,7 +193,7 @@ def worker_kind_from_features(
 
 
 def worker_matches_agent_run(
-    task: AgentRunRecord,
+    task: AgentRun,
     *,
     worker_kind: WorkerKind | None,
     features: set[str] | None,

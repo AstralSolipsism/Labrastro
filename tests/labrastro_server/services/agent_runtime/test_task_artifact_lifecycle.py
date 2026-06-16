@@ -12,7 +12,6 @@ def test_completing_task_does_not_mark_pull_request_as_merged() -> None:
 
     state = lifecycle.TaskLifecycleState.create(
         task_id="task-1",
-        issue_id="issue-1",
         agent_id="code_reviewer",
     )
     state.attach_artifact(
@@ -23,7 +22,7 @@ def test_completing_task_does_not_mark_pull_request_as_merged() -> None:
         status="pr_created",
     )
 
-    state.complete_agent_run(output="PR 已创建，等待审核")
+    state.complete_task_lifecycle(output="PR 已创建，等待审核")
 
     assert state.task.status.value == "completed"
     assert state.artifacts["artifact-1"].status.value == "pr_created"
@@ -36,7 +35,6 @@ def test_user_merge_updates_artifact_without_rewriting_task_result() -> None:
 
     state = lifecycle.TaskLifecycleState.create(
         task_id="task-1",
-        issue_id="issue-1",
         agent_id="code_reviewer",
     )
     state.attach_artifact(
@@ -46,11 +44,12 @@ def test_user_merge_updates_artifact_without_rewriting_task_result() -> None:
         pr_url="https://example.test/pr/1",
         status="pr_created",
     )
-    state.complete_agent_run(output="PR 已创建，等待审核")
+    state.complete_task_lifecycle(output="PR 已创建，等待审核")
     state.mark_artifact_merged("artifact-1", actor_user_id="user-1")
 
     assert state.task.status.value == "completed"
-    assert state.task.output == "PR 已创建，等待审核"
+    assert not hasattr(state.task, "output")
+    assert state.task.terminal_result == {"output": "PR 已创建，等待审核"}
     assert state.artifacts["artifact-1"].status.value == "merged"
     assert state.artifacts["artifact-1"].merge_status.value == "merged_by_user"
     assert state.artifacts["artifact-1"].merged_by == "user-1"
@@ -62,7 +61,6 @@ def test_review_comment_creates_followup_task_reusing_branch_and_pr() -> None:
 
     state = lifecycle.TaskLifecycleState.create(
         task_id="task-1",
-        issue_id="issue-1",
         agent_id="code_reviewer",
     )
     state.attach_artifact(
@@ -78,10 +76,10 @@ def test_review_comment_creates_followup_task_reusing_branch_and_pr() -> None:
         agent_id="code_reviewer",
     )
 
-    assert followup.parent_task_id == "task-1"
-    assert followup.trigger_comment_id == "comment-2"
-    assert followup.branch_name == "agent/code-reviewer/task-1"
-    assert followup.pr_url == "https://example.test/pr/1"
+    assert not hasattr(followup, "parent_task_id")
+    assert not hasattr(followup, "trigger_comment_id")
+    assert not hasattr(followup, "branch_name")
+    assert not hasattr(followup, "pr_url")
     assert followup.status.value == "queued"
 
 
@@ -90,7 +88,6 @@ def test_non_code_task_can_complete_with_report_artifact_only() -> None:
 
     state = lifecycle.TaskLifecycleState.create(
         task_id="task-2",
-        issue_id="issue-2",
         agent_id="researcher",
     )
     state.attach_artifact(
@@ -99,7 +96,7 @@ def test_non_code_task_can_complete_with_report_artifact_only() -> None:
         content="调研结论",
         status="generated",
     )
-    state.complete_agent_run(output="已完成调研")
+    state.complete_task_lifecycle(output="已完成调研")
 
     assert state.task.status.value == "completed"
     assert state.artifacts["artifact-2"].type.value == "report"
@@ -113,7 +110,6 @@ def test_publish_failure_artifact_is_preserved_without_blocking_completion() -> 
 
     state = lifecycle.TaskLifecycleState.create(
         task_id="task-3",
-        issue_id="issue-3",
         agent_id="coder",
     )
     state.attach_artifact(
@@ -123,7 +119,7 @@ def test_publish_failure_artifact_is_preserved_without_blocking_completion() -> 
         content="gh pr create failed",
         metadata={"stage": "pr_create"},
     )
-    state.complete_agent_run(output="executor completed")
+    state.complete_task_lifecycle(output="executor completed")
 
     assert state.task.status.value == "completed"
     assert state.artifacts["artifact-failed"].status.value == "failed"

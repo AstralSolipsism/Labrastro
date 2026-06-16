@@ -9,12 +9,20 @@ import time
 import pytest
 
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentRunActivationInputKind,
+    AgentCallGrant,
     AgentConfig,
+    AgentRunFeedbackKind,
+    AgentRunFeedbackSource,
+    AgentRunResumePolicy,
+    AgentRunRelation,
+    AgentRunRelationType,
+    AgentRunWaitingReason,
     ExecutionLocation,
     ExecutorType,
     PublishPolicy,
     TaskSessionRef,
-    TaskStatus,
+    AgentRunStatus,
     TriggerMode,
     WorktreeRole,
 )
@@ -42,6 +50,26 @@ from labrastro_server.services.agent_runtime.postgres_store import PostgresAgent
 from labrastro_server.services.agent_runtime.runtime_store import (
     runtime_slot_key_for_agent_run,
 )
+
+
+def _relation(
+    owner_agent_run_id: str,
+    *,
+    relation_type: AgentRunRelationType | str = AgentRunRelationType.AGENT_CALL_EPHEMERAL,
+    metadata: dict | None = None,
+) -> AgentRunRelation:
+    relation_type_value = (
+        relation_type.value
+        if isinstance(relation_type, AgentRunRelationType)
+        else str(relation_type)
+    )
+    return AgentRunRelation(
+        id="",
+        owner_agent_run_id=owner_agent_run_id,
+        related_agent_run_id="",
+        relation_type=AgentRunRelationType(relation_type_value),
+        metadata=dict(metadata or {}),
+    )
 from labrastro_server.services.agent_runtime.session_projection import (
     agent_run_event_to_session_events,
 )
@@ -76,6 +104,66 @@ def _model_config() -> dict:
     }
 
 
+def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
+    return str(control.get_agent_run(task_id).current_activation_id or "")
+
+
+def test_agent_call_grant_is_bound_to_capability_scope_and_config_version() -> None:
+    control = AgentRunControlPlane()
+    grant = AgentCallGrant(
+        user_id="user-1",
+        grant_scope="workspace:/repo",
+        main_agent_id="planner",
+        target_agent_id="researcher",
+        conversation_scope="persistent",
+        capability_scope={"capability_refs": ["research"], "runtime_profile": "analysis"},
+        target_config_version="version-a",
+        granted_at="2026-06-15T00:00:00+00:00",
+    )
+
+    control.upsert_agent_call_grant(grant)
+
+    assert (
+        control.find_agent_call_grant(
+            user_id="user-1",
+            grant_scope="workspace:/repo",
+            main_agent_id="planner",
+            target_agent_id="researcher",
+            conversation_scope="persistent",
+            capability_scope={
+                "runtime_profile": "analysis",
+                "capability_refs": ["research"],
+            },
+            target_config_version="version-a",
+        )
+        == grant
+    )
+    assert (
+        control.find_agent_call_grant(
+            user_id="user-1",
+            grant_scope="workspace:/repo",
+            main_agent_id="planner",
+            target_agent_id="researcher",
+            conversation_scope="persistent",
+            capability_scope={"capability_refs": ["write"]},
+            target_config_version="version-a",
+        )
+        is None
+    )
+    assert (
+        control.find_agent_call_grant(
+            user_id="user-1",
+            grant_scope="workspace:/repo",
+            main_agent_id="planner",
+            target_agent_id="researcher",
+            conversation_scope="persistent",
+            capability_scope=grant.capability_scope,
+            target_config_version="version-b",
+        )
+        is None
+    )
+
+
 def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     control = AgentRunControlPlane(
         max_running_tasks=1,
@@ -91,7 +179,6 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="fix tests",
             executor=ExecutorType.CODEX,
@@ -103,18 +190,23 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
         task_id="task-1",
     )
 
-    claim = control.claim_agent_run(worker_id="worker-1", executors=["codex"])
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
 
     assert claim is not None
     assert claim.task.id == task.id
+    assert claim.activation_id == "task-1:activation:1"
+    assert claim.activation is not None
+    assert claim.activation.agent_run_id == task.id
+    assert claim.activation.status.value == "dispatched"
     assert claim.executor_request.executor == ExecutorType.CODEX
+    assert claim.executor_request.metadata["activation_id"] == claim.activation_id
     assert claim.executor_request.model == "gpt-5.2"
     assert claim.executor_request.execution_location == ExecutionLocation.DAEMON_WORKTREE
     assert claim.executor_request.worktree_role == WorktreeRole.TARGET
     assert claim.executor_request.publish_policy == PublishPolicy.NEVER
     assert claim.executor_request.metadata["worktree_role"] == "target"
     assert claim.executor_request.metadata["publish_policy"] == "never"
-    assert control.claim_agent_run(worker_id="worker-2", executors=["codex"]) is None
+    assert control.claim_agent_run_activation(worker_id="worker-2", executors=["codex"]) is None
 
     control.pin_session(
         task.id,
@@ -122,7 +214,6 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
             agent_id="coder",
             executor=ExecutorType.CODEX,
             execution_location=ExecutionLocation.DAEMON_WORKTREE,
-            issue_id="issue-1",
             task_id=task.id,
             workdir="runtime/worktrees/ws/coder-task",
             branch="agent/coder/task-1",
@@ -131,7 +222,7 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     )
     control.append_executor_event(task.id, ExecutorEvent.text_event("done"))
     control.create_or_update_pr(task.id, diff="diff --git a/file b/file")
-    completed = control.complete_agent_run(
+    completed = control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(
             task_id=task.id,
@@ -139,6 +230,7 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
             output="PR created",
             executor_session_id="codex-thread-1",
         ),
+        activation_id=_current_activation_id(control, task.id),
     )
 
     assert completed.status.value == "completed"
@@ -146,6 +238,53 @@ def test_task_queue_claim_pin_complete_and_pr_artifact() -> None:
     assert artifacts[0]["type"] == "pull_request"
     assert artifacts[0]["merge_status"] == "pending_user"
     assert control.list_events(task.id, after_seq=0)[0].type == "queued"
+    event_types = [event.type for event in control.list_events(task.id, after_seq=0)]
+    assert "activation_queued" in event_types
+    assert "activation_completed" in event_types
+
+
+def test_complete_agent_run_activation_requires_current_activation_id() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="coder", prompt="run"),
+        task_id="task-activation-lock",
+    )
+    result = ExecutorRunResult(
+        task_id=task.id,
+        status="completed",
+        output="done",
+    )
+
+    with pytest.raises(TypeError):
+        control.complete_agent_run_activation(task.id, result)
+    with pytest.raises(ValueError, match="activation_id_required"):
+        control.complete_agent_run_activation(task.id, result, activation_id="")
+    with pytest.raises(ValueError, match="activation_not_found"):
+        control.complete_agent_run_activation(
+            task.id,
+            result,
+            activation_id="other-run:activation:1",
+        )
+
+    stale_activation_id = _current_activation_id(control, task.id)
+    control.complete_agent_run_activation(
+        task.id,
+        result,
+        activation_id=stale_activation_id,
+    )
+    control.continue_agent_run(
+        task.id,
+        input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
+        input_payload={"feedback_id": "feedback-1"},
+        prompt="continue",
+    )
+
+    with pytest.raises(ValueError, match="activation_mismatch"):
+        control.complete_agent_run_activation(
+            task.id,
+            ExecutorRunResult(task_id=task.id, status="completed", output="again"),
+            activation_id=stale_activation_id,
+        )
 
 
 def test_agent_run_request_projects_source_and_sandbox_fields() -> None:
@@ -153,15 +292,12 @@ def test_agent_run_request_projects_source_and_sandbox_fields() -> None:
 
     run = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="run",
             source="manual",
             sandbox_id="sbx-1",
             sandbox_session_id="ssn-1",
             workspace_ref="repo:example",
-            delegated_by_run_id="chat:parent",
-            parent_run_id="chat:parent",
         ),
         task_id="run-1",
     )
@@ -175,8 +311,8 @@ def test_agent_run_request_projects_source_and_sandbox_fields() -> None:
     assert task["sandbox_id"] == "sbx-1"
     assert task["sandbox_session_id"] == "ssn-1"
     assert task["workspace_ref"] == "repo:example"
-    assert task["delegated_by_run_id"] == "chat:parent"
-    assert task["parent_run_id"] == "chat:parent"
+    assert "delegated_by_run_id" not in task
+    assert "parent_run_id" not in task
 
 
 def test_agent_run_request_normalizes_budget_into_control_plane_metadata() -> None:
@@ -184,7 +320,6 @@ def test_agent_run_request_normalizes_budget_into_control_plane_metadata() -> No
 
     run = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="run",
             budget={
@@ -210,7 +345,6 @@ def test_agent_run_claim_includes_budget_in_executor_request() -> None:
     control = AgentRunControlPlane()
     control.submit_agent_run(
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="run",
             executor="reuleauxcoder",
@@ -219,7 +353,7 @@ def test_agent_run_claim_includes_budget_in_executor_request() -> None:
         task_id="run-budget",
     )
 
-    claim = control.claim_agent_run(worker_id="worker-1", executors=["reuleauxcoder"])
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["reuleauxcoder"])
 
     assert claim is not None
     assert claim.executor_request.budget == {"max_tool_calls": 2, "timeout_sec": 30}
@@ -235,7 +369,6 @@ def test_budget_exceeded_executor_result_blocks_agent_run_with_session_end_audit
     control = AgentRunControlPlane()
     run = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="run",
             executor="reuleauxcoder",
@@ -245,7 +378,7 @@ def test_budget_exceeded_executor_result_blocks_agent_run_with_session_end_audit
     )
 
     message = "AgentRun budget exceeded: max_turns=1"
-    completed = control.complete_agent_run(
+    completed = control.complete_agent_run_activation(
         run.id,
         ExecutorRunResult(
             task_id=run.id,
@@ -262,10 +395,11 @@ def test_budget_exceeded_executor_result_blocks_agent_run_with_session_end_audit
                 )
             ],
         ),
+        activation_id=_current_activation_id(control, run.id),
     )
     events = [event.to_dict() for event in control.list_events(run.id)]
 
-    assert completed.status == TaskStatus.BLOCKED
+    assert completed.status == AgentRunStatus.BLOCKED
     assert completed.failure_reason == message
     assert control.agent_run_to_dict(run.id)["status"] == "blocked"
     session_end = next(event for event in events if event["type"] == "session_run_end")
@@ -326,35 +460,43 @@ def test_session_projection_inverts_render_response_fallback_to_response_rendere
 def test_agent_run_request_rejects_unknown_budget_fields() -> None:
     with pytest.raises(ValueError, match="unsupported AgentRun budget field"):
         AgentRunRequest(
-            issue_id="manual",
             agent_id="coder",
             prompt="run",
             budget={"made_up": 1},
         )
 
 
+def test_agent_run_request_rejects_relation_metadata_envelope() -> None:
+    with pytest.raises(ValueError, match="relation or external business identity"):
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="run",
+            metadata={
+                "called_by_agent_run_id": "parent-run",
+                "relation_type": "agent_call_ephemeral",
+            },
+        )
+
+
 def test_cancel_agent_run_cascades_to_child_agent_runs() -> None:
     control = AgentRunControlPlane(max_running_tasks=4)
     parent = control.submit_agent_run(
-        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        AgentRunRequest(agent_id="planner", prompt="parent"),
         task_id="parent-run",
     )
     running_child = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="child",
             agent_id="coder",
             prompt="child",
-            parent_run_id=parent.id,
-            delegated_by_run_id=parent.id,
+            relation=_relation(parent.id),
         ),
         task_id="child-run",
     )
     queued_grandchild = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="grandchild",
             agent_id="reviewer",
             prompt="grandchild",
-            parent_run_id=running_child.id,
+            relation=_relation(running_child.id),
         ),
         task_id="grandchild-run",
     )
@@ -367,22 +509,24 @@ def test_cancel_agent_run_cascades_to_child_agent_runs() -> None:
     child_events = [event.to_dict() for event in control.list_events(child.id)]
     grandchild_events = [event.to_dict() for event in control.list_events(grandchild.id)]
 
-    assert child.status == TaskStatus.RUNNING
+    assert child.status == AgentRunStatus.RUNNING
     child_cancel_requested = [
         event for event in child_events if event["type"] == "cancel_requested"
     ][0]
     child_parent_cancelled = [
         event for event in child_events if event["type"] == "parent_cancelled"
     ][0]
-    child_delegated_completed = [
-        event for event in child_events if event["type"] == "delegated_run_completed"
+    child_agent_call_result = [
+        event for event in child_events if event["type"] == "agent_call_failed"
     ][0]
     child_lifecycle_events = [
         event for event in child_events if event["type"] == "lifecycle_hook"
     ]
     assert child_cancel_requested["payload"]["reason"] == "parent_cancelled:user_stop"
-    assert child_parent_cancelled["payload"]["parent_run_id"] == parent.id
-    assert child_delegated_completed["payload"]["agent_run_id"] == queued_grandchild.id
+    assert child_parent_cancelled["payload"]["owner_agent_run_id"] == parent.id
+    assert child_agent_call_result["payload"]["target_agent_run_id"] == (
+        queued_grandchild.id
+    )
     assert [event["payload"]["event_name"] for event in child_lifecycle_events] == [
         "TaskCompleted",
         "SubagentStop",
@@ -391,7 +535,7 @@ def test_cancel_agent_run_cascades_to_child_agent_runs() -> None:
         queued_grandchild.id
     )
     assert child_lifecycle_events[0]["payload"]["payload"]["status"] == "cancelled"
-    assert grandchild.status == TaskStatus.CANCELLED
+    assert grandchild.status == AgentRunStatus.CANCELLED
     assert grandchild.cancel_reason == "parent_cancelled:user_stop"
     assert grandchild_events[-2]["type"] == "cancelled"
     assert grandchild_events[-1]["type"] == "parent_cancelled"
@@ -400,48 +544,48 @@ def test_cancel_agent_run_cascades_to_child_agent_runs() -> None:
 def test_child_agent_run_terminal_state_is_projected_to_parent_audit() -> None:
     control = AgentRunControlPlane(max_running_tasks=4)
     parent = control.submit_agent_run(
-        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        AgentRunRequest(agent_id="planner", prompt="parent"),
         task_id="parent-run",
     )
     child = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="child",
             agent_id="reviewer",
             prompt="review output",
-            parent_run_id=parent.id,
-            delegated_by_run_id=parent.id,
+            relation=_relation(parent.id),
         ),
         task_id="child-run",
     )
 
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         child.id,
         ExecutorRunResult(
             task_id=child.id,
             status="completed",
             output="review passed",
         ),
+        activation_id=_current_activation_id(control, child.id),
     )
 
     parent_events = [event.to_dict() for event in control.list_events(parent.id)]
-    delegated_event = [
-        event for event in parent_events if event["type"] == "delegated_run_completed"
+    agent_call_event = [
+        event for event in parent_events if event["type"] == "agent_call_result"
     ][0]
     lifecycle_events = [
         event for event in parent_events if event["type"] == "lifecycle_hook"
     ]
-    assert delegated_event["payload"] == {
-        "run_id": child.id,
-        "agent_run_id": child.id,
+    assert agent_call_event["payload"] == {
         "agent_id": "reviewer",
-        "task": "review output",
+        "target_agent_run_id": child.id,
+        "conversation_scope": "ephemeral",
+        "wait": False,
+        "thread_key": "",
         "status": "completed",
-        "result": "review passed",
-        "error": "",
-        "source": "manual",
-        "parent_run_id": parent.id,
-        "parent_task_id": None,
-        "delegated_by_run_id": parent.id,
+        "summary": "review passed",
+        "evidence_refs": [],
+        "artifact_refs": [],
+        "metrics": {},
+        "error_code": "",
+        "message": "",
     }
     assert [event["payload"]["event_name"] for event in lifecycle_events] == [
         "TaskCompleted",
@@ -467,10 +611,131 @@ def test_child_agent_run_terminal_state_is_projected_to_parent_audit() -> None:
     ]
 
 
+def test_persistent_agent_terminal_state_projects_summary_to_parent() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-parallel-run",
+    )
+    child = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-1",
+        agent_id="researcher",
+        prompt="collect context",
+        thread_key="project-context",
+        thread_summary="Project context research",
+    )
+
+    control.complete_agent_run_activation(
+        child.id,
+        ExecutorRunResult(
+            task_id=child.id,
+            status="completed",
+            output="context summary",
+        ),
+        activation_id=_current_activation_id(control, child.id),
+    )
+
+    parent_events = [event.to_dict() for event in control.list_events(parent.id)]
+    assert not [
+        event for event in parent_events if event["type"] == "agent_relation_completed"
+    ]
+    agent_call_event = [
+        event for event in parent_events if event["type"] == "agent_call_result"
+    ][0]
+    assert agent_call_event["payload"]["target_agent_run_id"] == child.id
+    assert agent_call_event["payload"]["agent_id"] == "researcher"
+    assert agent_call_event["payload"]["conversation_scope"] == "persistent"
+    assert agent_call_event["payload"]["thread_key"] == "project-context"
+    assert agent_call_event["payload"]["summary"] == "context summary"
+    projected = agent_run_event_to_session_events(agent_call_event)[0]
+    assert projected[0] == "context_event"
+    assert projected[1]["phase"] == "agent_call_result"
+    assert projected[1]["agent_call"]["target_agent_run_id"] == child.id
+    assert projected[1]["agent_call"]["summary"] == "context summary"
+    assert "events" not in projected[1]
+
+
+def test_waiting_agent_call_target_first_resumes_after_owner_completion() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-run",
+    )
+    child = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-1",
+        agent_id="researcher",
+        prompt="collect context",
+        thread_key="project-context",
+        thread_summary="Project context research",
+        wait=True,
+    )
+    control.mark_agent_call_waiting(
+        parent.id,
+        target_agent_run_id=child.id,
+        conversation_scope="persistent",
+        thread_key="project-context",
+        wait=True,
+    )
+
+    control.complete_agent_run_activation(
+        child.id,
+        ExecutorRunResult(
+            task_id=child.id,
+            status="completed",
+            output="context summary",
+        ),
+        activation_id=_current_activation_id(control, child.id),
+    )
+    pending_detail = control.load_agent_run_detail(parent.id)
+    assert pending_detail["agent_run"]["status"] == AgentRunStatus.WAITING.value
+    assert pending_detail["feedback"][0]["requires_activation"] is True
+    assert pending_detail["feedback"][0]["consumed_by_activation_id"] is None
+
+    resumed = control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="waiting"),
+        activation_id=_current_activation_id(control, parent.id),
+    )
+
+    detail = control.load_agent_run_detail(parent.id)
+    assert resumed.status == AgentRunStatus.QUEUED
+    assert detail["feedback"][0]["consumed_by_activation_id"] == (
+        "parent-run:activation:2"
+    )
+    assert detail["activations"][-1]["input_kind"] == "agent_feedback"
+    assert detail["activations"][-1]["input_payload"]["target_agent_run_id"] == child.id
+
+
+def test_persistent_agent_call_rejects_relation_metadata_override() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-parallel-run",
+    )
+
+    with pytest.raises(ValueError, match="cannot override relation fields"):
+        control.call_persistent_agent(
+            owner_agent_run_id=parent.id,
+            owner_session_run_id="session-1",
+            agent_id="researcher",
+            prompt="collect context",
+            thread_key="project-context",
+            thread_summary="Project context research",
+            metadata={
+                "called_by_agent_run_id": "other-run",
+            },
+        )
+
+    assert not control.list_agent_runs(agent_id="researcher")
+    assert not control.load_agent_run_detail(parent.id)["relations"]
+
+
 def test_lifecycle_agent_adapter_child_completion_projects_to_parent_session() -> None:
     control = AgentRunControlPlane(max_running_tasks=4)
     parent = control.submit_agent_run(
-        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        AgentRunRequest(agent_id="planner", prompt="parent"),
         task_id="parent-run",
     )
 
@@ -526,39 +791,42 @@ def test_lifecycle_agent_adapter_child_completion_projects_to_parent_session() -
 
     assert results[0].output.diagnostics[0]["code"] == "agent_run_submitted"
     child = control.list_agent_runs(agent_id="reviewer")[0]
-    assert child["parent_run_id"] == parent.id
-    assert child["metadata"]["lifecycle_hook_id"] == "hook:lifecycle-agent-review"
-    assert child["metadata"]["parent_session_id"] == "session-1"
-    assert child["metadata"]["parent_turn_id"] == "turn-1"
+    assert "parent_run_id" not in child
+    assert "lifecycle_hook_id" not in child["metadata"]
+    relation = control.load_agent_run_detail(parent.id)["relations"][0]
+    assert relation["metadata"]["lifecycle_hook_id"] == "hook:lifecycle-agent-review"
+    assert relation["metadata"]["parent_session_id"] == "session-1"
+    assert relation["metadata"]["parent_turn_id"] == "turn-1"
 
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         child["id"],
         ExecutorRunResult(
             task_id=child["id"],
             status="completed",
             output="review passed",
         ),
+        activation_id=_current_activation_id(control, child["id"]),
     )
 
     parent_events = [event.to_dict() for event in control.list_events(parent.id)]
-    delegated_event = [
-        event for event in parent_events if event["type"] == "delegated_run_completed"
+    agent_call_event = [
+        event for event in parent_events if event["type"] == "agent_call_result"
     ][0]
     lifecycle_events = [
         event for event in parent_events if event["type"] == "lifecycle_hook"
     ]
-    session_events = agent_run_event_to_session_events(delegated_event)
+    session_events = agent_run_event_to_session_events(agent_call_event)
     session_lifecycle_events = [
         agent_run_event_to_session_events(event)[0]
         for event in lifecycle_events
     ]
 
-    assert delegated_event["payload"]["agent_run_id"] == child["id"]
-    assert delegated_event["payload"]["parent_run_id"] == parent.id
+    assert agent_call_event["payload"]["target_agent_run_id"] == child["id"]
+    assert agent_call_event["payload"]["conversation_scope"] == "ephemeral"
     assert session_events[0][0] == "context_event"
-    assert session_events[0][1]["phase"] == "delegated_run_completed"
-    assert session_events[0][1]["child_agent_run_id"] == child["id"]
-    assert session_events[0][1]["result"] == "review passed"
+    assert session_events[0][1]["phase"] == "agent_call_result"
+    assert session_events[0][1]["agent_call"]["target_agent_run_id"] == child["id"]
+    assert session_events[0][1]["agent_call"]["summary"] == "review passed"
     assert [event["payload"]["event_name"] for event in lifecycle_events] == [
         "TaskCompleted",
         "SubagentStop",
@@ -574,10 +842,119 @@ def test_lifecycle_agent_adapter_child_completion_projects_to_parent_session() -
     ]
 
 
+def test_activation_and_feedback_events_project_without_internal_payloads() -> None:
+    activation_event = {
+        "agent_run_id": "run-1",
+        "seq": 1,
+        "type": "activation_queued",
+        "payload": {
+            "activation_id": "run-1:activation:2",
+            "activation": {
+                "id": "run-1:activation:2",
+                "agent_run_id": "run-1",
+                "seq": 2,
+                "input_kind": "server_feedback",
+                "status": "queued",
+                "prompt": "internal repair prompt",
+                "result_payload": {"secret": "nope"},
+            },
+        },
+    }
+    feedback_event = {
+        "agent_run_id": "run-1",
+        "seq": 2,
+        "type": "agent_run_feedback_added",
+        "payload": {
+            "feedback_id": "feedback-1",
+            "feedback": {
+                "id": "feedback-1",
+                "agent_run_id": "run-1",
+                "source": "server",
+                "kind": "candidate_validation_failed",
+                "payload": {"internal": "details"},
+                "visibility": "internal",
+            },
+        },
+    }
+    steer_event = {
+        "agent_run_id": "run-1",
+        "seq": 3,
+        "type": "activation_steer_queued",
+        "payload": {
+            "activation_id": "run-1:activation:2",
+            "steer_id": "steer-1",
+            "steer": {
+                "id": "steer-1",
+                "activation_id": "run-1:activation:2",
+                "source": "user",
+                "payload": {"message": "internal same-turn input"},
+                "status": "queued",
+                "metadata": {"secret": "nope"},
+            },
+        },
+    }
+    agent_call_failed_event = {
+        "agent_run_id": "run-1",
+        "seq": 4,
+        "type": "agent_run_feedback_added",
+        "payload": {
+            "feedback_id": "feedback-agent-call-failed",
+            "feedback": {
+                "id": "feedback-agent-call-failed",
+                "agent_run_id": "run-1",
+                "source": "system",
+                "kind": "agent_call_failed",
+                "payload": {
+                    "agent_id": "Reviewer",
+                    "conversation_scope": "ephemeral",
+                    "wait": True,
+                    "target_agent_run_id": "",
+                    "status": "failed",
+                    "message": "AgentConfig not found: Reviewer",
+                    "error_code": "agent_not_found",
+                    "request_preview": "internal request text",
+                },
+                "visibility": "user_visible",
+            },
+        },
+    }
+
+    projected_activation = agent_run_event_to_session_events(activation_event)[0]
+    projected_feedback = agent_run_event_to_session_events(feedback_event)[0]
+    projected_steer = agent_run_event_to_session_events(steer_event)[0]
+    projected_agent_call_failed = agent_run_event_to_session_events(
+        agent_call_failed_event
+    )[0]
+
+    assert projected_activation[0] == "context_event"
+    assert projected_activation[1]["phase"] == "agent_run_activation_queued"
+    assert projected_activation[1]["activation_id"] == "run-1:activation:2"
+    assert projected_activation[1]["activation"]["input_kind"] == "server_feedback"
+    assert "prompt" not in projected_activation[1]["activation"]
+    assert "result_payload" not in projected_activation[1]["activation"]
+    assert projected_feedback[0] == "context_event"
+    assert projected_feedback[1]["phase"] == "agent_run_feedback_added"
+    assert projected_feedback[1]["feedback"]["kind"] == "candidate_validation_failed"
+    assert "payload" not in projected_feedback[1]["feedback"]
+    assert projected_steer[0] == "context_event"
+    assert projected_steer[1]["phase"] == "agent_run_activation_steer_queued"
+    assert projected_steer[1]["steer"]["status"] == "queued"
+    assert "payload" not in projected_steer[1]["steer"]
+    assert "metadata" not in projected_steer[1]["steer"]
+    assert projected_agent_call_failed[0] == "context_event"
+    assert projected_agent_call_failed[1]["phase"] == "agent_call_failed"
+    assert projected_agent_call_failed[1]["agent_call"]["agent_id"] == "Reviewer"
+    assert (
+        projected_agent_call_failed[1]["agent_call"]["conversation_scope"]
+        == "ephemeral"
+    )
+    assert "request_preview" not in projected_agent_call_failed[1]["agent_call"]
+
+
 def test_lifecycle_agent_adapter_child_cancel_projects_to_parent_session() -> None:
     control = AgentRunControlPlane(max_running_tasks=4)
     parent = control.submit_agent_run(
-        AgentRunRequest(issue_id="parent", agent_id="planner", prompt="parent"),
+        AgentRunRequest(agent_id="planner", prompt="parent"),
         task_id="parent-run",
     )
 
@@ -645,7 +1022,7 @@ def test_lifecycle_agent_adapter_child_cancel_projects_to_parent_session() -> No
         for event in lifecycle_events
     ]
 
-    assert cancelled_child.status == TaskStatus.CANCELLED
+    assert cancelled_child.status == AgentRunStatus.CANCELLED
     assert cancelled_child.cancel_reason == "parent_cancelled:user_stop"
     assert [event["payload"]["event_name"] for event in lifecycle_events] == [
         "TaskCompleted",
@@ -702,14 +1079,13 @@ def test_agent_run_snapshots_agent_model_binding_for_server_origin() -> None:
 
     run = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="capability",
             agent_id="capability_packager",
             prompt="package repo",
             source="capability_ingest",
         ),
         task_id="run-packager",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="sandbox_worker",
         executors=["reuleauxcoder"],
@@ -735,14 +1111,13 @@ def test_reuleauxcoder_agent_run_gets_stable_executor_session_before_claim() -> 
 
     run = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="agent-run-session",
             agent_id="capability_packager",
             prompt="package repo",
             executor=ExecutorType.REULEAUXCODER,
         ),
         task_id="task-reuleaux",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         executors=["reuleauxcoder"],
     )
@@ -756,7 +1131,6 @@ def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-events",
             agent_id="coder",
             prompt="events",
         ),
@@ -772,17 +1146,166 @@ def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
     assert [event.seq for event in waited] == [2, 3]
 
     detail = control.load_agent_run_detail(task.id, event_limit=2)
-    assert [event["seq"] for event in detail["events"]] == [5, 6]
+    assert [event["seq"] for event in detail["events"]] == [6, 7]
+    assert [activation["id"] for activation in detail["activations"]] == [
+        "task-events:activation:1"
+    ]
+    assert detail["activations"][0]["status"] == "queued"
+
+
+def test_activation_steer_queues_feedback_without_new_run_or_activation() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="coder", prompt="initial task"),
+        task_id="task-steer",
+    )
+
+    steer, feedback = control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"message": "add this context"},
+        metadata={"turn_id": "turn-1"},
+        steer_id="steer-1",
+    )
+
+    detail = control.load_agent_run_detail(task.id)
+    assert steer.activation_id == "task-steer:activation:1"
+    assert feedback.agent_run_id == task.id
+    assert feedback.kind.value == "user_message"
+    assert feedback.metadata["steer_id"] == "steer-1"
+    assert feedback.metadata["fallback_reason"] == (
+        "same_activation_steer_delivery_unavailable"
+    )
+    assert detail["agent_run"]["id"] == task.id
+    assert [activation["id"] for activation in detail["activations"]] == [
+        "task-steer:activation:1"
+    ]
+    assert detail["activation_steers"] == [
+        {
+            "id": "steer-1",
+            "activation_id": "task-steer:activation:1",
+            "source": "user",
+            "payload": {"message": "add this context"},
+            "created_at": steer.created_at,
+            "delivered_at": None,
+            "status": "queued",
+            "metadata": {"turn_id": "turn-1"},
+        }
+    ]
+    assert detail["feedback"][0]["id"] == feedback.id
+    assert detail["feedback"][0]["consumed_by_activation_id"] is None
+    assert [event["type"] for event in detail["events"]][-2:] == [
+        "activation_steer_queued",
+        "agent_run_feedback_added",
+    ]
+
+    control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="blocked", output="paused"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+    resumed = control.continue_agent_run(
+        task.id,
+        input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
+        input_payload={"feedback_id": feedback.id},
+        feedback_id=feedback.id,
+        prompt="continue with queued steer",
+    )
+
+    assert resumed.id == task.id
+    resumed_detail = control.load_agent_run_detail(task.id)
+    assert [activation["id"] for activation in resumed_detail["activations"]] == [
+        "task-steer:activation:1",
+        "task-steer:activation:2",
+    ]
+    assert resumed_detail["feedback"][0]["consumed_by_activation_id"] == (
+        "task-steer:activation:2"
+    )
+
+
+def test_non_required_feedback_does_not_block_successful_agent_run_completion() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="coder", prompt="initial task"),
+        task_id="task-feedback-not-required",
+    )
+    control.append_agent_run_feedback(
+        task.id,
+        source=AgentRunFeedbackSource.SYSTEM,
+        kind=AgentRunFeedbackKind.CANDIDATE_READY,
+        payload={"candidate_id": "candidate-1"},
+        requires_activation=False,
+    )
+
+    completed = control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+
+    assert completed.status == AgentRunStatus.COMPLETED
+    assert completed.waiting_reason is None
+    assert completed.terminal_result == {"output": "done"}
+
+
+def test_required_feedback_blocks_successful_agent_run_terminal_state() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="coder", prompt="initial task"),
+        task_id="task-feedback-required",
+    )
+    feedback = control.append_agent_run_feedback(
+        task.id,
+        source=AgentRunFeedbackSource.SYSTEM,
+        kind=AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED,
+        payload={"error": "missing required field"},
+        requires_activation=True,
+    )
+
+    waiting = control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="draft"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+
+    assert waiting.status == AgentRunStatus.WAITING
+    assert waiting.waiting_reason == AgentRunWaitingReason.SERVER_PROCESSING
+    assert waiting.resume_policy == AgentRunResumePolicy.EXTERNAL_EVENT
+    assert waiting.terminal_result == {}
+    detail = control.load_agent_run_detail(task.id)
+    assert detail["feedback"][0]["id"] == feedback.id
+    assert detail["feedback"][0]["requires_activation"] is True
+    assert detail["events"][-1]["type"] == "waiting"
+
+
+def test_activation_steer_rejects_terminal_agent_run() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="coder", prompt="initial task"),
+        task_id="task-steer-terminal",
+    )
+    control.complete_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, task.id),
+    )
+
+    with pytest.raises(ValueError, match="only active AgentRun activations"):
+        control.append_activation_steer(
+            task.id,
+            source="user",
+            payload={"message": "too late"},
+        )
 
 
 def test_list_agent_runs_returns_newest_first_like_postgres_store() -> None:
     control = AgentRunControlPlane()
     control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-order", agent_id="coder", prompt="old"),
+        AgentRunRequest(agent_id="coder", prompt="old"),
         task_id="task-old",
     )
     control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-order", agent_id="coder", prompt="new"),
+        AgentRunRequest(agent_id="coder", prompt="new"),
         task_id="task-new",
     )
 
@@ -847,14 +1370,13 @@ def test_failed_agent_run_exposes_terminal_reason_when_output_is_empty() -> None
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-failed",
             agent_id="coder",
             prompt="run",
         ),
         task_id="task-failed",
     )
 
-    completed = control.complete_agent_run(
+    completed = control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(
             task_id=task.id,
@@ -862,10 +1384,12 @@ def test_failed_agent_run_exposes_terminal_reason_when_output_is_empty() -> None
             output="",
             error="real model failure",
         ),
+        activation_id=_current_activation_id(control, task.id),
     )
 
     assert completed.status.value == "failed"
-    assert completed.output == ""
+    assert not hasattr(completed, "output")
+    assert completed.terminal_result == {"output": ""}
     assert completed.failure_reason == "real model failure"
     detail = control.agent_run_to_dict(task.id)
     assert detail["failure_reason"] == "real model failure"
@@ -876,7 +1400,6 @@ def test_complete_without_session_id_preserves_stream_pinned_session() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-session",
             agent_id="coder",
             prompt="run",
             executor="codex",
@@ -890,7 +1413,6 @@ def test_complete_without_session_id_preserves_stream_pinned_session() -> None:
             agent_id="coder",
             executor=ExecutorType.CODEX,
             execution_location=ExecutionLocation.DAEMON_WORKTREE,
-            issue_id="issue-session",
             task_id=task.id,
             workdir="/tmp/work",
             branch="agent/coder/task-session",
@@ -898,9 +1420,10 @@ def test_complete_without_session_id_preserves_stream_pinned_session() -> None:
         ),
     )
 
-    completed = control.complete_agent_run(
+    completed = control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, task.id),
     )
 
     assert completed.executor_session_id == "codex-thread-1"
@@ -911,91 +1434,126 @@ def test_followup_task_inherits_parent_session_when_scope_matches() -> None:
     control = AgentRunControlPlane()
     parent = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-followup",
             agent_id="coder",
             prompt="parent",
             executor="claude",
             execution_location="daemon_worktree",
             workdir="/tmp/work",
-            branch_name="agent/coder/task-parent",
-            pr_url="https://example.test/pr/1",
             executor_session_id="claude-session-1",
+            metadata={"worktree_branch": "agent/coder/task-parent"},
         ),
         task_id="task-parent",
     )
-
-    followup = control.submit_agent_run(
-        AgentRunRequest(
-            issue_id="issue-followup",
-            agent_id="coder",
-            prompt="follow up",
-            parent_task_id=parent.id,
-            trigger_comment_id="comment-1",
-        ),
-        task_id="task-followup",
+    control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, parent.id),
     )
 
+    followup = control.continue_agent_run(
+        parent.id,
+        input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
+        input_payload={"message": "comment follow up"},
+        resume_session=True,
+        prompt="follow up",
+    )
+
+    assert followup.id == parent.id
     assert followup.executor == parent.executor
     assert followup.runtime_profile_id == parent.runtime_profile_id
     assert followup.workdir == parent.workdir
-    assert followup.branch_name == parent.branch_name
-    assert followup.pr_url == parent.pr_url
+    assert not hasattr(followup, "branch_name")
+    assert not hasattr(followup, "pr_url")
     assert followup.executor_session_id == "claude-session-1"
+
+
+def test_continue_agent_run_rejects_business_identity_payload_fields() -> None:
+    control = AgentRunControlPlane()
+    parent = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="parent",
+        ),
+        task_id="task-business-input",
+    )
+    control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, parent.id),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="AgentRunActivation.input_payload cannot store taskflow",
+    ):
+        forbidden_key = "trigger_" + "comment_id"
+        control.continue_agent_run(
+            parent.id,
+            input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
+            input_payload={forbidden_key: "comment-1"},
+            resume_session=True,
+            prompt="follow up",
+        )
 
 
 def test_reuleauxcoder_followup_reuses_parent_executor_session() -> None:
     control = AgentRunControlPlane()
     parent = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="capability-followup",
             agent_id="capability_packager",
             prompt="draft",
             executor=ExecutorType.REULEAUXCODER,
             execution_location=ExecutionLocation.REMOTE_SERVER,
             workdir="/tmp/capability",
-            branch_name="agent/capability/task-parent",
+            metadata={"worktree_branch": "agent/capability/task-parent"},
         ),
         task_id="task-capability-parent",
     )
+    control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="draft"),
+        activation_id=_current_activation_id(control, parent.id),
+    )
 
-    followup = control.submit_agent_run(
-        AgentRunRequest(
-            issue_id="capability-followup",
-            agent_id="capability_packager",
-            prompt="revise draft",
-            parent_task_id=parent.id,
-        ),
-        task_id="task-capability-followup",
+    followup = control.continue_agent_run(
+        parent.id,
+        input_kind=AgentRunActivationInputKind.SERVER_FEEDBACK,
+        input_payload={"kind": "candidate_validation_failed"},
+        resume_session=True,
+        prompt="revise draft",
     )
 
     assert parent.executor_session_id == "labrastro-agent-run-task-capability-parent"
+    assert followup.id == parent.id
     assert followup.executor_session_id == parent.executor_session_id
 
 
-def test_followup_task_does_not_inherit_session_for_different_agent() -> None:
+def test_continue_agent_run_without_resume_session_clears_executor_session() -> None:
     control = AgentRunControlPlane()
     parent = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-followup",
             agent_id="coder",
             prompt="parent",
             executor="claude",
             execution_location="daemon_worktree",
             workdir="/tmp/work",
-            branch_name="agent/coder/task-parent",
             executor_session_id="claude-session-1",
+            metadata={"worktree_branch": "agent/coder/task-parent"},
         ),
         task_id="task-parent-agent",
     )
+    control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, parent.id),
+    )
 
-    followup = control.submit_agent_run(
-        AgentRunRequest(
-            issue_id="issue-followup",
-            agent_id="reviewer",
-            prompt="follow up",
-            parent_task_id=parent.id,
-        ),
-        task_id="task-followup-agent",
+    followup = control.continue_agent_run(
+        parent.id,
+        input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
+        input_payload={"message": "continue without session"},
+        resume_session=False,
+        prompt="follow up",
     )
 
     assert followup.executor_session_id is None
@@ -1007,7 +1565,7 @@ def test_claim_task_waits_for_wakeup_when_task_is_submitted() -> None:
 
     def wait_for_claim() -> None:
         claims.append(
-            control.claim_agent_run(
+            control.claim_agent_run_activation(
                 worker_id="worker-wait",
                 executors=["fake"],
                 wait_sec=2,
@@ -1019,7 +1577,6 @@ def test_claim_task_waits_for_wakeup_when_task_is_submitted() -> None:
     time.sleep(0.1)
     control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="agent",
             prompt="run",
             executor=ExecutorType.FAKE,
@@ -1036,7 +1593,6 @@ def test_environment_runtime_events_are_derived_from_allowlisted_shell_commands(
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="environment-check",
             agent_id="environment_configurator",
             prompt="check environment",
             executor=ExecutorType.FAKE,
@@ -1081,9 +1637,10 @@ def test_environment_runtime_events_are_derived_from_allowlisted_shell_commands(
             },
         ),
     )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, task.id),
     )
 
     events = control.list_events(task.id, after_seq=0)
@@ -1098,7 +1655,6 @@ def test_worktree_ready_status_emits_worktree_create_lifecycle_audit() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="worktree",
             agent_id="coder",
             prompt="run in worktree",
             executor=ExecutorType.FAKE,
@@ -1144,7 +1700,6 @@ def test_worktree_removed_status_emits_worktree_remove_lifecycle_audit() -> None
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="worktree-remove",
             agent_id="coder",
             prompt="cleanup worktree",
             executor=ExecutorType.FAKE,
@@ -1349,7 +1904,6 @@ def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="environment-check",
             agent_id="environment_configurator",
             prompt="check environment",
             executor=ExecutorType.FAKE,
@@ -1380,9 +1934,10 @@ def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
             data={"tool": "exec_command", "input": {"command": "npm install -g x"}},
         ),
     )
-    completed = control.complete_agent_run(
+    completed = control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, task.id),
     )
 
     assert completed.status.value == "blocked"
@@ -1394,7 +1949,6 @@ def test_environment_runtime_reports_failed_install_command() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="environment-configure",
             agent_id="environment_configurator",
             prompt="configure environment",
             executor=ExecutorType.FAKE,
@@ -1474,7 +2028,6 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="fix",
             executor=ExecutorType.CODEX,
@@ -1483,7 +2036,7 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
         task_id="task-prompt",
     )
 
-    claim = control.claim_agent_run(worker_id="worker-1", executors=["codex"])
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
 
     assert claim is not None
     metadata = claim.executor_request.metadata
@@ -1516,7 +2069,7 @@ def test_claim_includes_rendered_prompt_files_from_runtime_snapshot() -> None:
 def test_runtime_configure_refreshes_snapshot_without_dropping_tasks() -> None:
     control = AgentRunControlPlane()
     existing = control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-1", agent_id="legacy", prompt="old"),
+        AgentRunRequest(agent_id="legacy", prompt="old"),
         task_id="task-existing",
     )
 
@@ -1538,13 +2091,13 @@ def test_runtime_configure_refreshes_snapshot_without_dropping_tasks() -> None:
         },
     )
     control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-2", agent_id="reviewer", prompt="new"),
+        AgentRunRequest(agent_id="reviewer", prompt="new"),
         task_id="task-new",
     )
 
     assert control.max_running_tasks == 3
     assert control.get_agent_run(existing.id).status.value == "queued"
-    claim = control.claim_agent_run(worker_id="worker-1", executors=["fake"])
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["fake"])
 
     assert claim is not None
     assert claim.task.id == "task-new"
@@ -1573,7 +2126,7 @@ def test_submit_resolves_agent_run_profile_defaults() -> None:
     )
 
     task = control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-1", agent_id="reviewer", prompt="review"),
+        AgentRunRequest(agent_id="reviewer", prompt="review"),
         task_id="task-agent-defaults",
     )
 
@@ -1583,7 +2136,7 @@ def test_submit_resolves_agent_run_profile_defaults() -> None:
     assert task.metadata["model"] == "smoke-model"
     assert task.metadata["worker_kind"] == "server_worker"
     assert task.metadata["model_request_origin"] == "server"
-    claim = control.claim_agent_run(worker_id="worker-1", executors=["fake"])
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["fake"])
     assert claim is not None
     assert claim.executor_request.runtime_profile_id == "fake_profile"
     assert claim.executor_request.executor == ExecutorType.FAKE
@@ -1616,7 +2169,6 @@ def test_submit_explicit_executor_and_profile_override_agent_defaults() -> None:
 
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             runtime_profile_id="fake_profile",
@@ -1640,7 +2192,7 @@ def test_submit_rejects_missing_agent_run_profile() -> None:
 
     with pytest.raises(ValueError, match="runtime profile not found: missing"):
         control.submit_agent_run(
-            AgentRunRequest(issue_id="issue-1", agent_id="reviewer", prompt="run"),
+            AgentRunRequest(agent_id="reviewer", prompt="run"),
             task_id="task-missing-profile",
         )
 
@@ -1667,7 +2219,7 @@ def test_submit_rejects_user_agent_without_runtime_profile() -> None:
 
     with pytest.raises(ValueError, match="requires a runtime_profile"):
         control.submit_agent_run(
-            AgentRunRequest(issue_id="issue-1", agent_id="reviewer", prompt="run"),
+            AgentRunRequest(agent_id="reviewer", prompt="run"),
             task_id="task-no-profile",
         )
 
@@ -1695,7 +2247,6 @@ def test_taskflow_rejects_local_only_runtime_profile() -> None:
     with pytest.raises(ValueError, match="Taskflow agent requires a server-capable runtime profile"):
         control.submit_agent_run(
             AgentRunRequest(
-                issue_id="taskflow-1",
                 agent_id="reviewer",
                 prompt="run taskflow",
                 source="taskflow",
@@ -1718,12 +2269,12 @@ def test_local_peer_cannot_claim_remote_server_agent_run() -> None:
         }
     )
     task = control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-1", agent_id="reviewer", prompt="run"),
+        AgentRunRequest(agent_id="reviewer", prompt="run"),
         task_id="task-remote-server",
     )
 
     assert (
-        control.claim_agent_run(
+        control.claim_agent_run_activation(
             worker_id="local-peer",
             worker_kind="local_peer",
             executors=["fake"],
@@ -1731,7 +2282,7 @@ def test_local_peer_cannot_claim_remote_server_agent_run() -> None:
         )
         is None
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="server-worker",
         worker_kind="server_worker",
         executors=["fake"],
@@ -1753,7 +2304,6 @@ def test_generic_agent_runs_feature_does_not_claim_non_local_agent_run(
     control = AgentRunControlPlane()
     control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="reviewer",
             prompt="run",
             executor=ExecutorType.FAKE,
@@ -1762,7 +2312,7 @@ def test_generic_agent_runs_feature_does_not_claim_non_local_agent_run(
         task_id=f"task-{execution_location.value}",
     )
 
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="generic-local-peer",
         executors=["fake"],
         peer_features=["agent_runs", "agent_runs.local_workspace"],
@@ -1787,14 +2337,13 @@ def test_local_cli_executor_records_local_model_request_origin() -> None:
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run local cli",
             metadata={"workspace_root": "G:/repo/main"},
         ),
         task_id="task-local-cli",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="local-peer",
         worker_kind="local_peer",
         executors=["codex"],
@@ -1857,7 +2406,7 @@ def test_submit_rejects_inconsistent_model_request_origin(
 
     with pytest.raises(ValueError, match=message):
         control.submit_agent_run(
-            AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run"),
+            AgentRunRequest(agent_id="coder", prompt="run"),
             task_id="task-inconsistent-origin",
         )
 
@@ -1885,16 +2434,16 @@ def test_runtime_slots_limit_server_worker_runs_independently_from_global_limit(
             },
         },
     )
-    control.submit_agent_run(AgentRunRequest(issue_id="slot-1", agent_id="reviewer", prompt="review"))
-    control.submit_agent_run(AgentRunRequest(issue_id="slot-2", agent_id="builder", prompt="build"))
+    control.submit_agent_run(AgentRunRequest(agent_id="reviewer", prompt="review"))
+    control.submit_agent_run(AgentRunRequest(agent_id="builder", prompt="build"))
 
-    first = control.claim_agent_run(
+    first = control.claim_agent_run_activation(
         worker_id="server-1",
         worker_kind="server_worker",
         executors=["fake"],
         peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
     )
-    second = control.claim_agent_run(
+    second = control.claim_agent_run_activation(
         worker_id="server-2",
         worker_kind="server_worker",
         executors=["fake"],
@@ -1936,16 +2485,16 @@ def test_runtime_slots_allow_server_and_local_peer_runs_to_progress_separately()
             },
         },
     )
-    control.submit_agent_run(AgentRunRequest(issue_id="slot-remote", agent_id="remote_agent", prompt="remote"))
-    control.submit_agent_run(AgentRunRequest(issue_id="slot-local", agent_id="local_agent", prompt="local"))
+    control.submit_agent_run(AgentRunRequest(agent_id="remote_agent", prompt="remote"))
+    control.submit_agent_run(AgentRunRequest(agent_id="local_agent", prompt="local"))
 
-    server_claim = control.claim_agent_run(
+    server_claim = control.claim_agent_run_activation(
         worker_id="server-1",
         worker_kind="server_worker",
         executors=["fake"],
         peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
     )
-    local_claim = control.claim_agent_run(
+    local_claim = control.claim_agent_run_activation(
         worker_id="local-1",
         worker_kind="local_peer",
         executors=["fake"],
@@ -1978,7 +2527,6 @@ def test_environment_agent_run_uses_local_peer_slot() -> None:
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="environment",
             agent_id="environment_configurator",
             prompt="check environment",
             source="environment",
@@ -2002,7 +2550,6 @@ def test_default_system_agent_runs_carry_effective_capability_boundaries() -> No
 
     environment_task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="environment",
             agent_id="environment_configurator",
             prompt="check",
             source="environment",
@@ -2011,7 +2558,6 @@ def test_default_system_agent_runs_carry_effective_capability_boundaries() -> No
     )
     packager_task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="capability-ingest",
             agent_id="capability_packager",
             prompt="draft",
             source="capability_ingest",
@@ -2049,19 +2595,18 @@ def test_sandbox_worker_claims_only_sandbox_managed_runs() -> None:
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="sandbox-claim",
             agent_id="sandbox_agent",
             prompt="sandbox",
         )
     )
 
-    server_claim = control.claim_agent_run(
+    server_claim = control.claim_agent_run_activation(
         worker_id="server-1",
         worker_kind="server_worker",
         executors=["fake"],
         peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
     )
-    sandbox_claim = control.claim_agent_run(
+    sandbox_claim = control.claim_agent_run_activation(
         worker_id="sandbox-1",
         worker_kind="sandbox_worker",
         executors=["fake"],
@@ -2076,7 +2621,7 @@ def test_sandbox_worker_claims_only_sandbox_managed_runs() -> None:
 def test_waiting_approval_event_updates_task_status() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run shell"),
+        AgentRunRequest(agent_id="coder", prompt="run shell"),
         task_id="task-approval",
     )
 
@@ -2089,13 +2634,15 @@ def test_waiting_approval_event_updates_task_status() -> None:
         ),
     )
 
-    assert control.get_agent_run(task.id).status.value == "waiting_approval"
+    updated = control.get_agent_run(task.id)
+    assert updated.status == AgentRunStatus.WAITING
+    assert updated.waiting_reason.value == "user_approval"
 
 
 def test_waiting_approval_status_projects_to_session_approval_request() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
-        AgentRunRequest(issue_id="issue-1", agent_id="coder", prompt="run shell"),
+        AgentRunRequest(agent_id="coder", prompt="run shell"),
         task_id="task-approval-projection",
     )
 
@@ -2175,7 +2722,6 @@ def test_taskflow_waiting_approval_event_becomes_blocked_review() -> None:
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="taskflow-1",
             agent_id="worker",
             prompt="run background",
             source="taskflow",
@@ -2221,7 +2767,6 @@ def test_background_permission_blocked_review_projects_to_session_decision() -> 
     )
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="taskflow-1",
             agent_id="worker",
             prompt="run background",
             source="taskflow",
@@ -2280,7 +2825,6 @@ def test_delegation_waiting_approval_event_becomes_blocked_review() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="delegation-1",
             agent_id="worker",
             prompt="run delegated task",
             source="delegation",
@@ -2310,7 +2854,6 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
     control = AgentRunControlPlane()
     local_task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="fix local",
             executor=ExecutorType.CODEX,
@@ -2321,7 +2864,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
     )
 
     assert (
-        control.claim_agent_run(
+        control.claim_agent_run_activation(
             worker_id="worker-shell",
             executors=["codex"],
             peer_features=["shell"],
@@ -2330,7 +2873,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         is None
     )
     assert (
-        control.claim_agent_run(
+        control.claim_agent_run_activation(
             worker_id="worker-no-workspace",
             executors=["codex"],
             peer_features=["agent_runs", "agent_runs.local_workspace"],
@@ -2338,7 +2881,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         is None
     )
     assert (
-        control.claim_agent_run(
+        control.claim_agent_run_activation(
             worker_id="worker-other",
             executors=["codex"],
             peer_features=["agent_runs", "agent_runs.local_workspace"],
@@ -2346,7 +2889,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         )
         is None
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-local",
         executors=["codex"],
         peer_features=["agent_runs", "agent_runs.local_workspace"],
@@ -2358,7 +2901,6 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
 
     remote_task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-2",
             agent_id="coder",
             prompt="fix remote",
             executor=ExecutorType.CLAUDE,
@@ -2366,7 +2908,7 @@ def test_claim_filters_by_workspace_and_execution_location() -> None:
         ),
         task_id="task-remote",
     )
-    remote_claim = control.claim_agent_run(
+    remote_claim = control.claim_agent_run_activation(
         worker_id="worker-remote",
         executors=["claude"],
         peer_features=["agent_runs.remote_server"],
@@ -2380,14 +2922,13 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.FAKE,
         ),
         task_id="task-heartbeat",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="local_peer",
         executors=["fake"],
@@ -2397,28 +2938,31 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
     )
 
     assert claim is not None
-    heartbeat = control.heartbeat_agent_run(
+    heartbeat = control.heartbeat_agent_run_activation(
         request_id=claim.request_id,
         task_id=task.id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
         lease_sec=5,
     )
     assert heartbeat["ok"] is True
+    assert heartbeat["activation_id"] == claim.activation_id
     assert heartbeat["cancel_requested"] is False
     assert control.get_agent_run(task.id).status.value == "running"
 
     assert control.cancel_agent_run(task.id, reason="stop") is True
-    heartbeat = control.heartbeat_agent_run(
+    heartbeat = control.heartbeat_agent_run_activation(
         request_id=claim.request_id,
         task_id=task.id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
     assert heartbeat["cancel_requested"] is True
     assert heartbeat["reason"] == "stop"
 
-    completed = control.complete_agent_run(
+    completed = control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(
             task_id=task.id,
@@ -2426,14 +2970,16 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
             output="",
             error="execution cancelled",
         ),
+        activation_id=_current_activation_id(control, task.id),
     )
     assert completed.status.value == "cancelled"
     assert completed.cancel_reason == "stop"
     assert control.agent_run_to_dict(task.id)["cancel_reason"] == "stop"
 
-    missing = control.heartbeat_agent_run(
+    missing = control.heartbeat_agent_run_activation(
         request_id="missing-claim",
         task_id="missing-task",
+        activation_id=claim.activation_id,
         worker_id="worker-1",
     )
     assert missing["ok"] is False
@@ -2442,14 +2988,13 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
 
     stale_task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-2",
             agent_id="coder",
             prompt="stale",
             executor=ExecutorType.FAKE,
         ),
         task_id="task-stale",
     )
-    stale_claim = control.claim_agent_run(
+    stale_claim = control.claim_agent_run_activation(
         worker_id="worker-2",
         worker_kind="local_peer",
         executors=["fake"],
@@ -2469,14 +3014,13 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.FAKE,
         ),
         task_id="task-owner",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="local_peer",
         executors=["fake"],
@@ -2485,9 +3029,12 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     )
 
     assert claim is not None
-    ok, reason = control.pin_claimed_session(
+    assert claim.activation_id == "task-owner:activation:1"
+    assert claim.to_dict()["activation"]["activation_id"] == claim.activation_id
+    ok, reason = control.pin_claimed_activation_session(
         request_id=claim.request_id,
         task_id=task.id,
+        activation_id=claim.activation_id,
         worker_id="other-worker",
         peer_id="peer-1",
         workdir="/tmp/work",
@@ -2495,9 +3042,10 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     assert ok is False
     assert reason == "worker_mismatch"
 
-    ok, reason = control.pin_claimed_session(
+    ok, reason = control.pin_claimed_activation_session(
         request_id=claim.request_id,
         task_id=task.id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
         workdir="/tmp/work",
@@ -2506,11 +3054,18 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     assert ok is True
     assert reason == ""
     assert control.get_agent_run(task.id).workdir == "/tmp/work"
+    session_events = [
+        event
+        for event in control.list_events(task.id)
+        if event.type == "session_metadata"
+    ]
+    assert not session_events
 
     ok, reason = control.append_executor_event(
         task.id,
         ExecutorEvent.status("running"),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="other-worker",
         peer_id="peer-1",
     )
@@ -2521,16 +3076,22 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
         task.id,
         ExecutorEvent.text_event("hello"),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
     assert ok is True
     assert reason == ""
+    text_event = [
+        event for event in control.list_events(task.id) if event.type == "text"
+    ][0]
+    assert text_event.payload["activation_id"] == claim.activation_id
 
-    ok, reason, completed = control.complete_claimed_agent_run(
+    ok, reason, completed = control.complete_claimed_agent_run_activation(
         task.id,
         ExecutorRunResult(task_id=task.id, status="completed", output="done"),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
@@ -2538,13 +3099,19 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     assert reason == ""
     assert completed is not None
     assert completed.status.value == "completed"
+    activation_completed = [
+        event
+        for event in control.list_events(task.id)
+        if event.type == "activation_completed"
+    ][0]
+    assert activation_completed.payload["activation_id"] == claim.activation_id
+    assert activation_completed.payload["activation"]["status"] == "completed"
 
 
 def test_blocked_complete_and_retry_terminal_task() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.FAKE,
@@ -2553,7 +3120,7 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
         ),
         task_id="task-blocked",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="server_worker",
         executors=["fake"],
@@ -2562,7 +3129,7 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
     )
 
     assert claim is not None
-    ok, reason, blocked = control.complete_claimed_agent_run(
+    ok, reason, blocked = control.complete_claimed_agent_run_activation(
         task.id,
         ExecutorRunResult(
             task_id=task.id,
@@ -2571,6 +3138,7 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
             error="repo_url missing",
         ),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
@@ -2582,26 +3150,54 @@ def test_blocked_complete_and_retry_terminal_task() -> None:
 
     blocked.executor_session_id = "fake-session-1"
 
-    retry = control.retry_agent_run(task.id, new_agent_run_id="task-retry")
+    retry = control.retry_agent_run(task.id)
 
+    assert retry.id == task.id
     assert retry.status.value == "queued"
-    assert retry.metadata["retry_of"] == task.id
+    detail = control.load_agent_run_detail(task.id)
+    assert detail["agent_run"]["current_activation_id"] == "task-blocked:activation:2"
+    assert detail["activations"][1]["seq"] == 2
+    assert detail["activations"][1]["input_kind"] == "admin_resume"
+    assert detail["activations"][1]["input_payload"] == {
+        "retry_of_activation_id": "task-blocked:activation:1",
+        "resume_session": False,
+    }
+    public_run = control.agent_run_to_dict(task.id)
+    assert public_run["current_activation_id"] == "task-blocked:activation:2"
+    assert "current_activation_id" not in public_run["metadata"]
+    assert "current_activation_seq" not in public_run["metadata"]
+    assert "current_activation_input_kind" not in public_run["metadata"]
+    assert "current_activation_input_payload" not in public_run["metadata"]
+    assert "current_activation_prompt" not in public_run["metadata"]
     assert retry.metadata["repo_url"] == "file:///repo"
     assert retry.executor_session_id is None
 
+    retry.status = AgentRunStatus.BLOCKED
+    retry.executor_session_id = "fake-session-1"
     resumed = control.retry_agent_run(
         task.id,
-        new_agent_run_id="task-retry-resume",
         resume_session=True,
     )
+    assert resumed.id == task.id
     assert resumed.executor_session_id == "fake-session-1"
+    detail = control.load_agent_run_detail(task.id)
+    assert detail["agent_run"]["current_activation_id"] == "task-blocked:activation:3"
+    assert [activation["id"] for activation in detail["activations"]] == [
+        "task-blocked:activation:1",
+        "task-blocked:activation:2",
+        "task-blocked:activation:3",
+    ]
+    assert [activation["status"] for activation in detail["activations"]] == [
+        "blocked",
+        "queued",
+        "queued",
+    ]
 
 
 def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.FAKE,
@@ -2609,7 +3205,7 @@ def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
         ),
         task_id="task-artifacts",
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="server_worker",
         executors=["fake"],
@@ -2618,10 +3214,11 @@ def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
     )
 
     assert claim is not None
-    ok, reason, completed = control.complete_claimed_agent_run(
+    ok, reason, completed = control.complete_claimed_agent_run_activation(
         task.id,
         ExecutorRunResult(task_id=task.id, status="completed", output="done"),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
         artifacts=[
@@ -2649,14 +3246,17 @@ def test_complete_task_accepts_branch_pr_and_failed_publish_artifacts() -> None:
     assert reason == ""
     assert completed is not None
     assert completed.status.value == "completed"
-    assert completed.branch_name == "agent/coder/task-artifacts"
-    assert completed.pr_url == "https://example.test/pr/1"
+    assert not hasattr(completed, "branch_name")
+    assert not hasattr(completed, "pr_url")
     artifacts = control.artifacts_to_dict(task.id)
     assert [artifact["type"] for artifact in artifacts] == [
         "branch",
         "pull_request",
         "log",
     ]
+    assert artifacts[0]["branch_name"] == "agent/coder/task-artifacts"
+    assert artifacts[1]["branch_name"] == "agent/coder/task-artifacts"
+    assert artifacts[1]["pr_url"] == "https://example.test/pr/1"
     assert artifacts[2]["status"] == "failed"
     assert artifacts[2]["metadata"]["stage"] == "pr_create"
 
@@ -2665,7 +3265,6 @@ def test_complete_task_persists_lifecycle_overflow_artifacts_without_event_conte
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="issue-1",
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.REULEAUXCODER,
@@ -2676,7 +3275,7 @@ def test_complete_task_persists_lifecycle_overflow_artifacts_without_event_conte
     huge = "OVERSIZED_LIFECYCLE_OUTPUT_SECRET" * 500
     artifact_id = "lifecycle-output-overflow:hook-oversized:1"
 
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         task.id,
         ExecutorRunResult(
             task_id=task.id,
@@ -2727,6 +3326,7 @@ def test_complete_task_persists_lifecycle_overflow_artifacts_without_event_conte
                 }
             ],
         ),
+        activation_id=_current_activation_id(control, task.id),
     )
 
     artifacts = control.artifacts_to_dict(task.id)
@@ -2789,12 +3389,12 @@ def test_basic_scheduler_selects_lowest_running_agent() -> None:
             id="coder",
             max_concurrent_tasks=2,
         ),
-        "capability_packager": AgentConfig(
-            id="capability_packager",
-            visibility="internal",
-            delegable=False,
-            taskflow_eligible=False,
-        ),
+            "capability_packager": AgentConfig(
+                id="capability_packager",
+                visibility="internal",
+                callable_scopes=[],
+                taskflow_eligible=False,
+            ),
     }
     scheduler = BasicAgentScheduler(agents=agents)
 
@@ -2815,12 +3415,12 @@ def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> 
                 }
             },
             "agents": {
-                "capability_packager": {
-                    "visibility": "internal",
-                    "delegable": False,
-                    "taskflow_eligible": False,
-                    "system_flow_only": ["capability_ingest"],
-                    "runtime_profile": "capability_packager_remote",
+                    "capability_packager": {
+                        "visibility": "internal",
+                        "callable_scopes": [],
+                        "taskflow_eligible": False,
+                        "system_flow_only": ["capability_ingest"],
+                        "runtime_profile": "capability_packager_remote",
                 }
             }
         }
@@ -2829,7 +3429,6 @@ def test_control_plane_rejects_internal_agent_outside_declared_system_flow() -> 
     with pytest.raises(ValueError, match="restricted to system flows"):
         control.submit_agent_run(
             AgentRunRequest(
-                issue_id="manual",
                 agent_id="capability_packager",
                 prompt="run",
                 source="manual",
@@ -2851,12 +3450,12 @@ def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
                 }
             },
             "agents": {
-                "capability_packager": {
-                    "visibility": "internal",
-                    "delegable": False,
-                    "taskflow_eligible": False,
-                    "system_flow_only": ["capability_ingest"],
-                    "runtime_profile": "capability_packager_remote",
+                    "capability_packager": {
+                        "visibility": "internal",
+                        "callable_scopes": [],
+                        "taskflow_eligible": False,
+                        "system_flow_only": ["capability_ingest"],
+                        "runtime_profile": "capability_packager_remote",
                 }
             }
         }
@@ -2864,7 +3463,6 @@ def test_control_plane_allows_internal_agent_for_declared_system_flow() -> None:
 
     task = control.submit_agent_run(
         AgentRunRequest(
-            issue_id="ingest",
             agent_id="capability_packager",
             prompt="package",
             source="capability_ingest",

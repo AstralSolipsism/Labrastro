@@ -1,4 +1,4 @@
-﻿"""Agent runtime service helpers."""
+"""Agent runtime service helpers."""
 
 from labrastro_server.services.agent_runtime.executor_backend import (
     AgentExecutorBackend,
@@ -11,7 +11,7 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 )
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
-    AgentRunClaim,
+    AgentRunActivationClaim,
     AgentRunEvent,
     AgentRunRequest,
     InMemoryPRFlow,
@@ -31,7 +31,7 @@ from labrastro_server.services.agent_runtime.worktree import (
 __all__ = [
     "AgentExecutorBackend",
     "AgentRunControlPlane",
-    "AgentRunClaim",
+    "AgentRunActivationClaim",
     "AgentRunEvent",
     "AgentRunRequest",
     "AgentScheduleDecision",

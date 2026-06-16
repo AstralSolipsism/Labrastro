@@ -1,4 +1,4 @@
-﻿"""Environment configuration runs submitted through AgentRun."""
+"""Environment configuration runs submitted through AgentRun."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
     AgentRunRequest,
 )
-from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord, TriggerMode
+from reuleauxcoder.domain.agent_runtime.models import AgentRun, TriggerMode
 from reuleauxcoder.domain.config.models import DEFAULT_ENVIRONMENT_AGENT_ID
 
 
@@ -41,7 +41,7 @@ class EnvironmentRunError(Exception):
 
 @dataclass(frozen=True)
 class EnvironmentRunResult:
-    agent_run: AgentRunRecord
+    agent_run: AgentRun
     agent_id: str
     entry_ids: list[str]
     manifest_hash: str
@@ -91,7 +91,6 @@ class EnvironmentRunService:
         )
         metadata = {
             "workflow": ENVIRONMENT_WORKFLOW,
-            "agent_run_source": "environment",
             "environment_mode": normalized_mode,
             "entry_ids": list(selected_ids),
             "manifest_hash": manifest_hash,
@@ -101,7 +100,6 @@ class EnvironmentRunService:
             metadata["workspace_root"] = workspace_root
         agent_run = self.runtime_control_plane.submit_agent_run(
             AgentRunRequest(
-                issue_id=f"environment-{normalized_mode}",
                 agent_id=selected_agent_id,
                 prompt=prompt,
                 source="environment",
