@@ -46,6 +46,7 @@ class CapabilityInstallCandidate:
     credentials: list[str] = field(default_factory=list)
     credential_requirements: list[dict[str, Any]] = field(default_factory=list)
     credential_bindings: list[dict[str, Any]] = field(default_factory=list)
+    optional_features: list[dict[str, Any]] = field(default_factory=list)
     risk_level: str = ""
     hooks: list[dict[str, Any]] = field(default_factory=list)
     runtime_footprint: dict[str, Any] = field(default_factory=dict)
@@ -77,6 +78,7 @@ class CapabilityInstallCandidate:
             credentials=_string_list(raw.get("credentials")),
             credential_requirements=_dict_list(raw.get("credential_requirements")),
             credential_bindings=_dict_list(raw.get("credential_bindings")),
+            optional_features=_dict_list(raw.get("optional_features")),
             risk_level=str(raw.get("risk_level") or "").strip().lower(),
             hooks=_dict_list(raw.get("hooks")),
             runtime_footprint=_dict_value(raw.get("runtime_footprint")),
@@ -112,6 +114,7 @@ class CapabilityInstallCandidate:
                 dict(item) for item in self.credential_requirements
             ],
             "credential_bindings": [dict(item) for item in self.credential_bindings],
+            "optional_features": [dict(item) for item in self.optional_features],
             "risk_level": self.risk_level,
             "hooks": [dict(item) for item in self.hooks],
             "runtime_footprint": dict(self.runtime_footprint),
@@ -233,6 +236,7 @@ def build_install_candidate(
     credentials: list[str] | None = None,
     credential_requirements: list[dict[str, Any]] | None = None,
     credential_bindings: list[dict[str, Any]] | None = None,
+    optional_features: list[dict[str, Any]] | None = None,
     risk_level: str = "",
     hooks: list[dict[str, Any]] | None = None,
     runtime_footprint: dict[str, Any] | None = None,
@@ -255,6 +259,7 @@ def build_install_candidate(
         usage=usage or [],
         evidence=evidence or [],
         credentials=credentials or [],
+        optional_features=optional_features or [],
         risk_level=risk_level,
         post_install_checks=post_install_checks or [],
     )
@@ -273,6 +278,7 @@ def build_install_candidate(
         credentials=_string_list(credentials),
         credential_requirements=_dict_list(credential_requirements),
         credential_bindings=_dict_list(credential_bindings),
+        optional_features=_dict_list(optional_features),
         risk_level=str(risk_level or "").strip().lower(),
         hooks=_dict_list(hooks),
         runtime_footprint=dict(runtime_footprint or {}),
@@ -389,6 +395,7 @@ def capability_install_candidate_review(
     usage: list[str],
     evidence: list[dict[str, Any]],
     credentials: list[str],
+    optional_features: list[dict[str, Any]],
     risk_level: str,
     post_install_checks: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -413,6 +420,7 @@ def capability_install_candidate_review(
         "usage": list(usage),
         "evidence": [dict(item) for item in evidence],
         "credentials": list(credentials),
+        "optional_features": [dict(item) for item in optional_features],
         "risks": [item for item in [f"risk_level: {risk_level}" if risk_level else ""] if item],
         "post_install_checks": [dict(item) for item in post_install_checks],
     }

@@ -42,7 +42,11 @@ from labrastro_server.services.capability_install_candidates import (
     existing_mcp_server_names,
 )
 from reuleauxcoder.domain.agent_runtime.models import (
-    AgentRunRecord,
+    AgentRunActivationInputKind,
+    AgentRunFeedbackKind,
+    AgentRunFeedbackSource,
+    AgentRunFeedbackVisibility,
+    AgentRun,
     ArtifactType,
     CAPABILITY_COMPONENT_KINDS,
     CapabilityComponentConfig,
@@ -114,6 +118,14 @@ _CAPABILITY_READ_SOURCE_TOOL_NAMES = {
     "search_file",
     "search_files",
 }
+
+
+@dataclass(frozen=True)
+class _CapabilityCandidateRepairRequest:
+    source_bundle: dict[str, Any]
+    draft: dict[str, Any]
+    instruction: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
     "zh-CN": {
         "queued_title": "能力包生成任务已排队",
@@ -158,6 +170,7 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "tool_extract_evidence": "提取能力包证据",
         "materialize_draft": "组装内部字段并校验候选来源",
         "materialize_candidate": "生成并校验能力安装候选",
+        "candidate_repair_requested": "能力安装候选未通过校验，已回灌给 capability_packager 修正字段。",
         "skill_content_unresolved": "无法定位能力包 Skill 内容",
         "command_evidence_missing": "能力包依赖命令缺少来源证据",
         "source_discovery_incomplete": "能力包来源探索不完整",
@@ -212,6 +225,7 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "tool_extract_evidence": "Extracting capability package evidence",
         "materialize_draft": "Assembling internal fields and validating candidate source",
         "materialize_candidate": "Building and validating capability install candidate",
+        "candidate_repair_requested": "Capability install candidate validation failed; sending field repair back to capability_packager.",
         "skill_content_unresolved": "Could not resolve capability package Skill content",
         "command_evidence_missing": "Capability package dependency commands lack source evidence",
         "source_discovery_incomplete": "Capability package source discovery is incomplete",
@@ -225,6 +239,19 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
     },
 }
 MAX_SNIPPET_CHARS = 36_000
+_CAPABILITY_CANDIDATE_REPAIR_LIMIT = 1
+_CAPABILITY_INGEST_START_FORBIDDEN_REVISION_FIELDS = {
+    "candidate_build_failure",
+    "repair_attempt",
+    "revision_draft",
+    "revision_followup_id",
+    "revision_instruction",
+}
+_CAPABILITY_CANDIDATE_REPAIRABLE_REASONS = {
+    "candidate_validation_failed",
+    "candidate_component_materialization_failed",
+    "draft_invalid",
+}
 _CAPABILITY_WORKSPACE_SKILL_FILE_LIMIT = 100
 _CAPABILITY_WORKSPACE_SKILL_FILE_MAX_CHARS = 200_000
 _CAPABILITY_PROMPT_DOCUMENT_CONTENT_PREVIEW_CHARS = 1_200
@@ -396,7 +423,7 @@ class EvidenceBundle:
 
 @dataclass(frozen=True)
 class CapabilityPackageIngestResult:
-    agent_run: AgentRunRecord
+    agent_run: AgentRun
     source: dict[str, Any]
     source_bundle: dict[str, Any]
 
@@ -643,21 +670,16 @@ class CapabilityPackagerRunner:
         evidence_bundle: EvidenceBundle,
         workspace_root: str = "",
         agent_run_metadata: dict[str, Any] | None = None,
-        revision_draft: dict[str, Any] | None = None,
-        revision_instruction: str = "",
-    ) -> AgentRunRecord:
+    ) -> AgentRun:
         bundle = evidence_bundle.to_dict()
         prompt_bundle = _source_bundle_for_packager_prompt(bundle)
         locale = _metadata_locale(agent_run_metadata)
         prompt = _render_packager_prompt(
             bundle=prompt_bundle,
             locale=locale,
-            revision_draft=revision_draft,
-            revision_instruction=revision_instruction,
         )
         metadata = {
             "workflow": CAPABILITY_INGEST_WORKFLOW,
-            "agent_run_source": "capability_ingest",
             "capability_source": evidence_bundle.source,
             "source_bundle": prompt_bundle,
         }
@@ -666,8 +688,6 @@ class CapabilityPackagerRunner:
             "session_run_id",
             "client_request_id",
             "workflow_mode",
-            "revision_of_agent_run_id",
-            "revision_followup_id",
             "locale",
         ):
             value = (agent_run_metadata or {}).get(key)
@@ -675,13 +695,6 @@ class CapabilityPackagerRunner:
                 metadata[key] = (
                     normalize_session_locale(value) if key == "locale" else str(value)
                 )
-        revision_text = str(
-            (agent_run_metadata or {}).get("revision_instruction")
-            or revision_instruction
-            or ""
-        ).strip()
-        if revision_text:
-            metadata["revision_instruction"] = revision_text
         source_url = str(evidence_bundle.source.get("url") or "").strip()
         if evidence_bundle.source.get("type") == "github_repo" and source_url:
             metadata["repo_url"] = source_url
@@ -689,7 +702,6 @@ class CapabilityPackagerRunner:
             metadata["workspace_root"] = workspace_root
         return self.runtime_control_plane.submit_agent_run(
             AgentRunRequest(
-                issue_id="capability-package-ingest",
                 agent_id=self.agent_id,
                 prompt=prompt,
                 source="capability_ingest",
@@ -697,8 +709,6 @@ class CapabilityPackagerRunner:
                 worktree_role=WorktreeRole.SOURCE,
                 publish_policy=PublishPolicy.NEVER,
                 workdir=workspace_root or None,
-                parent_task_id=str(metadata.get("revision_of_agent_run_id") or "") or None,
-                parent_run_id=str(metadata.get("revision_of_agent_run_id") or "") or None,
                 metadata=metadata,
             )
         )
@@ -1494,6 +1504,7 @@ def build_capability_install_candidate_from_draft(
         credentials=draft.credentials,
         credential_requirements=draft.credential_requirements,
         credential_bindings=draft.credential_bindings,
+        optional_features=draft.optional_features,
         risk_level=draft.risk_level,
         hooks=package_hooks,
         runtime_footprint=aggregate_runtime_footprint(
@@ -1545,9 +1556,21 @@ class CapabilityPackageIngestService:
         payload: dict[str, Any],
         *,
         agent_run_metadata: dict[str, Any] | None = None,
-        revision_draft: dict[str, Any] | None = None,
-        revision_instruction: str = "",
     ) -> CapabilityPackageIngestResult:
+        forbidden_revision_fields = sorted(
+            field
+            for field in _CAPABILITY_INGEST_START_FORBIDDEN_REVISION_FIELDS
+            if field in payload
+        )
+        if forbidden_revision_fields:
+            raise CapabilityPackageIngestError(
+                "capability_ingest_revision_requires_existing_agent_run",
+                (
+                    "Capability package revision input must resume the existing "
+                    "AgentRun: "
+                    + ", ".join(forbidden_revision_fields)
+                ),
+            )
         raw_source = payload.get("source")
         source_payload: dict[str, Any] = raw_source if isinstance(raw_source, dict) else payload
         evidence_bundle = self.collector.collect(source_payload)
@@ -1562,8 +1585,6 @@ class CapabilityPackageIngestService:
             evidence_bundle=evidence_bundle,
             workspace_root=workspace_root,
             agent_run_metadata=agent_run_metadata,
-            revision_draft=revision_draft,
-            revision_instruction=revision_instruction,
         )
         persist_seed = getattr(self.packager_runner, "persist_seed_source_bundle", None)
         if callable(persist_seed):
@@ -1589,6 +1610,27 @@ class CapabilityPackageIngestService:
                 f"AgentRun not found: {task_id}",
                 status=HTTPStatus.NOT_FOUND,
             ) from exc
+        final_output = _agent_run_activation_output(self.packager_runner, task_id)
+        if final_output and isinstance(agent_run, dict):
+            agent_run = {**agent_run, "_activation_output": final_output}
+        activations: list[dict[str, Any]] = []
+        detail_loader = getattr(
+            getattr(self.packager_runner, "runtime_control_plane", None),
+            "load_agent_run_detail",
+            None,
+        )
+        if callable(detail_loader):
+            try:
+                detail = detail_loader(task_id, event_limit=1)
+            except Exception:
+                detail = {}
+            raw_activations = (
+                detail.get("activations") if isinstance(detail, dict) else None
+            )
+            if isinstance(raw_activations, list):
+                activations = [
+                    dict(item) for item in raw_activations if isinstance(item, dict)
+                ]
         draft: dict[str, Any] | None = None
         diagnostic_events_loader = getattr(
             self.packager_runner,
@@ -1660,6 +1702,7 @@ class CapabilityPackageIngestService:
             "ok": True,
             "agent_run": agent_run,
             "events": display_events,
+            "activations": activations,
             "capability_run_state": _capability_run_state(
                 agent_run,
                 draft,
@@ -1767,6 +1810,24 @@ class CapabilityPackageSessionRunService:
                 completed = self._completed_draft_status(session, agent_run_id)
                 if completed is None:
                     return
+                if isinstance(completed, _CapabilityCandidateRepairRequest):
+                    result = self._continue_revision_ingest(
+                        session,
+                        payload,
+                        completed.source_bundle,
+                        completed.draft,
+                        completed.instruction,
+                        agent_run_id,
+                        str(
+                            completed.metadata.get("revision_followup_id")
+                            or "candidate-build-repair"
+                        ),
+                        feedback_source=AgentRunFeedbackSource.SERVER,
+                        feedback_kind=AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED,
+                        input_kind=AgentRunActivationInputKind.SERVER_FEEDBACK,
+                        extra_metadata=completed.metadata,
+                    )
+                    continue
                 draft, source_bundle, candidate = completed
                 revision = self._request_install_approval(
                     session,
@@ -1778,7 +1839,7 @@ class CapabilityPackageSessionRunService:
                 )
                 if revision is None:
                     return
-                result = self._start_revision_ingest(
+                result = self._continue_revision_ingest(
                     session,
                     payload,
                     source_bundle,
@@ -1786,6 +1847,9 @@ class CapabilityPackageSessionRunService:
                     str(revision.get("text") or ""),
                     agent_run_id,
                     str(revision.get("followup_id") or ""),
+                    feedback_source=AgentRunFeedbackSource.USER,
+                    feedback_kind=AgentRunFeedbackKind.USER_MESSAGE,
+                    input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
                 )
         except CapabilityPackageIngestError as exc:
             session.append_event("error", {"message": exc.message, "code": exc.error})
@@ -1839,7 +1903,7 @@ class CapabilityPackageSessionRunService:
             metadata["locale"] = normalize_session_locale(metadata["locale"])
         return metadata
 
-    def _bind_agent_run(self, session: Any, agent_run: AgentRunRecord) -> None:
+    def _bind_agent_run(self, session: Any, agent_run: AgentRun) -> None:
         agent_run_id = agent_run.id
         session.set_cancel_callback(
             lambda reason, run_id=agent_run_id: self.runtime_control_plane.cancel_agent_run(
@@ -1854,8 +1918,40 @@ class CapabilityPackageSessionRunService:
                 agent_run=agent_run,
             ),
         )
-        metadata = dict(agent_run.metadata or {})
-        is_revision = bool(metadata.get("revision_of_agent_run_id"))
+        raw_activation_payload: Any = {}
+        try:
+            detail = self.runtime_control_plane.load_agent_run_detail(
+                agent_run_id,
+                event_limit=1,
+            )
+        except KeyError:
+            detail = {}
+        detail_agent_run = (
+            detail.get("agent_run") if isinstance(detail.get("agent_run"), dict) else {}
+        )
+        current_activation_id = str(
+            getattr(agent_run, "current_activation_id", None)
+            or detail_agent_run.get("current_activation_id")
+            or ""
+        ).strip()
+        activations = list(detail.get("activations") or [])
+        current_activation = next(
+            (
+                item
+                for item in reversed(activations)
+                if isinstance(item, dict)
+                and str(item.get("id") or item.get("activation_id") or "")
+                == current_activation_id
+            ),
+            activations[-1] if activations and isinstance(activations[-1], dict) else {},
+        )
+        raw_activation_payload = current_activation.get("input_payload")
+        activation_payload = (
+            dict(raw_activation_payload)
+            if isinstance(raw_activation_payload, dict)
+            else {}
+        )
+        is_revision = bool(activation_payload.get("revision_followup_id"))
         locale = _session_locale(session)
         session.append_event(
             "workflow_step",
@@ -1870,8 +1966,9 @@ class CapabilityPackageSessionRunService:
                     "agent_run_id": agent_run_id,
                     **(
                         {
-                            "revision_of_agent_run_id": str(metadata.get("revision_of_agent_run_id")),
-                            "revision_followup_id": str(metadata.get("revision_followup_id")),
+                            "revision_followup_id": str(
+                                activation_payload.get("revision_followup_id")
+                            ),
                         }
                         if is_revision
                         else {}
@@ -1884,7 +1981,11 @@ class CapabilityPackageSessionRunService:
         self,
         session: Any,
         agent_run_id: str,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    ) -> (
+        tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
+        | _CapabilityCandidateRepairRequest
+        | None
+    ):
         status = CapabilityPackageIngestService(self.runtime_control_plane).status(agent_run_id)
         task = status.get("agent_run") if isinstance(status.get("agent_run"), dict) else {}
         task_status = str(task.get("status") or "").strip()
@@ -2019,6 +2120,33 @@ class CapabilityPackageSessionRunService:
                 if isinstance(payload, dict)
                 else ""
             ).strip() or "capability install candidate could not be generated"
+            repair_request = _capability_candidate_repair_request(
+                task,
+                draft,
+                source_bundle,
+                payload if isinstance(payload, dict) else {},
+                locale,
+                activations=status.get("activations")
+                if isinstance(status.get("activations"), list)
+                else [],
+            )
+            if repair_request is not None:
+                session.append_event(
+                    "workflow_step",
+                    _capability_workflow_step_event(
+                        _capability_text(locale, "candidate_repair_requested"),
+                        "materialize_candidate",
+                        {
+                            "phase": "capability_install_candidate_repair_requested",
+                            "agent_run_id": agent_run_id,
+                            "repair_attempt": repair_request.metadata.get("repair_attempt"),
+                            "result": payload if isinstance(payload, dict) else {},
+                        },
+                        status="running",
+                        summary="capability_install_candidate_repair_requested",
+                    ),
+                )
+                return repair_request
             session.append_event(
                 "workflow_step",
                 _capability_workflow_step_event(
@@ -2079,9 +2207,40 @@ class CapabilityPackageSessionRunService:
                 locale=locale,
             ),
         )
+        candidate_review = (
+            candidate_payload.get("review")
+            if isinstance(candidate_payload.get("review"), dict)
+            else {}
+        )
+        self.runtime_control_plane.append_agent_run_feedback(
+            agent_run_id,
+            source=AgentRunFeedbackSource.SERVER,
+            kind=AgentRunFeedbackKind.CANDIDATE_READY,
+            payload={
+                "package_id": str(
+                    candidate_payload.get("package_id")
+                    or candidate_review.get("package_id")
+                    or ""
+                ),
+                "candidate_id": str(candidate_payload.get("candidate_id") or ""),
+                "candidate_hash": str(candidate_payload.get("candidate_hash") or ""),
+                "operation": str(candidate_payload.get("operation") or ""),
+                "status": str(candidate_payload.get("status") or ""),
+                "summary": str(candidate_review.get("description") or ""),
+            },
+            visibility=AgentRunFeedbackVisibility.INTERNAL,
+            requires_activation=False,
+            metadata=self._agent_run_metadata(
+                session,
+                {
+                    "phase": "capability_install_candidate_ready",
+                    "package_id": str(candidate_payload.get("package_id") or ""),
+                },
+            ),
+        )
         return draft, source_bundle, candidate_payload
 
-    def _start_revision_ingest(
+    def _continue_revision_ingest(
         self,
         session: Any,
         payload: dict[str, Any],
@@ -2090,26 +2249,53 @@ class CapabilityPackageSessionRunService:
         instruction: str,
         previous_agent_run_id: str,
         followup_id: str,
+        *,
+        feedback_source: AgentRunFeedbackSource,
+        feedback_kind: AgentRunFeedbackKind,
+        input_kind: AgentRunActivationInputKind,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> CapabilityPackageIngestResult:
         seed_source_bundle = _source_bundle_with_document_ids(source_bundle)
         evidence_bundle = EvidenceBundle.from_dict(seed_source_bundle)
-        workspace_root = str(payload.get("workspace_root") or "").strip()
-        runner = CapabilityPackagerRunner(self.runtime_control_plane)
-        agent_run = runner.start(
-            evidence_bundle=evidence_bundle,
-            workspace_root=workspace_root,
-            revision_draft=draft,
-            revision_instruction=instruction,
-            agent_run_metadata=self._agent_run_metadata(
-                session,
-                {
-                    "revision_of_agent_run_id": previous_agent_run_id,
-                    "revision_followup_id": followup_id,
-                    "revision_instruction": instruction,
-                },
+        metadata = {
+            "revision_of_agent_run_id": previous_agent_run_id,
+            "revision_followup_id": followup_id,
+            "revision_instruction": instruction,
+            **dict(extra_metadata or {}),
+        }
+        feedback = self.runtime_control_plane.append_agent_run_feedback(
+            previous_agent_run_id,
+            source=feedback_source,
+            kind=feedback_kind,
+            payload={
+                "revision_followup_id": followup_id,
+                "revision_instruction": instruction,
+                "draft": _public_internal_capability_source(draft),
+                "source_bundle": seed_source_bundle,
+                **dict(extra_metadata or {}),
+            },
+            visibility=AgentRunFeedbackVisibility.INTERNAL,
+            requires_activation=True,
+            metadata=self._agent_run_metadata(session, metadata),
+        )
+        agent_run = self.runtime_control_plane.continue_agent_run(
+            previous_agent_run_id,
+            input_kind=input_kind,
+            input_payload={
+                "feedback_id": feedback.id,
+                "feedback_kind": feedback.kind.value,
+                "revision_followup_id": followup_id,
+                "revision_instruction": instruction,
+                **dict(extra_metadata or {}),
+            },
+            resume_session=True,
+            feedback_id=feedback.id,
+            prompt=_capability_revision_activation_prompt(
+                instruction,
+                locale=_session_locale(session),
+                feedback_kind=feedback.kind.value,
             ),
         )
-        runner.persist_seed_source_bundle(agent_run.id, seed_source_bundle)
         return CapabilityPackageIngestResult(
             agent_run=agent_run,
             source=evidence_bundle.source,
@@ -2191,8 +2377,17 @@ class CapabilityPackageSessionRunService:
         package_id = str(candidate.get("package_id") or "capability-package").strip()
         candidate_id = str(candidate.get("candidate_id") or "").strip()
         candidate_hash = str(candidate.get("candidate_hash") or "").strip()
-        approval_id = f"capability-package-install:{session.session_run_id}:{agent_run_id}:{package_id}"
-        tool_call_id = f"capability-package-install:{agent_run_id or session.session_run_id}"
+        try:
+            task = self.runtime_control_plane.agent_run_to_dict(agent_run_id)
+        except KeyError:
+            task = {}
+        activation_id = str(task.get("current_activation_id") or "").strip()
+        approval_scope = activation_id or agent_run_id or session.session_run_id
+        approval_id = (
+            f"capability-package-install:{session.session_run_id}:"
+            f"{agent_run_id}:{approval_scope}:{package_id}"
+        )
+        tool_call_id = f"capability-package-install:{approval_scope}"
         locale = _session_locale(session)
         approval_payload = _capability_install_candidate_decision_payload(
             approval_id,
@@ -2222,6 +2417,29 @@ class CapabilityPackageSessionRunService:
             return None
         revision_ticket = self._pop_revision_ticket(session, follow_up_queue, follow_up_lock)
         if revision_ticket is not None:
+            self.runtime_control_plane.append_agent_run_feedback(
+                agent_run_id,
+                source=AgentRunFeedbackSource.USER,
+                kind=AgentRunFeedbackKind.APPROVAL_RESOLVED,
+                payload={
+                    "approval_id": approval_id,
+                    "tool_call_id": tool_call_id,
+                    "package_id": package_id,
+                    "candidate_id": candidate_id,
+                    "candidate_hash": candidate_hash,
+                    "decision": "deny_once",
+                    "reason": _capability_text(locale, "revision_approval_reason"),
+                },
+                visibility=AgentRunFeedbackVisibility.INTERNAL,
+                requires_activation=False,
+                metadata=self._agent_run_metadata(
+                    session,
+                    {
+                        "phase": "capability_package_revision_requested",
+                        "package_id": package_id,
+                    },
+                ),
+            )
             session.append_event(
                 "approval_resolved",
                 {
@@ -2271,6 +2489,29 @@ class CapabilityPackageSessionRunService:
                 ),
             )
             return dict(revision_ticket)
+        self.runtime_control_plane.append_agent_run_feedback(
+            agent_run_id,
+            source=AgentRunFeedbackSource.USER,
+            kind=AgentRunFeedbackKind.APPROVAL_RESOLVED,
+            payload={
+                "approval_id": approval_id,
+                "tool_call_id": tool_call_id,
+                "package_id": package_id,
+                "candidate_id": candidate_id,
+                "candidate_hash": candidate_hash,
+                "decision": decision,
+                **({"reason": reason} if reason else {}),
+            },
+            visibility=AgentRunFeedbackVisibility.INTERNAL,
+            requires_activation=False,
+            metadata=self._agent_run_metadata(
+                session,
+                {
+                    "phase": "capability_package_install_approval_resolved",
+                    "package_id": package_id,
+                },
+            ),
+        )
         session.append_event(
             "approval_resolved",
             {
@@ -2436,7 +2677,7 @@ def _normalize_source(payload: dict[str, Any]) -> dict[str, Any]:
 def _capability_session_runtime_state(
     runtime_control_plane: AgentRunControlPlane,
     *,
-    agent_run: AgentRunRecord | None = None,
+    agent_run: AgentRun | None = None,
 ) -> dict[str, Any]:
     model_binding: dict[str, Any] = {}
     if agent_run is not None:
@@ -2600,7 +2841,7 @@ def _agent_run_terminal_message(
     task_candidates = [
         task.get("failure_reason"),
         task.get("cancel_reason"),
-        task.get("output"),
+        _agent_run_final_output(task),
     ]
     message = first_meaningful(task_candidates)
     if message and message.lower() not in generic_values:
@@ -2843,6 +3084,138 @@ def _truncate_single_line(value: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[:max_chars - 1]}…"
+
+
+def _capability_candidate_repair_request(
+    agent_run: dict[str, Any],
+    draft: dict[str, Any],
+    source_bundle: dict[str, Any],
+    payload: dict[str, Any],
+    locale: str,
+    *,
+    activations: list[dict[str, Any]] | None = None,
+) -> _CapabilityCandidateRepairRequest | None:
+    details = _capability_candidate_build_failure_details(payload)
+    if details.get("error") != "capability_install_candidate_not_ready":
+        return None
+    if str(details.get("reason") or "") not in _CAPABILITY_CANDIDATE_REPAIRABLE_REASONS:
+        return None
+    repair_attempt = _capability_candidate_repair_attempt(
+        activations=activations,
+    )
+    if repair_attempt >= _CAPABILITY_CANDIDATE_REPAIR_LIMIT:
+        return None
+    next_attempt = repair_attempt + 1
+    return _CapabilityCandidateRepairRequest(
+        source_bundle=dict(source_bundle),
+        draft=deepcopy(draft),
+        instruction=_capability_candidate_repair_instruction(
+            details,
+            locale,
+        ),
+        metadata={
+            "revision_followup_id": f"candidate-build-repair-{next_attempt}",
+            "candidate_build_failure": details,
+            "repair_attempt": next_attempt,
+        },
+    )
+
+
+def _capability_candidate_build_failure_details(payload: dict[str, Any]) -> dict[str, Any]:
+    messages = [
+        str(item).strip()
+        for item in payload.get("messages", [])
+        if str(item).strip()
+    ] if isinstance(payload.get("messages"), list) else []
+    return _drop_empty_dict(
+        {
+            "error": str(payload.get("error") or "").strip(),
+            "status": str(payload.get("status") or "").strip(),
+            "reason": str(payload.get("reason") or "").strip(),
+            "messages": messages,
+        }
+    )
+
+
+def _capability_candidate_repair_attempt(
+    *,
+    activations: list[dict[str, Any]] | None = None,
+) -> int:
+    raw_attempt: Any = None
+    for activation in reversed(activations or []):
+        if not isinstance(activation, dict):
+            continue
+        activation_payload = activation.get("input_payload")
+        if isinstance(activation_payload, dict):
+            raw_attempt = activation_payload.get("repair_attempt")
+        if raw_attempt is not None:
+            break
+    try:
+        return max(0, int(raw_attempt or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _capability_candidate_repair_instruction(
+    failure: dict[str, Any],
+    locale: str,
+) -> str:
+    failure_json = _stable_json(failure)
+    if len(failure_json) > 4_000:
+        failure_json = f"{failure_json[:3999]}…"
+    if normalize_session_locale(locale) == "zh-CN":
+        return (
+            "候选生成未通过服务端校验。请只基于上一版草案输出 "
+            "capability_draft_patch 或 capability_draft_patches 来修正字段；"
+            "不要重新探索仓库，不要运行安装命令，不要输出完整草案，不要输出文件正文。"
+            "必须继续使用外部能力包协议：MCP 工具写入 contributions.mcp_tools，"
+            "身份为 mcp:<server>:<tool>；可选增强写入 optional_features；"
+            "environment_requirements 只记录 Labrastro 运行前置条件。"
+            f"服务端校验失败详情：{failure_json}"
+        )
+    return (
+        "Capability candidate generation failed backend validation. Only emit "
+        "capability_draft_patch or capability_draft_patches to repair fields in the previous draft; "
+        "do not re-explore the repository, do not run install commands, do not emit a complete draft, "
+        "and do not emit file bodies. Keep using the external capability package protocol: MCP tools "
+        "go in contributions.mcp_tools with identity mcp:<server>:<tool>; optional enhancements go in "
+        "optional_features; environment_requirements only records Labrastro runtime prerequisites. "
+        f"Backend validation failure details: {failure_json}"
+    )
+
+
+def _capability_revision_activation_prompt(
+    instruction: str,
+    *,
+    locale: str,
+    feedback_kind: str,
+) -> str:
+    text = str(instruction or "").strip()
+    if normalize_session_locale(locale) == "zh-CN":
+        if feedback_kind == AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED.value:
+            return text
+        return (
+            "用户已经审阅上一版能力草案。请在当前会话上下文中继续，"
+            "只输出需要变更的 capability_draft_patch 或 capability_draft_patches 字段补丁；"
+            "不要重新探索仓库，不要输出完整草案，不要输出未变化字段，不要运行安装命令。"
+            f"用户意见：{text or '（没有额外文字）'}"
+        )
+    if feedback_kind == AgentRunFeedbackKind.CANDIDATE_VALIDATION_FAILED.value:
+        return text
+    return (
+        "The user reviewed the previous capability draft. Continue in the current session context. "
+        "Only emit the needed capability_draft_patch or capability_draft_patches field patches; "
+        "do not re-explore the repository, emit a complete draft, restate unchanged fields, or run install commands. "
+        f"User instruction: {text or '(no extra text)'}"
+    )
+
+
+def _drop_empty_dict(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: item
+        for key, item in value.items()
+        if item not in ("", [], {}, None)
+    }
 
 
 def _capability_install_candidate_artifact_event_payload(
@@ -3146,43 +3519,11 @@ def _render_packager_prompt(
     *,
     bundle: dict[str, Any],
     locale: str = "",
-    revision_draft: dict[str, Any] | None = None,
-    revision_instruction: str = "",
 ) -> str:
     bundle_json = json.dumps(bundle, ensure_ascii=False, indent=2)
     language_instruction = session_locale_prompt_append(locale)
     language_block = f"{language_instruction}\n" if language_instruction else ""
     use_zh = bool(locale) and normalize_session_locale(locale) == "zh-CN"
-    revision_text = str(revision_instruction or "").strip()
-    revision_block = ""
-    if revision_text or isinstance(revision_draft, dict):
-        current_draft_json = json.dumps(
-            _public_internal_capability_source(revision_draft or {}),
-            ensure_ascii=False,
-            indent=2,
-        )
-        if use_zh:
-            revision_block = (
-                "\n修改请求：\n"
-                "用户已经审阅上一版草案。请只输出需要变更的 capability_draft_patch / "
-                "capability_draft_patches 字段补丁。保留仍然有效的字段，并在证据包支持时"
-                "应用用户的修改意见；不要把未变化字段重新输出成完整最终草案。\n"
-                f"用户意见：\n{revision_text or '（没有额外文字）'}\n"
-                "上一版草案：\n"
-                f"```json\n{current_draft_json}\n```\n"
-            )
-        else:
-            revision_block = (
-                "\nRevision request:\n"
-                "The user has reviewed the previous draft. Produce only the needed "
-                "capability_draft_patch / capability_draft_patches field patches. Keep every "
-                "field that remains valid, and apply the user's requested changes when they "
-                "are supported by the evidence bundle. Do not restate unchanged fields as a "
-                "complete final draft.\n"
-                f"User instruction:\n{revision_text or '(no extra text)'}\n"
-                "Previous draft:\n"
-                f"```json\n{current_draft_json}\n```\n"
-            )
     if use_zh:
         return (
             "你是 capability_packager。请主动探索给定仓库/文档，生成一个可安装的能力包结构决策。\n"
@@ -3195,7 +3536,8 @@ def _render_packager_prompt(
             "content_ref 只能使用真实观察到的工具调用引用，不能自造。\n"
             "读取 Skill 文件时必须获取完整文件内容，例如 read_file override=true；分页或截断读取不能用于安装物化。\n"
             "只能提取来源支持的说明；environment_requirements 只记录安装后的能力实际运行/检查需要的依赖，"
-            "且 check/install/command 必须有来源中的精确命令证据。不要把外部安装方式（例如 npx skills add）转换成 Labrastro 运行依赖。\n"
+            "且 check/install/command 必须有来源中的精确命令证据。不要把外部安装方式（例如 npx skills add）转换成 Labrastro 运行依赖。"
+            "生态库、语言包和可选增强不要写成 environment_requirements；可选增强统一写入 optional_features。\n"
             "最终输出主协议是字段补丁，不是完整最终草案 JSON。每看明白一个字段就可以输出一个紧凑 JSON 对象；"
             "不要使用 markdown fence，不要输出完整文件正文。字段补丁结构如下：\n"
             "{\n"
@@ -3221,9 +3563,9 @@ def _render_packager_prompt(
             "Do not produce a complete final draft JSON; field patches are the only accepted draft protocol.\n"
             "服务端会按 field_path 组装最终草案。需要填的字段包括：id、name、description、source、runtime_footprint、"
             "source_inventory、materialization_plan、contributions.skills、contributions.mcp_servers、"
-            "contributions.builtin_tools、contributions.prompt_fragments、contributions.credential_refs、"
-            "contributions.environment_requirements、effective_capabilities、install_plan、usage、evidence、"
-            "credentials、risk_level、execution_policy、notes。\n"
+            "contributions.mcp_tools、contributions.prompt_fragments、contributions.credential_refs、"
+            "contributions.environment_requirements、effective_capabilities、optional_features、install_plan、usage、evidence、"
+            "credentials、risk_level、execution_policy、notes。只输出这些字段。\n"
             "字段 value 的兼容结构如下：\n"
             "{\n"
             '  "id": "package-id", "name": "Package Name", "description": "...",\n'
@@ -3249,7 +3591,12 @@ def _render_packager_prompt(
             '"handler_ref": "...", "matcher": {"tool_names": ["read_file"]}, '
             '"permissions": [], "display_name": "...", "summary": "...", '
             '"risk_level": "low|medium|high"}]}\n'
-            '    ], "mcp_servers": [], "builtin_tools": [],\n'
+            '    ], "mcp_servers": [],\n'
+            '    "mcp_tools": [\n'
+            '      {"id": "mcp:github:search", "kind": "mcp_tool", '
+            '"name": "search", "registry_path": "mcp:github:search", '
+            '"summary": "Search through the github MCP server"}\n'
+            "    ],\n"
             '    "prompt_fragments": [], "credential_refs": [],\n'
             '    "environment_requirements": [\n'
             '      {"id": "envreq:executable:gh", "kind": "executable", '
@@ -3258,6 +3605,13 @@ def _render_packager_prompt(
             "    ]\n"
             "  },\n"
             '  "effective_capabilities": ["Plain language capability added to an Agent"],\n'
+            '  "optional_features": [\n'
+            '    {"id": "optional:readability", "title": "Readability extraction", '
+            '"description": "Optional enhancement supported by source evidence", '
+            '"placement": "server|peer|both", "default_selected": false, '
+            '"selection_scope": "user|admin|workspace", "component_refs": [], '
+            '"requirement_refs": []}\n'
+            "  ],\n"
             '  "install_plan": [], "usage": [], "evidence": [], "credentials": [], '
             '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
             "}\n\n"
@@ -3265,14 +3619,18 @@ def _render_packager_prompt(
             "每个 Skill 组件必须给出可由证据包或 worktree 定位的 source_document_id/source_path，"
             "只有存在真实工具调用引用时才给 content_ref，"
             "完整 skill_content 由后端读取并组装，不要在模型输出中搬运大文件。\n"
-            "运行端必须明确：server runs in Labrastro backend；peer means the user's local VS Code side；"
-            "both 表示两端都需要安装/配置证据。hooks 必须使用标准 matcher 列表字段 "
+            "MCP server 是服务声明，不是工具；MCP 工具必须写入 contributions.mcp_tools，"
+            "id 和 registry_path 必须完全相同，格式固定为 mcp:<server>:<tool>，server 必须来自 contributions.mcp_servers 或已知服务。"
+            "不要输出泛化 tools 字段。\n"
+            "能力定义默认服务端登记。peer 只表示执行资源在用户本地端；本地能力使用“服务端登记、本地端执行”表达。"
+            "Skill 文档默认 agent_only 且服务端登记可读；server 表示后端服务、服务端 MCP、索引、数据库、服务端凭据、长期任务或服务端 AgentRun 可执行；"
+            "peer 表示 VS Code 工作区、本地 shell/browser/profile/MCP/credentials/filesystem/hardware/desktop app 必须参与；"
+            "both 必须拆成可审计的 server/peer 子动作和状态。hooks 必须使用标准 matcher 列表字段 "
             "tool_names/tool_call_ids/tool_sources/mcp_servers；不要输出 trust，trust defaults to pending_review，"
             "由用户在 Settings/ChatView 审查后决定。能力包不能声明 internal handler；"
             "SessionStart/SessionEnd 等未接入外部配置运行线的事件不能输出到草案。\n"
             "证据包：\n"
             f"```json\n{bundle_json}\n```\n"
-            f"{revision_block}"
         )
     return (
         "You are capability_packager. Actively explore the provided repository/docs "
@@ -3293,7 +3651,9 @@ def _render_packager_prompt(
         "Extract only instructions supported by source evidence. environment_requirements are "
         "only for dependencies actually needed to run/check the installed capability, and "
         "check/install/command values must have exact command evidence. Do not turn external "
-        "installation methods such as npx skills add into Labrastro runtime dependencies.\n"
+        "installation methods such as npx skills add into Labrastro runtime dependencies. "
+        "Ecosystem libraries, language-package notes, and optional enhancements do not belong "
+        "in environment_requirements; put optional enhancements in optional_features.\n"
         "The primary final-output protocol is field patches, not a complete final draft JSON. "
         "As soon as you understand one field, emit one compact JSON object for that field. "
         "Do not wrap it in a markdown fence, and do not output complete file bodies.\n"
@@ -3321,10 +3681,10 @@ def _render_packager_prompt(
         "Do not produce a complete final draft JSON; field patches are the only accepted draft protocol.\n"
         "The backend assembles the final draft by field_path. Fill these fields: id, name, "
         "description, source, runtime_footprint, source_inventory, materialization_plan, "
-        "contributions.skills, contributions.mcp_servers, contributions.builtin_tools, "
+        "contributions.skills, contributions.mcp_servers, contributions.mcp_tools, "
         "contributions.prompt_fragments, contributions.credential_refs, "
-        "contributions.environment_requirements, effective_capabilities, install_plan, usage, "
-        "evidence, credentials, risk_level, execution_policy, notes.\n"
+        "contributions.environment_requirements, effective_capabilities, optional_features, install_plan, usage, "
+        "evidence, credentials, risk_level, execution_policy, notes. Only emit these fields.\n"
         "Use these compatible value shapes:\n"
         "{\n"
         '  "id": "package-id", "name": "Package Name", "description": "...",\n'
@@ -3350,7 +3710,12 @@ def _render_packager_prompt(
         '"handler_ref": "...", "matcher": {"tool_names": ["read_file"]}, '
         '"permissions": [], "display_name": "...", "summary": "...", '
         '"risk_level": "low|medium|high"}]}\n'
-        '    ], "mcp_servers": [], "builtin_tools": [],\n'
+        '    ], "mcp_servers": [],\n'
+        '    "mcp_tools": [\n'
+        '      {"id": "mcp:github:search", "kind": "mcp_tool", '
+        '"name": "search", "registry_path": "mcp:github:search", '
+        '"summary": "Search through the github MCP server"}\n'
+        "    ],\n"
         '    "prompt_fragments": [], "credential_refs": [],\n'
         '    "environment_requirements": [\n'
         '      {"id": "envreq:executable:gh", "kind": "executable", '
@@ -3359,6 +3724,13 @@ def _render_packager_prompt(
         "    ]\n"
         "  },\n"
         '  "effective_capabilities": ["Plain language capability added to an Agent"],\n'
+        '  "optional_features": [\n'
+        '    {"id": "optional:readability", "title": "Readability extraction", '
+        '"description": "Optional enhancement supported by source evidence", '
+        '"placement": "server|peer|both", "default_selected": false, '
+        '"selection_scope": "user|admin|workspace", "component_refs": [], '
+        '"requirement_refs": []}\n'
+        "  ],\n"
         '  "install_plan": [], "usage": [], "evidence": [], "credentials": [], '
         '"risk_level": "low|medium|high", "execution_policy": "inherit", "notes": []\n'
         "}\n\n"
@@ -3366,16 +3738,23 @@ def _render_packager_prompt(
         "include source_document_id/source_path for every Skill component so the backend can read "
         "and assemble canonical skill_content. Include content_ref only for observed tool-call "
         "references. Do not copy large Skill files into the model output.\n"
-        "Runtime placement must be explicit: server runs in Labrastro backend; "
-        "peer means the user's local VS Code side; both means both sides require evidence-backed "
-        "installation/configuration. hooks must use the standard matcher list fields "
+        "MCP servers are service declarations, not tools. MCP tools must be written in "
+        "contributions.mcp_tools; id and registry_path must match exactly as "
+        "mcp:<server>:<tool>, and server must come from contributions.mcp_servers or a known server. "
+        "Do not emit a generic tools field.\n"
+        "Capability definitions are server-registered by default. peer only describes local execution "
+        "or local resource placement; express local capabilities as server-registered, local-peer-executed. "
+        "Skill docs default to agent_only and server-readable registration. server means backend service, "
+        "server MCP, index, database, server credential, long-running task, or server AgentRun execution; "
+        "peer means the VS Code workspace, local shell/browser/profile/MCP/credentials/filesystem/hardware/"
+        "desktop app must participate; both must be split into auditable server/peer actions and states. "
+        "hooks must use the standard matcher list fields "
         "tool_names/tool_call_ids/tool_sources/mcp_servers. Do not output trust; "
         "trust defaults to pending_review and is granted later by the user through Settings/ChatView. "
         "Capability packages must not declare internal handlers; do not output SessionStart/SessionEnd "
         "or other events that are not wired for external configuration.\n"
         "Evidence bundle:\n"
         f"```json\n{bundle_json}\n```\n"
-        f"{revision_block}"
     )
 
 
@@ -3701,7 +4080,7 @@ def _capability_draft_field_patches(
     patches: list[CapabilityDraftFieldPatch] = []
     for event in events:
         patches.extend(_capability_draft_field_patches_from_event(event))
-    output = agent_run.get("output") if isinstance(agent_run, dict) else None
+    output = _agent_run_final_output(agent_run)
     if str(output or "").strip():
         # Completed AgentRun output is the terminal answer and must override
         # earlier streamed field patches for the same field_path.
@@ -4990,10 +5369,21 @@ def _component_validation_messages(component: dict[str, Any]) -> list[str]:
         )
     component_id = str(component.get("id") or "").strip()
     if component_id:
+        if validation_kind == "mcp_tool":
+            registry_path = str(component.get("registry_path") or "").strip()
+            if not _is_mcp_tool_registry_path(registry_path):
+                messages.append(
+                    "mcp_tool component must use registry_path mcp:<server>:<tool>"
+                )
+            elif component_id != registry_path:
+                messages.append("mcp_tool component id must match registry_path")
+            return messages
         parsed_kind, sep, parsed_name = component_id.partition(":")
         if parsed_kind == "envreq":
             parsed_kind = "environment_requirement"
             _, _, parsed_name = parsed_name.partition(":")
+        elif parsed_kind == "mcp" and validation_kind == "mcp_server":
+            parsed_kind = "mcp_server"
         if sep and parsed_kind in CAPABILITY_COMPONENT_KINDS:
             if validation_kind in CAPABILITY_COMPONENT_KINDS and parsed_kind != validation_kind:
                 messages.append("component.id kind must match component.kind")
@@ -5048,12 +5438,49 @@ def _missing_draft_failure_code(
     agent_run: dict[str, Any] | None,
     events: list[dict[str, Any]] | None,
 ) -> str:
-    output = agent_run.get("output") if isinstance(agent_run, dict) else None
+    output = _agent_run_final_output(agent_run)
     if _model_output_looks_incomplete_json(output):
         return "model_output_incomplete"
     if _agent_run_events_indicate_draft_generation_interruption(events or []):
         return "draft_generation_interrupted"
     return "draft_not_produced"
+
+
+def _agent_run_final_output(agent_run: dict[str, Any] | None) -> Any:
+    if not isinstance(agent_run, dict):
+        return None
+    output = agent_run.get("output")
+    if str(output or "").strip():
+        return output
+    return agent_run.get("_activation_output")
+
+
+def _agent_run_activation_output(packager_runner: Any, agent_run_id: str) -> str:
+    control = getattr(packager_runner, "runtime_control_plane", None)
+    load_detail = getattr(control, "load_agent_run_detail", None)
+    if callable(load_detail):
+        try:
+            detail = load_detail(agent_run_id, event_limit=1)
+        except Exception:
+            detail = {}
+        activations = detail.get("activations") if isinstance(detail, dict) else []
+        if isinstance(activations, list):
+            for activation in reversed(activations):
+                if not isinstance(activation, dict):
+                    continue
+                output = str(activation.get("output") or "").strip()
+                if output:
+                    return output
+    get_agent_run = getattr(control, "get_agent_run", None)
+    if callable(get_agent_run):
+        try:
+            task = get_agent_run(agent_run_id)
+        except Exception:
+            task = None
+        output = str(getattr(task, "output", "") or "").strip()
+        if output:
+            return output
+    return ""
 
 
 def _agent_run_events_indicate_draft_generation_interruption(

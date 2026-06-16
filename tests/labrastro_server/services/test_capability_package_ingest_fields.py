@@ -205,6 +205,56 @@ def test_assembler_retains_manifest_candidate_and_open_finding_patches() -> None
     ]
 
 
+def test_assembler_retains_optional_features_patch() -> None:
+    optional_features = [
+        {
+            "id": "optional:readability",
+            "title": "Readability extraction",
+            "placement": "server",
+            "default_selected": False,
+            "selection_scope": "user",
+            "requirement_refs": [],
+        }
+    ]
+
+    result = CapabilityDraftAssembler().assemble(
+        source_bundle=_source_bundle(),
+        patches=[
+            CapabilityDraftFieldPatch(field_path="id", value="gsap-skills"),
+            CapabilityDraftFieldPatch(field_path="name", value="GSAP Skills"),
+            CapabilityDraftFieldPatch(
+                field_path="contributions.skills",
+                value=[
+                    {
+                        "id": "skill:gsap-core",
+                        "kind": "skill",
+                        "name": "gsap-core",
+                        "source_document_id": "cap-src-doc-gsap-core",
+                    }
+                ],
+            ),
+            CapabilityDraftFieldPatch(field_path="optional_features", value=optional_features),
+            CapabilityDraftFieldPatch(
+                field_path="install_plan",
+                value=["Install the GSAP skill files."],
+            ),
+            CapabilityDraftFieldPatch(
+                field_path="usage",
+                value=["Use gsap-core when authoring GSAP animations."],
+            ),
+            CapabilityDraftFieldPatch(
+                field_path="evidence",
+                value=[{"title": "GSAP core", "excerpt": "Use GSAP core."}],
+            ),
+            CapabilityDraftFieldPatch(field_path="risk_level", value="low"),
+        ],
+    )
+
+    assert result.failure_code == ""
+    assert result.draft is not None
+    assert result.draft["optional_features"] == optional_features
+
+
 def test_assembler_builds_compatible_draft_from_field_patches() -> None:
     result = CapabilityDraftAssembler().assemble(
         source_bundle=_source_bundle(),

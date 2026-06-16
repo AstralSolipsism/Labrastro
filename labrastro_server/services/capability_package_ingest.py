@@ -316,6 +316,7 @@ def _is_draft_field_path(field_path: str) -> bool:
         "effective_capabilities",
         "evidence",
         "credentials",
+        "optional_features",
         "risk_level",
         "execution_policy",
         "notes",

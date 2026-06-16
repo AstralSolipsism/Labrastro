@@ -136,7 +136,6 @@ class RemoteAdminRoutes:
                 try:
                     agent_run = self.service.runtime_control_plane.submit_agent_run(
                         AgentRunRequest(
-                            issue_id=str(payload.get("issue_id") or "manual"),
                             agent_id=str(payload.get("agent_id") or "default"),
                             prompt=str(payload.get("prompt") or ""),
                             source=optional_payload_str(payload, "source") or "manual",
@@ -297,14 +296,16 @@ class RemoteAdminRoutes:
                 if not task_id:
                     self._send_error(HTTPStatus.BAD_REQUEST, "agent_run_id_required")
                     return
+                if "new_agent_run_id" in payload:
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "agent_run_retry_continues_same_run",
+                        "AgentRun retry creates a new Activation on the same AgentRun",
+                    )
+                    return
                 try:
                     retry = self.service.runtime_control_plane.retry_agent_run(
                         task_id,
-                        new_agent_run_id=(
-                            str(payload["new_agent_run_id"])
-                            if payload.get("new_agent_run_id") is not None
-                            else None
-                        ),
                         resume_session=payload.get("resume_session") is True,
                     )
                 except KeyError:
@@ -342,7 +343,6 @@ class RemoteAdminRoutes:
                         "agent_runs": self.service.runtime_control_plane.list_agent_runs(
                             status=optional_payload_str(payload, "status"),
                             agent_id=optional_payload_str(payload, "agent_id"),
-                            issue_id=optional_payload_str(payload, "issue_id"),
                             limit=int(payload.get("limit") or 50),
                             after_created_at=optional_payload_str(
                                 payload, "after_created_at"

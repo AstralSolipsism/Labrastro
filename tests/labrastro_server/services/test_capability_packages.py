@@ -38,10 +38,13 @@ from labrastro_server.services.capability_packages import (
     build_capability_install_candidate_from_draft,
 )
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentRunActivationInputKind,
+    AgentRunFeedbackKind,
+    AgentRunFeedbackSource,
     CapabilityComponentConfig,
     CapabilityPackageConfig,
 )
-from reuleauxcoder.domain.agent_runtime.models import AgentRunRecord
+from reuleauxcoder.domain.agent_runtime.models import AgentRun
 from reuleauxcoder.domain.session.document import apply_session_event
 
 
@@ -65,6 +68,22 @@ def _control_plane() -> AgentRunControlPlane:
     )
 
 
+def _current_activation_prompt(
+    control: AgentRunControlPlane,
+    agent_run: AgentRun,
+) -> str:
+    detail = control.load_agent_run_detail(agent_run.id)
+    current_activation_id = str(
+        getattr(agent_run, "current_activation_id", None)
+        or detail["agent_run"].get("current_activation_id")
+        or ""
+    )
+    for activation in reversed(detail.get("activations") or []):
+        if str(activation.get("id") or activation.get("activation_id") or "") == current_activation_id:
+            return str(activation.get("prompt") or "")
+    return ""
+
+
 def _wait_for(predicate, *, timeout_sec: float = 3.0):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -73,6 +92,10 @@ def _wait_for(predicate, *, timeout_sec: float = 3.0):
             return value
         time.sleep(0.02)
     raise AssertionError("timed out waiting for condition")
+
+
+def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
+    return str(control.get_agent_run(task_id).current_activation_id or "")
 
 
 def test_capability_package_state_keeps_activation_active_when_mcp_runtime_failed() -> None:
@@ -246,6 +269,74 @@ def test_install_candidate_preserves_mcp_tool_registry_path_from_config() -> Non
     )
     assert mcp_tool["id"] == "mcp:github:search"
     assert mcp_tool["registry_path"] == "mcp:github:search"
+
+
+def test_install_candidate_preserves_optional_features_without_envreq_kind(
+    tmp_path: Path,
+) -> None:
+    source = _candidate_source_fixture(
+        {
+            "id": "waza",
+            "name": "Waza",
+            "description": "Agent-only skill package with optional extraction helpers.",
+            "components": [
+                {
+                    "kind": "skill",
+                    "name": "waza",
+                    "source_path": "skills/waza/SKILL.md",
+                    "config": {
+                        "skill_content": (
+                            "---\n"
+                            "name: waza\n"
+                            "description: Analyze repositories.\n"
+                            "---\n"
+                            "Use optional readability helpers when available.\n"
+                        )
+                    },
+                }
+            ],
+            "optional_features": [
+                {
+                    "id": "optional:readability",
+                    "title": "Readability extraction",
+                    "placement": "server",
+                    "default_selected": False,
+                    "selection_scope": "user",
+                    "requirement_refs": [],
+                }
+            ],
+        }
+    )
+
+    result = build_capability_install_candidate_from_draft(
+        {},
+        source,
+        {"source": source["source"]},
+    )
+
+    assert result.status == "ready", result.messages
+    assert result.candidate is not None
+    assert result.candidate.optional_features == [
+        {
+            "id": "optional:readability",
+            "title": "Readability extraction",
+            "placement": "server",
+            "default_selected": False,
+            "selection_scope": "user",
+            "requirement_refs": [],
+        }
+    ]
+    assert result.candidate.review["optional_features"] == result.candidate.optional_features
+    assert all(
+        item.get("kind") != "optional"
+        for item in result.candidate.components
+    )
+    data: dict[str, object] = {}
+    install_result = CapabilityPackageInstaller(
+        skill_install_root=tmp_path,
+    ).install_candidate(data, result.candidate)
+
+    assert "optional_features" not in install_result.package.to_dict()
 
 
 def test_candidate_from_dict_preserves_missing_operation_and_status() -> None:
@@ -867,7 +958,7 @@ def test_delegated_agent_run_completion_projects_as_process_context() -> None:
         {
             "agent_run_id": "parent-run",
             "seq": 2,
-            "type": "delegated_run_completed",
+            "type": "agent_relation_completed",
             "payload": {
                 "agent_run_id": "child-run",
                 "agent_id": "reviewer",
@@ -880,7 +971,7 @@ def test_delegated_agent_run_completion_projects_as_process_context() -> None:
 
     assert [event_type for event_type, _ in session_events] == ["context_event"]
     payload = session_events[0][1]
-    assert payload["phase"] == "delegated_run_completed"
+    assert payload["phase"] == "agent_relation_completed"
     assert payload["title"] == "reviewer completed"
     assert payload["agent_run_id"] == "parent-run"
     assert payload["child_agent_run_id"] == "child-run"
@@ -1799,18 +1890,44 @@ def test_project_notes_input_creates_read_only_ingest_run() -> None:
     ].startswith("cap-src-doc-")
     assert "capability_packages" not in control.runtime_snapshot
     assert "capability_components" not in control.runtime_snapshot
-    assert '"skill_content"' not in result.agent_run.prompt
-    assert "source_path" in result.agent_run.prompt
-    assert "source_document_id" in result.agent_run.prompt
-    assert "content_ref only for observed tool-call" in result.agent_run.prompt
-    assert "Do not copy large Skill files into the model output." in result.agent_run.prompt
+    assert not hasattr(result.agent_run, "prompt")
+    activation_prompt = _current_activation_prompt(control, result.agent_run)
+    assert '"skill_content"' not in activation_prompt
+    assert "source_path" in activation_prompt
+    assert "source_document_id" in activation_prompt
+    assert "content_ref only for observed tool-call" in activation_prompt
+    assert "Do not copy large Skill files into the model output." in activation_prompt
 
 
-def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -> None:
+def test_capability_ingest_start_rejects_revision_payload_without_existing_agent_run() -> None:
+    control = _control_plane()
+    service = CapabilityPackageIngestService(control)
+
+    with pytest.raises(
+        CapabilityPackageIngestError,
+        match="Capability package revision input must resume the existing AgentRun",
+    ) as exc_info:
+        service.start(
+            {
+                "source": {"type": "project_notes", "notes": "Fix package draft."},
+                "revision_instruction": "Add missing MCP server.",
+            }
+        )
+
+    assert exc_info.value.error == (
+        "capability_ingest_revision_requires_existing_agent_run"
+    )
+    assert "revision_instruction" in exc_info.value.message
+    assert control.list_agent_runs(agent_id="capability_packager") == []
+
+
+def test_packager_prompt_uses_external_contract_without_internal_tool_fields() -> None:
     prompt = capability_packages_module._render_packager_prompt(
         bundle={"source": {"type": "project_notes"}, "items": []},
         locale="en-US",
     )
+    forbidden_builtin_section = "contributions." + "builtin_tools"
+    forbidden_builtin_empty = '"builtin_' + 'tools": []'
 
     assert '"capability_draft_patch"' in prompt
     assert '"capability_draft_patches"' in prompt
@@ -1822,6 +1939,12 @@ def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -
     assert '"field_path": "risk_level"' in prompt
     assert "Do not produce a complete final draft JSON; field patches are the only accepted draft protocol." in prompt
     assert "complete draft JSON is accepted only as a legacy fallback" not in prompt
+    assert "contributions.mcp_tools" in prompt
+    assert '"mcp_tools": [' in prompt
+    assert '"registry_path": "mcp:github:search"' in prompt
+    assert forbidden_builtin_section not in prompt
+    assert forbidden_builtin_empty not in prompt
+    assert "optional_features" in prompt
     assert '"hooks"' in prompt
     assert '"runtime_footprint"' in prompt
     assert '"placement": "server|peer|both"' in prompt
@@ -1831,37 +1954,94 @@ def test_packager_prompt_requires_lifecycle_hooks_runtime_and_trust_contract() -
     assert '"matcher": {"tool_names": ["read_file"]}' in prompt
     assert '"permissions": []' in prompt
     assert "trust defaults to pending_review" in prompt
-    assert "server runs in Labrastro backend" in prompt
-    assert "peer means the user's local VS Code side" in prompt
+    assert "Capability definitions are server-registered by default" in prompt
+    assert "local-peer-executed" in prompt
+    assert "both must be split into auditable server/peer actions and states" in prompt
+    assert "Do not emit a generic tools field" in prompt
 
 
-def test_revision_prompt_uses_public_draft_without_skill_content() -> None:
-    control = _control_plane()
-    runner = CapabilityPackagerRunner(control)
-    task = runner.start(
-        evidence_bundle=EvidenceBundle(
-            source={"type": "project_notes"},
-            documents=[{"title": "Project notes", "content": "Review code changes."}],
-            evidence=[{"title": "Project notes", "excerpt": "Review code changes."}],
-        ),
-        revision_instruction="rename the package",
-        revision_draft={
-            "id": "review",
-            "name": "Review",
-            "contributions": {
-                "skills": [
-                    {
-                        "id": "skill:code-review",
-                        "kind": "skill",
-                        "name": "code-review",
-                        "skill_content": "---\nname: code-review\n---\nlarge body",
-                    }
-                ]
-            },
-        },
+def test_zh_packager_prompt_uses_external_contract_without_internal_tool_fields() -> None:
+    prompt = capability_packages_module._render_packager_prompt(
+        bundle={"source": {"type": "project_notes"}, "items": []},
+        locale="zh-CN",
     )
-    assert '"skill_content":' not in task.prompt
-    assert "skill_content_chars" in task.prompt
+    forbidden_builtin_section = "contributions." + "builtin_tools"
+    forbidden_builtin_empty = '"builtin_' + 'tools": []'
+
+    assert "contributions.mcp_tools" in prompt
+    assert '"mcp_tools": [' in prompt
+    assert '"registry_path": "mcp:github:search"' in prompt
+    assert forbidden_builtin_section not in prompt
+    assert forbidden_builtin_empty not in prompt
+    assert "optional_features" in prompt
+    assert "服务端登记、本地端执行" in prompt
+    assert "不要输出泛化 tools 字段" in prompt
+
+
+def test_revision_feedback_uses_public_draft_without_new_agent_run() -> None:
+    control = _control_plane()
+    ingest = CapabilityPackageIngestService(control)
+    result = ingest.start({"source": {"type": "project_notes", "notes": "Review code changes."}})
+    session = _RemoteSessionRun(
+        session_run_id="session-run-revision-feedback",
+        peer_id="peer-1",
+        session_hint="session-1",
+        locale="zh-CN",
+        artifact_root=Path.cwd(),
+    )
+    service = CapabilityPackageSessionRunService(control, object(), poll_timeout_sec=0.05)
+    draft = {
+        "id": "review",
+        "name": "Review",
+        "contributions": {
+            "skills": [
+                {
+                    "id": "skill:code-review",
+                    "kind": "skill",
+                    "name": "code-review",
+                    "skill_content": "---\nname: code-review\n---\nlarge body",
+                }
+            ]
+        },
+    }
+    control.complete_agent_run_activation(
+        result.agent_run.id,
+        ExecutorRunResult(
+            task_id=result.agent_run.id,
+            status="completed",
+            output="{}",
+        ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
+    )
+
+    continued = service._continue_revision_ingest(
+        session,
+        {},
+        result.source_bundle,
+        draft,
+        "rename the package",
+        result.agent_run.id,
+        "revision-1",
+        feedback_source=AgentRunFeedbackSource.USER,
+        feedback_kind=AgentRunFeedbackKind.USER_MESSAGE,
+        input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
+    )
+
+    assert continued.agent_run.id == result.agent_run.id
+    assert [run["id"] for run in control.list_agent_runs(agent_id="capability_packager")] == [
+        result.agent_run.id
+    ]
+    detail = control.load_agent_run_detail(result.agent_run.id)
+    feedback_draft = detail["feedback"][0]["payload"]["draft"]
+    feedback_json = json.dumps(feedback_draft, ensure_ascii=False)
+    assert '"skill_content":' not in feedback_json
+    assert "large body" not in feedback_json
+    assert "skill_content_chars" in feedback_json
+    assert detail["activations"][1]["input_kind"] == "user_feedback"
+    assert detail["activations"][1]["input_payload"]["feedback_id"] == detail["feedback"][0]["id"]
+    activation_prompt = _current_activation_prompt(control, continued.agent_run)
+    assert '"skill_content":' not in activation_prompt
+    assert "你是 capability_packager" not in activation_prompt
 
 
 def test_github_repo_ingest_sets_repo_url_for_sandbox_worktree() -> None:
@@ -1999,21 +2179,16 @@ def test_ingest_service_only_orchestrates_collector_and_runner() -> None:
             evidence_bundle: EvidenceBundle,
             workspace_root: str = "",
             agent_run_metadata: dict[str, object] | None = None,
-            revision_draft: dict[str, object] | None = None,
-            revision_instruction: str = "",
-        ) -> AgentRunRecord:
+        ) -> AgentRun:
             self.calls.append(
                 {
                     "evidence_bundle": evidence_bundle,
                     "workspace_root": workspace_root,
                     "agent_run_metadata": agent_run_metadata or {},
-                    "revision_draft": revision_draft,
-                    "revision_instruction": revision_instruction,
                 }
             )
-            return AgentRunRecord(
+            return AgentRun(
                 id="run-1",
-                issue_id="capability-package-ingest",
                 agent_id="custom-packager",
                 source="capability_ingest",
                 metadata={"source_bundle": evidence_bundle.to_dict()},
@@ -2662,13 +2837,14 @@ def test_ingest_status_extracts_completed_draft_json() -> None:
         "risk_level": "low",
     }
 
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=f"```json\n{json.dumps(draft)}\n```",
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -2727,13 +2903,14 @@ def test_ingest_status_final_output_patch_overrides_earlier_event_patch() -> Non
         ),
         ("risk_level", "low"),
     ]
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=_capability_patch_stream(output_patches),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -2790,13 +2967,14 @@ def test_ingest_status_builds_skill_content_from_source_bundle() -> None:
         "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -2859,13 +3037,14 @@ def test_ingest_status_resolves_skill_content_by_source_document_id() -> None:
         "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -2922,13 +3101,14 @@ def test_ingest_status_restores_source_bundle_from_seed_artifact_when_metadata_m
         "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -2989,13 +3169,14 @@ def test_ingest_status_invalid_source_document_id_does_not_fallback_to_source_pa
         "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3050,13 +3231,14 @@ def test_ingest_status_builds_skill_content_from_workspace_root(tmp_path: Path) 
         "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3116,7 +3298,8 @@ def test_ingest_start_elides_workspace_skill_content_from_prompt_and_metadata(
         if item["id"] == seed_artifact_id
     )
     assert marker in seed_artifact["content"]
-    assert marker not in result.agent_run.prompt
+    assert not hasattr(result.agent_run, "prompt")
+    assert marker not in _current_activation_prompt(control, result.agent_run)
 
     metadata_docs = {
         item["source_path"]: item
@@ -3176,13 +3359,14 @@ def test_ingest_status_does_not_read_skill_content_from_agent_run_workdir(tmp_pa
         "evidence": [{"title": "Skill", "excerpt": "Detect vague AI writing."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3233,13 +3417,14 @@ def test_ingest_status_does_not_read_skill_content_from_sandbox_container_workdi
         "evidence": [{"title": "Skill", "excerpt": "Detect vague AI writing."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3293,13 +3478,14 @@ def test_ingest_status_requires_source_document_instead_of_scanning_ambiguous_wo
         "evidence": [{"title": "Skill", "excerpt": "Generated skill."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3362,13 +3548,14 @@ def test_ingest_status_builds_skill_content_from_agent_run_read_file_event() -> 
         "evidence": [{"title": "Skill", "excerpt": "Review code changes."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3449,13 +3636,14 @@ def test_ingest_status_builds_source_inventory_from_session_tool_call_events() -
         ),
         ("risk_level", "low"),
     ]
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=_capability_patch_stream(patches, source_path=source_path),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3545,13 +3733,14 @@ def test_ingest_status_prefers_full_read_after_paged_read_file_same_source_path(
         "evidence": [{"title": "Partial skill", "excerpt": source_path}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3633,13 +3822,14 @@ def test_ingest_status_treats_list_file_as_inventory_not_skill_content() -> None
         "evidence": [{"title": "GSAP", "excerpt": source_path}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3757,13 +3947,14 @@ def test_ingest_status_materializes_gsap_style_skill_repo_from_agent_run_reads()
         "evidence": [{"title": "GSAP skills", "excerpt": "skills/gsap-core/SKILL.md"}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3829,7 +4020,7 @@ def test_ingest_status_reports_incomplete_model_output_after_source_discovery() 
         '"contributions": {"skills": [{"id": "skill:gsap-core", "kind": "skill", '
         '"name": "gsap-core", "runs_on": "server'
     )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
@@ -3845,6 +4036,7 @@ def test_ingest_status_reports_incomplete_model_output_after_source_discovery() 
                 )
             ],
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3875,7 +4067,7 @@ def test_ingest_status_diagnoses_interrupted_output_beyond_display_event_window(
             result.agent_run.id,
             ExecutorEvent.status("thinking", index=index),
         )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
@@ -3891,6 +4083,7 @@ def test_ingest_status_diagnoses_interrupted_output_beyond_display_event_window(
                 )
             ],
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -3931,7 +4124,7 @@ def test_ingest_status_records_field_patch_without_draft_ready() -> None:
             },
         ),
     )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
@@ -3953,6 +4146,7 @@ def test_ingest_status_records_field_patch_without_draft_ready() -> None:
                 )
             ],
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4018,7 +4212,7 @@ def test_ingest_status_assembles_completed_draft_from_field_patches() -> None:
             )
         )
 
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
@@ -4065,6 +4259,7 @@ def test_ingest_status_assembles_completed_draft_from_field_patches() -> None:
                 patch_event("risk_level", "low"),
             ],
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4141,13 +4336,14 @@ def test_ingest_status_assembles_completed_draft_from_agent_run_output_patch_str
         ),
         ("risk_level", "low"),
     ]
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=_capability_patch_stream(patches, source_path=source_path),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4227,13 +4423,14 @@ def test_ingest_status_loads_patch_stream_event_beyond_event_window() -> None:
         result.agent_run.id,
         ExecutorEvent.text_event(_capability_patch_stream(patches, source_path=source_path)),
     )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output="",
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4363,13 +4560,14 @@ def test_ingest_status_materializes_source_documents_beyond_event_window_with_ru
         "evidence": [{"title": "GSAP skills", "excerpt": core_source_path}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4511,13 +4709,14 @@ def test_ingest_status_strips_read_file_line_numbers_from_skill_content() -> Non
         "evidence": [{"title": "Numbered skill", "excerpt": source_path}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4583,13 +4782,14 @@ def test_ingest_status_does_not_resolve_fake_content_ref_by_component_name() -> 
         "evidence": [{"title": "GSAP skill", "excerpt": "skills/gsap-core/SKILL.md"}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4668,13 +4868,14 @@ def test_ingest_status_rejects_paged_read_file_skill_content_without_complete_so
         "evidence": [{"title": "Partial skill", "excerpt": source_path}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4732,13 +4933,14 @@ def test_ingest_status_requires_source_document_even_with_exact_workdir_path(
         "evidence": [{"title": "Skill", "excerpt": "two skill"}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4782,13 +4984,14 @@ def test_ingest_status_classifies_draft_invalid_as_validation_failed() -> None:
         "evidence": [{"title": "Invalid skill", "excerpt": "Invalid skill."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4861,13 +5064,14 @@ def test_ingest_status_reports_unsupported_external_install_envreq() -> None:
         "evidence": [{"title": "GSAP", "excerpt": "Use GSAP core."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         result.agent_run.id,
         ExecutorRunResult(
             task_id=result.agent_run.id,
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, result.agent_run.id),
     )
 
     status = service.status(result.agent_run.id)
@@ -4938,13 +5142,14 @@ def test_capability_package_session_reports_structured_skill_content_failure(
         "evidence": [{"title": "Project notes", "excerpt": "Generate one missing skill."}],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
             status="completed",
             output=json.dumps(draft_decision),
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
 
     _wait_for(lambda: session.done)
@@ -5022,7 +5227,7 @@ def test_capability_package_session_reports_incomplete_field_generation_without_
             },
         ),
     )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
@@ -5041,6 +5246,7 @@ def test_capability_package_session_reports_incomplete_field_generation_without_
                 )
             ],
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
 
     _wait_for(lambda: session.done)
@@ -5108,7 +5314,7 @@ def test_capability_package_session_reports_interrupted_output_beyond_display_ev
             str(agent_run_id),
             ExecutorEvent.status("thinking", index=index),
         )
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
@@ -5124,6 +5330,7 @@ def test_capability_package_session_reports_interrupted_output_beyond_display_ev
                 )
             ],
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
 
     _wait_for(lambda: session.done)
@@ -5225,13 +5432,14 @@ def test_capability_package_session_requests_approval_from_patch_stream_with_emp
         ),
         ("risk_level", "low"),
     ]
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
             status="completed",
             output=_capability_patch_stream(patches),
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
 
     approval = _wait_for(
@@ -5388,13 +5596,14 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
         "credentials": ["GITHUB_TOKEN"],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
             status="completed",
             output=f"```json\n{json.dumps(draft)}\n```",
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
     approval = _wait_for(
         lambda: next(
@@ -5433,6 +5642,18 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     assert admin.payloads
     assert admin.payloads[0]["candidate_id"] == approval["tool_args"]["candidate_id"]
     assert admin.payloads[0]["candidate_hash"] == approval["tool_args"]["candidate_hash"]
+    feedback_by_kind = {
+        item["kind"]: item
+        for item in control.load_agent_run_detail(str(agent_run_id))["feedback"]
+    }
+    assert feedback_by_kind["candidate_ready"]["requires_activation"] is False
+    assert feedback_by_kind["candidate_ready"]["payload"]["package_id"] == "review"
+    assert feedback_by_kind["approval_resolved"]["requires_activation"] is False
+    assert feedback_by_kind["approval_resolved"]["payload"]["decision"] == "allow_once"
+    assert (
+        feedback_by_kind["approval_resolved"]["payload"]["candidate_id"]
+        == approval["tool_args"]["candidate_id"]
+    )
     assert not any(event["type"] in {"tool_call_start", "tool_call_end"} for event in session.events)
     tool_steps = [
         event["payload"]
@@ -5499,14 +5720,14 @@ def test_capability_package_session_process_text_follows_english_locale(tmp_path
             "",
         )
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="sandbox_worker",
         executors=["fake"],
         peer_id="peer-1",
     )
     assert claim is not None
-    control.complete_claimed_agent_run(
+    control.complete_claimed_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
@@ -5515,6 +5736,7 @@ def test_capability_package_session_process_text_follows_english_locale(tmp_path
             error="No model provider/profile is configured.",
         ),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
@@ -5613,18 +5835,21 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         )
     )
     first_agent_run = control.agent_run_to_dict(str(first_agent_run_id))
+    first_detail = control.load_agent_run_detail(str(first_agent_run_id))
+    first_prompt = first_detail["activations"][0]["prompt"]
     assert first_agent_run["metadata"]["locale"] == "zh-CN"
-    assert "所有用户可见的生成内容都必须使用简体中文" in first_agent_run["prompt"]
-    assert "生成草案中的自然语言字段" in first_agent_run["prompt"]
-    assert "你是 capability_packager" in first_agent_run["prompt"]
+    assert "所有用户可见的生成内容都必须使用简体中文" in first_prompt
+    assert "生成草案中的自然语言字段" in first_prompt
+    assert "你是 capability_packager" in first_prompt
     first_draft = _review_draft(command="hub")
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(first_agent_run_id),
         ExecutorRunResult(
             task_id=str(first_agent_run_id),
             status="completed",
             output=f"```json\n{json.dumps(first_draft)}\n```",
         ),
+        activation_id=_current_activation_id(control, str(first_agent_run_id)),
     )
     first_approval = _wait_for(
         lambda: next(
@@ -5642,26 +5867,48 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         followup_id="follow-revise",
         client_request_id="pending-revise",
     )
-    second_agent_run_id = _wait_for(
-        lambda: next(
-            (
-                run["id"]
-                for run in control.list_agent_runs(agent_id="capability_packager")
-                if run["id"] != first_agent_run_id
-            ),
-            "",
+    _wait_for(
+        lambda: control.agent_run_to_dict(str(first_agent_run_id)).get(
+            "current_activation_id"
         )
+        == f"{first_agent_run_id}:activation:2"
     )
+    second_agent_run_id = first_agent_run_id
     second_agent_run = control.agent_run_to_dict(str(second_agent_run_id))
+    assert [run["id"] for run in control.list_agent_runs(agent_id="capability_packager")] == [
+        first_agent_run_id
+    ]
     assert second_agent_run["metadata"]["session_run_id"] == "session-run-revise"
     assert second_agent_run["metadata"]["locale"] == "zh-CN"
-    assert second_agent_run["metadata"]["revision_of_agent_run_id"] == first_agent_run_id
-    assert second_agent_run["metadata"]["revision_followup_id"] == "follow-revise"
-    assert second_agent_run["metadata"]["revision_instruction"] == "把依赖改成 gh，不要用 hub"
-    assert second_agent_run["parent_task_id"] == first_agent_run_id
-    assert "用户意见：" in second_agent_run["prompt"]
-    assert "把依赖改成 gh，不要用 hub" in second_agent_run["prompt"]
-    assert '"command": "hub"' in second_agent_run["prompt"]
+    assert "current_activation_seq" not in second_agent_run["metadata"]
+    assert "current_activation_input_kind" not in second_agent_run["metadata"]
+    assert "current_activation_input_payload" not in second_agent_run["metadata"]
+    assert "current_activation_prompt" not in second_agent_run["metadata"]
+    assert "parent_task_id" not in second_agent_run
+    detail = control.load_agent_run_detail(str(second_agent_run_id))
+    assert [activation["id"] for activation in detail["activations"]] == [
+        f"{first_agent_run_id}:activation:1",
+        f"{first_agent_run_id}:activation:2",
+    ]
+    assert detail["activations"][1]["seq"] == 2
+    assert detail["activations"][1]["input_kind"] == "user_feedback"
+    assert (
+        detail["activations"][1]["input_payload"]["revision_followup_id"]
+        == "follow-revise"
+    )
+    feedback_by_kind = {item["kind"]: item for item in detail["feedback"]}
+    assert feedback_by_kind["candidate_ready"]["requires_activation"] is False
+    assert feedback_by_kind["approval_resolved"]["requires_activation"] is False
+    assert feedback_by_kind["approval_resolved"]["payload"]["decision"] == "deny_once"
+    assert feedback_by_kind["user_message"]["requires_activation"] is True
+    assert (
+        feedback_by_kind["user_message"]["consumed_by_activation_id"]
+        == f"{first_agent_run_id}:activation:2"
+    )
+    assert "用户意见：" in detail["activations"][1]["prompt"]
+    assert "把依赖改成 gh，不要用 hub" in detail["activations"][1]["prompt"]
+    assert '"command": "hub"' not in detail["activations"][1]["prompt"]
+    assert "你是 capability_packager" not in detail["activations"][1]["prompt"]
     assert any(
         event["type"] == "approval_resolved"
         and event["payload"].get("approval_id") == first_approval["approval_id"]
@@ -5682,13 +5929,14 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     )
 
     second_draft = _review_draft(command="gh")
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(second_agent_run_id),
         ExecutorRunResult(
             task_id=str(second_agent_run_id),
             status="completed",
             output=f"```json\n{json.dumps(second_draft)}\n```",
         ),
+        activation_id=_current_activation_id(control, str(second_agent_run_id)),
     )
     approvals = _wait_for(
         lambda: [
@@ -5703,6 +5951,169 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     assert second_approval["tool_args"]["agent_run_id"] == second_agent_run_id
 
     session.resolve_approval(str(second_approval["approval_id"]), "deny_once", "test_cleanup")
+    _wait_for(lambda: session.done)
+    assert admin.payloads == []
+
+
+def test_capability_package_session_repairs_candidate_build_field_errors(
+    tmp_path: Path,
+) -> None:
+    class FakeAdminManager(_CandidateAdminMixin):
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+    control = _control_plane()
+    admin = FakeAdminManager()
+    session = _RemoteSessionRun(
+        session_run_id="session-run-candidate-repair",
+        peer_id="peer-1",
+        session_hint="session-1",
+        locale="zh-CN",
+        artifact_root=tmp_path,
+    )
+    service = CapabilityPackageSessionRunService(control, admin, poll_timeout_sec=0.05)
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install a GitHub MCP search helper.",
+            }
+        },
+    )
+    first_agent_run_id = _wait_for(
+        lambda: next(
+            (
+                event["payload"].get("agent_run_id")
+                for event in session.events
+                if event["type"] == "workflow_step"
+                and event["payload"].get("agent_run_id")
+            ),
+            "",
+        )
+    )
+    first_draft = _candidate_source_fixture(
+        {
+            "id": "github-search",
+            "name": "GitHub Search",
+            "contributions": {
+                "mcp_tools": [
+                    {
+                        "id": "mcp:github:search",
+                        "kind": "mcp_tool",
+                        "name": "search",
+                        "registry_path": "mcp:github:search",
+                    }
+                ]
+            },
+            "install_plan": ["Expose GitHub search."],
+            "usage": ["Search GitHub."],
+            "evidence": [{"title": "Notes", "excerpt": "Use GitHub search."}],
+            "risk_level": "low",
+        },
+        package_id="github-search",
+    )
+    control.complete_agent_run_activation(
+        str(first_agent_run_id),
+        ExecutorRunResult(
+            task_id=str(first_agent_run_id),
+            status="completed",
+            output=f"```json\n{json.dumps(first_draft)}\n```",
+        ),
+        activation_id=_current_activation_id(control, str(first_agent_run_id)),
+    )
+    _wait_for(
+        lambda: control.agent_run_to_dict(str(first_agent_run_id)).get(
+            "current_activation_id"
+        )
+        == f"{first_agent_run_id}:activation:2"
+    )
+    second_agent_run_id = first_agent_run_id
+    second_agent_run = control.agent_run_to_dict(str(second_agent_run_id))
+
+    assert [run["id"] for run in control.list_agent_runs(agent_id="capability_packager")] == [
+        first_agent_run_id
+    ]
+    assert "current_activation_seq" not in second_agent_run["metadata"]
+    assert "current_activation_input_kind" not in second_agent_run["metadata"]
+    assert "current_activation_input_payload" not in second_agent_run["metadata"]
+    assert "current_activation_prompt" not in second_agent_run["metadata"]
+    detail = control.load_agent_run_detail(str(second_agent_run_id))
+    assert [activation["id"] for activation in detail["activations"]] == [
+        f"{first_agent_run_id}:activation:1",
+        f"{first_agent_run_id}:activation:2",
+    ]
+    assert detail["activations"][1]["seq"] == 2
+    assert detail["activations"][1]["input_kind"] == "server_feedback"
+    payload = detail["activations"][1]["input_payload"]
+    assert payload["revision_followup_id"] == "candidate-build-repair-1"
+    assert payload["repair_attempt"] == 1
+    assert payload["candidate_build_failure"]["error"] == (
+        "capability_install_candidate_not_ready"
+    )
+    assert payload["candidate_build_failure"]["reason"] == (
+        "candidate_validation_failed"
+    )
+    assert detail["feedback"][0]["kind"] == "candidate_validation_failed"
+    assert (
+        detail["feedback"][0]["consumed_by_activation_id"]
+        == f"{first_agent_run_id}:activation:2"
+    )
+    assert "不要重新探索仓库" in detail["activations"][1]["prompt"]
+    assert "capability_draft_patch" in detail["activations"][1]["prompt"]
+    assert "optional_features" in detail["activations"][1]["prompt"]
+    assert "你是 capability_packager" not in detail["activations"][1]["prompt"]
+    assert any(
+        event["type"] == "workflow_step"
+        and event["payload"].get("details", {}).get("phase")
+        == "capability_install_candidate_repair_requested"
+        and event["payload"].get("details", {}).get("repair_attempt") == 1
+        for event in session.events
+    )
+
+    repaired_draft = deepcopy(first_draft)
+    repaired_draft["contributions"] = {
+        "mcp_servers": [
+            {
+                "id": "mcp:github",
+                "kind": "mcp_server",
+                "name": "github",
+            }
+        ],
+        "mcp_tools": [
+            {
+                "id": "mcp:github:search",
+                "kind": "mcp_tool",
+                "name": "search",
+                "registry_path": "mcp:github:search",
+            }
+        ],
+    }
+    control.complete_agent_run_activation(
+        str(second_agent_run_id),
+        ExecutorRunResult(
+            task_id=str(second_agent_run_id),
+            status="completed",
+            output=f"```json\n{json.dumps(repaired_draft)}\n```",
+        ),
+        activation_id=_current_activation_id(control, str(second_agent_run_id)),
+    )
+    approval = _wait_for(
+        lambda: next(
+            (
+                event["payload"]
+                for event in session.events
+                if event["type"] == "workflow_decision"
+            ),
+            None,
+        )
+    )
+
+    assert approval["tool_name"] == "install_capability_package"
+    assert approval["tool_args"]["agent_run_id"] == second_agent_run_id
+    assert "mcp:github:search" in json.dumps(approval, ensure_ascii=False)
+
+    session.resolve_approval(str(approval["approval_id"]), "deny_once", "test_cleanup")
     _wait_for(lambda: session.done)
     assert admin.payloads == []
 
@@ -5808,7 +6219,7 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
             "",
         )
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="sandbox_worker",
         executors=["fake"],
@@ -5823,13 +6234,14 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
     assert control.agent_run_to_dict(str(agent_run_id))["status"] == "queued"
 
     draft = _review_draft(command="gh")
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
             status="completed",
             output=f"```json\n{json.dumps(draft)}\n```",
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
     approval = _wait_for(
         lambda: next(
@@ -5958,13 +6370,14 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
         "credentials": ["GITHUB_TOKEN"],
         "risk_level": "low",
     }
-    control.complete_agent_run(
+    control.complete_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
             status="completed",
             output=f"```json\n{json.dumps(draft)}\n```",
         ),
+        activation_id=_current_activation_id(control, str(agent_run_id)),
     )
     approval = _wait_for(
         lambda: next(
@@ -6063,7 +6476,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
             "",
         )
     )
-    claim = control.claim_agent_run(
+    claim = control.claim_agent_run_activation(
         worker_id="worker-1",
         worker_kind="sandbox_worker",
         executors=["fake"],
@@ -6075,6 +6488,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
         str(agent_run_id),
         ExecutorEvent.status("preparing_worktree"),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
@@ -6082,6 +6496,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
         str(agent_run_id),
         ExecutorEvent.status("worktree_ready", workdir="/tmp/work"),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
@@ -6090,10 +6505,11 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
             str(agent_run_id),
             ExecutorEvent.text_event(f"progress line {idx}"),
             request_id=claim.request_id,
+            activation_id=claim.activation_id,
             worker_id="worker-1",
             peer_id="peer-1",
         )
-    control.complete_claimed_agent_run(
+    control.complete_claimed_agent_run_activation(
         str(agent_run_id),
         ExecutorRunResult(
             task_id=str(agent_run_id),
@@ -6102,6 +6518,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
             error="No model provider/profile is configured.",
         ),
         request_id=claim.request_id,
+        activation_id=claim.activation_id,
         worker_id="worker-1",
         peer_id="peer-1",
     )
