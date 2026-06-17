@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from urllib import request
 from urllib.error import HTTPError
 
+import pytest
+
 
 _URLOPEN = request.build_opener(request.ProxyHandler({})).open
 
@@ -2353,7 +2355,7 @@ class TestRunnerRemoteExec:
         finally:
             runner.cleanup(ctx.agent)
 
-    def test_runner_remote_session_fork_clones_history_and_reuses_it_for_chat(self) -> None:
+    def test_runner_remote_session_fork_endpoint_is_removed(self) -> None:
         workspace = Path(__file__).resolve().parent
         port = _free_port()
         session_store = MemorySessionStore()
@@ -2395,6 +2397,7 @@ class TestRunnerRemoteExec:
                 if event["type"] == "remote_peer_ready"
             ][0]
             source_session_id = ready["session_id"]
+            session_count = len(session_store.sessions)
 
             _, loaded = _json_request(
                 "POST",
@@ -2403,46 +2406,18 @@ class TestRunnerRemoteExec:
             )
             assert loaded["document"]["turns"][0]["userMessage"]["text"] == "hello"
 
-            _, forked = _json_request(
-                "POST",
-                f"{runner._relay_http_service.base_url}/remote/sessions/fork",
-                {
-                    "peer_token": peer_token,
-                    "source_session_id": source_session_id,
-                    "keep_through_message_index": 0,
-                },
-            )
-            forked_session_id = forked["metadata"]["id"]
-            assert forked["document"]["session"]["parentSessionId"] == source_session_id
-            assert forked["document"]["turns"][0]["userMessage"]["text"] == "hello"
-
-            _, fork_start = _json_request(
-                "POST",
-                f"{runner._relay_http_service.base_url}/remote/session-runs/start",
-                {
-                    "peer_token": peer_token,
-                    "prompt": "follow up",
-                    "session_hint": forked_session_id,
-                },
-            )
-            fork_events = _collect_stream_events(
-                runner._relay_http_service.base_url, peer_token, fork_start["session_run_id"]
-            )
-            fork_ready = [
-                event["payload"]
-                for event in fork_events
-                if event["type"] == "remote_peer_ready"
-            ][0]
-            fork_end = [event for event in fork_events if event["type"] == "session_run_end"][-1]
-            assert fork_ready["session_id"] == forked_session_id
-            assert "follow up|history=hello|sid=" in fork_end["payload"]["response"]
-
-            forked_session = session_store.load(forked_session_id)
-            assert forked_session is not None
-            assert any(
-                message.get("role") == "user" and message.get("content") == "follow up"
-                for message in forked_session.messages
-            )
+            with pytest.raises(HTTPError) as exc_info:
+                _json_request(
+                    "POST",
+                    f"{runner._relay_http_service.base_url}/remote/sessions/fork",
+                    {
+                        "peer_token": peer_token,
+                        "source_session_id": source_session_id,
+                        "keep_through_message_index": 0,
+                    },
+                )
+            assert exc_info.value.code == 404
+            assert len(session_store.sessions) == session_count
         finally:
             runner.cleanup(ctx.agent)
 

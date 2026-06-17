@@ -64,33 +64,6 @@ class SessionDeleteRequest:
         return cls(peer_token=d["peer_token"], session_id=d["session_id"])
 
 @dataclass
-class SessionForkRequest:
-    peer_token: str
-    source_session_id: str
-    keep_through_message_index: int = -1
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "peer_token": self.peer_token,
-            "source_session_id": self.source_session_id,
-            "keep_through_message_index": self.keep_through_message_index,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SessionForkRequest":
-        return cls(
-            peer_token=d["peer_token"],
-            source_session_id=str(
-                d.get("source_session_id") or d.get("sourceSessionId") or ""
-            ),
-            keep_through_message_index=int(
-                d.get("keep_through_message_index")
-                if d.get("keep_through_message_index") is not None
-                else d.get("keepThroughMessageIndex", -1)
-            ),
-        )
-
-@dataclass
 class SessionModelSwitchRequest:
     peer_token: str
     provider_id: str
@@ -128,6 +101,5 @@ __all__ = [
     "SessionLoadRequest",
     "SessionNewRequest",
     "SessionDeleteRequest",
-    "SessionForkRequest",
     "SessionModelSwitchRequest",
 ]
