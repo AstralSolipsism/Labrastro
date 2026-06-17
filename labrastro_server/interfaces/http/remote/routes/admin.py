@@ -177,6 +177,220 @@ class RemoteAdminRoutes:
                     },
                 )
                 return
+            if path == "/remote/admin/agent-runs/branch":
+                if self.service.runtime_control_plane is None:
+                    self._send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "agent_runs_unavailable",
+                    )
+                    return
+                metadata = (
+                    dict(payload.get("metadata", {}))
+                    if isinstance(payload.get("metadata"), dict)
+                    else {}
+                )
+                try:
+                    agent_run = self.service.runtime_control_plane.branch_agent_run(
+                        source_agent_run_id=str(
+                            payload.get("source_agent_run_id") or ""
+                        ),
+                        base_session_item_id=str(
+                            payload.get("base_session_item_id") or ""
+                        ),
+                        runtime_root=str(payload.get("runtime_root") or ""),
+                        repo_root=optional_payload_str(payload, "repo_root"),
+                        agent_id=optional_payload_str(payload, "agent_id"),
+                        prompt=str(payload.get("prompt") or ""),
+                        task_id=optional_payload_str(payload, "agent_run_id"),
+                        branch_name=optional_payload_str(payload, "branch_name"),
+                        base_ref=optional_payload_str(payload, "base_ref") or "HEAD",
+                        permission_recompute_policy=optional_payload_str(
+                            payload,
+                            "permission_recompute_policy",
+                        ),
+                        cleanup_policy=optional_payload_str(
+                            payload,
+                            "cleanup_policy",
+                        ),
+                        executor=optional_payload_str(payload, "executor"),
+                        runtime_profile_id=optional_payload_str(
+                            payload,
+                            "runtime_profile_id",
+                        ),
+                        model=optional_payload_str(payload, "model"),
+                        metadata=metadata,
+                    )
+                except KeyError:
+                    self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+                    return
+                except (RuntimeError, ValueError) as exc:
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_agent_run_branch",
+                        str(exc) or "invalid AgentRun branch",
+                    )
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
+                            agent_run.id
+                        ),
+                    },
+                )
+                return
+            if path == "/remote/admin/agent-runs/fork":
+                if self.service.runtime_control_plane is None:
+                    self._send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "agent_runs_unavailable",
+                    )
+                    return
+                metadata = (
+                    dict(payload.get("metadata", {}))
+                    if isinstance(payload.get("metadata"), dict)
+                    else {}
+                )
+                try:
+                    agent_run = self.service.runtime_control_plane.fork_agent_run(
+                        source_agent_run_id=str(
+                            payload.get("source_agent_run_id") or ""
+                        ),
+                        base_session_item_id=str(
+                            payload.get("base_session_item_id") or ""
+                        ),
+                        fork_workspace_ref=str(
+                            payload.get("fork_workspace_ref") or ""
+                        ),
+                        target_owner_session_run_id=str(
+                            payload.get("target_owner_session_run_id") or ""
+                        ),
+                        agent_id=optional_payload_str(payload, "agent_id"),
+                        prompt=str(payload.get("prompt") or ""),
+                        task_id=optional_payload_str(payload, "agent_run_id"),
+                        provenance_status=optional_payload_str(
+                            payload,
+                            "provenance_status",
+                        )
+                        or "visible",
+                        permission_recompute_policy=optional_payload_str(
+                            payload,
+                            "permission_recompute_policy",
+                        ),
+                        cleanup_policy=optional_payload_str(
+                            payload,
+                            "cleanup_policy",
+                        ),
+                        workdir=optional_payload_str(payload, "workdir"),
+                        executor=optional_payload_str(payload, "executor"),
+                        execution_location=optional_payload_str(
+                            payload,
+                            "execution_location",
+                        ),
+                        runtime_profile_id=optional_payload_str(
+                            payload,
+                            "runtime_profile_id",
+                        ),
+                        model=optional_payload_str(payload, "model"),
+                        metadata=metadata,
+                    )
+                except KeyError:
+                    self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+                    return
+                except ValueError as exc:
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_agent_run_fork",
+                        str(exc) or "invalid AgentRun fork",
+                    )
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
+                            agent_run.id
+                        ),
+                    },
+                )
+                return
+            if path == "/remote/admin/agent-runs/steer":
+                if self.service.runtime_control_plane is None:
+                    self._send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "agent_runs_unavailable",
+                    )
+                    return
+                steer_payload = payload.get("payload")
+                if not isinstance(steer_payload, dict):
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_agent_run_steer",
+                        "activation steer payload is required",
+                    )
+                    return
+                metadata = (
+                    dict(payload.get("metadata", {}))
+                    if isinstance(payload.get("metadata"), dict)
+                    else {}
+                )
+                client_steer_id = optional_payload_str(payload, "client_steer_id")
+                idempotency_key = (
+                    optional_payload_str(payload, "idempotency_key")
+                    or str(metadata.get("idempotency_key") or "").strip()
+                    or client_steer_id
+                    or str(metadata.get("client_steer_id") or "").strip()
+                )
+                if not idempotency_key:
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "activation_steer_idempotency_key_required",
+                    )
+                    return
+                sender = (
+                    optional_payload_str(payload, "sender")
+                    or str(metadata.get("sender") or "").strip()
+                    or "admin"
+                )
+                metadata["idempotency_key"] = idempotency_key
+                metadata["sender"] = sender
+                if client_steer_id:
+                    metadata["client_steer_id"] = client_steer_id
+                try:
+                    steer = self.service.runtime_control_plane.append_activation_steer(
+                        str(payload.get("agent_run_id") or ""),
+                        source=optional_payload_str(payload, "source") or "admin",
+                        payload=steer_payload,
+                        metadata=metadata,
+                    )
+                except KeyError:
+                    self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+                    return
+                except ValueError as exc:
+                    self._send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_agent_run_steer",
+                        str(exc) or "invalid AgentRun steer",
+                    )
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "activation_steer": {
+                            "id": steer.id,
+                            "activation_id": steer.activation_id,
+                            "source": steer.source.value,
+                            "payload": dict(steer.payload),
+                            "created_at": steer.created_at,
+                            "delivered_at": steer.delivered_at,
+                            "status": steer.status.value,
+                            "metadata": dict(steer.metadata),
+                        },
+                    },
+                )
+                return
             if path == "/remote/admin/environment/run":
                 if self.service.runtime_control_plane is None:
                     self._send_error(

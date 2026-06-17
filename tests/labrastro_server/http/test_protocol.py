@@ -163,6 +163,27 @@ class TestRemoteHTTPContract:
         assert registry["admin.models.delete"]["path"] == "/remote/admin/models/delete"
         assert registry["admin.models.delete"]["request_model"] == "ModelProfileDeleteRequest"
         assert registry["admin.models.delete"]["auth"] == "bearer"
+        assert registry["admin.agent_runs.branch"]["path"] == (
+            "/remote/admin/agent-runs/branch"
+        )
+        assert registry["admin.agent_runs.branch"]["request_model"] == (
+            "AgentRunBranchRequest"
+        )
+        assert registry["admin.agent_runs.fork"]["path"] == (
+            "/remote/admin/agent-runs/fork"
+        )
+        assert registry["admin.agent_runs.fork"]["request_model"] == (
+            "AgentRunForkRequest"
+        )
+        assert registry["admin.agent_runs.steer"]["path"] == (
+            "/remote/admin/agent-runs/steer"
+        )
+        assert registry["admin.agent_runs.steer"]["request_model"] == (
+            "AgentRunSteerRequest"
+        )
+        assert registry["admin.agent_runs.steer"]["response_shape"] == (
+            "AgentRunSteerResponse"
+        )
         assert "admin.environment_requirements.behavior_catalog" not in registry
         assert registry["admin.behavior.catalog"]["path"] == "/remote/admin/behavior/catalog"
         assert registry["admin.skills.list"]["path"] == "/remote/admin/skills/list"
