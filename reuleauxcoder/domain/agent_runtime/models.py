@@ -1679,6 +1679,7 @@ class ActivationSteerStatus(str, Enum):
     """Delivery state for same-activation steering input."""
 
     QUEUED = "queued"
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -1689,6 +1690,7 @@ class AgentRunRelationType(str, Enum):
 
     AGENT_CALL_EPHEMERAL = "agent_call_ephemeral"
     AGENT_CALL_PERSISTENT = "agent_call_persistent"
+    BRANCH = "branch"
     FORK = "fork"
     REVIEW = "review"
     DIAGNOSTIC_PROBE = "diagnostic_probe"
@@ -1702,6 +1704,140 @@ class AgentRunRelationStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     UNAVAILABLE = "unavailable"
+
+
+AGENT_RUN_RELATION_METADATA_FORBIDDEN_KEYS = frozenset(
+    {
+        "conversation_scope",
+        "wait",
+        "thread_key",
+        "thread_summary",
+        "parent_session_id",
+        "parent_turn_id",
+        "workspace_root",
+        "lifecycle_hook_id",
+        "source_agent_run_id",
+        "target_agent_run_id",
+        "base_session_item_id",
+        "base_git_ref",
+        "base_tree_ref",
+        "branch_name",
+        "branch_git_ref",
+        "branch_worktree_ref",
+        "fork_workspace_ref",
+        "source_owner_session_run_id",
+        "target_owner_session_run_id",
+        "provenance_status",
+        "reuse_live_executor_session",
+        "permission_recompute_policy",
+        "cleanup_policy",
+        "runtime_root",
+        "source_workspace_root",
+    }
+)
+
+
+_RELATION_PAYLOAD_REQUIRED_KEYS: dict[AgentRunRelationType, frozenset[str]] = {
+    AgentRunRelationType.AGENT_CALL_EPHEMERAL: frozenset(
+        {"conversation_scope", "wait"}
+    ),
+    AgentRunRelationType.AGENT_CALL_PERSISTENT: frozenset(
+        {"conversation_scope", "wait", "thread_key", "thread_summary"}
+    ),
+    AgentRunRelationType.BRANCH: frozenset(
+        {
+            "source_agent_run_id",
+            "target_agent_run_id",
+            "base_session_item_id",
+            "base_git_ref",
+            "base_tree_ref",
+            "branch_name",
+            "branch_git_ref",
+            "branch_worktree_ref",
+            "permission_recompute_policy",
+            "reuse_live_executor_session",
+            "cleanup_policy",
+            "runtime_root",
+            "source_workspace_root",
+        }
+    ),
+    AgentRunRelationType.FORK: frozenset(
+        {
+            "source_agent_run_id",
+            "target_agent_run_id",
+            "base_session_item_id",
+            "fork_workspace_ref",
+            "target_owner_session_run_id",
+            "permission_recompute_policy",
+            "reuse_live_executor_session",
+            "cleanup_policy",
+            "provenance_status",
+        }
+    ),
+    AgentRunRelationType.REVIEW: frozenset({"review_kind"}),
+    AgentRunRelationType.DIAGNOSTIC_PROBE: frozenset({"probe_kind"}),
+}
+
+
+def _validate_relation_payload(
+    relation_type: AgentRunRelationType,
+    payload: dict[str, Any],
+) -> None:
+    required = _RELATION_PAYLOAD_REQUIRED_KEYS.get(relation_type, frozenset())
+    missing = sorted(
+        key
+        for key in required
+        if key not in payload or payload.get(key) is None
+    )
+    if missing:
+        raise ValueError(
+            f"AgentRunRelation.payload missing required {relation_type.value} "
+            "fields: "
+            + ", ".join(missing)
+        )
+    if relation_type in {
+        AgentRunRelationType.AGENT_CALL_EPHEMERAL,
+        AgentRunRelationType.AGENT_CALL_PERSISTENT,
+    }:
+        expected_scope = (
+            "persistent"
+            if relation_type == AgentRunRelationType.AGENT_CALL_PERSISTENT
+            else "ephemeral"
+        )
+        if str(payload.get("conversation_scope") or "") != expected_scope:
+            raise ValueError(
+                "AgentRunRelation.payload conversation_scope must match "
+                f"{relation_type.value}"
+            )
+        if not isinstance(payload.get("wait"), bool):
+            raise ValueError("AgentRunRelation.payload wait must be boolean")
+    if relation_type in {AgentRunRelationType.BRANCH, AgentRunRelationType.FORK}:
+        blank = sorted(
+            key
+            for key in required
+            if key != "reuse_live_executor_session"
+            and str(payload.get(key) or "") == ""
+        )
+        if blank:
+            raise ValueError(
+                f"AgentRunRelation.payload missing required {relation_type.value} "
+                "fields: "
+                + ", ".join(blank)
+            )
+        if payload.get("reuse_live_executor_session") is not False:
+            raise ValueError(
+                "AgentRunRelation.payload reuse_live_executor_session must be false"
+            )
+    if relation_type == AgentRunRelationType.FORK:
+        if str(payload.get("provenance_status") or "") not in {
+            "visible",
+            "redacted",
+            "unavailable",
+        }:
+            raise ValueError(
+                "AgentRunRelation.payload provenance_status must be visible, "
+                "redacted, or unavailable"
+            )
 
 
 class AgentThreadBindingLifetime(str, Enum):
@@ -1929,6 +2065,7 @@ class AgentRunRelation:
     relation_scope: str = "session"
     created_by_activation_id: str | None = None
     status: AgentRunRelationStatus = AgentRunRelationStatus.ACTIVE
+    payload: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -1937,7 +2074,19 @@ class AgentRunRelation:
             _enum_value(self.status) or AgentRunRelationStatus.ACTIVE
         )
         self.relation_scope = str(self.relation_scope or "session")
+        self.payload = _dict_value(self.payload)
         self.metadata = _dict_value(self.metadata)
+        forbidden_metadata = sorted(
+            key
+            for key in self.metadata
+            if key in AGENT_RUN_RELATION_METADATA_FORBIDDEN_KEYS
+        )
+        if forbidden_metadata:
+            raise ValueError(
+                "AgentRunRelation.metadata cannot store relation decision fields: "
+                + ", ".join(forbidden_metadata)
+            )
+        _validate_relation_payload(self.relation_type, self.payload)
 
 
 @dataclass

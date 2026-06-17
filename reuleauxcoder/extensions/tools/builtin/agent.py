@@ -596,7 +596,7 @@ class CallAgentTool(Tool):
                         owner_agent_run_id=owner_agent_run_id,
                         related_agent_run_id="",
                         relation_type=AgentRunRelationType.AGENT_CALL_EPHEMERAL,
-                        metadata={
+                        payload={
                             "conversation_scope": scope_value,
                             "wait": wait_value,
                             **(

@@ -3089,8 +3089,8 @@ def test_agent_lifecycle_runtime_adapter_submits_agent_run_reference() -> None:
     assert request.relation.relation_type.value == "agent_call_ephemeral"
     assert request.budget == {"token_budget": 5000, "max_turns": 2}
     assert "budget" not in request.metadata
-    assert request.relation.metadata["parent_session_id"] == "session-1"
-    assert request.relation.metadata["parent_turn_id"] == "turn-1"
+    assert request.relation.payload["parent_session_id"] == "session-1"
+    assert request.relation.payload["parent_turn_id"] == "turn-1"
 
 
 def _agent_adapter_task_lifecycle_dispatcher(agent, declarations, handler):

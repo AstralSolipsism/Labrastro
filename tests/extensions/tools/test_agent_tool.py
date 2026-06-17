@@ -113,7 +113,12 @@ class _ControlPlaneStub:
                 owner_agent_run_id=owner_agent_run_id,
                 related_agent_run_id="",
                 relation_type=AgentRunRelationType.AGENT_CALL_PERSISTENT,
-                metadata={"conversation_scope": "persistent"},
+                payload={
+                    "conversation_scope": "persistent",
+                    "wait": wait,
+                    "thread_key": thread_key,
+                    "thread_summary": thread_summary,
+                },
             ),
         )
         self.requests.append(request)
@@ -287,7 +292,7 @@ def test_call_agent_submits_ephemeral_run_without_parent_field_relation() -> Non
     assert request.relation is not None
     assert request.relation.owner_agent_run_id == "chat:parent"
     assert request.relation.relation_type == AgentRunRelationType.AGENT_CALL_EPHEMERAL
-    assert request.relation.metadata["conversation_scope"] == "ephemeral"
+    assert request.relation.payload["conversation_scope"] == "ephemeral"
     assert "relation_type" not in request.metadata
     assert "call_agent_mode" not in request.metadata
     assert "called_by_agent_run_id" not in request.metadata
@@ -408,7 +413,7 @@ def test_call_agent_stores_relation_outside_agent_run_metadata() -> None:
     assert relation["owner_agent_run_id"] == parent_run.id
     assert relation["related_agent_run_id"] == child["id"]
     assert relation["relation_type"] == "agent_call_persistent"
-    assert relation["metadata"]["thread_key"] == "project-context"
+    assert relation["payload"]["thread_key"] == "project-context"
     assert "call_agent_mode" not in child["metadata"]
     assert "purpose_key" not in child["metadata"]
 

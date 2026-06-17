@@ -1507,7 +1507,9 @@ class AgentLifecycleHookRuntimeAdapter:
                         owner_agent_run_id=owner_agent_run_id or "",
                         related_agent_run_id="",
                         relation_type=AgentRunRelationType.AGENT_CALL_EPHEMERAL,
-                        metadata={
+                        payload={
+                            "conversation_scope": "ephemeral",
+                            "wait": True,
                             "lifecycle_hook_id": declaration.id,
                             "lifecycle_event": context.event_name,
                             "trigger_source": context.source,

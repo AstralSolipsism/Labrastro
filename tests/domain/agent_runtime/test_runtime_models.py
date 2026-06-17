@@ -169,6 +169,7 @@ def test_agent_run_activation_feedback_models_keep_lifecycle_boundaries() -> Non
         relation_type="agent_call_ephemeral",
         relation_scope="session",
         created_by_activation_id="act-1",
+        payload={"conversation_scope": "ephemeral", "wait": True},
     )
     binding = models.AgentThreadBinding(
         id="binding-1",
@@ -198,6 +199,191 @@ def test_agent_run_activation_feedback_models_keep_lifecycle_boundaries() -> Non
     assert binding.target_agent_run_id == "run-2"
     assert binding.thread_key == "backend"
     assert binding.binding_lifetime == models.AgentThreadBindingLifetime.SESSION
+
+
+def test_agent_run_relation_contract_uses_typed_payloads_for_decision_fields() -> None:
+    models = _models()
+
+    relation = models.AgentRunRelation(
+        id="relation-branch",
+        owner_agent_run_id="run-base",
+        related_agent_run_id="run-branch",
+        relation_type="branch",
+        payload={
+            "source_agent_run_id": "run-base",
+            "target_agent_run_id": "run-branch",
+            "base_session_item_id": "session-item-12",
+            "base_git_ref": "refs/heads/main",
+            "base_tree_ref": "tree:base",
+            "branch_name": "agent-run/run-branch",
+            "branch_git_ref": "refs/heads/agent-run/run-branch",
+            "branch_worktree_ref": "worktree:run-branch",
+            "permission_recompute_policy": "recompute_or_reject",
+            "reuse_live_executor_session": False,
+            "cleanup_policy": "delete_with_owner_session",
+            "runtime_root": "runtime",
+            "source_workspace_root": "workspace:source",
+        },
+    )
+
+    assert relation.relation_type == models.AgentRunRelationType.BRANCH
+    assert relation.payload["base_session_item_id"] == "session-item-12"
+    assert relation.payload["reuse_live_executor_session"] is False
+    assert relation.metadata == {}
+
+
+@pytest.mark.parametrize(
+    "relation_type,payload",
+    [
+        (
+            "agent_call_ephemeral",
+            {
+                "conversation_scope": "ephemeral",
+                "wait": True,
+                "parent_session_id": "session-1",
+            },
+        ),
+        (
+            "agent_call_persistent",
+            {
+                "conversation_scope": "persistent",
+                "wait": False,
+                "thread_key": "backend",
+                "thread_summary": "Backend thread",
+                "parent_session_id": "session-1",
+                "workspace_root": "G:/AboutDEV/EZCode/Labrastro",
+            },
+        ),
+        (
+            "branch",
+            {
+                "source_agent_run_id": "run-base",
+                "target_agent_run_id": "run-branch",
+                "base_session_item_id": "session-item-12",
+                "base_git_ref": "refs/heads/main",
+                "base_tree_ref": "tree:base",
+                "branch_name": "agent-run/run-branch",
+                "branch_git_ref": "refs/heads/agent-run/run-branch",
+                "branch_worktree_ref": "worktree:run-branch",
+                "permission_recompute_policy": "recompute_or_reject",
+                "reuse_live_executor_session": False,
+                "cleanup_policy": "delete_with_owner_session",
+                "runtime_root": "runtime",
+                "source_workspace_root": "workspace:source",
+            },
+        ),
+        (
+            "fork",
+                {
+                    "source_agent_run_id": "run-base",
+                    "target_agent_run_id": "run-fork",
+                    "base_session_item_id": "session-item-12",
+                    "fork_workspace_ref": "workspace:fork",
+                    "target_owner_session_run_id": "session-target",
+                    "permission_recompute_policy": "recompute_or_reject",
+                    "reuse_live_executor_session": False,
+                    "cleanup_policy": "delete_with_owner_session",
+                "provenance_status": "visible",
+            },
+        ),
+        (
+            "review",
+            {
+                "review_kind": "lifecycle_hook",
+                "lifecycle_hook_id": "hook:lifecycle-agent-review",
+                "parent_session_id": "session-1",
+                "parent_turn_id": "turn-1",
+            },
+        ),
+        (
+            "diagnostic_probe",
+            {
+                "probe_kind": "environment",
+                "parent_session_id": "session-1",
+            },
+        ),
+    ],
+)
+def test_agent_run_relation_accepts_required_typed_payloads(
+    relation_type: str,
+    payload: dict[str, object],
+) -> None:
+    models = _models()
+
+    relation = models.AgentRunRelation(
+        id=f"relation-{relation_type}",
+        owner_agent_run_id="run-1",
+        related_agent_run_id="run-2",
+        relation_type=relation_type,
+        payload=payload,
+    )
+
+    assert relation.payload == payload
+
+
+@pytest.mark.parametrize(
+    "metadata_key",
+    [
+        "conversation_scope",
+        "wait",
+        "thread_key",
+        "thread_summary",
+        "parent_session_id",
+        "parent_turn_id",
+        "workspace_root",
+        "lifecycle_hook_id",
+        "base_session_item_id",
+        "base_git_ref",
+        "branch_name",
+        "branch_git_ref",
+        "branch_worktree_ref",
+        "fork_workspace_ref",
+        "reuse_live_executor_session",
+        "permission_recompute_policy",
+        "cleanup_policy",
+        "runtime_root",
+        "source_workspace_root",
+    ],
+)
+def test_agent_run_relation_rejects_decision_fields_in_metadata(
+    metadata_key: str,
+) -> None:
+    models = _models()
+
+    with pytest.raises(ValueError, match="AgentRunRelation.metadata"):
+        models.AgentRunRelation(
+            id="relation-1",
+            owner_agent_run_id="run-1",
+            related_agent_run_id="run-2",
+            relation_type="agent_call_persistent",
+            metadata={metadata_key: "not-allowed"},
+        )
+
+
+def test_activation_steer_contract_supports_delivering_and_idempotency_metadata() -> None:
+    models = _models()
+
+    steer = models.ActivationSteer(
+        id="steer-1",
+        activation_id="activation-1",
+        source="user",
+        status="delivering",
+        payload={
+            "items": [
+                {"type": "text", "text": "先查影响范围"},
+                {"type": "artifact_ref", "artifact_id": "artifact-1"},
+            ]
+        },
+        metadata={
+            "client_steer_id": "client-1",
+            "idempotency_key": "client-1",
+            "sender": "user-1",
+        },
+    )
+
+    assert steer.status == models.ActivationSteerStatus.DELIVERING
+    assert steer.payload["items"][0]["type"] == "text"
+    assert steer.metadata["idempotency_key"] == "client-1"
 
 
 def test_agent_run_rejects_taskflow_business_identity_in_metadata() -> None:
