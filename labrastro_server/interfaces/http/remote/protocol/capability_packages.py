@@ -6,6 +6,49 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+@dataclass
+class CapabilityPackageIngestSessionStartRequest:
+    peer_token: str
+    source: dict[str, Any]
+    session_id: str | None = None
+    client_request_id: str | None = None
+    locale: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "peer_token": self.peer_token,
+            "source": dict(self.source),
+        }
+        if self.session_id is not None:
+            payload["session_id"] = self.session_id
+        if self.client_request_id is not None:
+            payload["client_request_id"] = self.client_request_id
+        if self.locale is not None:
+            payload["locale"] = self.locale
+        return payload
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: dict[str, Any],
+    ) -> "CapabilityPackageIngestSessionStartRequest":
+        return cls(
+            peer_token=value["peer_token"],
+            source=_dict(value.get("source")),
+            session_id=value.get("session_id")
+            if isinstance(value.get("session_id"), str)
+            else None,
+            client_request_id=value.get("client_request_id")
+            if isinstance(value.get("client_request_id"), str)
+            else None,
+            locale=value.get("locale") if isinstance(value.get("locale"), str) else None,
+        )
+
+
 @dataclass(frozen=True)
 class CapabilityPackageInstallResultRecord:
     plan_id: str
@@ -72,4 +115,7 @@ class CapabilityPackageInstallResultRecord:
         return result
 
 
-__all__ = ["CapabilityPackageInstallResultRecord"]
+__all__ = [
+    "CapabilityPackageIngestSessionStartRequest",
+    "CapabilityPackageInstallResultRecord",
+]

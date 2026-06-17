@@ -1,4 +1,4 @@
-"""Capability package ingestion through a dedicated AgentRun."""
+﻿"""Capability package ingestion through a dedicated AgentRun."""
 
 from __future__ import annotations
 
@@ -244,7 +244,7 @@ _CAPABILITY_INGEST_START_FORBIDDEN_REVISION_FIELDS = {
     "candidate_build_failure",
     "repair_attempt",
     "revision_draft",
-    "revision_followup_id",
+    "revision_feedback_id",
     "revision_instruction",
 }
 _CAPABILITY_CANDIDATE_REPAIRABLE_REASONS = {
@@ -1754,24 +1754,24 @@ class CapabilityPackageSessionRunService:
         thread.start()
 
     def _run(self, session: Any, payload: dict[str, Any]) -> None:
-        follow_up_lock = threading.Lock()
-        follow_up_queue: list[dict[str, Any]] = []
+        revision_lock = threading.Lock()
+        revision_queue: list[dict[str, Any]] = []
         active_approval_id: dict[str, str] = {"value": ""}
 
-        def on_follow_up(ticket: dict[str, Any]) -> None:
+        def on_revision_feedback(ticket: dict[str, Any]) -> None:
             approval_id = ""
             revision_reason = _capability_text(
                 _session_locale(session),
                 "revision_approval_reason",
             )
-            followup_id = str(ticket.get("followup_id") or "").strip()
-            with follow_up_lock:
-                if followup_id and any(
-                    str(item.get("followup_id") or "") == followup_id
-                    for item in follow_up_queue
+            revision_feedback_id = str(ticket.get("revision_feedback_id") or "").strip()
+            with revision_lock:
+                if revision_feedback_id and any(
+                    str(item.get("revision_feedback_id") or "") == revision_feedback_id
+                    for item in revision_queue
                 ):
                     return
-                follow_up_queue.append(dict(ticket))
+                revision_queue.append(dict(ticket))
                 approval_id = active_approval_id.get("value", "")
             if approval_id:
                 session.resolve_approval(
@@ -1780,7 +1780,7 @@ class CapabilityPackageSessionRunService:
                     revision_reason,
                 )
 
-        session.set_follow_up_callback(on_follow_up)
+        session.set_revision_feedback_callback(on_revision_feedback)
         try:
             if getattr(session, "cancel_requested", False):
                 return
@@ -1819,7 +1819,7 @@ class CapabilityPackageSessionRunService:
                         completed.instruction,
                         agent_run_id,
                         str(
-                            completed.metadata.get("revision_followup_id")
+                            completed.metadata.get("revision_feedback_id")
                             or "candidate-build-repair"
                         ),
                         feedback_source=AgentRunFeedbackSource.SERVER,
@@ -1833,8 +1833,8 @@ class CapabilityPackageSessionRunService:
                     session,
                     candidate,
                     agent_run_id,
-                    follow_up_queue=follow_up_queue,
-                    follow_up_lock=follow_up_lock,
+                    revision_queue=revision_queue,
+                    revision_lock=revision_lock,
                     active_approval_id=active_approval_id,
                 )
                 if revision is None:
@@ -1846,7 +1846,7 @@ class CapabilityPackageSessionRunService:
                     draft,
                     str(revision.get("text") or ""),
                     agent_run_id,
-                    str(revision.get("followup_id") or ""),
+                    str(revision.get("revision_feedback_id") or ""),
                     feedback_source=AgentRunFeedbackSource.USER,
                     feedback_kind=AgentRunFeedbackKind.USER_MESSAGE,
                     input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
@@ -1880,7 +1880,7 @@ class CapabilityPackageSessionRunService:
                 },
             )
         finally:
-            session.set_follow_up_callback(None)
+            session.set_revision_feedback_callback(None)
             session.mark_done()
 
     def _agent_run_metadata(
@@ -1905,6 +1905,30 @@ class CapabilityPackageSessionRunService:
 
     def _bind_agent_run(self, session: Any, agent_run: AgentRun) -> None:
         agent_run_id = agent_run.id
+        branch_binding_id = str(getattr(session, "branch_binding_id", "") or "main").strip()
+        try:
+            binding = self.runtime_control_plane.find_session_run_binding(
+                session_run_id=str(getattr(session, "session_run_id", "") or ""),
+                branch_binding_id=branch_binding_id,
+                selected_only=False,
+            )
+        except Exception:
+            binding = None
+        if binding is None:
+            binding = self.runtime_control_plane.create_session_run_binding(
+                session_run_id=str(getattr(session, "session_run_id", "") or ""),
+                session_id=str(getattr(session, "session_id", "") or ""),
+                peer_id=str(getattr(session, "peer_id", "") or ""),
+                agent_run_id=agent_run_id,
+                branch_binding_id=branch_binding_id,
+                selected=True,
+                target_agent_run_id=agent_run_id,
+                metadata={"binding_kind": "capability_package_mainline"},
+            )
+        if hasattr(session, "record_branch_binding"):
+            session.record_branch_binding(binding)
+        session.agent_run_id = agent_run_id
+        session.branch_binding_id = binding.branch_binding_id
         session.set_cancel_callback(
             lambda reason, run_id=agent_run_id: self.runtime_control_plane.cancel_agent_run(
                 run_id,
@@ -1951,7 +1975,7 @@ class CapabilityPackageSessionRunService:
             if isinstance(raw_activation_payload, dict)
             else {}
         )
-        is_revision = bool(activation_payload.get("revision_followup_id"))
+        is_revision = bool(activation_payload.get("revision_feedback_id"))
         locale = _session_locale(session)
         session.append_event(
             "workflow_step",
@@ -1966,8 +1990,8 @@ class CapabilityPackageSessionRunService:
                     "agent_run_id": agent_run_id,
                     **(
                         {
-                            "revision_followup_id": str(
-                                activation_payload.get("revision_followup_id")
+                            "revision_feedback_id": str(
+                                activation_payload.get("revision_feedback_id")
                             ),
                         }
                         if is_revision
@@ -2248,7 +2272,7 @@ class CapabilityPackageSessionRunService:
         draft: dict[str, Any],
         instruction: str,
         previous_agent_run_id: str,
-        followup_id: str,
+        revision_feedback_id: str,
         *,
         feedback_source: AgentRunFeedbackSource,
         feedback_kind: AgentRunFeedbackKind,
@@ -2259,7 +2283,7 @@ class CapabilityPackageSessionRunService:
         evidence_bundle = EvidenceBundle.from_dict(seed_source_bundle)
         metadata = {
             "revision_of_agent_run_id": previous_agent_run_id,
-            "revision_followup_id": followup_id,
+            "revision_feedback_id": revision_feedback_id,
             "revision_instruction": instruction,
             **dict(extra_metadata or {}),
         }
@@ -2268,7 +2292,7 @@ class CapabilityPackageSessionRunService:
             source=feedback_source,
             kind=feedback_kind,
             payload={
-                "revision_followup_id": followup_id,
+                "revision_feedback_id": revision_feedback_id,
                 "revision_instruction": instruction,
                 "draft": _public_internal_capability_source(draft),
                 "source_bundle": seed_source_bundle,
@@ -2284,7 +2308,7 @@ class CapabilityPackageSessionRunService:
             input_payload={
                 "feedback_id": feedback.id,
                 "feedback_kind": feedback.kind.value,
-                "revision_followup_id": followup_id,
+                "revision_feedback_id": revision_feedback_id,
                 "revision_instruction": instruction,
                 **dict(extra_metadata or {}),
             },
@@ -2370,8 +2394,8 @@ class CapabilityPackageSessionRunService:
         candidate: dict[str, Any],
         agent_run_id: str,
         *,
-        follow_up_queue: list[dict[str, Any]],
-        follow_up_lock: threading.Lock,
+        revision_queue: list[dict[str, Any]],
+        revision_lock: threading.Lock,
         active_approval_id: dict[str, str],
     ) -> dict[str, Any] | None:
         package_id = str(candidate.get("package_id") or "capability-package").strip()
@@ -2398,9 +2422,9 @@ class CapabilityPackageSessionRunService:
         )
         session.register_approval(approval_id, approval_payload)
         session.append_event("workflow_decision", approval_payload)
-        with follow_up_lock:
+        with revision_lock:
             active_approval_id["value"] = approval_id
-            has_pending_revision = bool(follow_up_queue)
+            has_pending_revision = bool(revision_queue)
         if has_pending_revision:
             session.resolve_approval(
                 approval_id,
@@ -2410,12 +2434,12 @@ class CapabilityPackageSessionRunService:
         try:
             decision, reason, _resolution_meta = session.wait_approval(approval_id)
         finally:
-            with follow_up_lock:
+            with revision_lock:
                 if active_approval_id.get("value") == approval_id:
                     active_approval_id["value"] = ""
         if getattr(session, "cancel_requested", False) or getattr(session, "done", False):
             return None
-        revision_ticket = self._pop_revision_ticket(session, follow_up_queue, follow_up_lock)
+        revision_ticket = self._pop_revision_ticket(session, revision_queue, revision_lock)
         if revision_ticket is not None:
             self.runtime_control_plane.append_agent_run_feedback(
                 agent_run_id,
@@ -2459,9 +2483,9 @@ class CapabilityPackageSessionRunService:
                     {"package_id": package_id, "agent_run_id": agent_run_id},
                 ),
             )
-            followup_id = str(revision_ticket.get("followup_id") or "")
-            if followup_id:
-                session.mark_follow_up_consumed(followup_id)
+            revision_feedback_id = str(revision_ticket.get("revision_feedback_id") or "")
+            if revision_feedback_id:
+                session.mark_revision_feedback_consumed(revision_feedback_id)
             instruction = str(revision_ticket.get("text") or "").strip()
             instruction_title = (
                 _capability_text(
@@ -2483,7 +2507,7 @@ class CapabilityPackageSessionRunService:
                         "phase": "capability_package_revision_requested",
                         "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
                         "agent_run_id": agent_run_id,
-                        "followup_id": followup_id,
+                        "revision_feedback_id": revision_feedback_id,
                         "instruction": instruction,
                     },
                 ),
@@ -2595,22 +2619,22 @@ class CapabilityPackageSessionRunService:
     def _pop_revision_ticket(
         self,
         session: Any,
-        follow_up_queue: list[dict[str, Any]],
-        follow_up_lock: threading.Lock,
+        revision_queue: list[dict[str, Any]],
+        revision_lock: threading.Lock,
     ) -> dict[str, Any] | None:
         while True:
-            with follow_up_lock:
-                if not follow_up_queue:
+            with revision_lock:
+                if not revision_queue:
                     return None
-                ticket = follow_up_queue.pop(0)
-            followup_id = str(ticket.get("followup_id") or "").strip()
-            if not followup_id:
+                ticket = revision_queue.pop(0)
+            revision_feedback_id = str(ticket.get("revision_feedback_id") or "").strip()
+            if not revision_feedback_id:
                 return dict(ticket)
             cond = getattr(session, "cond", None)
             if cond is None:
                 return dict(ticket)
             with cond:
-                live_ticket = getattr(session, "follow_up_tickets", {}).get(followup_id)
+                live_ticket = getattr(session, "revision_feedback_tickets", {}).get(revision_feedback_id)
                 if not isinstance(live_ticket, dict):
                     return dict(ticket)
                 if live_ticket.get("state") == "pending":
@@ -3114,7 +3138,7 @@ def _capability_candidate_repair_request(
             locale,
         ),
         metadata={
-            "revision_followup_id": f"candidate-build-repair-{next_attempt}",
+            "revision_feedback_id": f"candidate-build-repair-{next_attempt}",
             "candidate_build_failure": details,
             "repair_attempt": next_attempt,
         },

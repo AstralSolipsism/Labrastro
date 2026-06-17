@@ -11,7 +11,7 @@ import pytest
 import labrastro_server.services.capability_packages as capability_packages_module
 from labrastro_server.interfaces.http.remote.service import (
     RemoteRelayHTTPService,
-    _RemoteSessionRun,
+    _SessionRunProjection,
 )
 from labrastro_server.services.agent_runtime.control_plane import AgentRunControlPlane
 from labrastro_server.services.agent_runtime.executor_backend import (
@@ -1982,7 +1982,7 @@ def test_revision_feedback_uses_public_draft_without_new_agent_run() -> None:
     control = _control_plane()
     ingest = CapabilityPackageIngestService(control)
     result = ingest.start({"source": {"type": "project_notes", "notes": "Review code changes."}})
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-revision-feedback",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5095,7 +5095,7 @@ def test_capability_package_session_reports_structured_skill_content_failure(
             raise AssertionError("invalid draft must not install")
 
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-skill-content-failure",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5178,7 +5178,7 @@ def test_capability_package_session_reports_incomplete_field_generation_without_
             raise AssertionError("incomplete field generation must not install")
 
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-field-incomplete",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5277,7 +5277,7 @@ def test_capability_package_session_reports_interrupted_output_beyond_display_ev
             raise AssertionError("interrupted draft must not install")
 
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-output-interrupted",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5372,7 +5372,7 @@ def test_capability_package_session_requests_approval_from_patch_stream_with_emp
 
     control = _control_plane()
     admin = FakeAdminManager()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-empty-list-patches",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5508,7 +5508,7 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
         )
         return int(document.get("last_event_seq") or 0)
 
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-1",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5688,7 +5688,7 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
 
 def test_capability_package_session_process_text_follows_english_locale(tmp_path: Path) -> None:
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-1",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5763,7 +5763,7 @@ def test_capability_package_session_unknown_failure_uses_session_locale(
 
     monkeypatch.setattr(CapabilityPackageIngestService, "start", fail_start)
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-1",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5795,7 +5795,7 @@ def test_capability_package_session_unknown_failure_uses_session_locale(
     assert failed_event["payload"]["message"] == "能力包流程执行失败。"
 
 
-def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Path) -> None:
+def test_capability_package_session_revision_feedback_revises_pending_draft(tmp_path: Path) -> None:
     class FakeAdminManager(_CandidateAdminMixin):
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
@@ -5806,7 +5806,7 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
 
     control = _control_plane()
     admin = FakeAdminManager()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-revise",
         peer_id="peer-1",
         session_hint="session-1",
@@ -5862,9 +5862,9 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         )
     )
 
-    session.submit_follow_up(
+    session.submit_revision_feedback(
         "把依赖改成 gh，不要用 hub",
-        followup_id="follow-revise",
+        revision_feedback_id="revision-revise",
         client_request_id="pending-revise",
     )
     _wait_for(
@@ -5893,8 +5893,8 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
     assert detail["activations"][1]["seq"] == 2
     assert detail["activations"][1]["input_kind"] == "user_feedback"
     assert (
-        detail["activations"][1]["input_payload"]["revision_followup_id"]
-        == "follow-revise"
+        detail["activations"][1]["input_payload"]["revision_feedback_id"]
+        == "revision-revise"
     )
     feedback_by_kind = {item["kind"]: item for item in detail["feedback"]}
     assert feedback_by_kind["candidate_ready"]["requires_activation"] is False
@@ -5916,8 +5916,8 @@ def test_capability_package_session_follow_up_revises_pending_draft(tmp_path: Pa
         for event in session.events
     )
     assert any(
-        event["type"] == "session_run_follow_up_consumed"
-        and event["payload"].get("followup_id") == "follow-revise"
+        event["type"] == "session_run_revision_feedback_consumed"
+        and event["payload"].get("revision_feedback_id") == "revision-revise"
         for event in session.events
     )
     assert any(
@@ -5964,7 +5964,7 @@ def test_capability_package_session_repairs_candidate_build_field_errors(
 
     control = _control_plane()
     admin = FakeAdminManager()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-candidate-repair",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6046,7 +6046,7 @@ def test_capability_package_session_repairs_candidate_build_field_errors(
     assert detail["activations"][1]["seq"] == 2
     assert detail["activations"][1]["input_kind"] == "server_feedback"
     payload = detail["activations"][1]["input_payload"]
-    assert payload["revision_followup_id"] == "candidate-build-repair-1"
+    assert payload["revision_feedback_id"] == "candidate-build-repair-1"
     assert payload["repair_attempt"] == 1
     assert payload["candidate_build_failure"]["error"] == (
         "capability_install_candidate_not_ready"
@@ -6127,7 +6127,7 @@ def test_peer_shutdown_keeps_capability_package_session_run_active(tmp_path: Pat
     http_service = object.__new__(RemoteRelayHTTPService)
     http_service._session_runs_lock = threading.Lock()
     http_service._session_runs = {}
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-peer-shutdown",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6188,7 +6188,7 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
             raise AssertionError("lease recovery test should stop at approval")
 
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-lease-recover",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6267,7 +6267,7 @@ def test_capability_package_session_cancel_cancels_agent_run(tmp_path: Path) -> 
             raise AssertionError("cancelled session must not install")
 
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-2",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6318,7 +6318,7 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
 
     control = _control_plane()
     admin = FakeAdminManager()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-approval-cancel",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6443,7 +6443,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
         return len(persisted)
 
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-trace",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6553,7 +6553,7 @@ def test_remote_session_run_replays_pending_trace_events_when_sink_is_attached(
     http_service._session_runs_lock = threading.Lock()
     http_service._session_runs = {}
     http_service.session_trace_event_sink = None
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-late-sink",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6609,7 +6609,7 @@ def test_remote_session_run_does_not_persist_when_sink_is_attached_without_trace
     http_service._session_runs_lock = threading.Lock()
     http_service._session_runs = {}
     http_service.session_trace_event_sink = None
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-memory-only",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6693,7 +6693,7 @@ def test_capability_package_session_surfaces_source_bundle_errors(
         fake_fetch,
     )
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-source-warning",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6785,7 +6785,7 @@ def test_capability_package_session_softens_partial_source_fetch_errors(
         fake_fetch,
     )
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-partial-source-warning",
         peer_id="peer-1",
         session_hint="session-1",
@@ -6856,7 +6856,7 @@ def test_capability_package_session_surfaces_empty_source_evidence(
         fake_fetch,
     )
     control = _control_plane()
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="session-run-empty-evidence",
         peer_id="peer-1",
         session_hint="session-1",
