@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import threading
 import time
@@ -19,6 +20,9 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRelation,
     AgentRunRelationType,
     AgentRunWaitingReason,
+    AgentThreadBinding,
+    AgentThreadBindingLifetime,
+    AgentThreadBindingStatus,
     ExecutionLocation,
     ExecutorType,
     PublishPolicy,
@@ -39,6 +43,7 @@ from reuleauxcoder.domain.hooks.lifecycle import (
 from reuleauxcoder.domain.permission_gateway import PermissionAction, PermissionDecision
 from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.services.agent_runtime.control_plane import (
+    AgentCallDispatchError,
     AgentRunRequest,
     AgentRunControlPlane,
 )
@@ -51,6 +56,32 @@ from labrastro_server.services.agent_runtime.postgres_store import PostgresAgent
 from labrastro_server.services.agent_runtime.runtime_store import (
     runtime_slot_key_for_agent_run,
 )
+from labrastro_server.services.agent_runtime.worktree import (
+    WorktreeManager,
+    WorktreeOwnershipError,
+)
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout.strip()
+
+
+def _init_git_repo(path: Path) -> Path:
+    path.mkdir(parents=True)
+    _git(path, "init")
+    _git(path, "config", "user.email", "agent@example.invalid")
+    _git(path, "config", "user.name", "Agent Test")
+    (path / "README.md").write_text("base\n", encoding="utf-8")
+    _git(path, "add", "README.md")
+    _git(path, "commit", "-m", "base")
+    return path
 
 
 class _FakeSandboxProvider:
@@ -106,27 +137,36 @@ def _relation(
     *,
     relation_type: AgentRunRelationType | str = AgentRunRelationType.AGENT_CALL_EPHEMERAL,
     metadata: dict | None = None,
+    payload: dict | None = None,
 ) -> AgentRunRelation:
     relation_type_value = (
         relation_type.value
         if isinstance(relation_type, AgentRunRelationType)
         else str(relation_type)
     )
+    relation_payload = dict(payload or {})
+    if not relation_payload:
+        if relation_type_value == AgentRunRelationType.AGENT_CALL_PERSISTENT.value:
+            relation_payload = {
+                "conversation_scope": "persistent",
+                "wait": True,
+                "thread_key": "",
+                "thread_summary": "Persistent thread",
+            }
+        else:
+            relation_payload = {"conversation_scope": "ephemeral", "wait": False}
     return AgentRunRelation(
         id="",
         owner_agent_run_id=owner_agent_run_id,
         related_agent_run_id="",
         relation_type=AgentRunRelationType(relation_type_value),
+        payload=relation_payload,
         metadata=dict(metadata or {}),
     )
 from labrastro_server.services.agent_runtime.session_projection import (
     agent_run_event_to_session_events,
 )
 from labrastro_server.services.agent_runtime.scheduler import BasicAgentScheduler
-from labrastro_server.services.agent_runtime.worktree import (
-    WorktreeManager,
-    WorktreeOwnershipError,
-)
 
 
 def _model_config() -> dict:
@@ -802,6 +842,147 @@ def test_agent_call_feedback_resume_keeps_sandbox_session_alive() -> None:
     assert sandbox.stopped_sessions == []
 
 
+def test_close_agent_thread_binding_cancels_target_and_allows_recreate() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-close-binding",
+    )
+    child = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-close-binding",
+        agent_id="researcher",
+        prompt="collect context",
+        thread_key="project",
+        thread_summary="Project context",
+        wait=False,
+    )
+    binding = control.load_agent_run_detail(parent.id)["agent_thread_bindings"][0]
+
+    assert control.close_agent_thread_binding(binding["id"], reason="user_closed")
+
+    closed = control.load_agent_run_detail(parent.id)["agent_thread_bindings"][0]
+    assert closed["status"] == AgentThreadBindingStatus.CLOSED.value
+    assert control.get_agent_run(child.id).status == AgentRunStatus.CANCELLED
+
+    replacement = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-close-binding",
+        agent_id="researcher",
+        prompt="collect again",
+        thread_key="project",
+        thread_summary="Project context",
+        wait=False,
+    )
+    reopened = control.load_agent_run_detail(parent.id)["agent_thread_bindings"][0]
+    assert replacement.id != child.id
+    assert reopened["status"] == AgentThreadBindingStatus.ACTIVE.value
+    assert reopened["target_agent_run_id"] == replacement.id
+
+
+def test_unavailable_agent_thread_binding_blocks_silent_recreate() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-unavailable-binding",
+    )
+    child = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-unavailable-binding",
+        agent_id="researcher",
+        prompt="collect context",
+        thread_key="project",
+        thread_summary="Project context",
+        wait=False,
+    )
+    binding = control.load_agent_run_detail(parent.id)["agent_thread_bindings"][0]
+
+    assert control.mark_agent_thread_binding_unavailable(
+        binding["id"],
+        reason="agent_config_unavailable",
+        cancel_target=False,
+    )
+
+    with pytest.raises(AgentCallDispatchError) as exc_info:
+        control.call_persistent_agent(
+            owner_agent_run_id=parent.id,
+            owner_session_run_id="session-unavailable-binding",
+            agent_id="researcher",
+            prompt="collect again",
+            thread_key="project",
+            thread_summary="Project context",
+            wait=False,
+        )
+
+    assert exc_info.value.code == "agent_thread_unavailable"
+    assert control.get_agent_run(child.id).status == AgentRunStatus.QUEUED
+
+
+def test_delete_owner_session_agent_thread_bindings_cancels_targets() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-delete-binding",
+    )
+    child = control.call_persistent_agent(
+        owner_agent_run_id=parent.id,
+        owner_session_run_id="session-delete-binding",
+        agent_id="researcher",
+        prompt="collect context",
+        thread_key="project",
+        thread_summary="Project context",
+        wait=False,
+    )
+    binding = control.load_agent_run_detail(parent.id)["agent_thread_bindings"][0]
+
+    deleted = control.delete_agent_thread_bindings_for_owner_session(
+        "session-delete-binding",
+        reason="owner_session_deleted",
+    )
+
+    assert deleted == [binding["id"]]
+    assert control.get_agent_run(child.id).status == AgentRunStatus.CANCELLED
+    assert control.load_agent_run_detail(parent.id)["agent_thread_bindings"] == []
+    assert control.load_agent_run_detail(child.id)["agent_thread_bindings"] == []
+
+
+def test_run_lifetime_agent_thread_binding_closes_when_main_run_terminal() -> None:
+    control = AgentRunControlPlane(max_running_tasks=4)
+    parent = control.submit_agent_run(
+        AgentRunRequest(agent_id="planner", prompt="parent"),
+        task_id="parent-run-lifetime-binding",
+    )
+    child = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="researcher",
+            prompt="child",
+            owner_session_run_id="session-run-lifetime-binding",
+        ),
+        task_id="child-run-lifetime-binding",
+    )
+    binding = AgentThreadBinding(
+        id="binding-run-lifetime",
+        owner_session_run_id="session-run-lifetime-binding",
+        main_agent_run_id=parent.id,
+        agent_id="researcher",
+        target_agent_run_id=child.id,
+        thread_key="project",
+        thread_summary="Project context",
+        binding_lifetime=AgentThreadBindingLifetime.RUN,
+    )
+    control.upsert_agent_thread_binding(binding)
+
+    control.complete_agent_run_activation(
+        parent.id,
+        ExecutorRunResult(task_id=parent.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, parent.id),
+    )
+
+    updated = control.load_agent_run_detail(parent.id)["agent_thread_bindings"][0]
+    assert updated["status"] == AgentThreadBindingStatus.CLOSED.value
+    assert control.get_agent_run(child.id).status == AgentRunStatus.CANCELLED
+
+
 def test_persistent_agent_call_rejects_relation_metadata_override() -> None:
     control = AgentRunControlPlane(max_running_tasks=4)
     parent = control.submit_agent_run(
@@ -888,9 +1069,9 @@ def test_lifecycle_agent_adapter_child_completion_projects_to_parent_session() -
     assert "parent_run_id" not in child
     assert "lifecycle_hook_id" not in child["metadata"]
     relation = control.load_agent_run_detail(parent.id)["relations"][0]
-    assert relation["metadata"]["lifecycle_hook_id"] == "hook:lifecycle-agent-review"
-    assert relation["metadata"]["parent_session_id"] == "session-1"
-    assert relation["metadata"]["parent_turn_id"] == "turn-1"
+    assert relation["payload"]["lifecycle_hook_id"] == "hook:lifecycle-agent-review"
+    assert relation["payload"]["parent_session_id"] == "session-1"
+    assert relation["payload"]["parent_turn_id"] == "turn-1"
 
     control.complete_agent_run_activation(
         child["id"],
@@ -987,9 +1168,26 @@ def test_activation_and_feedback_events_project_without_internal_payloads() -> N
             },
         },
     }
-    agent_call_failed_event = {
+    steer_delivered_event = {
         "agent_run_id": "run-1",
         "seq": 4,
+        "type": "activation_steer_delivered",
+        "payload": {
+            "activation_id": "run-1:activation:2",
+            "steer_id": "steer-1",
+            "steer": {
+                "id": "steer-1",
+                "activation_id": "run-1:activation:2",
+                "source": "user",
+                "payload": {"message": "internal same-turn input"},
+                "status": "delivered",
+                "metadata": {"secret": "nope"},
+            },
+        },
+    }
+    agent_call_failed_event = {
+        "agent_run_id": "run-1",
+        "seq": 5,
         "type": "agent_run_feedback_added",
         "payload": {
             "feedback_id": "feedback-agent-call-failed",
@@ -1016,6 +1214,9 @@ def test_activation_and_feedback_events_project_without_internal_payloads() -> N
     projected_activation = agent_run_event_to_session_events(activation_event)[0]
     projected_feedback = agent_run_event_to_session_events(feedback_event)[0]
     projected_steer = agent_run_event_to_session_events(steer_event)[0]
+    projected_steer_delivered = agent_run_event_to_session_events(
+        steer_delivered_event
+    )[0]
     projected_agent_call_failed = agent_run_event_to_session_events(
         agent_call_failed_event
     )[0]
@@ -1035,6 +1236,12 @@ def test_activation_and_feedback_events_project_without_internal_payloads() -> N
     assert projected_steer[1]["steer"]["status"] == "queued"
     assert "payload" not in projected_steer[1]["steer"]
     assert "metadata" not in projected_steer[1]["steer"]
+    assert projected_steer_delivered[1]["phase"] == (
+        "agent_run_activation_steer_delivered"
+    )
+    assert projected_steer_delivered[1]["steer"]["status"] == "delivered"
+    assert "payload" not in projected_steer_delivered[1]["steer"]
+    assert "metadata" not in projected_steer_delivered[1]["steer"]
     assert projected_agent_call_failed[0] == "context_event"
     assert projected_agent_call_failed[1]["phase"] == "agent_call_failed"
     assert projected_agent_call_failed[1]["agent_call"]["agent_id"] == "Reviewer"
@@ -1247,29 +1454,40 @@ def test_runtime_events_are_limited_and_task_detail_reads_tail() -> None:
     assert detail["activations"][0]["status"] == "queued"
 
 
-def test_activation_steer_queues_feedback_without_new_run_or_activation() -> None:
+def test_activation_steer_queues_mailbox_item_without_feedback_or_new_activation() -> None:
     control = AgentRunControlPlane()
     task = control.submit_agent_run(
-        AgentRunRequest(agent_id="coder", prompt="initial task"),
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+            execution_location=ExecutionLocation.DAEMON_WORKTREE,
+        ),
         task_id="task-steer",
     )
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
 
-    steer, feedback = control.append_activation_steer(
+    steer = control.append_activation_steer(
         task.id,
         source="user",
-        payload={"message": "add this context"},
-        metadata={"turn_id": "turn-1"},
+        payload={"items": [{"type": "text", "text": "add this context"}]},
+        metadata={
+            "client_steer_id": "client-steer-1",
+            "idempotency_key": "client-steer-1",
+            "sender": "user-1",
+        },
         steer_id="steer-1",
     )
 
     detail = control.load_agent_run_detail(task.id)
     assert steer.activation_id == "task-steer:activation:1"
-    assert feedback.agent_run_id == task.id
-    assert feedback.kind.value == "user_message"
-    assert feedback.metadata["steer_id"] == "steer-1"
-    assert feedback.metadata["fallback_reason"] == (
-        "same_activation_steer_delivery_unavailable"
-    )
     assert detail["agent_run"]["id"] == task.id
     assert [activation["id"] for activation in detail["activations"]] == [
         "task-steer:activation:1"
@@ -1279,42 +1497,278 @@ def test_activation_steer_queues_feedback_without_new_run_or_activation() -> Non
             "id": "steer-1",
             "activation_id": "task-steer:activation:1",
             "source": "user",
-            "payload": {"message": "add this context"},
+            "payload": {"items": [{"type": "text", "text": "add this context"}]},
             "created_at": steer.created_at,
             "delivered_at": None,
             "status": "queued",
-            "metadata": {"turn_id": "turn-1"},
+            "metadata": {
+                "client_steer_id": "client-steer-1",
+                "idempotency_key": "client-steer-1",
+                "sender": "user-1",
+            },
         }
     ]
-    assert detail["feedback"][0]["id"] == feedback.id
-    assert detail["feedback"][0]["consumed_by_activation_id"] is None
-    assert [event["type"] for event in detail["events"]][-2:] == [
+    assert detail["feedback"] == []
+    assert [event["type"] for event in detail["events"]][-1:] == [
         "activation_steer_queued",
-        "agent_run_feedback_added",
     ]
 
-    control.complete_agent_run_activation(
-        task.id,
-        ExecutorRunResult(task_id=task.id, status="blocked", output="paused"),
-        activation_id=_current_activation_id(control, task.id),
+
+def test_activation_steer_requires_active_worker_claim() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+        ),
+        task_id="task-steer-no-claim",
     )
-    resumed = control.continue_agent_run(
-        task.id,
-        input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
-        input_payload={"feedback_id": feedback.id},
-        feedback_id=feedback.id,
-        prompt="continue with queued steer",
+    control.append_executor_event(task.id, ExecutorEvent.status("running"))
+
+    with pytest.raises(ValueError, match="active worker claim"):
+        control.append_activation_steer(
+            task.id,
+            source="user",
+            payload={"items": [{"type": "text", "text": "should wait"}]},
+            metadata={
+                "idempotency_key": "client-no-claim",
+                "sender": "user-1",
+            },
+        )
+
+
+def test_activation_steer_idempotency_replays_same_payload_and_rejects_conflict() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+        ),
+        task_id="task-steer-idempotent",
+    )
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
     )
 
-    assert resumed.id == task.id
-    resumed_detail = control.load_agent_run_detail(task.id)
-    assert [activation["id"] for activation in resumed_detail["activations"]] == [
-        "task-steer:activation:1",
-        "task-steer:activation:2",
-    ]
-    assert resumed_detail["feedback"][0]["consumed_by_activation_id"] == (
-        "task-steer:activation:2"
+    metadata = {"idempotency_key": "client-repeat", "sender": "user-1"}
+    first = control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "same"}]},
+        metadata=metadata,
+        steer_id="steer-repeat-1",
     )
+    replay = control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "same"}]},
+        metadata=metadata,
+    )
+
+    assert replay.id == first.id
+    assert len(control.load_agent_run_detail(task.id)["activation_steers"]) == 1
+    with pytest.raises(ValueError, match="activation_steer_idempotency_conflict"):
+        control.append_activation_steer(
+            task.id,
+            source="user",
+            payload={"items": [{"type": "text", "text": "different"}]},
+            metadata=metadata,
+        )
+
+
+def test_activation_steer_heartbeat_delivers_and_acknowledges_mailbox_item() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+        ),
+        task_id="task-steer-delivery",
+    )
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+    control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={
+            "items": [
+                {"type": "text", "text": "add this"},
+                {"type": "image_ref", "uri": "asset://image-1"},
+            ]
+        },
+        steer_id="steer-delivery-1",
+    )
+
+    delivery = control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+
+    assert delivery["cancel_requested"] is False
+    assert [item["id"] for item in delivery["activation_steers"]] == [
+        "steer-delivery-1"
+    ]
+    assert delivery["activation_steers"][0]["status"] == "delivering"
+    assert delivery["activation_steers"][0]["payload"]["items"][1]["uri"] == (
+        "asset://image-1"
+    )
+
+    ack = control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+        delivered_steer_ids=["steer-delivery-1"],
+    )
+
+    detail = control.load_agent_run_detail(task.id)
+    assert ack["activation_steers"] == []
+    assert detail["activation_steers"][0]["status"] == "delivered"
+    assert detail["activation_steers"][0]["delivered_at"] is not None
+    assert [event["type"] for event in detail["events"]][-2:] == [
+        "activation_steer_delivering",
+        "activation_steer_delivered",
+    ]
+
+
+def test_activation_steer_requeues_delivering_item_after_stale_claim_recovery() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+        ),
+        task_id="task-steer-stale",
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="worker-1",
+        executors=["codex"],
+        lease_sec=1,
+    )
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+    control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "recover me"}]},
+        metadata={"idempotency_key": "recover-me", "sender": "user-1"},
+        steer_id="steer-recover-1",
+    )
+    delivery = control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+    assert delivery["activation_steers"][0]["status"] == "delivering"
+
+    assert control.recover_stale_agent_runs(now=9999999999) == [task.id]
+    recovered = control.load_agent_run_detail(task.id)["activation_steers"][0]
+    assert recovered["status"] == "queued"
+    assert "delivering_request_id" not in recovered["metadata"]
+    next_claim = control.claim_agent_run_activation(
+        worker_id="worker-2",
+        executors=["codex"],
+    )
+    assert next_claim is not None
+    redelivery = control.heartbeat_agent_run_activation(
+        request_id=next_claim.request_id,
+        task_id=task.id,
+        activation_id=next_claim.activation_id,
+        worker_id="worker-2",
+    )
+    assert [item["id"] for item in redelivery["activation_steers"]] == [
+        "steer-recover-1"
+    ]
+
+
+def test_activation_steer_cancel_requested_takes_priority_over_delivery() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+        ),
+        task_id="task-steer-cancel-priority",
+    )
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+    control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "too late"}]},
+        steer_id="steer-cancel-priority-1",
+    )
+    assert control.cancel_agent_run(task.id, reason="user_stop") is True
+
+    heartbeat = control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+
+    detail = control.load_agent_run_detail(task.id)
+    assert heartbeat["cancel_requested"] is True
+    assert heartbeat["activation_steers"] == []
+    assert detail["activation_steers"][0]["status"] == "queued"
+
+
+def test_activation_steer_rejects_explicit_executor_capability_mismatch() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="initial task",
+            executor=ExecutorType.CODEX,
+            metadata={"activation_steer_supported": False},
+        ),
+        task_id="task-steer-unsupported",
+    )
+    claim = control.claim_agent_run_activation(worker_id="worker-1", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-1",
+    )
+
+    with pytest.raises(ValueError, match="not supported"):
+        control.append_activation_steer(
+            task.id,
+            source="user",
+            payload={"items": [{"type": "text", "text": "blocked"}]},
+        )
 
 
 def test_non_required_feedback_does_not_block_successful_agent_run_completion() -> None:
@@ -3772,6 +4226,165 @@ def test_worktree_manager_rejects_paths_outside_runtime_root() -> None:
         pass
     else:
         raise AssertionError("expected WorktreeOwnershipError")
+
+
+def test_worktree_manager_creates_and_cleans_real_git_branch_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    manager = WorktreeManager(tmp_path / "runtime")
+    plan = manager.plan(
+        workspace_id="session-1",
+        task_id="task-branch",
+        agent_id="coder",
+    )
+
+    prepared = manager.create_branch_worktree(
+        source_repo=repo,
+        plan=plan,
+        base_ref="HEAD",
+    )
+
+    assert prepared.branch_name == "agent/coder/task-branch"
+    assert prepared.branch_git_ref == "refs/heads/agent/coder/task-branch"
+    assert prepared.worktree_path.is_dir()
+    assert _git(repo, "show-ref", "--verify", prepared.branch_git_ref)
+    assert Path(
+        _git(prepared.worktree_path, "rev-parse", "--show-toplevel")
+    ).resolve() == prepared.worktree_path
+
+    cleanup = manager.cleanup_branch_worktree(
+        source_repo=repo,
+        branch_name=prepared.branch_name,
+        worktree_path=prepared.worktree_path,
+        delete_branch=True,
+    )
+
+    assert cleanup.ok
+    assert cleanup.removed_worktree is True
+    assert cleanup.deleted_branch is True
+    assert not prepared.worktree_path.exists()
+    branch_check = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            prepared.branch_git_ref,
+        ],
+        check=False,
+    )
+    assert branch_check.returncode != 0
+
+
+def test_branch_agent_run_creates_relation_payload_and_cleans_worktree_on_cascade(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    control = AgentRunControlPlane()
+    source = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="base",
+            owner_session_run_id="session-branch",
+            executor=ExecutorType.CODEX,
+            execution_location=ExecutionLocation.LOCAL_WORKSPACE,
+            workdir=str(repo),
+            executor_session_id="live-source-session",
+        ),
+        task_id="source-run",
+    )
+
+    branch = control.branch_agent_run(
+        source_agent_run_id=source.id,
+        base_session_item_id="session-item-1",
+        runtime_root=str(tmp_path / "runtime"),
+        repo_root=str(repo),
+        prompt="continue on branch",
+        task_id="branch-run",
+    )
+    detail = control.load_agent_run_detail(branch.id)
+    relation = next(
+        item
+        for item in detail["relations"]
+        if item["relation_type"] == AgentRunRelationType.BRANCH.value
+    )
+    payload = relation["payload"]
+
+    assert branch.owner_session_run_id == source.owner_session_run_id
+    assert branch.executor_session_id is None
+    assert branch.execution_location == ExecutionLocation.DAEMON_WORKTREE
+    assert branch.worktree_role == WorktreeRole.TARGET
+    assert branch.publish_policy == PublishPolicy.BRANCH
+    assert payload["source_agent_run_id"] == source.id
+    assert payload["target_agent_run_id"] == branch.id
+    assert payload["base_session_item_id"] == "session-item-1"
+    assert payload["branch_name"] == "agent/coder/branch-run"
+    assert payload["branch_git_ref"] == "refs/heads/agent/coder/branch-run"
+    assert payload["branch_worktree_ref"] == branch.workdir
+    assert payload["permission_recompute_policy"] == "recompute_or_reject"
+    assert payload["reuse_live_executor_session"] is False
+    assert payload["cleanup_policy"] == "delete_with_owner_session"
+    assert payload["source_workspace_root"] == str(repo)
+    assert Path(payload["branch_worktree_ref"]).is_dir()
+
+    assert control.cancel_agent_run(source.id, reason="delete_owner_session") is True
+
+    assert control.get_agent_run(branch.id).status == AgentRunStatus.CANCELLED
+    assert not Path(payload["branch_worktree_ref"]).exists()
+
+
+def test_fork_agent_run_creates_typed_relation_without_reusing_live_session() -> None:
+    control = AgentRunControlPlane()
+    source = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="base",
+            owner_session_run_id="session-fork",
+            executor=ExecutorType.CODEX,
+            execution_location=ExecutionLocation.LOCAL_WORKSPACE,
+            workdir="/workspace/source",
+            executor_session_id="live-source-session",
+        ),
+        task_id="source-fork-run",
+    )
+
+    fork = control.fork_agent_run(
+        source_agent_run_id=source.id,
+        base_session_item_id="session-item-2",
+        fork_workspace_ref="fork:workspace:session-item-2",
+        target_owner_session_run_id="session-fork-target",
+        prompt="continue from fork",
+        task_id="fork-run",
+        provenance_status="redacted",
+    )
+    detail = control.load_agent_run_detail(fork.id)
+    relation = next(
+        item
+        for item in detail["relations"]
+        if item["relation_type"] == AgentRunRelationType.FORK.value
+    )
+    payload = relation["payload"]
+
+    assert fork.owner_session_run_id == "session-fork-target"
+    assert fork.executor_session_id != source.executor_session_id
+    assert fork.workdir is None
+    assert fork.workspace_ref == "fork:workspace:session-item-2"
+    assert payload == {
+        "source_agent_run_id": source.id,
+        "target_agent_run_id": fork.id,
+        "base_session_item_id": "session-item-2",
+        "fork_workspace_ref": "fork:workspace:session-item-2",
+        "source_owner_session_run_id": "session-fork",
+        "target_owner_session_run_id": "session-fork-target",
+        "source_workspace_ref": "",
+        "permission_recompute_policy": "recompute_or_reject",
+        "reuse_live_executor_session": False,
+        "cleanup_policy": "delete_with_owner_session",
+        "provenance_status": "redacted",
+    }
 
 
 def test_basic_scheduler_selects_lowest_running_agent() -> None:

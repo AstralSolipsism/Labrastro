@@ -76,4 +76,5 @@ def test_agent_run_activation_schema_is_folded_into_initial_baseline() -> None:
     assert "CREATE TABLE IF NOT EXISTS labrastro_agent_thread_bindings" in baseline_sql
     assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_activation_claims" in baseline_sql
     assert "CREATE TABLE IF NOT EXISTS labrastro_agent_run_activation_steers" in baseline_sql
+    assert "idx_labrastro_agent_run_activation_steers_idempotency" in baseline_sql
     assert "CREATE TABLE IF NOT EXISTS labrastro_agent_call_grants" in baseline_sql

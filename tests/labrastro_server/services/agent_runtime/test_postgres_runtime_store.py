@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 
 import pytest
 from sqlalchemy import text
@@ -42,17 +43,30 @@ def _relation(
     *,
     relation_type: AgentRunRelationType | str = AgentRunRelationType.AGENT_CALL_EPHEMERAL,
     metadata: dict | None = None,
+    payload: dict | None = None,
 ) -> AgentRunRelation:
     relation_type_value = (
         relation_type.value
         if isinstance(relation_type, AgentRunRelationType)
         else str(relation_type)
     )
+    relation_payload = dict(payload or {})
+    if not relation_payload:
+        if relation_type_value == AgentRunRelationType.AGENT_CALL_PERSISTENT.value:
+            relation_payload = {
+                "conversation_scope": "persistent",
+                "wait": True,
+                "thread_key": "",
+                "thread_summary": "Persistent thread",
+            }
+        else:
+            relation_payload = {"conversation_scope": "ephemeral", "wait": False}
     return AgentRunRelation(
         id="",
         owner_agent_run_id=owner_agent_run_id,
         related_agent_run_id="",
         relation_type=AgentRunRelationType(relation_type_value),
+        payload=relation_payload,
         metadata=dict(metadata or {}),
     )
 
@@ -391,25 +405,41 @@ def test_postgres_agent_call_grant_is_bound_to_capability_scope() -> None:
     assert mismatched_scope is None
 
 
-def test_postgres_activation_steer_persists_and_queues_feedback() -> None:
+def test_postgres_activation_steer_persists_mailbox_item_without_feedback() -> None:
     control = _control()
     task = control.submit_agent_run(
-        AgentRunRequest(agent_id="pg-agent", prompt="postgres steer"),
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="postgres steer",
+            executor="codex",
+            execution_location="daemon_worktree",
+        ),
         task_id="pg-steer-run",
     )
+    claim = control.claim_agent_run_activation(worker_id="worker-pg", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-pg",
+    )
 
-    steer, feedback = control.append_activation_steer(
+    steer = control.append_activation_steer(
         task.id,
         source="user",
-        payload={"message": "extra context"},
-        metadata={"turn_id": "turn-pg"},
+        payload={"items": [{"type": "text", "text": "extra context"}]},
+        metadata={
+            "client_steer_id": "client-pg",
+            "idempotency_key": "client-pg",
+            "sender": "user-pg",
+        },
         steer_id="pg-steer-1",
     )
 
     detail = control.load_agent_run_detail(task.id)
     json.dumps(detail)
     assert steer.activation_id == "pg-steer-run:activation:1"
-    assert feedback.metadata["steer_id"] == "pg-steer-1"
     assert [activation["id"] for activation in detail["activations"]] == [
         "pg-steer-run:activation:1"
     ]
@@ -417,13 +447,116 @@ def test_postgres_activation_steer_persists_and_queues_feedback() -> None:
     assert detail["activation_steers"][0]["activation_id"] == (
         "pg-steer-run:activation:1"
     )
-    assert detail["activation_steers"][0]["payload"] == {"message": "extra context"}
-    assert detail["feedback"][0]["metadata"]["fallback_reason"] == (
-        "same_activation_steer_delivery_unavailable"
-    )
-    assert [event["type"] for event in detail["events"]][-2:] == [
+    assert detail["activation_steers"][0]["payload"] == {
+        "items": [{"type": "text", "text": "extra context"}]
+    }
+    assert detail["feedback"] == []
+    assert [event["type"] for event in detail["events"]][-1:] == [
         "activation_steer_queued",
-        "agent_run_feedback_added",
+    ]
+
+
+def test_postgres_activation_steer_enforces_idempotency_key() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="postgres steer idempotency",
+            executor="codex",
+            execution_location="daemon_worktree",
+        ),
+        task_id="pg-steer-idempotent",
+    )
+    claim = control.claim_agent_run_activation(worker_id="worker-pg", executors=["codex"])
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-pg",
+    )
+
+    metadata = {"idempotency_key": "client-pg-repeat", "sender": "user-pg"}
+    first = control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "same"}]},
+        metadata=metadata,
+        steer_id="pg-steer-repeat-1",
+    )
+    replay = control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "same"}]},
+        metadata=metadata,
+    )
+
+    assert replay.id == first.id
+    assert len(control.load_agent_run_detail(task.id)["activation_steers"]) == 1
+    with pytest.raises(ValueError, match="activation_steer_idempotency_conflict"):
+        control.append_activation_steer(
+            task.id,
+            source="user",
+            payload={"items": [{"type": "text", "text": "different"}]},
+            metadata=metadata,
+        )
+
+
+def test_postgres_activation_steer_requeues_delivering_item_after_stale_claim_recovery() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="postgres stale steer",
+            executor="codex",
+            execution_location="daemon_worktree",
+        ),
+        task_id="pg-steer-stale",
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="worker-pg-1",
+        executors=["codex"],
+        lease_sec=1,
+    )
+    assert claim is not None
+    control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-pg-1",
+    )
+    control.append_activation_steer(
+        task.id,
+        source="user",
+        payload={"items": [{"type": "text", "text": "recover me"}]},
+        metadata={"idempotency_key": "client-pg-recover", "sender": "user-pg"},
+        steer_id="pg-steer-recover-1",
+    )
+    delivery = control.heartbeat_agent_run_activation(
+        request_id=claim.request_id,
+        task_id=task.id,
+        activation_id=claim.activation_id,
+        worker_id="worker-pg-1",
+    )
+    assert delivery["activation_steers"][0]["status"] == "delivering"
+
+    assert control.recover_stale_agent_runs(now=time.time() + 3600) == [task.id]
+    recovered = control.load_agent_run_detail(task.id)["activation_steers"][0]
+    assert recovered["status"] == "queued"
+    assert "delivering_request_id" not in recovered["metadata"]
+    next_claim = control.claim_agent_run_activation(
+        worker_id="worker-pg-2",
+        executors=["codex"],
+    )
+    assert next_claim is not None
+    redelivery = control.heartbeat_agent_run_activation(
+        request_id=next_claim.request_id,
+        task_id=task.id,
+        activation_id=next_claim.activation_id,
+        worker_id="worker-pg-2",
+    )
+    assert [item["id"] for item in redelivery["activation_steers"]] == [
+        "pg-steer-recover-1"
     ]
 
 
