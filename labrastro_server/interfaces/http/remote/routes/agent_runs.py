@@ -247,6 +247,15 @@ class RemoteAgentRunRoutes:
                 if payload.get("lease_sec") is not None
                 else None
             ),
+            delivered_steer_ids=[
+                str(item)
+                for item in (
+                    payload.get("delivered_steer_ids")
+                    if isinstance(payload.get("delivered_steer_ids"), list)
+                    else []
+                )
+                if str(item).strip()
+            ],
         )
         self._send_json(HTTPStatus.OK, response)
 

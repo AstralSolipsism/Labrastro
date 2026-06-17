@@ -118,6 +118,17 @@ def upgrade() -> None:
     )
     op.execute(
         """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_labrastro_agent_run_activation_steers_idempotency
+            ON labrastro_agent_run_activation_steers(
+                activation_id,
+                COALESCE(metadata->>'sender', ''),
+                COALESCE(metadata->>'idempotency_key', '')
+            )
+            WHERE COALESCE(metadata->>'idempotency_key', '') <> ''
+        """
+    )
+    op.execute(
+        """
         CREATE TABLE IF NOT EXISTS labrastro_agent_run_feedback (
             id TEXT PRIMARY KEY,
             agent_run_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
@@ -142,6 +153,7 @@ def upgrade() -> None:
             relation_scope TEXT NOT NULL DEFAULT 'session',
             created_by_activation_id TEXT REFERENCES labrastro_agent_run_activations(id) ON DELETE SET NULL,
             status TEXT NOT NULL DEFAULT 'active',
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),

@@ -106,6 +106,66 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+_ACTIVATION_STEER_ITEM_TYPES = {
+    "text",
+    "image_ref",
+    "file_ref",
+    "artifact_ref",
+    "session_item_ref",
+}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _validate_activation_steer_payload(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("activation steer payload must be an object")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("activation steer payload requires non-empty items")
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("activation steer item must be an object")
+        item_type = str(item.get("type") or "").strip()
+        if item_type not in _ACTIVATION_STEER_ITEM_TYPES:
+            raise ValueError("unsupported activation steer item type")
+
+
+def _normalize_activation_steer_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    source: ActivationSteerSource,
+    fallback_key: str,
+) -> dict[str, Any]:
+    value = dict(metadata or {})
+    idempotency_key = str(
+        value.get("idempotency_key") or value.get("client_steer_id") or fallback_key
+    ).strip()
+    if not idempotency_key:
+        raise ValueError("activation steer idempotency_key is required")
+    value["idempotency_key"] = idempotency_key
+    value.setdefault("sender", source.value)
+    value["sender"] = str(value.get("sender") or source.value).strip() or source.value
+    return value
+
+
+def _activation_steer_idempotency_scope(
+    metadata: dict[str, Any],
+) -> tuple[str, str]:
+    return (
+        str(metadata.get("sender") or "").strip(),
+        str(metadata.get("idempotency_key") or "").strip(),
+    )
+
+
 def _default_executor_session_id(task_id: str) -> str:
     safe = "".join(
         ch if ch.isalnum() or ch in "._-" else "-"
@@ -223,6 +283,19 @@ def _jsonable_row(row: Any) -> dict[str, Any]:
     return result
 
 
+def _steer_from_row(row: Any) -> ActivationSteer:
+    return ActivationSteer(
+        id=str(row["id"]),
+        activation_id=str(row["activation_id"]),
+        source=str(row["source"]),
+        payload=_dict_from(row["payload"]),
+        created_at=_timestamp_text(row["created_at"]) or "",
+        delivered_at=_timestamp_text(row["delivered_at"]),
+        status=str(row["status"]),
+        metadata=_dict_from(row["metadata"]),
+    )
+
+
 def _timestamp_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -302,6 +375,7 @@ def _relation_to_dict(relation: AgentRunRelation) -> dict[str, Any]:
         "relation_scope": relation.relation_scope,
         "created_by_activation_id": relation.created_by_activation_id,
         "status": relation.status.value,
+        "payload": dict(relation.payload),
         "metadata": dict(relation.metadata),
     }
 
@@ -315,6 +389,7 @@ def _relation_row_to_dict(row: Any) -> dict[str, Any]:
         "relation_scope": str(row["relation_scope"]),
         "created_by_activation_id": row["created_by_activation_id"],
         "status": str(row["status"]),
+        "payload": _dict_from(row["payload"]),
         "metadata": _dict_from(row["metadata"]),
     }
 
@@ -453,58 +528,19 @@ def _relation_from_submit_request(
         relation_scope=relation.relation_scope,
         created_by_activation_id=relation.created_by_activation_id,
         status=relation.status,
+        payload=dict(relation.payload),
         metadata=dict(relation.metadata),
     )
 
 
 _TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "cancelled", "blocked"}
 _CANCEL_REQUEST_AGENT_RUN_STATUSES = {"dispatched", "running", "waiting"}
-_ACTIVE_STEER_AGENT_RUN_STATUSES = {"queued", "dispatched", "running", "waiting"}
-_ACTIVE_AGENT_RUN_STATUSES = _ACTIVE_STEER_AGENT_RUN_STATUSES
+_ACTIVE_STEER_AGENT_RUN_STATUSES = {"running"}
+_ACTIVE_AGENT_RUN_STATUSES = {"queued", "dispatched", "running", "waiting"}
 _AGENT_CALL_FEEDBACK_KINDS = {
     AgentRunFeedbackKind.AGENT_CALL_RESULT.value,
     AgentRunFeedbackKind.AGENT_CALL_FAILED.value,
 }
-
-
-def _feedback_source_for_steer(
-    source: ActivationSteerSource,
-) -> AgentRunFeedbackSource:
-    if source == ActivationSteerSource.USER:
-        return AgentRunFeedbackSource.USER
-    if source == ActivationSteerSource.ADMIN:
-        return AgentRunFeedbackSource.ADMIN
-    return AgentRunFeedbackSource.SYSTEM
-
-
-def _feedback_kind_for_steer(source: ActivationSteerSource) -> AgentRunFeedbackKind:
-    if source == ActivationSteerSource.USER:
-        return AgentRunFeedbackKind.USER_MESSAGE
-    return AgentRunFeedbackKind.RETRY_INSTRUCTION
-
-
-def _feedback_payload_for_steer(steer: ActivationSteer) -> dict[str, Any]:
-    return {
-        "kind": "activation_steer_pending_feedback",
-        "activation_id": steer.activation_id,
-        "steer_id": steer.id,
-        "source": steer.source.value,
-        "payload": dict(steer.payload),
-    }
-
-
-def _feedback_metadata_for_steer(
-    steer: ActivationSteer,
-    metadata: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        **metadata,
-        "activation_id": steer.activation_id,
-        "steer_id": steer.id,
-        "steer_status": steer.status.value,
-        "fallback_reason": "same_activation_steer_delivery_unavailable",
-        "delivery_path": "feedback_after_activation",
-    }
 
 
 def _waiting_reason_for_required_feedback_kind(
@@ -810,17 +846,18 @@ class PostgresAgentRunStore:
                 """
                 INSERT INTO labrastro_agent_run_relations (
                     id, owner_agent_run_id, related_agent_run_id, relation_type,
-                    relation_scope, created_by_activation_id, status, metadata
+                    relation_scope, created_by_activation_id, status, payload, metadata
                 ) VALUES (
                     :id, :owner_agent_run_id, :related_agent_run_id, :relation_type,
                     :relation_scope, :created_by_activation_id, :status,
-                    CAST(:metadata AS JSONB)
+                    CAST(:payload AS JSONB), CAST(:metadata AS JSONB)
                 )
                 ON CONFLICT (owner_agent_run_id, related_agent_run_id, relation_type)
                 DO UPDATE SET
                     relation_scope=EXCLUDED.relation_scope,
                     created_by_activation_id=EXCLUDED.created_by_activation_id,
                     status=EXCLUDED.status,
+                    payload=EXCLUDED.payload,
                     metadata=EXCLUDED.metadata,
                     updated_at=now()
                 """
@@ -833,6 +870,7 @@ class PostgresAgentRunStore:
                 "relation_scope": relation.relation_scope,
                 "created_by_activation_id": relation.created_by_activation_id,
                 "status": relation.status.value,
+                "payload": _json(relation.payload),
                 "metadata": _json(relation.metadata),
             },
         )
@@ -890,11 +928,13 @@ class PostgresAgentRunStore:
         agent_id: str,
         thread_key: str = "",
         binding_lifetime: str = "session",
+        include_inactive: bool = False,
     ) -> AgentThreadBinding | None:
+        status_filter = "" if include_inactive else "AND status='active'"
         with self.engine.begin() as conn:
             row = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT id, owner_session_run_id, main_agent_run_id, agent_id,
                            target_agent_run_id, thread_key, binding_lifetime, workdir_policy,
                            visibility, status, cleanup_policy, created_at,
@@ -905,7 +945,7 @@ class PostgresAgentRunStore:
                       AND agent_id=:agent_id
                       AND thread_key=:thread_key
                       AND binding_lifetime=:binding_lifetime
-                      AND status='active'
+                      {status_filter}
                     ORDER BY updated_at DESC
                     LIMIT 1
                     """
@@ -922,6 +962,157 @@ class PostgresAgentRunStore:
                 },
             ).mappings().first()
         return _parallel_binding_from_row(row) if row is not None else None
+
+    def list_agent_thread_bindings(self, **filters: Any) -> list[AgentThreadBinding]:
+        clauses: list[str] = ["1=1"]
+        params: dict[str, Any] = {}
+        for key in (
+            "owner_session_run_id",
+            "main_agent_run_id",
+            "target_agent_run_id",
+            "agent_id",
+            "status",
+        ):
+            value = filters.get(key)
+            if value is None:
+                continue
+            clauses.append(f"{key}=:{key}")
+            params[key] = str(value)
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, owner_session_run_id, main_agent_run_id, agent_id,
+                           target_agent_run_id, thread_key, binding_lifetime,
+                           workdir_policy, visibility, status, cleanup_policy,
+                           created_at, updated_at, metadata
+                    FROM labrastro_agent_thread_bindings
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY updated_at DESC, id ASC
+                    """
+                ),
+                params,
+            ).mappings()
+            return [_parallel_binding_from_row(row) for row in rows]
+
+    def set_agent_thread_binding_status(
+        self,
+        binding_id: str,
+        *,
+        status: AgentThreadBindingStatus | str,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> AgentThreadBinding | None:
+        binding_status = AgentThreadBindingStatus(str(getattr(status, "value", status)))
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT id, owner_session_run_id, main_agent_run_id, agent_id,
+                           target_agent_run_id, thread_key, binding_lifetime,
+                           workdir_policy, visibility, status, cleanup_policy,
+                           created_at, updated_at, metadata
+                    FROM labrastro_agent_thread_bindings
+                    WHERE id=:binding_id
+                    """
+                ),
+                {"binding_id": str(binding_id or "").strip()},
+            ).mappings().first()
+            if row is None:
+                return None
+            row_metadata = _dict_from(row["metadata"])
+            row_metadata.update(dict(metadata or {}))
+            if reason:
+                row_metadata["status_reason"] = str(reason)
+            conn.execute(
+                text(
+                    """
+                    UPDATE labrastro_agent_thread_bindings
+                    SET status=:status,
+                        metadata=CAST(:metadata AS JSONB),
+                        updated_at=now()
+                    WHERE id=:binding_id
+                    """
+                ),
+                {
+                    "binding_id": str(binding_id or "").strip(),
+                    "status": binding_status.value,
+                    "metadata": _json(row_metadata),
+                },
+            )
+            binding = _parallel_binding_from_row(row)
+            binding.status = binding_status
+            binding.metadata = row_metadata
+            event_type = (
+                "agent_thread_binding_unavailable"
+                if binding_status == AgentThreadBindingStatus.UNAVAILABLE
+                else "agent_thread_binding_closed"
+            )
+            event_payload = {
+                "binding_id": binding.id,
+                "reason": str(reason or ""),
+                "binding": _agent_thread_binding_to_dict(binding),
+            }
+            for task_id in (binding.main_agent_run_id, binding.target_agent_run_id):
+                self._append_event(conn, task_id, event_type, event_payload)
+        bindings = self.list_agent_thread_bindings()
+        return next(
+            (
+                binding
+                for binding in bindings
+                if binding.id == str(binding_id or "").strip()
+            ),
+            None,
+        )
+
+    def delete_agent_thread_bindings_for_owner_session(
+        self,
+        owner_session_run_id: str,
+        *,
+        reason: str = "owner_session_deleted",
+    ) -> list[AgentThreadBinding]:
+        session_run_id = str(owner_session_run_id or "").strip()
+        if not session_run_id:
+            return []
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, owner_session_run_id, main_agent_run_id, agent_id,
+                           target_agent_run_id, thread_key, binding_lifetime,
+                           workdir_policy, visibility, status, cleanup_policy,
+                           created_at, updated_at, metadata
+                    FROM labrastro_agent_thread_bindings
+                    WHERE owner_session_run_id=:owner_session_run_id
+                    ORDER BY updated_at DESC, id ASC
+                    """
+                ),
+                {"owner_session_run_id": session_run_id},
+            ).mappings().all()
+            bindings = [_parallel_binding_from_row(row) for row in rows]
+            for binding in bindings:
+                event_payload = {
+                    "binding_id": binding.id,
+                    "reason": str(reason or ""),
+                    "binding": _agent_thread_binding_to_dict(binding),
+                }
+                for task_id in (binding.main_agent_run_id, binding.target_agent_run_id):
+                    self._append_event(
+                        conn,
+                        task_id,
+                        "agent_thread_binding_deleted",
+                        event_payload,
+                    )
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM labrastro_agent_thread_bindings
+                    WHERE owner_session_run_id=:owner_session_run_id
+                    """
+                ),
+                {"owner_session_run_id": session_run_id},
+            )
+        return bindings
 
     def mark_agent_call_waiting(
         self,
@@ -1398,6 +1589,7 @@ class PostgresAgentRunStore:
         worker_id: str,
         peer_id: str | None = None,
         lease_sec: int | None = None,
+        delivered_steer_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         with self.engine.begin() as conn:
             row = self._active_claim(conn, request_id)
@@ -1475,12 +1667,94 @@ class PostgresAgentRunStore:
             activation_id = activation_id or activation.id
             task.current_activation_id = activation_id
             self._upsert_activation_with_conn(conn, activation)
+            for steer_id in [
+                str(item)
+                for item in delivered_steer_ids or []
+                if str(item).strip()
+            ]:
+                delivered_rows = conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_agent_run_activation_steers
+                        SET status=:status,
+                            delivered_at=now(),
+                            metadata=metadata || CAST(:metadata AS JSONB)
+                        WHERE id=:steer_id
+                          AND activation_id=:activation_id
+                          AND status IN ('queued', 'delivering')
+                        RETURNING id, activation_id, source, payload, created_at,
+                                  delivered_at, status, metadata
+                        """
+                    ),
+                    {
+                        "status": ActivationSteerStatus.DELIVERED.value,
+                        "steer_id": steer_id,
+                        "activation_id": activation_id,
+                        "metadata": _json(
+                            {
+                                "delivered_by_request_id": request_id,
+                                "delivered_by_worker_id": worker_id,
+                            }
+                        ),
+                    },
+                ).mappings().all()
+                for steer_row in delivered_rows:
+                    steer_payload = _jsonable_row(steer_row)
+                    self._append_event(
+                        conn,
+                        task_id,
+                        "activation_steer_delivered",
+                        {
+                            "activation_id": activation_id,
+                            "steer_id": str(steer_row["id"]),
+                            "steer": steer_payload,
+                        },
+                    )
+            activation_steers: list[dict[str, Any]] = []
+            if not cancel_reason:
+                steer_rows = conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_agent_run_activation_steers
+                        SET status=:status,
+                            metadata=metadata || CAST(:metadata AS JSONB)
+                        WHERE activation_id=:activation_id
+                          AND status='queued'
+                        RETURNING id, activation_id, source, payload, created_at,
+                                  delivered_at, status, metadata
+                        """
+                    ),
+                    {
+                        "status": ActivationSteerStatus.DELIVERING.value,
+                        "activation_id": activation_id,
+                        "metadata": _json(
+                            {
+                                "delivering_request_id": request_id,
+                                "delivering_worker_id": worker_id,
+                            }
+                        ),
+                    },
+                ).mappings().all()
+                for steer_row in steer_rows:
+                    steer_payload = _jsonable_row(steer_row)
+                    activation_steers.append(steer_payload)
+                    self._append_event(
+                        conn,
+                        task_id,
+                        "activation_steer_delivering",
+                        {
+                            "activation_id": activation_id,
+                            "steer_id": str(steer_row["id"]),
+                            "steer": steer_payload,
+                        },
+                    )
             return {
                 "ok": True,
                 "activation_id": activation_id,
                 "cancel_requested": bool(cancel_reason),
                 "reason": cancel_reason or "",
                 "lease_sec": effective_lease,
+                "activation_steers": activation_steers,
             }
 
     def validate_activation_claim_owner(
@@ -2154,37 +2428,76 @@ class PostgresAgentRunStore:
         payload: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         steer_id: str | None = None,
-    ) -> tuple[ActivationSteer, AgentRunFeedback]:
+    ) -> ActivationSteer:
         source_value = ActivationSteerSource(getattr(source, "value", source))
+        resolved_steer_id = steer_id or _new_id("steer")
         created_at = datetime.now(timezone.utc).isoformat()
-        metadata_value = dict(metadata or {})
+        metadata_value = _normalize_activation_steer_metadata(
+            metadata,
+            source=source_value,
+            fallback_key=resolved_steer_id,
+        )
         with self.engine.begin() as conn:
             task = self._task_from_row(self._task_row(conn, task_id))
             if task.status.value not in _ACTIVE_STEER_AGENT_RUN_STATUSES:
                 raise ValueError("only active AgentRun activations can be steered")
+            if task.metadata.get("activation_steer_supported") is False:
+                raise ValueError("activation steer is not supported by this executor")
             activation_id = str(
-                task.current_activation_id
-                or f"{task.id}:activation:1"
+                task.current_activation_id or ""
             )
+            if not activation_id:
+                raise ValueError("active AgentRun activation is required")
+            active_claim = conn.execute(
+                text(
+                    """
+                    SELECT request_id FROM labrastro_agent_run_activation_claims
+                    WHERE task_id=:task_id
+                      AND activation_id=:activation_id
+                      AND status='active'
+                    LIMIT 1
+                    """
+                ),
+                {"task_id": task_id, "activation_id": activation_id},
+            ).mappings().first()
+            if active_claim is None:
+                raise ValueError("active worker claim is required")
+            _validate_activation_steer_payload(payload)
+            sender, idempotency_key = _activation_steer_idempotency_scope(
+                metadata_value
+            )
+            existing_row = conn.execute(
+                text(
+                    """
+                    SELECT id, activation_id, source, payload, created_at,
+                           delivered_at, status, metadata
+                    FROM labrastro_agent_run_activation_steers
+                    WHERE activation_id=:activation_id
+                      AND metadata->>'sender'=:sender
+                      AND metadata->>'idempotency_key'=:idempotency_key
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "activation_id": activation_id,
+                    "sender": sender,
+                    "idempotency_key": idempotency_key,
+                },
+            ).mappings().first()
+            if existing_row is not None:
+                existing = _steer_from_row(existing_row)
+                if _canonical_json(existing.payload) != _canonical_json(payload):
+                    raise ValueError("activation_steer_idempotency_conflict")
+                return existing
             steer = ActivationSteer(
-                id=steer_id or _new_id("steer"),
+                id=resolved_steer_id,
                 activation_id=activation_id,
                 source=source_value,
                 payload=dict(payload),
                 created_at=created_at,
                 status=ActivationSteerStatus.QUEUED,
                 metadata=metadata_value,
-            )
-            feedback = AgentRunFeedback(
-                id=_new_id("feedback"),
-                agent_run_id=task_id,
-                source=_feedback_source_for_steer(steer.source),
-                kind=_feedback_kind_for_steer(steer.source),
-                payload=_feedback_payload_for_steer(steer),
-                created_at=created_at,
-                visibility=AgentRunFeedbackVisibility.INTERNAL,
-                requires_activation=True,
-                metadata=_feedback_metadata_for_steer(steer, metadata_value),
             )
             conn.execute(
                 text(
@@ -2210,34 +2523,6 @@ class PostgresAgentRunStore:
                     "metadata": _json(steer.metadata),
                 },
             )
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO labrastro_agent_run_feedback (
-                        id, agent_run_id, source, kind, payload,
-                        created_at, consumed_by_activation_id, visibility,
-                        requires_activation, metadata
-                    ) VALUES (
-                        :id, :agent_run_id, :source, :kind,
-                        CAST(:payload AS JSONB), CAST(:created_at AS TIMESTAMPTZ),
-                        :consumed_by_activation_id, :visibility,
-                        :requires_activation, CAST(:metadata AS JSONB)
-                    )
-                    """
-                ),
-                {
-                    "id": feedback.id,
-                    "agent_run_id": feedback.agent_run_id,
-                    "source": feedback.source.value,
-                    "kind": feedback.kind.value,
-                    "payload": _json(feedback.payload),
-                    "created_at": feedback.created_at,
-                    "consumed_by_activation_id": feedback.consumed_by_activation_id,
-                    "visibility": feedback.visibility.value,
-                    "requires_activation": feedback.requires_activation,
-                    "metadata": _json(feedback.metadata),
-                },
-            )
             self._append_event(
                 conn,
                 task_id,
@@ -2248,16 +2533,7 @@ class PostgresAgentRunStore:
                     "steer": _steer_to_dict(steer),
                 },
             )
-            self._append_event(
-                conn,
-                task_id,
-                "agent_run_feedback_added",
-                {
-                    "feedback_id": feedback.id,
-                    "feedback": _feedback_to_dict(feedback),
-                },
-            )
-        return steer, feedback
+        return steer
 
     def continue_agent_run(
         self,
@@ -2864,7 +3140,7 @@ class PostgresAgentRunStore:
                     """
                     SELECT id, owner_agent_run_id, related_agent_run_id,
                            relation_type, relation_scope, created_by_activation_id,
-                           status, metadata
+                           status, payload, metadata
                     FROM labrastro_agent_run_relations
                     WHERE owner_agent_run_id=:task_id
                        OR related_agent_run_id=:task_id
@@ -3021,7 +3297,7 @@ class PostgresAgentRunStore:
         owner_rows = conn.execute(
             text(
                 """
-                SELECT id, owner_agent_run_id, relation_type, metadata
+                SELECT id, owner_agent_run_id, relation_type, payload, metadata
                 FROM labrastro_agent_run_relations
                 WHERE related_agent_run_id=:task_id
                   AND owner_agent_run_id != :task_id
@@ -3036,13 +3312,14 @@ class PostgresAgentRunStore:
         for row in owner_rows:
             owner_agent_run_id = str(row["owner_agent_run_id"])
             relation_type = str(row["relation_type"])
-            relation_metadata = _dict_from(row["metadata"])
+            relation_payload = _dict_from(row["payload"])
             relation = AgentRunRelation(
                 id=str(row["id"] or ""),
                 owner_agent_run_id=owner_agent_run_id,
                 related_agent_run_id=task.id,
                 relation_type=relation_type,
-                metadata=relation_metadata,
+                payload=relation_payload,
+                metadata=_dict_from(row["metadata"]),
             )
             if relation.relation_type in {
                 AgentRunRelationType.AGENT_CALL_EPHEMERAL,
@@ -3057,12 +3334,12 @@ class PostgresAgentRunStore:
                 )
                 if (
                     relation.relation_type == AgentRunRelationType.AGENT_CALL_EPHEMERAL
-                    or relation.metadata.get("lifecycle_hook_id")
+                    or relation.payload.get("lifecycle_hook_id")
                 ):
                     for event_type, payload in agent_relation_terminal_lifecycle_events(
                         task,
                         owner_agent_run_id=owner_agent_run_id,
-                        relation_metadata=relation_metadata,
+                        relation_metadata=relation_payload,
                         task_prompt=task_prompt,
                     ):
                         self._append_event(conn, owner_agent_run_id, event_type, payload)
@@ -3080,7 +3357,7 @@ class PostgresAgentRunStore:
             for event_type, payload in agent_relation_terminal_lifecycle_events(
                 task,
                 owner_agent_run_id=owner_agent_run_id,
-                relation_metadata=relation_metadata,
+                relation_metadata=relation_payload,
                 task_prompt=task_prompt,
             ):
                 self._append_event(conn, owner_agent_run_id, event_type, payload)
@@ -3229,7 +3506,7 @@ class PostgresAgentRunStore:
         )
 
         owner_run_id = relation.owner_agent_run_id
-        wait = bool(dict(relation.metadata).get("wait") is True)
+        wait = bool(dict(relation.payload).get("wait") is True)
         payload = _agent_call_feedback_payload(task, relation=relation)
         feedback = AgentRunFeedback(
             id=_new_id("feedback"),
@@ -3643,6 +3920,24 @@ class PostgresAgentRunStore:
                     status=AgentRunActivationStatus.QUEUED,
                 )
                 self._upsert_activation_with_conn(conn, activation)
+                conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_agent_run_activation_steers
+                        SET status='queued',
+                            metadata=metadata
+                                - 'delivering_request_id'
+                                - 'delivering_worker_id'
+                        WHERE activation_id=:activation_id
+                          AND status='delivering'
+                          AND metadata->>'delivering_request_id'=:request_id
+                        """
+                    ),
+                    {
+                        "activation_id": activation.id,
+                        "request_id": str(row["request_id"]),
+                    },
+                )
                 self._append_event(
                     conn,
                     task_id,

@@ -421,6 +421,7 @@ class ActivationLeaseStore(Protocol):
         worker_id: str,
         peer_id: str | None = None,
         lease_sec: int | None = None,
+        delivered_steer_ids: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
     def validate_activation_claim_owner(
@@ -570,7 +571,7 @@ class AgentRunStore(
         payload: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         steer_id: str | None = None,
-    ) -> tuple[ActivationSteer, AgentRunFeedback]: ...
+    ) -> ActivationSteer: ...
 
     def find_agent_thread_binding(
         self,
@@ -580,9 +581,28 @@ class AgentRunStore(
         agent_id: str,
         thread_key: str = "",
         binding_lifetime: str = "session",
+        include_inactive: bool = False,
     ) -> Any | None: ...
 
     def upsert_agent_thread_binding(self, binding: Any) -> None: ...
+
+    def list_agent_thread_bindings(self, **filters: Any) -> list[Any]: ...
+
+    def set_agent_thread_binding_status(
+        self,
+        binding_id: str,
+        *,
+        status: Any,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> Any | None: ...
+
+    def delete_agent_thread_bindings_for_owner_session(
+        self,
+        owner_session_run_id: str,
+        *,
+        reason: str = "owner_session_deleted",
+    ) -> list[Any]: ...
 
     def mark_agent_call_waiting(
         self,

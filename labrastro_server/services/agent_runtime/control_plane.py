@@ -89,11 +89,72 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
     worker_matches_agent_run,
     workspace_key,
 )
+from labrastro_server.services.agent_runtime.worktree import WorktreeManager
 from labrastro_server.services.sandbox.provider import SandboxProfile, SandboxProvider
 
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
+
+
+_ACTIVATION_STEER_ITEM_TYPES = {
+    "text",
+    "image_ref",
+    "file_ref",
+    "artifact_ref",
+    "session_item_ref",
+}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _validate_activation_steer_payload(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("activation steer payload must be an object")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("activation steer payload requires non-empty items")
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("activation steer item must be an object")
+        item_type = str(item.get("type") or "").strip()
+        if item_type not in _ACTIVATION_STEER_ITEM_TYPES:
+            raise ValueError("unsupported activation steer item type")
+
+
+def _normalize_activation_steer_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    source: ActivationSteerSource,
+    fallback_key: str,
+) -> dict[str, Any]:
+    value = dict(metadata or {})
+    idempotency_key = str(
+        value.get("idempotency_key") or value.get("client_steer_id") or fallback_key
+    ).strip()
+    if not idempotency_key:
+        raise ValueError("activation steer idempotency_key is required")
+    value["idempotency_key"] = idempotency_key
+    value.setdefault("sender", source.value)
+    value["sender"] = str(value.get("sender") or source.value).strip() or source.value
+    return value
+
+
+def _activation_steer_idempotency_scope(
+    metadata: dict[str, Any],
+) -> tuple[str, str]:
+    return (
+        str(metadata.get("sender") or "").strip(),
+        str(metadata.get("idempotency_key") or "").strip(),
+    )
 
 
 def _default_executor_session_id(task_id: str) -> str:
@@ -386,8 +447,27 @@ def _relation_to_dict(relation: AgentRunRelation) -> dict[str, Any]:
         "relation_scope": relation.relation_scope,
         "created_by_activation_id": relation.created_by_activation_id,
         "status": relation.status.value,
+        "payload": dict(relation.payload),
         "metadata": dict(relation.metadata),
     }
+
+
+def _relation_from_dict(data: dict[str, Any]) -> AgentRunRelation:
+    return AgentRunRelation(
+        id=str(data.get("id") or ""),
+        owner_agent_run_id=str(data.get("owner_agent_run_id") or ""),
+        related_agent_run_id=str(data.get("related_agent_run_id") or ""),
+        relation_type=str(data.get("relation_type") or ""),
+        relation_scope=str(data.get("relation_scope") or "session"),
+        created_by_activation_id=(
+            str(data["created_by_activation_id"])
+            if data.get("created_by_activation_id") is not None
+            else None
+        ),
+        status=str(data.get("status") or "active"),
+        payload=_dict_from(data.get("payload")),
+        metadata=_dict_from(data.get("metadata")),
+    )
 
 
 def _agent_thread_binding_to_dict(binding: AgentThreadBinding) -> dict[str, Any]:
@@ -505,6 +585,7 @@ def _relation_from_submit_request(
         relation_scope=relation.relation_scope,
         created_by_activation_id=relation.created_by_activation_id,
         status=relation.status,
+        payload=dict(relation.payload),
         metadata=dict(relation.metadata),
     )
 
@@ -523,6 +604,9 @@ _PERSISTENT_AGENT_CALL_METADATA_RESERVED = {
     "workspace_root",
 }
 
+_RELATION_PERMISSION_RECOMPUTE_POLICIES = {"recompute_or_reject"}
+_RELATION_CLEANUP_POLICIES = {"delete_with_owner_session"}
+
 
 def _external_persistent_agent_metadata(value: dict[str, Any] | None) -> dict[str, Any]:
     metadata = dict(value or {})
@@ -535,6 +619,27 @@ def _external_persistent_agent_metadata(value: dict[str, Any] | None) -> dict[st
             + ", ".join(reserved)
         )
     return metadata
+
+
+def _normalize_permission_recompute_policy(value: str | None) -> str:
+    policy = str(value or "recompute_or_reject").strip()
+    if policy not in _RELATION_PERMISSION_RECOMPUTE_POLICIES:
+        raise ValueError("permission_recompute_policy must be recompute_or_reject")
+    return policy
+
+
+def _normalize_relation_cleanup_policy(value: str | None) -> str:
+    policy = str(value or "delete_with_owner_session").strip()
+    if policy not in _RELATION_CLEANUP_POLICIES:
+        raise ValueError("cleanup_policy must be delete_with_owner_session")
+    return policy
+
+
+def _require_relation_text(value: str | None, *, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} is required")
+    return text
 
 
 def _safe_binding_part(value: str) -> str:
@@ -607,12 +712,14 @@ def _agent_call_grant_is_active(grant: AgentCallGrant | None) -> bool:
 
 
 _ACTIVE_STEER_AGENT_RUN_STATUSES = {
+    AgentRunStatus.RUNNING,
+}
+_ACTIVE_AGENT_RUN_STATUSES = {
     AgentRunStatus.QUEUED,
     AgentRunStatus.DISPATCHED,
     AgentRunStatus.RUNNING,
     AgentRunStatus.WAITING,
 }
-_ACTIVE_AGENT_RUN_STATUSES = _ACTIVE_STEER_AGENT_RUN_STATUSES
 _AGENT_CALL_FEEDBACK_KINDS = {
     AgentRunFeedbackKind.AGENT_CALL_RESULT,
     AgentRunFeedbackKind.AGENT_CALL_FAILED,
@@ -647,46 +754,6 @@ def _validate_activation_input_payload(input_payload: dict[str, Any]) -> None:
         )
 
 
-def _feedback_source_for_steer(
-    source: ActivationSteerSource,
-) -> AgentRunFeedbackSource:
-    if source == ActivationSteerSource.USER:
-        return AgentRunFeedbackSource.USER
-    if source == ActivationSteerSource.ADMIN:
-        return AgentRunFeedbackSource.ADMIN
-    return AgentRunFeedbackSource.SYSTEM
-
-
-def _feedback_kind_for_steer(source: ActivationSteerSource) -> AgentRunFeedbackKind:
-    if source == ActivationSteerSource.USER:
-        return AgentRunFeedbackKind.USER_MESSAGE
-    return AgentRunFeedbackKind.RETRY_INSTRUCTION
-
-
-def _feedback_payload_for_steer(steer: ActivationSteer) -> dict[str, Any]:
-    return {
-        "kind": "activation_steer_pending_feedback",
-        "activation_id": steer.activation_id,
-        "steer_id": steer.id,
-        "source": steer.source.value,
-        "payload": dict(steer.payload),
-    }
-
-
-def _feedback_metadata_for_steer(
-    steer: ActivationSteer,
-    metadata: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        **metadata,
-        "activation_id": steer.activation_id,
-        "steer_id": steer.id,
-        "steer_status": steer.status.value,
-        "fallback_reason": "same_activation_steer_delivery_unavailable",
-        "delivery_path": "feedback_after_activation",
-    }
-
-
 def _waiting_reason_for_required_feedback(
     feedbacks: list[AgentRunFeedback],
 ) -> AgentRunWaitingReason | None:
@@ -715,8 +782,8 @@ def _agent_call_feedback_payload(
     *,
     relation: AgentRunRelation,
 ) -> dict[str, Any]:
-    metadata = dict(relation.metadata)
-    conversation_scope = str(metadata.get("conversation_scope") or "").strip()
+    payload_data = dict(relation.payload)
+    conversation_scope = str(payload_data.get("conversation_scope") or "").strip()
     if not conversation_scope:
         conversation_scope = (
             "persistent"
@@ -729,8 +796,8 @@ def _agent_call_feedback_payload(
         "agent_id": task.agent_id,
         "target_agent_run_id": task.id,
         "conversation_scope": conversation_scope,
-        "wait": bool(metadata.get("wait") is True),
-        "thread_key": str(metadata.get("thread_key") or ""),
+        "wait": bool(payload_data.get("wait") is True),
+        "thread_key": str(payload_data.get("thread_key") or ""),
         "status": status,
         "summary": output if status == AgentRunStatus.COMPLETED.value else "",
         "evidence_refs": [],
@@ -1268,7 +1335,15 @@ class AgentRunControlPlane:
             agent_id=target_agent_id,
             thread_key=stable_thread_key,
             binding_lifetime=AgentThreadBindingLifetime.SESSION.value,
+            include_inactive=True,
         )
+        if existing is not None and existing.status == AgentThreadBindingStatus.UNAVAILABLE:
+            raise AgentCallDispatchError(
+                "agent_thread_unavailable",
+                "persistent Agent thread is unavailable",
+            )
+        if existing is not None and existing.status != AgentThreadBindingStatus.ACTIVE:
+            existing = None
         if existing is not None:
             if (
                 stable_thread_summary
@@ -1305,16 +1380,16 @@ class AgentRunControlPlane:
                 "thread_summary is required when creating a persistent Agent thread",
             )
         external_metadata = _external_persistent_agent_metadata(metadata)
-        relation_metadata = {
+        relation_payload = {
             "conversation_scope": "persistent",
             "wait": bool(wait),
+            "thread_key": stable_thread_key,
+            "thread_summary": stable_thread_summary,
         }
-        if stable_thread_key:
-            relation_metadata["thread_key"] = stable_thread_key
         if session_run_id:
-            relation_metadata["parent_session_id"] = session_run_id
+            relation_payload["parent_session_id"] = session_run_id
         if workdir:
-            relation_metadata["workspace_root"] = str(workdir)
+            relation_payload["workspace_root"] = str(workdir)
         run = self.submit_agent_run(
             AgentRunRequest(
                 agent_id=target_agent_id,
@@ -1328,7 +1403,7 @@ class AgentRunControlPlane:
                     owner_agent_run_id=main_agent_run_id,
                     related_agent_run_id="",
                     relation_type=AgentRunRelationType.AGENT_CALL_PERSISTENT,
-                    metadata=relation_metadata,
+                    payload=relation_payload,
                 ),
             )
         )
@@ -1348,11 +1423,202 @@ class AgentRunControlPlane:
             thread_summary=stable_thread_summary,
             metadata={
                 "created_by_agent_run_id": main_agent_run_id,
-                "conversation_scope": "persistent",
             },
         )
         self.upsert_agent_thread_binding(binding)
         return run
+
+    def branch_agent_run(
+        self,
+        *,
+        source_agent_run_id: str,
+        base_session_item_id: str,
+        runtime_root: str,
+        repo_root: str | None = None,
+        agent_id: str | None = None,
+        prompt: str = "",
+        task_id: str | None = None,
+        branch_name: str | None = None,
+        base_ref: str = "HEAD",
+        permission_recompute_policy: str | None = None,
+        cleanup_policy: str | None = None,
+        executor: ExecutorType | str | None = None,
+        runtime_profile_id: str | None = None,
+        model: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AgentRun:
+        """Create a real git branch/worktree and a related target AgentRun."""
+
+        source_run_id = _require_relation_text(
+            source_agent_run_id,
+            field="source_agent_run_id",
+        )
+        base_item_id = _require_relation_text(
+            base_session_item_id,
+            field="base_session_item_id",
+        )
+        runtime_root_value = _require_relation_text(runtime_root, field="runtime_root")
+        source = self.get_agent_run(source_run_id)
+        target_task_id = task_id or _new_id("task")
+        target_agent_id = str(agent_id or source.agent_id or "").strip()
+        if not target_agent_id:
+            raise ValueError("agent_id is required")
+        source_workspace_root = _require_relation_text(
+            repo_root or source.workdir,
+            field="repo_root",
+        )
+        policy = _normalize_permission_recompute_policy(permission_recompute_policy)
+        cleanup = _normalize_relation_cleanup_policy(cleanup_policy)
+        manager = WorktreeManager(runtime_root_value)
+        plan = manager.plan(
+            workspace_id=source.owner_session_run_id or source.workspace_ref or source.id,
+            task_id=target_task_id,
+            agent_id=target_agent_id,
+            branch_name=branch_name,
+        )
+        prepared = manager.create_branch_worktree(
+            source_repo=source_workspace_root,
+            plan=plan,
+            base_ref=base_ref,
+        )
+        relation_payload = {
+            "source_agent_run_id": source.id,
+            "target_agent_run_id": target_task_id,
+            "base_session_item_id": base_item_id,
+            "base_git_ref": prepared.base_git_ref,
+            "base_tree_ref": prepared.base_tree_ref,
+            "branch_name": prepared.branch_name,
+            "branch_git_ref": prepared.branch_git_ref,
+            "branch_worktree_ref": prepared.branch_worktree_ref,
+            "permission_recompute_policy": policy,
+            "reuse_live_executor_session": False,
+            "cleanup_policy": cleanup,
+            "runtime_root": str(prepared.runtime_root),
+            "source_workspace_root": str(prepared.source_repo),
+        }
+        try:
+            return self.submit_agent_run(
+                AgentRunRequest(
+                    agent_id=target_agent_id,
+                    prompt=str(prompt or ""),
+                    owner_session_run_id=source.owner_session_run_id,
+                    source=source.source,
+                    executor=executor or source.executor,
+                    execution_location=ExecutionLocation.DAEMON_WORKTREE,
+                    worktree_role=WorktreeRole.TARGET,
+                    publish_policy=PublishPolicy.BRANCH,
+                    trigger_mode=source.trigger_mode,
+                    runtime_profile_id=runtime_profile_id or source.runtime_profile_id,
+                    workdir=prepared.branch_worktree_ref,
+                    model=model,
+                    workspace_ref=prepared.branch_worktree_ref,
+                    metadata=dict(metadata or {}),
+                    relation=AgentRunRelation(
+                        id="",
+                        owner_agent_run_id=source.id,
+                        related_agent_run_id=target_task_id,
+                        relation_type=AgentRunRelationType.BRANCH,
+                        payload=relation_payload,
+                    ),
+                ),
+                task_id=target_task_id,
+            )
+        except Exception:
+            manager.cleanup_branch_worktree(
+                source_repo=prepared.source_repo,
+                branch_name=prepared.branch_name,
+                worktree_path=prepared.worktree_path,
+                delete_branch=True,
+            )
+            raise
+
+    def fork_agent_run(
+        self,
+        *,
+        source_agent_run_id: str,
+        base_session_item_id: str,
+        fork_workspace_ref: str,
+        target_owner_session_run_id: str,
+        agent_id: str | None = None,
+        prompt: str = "",
+        task_id: str | None = None,
+        provenance_status: str = "visible",
+        permission_recompute_policy: str | None = None,
+        cleanup_policy: str | None = None,
+        workdir: str | None = None,
+        executor: ExecutorType | str | None = None,
+        execution_location: ExecutionLocation | str | None = None,
+        runtime_profile_id: str | None = None,
+        model: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AgentRun:
+        """Create a derived AgentRun through the relation control-plane path."""
+
+        source_run_id = _require_relation_text(
+            source_agent_run_id,
+            field="source_agent_run_id",
+        )
+        base_item_id = _require_relation_text(
+            base_session_item_id,
+            field="base_session_item_id",
+        )
+        fork_ref = _require_relation_text(
+            fork_workspace_ref,
+            field="fork_workspace_ref",
+        )
+        target_owner_id = _require_relation_text(
+            target_owner_session_run_id,
+            field="target_owner_session_run_id",
+        )
+        provenance = str(provenance_status or "visible").strip()
+        if provenance not in {"visible", "redacted", "unavailable"}:
+            raise ValueError(
+                "provenance_status must be visible, redacted, or unavailable"
+            )
+        source = self.get_agent_run(source_run_id)
+        target_task_id = task_id or _new_id("task")
+        target_agent_id = str(agent_id or source.agent_id or "").strip()
+        if not target_agent_id:
+            raise ValueError("agent_id is required")
+        relation_payload = {
+            "source_agent_run_id": source.id,
+            "target_agent_run_id": target_task_id,
+            "base_session_item_id": base_item_id,
+            "fork_workspace_ref": fork_ref,
+            "source_owner_session_run_id": source.owner_session_run_id,
+            "target_owner_session_run_id": target_owner_id,
+            "source_workspace_ref": source.workspace_ref or "",
+            "permission_recompute_policy": _normalize_permission_recompute_policy(
+                permission_recompute_policy
+            ),
+            "reuse_live_executor_session": False,
+            "cleanup_policy": _normalize_relation_cleanup_policy(cleanup_policy),
+            "provenance_status": provenance,
+        }
+        return self.submit_agent_run(
+            AgentRunRequest(
+                agent_id=target_agent_id,
+                prompt=str(prompt or ""),
+                owner_session_run_id=target_owner_id,
+                source=source.source,
+                executor=executor,
+                execution_location=execution_location,
+                trigger_mode=source.trigger_mode,
+                runtime_profile_id=runtime_profile_id,
+                workdir=str(workdir) if workdir is not None else None,
+                model=model,
+                workspace_ref=fork_ref,
+                metadata=dict(metadata or {}),
+                relation=AgentRunRelation(
+                    id="",
+                    owner_agent_run_id=source.id,
+                    related_agent_run_id=target_task_id,
+                    relation_type=AgentRunRelationType.FORK,
+                    payload=relation_payload,
+                ),
+            ),
+            task_id=target_task_id,
+        )
 
     def mark_agent_call_waiting(
         self,
@@ -1410,6 +1676,7 @@ class AgentRunControlPlane:
         agent_id: str,
         thread_key: str = "",
         binding_lifetime: str = "session",
+        include_inactive: bool = False,
     ) -> AgentThreadBinding | None:
         if self._store is not None:
             finder = getattr(self._store, "find_agent_thread_binding", None)
@@ -1420,12 +1687,13 @@ class AgentRunControlPlane:
                     agent_id=agent_id,
                     thread_key=thread_key,
                     binding_lifetime=binding_lifetime,
+                    include_inactive=include_inactive,
                 )
             raise RuntimeError("AgentRun store does not support Agent thread bindings")
         with self._lock:
             for binding in self._agent_thread_bindings.values():
                 if (
-                    binding.status == AgentThreadBindingStatus.ACTIVE
+                    (include_inactive or binding.status == AgentThreadBindingStatus.ACTIVE)
                     and binding.binding_lifetime
                     == AgentThreadBindingLifetime(binding_lifetime)
                     and binding.owner_session_run_id
@@ -1453,6 +1721,298 @@ class AgentRunControlPlane:
                         "agent_thread_binding_upserted",
                         {"binding": _agent_thread_binding_to_dict(binding)},
                     )
+
+    def list_agent_thread_bindings(self, **filters: Any) -> list[AgentThreadBinding]:
+        if self._store is not None:
+            lister = getattr(self._store, "list_agent_thread_bindings", None)
+            if callable(lister):
+                return lister(**filters)
+            raise RuntimeError("AgentRun store does not support Agent thread bindings")
+        with self._lock:
+            bindings = list(self._agent_thread_bindings.values())
+            for key, value in filters.items():
+                if value is None:
+                    continue
+                expected = getattr(value, "value", value)
+                filtered: list[AgentThreadBinding] = []
+                for binding in bindings:
+                    actual = getattr(binding, key, "")
+                    actual_value = getattr(actual, "value", actual)
+                    if str(actual_value) == str(expected):
+                        filtered.append(binding)
+                bindings = filtered
+            return bindings
+
+    def _append_agent_thread_binding_status_event_locked(
+        self,
+        binding: AgentThreadBinding,
+        event_type: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        binding.updated_at = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "binding_id": binding.id,
+            "reason": str(reason or ""),
+            "binding": _agent_thread_binding_to_dict(binding),
+        }
+        for task_id in (binding.main_agent_run_id, binding.target_agent_run_id):
+            if task_id in self._events:
+                self._append_event_locked(task_id, event_type, payload)
+
+    def _set_agent_thread_binding_status_locked(
+        self,
+        binding: AgentThreadBinding,
+        *,
+        status: AgentThreadBindingStatus,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+        cancel_target: bool = False,
+    ) -> AgentThreadBinding:
+        binding.status = status
+        if metadata:
+            binding.metadata.update(dict(metadata))
+        if reason:
+            binding.metadata["status_reason"] = str(reason)
+        self._agent_thread_bindings[binding.id] = binding
+        event_type = (
+            "agent_thread_binding_unavailable"
+            if status == AgentThreadBindingStatus.UNAVAILABLE
+            else "agent_thread_binding_closed"
+        )
+        self._append_agent_thread_binding_status_event_locked(
+            binding,
+            event_type,
+            reason=reason,
+        )
+        if cancel_target and binding.target_agent_run_id in self._states:
+            target = self._states[binding.target_agent_run_id].task
+            self._cancel_task_locked(
+                target,
+                reason=f"agent_thread_binding_{status.value}:{reason or 'closed'}",
+            )
+        return binding
+
+    def close_agent_thread_binding(
+        self,
+        binding_id: str,
+        *,
+        reason: str = "user_closed",
+        cancel_target: bool = True,
+    ) -> bool:
+        normalized_id = str(binding_id or "").strip()
+        if self._store is not None:
+            setter = getattr(self._store, "set_agent_thread_binding_status", None)
+            if not callable(setter):
+                raise RuntimeError("AgentRun store does not support Agent thread bindings")
+            binding = setter(
+                normalized_id,
+                status=AgentThreadBindingStatus.CLOSED,
+                reason=reason,
+            )
+            if binding is None:
+                return False
+            if cancel_target:
+                self.cancel_agent_run(
+                    binding.target_agent_run_id,
+                    reason=f"agent_thread_binding_closed:{reason}",
+                )
+            return True
+        with self._lock:
+            binding = self._agent_thread_bindings.get(normalized_id)
+            if binding is None:
+                return False
+            self._set_agent_thread_binding_status_locked(
+                binding,
+                status=AgentThreadBindingStatus.CLOSED,
+                reason=reason,
+                cancel_target=cancel_target,
+            )
+            return True
+
+    def mark_agent_thread_binding_unavailable(
+        self,
+        binding_id: str,
+        *,
+        reason: str = "agent_config_unavailable",
+        metadata: dict[str, Any] | None = None,
+        cancel_target: bool = True,
+    ) -> bool:
+        normalized_id = str(binding_id or "").strip()
+        if self._store is not None:
+            setter = getattr(self._store, "set_agent_thread_binding_status", None)
+            if not callable(setter):
+                raise RuntimeError("AgentRun store does not support Agent thread bindings")
+            binding = setter(
+                normalized_id,
+                status=AgentThreadBindingStatus.UNAVAILABLE,
+                reason=reason,
+                metadata=metadata,
+            )
+            if binding is None:
+                return False
+            if cancel_target:
+                self.cancel_agent_run(
+                    binding.target_agent_run_id,
+                    reason=f"agent_thread_binding_unavailable:{reason}",
+                )
+            return True
+        with self._lock:
+            binding = self._agent_thread_bindings.get(normalized_id)
+            if binding is None:
+                return False
+            self._set_agent_thread_binding_status_locked(
+                binding,
+                status=AgentThreadBindingStatus.UNAVAILABLE,
+                reason=reason,
+                metadata=metadata,
+                cancel_target=cancel_target,
+            )
+            return True
+
+    def delete_agent_thread_bindings_for_owner_session(
+        self,
+        owner_session_run_id: str,
+        *,
+        reason: str = "owner_session_deleted",
+    ) -> list[str]:
+        session_run_id = str(owner_session_run_id or "").strip()
+        if not session_run_id:
+            return []
+        if self._store is not None:
+            deleter = getattr(
+                self._store,
+                "delete_agent_thread_bindings_for_owner_session",
+                None,
+            )
+            if not callable(deleter):
+                raise RuntimeError("AgentRun store does not support Agent thread bindings")
+            deleted = deleter(session_run_id, reason=reason)
+            for binding in deleted:
+                if (
+                    binding.cleanup_policy == "delete_with_owner_session"
+                    and binding.status == AgentThreadBindingStatus.ACTIVE
+                ):
+                    self.cancel_agent_run(
+                        binding.target_agent_run_id,
+                        reason=f"owner_session_deleted:{reason}",
+                    )
+            return [binding.id for binding in deleted]
+        with self._lock:
+            deleted_ids: list[str] = []
+            for binding in list(self._agent_thread_bindings.values()):
+                if binding.owner_session_run_id != session_run_id:
+                    continue
+                if (
+                    binding.cleanup_policy == "delete_with_owner_session"
+                    and binding.status == AgentThreadBindingStatus.ACTIVE
+                    and binding.target_agent_run_id in self._states
+                ):
+                    target = self._states[binding.target_agent_run_id].task
+                    self._cancel_task_locked(
+                        target,
+                        reason=f"owner_session_deleted:{reason}",
+                    )
+                self._append_agent_thread_binding_status_event_locked(
+                    binding,
+                    "agent_thread_binding_deleted",
+                    reason=reason,
+                )
+                deleted_ids.append(binding.id)
+                self._agent_thread_bindings.pop(binding.id, None)
+            return deleted_ids
+
+    def invalidate_agent_thread_bindings(
+        self,
+        *,
+        agent_id: str | None = None,
+        owner_session_run_id: str | None = None,
+        main_agent_run_id: str | None = None,
+        reason: str = "agent_config_unavailable",
+        metadata: dict[str, Any] | None = None,
+    ) -> list[str]:
+        filters = {
+            "agent_id": agent_id,
+            "owner_session_run_id": owner_session_run_id,
+            "main_agent_run_id": main_agent_run_id,
+            "status": AgentThreadBindingStatus.ACTIVE.value,
+        }
+        bindings = self.list_agent_thread_bindings(**filters)
+        unavailable: list[str] = []
+        for binding in bindings:
+            if self.mark_agent_thread_binding_unavailable(
+                binding.id,
+                reason=reason,
+                metadata=metadata,
+            ):
+                unavailable.append(binding.id)
+        return unavailable
+
+    def _cleanup_bindings_for_terminal_task_locked(self, task: AgentRun) -> None:
+        if not task.is_terminal:
+            return
+        for binding in list(self._agent_thread_bindings.values()):
+            if binding.status != AgentThreadBindingStatus.ACTIVE:
+                continue
+            if (
+                binding.main_agent_run_id == task.id
+                and binding.binding_lifetime == AgentThreadBindingLifetime.RUN
+            ):
+                self._set_agent_thread_binding_status_locked(
+                    binding,
+                    status=AgentThreadBindingStatus.CLOSED,
+                    reason=f"main_agent_run_terminal:{task.status.value}",
+                    cancel_target=True,
+                )
+                continue
+            if (
+                binding.target_agent_run_id == task.id
+                and task.status
+                in {
+                    AgentRunStatus.FAILED,
+                    AgentRunStatus.CANCELLED,
+                    AgentRunStatus.BLOCKED,
+                }
+            ):
+                self._set_agent_thread_binding_status_locked(
+                    binding,
+                    status=AgentThreadBindingStatus.UNAVAILABLE,
+                    reason=f"target_agent_run_terminal:{task.status.value}",
+                    cancel_target=False,
+                )
+
+    def _cleanup_bindings_for_terminal_task(self, task: AgentRun) -> None:
+        if not task.is_terminal:
+            return
+        if self._store is None:
+            with self._lock:
+                self._cleanup_bindings_for_terminal_task_locked(task)
+            return
+        for binding in self.list_agent_thread_bindings(
+            main_agent_run_id=task.id,
+            status=AgentThreadBindingStatus.ACTIVE.value,
+        ):
+            if binding.binding_lifetime == AgentThreadBindingLifetime.RUN:
+                self.close_agent_thread_binding(
+                    binding.id,
+                    reason=f"main_agent_run_terminal:{task.status.value}",
+                    cancel_target=True,
+                )
+        if task.status not in {
+            AgentRunStatus.FAILED,
+            AgentRunStatus.CANCELLED,
+            AgentRunStatus.BLOCKED,
+        }:
+            return
+        for binding in self.list_agent_thread_bindings(
+            target_agent_run_id=task.id,
+            status=AgentThreadBindingStatus.ACTIVE.value,
+        ):
+            self.mark_agent_thread_binding_unavailable(
+                binding.id,
+                reason=f"target_agent_run_terminal:{task.status.value}",
+                cancel_target=False,
+            )
 
     def find_agent_call_grant(
         self,
@@ -1916,6 +2476,7 @@ class AgentRunControlPlane:
         worker_id: str,
         peer_id: str | None = None,
         lease_sec: int | None = None,
+        delivered_steer_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if self._store is not None:
             result = self._store.heartbeat_agent_run_activation(
@@ -1925,6 +2486,7 @@ class AgentRunControlPlane:
                 worker_id=worker_id,
                 peer_id=peer_id,
                 lease_sec=lease_sec,
+                delivered_steer_ids=delivered_steer_ids,
             )
             self.notify_task_available()
             return result
@@ -1981,12 +2543,32 @@ class AgentRunControlPlane:
                     request_id=request_id,
                     worker_id=worker_id,
                 )
+            self._mark_activation_steers_delivered_locked(
+                task_id,
+                activation_id=activation_id,
+                steer_ids=delivered_steer_ids or [],
+                request_id=request_id,
+                worker_id=worker_id,
+            )
+            activation_steers = (
+                []
+                if reason
+                else self._claim_activation_steers_for_delivery_locked(
+                    task_id,
+                    activation_id=activation_id,
+                    request_id=request_id,
+                    worker_id=worker_id,
+                )
+            )
             return {
                 "ok": True,
                 "activation_id": activation_id,
                 "cancel_requested": bool(reason),
                 "reason": reason,
                 "lease_sec": effective_lease_sec,
+                "activation_steers": [
+                    _steer_to_dict(steer) for steer in activation_steers
+                ],
             }
 
     def validate_activation_claim_owner(
@@ -2053,6 +2635,11 @@ class AgentRunControlPlane:
                     )
                     task.current_activation_id = activation.id
                     self._activations[activation.id] = activation
+                    self._requeue_delivering_activation_steers_locked(
+                        task_id,
+                        activation_id=activation_id or activation.id,
+                        request_id=request_id,
+                    )
                     self._cancel_requests.pop(task_id, None)
                     recovered.append(task_id)
                     self._append_event_locked(
@@ -2452,6 +3039,7 @@ class AgentRunControlPlane:
             )
             if result_value[2] is not None and result_value[2].is_terminal:
                 self._stop_sandbox_for_task(result_value[2])
+                self._cleanup_bindings_for_terminal_task(result_value[2])
             self.notify_task_available()
             return result_value
         with self._lock:
@@ -2497,6 +3085,7 @@ class AgentRunControlPlane:
             )
             if task.is_terminal:
                 self._stop_sandbox_for_task(task)
+                self._cleanup_bindings_for_terminal_task(task)
             self.notify_task_available()
             return task
         with self._lock:
@@ -2648,6 +3237,7 @@ class AgentRunControlPlane:
             task = self._task_locked(task_id)
             if task.is_terminal:
                 self._append_parent_terminal_event_locked(task)
+                self._cleanup_bindings_for_terminal_task_locked(task)
             self._clear_task_claims_locked(task_id)
             self._cancel_requests.pop(task_id, None)
             if task.is_terminal:
@@ -2714,6 +3304,98 @@ class AgentRunControlPlane:
             )
         return feedback
 
+    def _mark_activation_steers_delivered_locked(
+        self,
+        task_id: str,
+        *,
+        activation_id: str,
+        steer_ids: list[str],
+        request_id: str,
+        worker_id: str,
+    ) -> None:
+        delivered_ids = {str(item) for item in steer_ids if str(item).strip()}
+        if not delivered_ids:
+            return
+        delivered_at = datetime.now(timezone.utc).isoformat()
+        for steer in self._steers.get(task_id, []):
+            if steer.id not in delivered_ids or steer.activation_id != activation_id:
+                continue
+            if steer.status not in {
+                ActivationSteerStatus.QUEUED,
+                ActivationSteerStatus.DELIVERING,
+            }:
+                continue
+            steer.status = ActivationSteerStatus.DELIVERED
+            steer.delivered_at = delivered_at
+            steer.metadata.update(
+                {
+                    "delivered_by_request_id": request_id,
+                    "delivered_by_worker_id": worker_id,
+                }
+            )
+            self._append_event_locked(
+                task_id,
+                "activation_steer_delivered",
+                {
+                    "activation_id": activation_id,
+                    "steer_id": steer.id,
+                    "steer": _steer_to_dict(steer),
+                },
+            )
+
+    def _claim_activation_steers_for_delivery_locked(
+        self,
+        task_id: str,
+        *,
+        activation_id: str,
+        request_id: str,
+        worker_id: str,
+    ) -> list[ActivationSteer]:
+        claimed: list[ActivationSteer] = []
+        for steer in self._steers.get(task_id, []):
+            if steer.activation_id != activation_id:
+                continue
+            if steer.status != ActivationSteerStatus.QUEUED:
+                continue
+            steer.status = ActivationSteerStatus.DELIVERING
+            steer.metadata.update(
+                {
+                    "delivering_request_id": request_id,
+                    "delivering_worker_id": worker_id,
+                }
+            )
+            claimed.append(steer)
+            self._append_event_locked(
+                task_id,
+                "activation_steer_delivering",
+                {
+                    "activation_id": activation_id,
+                    "steer_id": steer.id,
+                    "steer": _steer_to_dict(steer),
+                },
+            )
+        return claimed
+
+    def _requeue_delivering_activation_steers_locked(
+        self,
+        task_id: str,
+        *,
+        activation_id: str,
+        request_id: str,
+    ) -> None:
+        if not activation_id or not request_id:
+            return
+        for steer in self._steers.get(task_id, []):
+            if steer.activation_id != activation_id:
+                continue
+            if steer.status != ActivationSteerStatus.DELIVERING:
+                continue
+            if str(steer.metadata.get("delivering_request_id") or "") != request_id:
+                continue
+            steer.status = ActivationSteerStatus.QUEUED
+            steer.metadata.pop("delivering_request_id", None)
+            steer.metadata.pop("delivering_worker_id", None)
+
     def append_activation_steer(
         self,
         task_id: str,
@@ -2722,9 +3404,14 @@ class AgentRunControlPlane:
         payload: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         steer_id: str | None = None,
-    ) -> tuple[ActivationSteer, AgentRunFeedback]:
+    ) -> ActivationSteer:
         source_value = ActivationSteerSource(getattr(source, "value", source))
-        metadata_value = dict(metadata or {})
+        resolved_steer_id = steer_id or _new_id("steer")
+        metadata_value = _normalize_activation_steer_metadata(
+            metadata,
+            source=source_value,
+            fallback_key=resolved_steer_id,
+        )
         if self._store is not None:
             return self._store.append_activation_steer(
                 task_id,
@@ -2738,14 +3425,33 @@ class AgentRunControlPlane:
             task = self._task_locked(task_id)
             if task.status not in _ACTIVE_STEER_AGENT_RUN_STATUSES:
                 raise ValueError("only active AgentRun activations can be steered")
+            if task.metadata.get("activation_steer_supported") is False:
+                raise ValueError("activation steer is not supported by this executor")
             activation_id = str(
-                task.current_activation_id
-                or _activation_id_for_task(task.id, 1)
+                task.current_activation_id or ""
             )
-            if activation_id not in self._activations:
-                self._activations[activation_id] = _activation_from_task(task)
+            if not activation_id or activation_id not in self._activations:
+                raise ValueError("active AgentRun activation is required")
+            claim = self._active_claim_for_task_locked(task_id)
+            if claim is None or str(claim.get("activation_id") or "") != activation_id:
+                raise ValueError("active worker claim is required")
+            _validate_activation_steer_payload(payload)
+            sender, idempotency_key = _activation_steer_idempotency_scope(
+                metadata_value
+            )
+            for existing in self._steers.get(task_id, []):
+                if existing.activation_id != activation_id:
+                    continue
+                existing_sender, existing_key = _activation_steer_idempotency_scope(
+                    existing.metadata
+                )
+                if existing_sender != sender or existing_key != idempotency_key:
+                    continue
+                if _canonical_json(existing.payload) != _canonical_json(payload):
+                    raise ValueError("activation_steer_idempotency_conflict")
+                return existing
             steer = ActivationSteer(
-                id=steer_id or _new_id("steer"),
+                id=resolved_steer_id,
                 activation_id=activation_id,
                 source=source_value,
                 payload=dict(payload),
@@ -2763,27 +3469,7 @@ class AgentRunControlPlane:
                     "steer": _steer_to_dict(steer),
                 },
             )
-            feedback = AgentRunFeedback(
-                id=_new_id("feedback"),
-                agent_run_id=task_id,
-                source=_feedback_source_for_steer(steer.source),
-                kind=_feedback_kind_for_steer(steer.source),
-                payload=_feedback_payload_for_steer(steer),
-                created_at=created_at,
-                visibility=AgentRunFeedbackVisibility.INTERNAL,
-                requires_activation=True,
-                metadata=_feedback_metadata_for_steer(steer, metadata_value),
-            )
-            self._feedbacks.setdefault(task_id, []).append(feedback)
-            self._append_event_locked(
-                task_id,
-                "agent_run_feedback_added",
-                {
-                    "feedback_id": feedback.id,
-                    "feedback": _feedback_to_dict(feedback),
-                },
-            )
-            return steer, feedback
+            return steer
 
     def continue_agent_run(
         self,
@@ -2892,6 +3578,7 @@ class AgentRunControlPlane:
         if self._store is not None:
             task = self._store.fail_agent_run(task_id, error=error)
             self._stop_sandbox_for_task(task)
+            self._cleanup_bindings_for_terminal_task(task)
             self.notify_task_available()
             return task
         with self._lock:
@@ -2902,22 +3589,133 @@ class AgentRunControlPlane:
             task.cancel_reason = None
             self._append_event_locked(task_id, "failed", {"error": error})
             self._append_parent_terminal_event_locked(task)
+            self._cleanup_bindings_for_terminal_task_locked(task)
             self._clear_task_claims_locked(task_id)
             self._cancel_requests.pop(task_id, None)
             self._stop_sandbox_for_task(task)
             return task
 
+    def _store_branch_relations_for_cleanup(
+        self,
+        owner_agent_run_id: str,
+        descendants: list[AgentRun],
+    ) -> list[AgentRunRelation]:
+        if self._store is None:
+            return []
+        relations: list[AgentRunRelation] = []
+        seen_relation_ids: set[str] = set()
+        for parent_id in [owner_agent_run_id, *[task.id for task in descendants]]:
+            try:
+                detail = self._store.load_agent_run_detail(parent_id, event_limit=1)
+            except KeyError:
+                continue
+            for raw_relation in detail.get("relations", []):
+                if not isinstance(raw_relation, dict):
+                    continue
+                if str(raw_relation.get("owner_agent_run_id") or "") != parent_id:
+                    continue
+                if str(raw_relation.get("relation_type") or "") != (
+                    AgentRunRelationType.BRANCH.value
+                ):
+                    continue
+                if str(raw_relation.get("status") or "") != "active":
+                    continue
+                relation_id = str(raw_relation.get("id") or "")
+                if relation_id in seen_relation_ids:
+                    continue
+                relations.append(_relation_from_dict(raw_relation))
+                seen_relation_ids.add(relation_id)
+        return relations
+
+    def _cleanup_branch_relation_worktree(
+        self,
+        relation: AgentRunRelation,
+    ) -> dict[str, Any]:
+        if relation.relation_type != AgentRunRelationType.BRANCH:
+            return {"ok": True, "skipped": True}
+        payload = dict(relation.payload)
+        if str(payload.get("cleanup_policy") or "") != "delete_with_owner_session":
+            return {"ok": True, "skipped": True}
+        runtime_root = str(payload.get("runtime_root") or "").strip()
+        source_workspace_root = str(payload.get("source_workspace_root") or "").strip()
+        branch_name = str(payload.get("branch_name") or "").strip()
+        branch_worktree_ref = str(payload.get("branch_worktree_ref") or "").strip()
+        if (
+            not runtime_root
+            or not source_workspace_root
+            or not branch_name
+            or not branch_worktree_ref
+        ):
+            return {
+                "ok": False,
+                "error": "branch_relation_cleanup_payload_incomplete",
+            }
+        result = WorktreeManager(runtime_root).cleanup_branch_worktree(
+            source_repo=source_workspace_root,
+            branch_name=branch_name,
+            worktree_path=branch_worktree_ref,
+            delete_branch=True,
+        )
+        return result.to_dict()
+
+    def _cleanup_child_branch_worktrees_locked(self, owner_agent_run_id: str) -> None:
+        pending = [owner_agent_run_id]
+        seen: set[str] = set()
+        while pending:
+            current_parent_id = pending.pop()
+            if current_parent_id in seen:
+                continue
+            seen.add(current_parent_id)
+            child_relations = [
+                relation
+                for relation in self._relations.values()
+                if relation.owner_agent_run_id == current_parent_id
+                and relation.related_agent_run_id not in seen
+                and relation.status.value == "active"
+            ]
+            for relation in child_relations:
+                if relation.relation_type == AgentRunRelationType.BRANCH:
+                    result = self._cleanup_branch_relation_worktree(relation)
+                    event_type = (
+                        "agent_run_branch_worktree_cleaned"
+                        if result.get("ok") is True
+                        else "agent_run_branch_worktree_cleanup_failed"
+                    )
+                    for event_task_id in {
+                        relation.owner_agent_run_id,
+                        relation.related_agent_run_id,
+                    }:
+                        if event_task_id in self._events:
+                            self._append_event_locked(
+                                event_task_id,
+                                event_type,
+                                {
+                                    "relation_id": relation.id,
+                                    "cleanup": result,
+                                },
+                            )
+                pending.append(relation.related_agent_run_id)
+
     def cancel_agent_run(self, task_id: str, *, reason: str = "user_cancelled") -> bool:
         if self._store is not None:
             task_before = self._store.get_agent_run(task_id)
             descendants_before = self._store_descendant_agent_runs(task_id)
+            branch_relations = self._store_branch_relations_for_cleanup(
+                task_id,
+                descendants_before,
+            )
             ok = self._store.cancel_agent_run(task_id, reason=reason)
             if ok:
+                task_after = self._store.get_agent_run(task_id)
                 stopped: set[str] = set()
                 for task in [task_before, *descendants_before]:
                     if task.sandbox_session_id and task.sandbox_session_id not in stopped:
                         self._stop_sandbox_for_task(task, cancel=True)
                         stopped.add(task.sandbox_session_id)
+                for relation in branch_relations:
+                    self._cleanup_branch_relation_worktree(relation)
+                if task_after.is_terminal:
+                    self._cleanup_bindings_for_terminal_task(task_after)
             self.notify_task_available()
             return ok
         with self._lock:
@@ -2927,6 +3725,7 @@ class AgentRunControlPlane:
             changed = self._cancel_task_locked(task, reason=reason)
             if changed:
                 self._cancel_child_agent_runs_locked(task_id, reason=reason)
+                self._cleanup_child_branch_worktrees_locked(task_id)
             return changed
 
     def _cancel_task_locked(
@@ -2945,6 +3744,7 @@ class AgentRunControlPlane:
             task.cancel_reason = reason
             self._append_event_locked(task.id, "cancelled", {"reason": reason})
             self._append_parent_terminal_event_locked(task)
+            self._cleanup_bindings_for_terminal_task_locked(task)
             self._clear_task_claims_locked(task.id)
             self._cancel_requests.pop(task.id, None)
             return True
@@ -2971,6 +3771,7 @@ class AgentRunControlPlane:
         task.cancel_reason = reason
         self._append_event_locked(task.id, "cancelled", {"reason": reason})
         self._append_parent_terminal_event_locked(task)
+        self._cleanup_bindings_for_terminal_task_locked(task)
         self._clear_task_claims_locked(task.id)
         self._cancel_requests.pop(task.id, None)
         return True
@@ -3048,12 +3849,12 @@ class AgentRunControlPlane:
                 )
                 if (
                     relation.relation_type == AgentRunRelationType.AGENT_CALL_EPHEMERAL
-                    or relation.metadata.get("lifecycle_hook_id")
+                    or relation.payload.get("lifecycle_hook_id")
                 ):
                     for event_type, payload in agent_relation_terminal_lifecycle_events(
                         task,
                         owner_agent_run_id=owner_run_id,
-                        relation_metadata=relation.metadata,
+                        relation_metadata=relation.payload,
                         task_prompt=task_prompt,
                     ):
                         self._append_event_locked(owner_run_id, event_type, payload)
@@ -3070,7 +3871,7 @@ class AgentRunControlPlane:
             for event_type, payload in agent_relation_terminal_lifecycle_events(
                 task,
                 owner_agent_run_id=owner_run_id,
-                relation_metadata=relation.metadata,
+                relation_metadata=relation.payload,
                 task_prompt=task_prompt,
             ):
                 self._append_event_locked(owner_run_id, event_type, payload)
@@ -3120,7 +3921,7 @@ class AgentRunControlPlane:
         relation: AgentRunRelation,
     ) -> None:
         owner_run_id = relation.owner_agent_run_id
-        wait = bool(dict(relation.metadata).get("wait") is True)
+        wait = bool(dict(relation.payload).get("wait") is True)
         payload = _agent_call_feedback_payload(task, relation=relation)
         feedback = AgentRunFeedback(
             id=_new_id("feedback"),

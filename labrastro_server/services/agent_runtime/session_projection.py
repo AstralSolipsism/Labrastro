@@ -129,15 +129,20 @@ def agent_run_event_to_session_events(
                 ),
             )
         ]
-    if event_type == "activation_steer_queued":
+    if event_type in {
+        "activation_steer_queued",
+        "activation_steer_delivering",
+        "activation_steer_delivered",
+    }:
         steer = data.get("steer") if isinstance(data.get("steer"), dict) else {}
+        steer_status = str(steer.get("status") or event_type.rsplit("_", 1)[-1])
         return [
             (
                 "context_event",
                 _context_event(
                     labels,
-                    f"{labels.agent_id} activation steer queued",
-                    "agent_run_activation_steer_queued",
+                    f"{labels.agent_id} activation steer {steer_status}",
+                    f"agent_run_{event_type}",
                     {
                         **base,
                         "activation_id": str(
