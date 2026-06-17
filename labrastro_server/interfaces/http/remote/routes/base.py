@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import time
 import uuid
 from http import HTTPStatus
@@ -274,6 +275,47 @@ class RemoteRelayBaseHandler:
     def _verify_query_peer(self, parsed: Any) -> str | None:
         return self._verify_peer_token(self._query_value(parsed, "peer_token"))
 
+    def _session_binding_peer_matches(self, binding: Any, peer_id: str | None) -> bool:
+        if peer_id is None:
+            return False
+        binding_peer_id = str(getattr(binding, "peer_id", "") or "").strip()
+        if not binding_peer_id or binding_peer_id == peer_id:
+            return True
+        return self._peer_can_resume_binding_owner(binding_peer_id, peer_id)
+
+    def _peer_can_resume_binding_owner(
+        self,
+        owner_peer_id: str,
+        candidate_peer_id: str,
+    ) -> bool:
+        registry = self.service.relay_server.registry
+        current = registry.get(candidate_peer_id)
+        get_any = getattr(registry, "get_any", None)
+        owner = get_any(owner_peer_id) if callable(get_any) else None
+        if current is None or owner is None:
+            return False
+        if str(getattr(owner, "status", "") or "") == "online":
+            return False
+        owner_root = self._peer_scope_root(owner)
+        current_root = self._peer_scope_root(current)
+        if not owner_root or owner_root != current_root:
+            return False
+        owner_features = {str(item) for item in getattr(owner, "features", []) or []}
+        current_features = {str(item) for item in getattr(current, "features", []) or []}
+        return owner_features.issubset(current_features)
+
+    @staticmethod
+    def _peer_scope_root(peer: Any) -> str:
+        raw = (
+            getattr(peer, "workspace_root", None)
+            or getattr(peer, "cwd", None)
+            or ""
+        )
+        value = str(raw or "").strip()
+        if not value:
+            return ""
+        return os.path.normcase(os.path.normpath(value))
+
     def _bearer_token(self) -> str:
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
@@ -303,4 +345,3 @@ class RemoteRelayBaseHandler:
             self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
             return None
         return principal
-

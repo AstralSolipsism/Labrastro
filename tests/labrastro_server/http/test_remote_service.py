@@ -1,4 +1,4 @@
-﻿"""Tests for the HTTP transport adapter around the remote relay host."""
+"""Tests for the HTTP transport adapter around the remote relay host."""
 
 from __future__ import annotations
 
@@ -28,10 +28,10 @@ _GO_AVAILABLE = shutil.which("go") is not None
 from labrastro_server.interfaces.http.remote.service import (
     RemoteRelayHTTPService as _RemoteRelayHTTPService,
     _SessionRunEventBuffer,
-    _RemoteSessionRun,
+    _SessionRunProjection,
 )
 from labrastro_server.interfaces.http.remote.routes.chat import (
-    _session_run_events_handler_error_payload,
+    _remote_runtime_error_payload,
 )
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
@@ -52,6 +52,7 @@ from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunRequest,
     ExecutorRunResult,
 )
+from labrastro_server.services.agent_runtime.executor_backend import ExecutorEvent
 from reuleauxcoder.infrastructure.yaml.loader import load_yaml_config, save_yaml_config
 from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.interfaces.http.remote.protocol import (
@@ -88,18 +89,18 @@ def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
     return str(control.get_agent_run(task_id).current_activation_id or "")
 
 
-def test_session_run_events_handler_error_payload_preserves_remote_protocol_code() -> None:
+def test_remote_runtime_error_payload_preserves_remote_protocol_code() -> None:
     class RemoteProtocolLikeError(Exception):
         code = "REMOTE_PREVIEW_EMPTY"
         message = "remote peer preview did not include diff or sections"
 
-    assert _session_run_events_handler_error_payload(RemoteProtocolLikeError("wrapped")) == {
+    assert _remote_runtime_error_payload(RemoteProtocolLikeError("wrapped")) == {
         "message": "remote peer preview did not include diff or sections",
         "code": "REMOTE_PREVIEW_EMPTY",
     }
 
 
-def test_session_run_events_handler_error_payload_preserves_provider_diagnostic() -> None:
+def test_remote_runtime_error_payload_preserves_provider_diagnostic() -> None:
     class RemoteChatProviderError(Exception):
         code = "REMOTE_CHAT_ERROR"
         message = "Try provider type openai_chat. Upstream error: invalid csrf token"
@@ -112,7 +113,7 @@ def test_session_run_events_handler_error_payload_preserves_provider_diagnostic(
             "upstream_message": "invalid csrf token",
         }
 
-    payload = _session_run_events_handler_error_payload(RemoteChatProviderError("wrapped"))
+    payload = _remote_runtime_error_payload(RemoteChatProviderError("wrapped"))
 
     assert payload["message"] == "Try provider type openai_chat. Upstream error: invalid csrf token"
     assert payload["code"] == "REMOTE_CHAT_ERROR"
@@ -380,7 +381,7 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
         )
         return seq
 
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -444,7 +445,7 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
 
 
 def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: Path) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -476,7 +477,7 @@ def test_remote_session_run_adds_server_enqueue_latency_metrics(
         "labrastro_server.interfaces.http.remote.service.time.time",
         lambda: 10.25,
     )
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -490,7 +491,7 @@ def test_remote_session_run_adds_server_enqueue_latency_metrics(
 
 
 def test_remote_session_run_uses_english_notice_for_english_locale(tmp_path: Path) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -512,7 +513,7 @@ def test_remote_session_run_uses_english_notice_for_english_locale(tmp_path: Pat
 
 
 def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -530,6 +531,279 @@ def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -
     events, _done, _cursor = session.wait_events(cursor, 0.2)
     assert [event["type"] for event in events] == ["assistant_delta"]
     assert events[0]["payload"]["content"] == "BC"
+
+
+def test_remote_session_run_branch_projection_uses_parent_prefix_without_sibling_tail(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-branch",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.append_event(
+        "user_message",
+        {
+            "session_item_id": "msg-1",
+            "branch_binding_id": "main",
+            "content": "original question",
+        },
+    )
+    session.append_event(
+        "assistant_message",
+        {
+            "session_item_id": "msg-2",
+            "branch_binding_id": "main",
+            "content": "source branch answer after edit point",
+        },
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-1",
+            "session_run_id": "run-branch",
+            "branch_binding_id": "branch-1",
+            "agent_run_id": "agent-run-branch-1",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "source_agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-branch-1",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-2",
+            "session_run_id": "run-branch",
+            "branch_binding_id": "branch-2",
+            "agent_run_id": "agent-run-branch-2",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "source_agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-branch-2",
+            "selected": False,
+            "status": "active",
+        }
+    )
+    session.append_event(
+        "user_message",
+        {
+            "session_item_id": "branch-msg-1",
+            "branch_binding_id": "branch-1",
+            "content": "edited question",
+        },
+    )
+    session.append_event(
+        "assistant_message",
+        {
+            "session_item_id": "branch-msg-2",
+            "branch_binding_id": "branch-1",
+            "content": "derived branch answer",
+        },
+    )
+    session.append_event(
+        "assistant_message",
+        {
+            "session_item_id": "msg-3",
+            "branch_binding_id": "main",
+            "content": "source branch keeps running",
+        },
+    )
+
+    events, _done, _cursor = session.wait_events(0, 0)
+    contents = [event["payload"].get("content") for event in events]
+
+    assert contents == [
+        "original question",
+        "edited question",
+        "derived branch answer",
+    ]
+    assert (
+        session.compose_branch_prompt(
+            source_branch_binding_id="main",
+            base_session_item_id="msg-1",
+            prompt="edited question",
+        )
+        == "User: original question\n\nUser: edited question"
+    )
+    assert (
+        session.compose_branch_prompt(
+            source_branch_binding_id="main",
+            base_session_item_id="missing-msg",
+            prompt="edited question",
+        )
+        == "edited question"
+    )
+    assert len(session.events) == 5
+    branches = {
+        item["branch_binding_id"]: item
+        for item in session.status_payload(0)["branches"]
+    }
+    assert branches["branch-1"]["selected"] is True
+    assert branches["branch-1"]["current_index"] == 1
+    assert branches["branch-1"]["total_sibling_count"] == 2
+    assert branches["branch-2"]["total_sibling_count"] == 2
+    assert branches["main"]["has_updates"] is True
+
+
+def test_remote_session_run_branch_projection_root_base_uses_empty_parent_prefix(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-root-branch",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-root-branch",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.append_event(
+        "user_message",
+        {
+            "session_item_id": "source-msg-1",
+            "branch_binding_id": "main",
+            "content": "original first question",
+        },
+    )
+    session.append_event(
+        "assistant_message",
+        {
+            "session_item_id": "source-msg-2",
+            "branch_binding_id": "main",
+            "content": "source first answer",
+        },
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-root",
+            "session_run_id": "run-root-branch",
+            "branch_binding_id": "branch-root",
+            "agent_run_id": "agent-run-branch-root",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "__root__",
+            "source_agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-branch-root",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.append_event(
+        "user_message",
+        {
+            "session_item_id": "branch-msg-1",
+            "branch_binding_id": "branch-root",
+            "content": "edited first question",
+        },
+    )
+    session.append_event(
+        "assistant_message",
+        {
+            "session_item_id": "branch-msg-2",
+            "branch_binding_id": "branch-root",
+            "content": "derived first answer",
+        },
+    )
+
+    events, _done, _cursor = session.wait_events(0, 0)
+    contents = [event["payload"].get("content") for event in events]
+
+    assert contents == [
+        "edited first question",
+        "derived first answer",
+    ]
+    assert len(session.events) == 4
+
+
+def test_remote_session_run_pending_inputs_are_branch_local(tmp_path: Path) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-pending",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-branch-pending",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.register_approval(
+        "approval-main",
+        {"tool_call_id": "tool-main", "branch_binding_id": "main"},
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-1",
+            "session_run_id": "run-branch-pending",
+            "branch_binding_id": "branch-1",
+            "agent_run_id": "agent-run-branch-1",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "source_agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-branch-1",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.register_user_input(
+        "input-branch",
+        {"kind": "clarification", "branch_binding_id": "branch-1"},
+    )
+
+    status = session.status_payload(0)
+    branches = {item["branch_binding_id"]: item for item in status["branches"]}
+
+    assert status["approvals"] == []
+    assert [item["input_id"] for item in status["user_inputs"]] == ["input-branch"]
+    assert branches["main"]["pending_approval_count"] == 1
+    assert branches["branch-1"]["pending_user_input_count"] == 1
+    assert (
+        session.resolve_approval(
+            "approval-main",
+            "allow_once",
+            None,
+            branch_binding_id="branch-1",
+        )
+        is None
+    )
+    assert (
+        session.resolve_approval(
+            "approval-main",
+            "allow_once",
+            None,
+            branch_binding_id="main",
+        )
+        == "resolved"
+    )
 
 
 def test_remote_session_run_document_draft_preview_chunk_is_live_only(
@@ -559,7 +833,7 @@ def test_remote_session_run_document_draft_preview_chunk_is_live_only(
         )
         return len(persisted)
 
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -590,7 +864,7 @@ def test_remote_session_run_document_draft_preview_chunk_is_live_only(
 def test_remote_session_run_document_draft_preview_chunk_keeps_large_body_without_artifact(
     tmp_path: Path,
 ) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -623,7 +897,7 @@ def test_remote_session_run_document_draft_preview_chunk_keeps_large_body_withou
 def test_remote_session_run_hydrates_large_document_draft_snapshot_for_stream(
     tmp_path: Path,
 ) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -692,7 +966,7 @@ def test_remote_session_run_persists_document_draft_snapshot_trace_without_body(
         )
         return len(persisted)
 
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -763,7 +1037,7 @@ def test_remote_session_run_flushes_pending_document_draft_snapshot_trace_withou
         )
         return len(persisted)
 
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -802,7 +1076,7 @@ def test_remote_session_run_status_does_not_hydrate_large_document_draft_snapsho
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -842,7 +1116,7 @@ def test_remote_session_run_status_does_not_hydrate_large_document_draft_snapsho
 def test_remote_session_run_interleaves_live_and_durable_events_without_false_loss(
     tmp_path: Path,
 ) -> None:
-    session = _RemoteSessionRun(
+    session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
         artifact_root=tmp_path,
@@ -967,6 +1241,53 @@ def _fake_gh_env(tmp_path: Path, *, pr_url: str = "https://example.test/pr/fake"
 
 
 class TestRemoteRelayHTTPService:
+    def _start_bound_agent_run_session(self):
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        _, register_body = _json_request(
+            "POST",
+            f"{service.base_url}/remote/register",
+            _peer_register_payload(
+                relay,
+                features=["agent_runs", "agent_runs.local_workspace"],
+            ),
+        )
+        _, start_body = _json_request(
+            "POST",
+            f"{service.base_url}/remote/session-runs/start",
+            {
+                "peer_token": register_body["payload"]["peer_token"],
+                "prompt": "first",
+                "session_hint": "chat-session-steer",
+                "client_request_id": "start-steer-1",
+            },
+        )
+        return relay, service, control, register_body, start_body
+
+    def _mark_claim_running(
+        self,
+        control: AgentRunControlPlane,
+        peer_id: str,
+        claim: dict,
+    ) -> None:
+        ok, reason = control.append_executor_event(
+            claim["agent_run"]["id"],
+            ExecutorEvent.status("running"),
+            request_id=claim["request_id"],
+            activation_id=claim["activation_id"],
+            worker_id=claim["worker_id"],
+            peer_id=peer_id,
+        )
+        assert ok, reason
+
     def test_relay_send_preview_request_roundtrips_result(self) -> None:
         captured: list[RelayEnvelope] = []
 
@@ -1210,6 +1531,220 @@ class TestRemoteRelayHTTPService:
             assert "sk-secret-value" in raw
             assert "active_main: deepseek-main" in raw
             assert "deepseek-copy" not in raw
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_branch_select_switches_selected_projection_without_stopping_runs(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            source_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch prompt",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-branch-select",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-select-1",
+                selected=False,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=source_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+
+            status, body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/branches/select",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-select-1",
+                    "cursor": 0,
+                },
+            )
+
+            assert status == 200
+            assert body["session_run_id"] == session_run_id
+            assert body["agent_run_id"] == branch.id
+            assert body["branch_binding_id"] == "branch-select-1"
+            branches = {item["branch_binding_id"]: item for item in body["branches"]}
+            assert branches["main"]["selected"] is False
+            assert branches["branch-select-1"]["selected"] is True
+            assert control.agent_run_to_dict(source_agent_run_id)["status"] == "queued"
+            assert control.agent_run_to_dict(branch.id)["status"] == "queued"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_agent_run_branch_uses_session_branch_projection_prompt(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+
+        class FakePlan:
+            def __init__(self, runtime_root: Path, branch_name: str) -> None:
+                self.runtime_root = runtime_root
+                self.branch_name = branch_name
+                self.worktree_path = runtime_root / "worktrees" / branch_name.replace("/", "-")
+
+        class FakePrepared:
+            def __init__(self, plan: FakePlan, source_repo: Path) -> None:
+                self.runtime_root = plan.runtime_root
+                self.source_repo = source_repo
+                self.branch_name = plan.branch_name
+                self.base_git_ref = "base-commit"
+                self.base_tree_ref = "base-tree"
+                self.branch_git_ref = f"refs/heads/{plan.branch_name}"
+                self.branch_worktree_ref = str(plan.worktree_path)
+                self.worktree_path = plan.worktree_path
+
+        class FakeWorktreeManager:
+            def __init__(self, runtime_root: str | Path) -> None:
+                self.runtime_root = Path(runtime_root)
+
+            def plan(
+                self,
+                *,
+                workspace_id: str,
+                task_id: str,
+                agent_id: str,
+                repo_url: str | None = None,
+                branch_name: str | None = None,
+            ) -> FakePlan:
+                del workspace_id, task_id, agent_id, repo_url
+                return FakePlan(self.runtime_root, branch_name or "agent/chat/branch-run")
+
+            def create_branch_worktree(
+                self,
+                *,
+                source_repo: str | Path,
+                plan: FakePlan,
+                base_ref: str = "HEAD",
+            ) -> FakePrepared:
+                del base_ref
+                plan.worktree_path.mkdir(parents=True, exist_ok=True)
+                return FakePrepared(plan, Path(source_repo))
+
+            def cleanup_branch_worktree(self, **_kwargs: object) -> None:
+                return None
+
+        try:
+            session = service._create_session_run(
+                "peer-1",
+                "chat-session-branch",
+                agent_run_id="source-run",
+                branch_binding_id="main",
+            )
+            source_repo = tmp_path / "source-repo"
+            source_repo.mkdir()
+            source = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="base",
+                    owner_session_run_id=session.session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                    workdir=str(source_repo),
+                ),
+                task_id="source-run",
+            )
+            binding = control.create_session_run_binding(
+                session_run_id=session.session_run_id,
+                session_id=session.session_id or "chat-session-branch",
+                peer_id="peer-1",
+                agent_run_id=source.id,
+                branch_binding_id="main",
+                selected=True,
+                target_agent_run_id=source.id,
+                metadata={"binding_kind": "mainline"},
+            )
+            session.agent_run_id = source.id
+            session.record_branch_binding(binding)
+            session.append_event(
+                "user_message",
+                {
+                    "session_item_id": "msg-1",
+                    "branch_binding_id": "main",
+                    "content": "original question",
+                },
+            )
+            session.append_event(
+                "assistant_message",
+                {
+                    "session_item_id": "msg-2",
+                    "branch_binding_id": "main",
+                    "content": "source branch answer after edit point",
+                },
+            )
+
+            with patch(
+                "labrastro_server.services.agent_runtime.control_plane.WorktreeManager",
+                FakeWorktreeManager,
+            ):
+                status, body = _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/agent-runs/branch",
+                    {
+                        "source_agent_run_id": source.id,
+                        "base_session_item_id": "msg-1",
+                        "runtime_root": str(tmp_path / "runtime"),
+                        "repo_root": str(source_repo),
+                        "agent_run_id": "branch-run",
+                        "branch_binding_id": "branch-edit-1",
+                        "prompt": "edited question",
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+
+            assert status == 200
+            detail = control.load_agent_run_detail(body["agent_run"]["id"])
+            assert detail["activations"][-1]["prompt"] == (
+                "User: original question\n\nUser: edited question"
+            )
+            assert (
+                "source branch answer after edit point"
+                not in detail["activations"][-1]["prompt"]
+            )
+            events, _done, _cursor = session.wait_events(0, 0)
+            assert [event["payload"].get("content") for event in events] == [
+                "original question",
+                "edited question",
+            ]
+            assert all(
+                event["payload"].get("content")
+                != "source branch answer after edit point"
+                for event in events
+            )
+            selected_binding = control.find_session_run_binding(
+                session_run_id=session.session_run_id
+            )
+            assert selected_binding is not None
+            assert selected_binding.branch_binding_id == "branch-edit-1"
         finally:
             service.stop()
             relay.stop()
@@ -5044,313 +5579,15 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_disconnect_aborts_active_stream_session_run(self) -> None:
+    def test_session_run_start_creates_bound_agent_run_mainline(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            session.append_event("session_run_start", {"prompt": _prompt})
-            # Wait long enough so test can force disconnect first.
-            session.wait_approval("hold", timeout_sec=2)
-
+        control = AgentRunControlPlane()
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {
-                    "peer_token": peer_token,
-                    "prompt": "long-run",
-                },
-            )
-            session_run_id = start_body["session_run_id"]
-
-            status, _ = _json_request(
-                "POST",
-                f"{service.base_url}/remote/disconnect",
-                {"peer_token": peer_token, "reason": "test_disconnect"},
-            )
-            assert status == 200
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            assert stream_body["done"] is True
-            event_types = [event["type"] for event in stream_body["events"]]
-            assert "session_run_start" in event_types
-            assert "error" in event_types
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_disconnect_resolves_registered_pending_approval(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        approval_ready = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            approval_id = "approval-disconnect"
-            payload = {
-                "approval_id": approval_id,
-                "tool_call_id": "call-disconnect",
-                "tool_name": "shell",
-                "tool_source": "builtin",
-                "reason": "need approval",
-                "tool_args": {"command": "echo hi"},
-            }
-            session.register_approval(approval_id, payload)
-            session.append_event("approval_request", payload)
-            approval_ready.set()
-            session.wait_approval(approval_id, timeout_sec=2)
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "needs approval"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert approval_ready.wait(2)
-
-            status, _ = _json_request(
-                "POST",
-                f"{service.base_url}/remote/disconnect",
-                {"peer_token": peer_token, "reason": "peer_shutdown"},
-            )
-            assert status == 200
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            resolved_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "approval_resolved"
-            ]
-            assert len(resolved_events) == 1
-            payload = resolved_events[0]["payload"]
-            assert payload["server_enqueued_at"] > 0
-            assert {
-                key: payload[key]
-                for key in ("approval_id", "tool_call_id", "decision", "reason")
-            } == {
-                "approval_id": "approval-disconnect",
-                "tool_call_id": "call-disconnect",
-                "decision": "deny_once",
-                "reason": "peer_disconnected: peer_shutdown",
-            }
-            assert stream_body["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_start_preserves_requested_mode_on_stream_session(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        seen: dict[str, object] = {}
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            seen["mode"] = session.mode
-            seen["locale"] = session.locale
-            seen["mentions"] = session.mentions
-            session.append_event(
-                "session_run_start",
-                {
-                    "prompt": _prompt,
-                    "mode": session.mode,
-                    "locale": session.locale,
-                    "mentions": session.mentions,
-                },
-            )
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {
-                    "peer_token": peer_token,
-                    "prompt": "use planner mode",
-                    "mode": "planner",
-                    "locale": "zh-CN",
-                    "mentions": [
-                        {
-                            "kind": "file",
-                            "name": "README.md",
-                            "path": "README.md",
-                            "source": "workspace_files",
-                        }
-                    ],
-                },
-            )
-            session_run_id = start_body["session_run_id"]
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-
-            assert stream_body["done"] is True
-            assert seen["mode"] == "planner"
-            assert seen["locale"] == "zh-CN"
-            assert seen["mentions"] == [
-                {
-                    "kind": "file",
-                    "name": "README.md",
-                    "path": "README.md",
-                    "source": "workspace_files",
-                }
-            ]
-            session_run_start = next(
-                event for event in stream_body["events"] if event["type"] == "session_run_start"
-            )
-            assert session_run_start["payload"]["mentions"] == seen["mentions"]
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_start_is_idempotent_for_client_request_id(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        release = threading.Event()
-        starts: list[str] = []
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            starts.append(session.session_run_id)
-            release.wait(timeout=2)
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-            payload = {
-                "peer_token": peer_token,
-                "prompt": "same request",
-                "session_hint": "session-1",
-                "client_request_id": "req-1",
-            }
-
-            _, first = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                payload,
-            )
-            _, second = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                payload,
-            )
-
-            assert second["session_run_id"] == first["session_run_id"]
-            deadline = time.time() + 1
-            while len(starts) < 1 and time.time() < deadline:
-                time.sleep(0.01)
-            assert len(starts) == 1
-        finally:
-            release.set()
-            service.stop()
-            relay.stop()
-
-    def test_register_rejects_missing_runtime_context_when_required(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            require_peer_runtime_context=True,
-        )
-        service.start()
-        try:
-            with pytest.raises(HTTPError) as excinfo:
-                _json_request(
-                    "POST",
-                    f"{service.base_url}/remote/register",
-                    {
-                        "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                        "cwd": "/tmp/peer",
-                    },
-                )
-            assert excinfo.value.code == 400
-            body = json.loads(excinfo.value.read().decode("utf-8"))
-            assert body["error"] == "invalid_peer_runtime_context"
-            assert "host_info_min.shell" in body["details"]["missing"]
-            assert "workspace_root" in body["details"]["missing"]
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_start_requires_model_for_new_sessions_when_required(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-            require_explicit_chat_model=True,
-            require_peer_runtime_context=True,
+            runtime_control_plane=control,
         )
         service.start()
         try:
@@ -5360,58 +5597,145 @@ class TestRemoteRelayHTTPService:
                 _peer_register_payload(relay),
             )
             peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+
+            status, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {
+                    "peer_token": peer_token,
+                    "prompt": "first",
+                    "session_hint": "chat-session-1",
+                    "client_request_id": "start-1",
+                },
+            )
+
+            assert status == 200
+            session_run_id = start_body["session_run_id"]
+            agent_run_id = start_body["agent_run_id"]
+            assert start_body["branch_binding_id"] == "main"
+            assert start_body["activation_id"] == f"{agent_run_id}:activation:1"
+            binding = control.find_session_run_binding(session_run_id=session_run_id)
+            assert binding is not None
+            assert binding.agent_run_id == agent_run_id
+            assert binding.peer_id == peer_id
+            run = control.get_agent_run(agent_run_id)
+            assert run.owner_session_run_id == session_run_id
+            assert run.source.value == "chat"
+            assert run.trigger_mode.value == "interactive_chat"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_continue_uses_bound_agent_run_mainline(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {
+                    "peer_token": peer_token,
+                    "prompt": "first",
+                    "session_hint": "chat-session-1",
+                    "client_request_id": "start-1",
+                },
+            )
+            session_run_id = start_body["session_run_id"]
+            agent_run_id = start_body["agent_run_id"]
+            control.complete_agent_run_activation(
+                agent_run_id,
+                ExecutorRunResult(
+                    task_id=agent_run_id,
+                    status="completed",
+                    output="first done",
+                ),
+                activation_id=start_body["activation_id"],
+            )
+
+            status, continue_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/continue",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "prompt": "second",
+                    "client_request_id": "continue-1",
+                },
+            )
+
+            assert status == 200
+            assert continue_body["ok"] is True
+            assert continue_body["session_run_id"] == session_run_id
+            assert continue_body["agent_run_id"] == agent_run_id
+            assert continue_body["activation_id"] == f"{agent_run_id}:activation:2"
+            assert [item["id"] for item in control.list_agent_runs()] == [agent_run_id]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_continue_requires_selected_binding(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_id = register_body["payload"]["peer_id"]
+            peer_token = register_body["payload"]["peer_token"]
+            session = service._create_session_run(peer_id, "chat-session-1")
 
             with pytest.raises(HTTPError) as excinfo:
                 _json_request(
                     "POST",
-                    f"{service.base_url}/remote/session-runs/start",
-                    {"peer_token": peer_token, "prompt": "hello"},
+                    f"{service.base_url}/remote/session-runs/continue",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session.session_run_id,
+                        "prompt": "second",
+                    },
                 )
-            assert excinfo.value.code == 400
             body = json.loads(excinfo.value.read().decode("utf-8"))
-            assert body["error"] == "model_selection_required"
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {
-                    "peer_token": peer_token,
-                    "prompt": "hello",
-                    "provider_id": "deepseek",
-                    "model_id": "V4FLASH",
-                },
-            )
-            assert start_body["session_run_id"]
+            assert excinfo.value.code == 409
+            assert body["error"] == "session_run_binding_not_found"
         finally:
             service.stop()
             relay.stop()
 
-    def test_session_run_start_allows_existing_session_runtime_model_when_required(self) -> None:
+    def test_session_run_status_reads_bound_agent_run_status(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-
-        def session_handler(action: str, _peer_id: str, payload: dict) -> dict:
-            if action == "load" and payload.get("session_id") == "session-1":
-                return {
-                    "ok": True,
-                    "runtime_state": {
-                        "active_model_provider": "deepseek",
-                        "active_model": "V4FLASH",
-                    },
-                }
-            return {"ok": False, "error": "session_not_found", "_status": 404}
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            session.append_event("session_run_end", {"response": "ok"})
-
+        control = AgentRunControlPlane()
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-            session_handler=session_handler,
-            require_explicit_chat_model=True,
-            require_peer_runtime_context=True,
+            runtime_control_plane=control,
         )
         service.start()
         try:
@@ -5421,1893 +5745,272 @@ class TestRemoteRelayHTTPService:
                 _peer_register_payload(relay),
             )
             peer_token = register_body["payload"]["peer_token"]
-
             _, start_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/session-runs/start",
-                {
-                    "peer_token": peer_token,
-                    "prompt": "continue",
-                    "session_hint": "session-1",
-                },
+                {"peer_token": peer_token, "prompt": "first"},
             )
-            assert start_body["session_run_id"]
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_status_reports_running_done_and_error(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        running_started = threading.Event()
-        release_running = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, prompt: str, session) -> None:
-            session.append_event("session_run_start", {"prompt": prompt})
-            if prompt == "boom":
-                session.append_event("error", {"message": "intentional_failure"})
-                return
-            running_started.set()
-            release_running.wait(timeout=2)
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "hold"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert running_started.wait(2)
-
-            _, running_status = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/status",
-                {"peer_token": peer_token, "session_run_id": session_run_id, "cursor": 0},
-            )
-            assert running_status["ok"] is True
-            assert running_status["status"] == "running"
-            assert running_status["running"] is True
-            assert running_status["done"] is False
-            assert running_status["reconnectable"] is True
-            assert running_status["latest_seq"] >= 1
-
-            release_running.set()
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id, timeout_sec=2)
-            assert stream_body["done"] is True
-
-            _, done_status = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/status",
-                {"peer_token": peer_token, "session_run_id": session_run_id, "cursor": 0},
-            )
-            assert done_status["status"] == "done"
-            assert done_status["running"] is False
-            assert done_status["done"] is True
-            assert done_status["reconnectable"] is False
-
-            _, error_start = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "boom"},
-            )
-            error_stream = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                error_start["session_run_id"],
-                timeout_sec=2,
-            )
-            assert error_stream["done"] is True
-
-            _, error_status = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/status",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": error_start["session_run_id"],
-                    "cursor": 0,
-                },
-            )
-            assert error_status["status"] == "error"
-            assert error_status["done"] is True
-            assert error_status["error"] == "intentional_failure"
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_start_reports_peer_registration_setup_errors(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, _session) -> None:
-            raise ValueError("remote peer registration missing host_info_min.shell")
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "hello"},
-            )
-            stream_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                start_body["session_run_id"],
-            )
-
-            error_event = [
-                event for event in stream_body["events"] if event["type"] == "error"
-            ][-1]
-            error_payload = error_event["payload"]
-            assert error_payload["server_enqueued_at"] > 0
-            assert {
-                key: error_payload[key]
-                for key in ("message", "code")
-            } == {
-                "message": "remote peer registration missing host_info_min.shell",
-                "code": "session_run_handler_failed",
-            }
-            failed_event = [
-                event for event in stream_body["events"] if event["type"] == "session_run_failed"
-            ][-1]
-            failed_payload = failed_event["payload"]
-            assert failed_payload["server_enqueued_at"] > 0
-            assert {
-                key: failed_payload[key]
-                for key in ("message", "code", "recoverable")
-            } == {
-                "message": "remote peer registration missing host_info_min.shell",
-                "code": "session_run_handler_failed",
-                "recoverable": False,
-            }
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_recover_consumes_recovery_ticket_and_restarts_stream(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        prompts: list[str] = []
-
-        def session_run_events_handler(_peer_id: str, prompt: str, session) -> None:
-            prompts.append(prompt)
-            if len(prompts) == 1:
-                payload = {
-                    "message": "provider stream interrupted",
-                    "response": "partial answer",
-                    "recoverable": True,
-                    "recovery_actions": ["continue", "retry"],
-                }
-                session.register_recovery(payload)
-                session.append_event("session_run_interrupted", payload)
-                return
-            session.append_event("assistant_delta", {"content": " resumed"})
-            session.append_event("session_run_end", {"response": "partial answer resumed"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "initial"},
-            )
-            session_run_id = start_body["session_run_id"]
-            first_stream = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-            )
-            assert any(event["type"] == "session_run_interrupted" for event in first_stream["events"])
-
-            _, recover_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/recover",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "action": "continue",
-                },
-            )
-            assert recover_body == {
-                "ok": True,
-                "session_run_id": session_run_id,
-                "error": None,
-                "state": "consumed",
-            }
-
-            second_stream = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                cursor=first_stream["next_cursor"],
-            )
-            assert prompts[0] == "initial"
-            assert "<stream_recovery>" in prompts[1]
-            assert any(event["type"] == "session_run_recovery_start" for event in second_stream["events"])
-            assert any(event["type"] == "session_run_end" for event in second_stream["events"])
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_events_cursor_resume_reads_events_created_between_connections(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        first_delta_sent = threading.Event()
-        release_second_delta = threading.Event()
-        finished = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                session.append_event("session_run_start", {"prompt": _prompt})
-                session.append_event("delta", {"text": "first"})
-                first_delta_sent.set()
-                release_second_delta.wait(timeout=2)
-                session.append_event("delta", {"text": "second"})
-                session.append_event("session_run_end", {"response": "done"})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "resume"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert first_delta_sent.wait(2)
-
-            first_batch = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                timeout_sec=0,
-            )
-            assert first_batch["done"] is False
-            assert [event["type"] for event in first_batch["events"]] == [
-                "session_run_start",
-                "delta",
-            ]
-            first_cursor = first_batch["next_cursor"]
-
-            release_second_delta.set()
-            assert finished.wait(2)
-            resumed_batch = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                cursor=first_cursor,
-            )
-
-            assert resumed_batch["done"] is True
-            assert [event["type"] for event in resumed_batch["events"]] == [
-                "delta",
-                "session_run_end",
-            ]
-            assert resumed_batch["events"][0]["payload"]["text"] == "second"
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_events_sse_streams_chat_response_frames(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        first_delta_sent = threading.Event()
-        release_second_delta = threading.Event()
-        finished = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                session.append_event("session_run_start", {"prompt": _prompt})
-                session.append_event("delta", {"text": "first"})
-                first_delta_sent.set()
-                release_second_delta.wait(timeout=2)
-                session.append_event("delta", {"text": "second"})
-                session.append_event("session_run_end", {"response": "done"})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "sse"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert first_delta_sent.wait(2)
-
-            result: dict[str, object] = {}
-
-            def read_stream() -> None:
-                status, content_type, raw_body, frames = _sse_request(
-                    "POST",
-                    f"{service.base_url}/remote/session-runs/events",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "cursor": 0,
-                        "timeout_sec": 0.05,
-                    },
-                )
-                result.update(
-                    {
-                        "status": status,
-                        "content_type": content_type,
-                        "raw_body": raw_body,
-                        "frames": frames,
-                    }
-                )
-
-            reader = threading.Thread(target=read_stream)
-            reader.start()
-            time.sleep(0.2)
-            release_second_delta.set()
-            reader.join(timeout=5)
-
-            assert finished.wait(2)
-            assert not reader.is_alive()
-            assert result["status"] == 200
-            assert str(result["content_type"]).startswith("text/event-stream")
-            assert ": ping" in str(result["raw_body"])
-            frames = result["frames"]
-            assert isinstance(frames, list)
-            assert [frame["event"] for frame in frames] == ["session_run", "session_run"]
-            assert [event["type"] for event in frames[0]["data"]["events"]] == [
-                "session_run_start",
-                "delta",
-            ]
-            assert frames[0]["data"]["done"] is False
-            assert [event["type"] for event in frames[1]["data"]["events"]] == [
-                "delta",
-                "session_run_end",
-            ]
-            assert frames[1]["data"]["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_events_sse_resumes_from_cursor(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        first_delta_sent = threading.Event()
-        release_second_delta = threading.Event()
-        finished = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                session.append_event("delta", {"text": "first"})
-                first_delta_sent.set()
-                release_second_delta.wait(timeout=2)
-                session.append_event("delta", {"text": "second"})
-                session.append_event("session_run_end", {"response": "done"})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "resume-sse"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert first_delta_sent.wait(2)
-
-            first_batch = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                timeout_sec=0,
-            )
-            first_cursor = first_batch["next_cursor"]
-
-            release_second_delta.set()
-            assert finished.wait(2)
-            status, content_type, _raw_body, frames = _sse_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/events",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "cursor": first_cursor,
-                    "timeout_sec": 1,
-                },
-            )
-
-            assert status == 200
-            assert content_type.startswith("text/event-stream")
-            assert len(frames) == 1
-            assert [event["type"] for event in frames[0]["data"]["events"]] == [
-                "delta",
-                "session_run_end",
-            ]
-            assert frames[0]["data"]["events"][0]["payload"]["text"] == "second"
-            assert frames[0]["data"]["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_control_allows_any_valid_peer_token_for_existing_session_run(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        finished = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                session.append_event("session_run_start", {"prompt": _prompt})
-                session.append_event("delta", {"text": "after-reconnect"})
-                session.append_event("session_run_end", {"response": "done"})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, first_register = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer-a",
-                },
-            )
-            _, replacement_register = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer-b",
-                },
-            )
-            first_token = first_register["payload"]["peer_token"]
-            replacement_token = replacement_register["payload"]["peer_token"]
-            assert first_register["payload"]["peer_id"] != replacement_register["payload"]["peer_id"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": first_token, "prompt": "resume from replacement"},
-            )
-            assert finished.wait(2)
-
-            stream_body = _session_run_events_body(
-                service.base_url,
-                replacement_token,
-                start_body["session_run_id"],
-            )
-
-            assert stream_body["done"] is True
-            assert [event["type"] for event in stream_body["events"]] == [
-                "session_run_start",
-                "delta",
-                "session_run_end",
-            ]
-            assert stream_body["events"][1]["payload"]["text"] == "after-reconnect"
-
-            status_code, status_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/status",
-                {"peer_token": replacement_token, "session_run_id": start_body["session_run_id"]},
-            )
-            assert status_code == 200
-            assert status_body["session_run_id"] == start_body["session_run_id"]
-            assert status_body["peer_id"] == first_register["payload"]["peer_id"]
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_control_rejects_invalid_token_and_missing_run(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=lambda _peer_id, _prompt, _session: None,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            try:
-                _json_request(
-                    "POST",
-                    f"{service.base_url}/remote/session-runs/status",
-                    {"peer_token": "bad-token", "session_run_id": "missing-run"},
-                )
-                raise AssertionError("expected invalid peer token to fail")
-            except HTTPError as exc:
-                body = json.loads(exc.read().decode("utf-8"))
-                assert exc.code == 401
-                assert body["error"] == "invalid_peer_token"
-
-            try:
-                _json_request(
-                    "POST",
-                    f"{service.base_url}/remote/session-runs/status",
-                    {"peer_token": peer_token, "session_run_id": "missing-run"},
-                )
-                raise AssertionError("expected missing session run to fail")
-            except HTTPError as exc:
-                body = json.loads(exc.read().decode("utf-8"))
-                assert exc.code == 404
-                assert body["error"] == "session_run_not_found"
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_cancel_adds_terminal_event_and_marks_done(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            session.wait_approval("hold", timeout_sec=2)
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "cancel me"},
-            )
-            session_run_id = start_body["session_run_id"]
-
-            _, cancel_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/cancel",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "reason": "user_cancelled",
-                },
-            )
-            assert cancel_body["ok"] is True
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            assert stream_body["done"] is True
-            event_types = [event["type"] for event in stream_body["events"]]
-            assert "session_run_cancel_requested" in event_types
-            assert "session_run_cancelled" in event_types
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_cancel_resolves_registered_pending_approval(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        approval_ready = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            approval_id = "approval-cancel"
-            payload = {
-                "approval_id": approval_id,
-                "tool_call_id": "call-cancel",
-                "tool_name": "shell",
-                "tool_source": "builtin",
-                "reason": "need approval",
-                "tool_args": {"command": "echo hi"},
-            }
-            session.register_approval(approval_id, payload)
-            session.append_event("approval_request", payload)
-            approval_ready.set()
-            decision, resolution_reason, _resolution_meta = session.wait_approval(approval_id, timeout_sec=2)
-            session.append_event(
-                "approval_resolved",
-                {
-                    "approval_id": approval_id,
-                    "tool_call_id": "call-cancel",
-                    "decision": decision,
-                    "reason": resolution_reason,
-                },
-            )
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "cancel me"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert approval_ready.wait(2)
-
-            _, cancel_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/cancel",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "reason": "user_cancelled",
-                },
-            )
-            assert cancel_body["ok"] is True
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            resolved_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "approval_resolved"
-            ]
-            assert len(resolved_events) == 1
-            payload = resolved_events[0]["payload"]
-            assert payload["server_enqueued_at"] > 0
-            assert {
-                key: payload[key]
-                for key in ("approval_id", "tool_call_id", "decision", "reason")
-            } == {
-                "approval_id": "approval-cancel",
-                "tool_call_id": "call-cancel",
-                "decision": "deny_once",
-                "reason": "user_cancelled",
-            }
-            assert any(event["type"] == "session_run_cancelled" for event in stream_body["events"])
-            assert stream_body["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_follow_up_can_be_consumed_at_safe_boundary(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        handler_ready = threading.Event()
-        consumed = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            session.set_follow_up_callback(
-                lambda ticket: (
-                    session.mark_follow_up_consumed(ticket["followup_id"]),
-                    consumed.set(),
-                )
-            )
-            handler_ready.set()
-            consumed.wait(timeout=2)
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "guide me"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert handler_ready.wait(2)
-
-            _, follow_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/follow-up",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "followup_id": "follow-1",
-                    "client_request_id": "pending-1",
-                    "text": "prefer the shorter path",
-                },
-            )
-            assert follow_body["ok"] is True
-            assert follow_body["followup_id"] == "follow-1"
-            assert follow_body["state"] in {"pending", "consumed"}
-            assert consumed.wait(2)
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            event_types = [event["type"] for event in stream_body["events"]]
-            assert "session_run_follow_up_accepted" in event_types
-            assert "session_run_follow_up_consumed" in event_types
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_follow_up_unconsumed_when_run_finishes_without_boundary(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        handler_ready = threading.Event()
-        release = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            handler_ready.set()
-            release.wait(timeout=2)
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "pure stream"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert handler_ready.wait(2)
-
-            _, follow_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/follow-up",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "followup_id": "follow-1",
-                    "text": "late guidance",
-                },
-            )
-            assert follow_body["ok"] is True
-            release.set()
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            events = stream_body["events"]
-            unconsumed = [
-                event
-                for event in events
-                if event["type"] == "session_run_follow_up_unconsumed"
-            ]
-            assert unconsumed
-            assert unconsumed[-1]["payload"]["followup_id"] == "follow-1"
-        finally:
-            release.set()
-            service.stop()
-            relay.stop()
-
-    def test_session_run_follow_up_cancel_marks_ticket_cancelled(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        handler_ready = threading.Event()
-        release = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            handler_ready.set()
-            release.wait(timeout=2)
-            session.append_event("session_run_end", {"response": "ok"})
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "cancel follow up"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert handler_ready.wait(2)
-
-            _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/follow-up",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "followup_id": "follow-1",
-                    "text": "temporary guidance",
-                },
-            )
-            _, cancel_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/follow-up/cancel",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "followup_id": "follow-1",
-                    "reason": "user_changed_to_queue",
-                },
-            )
-            assert cancel_body["ok"] is True
-            assert cancel_body["state"] == "cancelled"
-            release.set()
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            cancelled = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "session_run_follow_up_cancelled"
-            ]
-            assert cancelled
-            assert cancelled[-1]["payload"]["reason"] == "user_changed_to_queue"
-        finally:
-            release.set()
-            service.stop()
-            relay.stop()
-
-    def test_session_run_events_reports_lost_events_when_buffer_pruned(
-        self, tmp_path: Path
-    ) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        finished = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                for idx in range(6):
-                    session.append_event("delta", {"idx": idx})
-                session.append_event("session_run_end", {"response": "done"})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-            session_run_max_events=3,
-            session_run_artifact_root=tmp_path / "session-run-events",
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "overflow"},
-            )
-            assert finished.wait(2)
-
-            stream_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                start_body["session_run_id"],
-            )
-
-            events = stream_body["events"]
-            assert events[0]["type"] == "events_lost"
-            assert events[0]["payload"]["first_available_seq"] > 1
-            assert events[0]["payload"]["dropped_count"] >= 1
-            assert [event["type"] for event in events[1:]] == [
-                "delta",
-                "delta",
-                "session_run_end",
-            ]
-            assert [event["payload"].get("idx") for event in events if event["type"] == "delta"] == [4, 5]
-            assert stream_body["next_cursor"] == events[-1]["seq"]
-            assert stream_body["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_events_spills_oversized_payload_to_gzip_artifact(
-        self, tmp_path: Path
-    ) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        finished = threading.Event()
-        large_text = "x" * 512
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                session.append_event("delta", {"text": large_text})
-                session.append_event("session_run_end", {"response": "done"})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-            session_run_max_payload_bytes=128,
-            session_run_artifact_root=tmp_path / "session-run-events",
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "large"},
-            )
-            assert finished.wait(2)
-
-            stream_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                start_body["session_run_id"],
-            )
-
-            delta_event = next(
-                event for event in stream_body["events"] if event["type"] == "delta"
-            )
-            artifact = delta_event["payload"]["artifact_ref"]
-            artifact_path = Path(artifact["path"])
-            assert artifact["encoding"] == "json+gzip"
-            assert artifact["bytes"] > 128
-            assert artifact_path.exists()
-            with gzip.open(artifact_path, "rt", encoding="utf-8") as fh:
-                assert json.load(fh) == {"text": large_text}
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_artifact_envelope_preserves_file_change_identity(
-        self, tmp_path: Path
-    ) -> None:
-        buffer = _SessionRunEventBuffer(
-            session_run_id="run-1",
-            artifact_root=tmp_path / "session-run-events",
-            max_events=20,
-            max_payload_bytes=128,
-            max_total_bytes=4096,
-        )
-        large_diff = "--- a/src/a.ts\n+++ b/src/a.ts\n" + "\n".join(
-            f"+line-{index}" for index in range(80)
-        )
-
-        buffer.append({
-            "session_run_id": "run-1",
-            "seq": 1,
-            "type": "file_change_patch_updated",
-            "payload": {
-                "item_id": "file-change-1",
-                "tool_call_id": "tool-1",
-                "approval_id": "approval-1",
-                "draft_id": "draft-1",
-                "status": "in_progress",
-                "changes": [{"path": "src/a.ts", "kind": "update", "diff": large_diff}],
-                "patch_preview": large_diff,
-            },
-        })
-
-        event = buffer.snapshot()[0]
-        payload = event["payload"]
-        assert payload["item_id"] == "file-change-1"
-        assert payload["tool_call_id"] == "tool-1"
-        assert payload["approval_id"] == "approval-1"
-        assert payload["draft_id"] == "draft-1"
-        assert payload["status"] == "in_progress"
-        assert "changes" not in payload
-        assert "patch_preview" not in payload
-        artifact = payload["artifact_ref"]
-        assert artifact["encoding"] == "json+gzip"
-        assert artifact["fields"] == ["changes", "patch_preview"]
-        with gzip.open(Path(artifact["path"]), "rt", encoding="utf-8") as fh:
-            stored = json.load(fh)
-        assert stored["changes"][0]["diff"] == large_diff
-        assert stored["patch_preview"] == large_diff
-
-    def test_session_run_gc_removes_closed_idle_sessions_and_artifacts(
-        self, tmp_path: Path
-    ) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        finished = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            try:
-                session.append_event("delta", {"text": "x" * 512})
-            finally:
-                finished.set()
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-            session_run_max_payload_bytes=128,
-            session_run_artifact_root=tmp_path / "session-run-events",
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "gc"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert finished.wait(2)
-
-            stream_body = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-            )
-            delta_event = next(
-                event for event in stream_body["events"] if event["type"] == "delta"
-            )
-            artifact_path = Path(delta_event["payload"]["artifact_ref"]["path"])
-            assert artifact_path.exists()
-
-            session = service._get_session_run(session_run_id)
-            assert session is not None
-            service._session_run_closed_ttl_sec = 0
-            session.finished_at = time.time() - 1
-            service._gc_session_runs()
-
-            assert service._get_session_run(session_run_id) is None
-            assert not artifact_path.exists()
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_approval_reply_routes_to_matching_session_run_only(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            approval_id = "approval-1"
-            approval_payload = {
-                "approval_id": approval_id,
-                "tool_call_id": "call-1",
-                "tool_name": "shell",
-                "tool_source": "builtin",
-                "reason": "need approval",
-                "tool_args": {"command": "echo hi"},
-                "sections": [{"id": "command", "kind": "text", "content": "echo hi"}],
-                "content": "approve echo hi",
-            }
-            session.register_approval(approval_id, approval_payload)
-            session.append_event(
-                "approval_request",
-                approval_payload,
-            )
-            decision, reason, resolution_meta = session.wait_approval(approval_id, timeout_sec=2)
-            session.append_event(
-                "approval_resolved",
-                {
-                    "approval_id": approval_id,
-                    "decision": decision,
-                    "reason": reason,
-                    "approved_save_candidate": resolution_meta.get("approved_save_candidate"),
-                },
-            )
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "approve me"},
-            )
-            session_run_id = start_body["session_run_id"]
-
-            stream_body = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-            )
-            approval_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "approval_request"
-            ]
-            assert approval_events
-            approval_id = approval_events[0]["payload"]["approval_id"]
-
-            _, pending_status = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/status",
-                {"peer_token": peer_token, "session_run_id": session_run_id, "cursor": 0},
-            )
-            assert pending_status["approvals"] == [
-                {
-                    "approval_id": approval_id,
-                    "tool_call_id": "call-1",
-                    "tool_name": "shell",
-                    "tool_source": "builtin",
-                    "reason": "need approval",
-                    "tool_args": {"command": "echo hi"},
-                    "sections": [{"id": "command", "kind": "text", "content": "echo hi"}],
-                    "content": "approve echo hi",
-                    "state": "requested",
-                }
-            ]
-
-            status, reply_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/approval/reply",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "approval_id": approval_id,
-                    "decision": "allow_once",
-                    "reason": "ok",
-                    "approved_save_candidate": {
-                        "tool_name": "apply_patch",
-                        "operations": [
-                            {
-                                "kind": "update",
-                                "path": "src/app.py",
-                                "new_content": "edited",
-                            }
-                        ],
-                    },
-                },
-            )
-            assert status == 200
-            assert reply_body["ok"] is True
-
-            resolved_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                cursor=stream_body["next_cursor"],
-            )
-            resolved_events = [
-                event
-                for event in resolved_body["events"]
-                if event["type"] == "approval_resolved"
-            ]
-            assert resolved_events
-            assert resolved_events[0]["payload"]["decision"] == "allow_once"
-            assert resolved_events[0]["payload"]["approved_save_candidate"] == {
-                "tool_name": "apply_patch",
-                "operations": [
-                    {
-                        "kind": "update",
-                        "path": "src/app.py",
-                        "new_content": "edited",
-                    }
-                ],
-            }
-            assert resolved_body["done"] is True
-
-            status, duplicate_reply_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/approval/reply",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "approval_id": approval_id,
-                    "decision": "allow_once",
-                    "reason": "ok",
-                },
-            )
-            assert status == 200
-            assert duplicate_reply_body["ok"] is True
-            assert duplicate_reply_body["state"] == "already_resolved"
-
-            bad_session_run_req = request.Request(
-                f"{service.base_url}/remote/approval/reply",
-                data=json.dumps(
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": "missing-run",
-                        "approval_id": approval_id,
-                        "decision": "allow_once",
-                    }
-                ).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                _URLOPEN(bad_session_run_req, timeout=5)
-                assert False, "expected HTTPError"
-            except HTTPError as exc:
-                assert exc.code == 404
-                body = json.loads(exc.read().decode("utf-8"))
-                assert body["error"] == "session_run_not_found"
-
-            bad_approval_req = request.Request(
-                f"{service.base_url}/remote/approval/reply",
-                data=json.dumps(
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "approval_id": "missing-approval",
-                        "decision": "allow_once",
-                    }
-                ).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                _URLOPEN(bad_approval_req, timeout=5)
-                assert False, "expected HTTPError"
-            except HTTPError as exc:
-                assert exc.code == 404
-                body = json.loads(exc.read().decode("utf-8"))
-                assert body["error"] == "approval_not_found"
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_approval_reply_ignores_save_candidate_for_denied_decision(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        seen: dict[str, object] = {}
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            approval_id = "approval-deny"
-            approval_payload = {
-                "approval_id": approval_id,
-                "tool_call_id": "call-deny",
-                "tool_name": "shell",
-                "tool_source": "builtin",
-                "reason": "need approval",
-                "tool_args": {"command": "echo hi"},
-                "sections": [{"id": "command", "kind": "text", "content": "echo hi"}],
-                "content": "approve echo hi",
-            }
-            session.register_approval(approval_id, approval_payload)
-            session.append_event("approval_request", approval_payload)
-            decision, reason, resolution_meta = session.wait_approval(approval_id, timeout_sec=2)
-            resolution_meta = dict(resolution_meta or {})
-            seen["resolution_meta"] = resolution_meta
-            event_payload = {
-                "approval_id": approval_id,
-                "decision": decision,
-                "reason": reason,
-            }
-            if isinstance(resolution_meta.get("approved_save_candidate"), dict):
-                event_payload["approved_save_candidate"] = resolution_meta[
-                    "approved_save_candidate"
-                ]
-            session.append_event("approval_resolved", event_payload)
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "deny me"},
-            )
-            session_run_id = start_body["session_run_id"]
-            stream_body = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-            )
-            approval_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "approval_request"
-            ]
-            assert approval_events
-
-            status, reply_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/approval/reply",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "approval_id": approval_events[0]["payload"]["approval_id"],
-                    "decision": "deny_once",
-                    "reason": "no",
-                    "approved_save_candidate": {
-                        "tool_name": "apply_patch",
-                        "operations": [
-                            {
-                                "kind": "update",
-                                "path": "src/app.py",
-                                "new_content": "should not be approved",
-                            }
-                        ],
-                    },
-                },
-            )
-            assert status == 200
-            assert reply_body["ok"] is True
-
-            resolved_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                cursor=stream_body["next_cursor"],
-            )
-            resolved_events = [
-                event
-                for event in resolved_body["events"]
-                if event["type"] == "approval_resolved"
-            ]
-            assert resolved_events
-            assert resolved_events[0]["payload"]["decision"] == "deny_once"
-            assert "approved_save_candidate" not in seen["resolution_meta"]
-            assert "approved_save_candidate" not in resolved_events[0]["payload"]
-            assert resolved_body["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_user_input_reply_routes_structured_mcp_elicitation_content(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            input_id = "mcp-elicitation-1"
-            request_payload = {
-                "input_id": input_id,
-                "kind": "mcp_elicitation",
-                "event_name": "Elicitation",
-                "mcp_server": "docs",
-                "tool_name": "lookup",
-                "tool_call_id": "tool-call-1",
-                "message": "Pick a format",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"format": {"type": "string"}},
-                },
-            }
-            session.register_user_input(input_id, request_payload)
-            session.append_event("user_input_request", request_payload)
-            action, content, reason = session.wait_user_input(input_id, timeout_sec=2)
-            session.append_event(
-                "user_input_resolved",
-                {
-                    "input_id": input_id,
-                    "kind": "mcp_elicitation",
-                    "action": action,
-                    "content": content,
-                    "reason": reason,
-                },
-            )
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "ask mcp"},
-            )
-            session_run_id = start_body["session_run_id"]
-
-            stream_body = _session_run_events_first_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-            )
-            input_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "user_input_request"
-            ]
-            assert input_events
-            input_id = input_events[0]["payload"]["input_id"]
-
-            status, reply_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/user-input/reply",
-                {
-                    "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "input_id": input_id,
-                    "action": "accept",
-                    "content": {"format": "markdown"},
-                    "reason": "chosen",
-                },
-            )
-            assert status == 200
-            assert reply_body["ok"] is True
-
-            resolved_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                session_run_id,
-                cursor=stream_body["next_cursor"],
-            )
-            resolved_events = [
-                event
-                for event in resolved_body["events"]
-                if event["type"] == "user_input_resolved"
-            ]
-            assert resolved_events
-            payload = resolved_events[0]["payload"]
-            assert payload["server_enqueued_at"] > 0
-            assert {
-                key: payload[key]
-                for key in ("input_id", "kind", "action", "content", "reason")
-            } == {
-                "input_id": input_id,
-                "kind": "mcp_elicitation",
-                "action": "accept",
-                "content": {"format": "markdown"},
-                "reason": "chosen",
-            }
-            assert resolved_body["done"] is True
-        finally:
-            service.stop()
-            relay.stop()
-
-    def test_session_run_status_reports_pending_mcp_user_inputs(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-        input_ready = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            input_id = "mcp-elicitation-status"
-            request_payload = {
-                "input_id": input_id,
-                "kind": "mcp_elicitation",
-                "event_name": "Elicitation",
-                "mcp_server": "docs",
-                "tool_name": "lookup",
-                "tool_call_id": "tool-call-status",
-                "message": "Pick a format",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"format": {"type": "string"}},
-                },
-            }
-            session.register_user_input(input_id, request_payload)
-            session.append_event("user_input_request", request_payload)
-            input_ready.set()
-            action, content, reason = session.wait_user_input(input_id, timeout_sec=5)
-            session.append_event(
-                "user_input_resolved",
-                {
-                    "input_id": input_id,
-                    "kind": "mcp_elicitation",
-                    "action": action,
-                    "content": content,
-                    "reason": reason,
-                },
-            )
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
-        )
-        service.start()
-        try:
-            _, register_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
-            )
-            peer_token = register_body["payload"]["peer_token"]
-
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "ask mcp"},
-            )
-            session_run_id = start_body["session_run_id"]
-            assert input_ready.wait(2)
+            agent_run_id = start_body["agent_run_id"]
 
             status, status_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/session-runs/status",
-                {"peer_token": peer_token, "session_run_id": session_run_id, "cursor": 0},
-            )
-            assert status == 200
-            assert status_body["user_inputs"] == [
-                {
-                    "input_id": "mcp-elicitation-status",
-                    "kind": "mcp_elicitation",
-                    "event_name": "Elicitation",
-                    "mcp_server": "docs",
-                    "tool_name": "lookup",
-                    "tool_call_id": "tool-call-status",
-                    "message": "Pick a format",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {"format": {"type": "string"}},
-                    },
-                    "state": "requested",
-                }
-            ]
-
-            _, reply_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/user-input/reply",
                 {
                     "peer_token": peer_token,
-                    "session_run_id": session_run_id,
-                    "input_id": "mcp-elicitation-status",
-                    "action": "decline",
-                    "reason": "test_cleanup",
+                    "session_run_id": start_body["session_run_id"],
                 },
             )
-            assert reply_body["ok"] is True
+
+            assert status == 200
+            assert status_body["status"] == "queued"
+            assert status_body["running"] is True
+            assert status_body["agent_run_id"] == agent_run_id
+            assert status_body["branch_binding_id"] == "main"
+
+            control.complete_agent_run_activation(
+                agent_run_id,
+                ExecutorRunResult(
+                    task_id=agent_run_id,
+                    status="completed",
+                    output="done",
+                ),
+                activation_id=start_body["activation_id"],
+            )
+            _, completed_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": start_body["session_run_id"],
+                },
+            )
+            assert completed_status["status"] == "completed"
+            assert completed_status["running"] is False
+            assert completed_status["done"] is True
         finally:
             service.stop()
             relay.stop()
 
-    def test_session_run_cancel_resolves_registered_pending_user_input(self) -> None:
+    def test_session_run_cancel_targets_bound_agent_run(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
-        input_ready = threading.Event()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            input_id = "mcp-elicitation-cancel"
-            payload = {
-                "input_id": input_id,
-                "kind": "mcp_elicitation",
-                "event_name": "Elicitation",
-                "message": "Pick a format",
-            }
-            session.register_user_input(input_id, payload)
-            session.append_event("user_input_request", payload)
-            input_ready.set()
-            action, content, reason = session.wait_user_input(input_id, timeout_sec=5)
-            session.append_event(
-                "user_input_resolved",
-                {
-                    "input_id": input_id,
-                    "kind": "mcp_elicitation",
-                    "action": action,
-                    "content": content,
-                    "reason": reason,
-                },
-            )
-
+        control = AgentRunControlPlane()
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
+            runtime_control_plane=control,
         )
         service.start()
         try:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
-                },
+                _peer_register_payload(relay),
             )
             peer_token = register_body["payload"]["peer_token"]
-
             _, start_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "cancel mcp"},
+                {"peer_token": peer_token, "prompt": "first"},
             )
-            session_run_id = start_body["session_run_id"]
-            assert input_ready.wait(2)
+            agent_run_id = start_body["agent_run_id"]
 
             status, cancel_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/session-runs/cancel",
                 {
                     "peer_token": peer_token,
-                    "session_run_id": session_run_id,
+                    "session_run_id": start_body["session_run_id"],
                     "reason": "user_cancelled",
                 },
             )
+
             assert status == 200
             assert cancel_body["ok"] is True
-
-            stream_body = _session_run_events_body(service.base_url, peer_token, session_run_id)
-            resolved_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "user_input_resolved"
-            ]
-            assert len(resolved_events) == 1
-            payload = resolved_events[0]["payload"]
-            assert payload["server_enqueued_at"] > 0
-            assert {
-                key: payload[key]
-                for key in ("input_id", "kind", "action", "content", "reason")
-            } == {
-                "input_id": "mcp-elicitation-cancel",
-                "kind": "mcp_elicitation",
-                "action": "cancel",
-                "content": {},
-                "reason": "user_cancelled",
-            }
-            assert any(event["type"] == "session_run_cancelled" for event in stream_body["events"])
-            assert stream_body["done"] is True
+            assert control.get_agent_run(agent_run_id).status.value == "cancelled"
         finally:
             service.stop()
             relay.stop()
 
-    def test_session_run_done_resolves_registered_pending_approval(self) -> None:
-        relay = RelayServer()
-        relay.start()
-        port = _free_port()
-
-        def session_run_events_handler(_peer_id: str, _prompt: str, session) -> None:
-            approval_id = "approval-done"
-            payload = {
-                "approval_id": approval_id,
-                "tool_call_id": "call-done",
-                "tool_name": "shell",
-                "tool_source": "builtin",
-                "reason": "need approval",
-                "tool_args": {"command": "echo hi"},
-            }
-            session.register_approval(approval_id, payload)
-            session.append_event("approval_request", payload)
-
-        service = RemoteRelayHTTPService(
-            relay_server=relay,
-            bind=f"127.0.0.1:{port}",
-            session_run_events_handler=session_run_events_handler,
+    def test_user_agent_run_steer_accepts_and_deduplicates_bound_activation(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
         )
-        service.start()
         try:
-            _, register_body = _json_request(
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            agent_run_id = start_body["agent_run_id"]
+            _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/register",
+                f"{service.base_url}/remote/agent-run-activations/claim",
                 {
-                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
-                    "cwd": "/tmp/peer",
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "executors": ["reuleauxcoder", "codex", "fake"],
                 },
             )
-            peer_token = register_body["payload"]["peer_token"]
+            claim = claim_body["claim"]
+            assert claim is not None
+            self._mark_claim_running(control, peer_id, claim)
 
-            _, start_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/session-runs/start",
-                {"peer_token": peer_token, "prompt": "finish with pending approval"},
-            )
-            stream_body = _session_run_events_body(
-                service.base_url,
-                peer_token,
-                start_body["session_run_id"],
-            )
-
-            resolved_events = [
-                event
-                for event in stream_body["events"]
-                if event["type"] == "approval_resolved"
-            ]
-            assert len(resolved_events) == 1
-            payload = resolved_events[0]["payload"]
-            assert payload["server_enqueued_at"] > 0
-            assert {
-                key: payload[key]
-                for key in ("approval_id", "tool_call_id", "decision", "reason")
-            } == {
-                "approval_id": "approval-done",
-                "tool_call_id": "call-done",
-                "decision": "deny_once",
-                "reason": "session_run_closed",
+            steer_payload = {
+                "peer_token": peer_token,
+                "session_run_id": start_body["session_run_id"],
+                "activation_id": start_body["activation_id"],
+                "idempotency_key": "user-steer-1",
+                "payload": {
+                    "items": [{"type": "text", "text": "add context"}],
+                },
             }
-            assert stream_body["done"] is True
+            status, steer_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/{agent_run_id}/steer",
+                steer_payload,
+            )
+
+            assert status == 200
+            assert steer_body["ok"] is True
+            assert steer_body["status"] == "accepted"
+            steer = steer_body["activation_steer"]
+            assert steer["activation_id"] == start_body["activation_id"]
+            assert steer["source"] == "user"
+            assert steer["status"] == "queued"
+            assert steer["metadata"]["idempotency_key"] == "user-steer-1"
+            assert steer["metadata"]["sender"] == f"peer:{peer_id}"
+            assert steer["metadata"]["peer_id"] == peer_id
+            assert steer["metadata"]["session_run_id"] == start_body["session_run_id"]
+            assert steer["metadata"]["branch_binding_id"] == "main"
+            assert (
+                steer["metadata"]["expected_activation_id"]
+                == start_body["activation_id"]
+            )
+
+            _, duplicate_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-runs/{agent_run_id}/steer",
+                steer_payload,
+            )
+
+            assert duplicate_body["ok"] is True
+            assert duplicate_body["status"] == "duplicate"
+            assert duplicate_body["activation_steer"]["id"] == steer["id"]
+            assert len(control.load_agent_run_detail(agent_run_id)["activation_steers"]) == 1
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_user_agent_run_steer_requires_active_claim_and_matching_activation(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            agent_run_id = start_body["agent_run_id"]
+
+            with pytest.raises(HTTPError) as no_claim:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/{agent_run_id}/steer",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": start_body["session_run_id"],
+                        "activation_id": start_body["activation_id"],
+                        "idempotency_key": "user-steer-too-early",
+                        "payload": {"items": [{"type": "text", "text": "too early"}]},
+                    },
+                )
+            no_claim_body = json.loads(no_claim.value.read().decode("utf-8"))
+            assert no_claim.value.code == 409
+            assert no_claim_body["error"] == "agent_run_not_steerable"
+
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-run-activations/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "executors": ["reuleauxcoder", "codex", "fake"],
+                },
+            )
+            claim = claim_body["claim"]
+            assert claim is not None
+            self._mark_claim_running(control, peer_id, claim)
+            with pytest.raises(HTTPError) as mismatch:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/{agent_run_id}/steer",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": start_body["session_run_id"],
+                        "activation_id": "stale-activation",
+                        "idempotency_key": "user-steer-mismatch",
+                        "payload": {"items": [{"type": "text", "text": "wrong"}]},
+                    },
+                )
+            mismatch_body = json.loads(mismatch.value.read().decode("utf-8"))
+            assert mismatch.value.code == 409
+            assert mismatch_body["error"] == "activation_mismatch"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_user_agent_run_steer_forbids_other_peer_session_binding(self) -> None:
+        relay, service, _control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            _, other_register = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(
+                    relay,
+                    cwd="/tmp/other-peer",
+                    features=["agent_runs", "agent_runs.local_workspace"],
+                ),
+            )
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/{start_body['agent_run_id']}/steer",
+                    {
+                        "peer_token": other_register["payload"]["peer_token"],
+                        "session_run_id": start_body["session_run_id"],
+                        "activation_id": start_body["activation_id"],
+                        "idempotency_key": "user-steer-other-peer",
+                        "payload": {"items": [{"type": "text", "text": "cross"}]},
+                    },
+                )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 403
+            assert body["error"] == "forbidden"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_user_agent_run_steer_requires_session_run_binding(self) -> None:
+        relay, service, _control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/{start_body['agent_run_id']}/steer",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": "missing-session-run",
+                        "activation_id": start_body["activation_id"],
+                        "idempotency_key": "user-steer-missing-binding",
+                        "payload": {"items": [{"type": "text", "text": "missing"}]},
+                    },
+                )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 403
+            assert body["error"] == "forbidden"
         finally:
             service.stop()
             relay.stop()
@@ -7530,14 +6233,11 @@ class TestRemoteRelayHTTPService:
         def session_handler(action: str, peer_id: str, payload: dict) -> dict:
             return {"ok": True, "action": action, "peer_id": peer_id}
 
-        def stream_handler(peer_id: str, prompt: str, session) -> None:
-            del peer_id, prompt, session
-
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
             session_handler=session_handler,
-            session_run_events_handler=stream_handler,
+            runtime_control_plane=AgentRunControlPlane(),
         )
         service.start()
         try:

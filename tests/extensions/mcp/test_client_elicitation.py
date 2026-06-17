@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from labrastro_server.interfaces.http.remote.service import _RemoteSessionRun
+from labrastro_server.interfaces.http.remote.service import _SessionRunProjection
 from reuleauxcoder.domain.agent.agent import Agent
 from reuleauxcoder.domain.agent.tool_execution import ToolExecutor
 from reuleauxcoder.domain.config.models import ApprovalConfig, Config
@@ -984,7 +984,7 @@ while True:
         encoding="utf-8",
     )
 
-    session = _RemoteSessionRun(session_run_id="run-live", peer_id="peer-live")
+    session = _SessionRunProjection(session_run_id="run-live", peer_id="peer-live")
     runner = AppRunner()
     runner._relay_http_service = SimpleNamespace(
         _get_session_run=lambda session_run_id: (

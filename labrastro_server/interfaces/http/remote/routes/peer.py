@@ -64,11 +64,11 @@ class RemotePeerRoutes:
                     "session_history_writable": session_history_status[
                         "session_history_writable"
                     ],
-                    "session_runs": self.service.session_run_events_handler is not None,
+                    "session_runs": self.service.runtime_control_plane is not None,
                     "taskflow": self.service.taskflow_service is not None,
                     "issue_assignment": self.service.issue_assignment_service
                     is not None,
-                    "fresh_session_without_session_hint": self.service.session_run_events_handler
+                    "fresh_session_without_session_hint": self.service.runtime_control_plane
                     is not None,
                     "peer_token_heartbeat_refresh": True,
             "agent_runs": agent_run_features,

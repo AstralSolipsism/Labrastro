@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import threading
 import time
 from types import SimpleNamespace
 from typing import Any
 
-from labrastro_server.interfaces.http.remote.service import _RemoteSessionRun
+from labrastro_server.interfaces.http.remote.service import _SessionRunProjection
 from reuleauxcoder.interfaces.entrypoint.runner import AppRunner
 
 
@@ -27,7 +27,7 @@ def _same_bound_method(left, right) -> bool:
 
 
 def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> None:
-    session = _RemoteSessionRun(session_run_id="run-1", peer_id="peer-1")
+    session = _SessionRunProjection(session_run_id="run-1", peer_id="peer-1")
     runner = AppRunner()
     runner._relay_http_service = SimpleNamespace(
         _get_session_run=lambda session_run_id: (
@@ -100,7 +100,7 @@ def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> No
 
 
 def test_runner_mcp_elicitation_handler_timeout_declines_and_audits_reason() -> None:
-    session = _RemoteSessionRun(session_run_id="run-1", peer_id="peer-1")
+    session = _SessionRunProjection(session_run_id="run-1", peer_id="peer-1")
     runner = AppRunner()
     runner._relay_http_service = SimpleNamespace(
         _get_session_run=lambda session_run_id: (

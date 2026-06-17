@@ -50,8 +50,6 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
 from labrastro_server.services.capability_packages import (
     CAPABILITY_INGEST_WORKFLOW,
-    CapabilityPackageIngestError,
-    CapabilityPackageIngestService,
     CapabilityPackageSessionRunService,
 )
 from labrastro_server.services.environment_run import (
@@ -68,6 +66,156 @@ def _capability_ingest_prompt(source: dict[str, Any]) -> str:
     notes = str(source.get("notes") or "").strip()
     target = url or notes[:120] or "能力包来源"
     return f"生成能力包草案：{source_type} {target}".strip()
+
+
+def _binding_value(binding: Any, name: str, default: Any = "") -> Any:
+    if isinstance(binding, dict):
+        return binding.get(name, default)
+    return getattr(binding, name, default)
+
+
+def _branch_source_binding_id(
+    control: Any,
+    *,
+    session_run_id: str,
+    source_agent_run_id: str,
+    preferred_branch_binding_id: str = "",
+) -> str:
+    preferred = str(preferred_branch_binding_id or "").strip()
+    if preferred:
+        return preferred
+    bindings = control.list_session_run_bindings(
+        session_run_id=session_run_id,
+        status="active",
+    )
+    candidates = [
+        binding
+        for binding in bindings
+        if str(_binding_value(binding, "agent_run_id") or "").strip() == source_agent_run_id
+        or str(_binding_value(binding, "target_agent_run_id") or "").strip()
+        == source_agent_run_id
+    ]
+    if not candidates:
+        candidates = [binding for binding in bindings if _binding_value(binding, "selected", False)]
+    if not candidates:
+        return ""
+    candidates.sort(
+        key=lambda binding: (
+            bool(_binding_value(binding, "selected", False)),
+            str(
+                _binding_value(binding, "updated_at")
+                or _binding_value(binding, "created_at")
+                or ""
+            ),
+        ),
+        reverse=True,
+    )
+    return str(_binding_value(candidates[0], "branch_binding_id") or "").strip()
+
+
+def _agent_run_branch_prompt(
+    service: Any,
+    payload: dict[str, Any],
+    raw_prompt: str,
+) -> str:
+    control = getattr(service, "runtime_control_plane", None)
+    if control is None:
+        return raw_prompt
+    source_agent_run_id = str(payload.get("source_agent_run_id") or "").strip()
+    if not source_agent_run_id:
+        return raw_prompt
+    source = control.get_agent_run(source_agent_run_id)
+    session_run_id = str(getattr(source, "owner_session_run_id", "") or "").strip()
+    if not session_run_id:
+        return raw_prompt
+    get_session_run = getattr(service, "_get_session_run", None)
+    if not callable(get_session_run):
+        return raw_prompt
+    session = get_session_run(session_run_id)
+    if session is None:
+        return raw_prompt
+    source_branch_binding_id = _branch_source_binding_id(
+        control,
+        session_run_id=session_run_id,
+        source_agent_run_id=source_agent_run_id,
+        preferred_branch_binding_id=optional_payload_str(
+            payload,
+            "source_branch_binding_id",
+        )
+        or "",
+    )
+    return session.compose_branch_prompt(
+        source_branch_binding_id=source_branch_binding_id,
+        base_session_item_id=str(payload.get("base_session_item_id") or ""),
+        prompt=raw_prompt,
+    )
+
+
+def _record_agent_run_branch_projection(
+    service: Any,
+    payload: dict[str, Any],
+    *,
+    agent_run_id: str,
+    raw_prompt: str,
+) -> None:
+    normalized_prompt = str(raw_prompt or "").strip()
+    if not normalized_prompt:
+        return
+    control = getattr(service, "runtime_control_plane", None)
+    if control is None:
+        return
+    source_agent_run_id = str(payload.get("source_agent_run_id") or "").strip()
+    if not source_agent_run_id:
+        return
+    source = control.get_agent_run(source_agent_run_id)
+    session_run_id = str(getattr(source, "owner_session_run_id", "") or "").strip()
+    if not session_run_id:
+        return
+    get_session_run = getattr(service, "_get_session_run", None)
+    if not callable(get_session_run):
+        return
+    session = get_session_run(session_run_id)
+    if session is None:
+        return
+    bindings = control.list_session_run_bindings(
+        session_run_id=session_run_id,
+        status="active",
+    )
+    target_binding = next(
+        (
+            binding
+            for binding in bindings
+            if str(_binding_value(binding, "agent_run_id") or "").strip() == agent_run_id
+            or str(_binding_value(binding, "target_agent_run_id") or "").strip()
+            == agent_run_id
+        ),
+        None,
+    )
+    branch_binding_id = str(
+        _binding_value(target_binding, "branch_binding_id")
+        or payload.get("branch_binding_id")
+        or ""
+    ).strip()
+    if not branch_binding_id:
+        return
+    if target_binding is not None and hasattr(session, "record_branch_binding"):
+        session.record_branch_binding(target_binding)
+    session_item_id = str(
+        payload.get("session_item_id")
+        or payload.get("item_id")
+        or f"{branch_binding_id}:user:{agent_run_id}"
+    ).strip()
+    session.append_event(
+        "user_message",
+        {
+            "session_item_id": session_item_id,
+            "branch_binding_id": branch_binding_id,
+            "agent_run_id": agent_run_id,
+            "source_agent_run_id": source_agent_run_id,
+            "base_session_item_id": str(payload.get("base_session_item_id") or ""),
+            "content": normalized_prompt,
+        },
+    )
 
 
 class RemoteAdminRoutes:
@@ -189,7 +337,13 @@ class RemoteAdminRoutes:
                     if isinstance(payload.get("metadata"), dict)
                     else {}
                 )
+                raw_prompt = str(payload.get("prompt") or "")
                 try:
+                    branch_prompt = _agent_run_branch_prompt(
+                        self.service,
+                        payload,
+                        raw_prompt,
+                    )
                     agent_run = self.service.runtime_control_plane.branch_agent_run(
                         source_agent_run_id=str(
                             payload.get("source_agent_run_id") or ""
@@ -200,8 +354,12 @@ class RemoteAdminRoutes:
                         runtime_root=str(payload.get("runtime_root") or ""),
                         repo_root=optional_payload_str(payload, "repo_root"),
                         agent_id=optional_payload_str(payload, "agent_id"),
-                        prompt=str(payload.get("prompt") or ""),
+                        prompt=branch_prompt,
                         task_id=optional_payload_str(payload, "agent_run_id"),
+                        branch_binding_id=optional_payload_str(
+                            payload,
+                            "branch_binding_id",
+                        ),
                         branch_name=optional_payload_str(payload, "branch_name"),
                         base_ref=optional_payload_str(payload, "base_ref") or "HEAD",
                         permission_recompute_policy=optional_payload_str(
@@ -218,7 +376,14 @@ class RemoteAdminRoutes:
                             "runtime_profile_id",
                         ),
                         model=optional_payload_str(payload, "model"),
+                        select_branch=bool(payload.get("select_branch", True)),
                         metadata=metadata,
+                    )
+                    _record_agent_run_branch_projection(
+                        self.service,
+                        payload,
+                        agent_run_id=agent_run.id,
+                        raw_prompt=raw_prompt,
                     )
                 except KeyError:
                     self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
@@ -269,6 +434,10 @@ class RemoteAdminRoutes:
                         agent_id=optional_payload_str(payload, "agent_id"),
                         prompt=str(payload.get("prompt") or ""),
                         task_id=optional_payload_str(payload, "agent_run_id"),
+                        branch_binding_id=optional_payload_str(
+                            payload,
+                            "branch_binding_id",
+                        ),
                         provenance_status=optional_payload_str(
                             payload,
                             "provenance_status",
@@ -293,6 +462,7 @@ class RemoteAdminRoutes:
                             "runtime_profile_id",
                         ),
                         model=optional_payload_str(payload, "model"),
+                        select_branch=bool(payload.get("select_branch", True)),
                         metadata=metadata,
                     )
                 except KeyError:
@@ -628,13 +798,9 @@ class RemoteAdminRoutes:
                 if peer_id is None:
                     self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
                     return
-                session_id = str(
-                    payload.get("session_id") or payload.get("sessionId") or ""
-                ).strip() or None
+                session_id = str(payload.get("session_id") or "").strip() or None
                 client_request_id_input = str(
-                    payload.get("client_request_id")
-                    or payload.get("clientRequestId")
-                    or ""
+                    payload.get("client_request_id") or ""
                 ).strip()
                 client_request_id = client_request_id_input or str(uuid.uuid4())
                 if client_request_id_input:
@@ -707,48 +873,6 @@ class RemoteAdminRoutes:
                         runtime_state=runtime_state,
                     ).to_dict(),
                 )
-                return
-            if path == "/remote/admin/capability-packages/ingest/start":
-                if self.service.runtime_control_plane is None:
-                    self._send_error(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runs_unavailable",
-                    )
-                    return
-                try:
-                    result = CapabilityPackageIngestService(
-                        self.service.runtime_control_plane
-                    ).start(payload)
-                except CapabilityPackageIngestError as exc:
-                    self._send_error(exc.status, exc.error, exc.message)
-                    return
-                self._send_json(
-                    HTTPStatus.OK,
-                    {
-                        "ok": True,
-                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
-                            result.agent_run.id
-                        ),
-                        "source": result.source,
-                        "source_bundle": result.source_bundle,
-                    },
-                )
-                return
-            if path == "/remote/admin/capability-packages/ingest/status":
-                if self.service.runtime_control_plane is None:
-                    self._send_error(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        "agent_runs_unavailable",
-                    )
-                    return
-                try:
-                    result = CapabilityPackageIngestService(
-                        self.service.runtime_control_plane
-                    ).status(str(payload.get("agent_run_id") or ""))
-                except CapabilityPackageIngestError as exc:
-                    self._send_error(exc.status, exc.error, exc.message)
-                    return
-                self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/remote/admin/capability-packages/candidates/build":
                 result = self._run_admin_config_mutation(

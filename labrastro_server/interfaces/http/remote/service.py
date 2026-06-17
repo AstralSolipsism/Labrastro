@@ -33,9 +33,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionRunCancelResponse,
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
-    SessionRunFollowUpCancelRequest,
-    SessionRunFollowUpRequest,
-    SessionRunFollowUpResponse,
     SessionRunStartRequest,
     SessionRunStartResponse,
     CleanupResult,
@@ -140,6 +137,31 @@ def _session_event_message_key(event_type: str, payload: dict[str, Any]) -> str:
     return ""
 
 
+def _session_event_prompt_line(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type") or "").strip()
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if event_type in {"session_run_start", "session_run_continue", "user_message"}:
+        role = "User"
+        text = str(
+            payload.get("content")
+            or payload.get("text")
+            or payload.get("prompt")
+            or ""
+        ).strip()
+    elif event_type in {"assistant_message", "session_run_end"}:
+        role = "Assistant"
+        text = str(
+            payload.get("content")
+            or payload.get("text")
+            or payload.get("response")
+            or payload.get("output")
+            or ""
+        ).strip()
+    else:
+        return ""
+    return f"{role}: {text}" if text else ""
+
+
 def _normalize_session_run_payload(
     event_type: str,
     payload: dict[str, Any],
@@ -218,76 +240,46 @@ class _SessionRunEventBuffer:
         "created_at",
         "createdAt",
         "draft_id",
-        "draftId",
         "content_length",
         "content_sha256",
-        "contentLength",
-        "contentSha256",
         "event_id",
-        "eventId",
         "emitted_at",
-        "emittedAt",
         "draft_preview_chunk_count",
-        "draftPreviewChunkCount",
         "format",
         "final",
         "flush_latency_ms",
-        "flushLatencyMs",
         "item_id",
-        "itemId",
         "last_chunk_seq",
-        "lastChunkSeq",
         "message",
         "message_key",
         "path",
         "patch_syntax_error_count",
         "patch_syntax_error_codes",
-        "patchSyntaxErrorCount",
-        "patchSyntaxErrorCodes",
         "patch_semantic_error_count",
         "patch_semantic_error_codes",
-        "patchSemanticErrorCount",
-        "patchSemanticErrorCodes",
         "provider_output_count",
         "provider_reasoning_count",
         "provider_tool_delta_count",
-        "providerOutputCount",
-        "providerReasoningCount",
-        "providerToolDeltaCount",
         "reason",
         "last_body_chunk_at",
-        "lastBodyChunkAt",
         "last_reasoning_chunk_at",
-        "lastReasoningChunkAt",
         "last_tool_delta_at",
-        "lastToolDeltaAt",
         "last_draft_preview_flush_latency_ms",
-        "lastDraftPreviewFlushLatencyMs",
         "server_enqueued_at",
-        "serverEnqueuedAt",
         "server_enqueue_latency_ms",
-        "serverEnqueueLatencyMs",
         "schema",
         "session_id",
         "session_run_id",
-        "sessionId",
-        "sessionRunId",
         "snapshot_kind",
-        "snapshotKind",
         "status",
         "target_path",
-        "targetPath",
         "timestamp",
         "title",
         "tool_call_id",
         "tool_name",
         "tool_source",
-        "toolCallId",
-        "toolName",
-        "toolSource",
         "type",
         "updated_at",
-        "updatedAt",
     }
 
     def __init__(
@@ -541,7 +533,7 @@ def _read_event_artifact_payload(artifact: dict[str, Any]) -> dict[str, Any] | N
 
 
 @dataclass
-class _RemoteSessionRun:
+class _SessionRunProjection:
     session_run_id: str
     peer_id: str
     session_hint: str | None = None
@@ -552,6 +544,10 @@ class _RemoteSessionRun:
     provider_id: str | None = None
     model_id: str | None = None
     client_request_id: str | None = None
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    selected_branch_binding_id: str = ""
+    branch_bindings: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_parameters: dict[str, Any] = field(default_factory=dict)
     runtime_state: dict[str, Any] = field(default_factory=dict)
     locale: str | None = None
@@ -565,9 +561,10 @@ class _RemoteSessionRun:
     seq_next: int = 1
     approval_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
     approval_resolutions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    revision_feedback_tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    revision_feedback_callback: Callable[[dict[str, Any]], None] | None = None
     user_input_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
     user_input_resolutions: dict[str, dict[str, Any]] = field(default_factory=dict)
-    follow_up_tickets: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_ticket: dict[str, Any] | None = None
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
@@ -575,8 +572,6 @@ class _RemoteSessionRun:
     cancel_requested: bool = False
     cancel_reason: str | None = None
     cancel_callback: Callable[[str], None] | None = None
-    follow_up_callback: Callable[[dict[str, Any]], None] | None = None
-    follow_up_cancel_callback: Callable[[str], None] | None = None
     artifact_root: Path = field(
         default_factory=lambda: Path(tempfile.gettempdir()) / "labrastro-session-run-events"
     )
@@ -597,6 +592,26 @@ class _RemoteSessionRun:
     def __post_init__(self) -> None:
         if self.session_id is None:
             self.session_id = self.session_hint
+        initial_branch_id = str(self.branch_binding_id or self.selected_branch_binding_id or "main").strip()
+        if initial_branch_id:
+            self.branch_binding_id = initial_branch_id
+            self.selected_branch_binding_id = initial_branch_id
+            self.branch_bindings.setdefault(
+                initial_branch_id,
+                {
+                    "branch_binding_id": initial_branch_id,
+                    "agent_run_id": str(self.agent_run_id or ""),
+                    "selected": True,
+                    "status": "active",
+                    "parent_branch_binding_id": "",
+                    "base_session_item_id": "",
+                    "source_agent_run_id": "",
+                    "target_agent_run_id": str(self.agent_run_id or ""),
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                    "metadata": {"binding_kind": "mainline"},
+                },
+            )
         self._event_buffer = _SessionRunEventBuffer(
             session_run_id=self.session_run_id,
             artifact_root=self.artifact_root,
@@ -683,9 +698,85 @@ class _RemoteSessionRun:
             },
         )
 
+    def record_branch_binding(self, binding: Any) -> None:
+        data = self._branch_binding_projection(binding)
+        branch_id = str(data.get("branch_binding_id") or "").strip()
+        if not branch_id:
+            return
+        with self.cond:
+            self._record_branch_binding_locked(data)
+            self.cond.notify_all()
+
+    def sync_branch_bindings(self, bindings: list[Any]) -> None:
+        with self.cond:
+            for binding in bindings:
+                data = self._branch_binding_projection(binding)
+                if data.get("branch_binding_id"):
+                    self._record_branch_binding_locked(data)
+            self.cond.notify_all()
+
+    def branch_summaries(self, cursor: int = 0) -> list[dict[str, Any]]:
+        with self.cond:
+            return self._branch_summaries_locked(cursor)
+
+    def _record_branch_binding_locked(self, data: dict[str, Any]) -> None:
+        branch_id = str(data.get("branch_binding_id") or "").strip()
+        if not branch_id:
+            return
+        existing = self.branch_bindings.get(branch_id)
+        if isinstance(existing, dict):
+            merged = {**existing, **data}
+            metadata = {}
+            if isinstance(existing.get("metadata"), dict):
+                metadata.update(existing["metadata"])
+            if isinstance(data.get("metadata"), dict):
+                metadata.update(data["metadata"])
+            merged["metadata"] = metadata
+            data = merged
+        if data.get("selected"):
+            for item in self.branch_bindings.values():
+                item["selected"] = False
+            self.selected_branch_binding_id = branch_id
+            self.branch_binding_id = branch_id
+            self.agent_run_id = str(data.get("agent_run_id") or self.agent_run_id or "")
+        elif not self.selected_branch_binding_id:
+            self.selected_branch_binding_id = branch_id
+            self.branch_binding_id = branch_id
+            data["selected"] = True
+        self.branch_bindings[branch_id] = data
+
+    def _branch_binding_projection(self, binding: Any) -> dict[str, Any]:
+        def value(name: str, default: Any = "") -> Any:
+            if isinstance(binding, dict):
+                return binding.get(name, default)
+            return getattr(binding, name, default)
+
+        status = value("status", "active")
+        status_value = getattr(status, "value", status)
+        metadata = value("metadata", {})
+        branch_id = str(value("branch_binding_id") or value("id") or "").strip()
+        return {
+            "id": str(value("id") or branch_id),
+            "session_run_id": str(value("session_run_id") or self.session_run_id),
+            "session_id": str(value("session_id") or self.session_id or ""),
+            "peer_id": str(value("peer_id") or self.peer_id or ""),
+            "branch_binding_id": branch_id,
+            "agent_run_id": str(value("agent_run_id") or ""),
+            "selected": bool(value("selected", False)),
+            "parent_branch_binding_id": str(value("parent_branch_binding_id") or ""),
+            "base_session_item_id": str(value("base_session_item_id") or ""),
+            "source_agent_run_id": str(value("source_agent_run_id") or ""),
+            "target_agent_run_id": str(value("target_agent_run_id") or value("agent_run_id") or ""),
+            "status": str(status_value or "active"),
+            "created_at": value("created_at", None),
+            "updated_at": value("updated_at", None),
+            "metadata": dict(metadata) if isinstance(metadata, dict) else {},
+        }
+
     def _append_event_locked(self, event_type: str, payload: dict[str, Any]) -> int:
         seq = self.seq_next
         self.seq_next += 1
+        payload = self._session_event_payload_locked(payload, seq)
         payload = _payload_with_server_enqueue_metrics(payload, time.time())
         event = {
             "session_run_id": self.session_run_id,
@@ -703,6 +794,43 @@ class _RemoteSessionRun:
         self._persist_or_queue_trace_event(durable_event)
         return seq
 
+    def _session_event_payload_locked(self, payload: dict[str, Any], seq: int) -> dict[str, Any]:
+        out = dict(payload)
+        branch_id = str(
+            out.get("branch_binding_id")
+            or self.selected_branch_binding_id
+            or self.branch_binding_id
+            or "main"
+        ).strip()
+        if branch_id:
+            out["branch_binding_id"] = branch_id
+            self.branch_bindings.setdefault(
+                branch_id,
+                {
+                    "branch_binding_id": branch_id,
+                    "agent_run_id": str(self.agent_run_id or ""),
+                    "selected": branch_id == self.selected_branch_binding_id,
+                    "status": "active",
+                    "parent_branch_binding_id": "",
+                    "base_session_item_id": "",
+                    "source_agent_run_id": "",
+                    "target_agent_run_id": str(self.agent_run_id or ""),
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                    "metadata": {},
+                },
+            )
+        session_item_id = str(
+            out.get("session_item_id")
+            or out.get("item_id")
+            or out.get("event_id")
+            or ""
+        ).strip()
+        if not session_item_id:
+            session_item_id = f"{self.session_run_id}:event:{seq}"
+        out["session_item_id"] = session_item_id
+        return out
+
     def _append_live_only_event_locked(
         self,
         event_type: str,
@@ -710,6 +838,7 @@ class _RemoteSessionRun:
     ) -> int:
         seq = self.seq_next
         self.seq_next += 1
+        payload = self._session_event_payload_locked(payload, seq)
         payload = _payload_with_server_enqueue_metrics(payload, time.time())
         event = {
             "session_run_id": self.session_run_id,
@@ -832,6 +961,11 @@ class _RemoteSessionRun:
             key=lambda event: int(event.get("seq", 0) or 0),
         )
         events = [_hydrate_stream_event_payload(event) for event in events]
+        events = [
+            event
+            for event in events
+            if self._event_visible_in_selected_branch_locked(event)
+        ]
         next_cursor = max(cursor, durable_cursor, live_cursor)
         if events:
             next_cursor = max(
@@ -839,6 +973,217 @@ class _RemoteSessionRun:
                 max(int(event.get("seq", 0) or 0) for event in events),
             )
         return events, next_cursor
+
+    def _event_visible_in_selected_branch_locked(self, event: dict[str, Any]) -> bool:
+        selected_branch_id = str(
+            self.selected_branch_binding_id or self.branch_binding_id or "main"
+        ).strip()
+        return self._event_visible_in_branch_locked(event, selected_branch_id)
+
+    def _event_visible_in_branch_locked(
+        self,
+        event: dict[str, Any],
+        branch_id: str,
+    ) -> bool:
+        selected_branch_id = str(branch_id or "").strip()
+        if not selected_branch_id:
+            return True
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_branch_id = str(payload.get("branch_binding_id") or selected_branch_id).strip()
+        if event_branch_id == selected_branch_id:
+            return True
+        ancestor_limits = self._selected_branch_ancestor_limits_locked(selected_branch_id)
+        limit = ancestor_limits.get(event_branch_id)
+        if limit is None:
+            return False
+        return int(event.get("seq", 0) or 0) <= limit
+
+    def _selected_branch_ancestor_limits_locked(self, branch_id: str) -> dict[str, int]:
+        limits: dict[str, int] = {}
+        current_id = str(branch_id or "").strip()
+        visited: set[str] = set()
+        while current_id and current_id not in visited:
+            visited.add(current_id)
+            binding = self.branch_bindings.get(current_id)
+            if not isinstance(binding, dict):
+                break
+            parent_id = str(binding.get("parent_branch_binding_id") or "").strip()
+            base_item_id = str(binding.get("base_session_item_id") or "").strip()
+            if not parent_id:
+                break
+            base_seq = self._branch_base_seq_locked(parent_id, base_item_id)
+            if base_seq is None:
+                limits[parent_id] = min(limits.get(parent_id, 0), 0)
+            else:
+                limits[parent_id] = min(limits.get(parent_id, base_seq), base_seq)
+            current_id = parent_id
+        return limits
+
+    def _branch_base_seq_locked(self, branch_id: str, base_session_item_id: str) -> int | None:
+        if not branch_id or not base_session_item_id:
+            return None
+        if base_session_item_id == "__root__":
+            return 0
+        for event in reversed(self._event_buffer.snapshot()):
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if str(payload.get("branch_binding_id") or "") != branch_id:
+                continue
+            if str(payload.get("session_item_id") or payload.get("item_id") or "") == base_session_item_id:
+                return int(event.get("seq", 0) or 0)
+        return None
+
+    def compose_branch_prompt(
+        self,
+        *,
+        source_branch_binding_id: str,
+        base_session_item_id: str,
+        prompt: str,
+    ) -> str:
+        normalized_prompt = str(prompt or "").strip()
+        with self.cond:
+            self._flush_live_events_locked(time.time(), force=True)
+            source_branch_id = str(
+                source_branch_binding_id
+                or self.selected_branch_binding_id
+                or self.branch_binding_id
+                or "main"
+            ).strip()
+            base_item_id = str(base_session_item_id or "").strip()
+            if not source_branch_id:
+                return normalized_prompt
+            context_events = self._branch_context_events_locked(
+                source_branch_id,
+                base_item_id,
+            )
+            context_lines = [
+                line
+                for event in context_events
+                if (line := _session_event_prompt_line(event))
+            ]
+        if not context_lines:
+            return normalized_prompt
+        if normalized_prompt:
+            context_lines.append(f"User: {normalized_prompt}")
+        return "\n\n".join(context_lines)
+
+    def _branch_context_events_locked(
+        self,
+        branch_id: str,
+        base_session_item_id: str,
+    ) -> list[dict[str, Any]]:
+        if base_session_item_id == "__root__":
+            return []
+        events = sorted(
+            [
+                *self._event_buffer.snapshot(),
+                *self._live_event_buffer.snapshot(),
+            ],
+            key=lambda event: int(event.get("seq", 0) or 0),
+        )
+        hydrated = [_hydrate_stream_event_payload(event) for event in events]
+        visible = [
+            event
+            for event in hydrated
+            if self._event_visible_in_branch_locked(event, branch_id)
+        ]
+        if not base_session_item_id:
+            return visible
+        selected: list[dict[str, Any]] = []
+        for event in visible:
+            selected.append(event)
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            item_id = str(payload.get("session_item_id") or payload.get("item_id") or "")
+            if item_id == base_session_item_id:
+                return selected
+        return []
+
+    def _branch_summaries_locked(self, cursor: int = 0) -> list[dict[str, Any]]:
+        self._flush_live_events_locked(time.time(), force=True)
+        selected_branch_id = str(
+            self.selected_branch_binding_id or self.branch_binding_id or "main"
+        ).strip()
+        event_stats: dict[str, dict[str, Any]] = {}
+        for event in self._event_buffer.snapshot():
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            branch_id = str(payload.get("branch_binding_id") or "main").strip()
+            if not branch_id:
+                continue
+            seq = int(event.get("seq", 0) or 0)
+            stats = event_stats.setdefault(branch_id, {"last_seq": 0, "last_event_at": None})
+            if seq >= int(stats.get("last_seq") or 0):
+                stats["last_seq"] = seq
+                stats["last_event_at"] = payload.get("server_enqueued_at")
+        pending_approvals: dict[str, int] = {}
+        for waiter in self.approval_waiters.values():
+            if waiter.get("done"):
+                continue
+            branch_id = self._waiter_branch_binding_id(waiter) or selected_branch_id
+            pending_approvals[branch_id] = pending_approvals.get(branch_id, 0) + 1
+        pending_user_inputs: dict[str, int] = {}
+        for waiter in self.user_input_waiters.values():
+            if waiter.get("done"):
+                continue
+            branch_id = self._waiter_branch_binding_id(waiter) or selected_branch_id
+            pending_user_inputs[branch_id] = pending_user_inputs.get(branch_id, 0) + 1
+        bindings = dict(self.branch_bindings)
+        if selected_branch_id and selected_branch_id not in bindings:
+            bindings[selected_branch_id] = {
+                "branch_binding_id": selected_branch_id,
+                "agent_run_id": str(self.agent_run_id or ""),
+                "selected": True,
+                "status": "active",
+                "parent_branch_binding_id": "",
+                "base_session_item_id": "",
+                "source_agent_run_id": "",
+                "target_agent_run_id": str(self.agent_run_id or ""),
+                "metadata": {},
+            }
+        sibling_groups: dict[tuple[str, str], list[str]] = {}
+        for branch_id, binding in bindings.items():
+            group_key = (
+                str(binding.get("parent_branch_binding_id") or ""),
+                str(binding.get("base_session_item_id") or ""),
+            )
+            sibling_groups.setdefault(group_key, []).append(branch_id)
+        for siblings in sibling_groups.values():
+            siblings.sort()
+        summaries: list[dict[str, Any]] = []
+        for branch_id in sorted(bindings):
+            binding = bindings[branch_id]
+            stats = event_stats.get(branch_id, {})
+            group_key = (
+                str(binding.get("parent_branch_binding_id") or ""),
+                str(binding.get("base_session_item_id") or ""),
+            )
+            siblings = sibling_groups.get(group_key, [branch_id])
+            current_index = siblings.index(branch_id) + 1 if branch_id in siblings else 1
+            last_seq = int(stats.get("last_seq") or 0)
+            summaries.append(
+                {
+                    "branch_binding_id": branch_id,
+                    "binding_id": str(binding.get("id") or branch_id),
+                    "agent_run_id": str(binding.get("agent_run_id") or ""),
+                    "parent_branch_binding_id": str(
+                        binding.get("parent_branch_binding_id") or ""
+                    ),
+                    "base_session_item_id": str(binding.get("base_session_item_id") or ""),
+                    "source_agent_run_id": str(binding.get("source_agent_run_id") or ""),
+                    "target_agent_run_id": str(binding.get("target_agent_run_id") or ""),
+                    "selected": branch_id == selected_branch_id,
+                    "status": str(binding.get("status") or "active"),
+                    "has_updates": branch_id != selected_branch_id and last_seq > int(cursor or 0),
+                    "last_seq": last_seq,
+                    "last_event_at": stats.get("last_event_at"),
+                    "pending_approval_count": pending_approvals.get(branch_id, 0),
+                    "pending_user_input_count": pending_user_inputs.get(branch_id, 0),
+                    "current_index": current_index,
+                    "total_sibling_count": len(siblings),
+                    "metadata": dict(binding.get("metadata") or {})
+                    if isinstance(binding.get("metadata"), dict)
+                    else {},
+                }
+            )
+        return summaries
 
     def _status_next_cursor_locked(self, cursor: int) -> int:
         return max(cursor, self._latest_stream_seq_locked())
@@ -977,7 +1322,6 @@ class _RemoteSessionRun:
             self.last_activity_at = time.time()
 
     def mark_done(self, reason: str | None = None) -> None:
-        unconsumed: list[dict[str, Any]] = []
         with self.cond:
             self._flush_live_events_locked(time.time(), force=True)
             close_reason = (
@@ -996,17 +1340,7 @@ class _RemoteSessionRun:
                 self.status = "done"
             self.finished_at = time.time()
             self.last_activity_at = self.finished_at
-            for ticket in self.follow_up_tickets.values():
-                if ticket.get("state") in {"consumed", "cancelled", "unconsumed"}:
-                    continue
-                ticket["state"] = "unconsumed"
-                unconsumed.append(dict(ticket))
             self.cond.notify_all()
-        for ticket in unconsumed:
-            self.append_event(
-                "session_run_follow_up_unconsumed",
-                self._follow_up_event_payload(ticket),
-            )
 
     def is_stale(self, now: float, *, closed_ttl_sec: float, idle_ttl_sec: float) -> bool:
         if self.done and self.finished_at is not None:
@@ -1039,14 +1373,21 @@ class _RemoteSessionRun:
                 "workflow_mode": self.workflow_mode,
                 "taskflow_id": self.taskflow_id,
                 "agent_id": self.agent_id,
+                "agent_run_id": self.agent_run_id,
+                "branch_binding_id": self.branch_binding_id,
                 "runtime_state": dict(self.runtime_state),
                 "created_at": self.created_at,
                 "last_activity_at": self.last_activity_at,
                 "finished_at": self.finished_at,
                 "error": self.last_error,
                 "recovery": dict(self.recovery_ticket) if self.recovery_ticket else None,
-                "approvals": self._pending_approvals_locked(),
-                "user_inputs": self._pending_user_inputs_locked(),
+                "approvals": self._pending_approvals_locked(
+                    self.selected_branch_binding_id or self.branch_binding_id
+                ),
+                "user_inputs": self._pending_user_inputs_locked(
+                    self.selected_branch_binding_id or self.branch_binding_id
+                ),
+                "branches": self._branch_summaries_locked(cursor),
             }
 
     def set_cancel_callback(self, callback: Callable[[str], None]) -> None:
@@ -1060,7 +1401,68 @@ class _RemoteSessionRun:
         if call_immediately:
             callback(reason)
 
-    def request_cancel(self, reason: str = "session_run_cancelled") -> tuple[bool, list[dict[str, Any]]]:
+    def set_revision_feedback_callback(
+        self,
+        callback: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        with self.cond:
+            self.revision_feedback_callback = callback
+
+    def submit_revision_feedback(
+        self,
+        text: str,
+        *,
+        revision_feedback_id: str | None = None,
+        client_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            raise ValueError("revision_feedback_empty")
+        normalized_id = str(revision_feedback_id or "").strip() or f"revision-{uuid.uuid4().hex}"
+        callback: Callable[[dict[str, Any]], None] | None
+        with self.cond:
+            existing = self.revision_feedback_tickets.get(normalized_id)
+            if isinstance(existing, dict):
+                return dict(existing)
+            ticket = {
+                "revision_feedback_id": normalized_id,
+                "text": normalized_text,
+                "client_request_id": str(client_request_id or "").strip(),
+                "state": "pending",
+                "created_at": time.time(),
+            }
+            self.revision_feedback_tickets[normalized_id] = ticket
+            self._flush_live_events_locked(time.time(), force=True)
+            self._append_event_locked("session_run_revision_feedback_accepted", dict(ticket))
+            self.last_activity_at = time.time()
+            self.cond.notify_all()
+            callback = self.revision_feedback_callback
+            out = dict(ticket)
+        if callback is not None:
+            callback(dict(out))
+        return out
+
+    def mark_revision_feedback_consumed(self, revision_feedback_id: str) -> None:
+        normalized_id = str(revision_feedback_id or "").strip()
+        if not normalized_id:
+            return
+        with self.cond:
+            ticket = self.revision_feedback_tickets.get(normalized_id)
+            if not isinstance(ticket, dict) or ticket.get("state") == "consumed":
+                return
+            ticket["state"] = "consumed"
+            ticket["consumed_at"] = time.time()
+            self._flush_live_events_locked(time.time(), force=True)
+            self._append_event_locked("session_run_revision_feedback_consumed", dict(ticket))
+            self.last_activity_at = time.time()
+            self.cond.notify_all()
+
+    def request_cancel(
+        self,
+        reason: str = "session_run_cancelled",
+        *,
+        branch_binding_id: str | None = None,
+    ) -> tuple[bool, list[dict[str, Any]]]:
         callback: Callable[[str], None] | None
         first_request = False
         resolved_approvals: list[dict[str, Any]]
@@ -1069,106 +1471,15 @@ class _RemoteSessionRun:
                 first_request = True
             self.cancel_requested = True
             self.cancel_reason = reason
-            resolved_approvals = self._cancel_pending_approvals_locked(reason)
+            resolved_approvals = self._cancel_pending_approvals_locked(
+                reason,
+                branch_binding_id,
+            )
             callback = self.cancel_callback
             self.cond.notify_all()
         if callback is not None:
             callback(reason)
         return first_request, resolved_approvals
-
-    def submit_follow_up(
-        self,
-        text: str,
-        *,
-        followup_id: str | None = None,
-        client_request_id: str | None = None,
-    ) -> dict[str, Any]:
-        message_text = text.strip()
-        if not message_text:
-            raise ValueError("empty_follow_up")
-        callback: Callable[[dict[str, Any]], None] | None = None
-        with self.cond:
-            ticket_id = followup_id or str(uuid.uuid4())
-            existing = self.follow_up_tickets.get(ticket_id)
-            if existing is not None:
-                return dict(existing)
-            ticket = {
-                "followup_id": ticket_id,
-                "text": message_text,
-                "state": "pending",
-                "client_request_id": client_request_id,
-                "created_at": time.time(),
-            }
-            self.follow_up_tickets[ticket_id] = ticket
-            callback = self.follow_up_callback
-            self.cond.notify_all()
-        self.append_event(
-            "session_run_follow_up_accepted",
-            self._follow_up_event_payload(ticket),
-        )
-        if callback is not None:
-            callback(dict(ticket))
-        return dict(ticket)
-
-    def set_follow_up_callback(
-        self, callback: Callable[[dict[str, Any]], None] | None
-    ) -> None:
-        with self.cond:
-            self.follow_up_callback = callback
-            pending = [
-                dict(ticket)
-                for ticket in self.follow_up_tickets.values()
-                if ticket.get("state") == "pending"
-            ]
-        if callback is not None:
-            for ticket in pending:
-                callback(ticket)
-
-    def set_follow_up_cancel_callback(
-        self, callback: Callable[[str], None] | None
-    ) -> None:
-        with self.cond:
-            self.follow_up_cancel_callback = callback
-
-    def cancel_follow_up(self, followup_id: str, reason: str | None = None) -> bool:
-        callback: Callable[[str], None] | None = None
-        with self.cond:
-            ticket = self.follow_up_tickets.get(followup_id)
-            if ticket is None:
-                return False
-            if ticket.get("state") in {"consumed", "cancelled"}:
-                return True
-            ticket["state"] = "cancelled"
-            ticket["reason"] = reason or "cancelled"
-            callback = self.follow_up_cancel_callback
-            payload = self._follow_up_event_payload(ticket)
-            self.cond.notify_all()
-        if callback is not None:
-            callback(followup_id)
-        self.append_event("session_run_follow_up_cancelled", payload)
-        return True
-
-    def mark_follow_up_consumed(self, followup_id: str) -> bool:
-        with self.cond:
-            ticket = self.follow_up_tickets.get(followup_id)
-            if ticket is None or ticket.get("state") in {"consumed", "cancelled", "unconsumed"}:
-                return False
-            ticket["state"] = "consumed"
-            ticket["consumed_at"] = time.time()
-            payload = self._follow_up_event_payload(ticket)
-            self.cond.notify_all()
-        self.append_event("session_run_follow_up_consumed", payload)
-        return True
-
-    @staticmethod
-    def _follow_up_event_payload(ticket: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "followup_id": ticket.get("followup_id"),
-            "client_request_id": ticket.get("client_request_id"),
-            "state": ticket.get("state"),
-            "text": ticket.get("text"),
-            **({"reason": ticket.get("reason")} if ticket.get("reason") else {}),
-        }
 
     def register_recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.cond:
@@ -1219,15 +1530,47 @@ class _RemoteSessionRun:
             "</stream_recovery>"
         )
 
+    def _payload_branch_binding_id_locked(self, payload: dict[str, Any]) -> str:
+        return str(
+            payload.get("branch_binding_id")
+            or self.selected_branch_binding_id
+            or self.branch_binding_id
+            or "main"
+        ).strip()
+
+    @staticmethod
+    def _waiter_branch_binding_id(waiter: dict[str, Any]) -> str:
+        payload = waiter.get("payload") if isinstance(waiter.get("payload"), dict) else {}
+        return str(
+            waiter.get("branch_binding_id")
+            or payload.get("branch_binding_id")
+            or ""
+        ).strip()
+
+    def _waiter_matches_branch(
+        self,
+        waiter: dict[str, Any],
+        branch_binding_id: str | None,
+    ) -> bool:
+        expected = str(branch_binding_id or "").strip()
+        if not expected:
+            return True
+        actual = self._waiter_branch_binding_id(waiter)
+        return not actual or actual == expected
+
     def register_approval(
         self, approval_id: str, payload: dict[str, Any] | None = None
     ) -> None:
         with self.cond:
             approval_id = str(approval_id)
+            approval_payload = self._approval_payload(approval_id, payload)
+            branch_binding_id = self._payload_branch_binding_id_locked(approval_payload)
+            approval_payload["branch_binding_id"] = branch_binding_id
             self.approval_waiters[approval_id] = {
                 "approval_id": approval_id,
                 "state": "requested",
-                "payload": self._approval_payload(approval_id, payload),
+                "branch_binding_id": branch_binding_id,
+                "payload": approval_payload,
                 "registered": True,
             }
             self.approval_resolutions.pop(approval_id, None)
@@ -1238,6 +1581,8 @@ class _RemoteSessionRun:
         decision: str,
         reason: str | None,
         meta: dict[str, Any] | None = None,
+        *,
+        branch_binding_id: str | None = None,
     ) -> str | None:
         with self.cond:
             resolution_meta = dict(meta or {})
@@ -1246,6 +1591,8 @@ class _RemoteSessionRun:
                 resolved = self.approval_resolutions.get(approval_id)
                 if resolved and resolved.get("decision") == decision:
                     return "already_resolved"
+                return None
+            if not self._waiter_matches_branch(waiter, branch_binding_id):
                 return None
             if waiter.get("done"):
                 if waiter.get("decision") == decision:
@@ -1272,7 +1619,17 @@ class _RemoteSessionRun:
                 {
                     "approval_id": str(approval_id),
                     "state": "requested",
-                    "payload": self._approval_payload(approval_id, None),
+                    "branch_binding_id": self.selected_branch_binding_id
+                    or self.branch_binding_id
+                    or "main",
+                    "payload": self._approval_payload(
+                        approval_id,
+                        {
+                            "branch_binding_id": self.selected_branch_binding_id
+                            or self.branch_binding_id
+                            or "main"
+                        },
+                    ),
                     "registered": False,
                 },
             )
@@ -1298,16 +1655,29 @@ class _RemoteSessionRun:
             self.approval_waiters.pop(approval_id, None)
             return decision, reason if isinstance(reason, str) else None, dict(meta)
 
-    def cancel_pending_approvals(self, reason: str) -> list[dict[str, Any]]:
+    def cancel_pending_approvals(
+        self,
+        reason: str,
+        branch_binding_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self.cond:
-            resolved_approvals = self._cancel_pending_approvals_locked(reason)
+            resolved_approvals = self._cancel_pending_approvals_locked(
+                reason,
+                branch_binding_id,
+            )
             self.cond.notify_all()
             return resolved_approvals
 
-    def _cancel_pending_approvals_locked(self, reason: str) -> list[dict[str, Any]]:
+    def _cancel_pending_approvals_locked(
+        self,
+        reason: str,
+        branch_binding_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         resolved_approvals: list[dict[str, Any]] = []
         for waiter in self.approval_waiters.values():
             if waiter.get("done"):
+                continue
+            if not self._waiter_matches_branch(waiter, branch_binding_id):
                 continue
             waiter["done"] = True
             waiter["decision"] = "deny_once"
@@ -1344,6 +1714,7 @@ class _RemoteSessionRun:
         resolved: dict[str, Any] = {
             "approval_id": str(payload.get("approval_id") or approval_id),
             "decision": decision,
+            "branch_binding_id": str(payload.get("branch_binding_id") or ""),
         }
         tool_call_id = payload.get("tool_call_id")
         if isinstance(tool_call_id, str) and tool_call_id:
@@ -1360,10 +1731,15 @@ class _RemoteSessionRun:
         out["approval_id"] = str(out.get("approval_id") or approval_id)
         return out
 
-    def _pending_approvals_locked(self) -> list[dict[str, Any]]:
+    def _pending_approvals_locked(
+        self,
+        branch_binding_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         approvals: list[dict[str, Any]] = []
         for approval_id, waiter in self.approval_waiters.items():
             if waiter.get("done"):
+                continue
+            if not self._waiter_matches_branch(waiter, branch_binding_id):
                 continue
             payload = self._approval_payload(
                 approval_id,
@@ -1396,10 +1772,14 @@ class _RemoteSessionRun:
     ) -> None:
         with self.cond:
             input_id = str(input_id)
+            input_payload = self._user_input_payload(input_id, payload)
+            branch_binding_id = self._payload_branch_binding_id_locked(input_payload)
+            input_payload["branch_binding_id"] = branch_binding_id
             self.user_input_waiters[input_id] = {
                 "input_id": input_id,
                 "state": "requested",
-                "payload": self._user_input_payload(input_id, payload),
+                "branch_binding_id": branch_binding_id,
+                "payload": input_payload,
                 "registered": True,
             }
             self.user_input_resolutions.pop(input_id, None)
@@ -1410,6 +1790,8 @@ class _RemoteSessionRun:
         action: str,
         content: dict[str, Any] | None,
         reason: str | None,
+        *,
+        branch_binding_id: str | None = None,
     ) -> str | None:
         with self.cond:
             input_id = str(input_id)
@@ -1423,6 +1805,8 @@ class _RemoteSessionRun:
                     and resolved.get("content") == normalized_content
                 ):
                     return "already_resolved"
+                return None
+            if not self._waiter_matches_branch(waiter, branch_binding_id):
                 return None
             if waiter.get("done"):
                 if (
@@ -1453,7 +1837,17 @@ class _RemoteSessionRun:
                 {
                     "input_id": input_id,
                     "state": "requested",
-                    "payload": self._user_input_payload(input_id, None),
+                    "branch_binding_id": self.selected_branch_binding_id
+                    or self.branch_binding_id
+                    or "main",
+                    "payload": self._user_input_payload(
+                        input_id,
+                        {
+                            "branch_binding_id": self.selected_branch_binding_id
+                            or self.branch_binding_id
+                            or "main"
+                        },
+                    ),
                     "registered": False,
                 },
             )
@@ -1486,16 +1880,29 @@ class _RemoteSessionRun:
             self.user_input_waiters.pop(input_id, None)
             return action, dict(content), reason if isinstance(reason, str) else None
 
-    def cancel_pending_user_inputs(self, reason: str) -> list[dict[str, Any]]:
+    def cancel_pending_user_inputs(
+        self,
+        reason: str,
+        branch_binding_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self.cond:
-            resolved_inputs = self._cancel_pending_user_inputs_locked(reason)
+            resolved_inputs = self._cancel_pending_user_inputs_locked(
+                reason,
+                branch_binding_id,
+            )
             self.cond.notify_all()
             return resolved_inputs
 
-    def _cancel_pending_user_inputs_locked(self, reason: str) -> list[dict[str, Any]]:
+    def _cancel_pending_user_inputs_locked(
+        self,
+        reason: str,
+        branch_binding_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         resolved_inputs: list[dict[str, Any]] = []
         for waiter in self.user_input_waiters.values():
             if waiter.get("done"):
+                continue
+            if not self._waiter_matches_branch(waiter, branch_binding_id):
                 continue
             waiter["done"] = True
             waiter["action"] = "cancel"
@@ -1520,10 +1927,15 @@ class _RemoteSessionRun:
                     resolved_inputs.append(event_payload)
         return resolved_inputs
 
-    def _pending_user_inputs_locked(self) -> list[dict[str, Any]]:
+    def _pending_user_inputs_locked(
+        self,
+        branch_binding_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         inputs: list[dict[str, Any]] = []
         for waiter in self.user_input_waiters.values():
             if waiter.get("done"):
+                continue
+            if not self._waiter_matches_branch(waiter, branch_binding_id):
                 continue
             input_id = str(waiter.get("input_id") or "")
             payload = self._user_input_payload(
@@ -1550,6 +1962,7 @@ class _RemoteSessionRun:
             "input_id": str(payload.get("input_id") or input_id),
             "action": action,
             "content": dict(content),
+            "branch_binding_id": str(payload.get("branch_binding_id") or ""),
         }
         kind = payload.get("kind")
         if isinstance(kind, str) and kind:
@@ -1595,8 +2008,6 @@ class RemoteRelayHTTPService:
         *,
         ui_bus: UIEventBus | None = None,
         artifact_provider: Callable[..., Any] | None = None,
-        session_run_events_handler: Callable[[str, str, _RemoteSessionRun], None]
-        | None = None,
         chat_command_handler: Callable[
             [str, ChatCommandDispatchRequest], ChatCommandDispatchResponse
         ]
@@ -1635,7 +2046,6 @@ class RemoteRelayHTTPService:
         self.bind = bind
         self.ui_bus = ui_bus
         self.artifact_provider = artifact_provider
-        self.session_run_events_handler = session_run_events_handler
         self.chat_command_handler = chat_command_handler
         self.session_handler = session_handler
         self.session_trace_event_sink: SessionTraceEventSink | None = None
@@ -1709,7 +2119,7 @@ class RemoteRelayHTTPService:
             str, dict[str, dict[str, Any]]
         ] = {}
         self._capability_package_peer_results_lock = threading.Lock()
-        self._session_runs: dict[str, _RemoteSessionRun] = {}
+        self._session_runs: dict[str, _SessionRunProjection] = {}
         self._session_runs_lock = threading.Lock()
         self._session_run_max_events = max(1, int(session_run_max_events or 1))
         self._session_run_max_payload_bytes = max(1, int(session_run_max_payload_bytes or 1))
@@ -1882,12 +2292,6 @@ class RemoteRelayHTTPService:
             ttl_sec=ttl_sec, claims=claims
         )
 
-    def set_session_run_events_handler(
-        self,
-        handler: Callable[[str, str, _RemoteSessionRun], None] | None,
-    ) -> None:
-        self.session_run_events_handler = handler
-
     def set_chat_command_handler(
         self,
         handler: Callable[[str, ChatCommandDispatchRequest], ChatCommandDispatchResponse]
@@ -1913,14 +2317,16 @@ class RemoteRelayHTTPService:
         provider_id: str | None = None,
         model_id: str | None = None,
         client_request_id: str | None = None,
+        agent_run_id: str | None = None,
+        branch_binding_id: str | None = None,
         model_parameters: dict[str, Any] | None = None,
         runtime_state: dict[str, Any] | None = None,
         locale: str | None = None,
         mentions: list[dict[str, Any]] | None = None,
         initial_prompt: str | None = None,
-    ) -> _RemoteSessionRun:
+    ) -> _SessionRunProjection:
         self._gc_session_runs()
-        session = _RemoteSessionRun(
+        session = _SessionRunProjection(
             session_run_id=str(uuid.uuid4()),
             peer_id=peer_id,
             session_hint=session_hint,
@@ -1931,6 +2337,8 @@ class RemoteRelayHTTPService:
             provider_id=provider_id,
             model_id=model_id,
             client_request_id=client_request_id,
+            agent_run_id=agent_run_id,
+            branch_binding_id=branch_binding_id,
             model_parameters=dict(model_parameters or {}),
             runtime_state=dict(runtime_state or {}),
             locale=locale,
@@ -1951,7 +2359,7 @@ class RemoteRelayHTTPService:
         peer_id: str,
         session_hint: str | None,
         client_request_id: str | None,
-    ) -> _RemoteSessionRun | None:
+    ) -> _SessionRunProjection | None:
         request_id = str(client_request_id or "").strip()
         if not request_id:
             return None
@@ -1993,7 +2401,7 @@ class RemoteRelayHTTPService:
                 if session is not None:
                     session.cleanup_artifacts()
 
-    def _get_session_run(self, session_run_id: str) -> _RemoteSessionRun | None:
+    def _get_session_run(self, session_run_id: str) -> _SessionRunProjection | None:
         self._gc_session_runs()
         with self._session_runs_lock:
             return self._session_runs.get(session_run_id)
@@ -2147,6 +2555,12 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/capability-packages/install/result":
                     self._handle_capability_package_install_result()
                     return
+                if (
+                    parsed.path.startswith("/remote/agent-runs/")
+                    and parsed.path.endswith("/steer")
+                ):
+                    self._handle_agent_run_steer(parsed)
+                    return
                 if parsed.path == "/remote/agent-run-activations/claim":
                     self._handle_agent_run_activation_claim()
                     return
@@ -2171,6 +2585,9 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/session-runs/start":
                     self._handle_session_run_start()
                     return
+                if parsed.path == "/remote/session-runs/continue":
+                    self._handle_session_run_continue()
+                    return
                 if parsed.path == "/remote/chat/command":
                     self._handle_chat_command()
                     return
@@ -2180,17 +2597,14 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/session-runs/status":
                     self._handle_session_run_status()
                     return
+                if parsed.path == "/remote/session-runs/branches/select":
+                    self._handle_session_run_branch_select()
+                    return
                 if parsed.path == "/remote/session-runs/recover":
                     self._handle_session_run_recover()
                     return
                 if parsed.path == "/remote/session-runs/cancel":
                     self._handle_session_run_cancel()
-                    return
-                if parsed.path == "/remote/session-runs/follow-up":
-                    self._handle_session_run_follow_up()
-                    return
-                if parsed.path == "/remote/session-runs/follow-up/cancel":
-                    self._handle_session_run_follow_up_cancel()
                     return
                 if parsed.path == "/remote/session-runs/user-input/reply":
                     self._handle_session_run_user_input_reply()

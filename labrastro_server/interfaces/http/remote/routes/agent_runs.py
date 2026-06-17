@@ -17,6 +17,8 @@ from labrastro_server.interfaces.http.remote.helpers import (
     strong_etag,
 )
 from labrastro_server.interfaces.http.remote.protocol import (
+    AgentRunSteerRequest,
+    AgentRunSteerResponse,
     ApprovalReplyRequest,
     ApprovalReplyResponse,
     SessionRunCancelRequest,
@@ -98,6 +100,55 @@ def _agent_run_model_unhandled_error_payload(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _activation_steer_response_payload(steer: Any) -> dict[str, Any]:
+    return {
+        "id": steer.id,
+        "activation_id": steer.activation_id,
+        "source": steer.source.value,
+        "payload": dict(steer.payload),
+        "created_at": steer.created_at,
+        "delivered_at": steer.delivered_at,
+        "status": steer.status.value,
+        "metadata": dict(steer.metadata),
+    }
+
+
+def _canonical_steer_payload(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _find_existing_activation_steer(
+    control_plane: Any,
+    agent_run_id: str,
+    *,
+    activation_id: str,
+    sender: str,
+    idempotency_key: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        detail = control_plane.load_agent_run_detail(agent_run_id)
+    except KeyError:
+        return None
+    target_payload = _canonical_steer_payload(payload)
+    for steer in detail.get("activation_steers", []):
+        if not isinstance(steer, dict):
+            continue
+        metadata = steer.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if str(steer.get("activation_id") or "") != activation_id:
+            continue
+        if str(metadata.get("sender") or "") != sender:
+            continue
+        if str(metadata.get("idempotency_key") or "") != idempotency_key:
+            continue
+        if _canonical_steer_payload(steer.get("payload", {})) != target_payload:
+            continue
+        return dict(steer)
+    return None
+
+
 class RemoteAgentRunRoutes:
     def _send_agent_run_model_sse_headers(self) -> None:
         self.send_response(HTTPStatus.OK)
@@ -164,6 +215,142 @@ class RemoteAgentRunRoutes:
                 "next_seq": next_seq,
                 "has_more": has_more,
             },
+        )
+
+    def _handle_agent_run_steer(self, parsed: Any) -> None:
+        parts = [
+            unquote(part)
+            for part in parsed.path.strip("/").split("/")
+            if part
+        ]
+        if (
+            len(parts) != 4
+            or parts[:2] != ["remote", "agent-runs"]
+            or parts[3] != "steer"
+        ):
+            self._send_error(HTTPStatus.NOT_FOUND, "not_found")
+            return
+        payload = self._read_json()
+        payload["agent_run_id"] = parts[2]
+        try:
+            req = AgentRunSteerRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_agent_run_steer_request")
+            return
+        peer_id = self._verify_peer_token(req.peer_token)
+        if peer_id is None:
+            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
+            return
+        if self.service.runtime_control_plane is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runs_unavailable")
+            return
+        if not req.session_run_id:
+            self._send_error(HTTPStatus.BAD_REQUEST, "session_run_id_required")
+            return
+        finder = getattr(self.service.runtime_control_plane, "find_session_run_binding", None)
+        if not callable(finder):
+            self._send_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "session_run_bindings_unavailable",
+            )
+            return
+        binding = finder(
+            session_run_id=req.session_run_id,
+            branch_binding_id=req.branch_binding_id or "",
+            selected_only=not bool(req.branch_binding_id),
+        )
+        if binding is None:
+            self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        if not self._session_binding_peer_matches(binding, peer_id):
+            self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        if binding.agent_run_id != req.agent_run_id:
+            self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        try:
+            task = self.service.runtime_control_plane.get_agent_run(req.agent_run_id)
+        except KeyError:
+            self._send_error(HTTPStatus.NOT_FOUND, "not_found")
+            return
+        current_activation_id = str(task.current_activation_id or "")
+        if not current_activation_id or task.status.value not in {
+            "queued",
+            "dispatched",
+            "running",
+        }:
+            self._send_error(HTTPStatus.CONFLICT, "agent_run_not_steerable")
+            return
+        if req.activation_id and req.activation_id != current_activation_id:
+            self._send_error(HTTPStatus.CONFLICT, "activation_mismatch")
+            return
+        idempotency_key = (
+            str(req.idempotency_key or "").strip()
+            or str(req.client_steer_id or "").strip()
+        )
+        if not idempotency_key:
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "activation_steer_idempotency_key_required",
+            )
+            return
+        metadata = dict(req.metadata)
+        metadata.update(
+            {
+                "idempotency_key": idempotency_key,
+                "sender": f"peer:{peer_id}",
+                "peer_id": peer_id,
+                "session_run_id": binding.session_run_id,
+                "branch_binding_id": binding.branch_binding_id,
+                "expected_activation_id": req.activation_id or current_activation_id,
+            }
+        )
+        if req.client_steer_id:
+            metadata["client_steer_id"] = req.client_steer_id
+        duplicate = _find_existing_activation_steer(
+            self.service.runtime_control_plane,
+            req.agent_run_id,
+            activation_id=current_activation_id,
+            sender=f"peer:{peer_id}",
+            idempotency_key=idempotency_key,
+            payload=req.payload,
+        )
+        try:
+            steer = self.service.runtime_control_plane.append_activation_steer(
+                req.agent_run_id,
+                source="user",
+                payload=req.payload,
+                metadata=metadata,
+            )
+        except KeyError:
+            self._send_error(HTTPStatus.NOT_FOUND, "not_found")
+            return
+        except ValueError as exc:
+            message = str(exc)
+            if "only active AgentRun activations" in message or "active worker claim" in message:
+                self._send_error(HTTPStatus.CONFLICT, "agent_run_not_steerable")
+                return
+            if "idempotency_conflict" in message:
+                self._send_error(HTTPStatus.CONFLICT, "activation_steer_idempotency_conflict")
+                return
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_agent_run_steer",
+                message or "invalid AgentRun steer",
+            )
+            return
+        self.service.relay_server.registry.update_heartbeat(peer_id)
+        self._send_json(
+            HTTPStatus.OK,
+            AgentRunSteerResponse(
+                ok=True,
+                status=(
+                    "duplicate"
+                    if duplicate is not None and duplicate.get("id") == steer.id
+                    else "accepted"
+                ),
+                activation_steer=_activation_steer_response_payload(steer),
+            ).to_dict(),
         )
 
     def _handle_agent_run_activation_claim(self) -> None:

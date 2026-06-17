@@ -80,6 +80,10 @@ class PeerRegistry:
             return None
         return info
 
+    def get_any(self, peer_id: str) -> PeerInfo | None:
+        """Get peer info regardless of online/offline status."""
+        return self._peers.get(peer_id)
+
     def pick_default_peer(self) -> PeerInfo | None:
         """Return the default online peer, or None."""
         online = [p for p in self._peers.values() if p.status == "online"]

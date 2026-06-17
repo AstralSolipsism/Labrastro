@@ -22,9 +22,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionRunCancelRequest,
     SessionRunCancelResponse,
     ChatCommandDispatchRequest,
-    SessionRunFollowUpCancelRequest,
-    SessionRunFollowUpRequest,
-    SessionRunFollowUpResponse,
+    SessionRunContinueRequest,
+    SessionRunContinueResponse,
+    SessionRunBranchSelectRequest,
     SessionRunRecoverRequest,
     SessionRunRecoverResponse,
     SessionRunStartRequest,
@@ -55,7 +55,10 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
-from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
+from labrastro_server.services.agent_runtime.control_plane import (
+    AgentRunActivationInputKind,
+    AgentRunRequest,
+)
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
     ExecutorRunResult,
@@ -65,7 +68,7 @@ from reuleauxcoder.interfaces.events import UIEventKind
 logger = logging.getLogger(__name__)
 
 
-def _session_run_events_handler_error_payload(exc: Exception) -> dict[str, Any]:
+def _remote_runtime_error_payload(exc: Exception) -> dict[str, Any]:
     message = str(exc).strip()
     code = getattr(exc, "code", None)
     protocol_message = getattr(exc, "message", None)
@@ -148,6 +151,77 @@ class RemoteChatRoutes:
             return None
         return control_peer_id, session
 
+    def _selected_session_run_binding(self, session, peer_id: str | None = None):
+        runtime = self.service.runtime_control_plane
+        if runtime is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runs_unavailable")
+            return None
+        finder = getattr(runtime, "find_session_run_binding", None)
+        if not callable(finder):
+            self._send_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "session_run_bindings_unavailable",
+            )
+            return None
+        binding = finder(session_run_id=session.session_run_id)
+        if binding is None:
+            self._send_error(HTTPStatus.CONFLICT, "session_run_binding_not_found")
+            return None
+        if peer_id is not None and not self._session_binding_peer_matches(binding, peer_id):
+            self._send_error(HTTPStatus.FORBIDDEN, "session_run_binding_peer_mismatch")
+            return None
+        lister = getattr(runtime, "list_session_run_bindings", None)
+        if callable(lister) and hasattr(session, "sync_branch_bindings"):
+            session.sync_branch_bindings(
+                lister(session_run_id=session.session_run_id)
+            )
+        elif hasattr(session, "record_branch_binding"):
+            session.record_branch_binding(binding)
+        return binding
+
+    def _send_session_run_status_response(self, session, binding, cursor: int) -> None:
+        agent_run = None
+        try:
+            agent_run = self.service.runtime_control_plane.get_agent_run(
+                binding.agent_run_id
+            )
+        except Exception:
+            self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+            return
+        status_payload = session.status_payload(cursor)
+        run_status = str(agent_run.status.value)
+        terminal = bool(getattr(agent_run, "is_terminal", False))
+        runtime_state = (
+            dict(status_payload.get("runtime_state"))
+            if isinstance(status_payload.get("runtime_state"), dict)
+            else {}
+        )
+        runtime_state.update(
+            {
+                "agent_run_id": agent_run.id,
+                "activation_id": str(agent_run.current_activation_id or ""),
+                "branch_binding_id": binding.branch_binding_id,
+            }
+        )
+        status_payload.update(
+            {
+                "status": run_status,
+                "running": run_status in {"queued", "dispatched", "running"},
+                "done": terminal,
+                "reconnectable": not terminal,
+                "agent_run_id": agent_run.id,
+                "branch_binding_id": binding.branch_binding_id,
+                "runtime_state": runtime_state,
+            }
+        )
+
+        self._send_json(
+            HTTPStatus.OK,
+            SessionRunStatusResponse.from_dict(
+                status_payload
+            ).to_dict(),
+        )
+
     def _handle_session_run_start(self) -> None:
         payload = self._read_json()
         try:
@@ -162,11 +236,8 @@ class RemoteChatRoutes:
         if peer_id is None:
             self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
             return
-        if self.service.session_run_events_handler is None:
-            self._send_error(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                "session_run_events_unavailable",
-            )
+        if self.service.runtime_control_plane is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runs_unavailable")
             return
 
         workflow_mode = (
@@ -197,11 +268,28 @@ class RemoteChatRoutes:
             req.client_request_id,
         )
         if existing is not None:
+            activation_id = ""
+            if existing.agent_run_id:
+                try:
+                    activation_id = str(
+                        self.service.runtime_control_plane.get_agent_run(
+                            existing.agent_run_id
+                        ).current_activation_id
+                        or ""
+                    )
+                except Exception:
+                    activation_id = ""
             self._send_json(
                 HTTPStatus.OK,
                 SessionRunStartResponse(
                     session_run_id=existing.session_run_id,
                     session_id=existing.session_id,
+                    agent_run_id=existing.agent_run_id,
+                    activation_id=activation_id or None,
+                    branch_binding_id=existing.branch_binding_id,
+                    agent_id=existing.agent_id,
+                    workflow_mode=existing.workflow_mode,
+                    runtime_state=dict(existing.runtime_state),
                 ).to_dict(),
             )
             return
@@ -219,35 +307,165 @@ class RemoteChatRoutes:
             mentions=req.mentions,
             initial_prompt=req.prompt,
         )
+        agent_id = str(req.taskflow_id or req.mode or "chat").strip() or "chat"
+        metadata: dict[str, Any] = {
+            "remote_peer_id": peer_id,
+            "session_hint": str(req.session_hint or ""),
+        }
+        if workflow_mode:
+            metadata["workflow_mode"] = workflow_mode
+        if req.mode:
+            metadata["mode"] = str(req.mode)
+        try:
+            agent_run = self.service.runtime_control_plane.submit_agent_run(
+                AgentRunRequest(
+                    agent_id=agent_id,
+                    prompt=req.prompt,
+                    owner_session_run_id=session.session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                    model=req.model_id,
+                    metadata=metadata,
+                )
+            )
+        except ValueError as exc:
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_session_run_agent_run",
+                str(exc) or "invalid AgentRun",
+            )
+            return
+        binding = self.service.runtime_control_plane.create_session_run_binding(
+            session_run_id=session.session_run_id,
+            session_id=session.session_id or "",
+            peer_id=peer_id,
+            agent_run_id=agent_run.id,
+            branch_binding_id="main",
+            selected=True,
+            target_agent_run_id=agent_run.id,
+            metadata={"binding_kind": "mainline"},
+        )
+        session.agent_id = agent_run.agent_id
+        session.agent_run_id = agent_run.id
+        session.branch_binding_id = binding.branch_binding_id
+        session.record_branch_binding(binding)
+        session.runtime_state.update(
+            {
+                "agent_run_id": agent_run.id,
+                "activation_id": str(agent_run.current_activation_id or ""),
+                "branch_binding_id": binding.branch_binding_id,
+            }
+        )
+        session.append_event(
+            "session_run_start",
+            {
+                "prompt": req.prompt,
+                "mode": req.mode,
+                "workflow_mode": workflow_mode,
+                "taskflow_id": req.taskflow_id,
+                "provider_id": req.provider_id,
+                "model_id": req.model_id,
+                "locale": req.locale,
+                "mentions": list(req.mentions),
+                "agent_run_id": agent_run.id,
+                "activation_id": agent_run.current_activation_id,
+                "branch_binding_id": binding.branch_binding_id,
+            },
+        )
+        session.append_event(
+            "session_run_binding_selected",
+            {
+                "agent_run_id": agent_run.id,
+                "branch_binding_id": binding.branch_binding_id,
+                "binding_id": binding.id,
+            },
+        )
         session.mark_running()
-
-        def _run_chat() -> None:
-            with self.service._get_peer_chat_lock(peer_id):
-                try:
-                    self.service.session_run_events_handler(peer_id, req.prompt, session)
-                except Exception as exc:
-                    logger.exception(
-                        "Remote session run handler failed",
-                        extra={"peer_id": peer_id, "session_run_id": session.session_run_id},
-                    )
-                    ensure_start = getattr(session, "ensure_session_run_start", None)
-                    if callable(ensure_start):
-                        ensure_start(req.prompt)
-                    payload = _session_run_events_handler_error_payload(exc)
-                    session.append_event("error", payload)
-                    session.append_event(
-                        "session_run_failed",
-                        {**payload, "recoverable": False},
-                    )
-                finally:
-                    session.mark_done()
-
-        threading.Thread(target=_run_chat, daemon=True).start()
         self._send_json(
             HTTPStatus.OK,
             SessionRunStartResponse(
                 session_run_id=session.session_run_id,
                 session_id=session.session_id,
+                agent_run_id=agent_run.id,
+                activation_id=str(agent_run.current_activation_id or "") or None,
+                branch_binding_id=binding.branch_binding_id,
+                agent_id=agent_run.agent_id,
+                workflow_mode=workflow_mode,
+                runtime_state=dict(session.runtime_state),
+            ).to_dict(),
+        )
+
+    def _handle_session_run_continue(self) -> None:
+        payload = self._read_json()
+        try:
+            req = SessionRunContinueRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_continue_request")
+            return
+
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
+        if control is None:
+            return
+        peer_id, session = control
+        binding = self._selected_session_run_binding(session, peer_id)
+        if binding is None:
+            return
+        try:
+            agent_run = self.service.runtime_control_plane.continue_agent_run(
+                binding.agent_run_id,
+                input_kind=AgentRunActivationInputKind.USER_REQUEST,
+                input_payload={
+                    "source": "session_run_continue",
+                    "session_run_id": session.session_run_id,
+                    "branch_binding_id": binding.branch_binding_id,
+                    "client_request_id": str(req.client_request_id or ""),
+                    "locale": str(req.locale or ""),
+                    "mentions": list(req.mentions),
+                },
+                resume_session=True,
+                prompt=req.prompt,
+            )
+        except KeyError:
+            self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+            return
+        except ValueError as exc:
+            self._send_error(
+                HTTPStatus.CONFLICT,
+                "agent_run_not_continuable",
+                str(exc) or "AgentRun is not continuable",
+            )
+            return
+        session.done = False
+        session.finished_at = None
+        session.mark_running()
+        session.agent_run_id = agent_run.id
+        session.branch_binding_id = binding.branch_binding_id
+        session.runtime_state.update(
+            {
+                "agent_run_id": agent_run.id,
+                "activation_id": str(agent_run.current_activation_id or ""),
+                "branch_binding_id": binding.branch_binding_id,
+            }
+        )
+        session.append_event(
+            "session_run_continue",
+            {
+                "prompt": req.prompt,
+                "agent_run_id": agent_run.id,
+                "activation_id": agent_run.current_activation_id,
+                "branch_binding_id": binding.branch_binding_id,
+                "client_request_id": req.client_request_id,
+                "locale": req.locale,
+                "mentions": list(req.mentions),
+            },
+        )
+        self._send_json(
+            HTTPStatus.OK,
+            SessionRunContinueResponse(
+                ok=True,
+                session_run_id=session.session_run_id,
+                activation_id=str(agent_run.current_activation_id or ""),
+                agent_run_id=agent_run.id,
             ).to_dict(),
         )
 
@@ -291,7 +509,10 @@ class RemoteChatRoutes:
         control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
-        _control_peer_id, session = control
+        control_peer_id, session = control
+        binding = self._selected_session_run_binding(session, control_peer_id)
+        if binding is None:
+            return
 
         self._send_sse_headers()
         cursor = int(req.cursor)
@@ -305,7 +526,10 @@ class RemoteChatRoutes:
                     self._write_sse_event(
                         "session_run",
                         SessionRunEventsBatch(
-                            events=events, done=done, next_cursor=next_cursor
+                            events=events,
+                            done=done,
+                            next_cursor=next_cursor,
+                            branches=session.branch_summaries(cursor),
                         ).to_dict(),
                     )
                     cursor = next_cursor
@@ -347,14 +571,64 @@ class RemoteChatRoutes:
         control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
-        _control_peer_id, session = control
+        control_peer_id, session = control
+        binding = self._selected_session_run_binding(session, control_peer_id)
+        if binding is None:
+            return
+        self._send_session_run_status_response(session, binding, req.cursor)
 
-        self._send_json(
-            HTTPStatus.OK,
-            SessionRunStatusResponse.from_dict(
-                session.status_payload(req.cursor)
-            ).to_dict(),
+    def _handle_session_run_branch_select(self) -> None:
+        payload = self._read_json()
+        try:
+            req = SessionRunBranchSelectRequest.from_dict(payload)
+        except Exception:
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_branch_select_request")
+            return
+
+        control = self._get_session_run_control(req.peer_token, req.session_run_id)
+        if control is None:
+            return
+        control_peer_id, session = control
+        runtime = self.service.runtime_control_plane
+        if runtime is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runs_unavailable")
+            return
+        finder = getattr(runtime, "find_session_run_binding", None)
+        selector = getattr(runtime, "select_session_run_branch", None)
+        if not callable(finder) or not callable(selector):
+            self._send_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "session_run_bindings_unavailable",
+            )
+            return
+        binding = finder(
+            session_run_id=session.session_run_id,
+            branch_binding_id=req.branch_binding_id,
+            selected_only=False,
         )
+        if binding is None:
+            self._send_error(HTTPStatus.NOT_FOUND, "session_run_branch_binding_not_found")
+            return
+        if not self._session_binding_peer_matches(binding, control_peer_id):
+            self._send_error(HTTPStatus.FORBIDDEN, "session_run_binding_peer_mismatch")
+            return
+        try:
+            selected = selector(
+                session_run_id=session.session_run_id,
+                branch_binding_id=req.branch_binding_id,
+            )
+        except Exception:
+            self._send_error(HTTPStatus.NOT_FOUND, "session_run_branch_binding_not_found")
+            return
+        session.branch_binding_id = selected.branch_binding_id
+        lister = getattr(runtime, "list_session_run_bindings", None)
+        if callable(lister) and hasattr(session, "sync_branch_bindings"):
+            session.sync_branch_bindings(
+                lister(session_run_id=session.session_run_id)
+            )
+        elif hasattr(session, "record_branch_binding"):
+            session.record_branch_binding(selected)
+        self._send_session_run_status_response(session, selected, req.cursor)
 
     def _handle_session_run_cancel(self) -> None:
         payload = self._read_json()
@@ -367,10 +641,20 @@ class RemoteChatRoutes:
         control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
-        _control_peer_id, session = control
+        control_peer_id, session = control
+        binding = self._selected_session_run_binding(session, control_peer_id)
+        if binding is None:
+            return
 
         reason = req.reason or "session_run_cancelled"
-        first_request, resolved_approvals = session.request_cancel(reason)
+        first_request, resolved_approvals = session.request_cancel(
+            reason,
+            branch_binding_id=binding.branch_binding_id,
+        )
+        ok = self.service.runtime_control_plane.cancel_agent_run(
+            binding.agent_run_id,
+            reason=reason,
+        )
         if first_request:
             session.append_event(
                 "session_run_cancel_requested", {"reason": reason}
@@ -380,40 +664,7 @@ class RemoteChatRoutes:
             session.append_event("session_run_cancelled", {"reason": reason})
             session.mark_done(reason)
         self._send_json(
-            HTTPStatus.OK, SessionRunCancelResponse(ok=True).to_dict()
-        )
-
-    def _handle_session_run_follow_up(self) -> None:
-        payload = self._read_json()
-        try:
-            req = SessionRunFollowUpRequest.from_dict(payload)
-        except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_follow_up_request")
-            return
-
-        control = self._get_session_run_control(req.peer_token, req.session_run_id)
-        if control is None:
-            return
-        _control_peer_id, session = control
-        if session.done or not session.running:
-            self._send_error(HTTPStatus.CONFLICT, "session_run_not_running")
-            return
-        try:
-            ticket = session.submit_follow_up(
-                req.text,
-                followup_id=req.followup_id,
-                client_request_id=req.client_request_id,
-            )
-        except ValueError:
-            self._send_error(HTTPStatus.BAD_REQUEST, "empty_follow_up")
-            return
-        self._send_json(
-            HTTPStatus.OK,
-            SessionRunFollowUpResponse(
-                ok=True,
-                followup_id=str(ticket.get("followup_id") or ""),
-                state=str(ticket.get("state") or "pending"),
-            ).to_dict(),
+            HTTPStatus.OK, SessionRunCancelResponse(ok=ok).to_dict()
         )
 
     def _handle_session_run_recover(self) -> None:
@@ -428,11 +679,8 @@ class RemoteChatRoutes:
         if control is None:
             return
         peer_id, session = control
-        if self.service.session_run_events_handler is None:
-            self._send_error(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                "session_run_events_unavailable",
-            )
+        binding = self._selected_session_run_binding(session, peer_id)
+        if binding is None:
             return
         if session.running:
             self._send_error(HTTPStatus.CONFLICT, "session_run_already_running")
@@ -449,60 +697,48 @@ class RemoteChatRoutes:
                 "action": ticket.get("action"),
             },
         )
-
-        def _run_recovery() -> None:
-            with self.service._get_peer_chat_lock(peer_id):
-                try:
-                    self.service.session_run_events_handler(peer_id, prompt, session)
-                except Exception as exc:
-                    logger.exception(
-                        "Remote session run recovery handler failed",
-                        extra={"peer_id": peer_id, "session_run_id": session.session_run_id},
-                    )
-                    payload = _session_run_events_handler_error_payload(exc)
-                    session.append_event("error", payload)
-                    session.append_event(
-                        "session_run_failed",
-                        {**payload, "recoverable": False},
-                    )
-                finally:
-                    session.mark_done()
-
-        threading.Thread(target=_run_recovery, daemon=True).start()
+        try:
+            agent_run = self.service.runtime_control_plane.continue_agent_run(
+                binding.agent_run_id,
+                input_kind=AgentRunActivationInputKind.USER_REQUEST,
+                input_payload={
+                    "source": "session_run_recover",
+                    "session_run_id": session.session_run_id,
+                    "branch_binding_id": binding.branch_binding_id,
+                    "recovery_id": str(ticket.get("recovery_id") or ""),
+                    "action": str(ticket.get("action") or ""),
+                },
+                resume_session=True,
+                prompt=prompt,
+            )
+        except KeyError:
+            self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+            return
+        except ValueError as exc:
+            self._send_error(
+                HTTPStatus.CONFLICT,
+                "agent_run_not_continuable",
+                str(exc) or "AgentRun is not continuable",
+            )
+            return
+        session.done = False
+        session.finished_at = None
+        session.agent_run_id = agent_run.id
+        session.branch_binding_id = binding.branch_binding_id
+        session.runtime_state.update(
+            {
+                "agent_run_id": agent_run.id,
+                "activation_id": str(agent_run.current_activation_id or ""),
+                "branch_binding_id": binding.branch_binding_id,
+            }
+        )
+        session.mark_running()
         self._send_json(
             HTTPStatus.OK,
             SessionRunRecoverResponse(
                 ok=True,
                 session_run_id=session.session_run_id,
                 state=str(ticket.get("state") or "consumed"),
-            ).to_dict(),
-        )
-
-    def _handle_session_run_follow_up_cancel(self) -> None:
-        payload = self._read_json()
-        try:
-            req = SessionRunFollowUpCancelRequest.from_dict(payload)
-        except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_session_run_follow_up_cancel_request")
-            return
-
-        control = self._get_session_run_control(req.peer_token, req.session_run_id)
-        if control is None:
-            return
-        _control_peer_id, session = control
-        if not req.followup_id:
-            self._send_error(HTTPStatus.BAD_REQUEST, "missing_followup_id")
-            return
-        ok = session.cancel_follow_up(req.followup_id, req.reason)
-        if not ok:
-            self._send_error(HTTPStatus.NOT_FOUND, "follow_up_not_found")
-            return
-        self._send_json(
-            HTTPStatus.OK,
-            SessionRunFollowUpResponse(
-                ok=True,
-                followup_id=req.followup_id,
-                state="cancelled",
             ).to_dict(),
         )
 
@@ -517,7 +753,10 @@ class RemoteChatRoutes:
         control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
-        _control_peer_id, session = control
+        control_peer_id, session = control
+        binding = self._selected_session_run_binding(session, control_peer_id)
+        if binding is None:
+            return
         if req.decision not in {"allow_once", "deny_once"}:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_approval_decision")
             return
@@ -531,6 +770,7 @@ class RemoteChatRoutes:
             req.decision,
             req.reason,
             metadata,
+            branch_binding_id=binding.branch_binding_id,
         )
         if state is None:
             self._send_error(HTTPStatus.NOT_FOUND, "approval_not_found")
@@ -551,7 +791,10 @@ class RemoteChatRoutes:
         control = self._get_session_run_control(req.peer_token, req.session_run_id)
         if control is None:
             return
-        _control_peer_id, session = control
+        control_peer_id, session = control
+        binding = self._selected_session_run_binding(session, control_peer_id)
+        if binding is None:
+            return
         if req.action not in {"accept", "decline", "cancel"}:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_user_input_action")
             return
@@ -560,6 +803,7 @@ class RemoteChatRoutes:
             req.action,
             req.content,
             req.reason,
+            branch_binding_id=binding.branch_binding_id,
         )
         if state is None:
             self._send_error(HTTPStatus.NOT_FOUND, "user_input_not_found")
