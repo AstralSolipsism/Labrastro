@@ -61,7 +61,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     CleanupResult,
     ExecToolResult,
     SessionDeleteRequest,
-    SessionForkRequest,
     SessionListRequest,
     SessionLoadRequest,
     SessionNewRequest,
@@ -7363,18 +7362,6 @@ class TestRemoteRelayHTTPService:
         assert SessionDeleteRequest.from_dict(
             {"peer_token": "peer-token", "session_id": "session-1"}
         ).to_dict() == {"peer_token": "peer-token", "session_id": "session-1"}
-        assert SessionForkRequest.from_dict(
-            {
-                "peer_token": "peer-token",
-                "source_session_id": "session-1",
-                "keep_through_message_index": 3,
-            }
-        ).to_dict() == {
-            "peer_token": "peer-token",
-            "source_session_id": "session-1",
-            "keep_through_message_index": 3,
-        }
-
     def test_sessions_routes_verify_peer_token_and_dispatch(self) -> None:
         relay = RelayServer()
         relay.start()
@@ -7469,19 +7456,19 @@ class TestRemoteRelayHTTPService:
             assert delete_body["action"] == "delete"
             assert calls[-1][0] == "delete"
 
-            status, fork_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/sessions/fork",
-                {
-                    "peer_token": peer_token,
-                    "source_session_id": "session-ok",
-                    "keep_through_message_index": 1,
-                },
-            )
-            assert status == 200
-            assert fork_body["ok"] is True
-            assert fork_body["action"] == "fork"
-            assert calls[-1][0] == "fork"
+            try:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/sessions/fork",
+                    {
+                        "peer_token": peer_token,
+                        "source_session_id": "session-ok",
+                    },
+                )
+                raise AssertionError("expected removed session fork route to fail")
+            except HTTPError as exc:
+                assert exc.code == 404
+            assert calls[-1][0] == "delete"
         finally:
             service.stop()
             relay.stop()
@@ -7908,6 +7895,151 @@ class TestRemoteRelayHTTPService:
                 == "task-http-runtime:activation:2"
             )
             assert "current_activation_input_kind" not in retry_body["agent_run"]["metadata"]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_agent_run_steer_endpoint_queues_and_delivers_mailbox_item(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": relay.issue_bootstrap_token(ttl_sec=60),
+                    "cwd": "G:/repo/main",
+                    "workspace_root": "G:/repo/main",
+                    "features": [
+                        "agent_runs",
+                        "agent_runs.local_workspace",
+                    ],
+                },
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            admin_headers = TEST_ADMIN_HEADERS
+
+            _, submit_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/agent-runs/submit",
+                {
+                    "agent_run_id": "task-http-steer",
+                    "agent_id": "coder",
+                    "prompt": "run fake",
+                    "executor": "fake",
+                    "execution_location": "local_workspace",
+                    "workspace_root": "G:/repo/main",
+                },
+                headers=admin_headers,
+            )
+            assert submit_body["ok"] is True
+
+            with pytest.raises(HTTPError) as missing_key:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/agent-runs/steer",
+                    {
+                        "agent_run_id": "task-http-steer",
+                        "payload": {"items": [{"type": "text", "text": "missing key"}]},
+                    },
+                    headers=admin_headers,
+                )
+            assert missing_key.value.code == 400
+
+            with pytest.raises(HTTPError) as no_claim:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/agent-runs/steer",
+                    {
+                        "agent_run_id": "task-http-steer",
+                        "payload": {"items": [{"type": "text", "text": "too early"}]},
+                        "idempotency_key": "too-early",
+                        "sender": "admin",
+                    },
+                    headers=admin_headers,
+                )
+            assert no_claim.value.code == 400
+
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-run-activations/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "worker-1",
+                    "executors": ["fake"],
+                },
+            )
+            claim = claim_body["claim"]
+            assert claim is not None
+            _, first_heartbeat = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-run-activations/heartbeat",
+                {
+                    "peer_token": peer_token,
+                    "request_id": claim["request_id"],
+                    "agent_run_id": "task-http-steer",
+                    "activation_id": claim["activation_id"],
+                    "worker_id": "worker-1",
+                },
+            )
+            assert first_heartbeat["ok"] is True
+
+            _, steer_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/admin/agent-runs/steer",
+                {
+                    "agent_run_id": "task-http-steer",
+                    "payload": {"items": [{"type": "text", "text": "add context"}]},
+                    "idempotency_key": "admin-steer-1",
+                    "sender": "admin",
+                    "source": "admin",
+                },
+                headers=admin_headers,
+            )
+            assert steer_body["ok"] is True
+            assert steer_body["activation_steer"]["status"] == "queued"
+            assert steer_body["activation_steer"]["metadata"]["idempotency_key"] == (
+                "admin-steer-1"
+            )
+
+            _, delivery = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-run-activations/heartbeat",
+                {
+                    "peer_token": peer_token,
+                    "request_id": claim["request_id"],
+                    "agent_run_id": "task-http-steer",
+                    "activation_id": claim["activation_id"],
+                    "worker_id": "worker-1",
+                },
+            )
+            assert [item["id"] for item in delivery["activation_steers"]] == [
+                steer_body["activation_steer"]["id"]
+            ]
+
+            _, ack = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-run-activations/heartbeat",
+                {
+                    "peer_token": peer_token,
+                    "request_id": claim["request_id"],
+                    "agent_run_id": "task-http-steer",
+                    "activation_id": claim["activation_id"],
+                    "worker_id": "worker-1",
+                    "delivered_steer_ids": [steer_body["activation_steer"]["id"]],
+                },
+            )
+            assert ack["activation_steers"] == []
+            detail = control.load_agent_run_detail("task-http-steer")
+            assert detail["activation_steers"][0]["status"] == "delivered"
         finally:
             service.stop()
             relay.stop()
