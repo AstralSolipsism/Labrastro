@@ -73,7 +73,9 @@ Labrastro/
 
 ### SessionRun 与 Chat
 
-`SessionRun` 是用户可观察的交互式会话边界。
+`SessionRun` 是用户可观察的交互式会话边界和 transcript/projection
+入口；模型执行、工具执行、worker claim 和 executor 写入权归
+`AgentRun` mainline/activation。
 
 主要代码：
 
@@ -85,18 +87,25 @@ Labrastro/
 关键 endpoint：
 
 - `POST /remote/session-runs/start`
+- `POST /remote/session-runs/continue`
 - `POST /remote/session-runs/events`
 - `POST /remote/session-runs/status`
 - `POST /remote/session-runs/recover`
 - `POST /remote/session-runs/cancel`
-- `POST /remote/session-runs/follow-up`
-- `POST /remote/session-runs/follow-up/cancel`
 - `POST /remote/session-runs/user-input/reply`
 - `POST /remote/approval/reply`
+- `POST /remote/agent-runs/{agent_run_id}/steer`
 
 约束：
 
 - ChatView 只消费 canonical SessionRun transcript。
+- 首轮用户输入走 `session-runs/start`，空闲态后续输入走
+  `session-runs/continue`，二者都必须通过持久化
+  `SessionRun` -> `AgentRun` branch binding 解析执行目标。
+- 运行中明确影响当前 activation 的指导走 user-facing
+  `agent-runs/{agent_run_id}/steer`，不走 `SessionRun` follow-up。
+- `session-runs/events` 和 `session-runs/status` 只读 selected branch
+  projection，不触发 prompt、model 或工具执行。
 - `SessionRun` 取消必须关闭关联 pending approval，并写入一个用户可见终态。
 - AgentRun executor event 只能通过 semantic projection 进入 ChatView。
 - raw exception、完整 stdout、工具诊断、prompt 细节、traceback 属于 audit/detail。
@@ -225,8 +234,6 @@ adapters、memory source connectors 和 lifecycle hooks。
 关键 endpoint：
 
 - `POST /remote/admin/capability-packages/ingest/session/start`
-- `POST /remote/admin/capability-packages/ingest/start`
-- `POST /remote/admin/capability-packages/ingest/status`
 - `POST /remote/admin/capability-packages/drafts/accept`
 - `POST /remote/admin/capability-packages/delete`
 - `POST /remote/admin/capability-packages/enable`
