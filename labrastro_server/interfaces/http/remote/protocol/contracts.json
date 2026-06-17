@@ -270,6 +270,62 @@
       }
     },
     {
+      "name": "session_run.branch_select",
+      "method": "POST",
+      "path": "/remote/session-runs/branches/select",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_run_id": "session_run_contract",
+        "branch_binding_id": "branch_contract",
+        "cursor": 0
+      },
+      "response": {
+        "ok": true,
+        "session_run_id": "session_run_contract",
+        "peer_id": "peer_contract",
+        "status": "running",
+        "running": true,
+        "done": false,
+        "reconnectable": true,
+        "cursor": 0,
+        "next_cursor": 4,
+        "first_available_seq": 1,
+        "latest_seq": 4,
+        "dropped_count": 0,
+        "session_id": "session_contract",
+        "mode": "chat",
+        "workflow_mode": null,
+        "taskflow_id": null,
+        "agent_run_id": "agent_run_branch_contract",
+        "branch_binding_id": "branch_contract",
+        "runtime_state": {
+          "agent_run_id": "agent_run_branch_contract",
+          "branch_binding_id": "branch_contract"
+        },
+        "created_at": 1760000000.0,
+        "last_activity_at": 1760000002.0,
+        "finished_at": null,
+        "error": null,
+        "approvals": [],
+        "user_inputs": [],
+        "branches": [
+          {
+            "branch_binding_id": "main",
+            "selected": false,
+            "current_index": 0,
+            "total_sibling_count": 2
+          },
+          {
+            "branch_binding_id": "branch_contract",
+            "selected": true,
+            "current_index": 1,
+            "total_sibling_count": 2
+          }
+        ]
+      }
+    },
+    {
       "name": "session_run.events_lost_events",
       "method": "POST",
       "path": "/remote/session-runs/events",
@@ -349,6 +405,48 @@
         ],
         "next_seq": 1,
         "has_more": false
+      }
+    },
+    {
+      "name": "agent_runs.steer",
+      "method": "POST",
+      "path": "/remote/agent-runs/{agent_run_id}/steer",
+      "auth": "peer_token",
+      "request": {
+        "agent_run_id": "agent_run_contract",
+        "peer_token": "pt_contract",
+        "session_run_id": "session_run_contract",
+        "branch_binding_id": "main",
+        "activation_id": "activation_contract",
+        "source": "user",
+        "payload": {
+          "type": "guidance",
+          "text": "adjust"
+        },
+        "idempotency_key": "user_steer_contract",
+        "metadata": {}
+      },
+      "response": {
+        "ok": true,
+        "status": "accepted",
+        "activation_steer": {
+          "id": "steer_contract",
+          "activation_id": "activation_contract",
+          "source": "user",
+          "payload": {
+            "type": "guidance",
+            "text": "adjust"
+          },
+          "status": "queued",
+          "metadata": {
+            "idempotency_key": "user_steer_contract",
+            "sender": "peer:peer_contract",
+            "peer_id": "peer_contract",
+            "session_run_id": "session_run_contract",
+            "branch_binding_id": "main",
+            "expected_activation_id": "activation_contract"
+          }
+        }
       }
     },
     {
@@ -455,6 +553,336 @@
       },
       "response": {
         "environment_requirements": []
+      }
+    },
+    {
+      "name": "session_run.continue",
+      "method": "POST",
+      "path": "/remote/session-runs/continue",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_run_id": "session_run_contract",
+        "prompt": "continue",
+        "client_request_id": "continue_contract",
+        "locale": "zh-CN",
+        "mentions": []
+      },
+      "response": {
+        "ok": true,
+        "session_run_id": "session_run_contract",
+        "agent_run_id": "agent_run_contract",
+        "activation_id": "activation_contract",
+        "error": null
+      }
+    },
+    {
+      "name": "session_run.recover",
+      "method": "POST",
+      "path": "/remote/session-runs/recover",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_run_id": "session_run_contract",
+        "action": "continue"
+      },
+      "response": {
+        "ok": true,
+        "session_run_id": "session_run_contract",
+        "state": "running",
+        "error": null
+      }
+    },
+    {
+      "name": "session_run.cancel",
+      "method": "POST",
+      "path": "/remote/session-runs/cancel",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_run_id": "session_run_contract",
+        "reason": "user_cancelled"
+      },
+      "response": {
+        "ok": true,
+        "error": null
+      }
+    },
+    {
+      "name": "session_run.user_input_reply",
+      "method": "POST",
+      "path": "/remote/session-runs/user-input/reply",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_run_id": "session_run_contract",
+        "input_id": "input_contract",
+        "action": "submit",
+        "content": {
+          "text": "answer"
+        },
+        "reason": null
+      },
+      "response": {
+        "ok": true,
+        "error": null,
+        "state": "submitted"
+      }
+    },
+    {
+      "name": "agent_run_activations.heartbeat",
+      "method": "POST",
+      "path": "/remote/agent-run-activations/heartbeat",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "request_id": "claim_contract",
+        "agent_run_id": "agent_run_contract",
+        "activation_id": "activation_contract",
+        "worker_id": "worker_contract",
+        "lease_sec": 30,
+        "delivered_steer_ids": ["steer_contract"]
+      },
+      "response": {
+        "ok": true,
+        "cancel_requested": false,
+        "lease_sec": 30,
+        "activation_steers": []
+      }
+    },
+    {
+      "name": "agent_run_activations.session",
+      "method": "POST",
+      "path": "/remote/agent-run-activations/session",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "request_id": "claim_contract",
+        "agent_run_id": "agent_run_contract",
+        "activation_id": "activation_contract",
+        "worker_id": "worker_contract",
+        "workdir": "/workspace",
+        "branch": "main",
+        "executor_session_id": "executor_session_contract"
+      },
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "name": "agent_run_activations.event",
+      "method": "POST",
+      "path": "/remote/agent-run-activations/event",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "request_id": "claim_contract",
+        "agent_run_id": "agent_run_contract",
+        "activation_id": "activation_contract",
+        "worker_id": "worker_contract",
+        "type": "status",
+        "text": "running",
+        "data": {}
+      },
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "name": "agent_run_activations.model_request",
+      "method": "POST",
+      "path": "/remote/agent-run-activations/model-request",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "request_id": "claim_contract",
+        "agent_run_id": "agent_run_contract",
+        "activation_id": "activation_contract",
+        "worker_id": "worker_contract",
+        "messages": [],
+        "stream": false,
+        "metadata": {}
+      },
+      "response": {
+        "ok": true,
+        "response": {}
+      }
+    },
+    {
+      "name": "admin.agent_runs.events",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/events",
+      "auth": "bearer",
+      "request": {
+        "agent_run_id": "agent_run_contract",
+        "after_seq": 0,
+        "limit": 200
+      },
+      "response": {
+        "ok": true,
+        "events": [],
+        "next_seq": 0,
+        "has_more": false
+      }
+    },
+    {
+      "name": "admin.agent_runs.cancel",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/cancel",
+      "auth": "bearer",
+      "request": {
+        "agent_run_id": "agent_run_contract",
+        "reason": "user_cancelled"
+      },
+      "response": {
+        "ok": true,
+        "agent_run_id": "agent_run_contract"
+      }
+    },
+    {
+      "name": "admin.agent_runs.retry",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/retry",
+      "auth": "bearer",
+      "request": {
+        "agent_run_id": "agent_run_contract",
+        "resume_session": true
+      },
+      "response": {
+        "ok": true,
+        "agent_run": {
+          "id": "agent_run_contract"
+        }
+      }
+    },
+    {
+      "name": "admin.agent_runs.branch",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/branch",
+      "auth": "bearer",
+      "request": {
+        "source_agent_run_id": "agent_run_contract",
+        "base_session_item_id": "item_contract",
+        "runtime_root": "/workspace",
+        "prompt": "branch prompt",
+        "branch_binding_id": "branch_contract",
+        "select_branch": true,
+        "metadata": {}
+      },
+      "response": {
+        "ok": true,
+        "agent_run": {
+          "id": "agent_run_branch_contract"
+        }
+      }
+    },
+    {
+      "name": "admin.agent_runs.fork",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/fork",
+      "auth": "bearer",
+      "request": {
+        "source_agent_run_id": "agent_run_contract",
+        "base_session_item_id": "item_contract",
+        "fork_workspace_ref": "workspace_contract",
+        "target_owner_session_run_id": "session_run_branch_contract",
+        "prompt": "fork prompt",
+        "branch_binding_id": "fork_contract",
+        "select_branch": true,
+        "metadata": {}
+      },
+      "response": {
+        "ok": true,
+        "agent_run": {
+          "id": "agent_run_fork_contract"
+        }
+      }
+    },
+    {
+      "name": "admin.agent_runs.steer",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/steer",
+      "auth": "bearer",
+      "request": {
+        "agent_run_id": "agent_run_contract",
+        "source": "admin",
+        "payload": {
+          "type": "guidance",
+          "text": "adjust"
+        },
+        "idempotency_key": "steer_contract",
+        "metadata": {}
+      },
+      "response": {
+        "ok": true,
+        "activation_steer": {
+          "id": "steer_contract",
+          "activation_id": "activation_contract",
+          "source": "admin",
+          "payload": {
+            "type": "guidance",
+            "text": "adjust"
+          },
+          "status": "queued",
+          "metadata": {}
+        }
+      }
+    },
+    {
+      "name": "admin.agent_runs.list",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/list",
+      "auth": "bearer",
+      "request": {
+        "status": "running",
+        "agent_id": "default",
+        "limit": 50,
+        "after_created_at": null
+      },
+      "response": {
+        "ok": true,
+        "agent_runs": []
+      }
+    },
+    {
+      "name": "admin.agent_runs.load",
+      "method": "POST",
+      "path": "/remote/admin/agent-runs/load",
+      "auth": "bearer",
+      "request": {
+        "agent_run_id": "agent_run_contract",
+        "event_limit": 100
+      },
+      "response": {
+        "ok": true,
+        "agent_run": {
+          "id": "agent_run_contract"
+        },
+        "events": []
+      }
+    },
+    {
+      "name": "admin.capability_packages.ingest_session_start",
+      "method": "POST",
+      "path": "/remote/admin/capability-packages/ingest/session/start",
+      "auth": "bearer",
+      "request": {
+        "peer_token": "pt_contract",
+        "session_id": "session_contract",
+        "client_request_id": "capability_ingest_contract",
+        "locale": "zh-CN",
+        "source": {
+          "type": "github_repo",
+          "url": "https://github.com/example/capability"
+        }
+      },
+      "response": {
+        "session_run_id": "session_run_contract",
+        "session_id": "session_contract",
+        "agent_id": "capability_package_ingest",
+        "workflow_mode": "capability_package_ingest",
+        "runtime_state": {},
+        "error": null
       }
     },
     {

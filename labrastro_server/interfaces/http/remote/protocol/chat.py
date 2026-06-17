@@ -58,7 +58,7 @@ class SessionRunStartRequest:
             peer_token=d["peer_token"],
             prompt=d["prompt"],
             session_hint=d.get("session_hint"),
-            client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
+            client_request_id=d.get("client_request_id"),
             mode=d.get("mode"),
             workflow_mode=d.get("workflow_mode"),
             taskflow_id=d.get("taskflow_id"),
@@ -73,6 +73,9 @@ class SessionRunStartRequest:
 class SessionRunStartResponse:
     session_run_id: str
     session_id: str | None = None
+    agent_run_id: str | None = None
+    activation_id: str | None = None
+    branch_binding_id: str | None = None
     agent_id: str | None = None
     workflow_mode: str | None = None
     runtime_state: dict[str, Any] = field(default_factory=dict)
@@ -82,6 +85,12 @@ class SessionRunStartResponse:
         payload: dict[str, Any] = {"session_run_id": self.session_run_id, "error": self.error}
         if self.session_id is not None:
             payload["session_id"] = self.session_id
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
+        if self.activation_id is not None:
+            payload["activation_id"] = self.activation_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
         if self.agent_id is not None:
             payload["agent_id"] = self.agent_id
         if self.workflow_mode is not None:
@@ -95,6 +104,9 @@ class SessionRunStartResponse:
         return cls(
             session_run_id=d.get("session_run_id", ""),
             session_id=d.get("session_id") if isinstance(d.get("session_id"), str) else None,
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            activation_id=d.get("activation_id") if isinstance(d.get("activation_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
             agent_id=d.get("agent_id") if isinstance(d.get("agent_id"), str) else None,
             workflow_mode=d.get("workflow_mode") if isinstance(d.get("workflow_mode"), str) else None,
             runtime_state=d.get("runtime_state") if isinstance(d.get("runtime_state"), dict) else {},
@@ -142,11 +154,11 @@ class ChatCommandDispatchRequest:
         return cls(
             peer_token=d["peer_token"],
             text=str(d.get("text") or ""),
-            command_id=str(d.get("command_id") or d.get("commandId") or ""),
+            command_id=str(d.get("command_id") or ""),
             trigger=str(d.get("trigger") or ""),
             args=str(d.get("args") or ""),
-            session_hint=d.get("session_hint") or d.get("sessionId") or d.get("session_id"),
-            client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
+            session_hint=d.get("session_hint"),
+            client_request_id=d.get("client_request_id"),
             mentions=_dict_list(d.get("mentions")),
         )
 
@@ -212,6 +224,7 @@ class SessionRunEventsBatch:
     done: bool = False
     next_cursor: int = 0
     error: str | None = None
+    branches: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -219,6 +232,7 @@ class SessionRunEventsBatch:
             "done": self.done,
             "next_cursor": self.next_cursor,
             "error": self.error,
+            "branches": _dict_list(self.branches),
         }
 
     @classmethod
@@ -228,6 +242,7 @@ class SessionRunEventsBatch:
             done=bool(d.get("done", False)),
             next_cursor=int(d.get("next_cursor", 0)),
             error=d.get("error"),
+            branches=_dict_list(d.get("branches")),
         )
 
 @dataclass
@@ -252,6 +267,30 @@ class SessionRunStatusRequest:
         )
 
 @dataclass
+class SessionRunBranchSelectRequest:
+    peer_token: str
+    session_run_id: str
+    branch_binding_id: str
+    cursor: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "peer_token": self.peer_token,
+            "session_run_id": self.session_run_id,
+            "branch_binding_id": self.branch_binding_id,
+            "cursor": self.cursor,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunBranchSelectRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            session_run_id=d["session_run_id"],
+            branch_binding_id=d["branch_binding_id"],
+            cursor=int(d.get("cursor", 0)),
+        )
+
+@dataclass
 class SessionRunStatusResponse:
     ok: bool
     session_run_id: str
@@ -270,6 +309,8 @@ class SessionRunStatusResponse:
     workflow_mode: str | None = None
     taskflow_id: str | None = None
     agent_id: str | None = None
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
     runtime_state: dict[str, Any] = field(default_factory=dict)
     created_at: float | None = None
     last_activity_at: float | None = None
@@ -278,6 +319,7 @@ class SessionRunStatusResponse:
     recovery: dict[str, Any] | None = None
     approvals: list[dict[str, Any]] = field(default_factory=list)
     user_inputs: list[dict[str, Any]] = field(default_factory=list)
+    branches: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -298,6 +340,8 @@ class SessionRunStatusResponse:
             "workflow_mode": self.workflow_mode,
             "taskflow_id": self.taskflow_id,
             "agent_id": self.agent_id,
+            "agent_run_id": self.agent_run_id,
+            "branch_binding_id": self.branch_binding_id,
             "runtime_state": dict(self.runtime_state),
             "created_at": self.created_at,
             "last_activity_at": self.last_activity_at,
@@ -306,6 +350,7 @@ class SessionRunStatusResponse:
             "recovery": dict(self.recovery) if isinstance(self.recovery, dict) else None,
             "approvals": _dict_list(self.approvals),
             "user_inputs": _dict_list(self.user_inputs),
+            "branches": _dict_list(self.branches),
         }
 
     @classmethod
@@ -328,6 +373,8 @@ class SessionRunStatusResponse:
             workflow_mode=d.get("workflow_mode") if isinstance(d.get("workflow_mode"), str) else None,
             taskflow_id=d.get("taskflow_id") if isinstance(d.get("taskflow_id"), str) else None,
             agent_id=d.get("agent_id") if isinstance(d.get("agent_id"), str) else None,
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
             runtime_state=d.get("runtime_state") if isinstance(d.get("runtime_state"), dict) else {},
             created_at=float(d["created_at"]) if d.get("created_at") is not None else None,
             last_activity_at=float(d["last_activity_at"])
@@ -338,6 +385,7 @@ class SessionRunStatusResponse:
             recovery=d.get("recovery") if isinstance(d.get("recovery"), dict) else None,
             approvals=_dict_list(d.get("approvals")),
             user_inputs=_dict_list(d.get("user_inputs")),
+            branches=_dict_list(d.get("branches")),
         )
 
 @dataclass
@@ -373,83 +421,76 @@ class SessionRunCancelResponse:
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunCancelResponse":
         return cls(ok=bool(d.get("ok", False)), error=d.get("error"))
 
+
 @dataclass
-class SessionRunFollowUpRequest:
+class SessionRunContinueRequest:
     peer_token: str
     session_run_id: str
-    text: str
-    followup_id: str | None = None
+    prompt: str
     client_request_id: str | None = None
+    locale: str | None = None
+    mentions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
-            "text": self.text,
+            "prompt": self.prompt,
         }
-        if self.followup_id is not None:
-            payload["followup_id"] = self.followup_id
         if self.client_request_id is not None:
             payload["client_request_id"] = self.client_request_id
+        if self.locale is not None:
+            payload["locale"] = self.locale
+        if self.mentions:
+            payload["mentions"] = list(self.mentions)
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SessionRunFollowUpRequest":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunContinueRequest":
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
-            text=d["text"],
-            followup_id=d.get("followup_id") or d.get("followupId"),
-            client_request_id=d.get("client_request_id") or d.get("clientRequestId"),
+            prompt=d["prompt"],
+            client_request_id=d.get("client_request_id"),
+            locale=d.get("locale"),
+            mentions=_dict_list(d.get("mentions")),
         )
 
-@dataclass
-class SessionRunFollowUpCancelRequest:
-    peer_token: str
-    session_run_id: str
-    followup_id: str
-    reason: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "followup_id": self.followup_id,
-            "reason": self.reason,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SessionRunFollowUpCancelRequest":
-        return cls(
-            peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            followup_id=d.get("followup_id") or d.get("followupId"),
-            reason=d.get("reason"),
-        )
 
 @dataclass
-class SessionRunFollowUpResponse:
+class SessionRunContinueResponse:
     ok: bool
-    followup_id: str | None = None
-    state: str | None = None
+    session_run_id: str
+    activation_id: str | None = None
+    agent_run_id: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"ok": self.ok, "error": self.error}
-        if self.followup_id is not None:
-            payload["followup_id"] = self.followup_id
-        if self.state is not None:
-            payload["state"] = self.state
+        payload: dict[str, Any] = {
+            "ok": self.ok,
+            "session_run_id": self.session_run_id,
+            "error": self.error,
+        }
+        if self.activation_id is not None:
+            payload["activation_id"] = self.activation_id
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
         return payload
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SessionRunFollowUpResponse":
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunContinueResponse":
         return cls(
             ok=bool(d.get("ok", False)),
-            followup_id=d.get("followup_id") if isinstance(d.get("followup_id"), str) else None,
-            state=d.get("state") if isinstance(d.get("state"), str) else None,
-            error=d.get("error"),
+            session_run_id=str(d.get("session_run_id") or ""),
+            activation_id=d.get("activation_id")
+            if isinstance(d.get("activation_id"), str)
+            else None,
+            agent_run_id=d.get("agent_run_id")
+            if isinstance(d.get("agent_run_id"), str)
+            else None,
+            error=d.get("error") if isinstance(d.get("error"), str) else None,
         )
+
 
 @dataclass
 class SessionRunRecoverRequest:
@@ -523,7 +564,7 @@ class SessionRunUserInputReplyRequest:
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
-            input_id=d.get("input_id") or d.get("inputId"),
+            input_id=d.get("input_id"),
             action=str(d.get("action") or "decline"),
             content=content if isinstance(content, dict) else {},
             reason=d.get("reason") if isinstance(d.get("reason"), str) else None,
@@ -572,8 +613,6 @@ class ApprovalReplyRequest:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ApprovalReplyRequest":
         approved_save_candidate = d.get("approved_save_candidate")
-        if not isinstance(approved_save_candidate, dict):
-            approved_save_candidate = d.get("approvedSaveCandidate")
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
@@ -618,9 +657,8 @@ __all__ = [
     "SessionRunStatusResponse",
     "SessionRunCancelRequest",
     "SessionRunCancelResponse",
-    "SessionRunFollowUpRequest",
-    "SessionRunFollowUpCancelRequest",
-    "SessionRunFollowUpResponse",
+    "SessionRunContinueRequest",
+    "SessionRunContinueResponse",
     "SessionRunRecoverRequest",
     "SessionRunRecoverResponse",
     "SessionRunUserInputReplyRequest",

@@ -325,19 +325,52 @@ type AgentRunEventsResponse struct {
 }
 
 type AgentRunActivationHeartbeatRequest struct {
-	PeerToken    string `json:"peer_token"`
-	RequestID    string `json:"request_id"`
-	ActivationID string `json:"activation_id"`
-	TaskID       string `json:"agent_run_id"`
-	WorkerID     string `json:"worker_id"`
-	LeaseSec     int    `json:"lease_sec,omitempty"`
+	PeerToken         string   `json:"peer_token"`
+	RequestID         string   `json:"request_id"`
+	ActivationID      string   `json:"activation_id"`
+	TaskID            string   `json:"agent_run_id"`
+	WorkerID          string   `json:"worker_id"`
+	LeaseSec          int      `json:"lease_sec,omitempty"`
+	DeliveredSteerIDs []string `json:"delivered_steer_ids,omitempty"`
 }
 
 type AgentRunActivationHeartbeatResponse struct {
-	OK              bool   `json:"ok"`
-	CancelRequested bool   `json:"cancel_requested"`
-	Reason          string `json:"reason,omitempty"`
-	LeaseSec        int    `json:"lease_sec,omitempty"`
+	OK               bool              `json:"ok"`
+	CancelRequested  bool              `json:"cancel_requested"`
+	Reason           string            `json:"reason,omitempty"`
+	LeaseSec         int               `json:"lease_sec,omitempty"`
+	ActivationSteers []ActivationSteer `json:"activation_steers,omitempty"`
+}
+
+type ActivationSteer struct {
+	ID           string         `json:"id"`
+	ActivationID string         `json:"activation_id"`
+	Source       string         `json:"source"`
+	Payload      map[string]any `json:"payload,omitempty"`
+	CreatedAt    string         `json:"created_at,omitempty"`
+	DeliveredAt  string         `json:"delivered_at,omitempty"`
+	Status       string         `json:"status,omitempty"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
+}
+
+type AgentRunSteerRequest struct {
+	PeerToken       string         `json:"peer_token,omitempty"`
+	TaskID          string         `json:"agent_run_id,omitempty"`
+	SessionRunID    string         `json:"session_run_id,omitempty"`
+	BranchBindingID string         `json:"branch_binding_id,omitempty"`
+	ActivationID    string         `json:"activation_id,omitempty"`
+	Source          string         `json:"source,omitempty"`
+	Payload         map[string]any `json:"payload"`
+	IdempotencyKey  string         `json:"idempotency_key,omitempty"`
+	ClientSteerID   string         `json:"client_steer_id,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty"`
+}
+
+type AgentRunSteerResponse struct {
+	OK              bool            `json:"ok"`
+	Status          string          `json:"status,omitempty"`
+	ActivationSteer ActivationSteer `json:"activation_steer,omitempty"`
+	Error           string          `json:"error,omitempty"`
 }
 
 type AgentRunActivationCompleteRequest struct {

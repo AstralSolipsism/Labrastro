@@ -5,6 +5,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+
+@dataclass
+class Empty:
+    def to_dict(self) -> dict[str, Any]:
+        return {}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Empty":
+        del d
+        return cls()
+
+
+@dataclass
+class Ok:
+    ok: bool = True
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"ok": self.ok}
+        if self.error is not None:
+            payload["error"] = self.error
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Ok":
+        return cls(ok=bool(d.get("ok", True)), error=d.get("error"))
+
+
 @dataclass
 class RelayEnvelope:
     """Top-level message wrapper for all relay communications."""
@@ -182,6 +210,8 @@ class DisconnectNotice:
         return cls(reason=d.get("reason", "peer_initiated"))
 
 __all__ = [
+    "Empty",
+    "Ok",
     "RelayEnvelope",
     "RegisterRequest",
     "RegisterResponse",

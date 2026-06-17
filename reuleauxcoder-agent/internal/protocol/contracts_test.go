@@ -30,11 +30,49 @@ func TestRemoteContractFixturesDecodePeerProtocolSamples(t *testing.T) {
 	mustDecode(t, fixtures["agent_run_activations.claim"].Request, &AgentRunActivationClaimRequest{})
 	mustDecode(t, fixtures["agent_run_activations.claim"].Response, &AgentRunActivationClaimResponse{})
 	mustDecode(t, fixtures["agent_runs.events"].Response, &AgentRunEventsResponse{})
+	mustDecode(t, fixtures["agent_runs.steer"].Request, &AgentRunSteerRequest{})
+	mustDecode(t, fixtures["agent_runs.steer"].Response, &AgentRunSteerResponse{})
+	mustDecode(t, fixtures["agent_run_activations.heartbeat"].Request, &AgentRunActivationHeartbeatRequest{})
+	mustDecode(t, fixtures["agent_run_activations.heartbeat"].Response, &AgentRunActivationHeartbeatResponse{})
 	mustDecode(t, fixtures["agent_run_activations.complete"].Request, &AgentRunActivationCompleteRequest{})
 	mustDecode(t, fixtures["agent_run_activations.complete"].Response, &AgentRunActivationCompleteResponse{})
 	mustDecode(t, fixtures["environment.manifest"].Request, &EnvironmentManifestRequest{})
 	mustDecode(t, fixtures["environment.manifest"].Response, &EnvironmentManifestResponse{})
 	mustDecode(t, fixtures["error.invalid_peer_token"].Response, &ErrorResponse{})
+}
+
+func TestAgentRunActivationHeartbeatContractIncludesSteerDelivery(t *testing.T) {
+	fixtures := loadContractFixtures(t)
+
+	var request AgentRunActivationHeartbeatRequest
+	mustDecode(t, fixtures["agent_run_activations.heartbeat"].Request, &request)
+	if len(request.DeliveredSteerIDs) != 1 || request.DeliveredSteerIDs[0] != "steer_contract" {
+		t.Fatalf("delivered steer ids = %#v", request.DeliveredSteerIDs)
+	}
+
+	var response AgentRunActivationHeartbeatResponse
+	mustDecode(t, fixtures["agent_run_activations.heartbeat"].Response, &response)
+	if response.ActivationSteers == nil {
+		t.Fatalf("activation_steers must decode as an explicit list")
+	}
+}
+
+func TestAgentRunSteerContractUsesSnakeCaseUserFacingFields(t *testing.T) {
+	fixtures := loadContractFixtures(t)
+
+	var request AgentRunSteerRequest
+	mustDecode(t, fixtures["agent_runs.steer"].Request, &request)
+	if request.SessionRunID != "session_run_contract" ||
+		request.BranchBindingID != "main" ||
+		request.IdempotencyKey != "user_steer_contract" {
+		t.Fatalf("user steer request = %#v", request)
+	}
+
+	var response AgentRunSteerResponse
+	mustDecode(t, fixtures["agent_runs.steer"].Response, &response)
+	if response.Status != "accepted" || response.ActivationSteer.Source != "user" {
+		t.Fatalf("user steer response = %#v", response)
+	}
 }
 
 func TestSessionRunStartRequestMarshalsOptionalStartContext(t *testing.T) {

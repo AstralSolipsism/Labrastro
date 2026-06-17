@@ -208,3 +208,150 @@ def test_agent_thread_binding_cleanup_is_control_plane_owned() -> None:
     ]
 
     assert missing == []
+
+
+def test_legacy_session_run_guidance_family_and_agent_loop_injection_are_forbidden() -> None:
+    scanned = {
+        "registry": _read("labrastro_server/interfaces/http/remote/protocol/registry.py"),
+        "chat_protocol": _read("labrastro_server/interfaces/http/remote/protocol/chat.py"),
+        "protocol_init": _read("labrastro_server/interfaces/http/remote/protocol/__init__.py"),
+        "chat_routes": _read("labrastro_server/interfaces/http/remote/routes/chat.py"),
+        "remote_service": _read("labrastro_server/interfaces/http/remote/service.py"),
+        "remote_relay": _read("reuleauxcoder/interfaces/entrypoint/remote_relay.py"),
+        "agent_loop": _read("reuleauxcoder/domain/agent/loop.py"),
+    }
+
+    guidance = "follow" + "_up"
+    dashed_guidance = "follow" + "-up"
+    forbidden = [
+        "/remote/session-runs/" + dashed_guidance,
+        "/remote/session-runs/" + dashed_guidance + "/cancel",
+        "session_run." + guidance,
+        "session_run." + guidance + "_cancel",
+        "SessionRun" + "FollowUpRequest",
+        "SessionRun" + "FollowUpCancelRequest",
+        "SessionRun" + "FollowUpResponse",
+        "session_run_" + guidance + "_",
+        "submit_" + guidance,
+        "queue_" + guidance,
+        "cancel_" + guidance,
+        "consume_" + "follow" + "_ups",
+        "_inject_pending_" + "follow" + "_ups",
+    ]
+    offenders = [
+        f"{name}: {pattern}"
+        for name, source in scanned.items()
+        for pattern in forbidden
+        if pattern in source
+    ]
+
+    assert offenders == []
+
+
+def test_session_run_continue_and_agent_run_protocol_contract_are_required() -> None:
+    scanned = {
+        "registry": _read("labrastro_server/interfaces/http/remote/protocol/registry.py"),
+        "protocol_init": _read("labrastro_server/interfaces/http/remote/protocol/__init__.py"),
+        "agent_runs_protocol": (
+            _read("labrastro_server/interfaces/http/remote/protocol/agent_runs.py")
+            if (REPO_ROOT / "labrastro_server/interfaces/http/remote/protocol/agent_runs.py").exists()
+            else ""
+        ),
+        "contracts": _read("labrastro_server/interfaces/http/remote/protocol/contracts.json"),
+    }
+
+    required = [
+        ("registry", "session_run.continue"),
+        ("registry", "/remote/session-runs/continue"),
+        ("registry", "SessionRunContinueRequest"),
+        ("registry", "SessionRunContinueResponse"),
+        ("protocol_init", "SessionRunContinueRequest"),
+        ("protocol_init", "SessionRunContinueResponse"),
+        ("agent_runs_protocol", "AgentRunActivationHeartbeatRequest"),
+        ("agent_runs_protocol", "AgentRunActivationHeartbeatResponse"),
+        ("agent_runs_protocol", "AgentRunSteerRequest"),
+        ("agent_runs_protocol", "AgentRunSteerResponse"),
+        ("contracts", '"name": "session_run.continue"'),
+    ]
+    missing = [
+        f"{name}: {pattern}"
+        for name, pattern in required
+        if pattern not in scanned[name]
+    ]
+
+    assert missing == []
+
+
+def test_public_remote_interfaces_do_not_accept_camel_case_aliases() -> None:
+    scanned = {
+        "chat_protocol": _read("labrastro_server/interfaces/http/remote/protocol/chat.py"),
+        "admin_routes": _read("labrastro_server/interfaces/http/remote/routes/admin.py"),
+        "http_protocol_tests": _read("tests/labrastro_server/http/test_protocol.py"),
+    }
+
+    forbidden = [
+        "client" + "RequestId",
+        "session" + "Id",
+    ]
+    offenders = [
+        f"{name}: {pattern}"
+        for name, source in scanned.items()
+        for pattern in forbidden
+        if pattern in source
+    ]
+
+    assert offenders == []
+
+
+def test_capability_package_ingest_has_single_public_start_route() -> None:
+    scanned = {
+        "admin_routes": _read("labrastro_server/interfaces/http/remote/routes/admin.py"),
+        "remote_service_tests": _read("tests/labrastro_server/http/test_remote_service.py"),
+        "backend_runtime_docs": _read("docs/agent-context/backend-runtime-map.md"),
+    }
+
+    required = [
+        ("admin_routes", "/remote/admin/capability-packages/ingest/session/start"),
+    ]
+    forbidden = [
+        "/remote/admin/capability-packages/ingest/start",
+        "/remote/admin/capability-packages/ingest/status",
+    ]
+    missing = [
+        f"{name}: {pattern}"
+        for name, pattern in required
+        if pattern not in scanned[name]
+    ]
+    offenders = [
+        f"{name}: {pattern}"
+        for name, source in scanned.items()
+        for pattern in forbidden
+        if pattern in source
+    ]
+
+    assert missing == []
+    assert offenders == []
+
+
+def test_session_run_routes_do_not_drive_direct_prompt_execution() -> None:
+    scanned = {
+        "chat_routes": _read("labrastro_server/interfaces/http/remote/routes/chat.py"),
+        "remote_service": _read("labrastro_server/interfaces/http/remote/service.py"),
+        "remote_relay": _read("reuleauxcoder/interfaces/entrypoint/remote_relay.py"),
+        "remote_service_tests": _read("tests/labrastro_server/http/test_remote_service.py"),
+    }
+
+    forbidden = [
+        "session_run_" + "events_handler",
+        "_Remote" + "SessionRun",
+        "_stream_" + "session_run",
+        "set_session_run_" + "events_handler",
+    ]
+    offenders = [
+        f"{name}: {pattern}"
+        for name, source in scanned.items()
+        for pattern in forbidden
+        if pattern in source
+    ]
+
+    assert offenders == []

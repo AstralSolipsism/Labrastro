@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import labrastro_server.interfaces.http.remote.protocol as remote_protocol
 from labrastro_server.interfaces.http.remote.protocol import (
     CleanupRequest,
     CleanupResult,
@@ -15,6 +16,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     SessionRunStartRequest,
     SessionRunStartResponse,
+    SessionRunBranchSelectRequest,
     SessionRunStatusRequest,
     SessionRunStatusResponse,
     SessionRunEventsRequest,
@@ -83,6 +85,16 @@ class TestRelayEnvelope:
 
 
 class TestRemoteHTTPContract:
+    @staticmethod
+    def _is_runtime_convergence_endpoint(name: str) -> bool:
+        return (
+            name.startswith("session_run.")
+            or name.startswith("agent_runs.")
+            or name.startswith("agent_run_activations.")
+            or name.startswith("admin.agent_runs.")
+            or name == "admin.capability_packages.ingest_session_start"
+        )
+
     def test_endpoint_registry_is_serializable_and_unique(self) -> None:
         registry = endpoint_registry()
 
@@ -122,6 +134,49 @@ class TestRemoteHTTPContract:
                 assert isinstance(response["details"], dict)
                 assert isinstance(response["request_id"], str)
 
+    def test_runtime_convergence_endpoints_have_contract_fixtures(self) -> None:
+        fixture_names = {
+            fixture["name"]
+            for fixture in _contract_fixtures()["fixtures"]
+        }
+        missing = [
+            endpoint.name
+            for endpoint in REMOTE_ENDPOINTS
+            if self._is_runtime_convergence_endpoint(endpoint.name)
+            and endpoint.name not in fixture_names
+        ]
+
+        assert missing == []
+
+    def test_runtime_convergence_protocol_shapes_are_exported_models(self) -> None:
+        exported = set(remote_protocol.__all__)
+        missing = []
+        for endpoint in REMOTE_ENDPOINTS:
+            if not self._is_runtime_convergence_endpoint(endpoint.name):
+                continue
+            if endpoint.request_model != "none" and endpoint.request_model not in exported:
+                missing.append(f"{endpoint.name}: request {endpoint.request_model}")
+            if endpoint.response_shape != "none" and endpoint.response_shape not in exported:
+                missing.append(f"{endpoint.name}: response {endpoint.response_shape}")
+
+        assert missing == []
+
+    def test_runtime_convergence_fixtures_roundtrip_protocol_models(self) -> None:
+        fixtures = {
+            fixture["name"]: fixture
+            for fixture in _contract_fixtures()["fixtures"]
+        }
+        for endpoint in REMOTE_ENDPOINTS:
+            if not self._is_runtime_convergence_endpoint(endpoint.name):
+                continue
+            fixture = fixtures[endpoint.name]
+            if endpoint.request_model != "none":
+                request_model = getattr(remote_protocol, endpoint.request_model)
+                request_model.from_dict(fixture["request"])
+            if endpoint.response_shape != "none":
+                response_model = getattr(remote_protocol, endpoint.response_shape)
+                response_model.from_dict(fixture["response"])
+
     def test_contract_fixtures_roundtrip_protocol_models(self) -> None:
         fixtures = {
             fixture["name"]: fixture
@@ -143,6 +198,8 @@ class TestRemoteHTTPContract:
         SessionRunEventsBatch.from_dict(fixtures["session_run.events"]["response"])
         SessionRunStatusRequest.from_dict(fixtures["session_run.status"]["request"])
         SessionRunStatusResponse.from_dict(fixtures["session_run.status"]["response"])
+        SessionRunBranchSelectRequest.from_dict(fixtures["session_run.branch_select"]["request"])
+        SessionRunStatusResponse.from_dict(fixtures["session_run.branch_select"]["response"])
         EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
         EnvironmentManifestResponse.from_dict(fixtures["environment.manifest"]["response"])
 
@@ -158,8 +215,17 @@ class TestRemoteHTTPContract:
         )
         assert registry["session_run.events"]["path"] == "/remote/session-runs/events"
         assert registry["session_run.events"]["response_shape"] == "SessionRunEventsBatch"
+        assert registry["session_run.branch_select"]["path"] == "/remote/session-runs/branches/select"
+        assert registry["session_run.branch_select"]["request_model"] == "SessionRunBranchSelectRequest"
         assert registry["chat.command_dispatch"]["path"] == "/remote/chat/command"
         assert registry["chat.command_dispatch"]["request_model"] == "ChatCommandDispatchRequest"
+        assert registry["agent_runs.steer"]["path"] == (
+            "/remote/agent-runs/{agent_run_id}/steer"
+        )
+        assert registry["agent_runs.steer"]["request_model"] == (
+            "AgentRunSteerRequest"
+        )
+        assert registry["agent_runs.steer"]["auth"] == "peer_token"
         assert registry["admin.models.delete"]["path"] == "/remote/admin/models/delete"
         assert registry["admin.models.delete"]["request_model"] == "ModelProfileDeleteRequest"
         assert registry["admin.models.delete"]["auth"] == "bearer"
@@ -330,8 +396,8 @@ class TestChatCommandDispatchProtocol:
                 "peer_token": "pt_1",
                 "text": " /debug on ",
                 "command_id": "system.debug",
-                "sessionId": "session-1",
-                "clientRequestId": "req-1",
+                "session_hint": "session-1",
+                "client_request_id": "req-1",
                 "mentions": [{"kind": "file", "path": "README.md"}],
             }
         )
@@ -394,6 +460,21 @@ class TestApprovalReplyProtocol:
 
 
 class TestSessionRunStatusProtocol:
+    def test_branch_select_request_roundtrip_preserves_branch_binding(self) -> None:
+        req = SessionRunBranchSelectRequest(
+            peer_token="pt_1",
+            session_run_id="run-1",
+            branch_binding_id="branch-2",
+            cursor=11,
+        )
+        restored = SessionRunBranchSelectRequest.from_dict(req.to_dict())
+
+        assert restored.peer_token == "pt_1"
+        assert restored.session_run_id == "run-1"
+        assert restored.branch_binding_id == "branch-2"
+        assert restored.cursor == 11
+        assert "branchBindingId" not in restored.to_dict()
+
     def test_roundtrip_preserves_recovery_diagnostics(self) -> None:
         req = SessionRunStatusRequest(peer_token="pt_1", session_run_id="run-1", cursor=7)
         restored_req = SessionRunStatusRequest.from_dict(req.to_dict())
