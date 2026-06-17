@@ -835,19 +835,12 @@ def test_agent_loop_stores_lifecycle_transformed_tool_call_in_history() -> None:
     assert stored_tool_call["function"]["arguments"] == '{"path": "after.txt"}'
 
 
-def test_agent_loop_injects_consumed_follow_up_before_next_llm_call() -> None:
+def test_agent_loop_has_no_legacy_guidance_injection_hook() -> None:
     agent = _AgentStub()
-    agent.consume_follow_ups = lambda: [
-        SimpleNamespace(followup_id="follow-1", text="prefer the shorter path")
-    ]
     loop = AgentLoop(agent, prompt_fn=system_prompt, shell_name="bash")
 
-    loop._inject_pending_follow_ups()
-    messages = loop._full_messages()
-
-    assert messages[-2]["role"] == "user"
-    assert "<conversation_guidance>" in messages[-2]["content"]
-    assert "prefer the shorter path" in messages[-2]["content"]
+    assert not hasattr(agent, "consume_" + "follow" + "_ups")
+    assert not hasattr(loop, "_inject_pending_" + "follow" + "_ups")
 
 
 def test_system_prompt_includes_taskflow_only_when_workflow_is_active() -> None:

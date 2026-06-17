@@ -465,25 +465,6 @@ class AgentLoop:
             "hosted_tool_count": len(plan.hosted),
         }
 
-    def _inject_pending_follow_ups(self) -> None:
-        consume = getattr(self.agent, "consume_follow_ups", None)
-        if not callable(consume):
-            return
-        follow_ups = list(consume())
-        if not follow_ups:
-            return
-        lines = [
-            "<conversation_guidance>",
-            "The user sent the following follow-up while this response was in progress.",
-            "Treat it as updated guidance for the current task and acknowledge it in the next response when useful.",
-        ]
-        for index, item in enumerate(follow_ups, start=1):
-            text = str(getattr(item, "text", "") or "").strip()
-            if text:
-                lines.append(f"{index}. {text}")
-        lines.append("</conversation_guidance>")
-        self.agent.state.messages.append({"role": "user", "content": "\n".join(lines)})
-
     def _tool_source(self, tool_name: str) -> str | None:
         tool = self.agent.get_tool(tool_name)
         return getattr(tool, "tool_source", None) if tool is not None else None
@@ -699,7 +680,6 @@ class AgentLoop:
 
             streamed_output = False
             streamed_reasoning = False
-            self._inject_pending_follow_ups()
             patch_decoders: dict[str, PatchArgumentStreamDecoder] = {}
 
             def _on_token(token: str) -> None:
@@ -897,7 +877,6 @@ class AgentLoop:
             "Briefly summarize the current findings/status, list any blockers or incomplete work, "
             "and end the task."
         )
-        self._inject_pending_follow_ups()
         self.agent.state.messages.append({"role": "user", "content": summary_prompt})
         summary_streamed = False
         summary_reasoning_streamed = False

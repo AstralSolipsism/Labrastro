@@ -145,12 +145,6 @@ _PERMISSION_LIFECYCLE_STATIC_POLICY_PREFIXES = (
 
 
 @dataclass
-class FollowUpMessage:
-    followup_id: str
-    text: str
-
-
-@dataclass
 class TerminalLifecycleResolution:
     user_message: str = ""
     diagnostics: list[object] = field(default_factory=list)
@@ -214,9 +208,6 @@ class Agent:
         self.state = AgentState()
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._follow_up_lock = threading.Lock()
-        self._pending_follow_ups: list[FollowUpMessage] = []
-        self._follow_up_consumed_handler: Callable[[FollowUpMessage], None] | None = None
 
         # Context manager
         context_cfg = getattr(config, "context", None)
@@ -312,54 +303,6 @@ class Agent:
     def stop_requested(self) -> bool:
         """Return True when cooperative stop has been requested."""
         return self._stop_event.is_set()
-
-    def queue_follow_up(self, followup_id: str, text: str) -> bool:
-        """Queue a user follow-up for the next safe LLM boundary."""
-        message_text = text.strip()
-        ticket_id = followup_id.strip()
-        if not ticket_id or not message_text:
-            return False
-        with self._follow_up_lock:
-            if any(item.followup_id == ticket_id for item in self._pending_follow_ups):
-                return False
-            self._pending_follow_ups.append(
-                FollowUpMessage(followup_id=ticket_id, text=message_text)
-            )
-            return True
-
-    def cancel_follow_up(self, followup_id: str) -> bool:
-        """Remove a queued follow-up that has not reached an LLM boundary."""
-        ticket_id = followup_id.strip()
-        if not ticket_id:
-            return False
-        with self._follow_up_lock:
-            before = len(self._pending_follow_ups)
-            self._pending_follow_ups = [
-                item for item in self._pending_follow_ups if item.followup_id != ticket_id
-            ]
-            return len(self._pending_follow_ups) != before
-
-    def consume_follow_ups(self) -> list[FollowUpMessage]:
-        """Return and clear queued follow-ups in arrival order."""
-        with self._follow_up_lock:
-            if not self._pending_follow_ups:
-                return []
-            items = list(self._pending_follow_ups)
-            self._pending_follow_ups = []
-        handler = self._follow_up_consumed_handler
-        if handler is not None:
-            for item in items:
-                try:
-                    handler(item)
-                except Exception:
-                    pass
-        return items
-
-    def set_follow_up_consumed_handler(
-        self,
-        handler: Callable[[FollowUpMessage], None] | None,
-    ) -> None:
-        self._follow_up_consumed_handler = handler
 
     def get_active_mode_config(self) -> ModeConfig | None:
         """Return active mode config if mode is enabled."""
