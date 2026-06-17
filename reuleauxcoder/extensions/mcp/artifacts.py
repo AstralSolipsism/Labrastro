@@ -516,6 +516,8 @@ class MCPArtifactManager:
                 cwd=str(cwd) if cwd is not None else None,
                 check=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )

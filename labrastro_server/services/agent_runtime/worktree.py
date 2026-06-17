@@ -292,6 +292,8 @@ class WorktreeManager:
             capture_output=True,
             check=False,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
     def _git(self, repo: Path, *args: str) -> str:

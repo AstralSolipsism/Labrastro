@@ -1132,6 +1132,8 @@ class CommandLifecycleHookRuntimeAdapter:
                 shell=True,
                 cwd=cwd,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=max(1, timeout),
             )

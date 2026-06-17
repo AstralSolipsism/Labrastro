@@ -111,6 +111,8 @@ class ShellTool(Tool):
                         shell_cmd + [command],
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         timeout=timeout,
                         cwd=cwd,
                     )
@@ -120,6 +122,8 @@ class ShellTool(Tool):
                         shell=True,
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         timeout=timeout,
                         cwd=cwd,
                     )
@@ -162,6 +166,8 @@ class ShellTool(Tool):
             shell_cmd + [normalized],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=cwd,
         )
