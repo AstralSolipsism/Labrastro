@@ -24,13 +24,53 @@ func (b SubprocessBackend) Execute(ctx context.Context, req RunRequest, opts Run
 	if err != nil {
 		return RunResult{TaskID: req.TaskID, Status: "failed", Error: err.Error()}, err
 	}
-	if inv.Cleanup != nil {
-		defer inv.Cleanup()
-	}
 	if inv.Transport == "jsonrpc_stdio" {
+		if inv.Cleanup != nil {
+			defer inv.Cleanup()
+		}
 		return executeCodexAppServer(ctx, req, opts, inv)
 	}
 
+	collector := startSteerBuffer(ctx, opts.Steers)
+	defer collector.stop()
+	combinedEvents := []Event{}
+	combinedOutput := strings.Builder{}
+	combinedUsage := map[string]TokenUsage{}
+	for {
+		result, runErr := executePlainSubprocess(ctx, req, opts, inv)
+		if inv.Cleanup != nil {
+			inv.Cleanup()
+		}
+		combinedEvents = append(combinedEvents, result.Events...)
+		appendCombinedOutput(&combinedOutput, result.Output)
+		mergeCombinedUsage(combinedUsage, result.Usage)
+		pendingSteers := collector.drain()
+		if runErr != nil || result.Status != "completed" || len(pendingSteers) == 0 {
+			return combinedSubprocessResult(result, combinedEvents, combinedOutput.String(), combinedUsage), runErr
+		}
+		nextPrompt := promptFromSteers(pendingSteers)
+		if strings.TrimSpace(nextPrompt) == "" {
+			return combinedSubprocessResult(result, combinedEvents, combinedOutput.String(), combinedUsage), runErr
+		}
+		if result.ExecutorSessionID != "" {
+			req.ExecutorSessionID = result.ExecutorSessionID
+		}
+		req.Prompt = nextPrompt
+		inv, err = BuildInvocation(req, opts)
+		if err != nil {
+			return RunResult{
+				TaskID: req.TaskID,
+				Status: "failed",
+				Error:  err.Error(),
+				Events: combinedEvents,
+				Output: combinedOutput.String(),
+				Usage:  nonEmptyUsage(combinedUsage),
+			}, err
+		}
+	}
+}
+
+func executePlainSubprocess(ctx context.Context, req RunRequest, opts RunOptions, inv Invocation) (RunResult, error) {
 	runCtx := ctx
 	cancel := func() {}
 	if opts.Timeout > 0 {
@@ -140,6 +180,43 @@ func (b SubprocessBackend) Execute(ctx context.Context, req RunRequest, opts Run
 		Usage:             parser.Usage(),
 		Events:            events,
 	}, nil
+}
+
+func appendCombinedOutput(builder *strings.Builder, output string) {
+	if strings.TrimSpace(output) == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteString("\n")
+	}
+	builder.WriteString(output)
+}
+
+func mergeCombinedUsage(target map[string]TokenUsage, usage map[string]TokenUsage) {
+	for model, item := range usage {
+		current := target[model]
+		current.InputTokens += item.InputTokens
+		current.OutputTokens += item.OutputTokens
+		current.CacheReadTokens += item.CacheReadTokens
+		current.CacheWriteTokens += item.CacheWriteTokens
+		target[model] = current
+	}
+}
+
+func combinedSubprocessResult(result RunResult, events []Event, output string, usage map[string]TokenUsage) RunResult {
+	result.Events = events
+	if strings.TrimSpace(output) != "" {
+		result.Output = output
+	}
+	result.Usage = nonEmptyUsage(usage)
+	return result
+}
+
+func nonEmptyUsage(usage map[string]TokenUsage) map[string]TokenUsage {
+	if len(usage) == 0 {
+		return nil
+	}
+	return usage
 }
 
 func mergeEnv(base []string, extra map[string]string) []string {

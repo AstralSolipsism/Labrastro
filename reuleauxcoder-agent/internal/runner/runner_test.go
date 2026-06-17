@@ -308,6 +308,189 @@ func TestRunPollLoopExitsOnInvalidPeerToken(t *testing.T) {
 	}
 }
 
+func TestRuntimeHeartbeatLoopAcknowledgesActivationSteers(t *testing.T) {
+	restore := overrideRuntimeHeartbeatIntervalForTest(t, 10*time.Millisecond)
+	defer restore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := make(chan protocol.AgentRunActivationHeartbeatRequest, 4)
+	var heartbeatCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/remote/agent-run-activations/heartbeat" {
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		var body protocol.AgentRunActivationHeartbeatRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		requests <- body
+		w.Header().Set("Content-Type", "application/json")
+		if heartbeatCount.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationHeartbeatResponse{
+				OK:              true,
+				CancelRequested: false,
+				ActivationSteers: []protocol.ActivationSteer{
+					{
+						ID:           "steer-1",
+						ActivationID: "run-1:activation:1",
+						Source:       "user",
+						Payload: map[string]any{
+							"items": []any{map[string]any{"type": "text", "text": "add context"}},
+						},
+						Status: "delivering",
+					},
+				},
+			})
+			return
+		}
+		cancel()
+		_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationHeartbeatResponse{
+			OK:              true,
+			CancelRequested: false,
+		})
+	}))
+	defer server.Close()
+
+	runner := &Runner{
+		client: client.New(server.URL),
+		active: map[string]context.CancelFunc{},
+	}
+	deliveredSteers := make(chan protocol.ActivationSteer, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runner.runtimeHeartbeatLoop(
+			ctx,
+			"peer-token",
+			"worker-1",
+			"claim-1",
+			"run-1:activation:1",
+			"run-1",
+			cancel,
+			func(ctx context.Context, steer protocol.ActivationSteer) error {
+				select {
+				case deliveredSteers <- steer:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runtime heartbeat loop did not stop")
+	}
+
+	first := <-requests
+	second := <-requests
+	if len(first.DeliveredSteerIDs) != 0 {
+		t.Fatalf("first heartbeat delivered ids = %#v", first.DeliveredSteerIDs)
+	}
+	if len(second.DeliveredSteerIDs) != 1 || second.DeliveredSteerIDs[0] != "steer-1" {
+		t.Fatalf("second heartbeat delivered ids = %#v", second.DeliveredSteerIDs)
+	}
+	delivered := <-deliveredSteers
+	if delivered.ID != "steer-1" || delivered.Payload["items"] == nil {
+		t.Fatalf("delivered steer = %#v", delivered)
+	}
+	if second.PeerToken != "peer-token" ||
+		second.RequestID != "claim-1" ||
+		second.ActivationID != "run-1:activation:1" ||
+		second.TaskID != "run-1" ||
+		second.WorkerID != "worker-1" {
+		t.Fatalf("heartbeat identity drifted: %#v", second)
+	}
+}
+
+func TestRuntimeHeartbeatLoopDoesNotAcknowledgeUndeliveredActivationSteers(t *testing.T) {
+	restore := overrideRuntimeHeartbeatIntervalForTest(t, 10*time.Millisecond)
+	defer restore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := make(chan protocol.AgentRunActivationHeartbeatRequest, 4)
+	var heartbeatCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/remote/agent-run-activations/heartbeat" {
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		var body protocol.AgentRunActivationHeartbeatRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		requests <- body
+		w.Header().Set("Content-Type", "application/json")
+		if heartbeatCount.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationHeartbeatResponse{
+				OK: true,
+				ActivationSteers: []protocol.ActivationSteer{
+					{
+						ID:           "steer-1",
+						ActivationID: "run-1:activation:1",
+						Source:       "user",
+						Payload: map[string]any{
+							"items": []any{map[string]any{"type": "text", "text": "add context"}},
+						},
+						Status: "delivering",
+					},
+				},
+			})
+			return
+		}
+		cancel()
+		_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationHeartbeatResponse{OK: true})
+	}))
+	defer server.Close()
+
+	runner := &Runner{
+		client: client.New(server.URL),
+		active: map[string]context.CancelFunc{},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runner.runtimeHeartbeatLoop(
+			ctx,
+			"peer-token",
+			"worker-1",
+			"claim-1",
+			"run-1:activation:1",
+			"run-1",
+			cancel,
+			func(context.Context, protocol.ActivationSteer) error {
+				return errors.New("executor not ready")
+			},
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runtime heartbeat loop did not stop")
+	}
+
+	first := <-requests
+	second := <-requests
+	if len(first.DeliveredSteerIDs) != 0 {
+		t.Fatalf("first heartbeat delivered ids = %#v", first.DeliveredSteerIDs)
+	}
+	if len(second.DeliveredSteerIDs) != 0 {
+		t.Fatalf("second heartbeat delivered ids = %#v", second.DeliveredSteerIDs)
+	}
+}
+
 func TestAgentRunLoopInjectsServerOriginBridgeOptions(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -888,6 +1071,18 @@ func overridePollTimingForTest(
 		pollRequestTimeout = oldRequestTimeout
 		pollRetryMinDelay = oldMinDelay
 		pollRetryMaxDelay = oldMaxDelay
+	}
+}
+
+func overrideRuntimeHeartbeatIntervalForTest(
+	t *testing.T,
+	interval time.Duration,
+) func() {
+	t.Helper()
+	oldInterval := runtimeHeartbeatInterval
+	runtimeHeartbeatInterval = interval
+	return func() {
+		runtimeHeartbeatInterval = oldInterval
 	}
 }
 

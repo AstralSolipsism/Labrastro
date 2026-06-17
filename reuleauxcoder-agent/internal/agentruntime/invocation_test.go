@@ -34,6 +34,24 @@ func TestMain(m *testing.M) {
 		fmt.Println(`{"type":"result","status":"failed","error":"real structured failure","executor_session_id":"labrastro-agent-run-failed"}`)
 		os.Exit(1)
 	}
+	if capturePath := os.Getenv("AGENTRUNTIME_HELPER_CAPTURE_ARGS"); capturePath != "" {
+		if delay := os.Getenv("AGENTRUNTIME_HELPER_DELAY_MS"); delay != "" {
+			var ms int
+			if _, err := fmt.Sscanf(delay, "%d", &ms); err == nil && ms > 0 {
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			}
+		}
+		f, err := os.OpenFile(capturePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		_, _ = fmt.Fprintln(f, strings.Join(os.Args[1:], "\t"))
+		_ = f.Close()
+		fmt.Println(`{"type":"status","status":"session_pinned","executor_session_id":"labrastro-agent-run-steer"}`)
+		fmt.Println(`{"type":"text","text":"turn output"}`)
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
 }
 
@@ -500,6 +518,83 @@ func TestSubprocessBackendStreamsEventsToSink(t *testing.T) {
 	}
 }
 
+func TestSubprocessBackendConsumesActivationSteersAtCommandBoundary(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturePath := filepath.Join(t.TempDir(), "args.txt")
+	steers := make(chan Steer)
+	type executeResult struct {
+		result RunResult
+		err    error
+	}
+	done := make(chan executeResult, 1)
+	go func() {
+		result, runErr := SubprocessBackend{}.Execute(
+			context.Background(),
+			RunRequest{
+				TaskID:            "task-steer",
+				Executor:          "reuleauxcoder",
+				Prompt:            "initial task",
+				ExecutorSessionID: "labrastro-agent-run-steer",
+			},
+			RunOptions{
+				Command: executable,
+				Env: map[string]string{
+					"AGENTRUNTIME_HELPER_CAPTURE_ARGS": capturePath,
+					"AGENTRUNTIME_HELPER_DELAY_MS":     "100",
+				},
+				Steers: steers,
+			},
+		)
+		done <- executeResult{result: result, err: runErr}
+	}()
+
+	select {
+	case steers <- Steer{
+		ID:           "steer-1",
+		ActivationID: "task-steer:activation:1",
+		Source:       "user",
+		Payload: map[string]any{
+			"items": []any{map[string]any{"type": "text", "text": "add this context"}},
+		},
+	}:
+	case <-time.After(time.Second):
+		t.Fatal("subprocess backend did not accept activation steer")
+	}
+
+	var executed executeResult
+	select {
+	case executed = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("subprocess backend did not finish")
+	}
+	if executed.err != nil {
+		t.Fatalf("Execute error: %v", executed.err)
+	}
+	if executed.result.Status != "completed" {
+		t.Fatalf("result = %#v", executed.result)
+	}
+	rawArgs, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(rawArgs)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("captured invocations = %q", rawArgs)
+	}
+	if !strings.Contains(lines[0], "\t--prompt\tinitial task\t") {
+		t.Fatalf("first invocation args = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "\t--prompt\tadd this context\t") {
+		t.Fatalf("second invocation did not use steer prompt: %q", lines[1])
+	}
+	if !strings.Contains(lines[1], "\t--session\tlabrastro-agent-run-steer") {
+		t.Fatalf("second invocation did not preserve executor session: %q", lines[1])
+	}
+}
+
 func TestSubprocessBackendPrefersStructuredFailureOnNonZeroExit(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -811,5 +906,54 @@ func TestCodexAppServerAutoApprovesServerRequestsAndCapturesUsage(t *testing.T) 
 	usage := rpc.snapshotUsage("gpt-test")
 	if usage["gpt-test"].InputTokens != 10 || usage["gpt-test"].OutputTokens != 4 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestCodexAppServerQueuesActivationSteersForNextTurnInput(t *testing.T) {
+	rpc := &codexRPC{
+		done:     make(chan struct{}),
+		activity: make(chan struct{}, 8),
+	}
+	steers := make(chan Steer)
+	readerDone := make(chan struct{})
+	pending := []Steer{}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitCodexTurn(context.Background(), rpc, time.Second, steers, &pending, readerDone)
+	}()
+
+	steers <- Steer{
+		ID:           "steer-1",
+		ActivationID: "run-1:activation:1",
+		Source:       "user",
+		Payload: map[string]any{
+			"items": []any{
+				map[string]any{"type": "text", "text": "add this context"},
+				map[string]any{"type": "image_ref", "uri": "asset://image-1"},
+			},
+		},
+	}
+	rpc.markDone()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("waitCodexTurn returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitCodexTurn did not stop after turn completion")
+	}
+	if len(pending) != 1 || pending[0].ID != "steer-1" {
+		t.Fatalf("pending steers = %#v", pending)
+	}
+	input := codexInputFromSteers(pending)
+	if len(input) != 2 {
+		t.Fatalf("next turn input = %#v", input)
+	}
+	if input[0]["type"] != "text" || input[0]["text"] != "add this context" {
+		t.Fatalf("text steer item not preserved: %#v", input[0])
+	}
+	if input[1]["type"] != "image_ref" || input[1]["uri"] != "asset://image-1" {
+		t.Fatalf("structured steer item not preserved: %#v", input[1])
 	}
 }

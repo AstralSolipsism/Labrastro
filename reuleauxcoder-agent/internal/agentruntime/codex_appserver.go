@@ -1,4 +1,4 @@
-﻿package agentruntime
+package agentruntime
 
 import (
 	"bufio"
@@ -100,47 +100,32 @@ func executeCodexAppServer(ctx context.Context, req RunRequest, opts RunOptions,
 		return codexFailed(req.TaskID, rpc, err.Error(), stderr.Tail()), err
 	}
 	rpc.threadID = threadID
-	if _, err := rpc.request(runCtx, "turn/start", map[string]any{
-		"threadId": threadID,
-		"input": []map[string]any{
-			{"type": "text", "text": req.Prompt},
-		},
-	}); err != nil {
-		return codexFailed(req.TaskID, rpc, "codex turn/start failed: "+err.Error(), stderr.Tail()), err
-	}
-
 	semanticIdle := opts.SemanticIdleTime
 	if semanticIdle <= 0 {
 		semanticIdle = defaultCodexSemanticIdleTime
 	}
-	semanticTimer := time.NewTimer(semanticIdle)
-	defer semanticTimer.Stop()
 
-	waiting := true
-	for waiting {
-		select {
-		case <-rpc.done:
-			waiting = false
-		case <-rpc.activity:
-			resetTimer(semanticTimer, semanticIdle)
-		case <-semanticTimer.C:
-			err := fmt.Errorf("codex semantic inactivity timeout after %s", semanticIdle)
-			return codexFailed(req.TaskID, rpc, err.Error(), stderr.Tail()), err
-		case <-runCtx.Done():
-			err := runCtx.Err()
+	pendingSteers := []Steer{}
+	turnInput := []map[string]any{{"type": "text", "text": req.Prompt}}
+	for len(turnInput) > 0 {
+		if err := rpc.startTurn(runCtx, threadID, turnInput); err != nil {
+			return codexFailed(req.TaskID, rpc, "codex turn/start failed: "+err.Error(), stderr.Tail()), err
+		}
+		if err := waitCodexTurn(runCtx, rpc, semanticIdle, opts.Steers, &pendingSteers, readerDone); err != nil {
 			if err == context.Canceled || err == context.DeadlineExceeded {
 				return codexStopped(req.TaskID, rpc, err, time.Since(start).Milliseconds())
 			}
 			return codexFailed(req.TaskID, rpc, err.Error(), stderr.Tail()), err
-		case <-readerDone:
-			if rpc.turnErr == "" {
-				rpc.turnErr = "codex app-server exited before turn completed"
-			}
-			waiting = false
 		}
-	}
-	if rpc.turnErr != "" {
-		return codexFailed(req.TaskID, rpc, rpc.turnErr, stderr.Tail()), errors.New(rpc.turnErr)
+		if rpc.turnErr != "" {
+			return codexFailed(req.TaskID, rpc, rpc.turnErr, stderr.Tail()), errors.New(rpc.turnErr)
+		}
+		drainCodexSteers(opts.Steers, &pendingSteers)
+		if len(pendingSteers) == 0 {
+			break
+		}
+		turnInput = codexInputFromSteers(pendingSteers)
+		pendingSteers = nil
 	}
 	rpc.appendEvent(Event{
 		Type: EventStatus,
@@ -197,6 +182,85 @@ func (r *codexRPC) startOrResumeThread(ctx context.Context, req RunRequest, opts
 		return "", errors.New("codex thread/start returned no thread id")
 	}
 	return threadID, nil
+}
+
+func (r *codexRPC) startTurn(ctx context.Context, threadID string, input []map[string]any) error {
+	r.resetTurn()
+	_, err := r.request(ctx, "turn/start", map[string]any{
+		"threadId": threadID,
+		"input":    input,
+	})
+	return err
+}
+
+func (r *codexRPC) resetTurn() {
+	r.started = false
+	r.turnErr = ""
+	r.done = make(chan struct{})
+	r.doneOnce = sync.Once{}
+}
+
+func waitCodexTurn(
+	ctx context.Context,
+	rpc *codexRPC,
+	semanticIdle time.Duration,
+	steers <-chan Steer,
+	pendingSteers *[]Steer,
+	readerDone <-chan struct{},
+) error {
+	semanticTimer := time.NewTimer(semanticIdle)
+	defer semanticTimer.Stop()
+	done := rpc.done
+	for {
+		select {
+		case <-done:
+			return nil
+		case steer := <-steers:
+			if strings.TrimSpace(steer.ID) != "" {
+				*pendingSteers = append(*pendingSteers, steer)
+			}
+		case <-rpc.activity:
+			resetTimer(semanticTimer, semanticIdle)
+		case <-semanticTimer.C:
+			return fmt.Errorf("codex semantic inactivity timeout after %s", semanticIdle)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-readerDone:
+			if rpc.turnErr == "" {
+				rpc.turnErr = "codex app-server exited before turn completed"
+			}
+			return nil
+		}
+	}
+}
+
+func drainCodexSteers(steers <-chan Steer, pendingSteers *[]Steer) {
+	for {
+		select {
+		case steer := <-steers:
+			if strings.TrimSpace(steer.ID) != "" {
+				*pendingSteers = append(*pendingSteers, steer)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func codexInputFromSteers(steers []Steer) []map[string]any {
+	input := []map[string]any{}
+	for _, steer := range steers {
+		for _, item := range steerPayloadItems(steer.Payload) {
+			itemType := strings.TrimSpace(fmt.Sprint(item["type"]))
+			if itemType == "" {
+				continue
+			}
+			normalized := cloneAnyMap(item)
+			normalized["type"] = itemType
+			input = append(input, normalized)
+		}
+	}
+	return input
 }
 
 func (r *codexRPC) request(ctx context.Context, method string, params any) (json.RawMessage, error) {

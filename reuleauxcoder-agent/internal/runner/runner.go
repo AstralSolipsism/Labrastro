@@ -28,11 +28,13 @@ import (
 )
 
 var (
-	errExecutableNotFound = errors.New("executable not found")
-	lookPathExecutable    = exec.LookPath
-	pollRequestTimeout    = 30 * time.Second
-	pollRetryMinDelay     = 500 * time.Millisecond
-	pollRetryMaxDelay     = 10 * time.Second
+	errExecutableNotFound       = errors.New("executable not found")
+	lookPathExecutable          = exec.LookPath
+	pollRequestTimeout          = 30 * time.Second
+	pollRetryMinDelay           = 500 * time.Millisecond
+	pollRetryMaxDelay           = 10 * time.Second
+	runtimeHeartbeatInterval    = 2 * time.Second
+	runtimeSteerDeliveryTimeout = time.Second
 )
 
 type Config struct {
@@ -248,7 +250,19 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 		req := runtimeRunRequest(claim.ExecutorRequest)
 		taskCtx, taskCancel := context.WithCancel(ctx)
 		r.registerActiveRequest(claim.RequestID, taskCancel)
-		go r.runtimeHeartbeatLoop(taskCtx, peerToken, workerID, claim.RequestID, claim.ActivationID, req.TaskID, taskCancel)
+		steers := make(chan agentruntime.Steer)
+		go r.runtimeHeartbeatLoop(
+			taskCtx,
+			peerToken,
+			workerID,
+			claim.RequestID,
+			claim.ActivationID,
+			req.TaskID,
+			taskCancel,
+			func(deliveryCtx context.Context, steer protocol.ActivationSteer) error {
+				return deliverActivationSteer(deliveryCtx, steers, steer)
+			},
+		)
 		var result agentruntime.RunResult
 		var runErr error
 		eventsForComplete := []agentruntime.Event{}
@@ -286,6 +300,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 				resolved.Options.AgentRunActivationID = claim.ActivationID
 				resolved.Options.AgentRunWorkerID = workerID
 			}
+			resolved.Options.Steers = steers
 			sendLiveRuntimeEvent("start", agentruntime.Event{
 				Type: agentruntime.EventStatus,
 				Data: map[string]any{
@@ -387,16 +402,37 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 	}
 }
 
-func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, requestID, activationID, taskID string, cancel context.CancelFunc) {
+type activationSteerDeliverer func(context.Context, protocol.ActivationSteer) error
+
+func (r *Runner) runtimeHeartbeatLoop(
+	ctx context.Context,
+	peerToken,
+	workerID,
+	requestID,
+	activationID,
+	taskID string,
+	cancel context.CancelFunc,
+	deliver activationSteerDeliverer,
+) {
+	deliveredSteerIDs := []string{}
+	deliveredSteers := map[string]struct{}{}
+	pendingSteers := []protocol.ActivationSteer{}
+	pendingSteerIDs := map[string]struct{}{}
 	send := func() bool {
+		deliveredSteerIDs = append(
+			deliveredSteerIDs,
+			deliverPendingActivationSteers(ctx, &pendingSteers, deliveredSteers, deliver)...,
+		)
+		pendingSteerIDs = activationSteerIDSet(pendingSteers)
 		heartbeatCtx, cancelHeartbeat := context.WithTimeout(context.Background(), 10*time.Second)
 		resp, err := r.client.AgentRunActivationHeartbeat(heartbeatCtx, protocol.AgentRunActivationHeartbeatRequest{
-			PeerToken:    peerToken,
-			RequestID:    requestID,
-			ActivationID: activationID,
-			TaskID:       taskID,
-			WorkerID:     workerID,
-			LeaseSec:     15,
+			PeerToken:         peerToken,
+			RequestID:         requestID,
+			ActivationID:      activationID,
+			TaskID:            taskID,
+			WorkerID:          workerID,
+			LeaseSec:          15,
+			DeliveredSteerIDs: append([]string(nil), deliveredSteerIDs...),
 		})
 		cancelHeartbeat()
 		if err != nil {
@@ -413,12 +449,32 @@ func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, 
 			cancel()
 			return true
 		}
+		for _, steer := range resp.ActivationSteers {
+			steerID := strings.TrimSpace(steer.ID)
+			if steerID == "" {
+				continue
+			}
+			if _, ok := deliveredSteers[steerID]; ok {
+				continue
+			}
+			if _, ok := pendingSteerIDs[steerID]; ok {
+				continue
+			}
+			pendingSteers = append(pendingSteers, steer)
+			pendingSteerIDs[steerID] = struct{}{}
+		}
+		newDelivered := deliverPendingActivationSteers(ctx, &pendingSteers, deliveredSteers, deliver)
+		pendingSteerIDs = activationSteerIDSet(pendingSteers)
+		for _, steerID := range newDelivered {
+			log.Printf("AgentRun activation steer delivered agent_run_id=%s activation_id=%s steer_id=%s", taskID, activationID, steerID)
+		}
+		deliveredSteerIDs = append(deliveredSteerIDs, newDelivered...)
 		return false
 	}
 	if send() {
 		return
 	}
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(runtimeHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -430,6 +486,77 @@ func (r *Runner) runtimeHeartbeatLoop(ctx context.Context, peerToken, workerID, 
 			}
 		}
 	}
+}
+
+func activationSteerIDSet(steers []protocol.ActivationSteer) map[string]struct{} {
+	result := make(map[string]struct{}, len(steers))
+	for _, steer := range steers {
+		steerID := strings.TrimSpace(steer.ID)
+		if steerID != "" {
+			result[steerID] = struct{}{}
+		}
+	}
+	return result
+}
+
+func deliverPendingActivationSteers(
+	ctx context.Context,
+	pendingSteers *[]protocol.ActivationSteer,
+	deliveredSteers map[string]struct{},
+	deliver activationSteerDeliverer,
+) []string {
+	if deliver == nil || len(*pendingSteers) == 0 {
+		return nil
+	}
+	deliveredIDs := []string{}
+	remaining := make([]protocol.ActivationSteer, 0, len(*pendingSteers))
+	for _, steer := range *pendingSteers {
+		steerID := strings.TrimSpace(steer.ID)
+		if steerID == "" {
+			continue
+		}
+		if _, ok := deliveredSteers[steerID]; ok {
+			continue
+		}
+		deliveryCtx, cancelDelivery := context.WithTimeout(ctx, runtimeSteerDeliveryTimeout)
+		err := deliver(deliveryCtx, steer)
+		cancelDelivery()
+		if err != nil {
+			remaining = append(remaining, steer)
+			continue
+		}
+		deliveredSteers[steerID] = struct{}{}
+		deliveredIDs = append(deliveredIDs, steerID)
+	}
+	*pendingSteers = remaining
+	return deliveredIDs
+}
+
+func deliverActivationSteer(ctx context.Context, steers chan<- agentruntime.Steer, steer protocol.ActivationSteer) error {
+	runtimeSteer := agentruntime.Steer{
+		ID:           strings.TrimSpace(steer.ID),
+		ActivationID: strings.TrimSpace(steer.ActivationID),
+		Source:       strings.TrimSpace(steer.Source),
+		Payload:      cloneProtocolMap(steer.Payload),
+		Metadata:     cloneProtocolMap(steer.Metadata),
+	}
+	select {
+	case steers <- runtimeSteer:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func cloneProtocolMap(value map[string]any) map[string]any {
+	if len(value) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
 }
 
 type blockedRunError struct {

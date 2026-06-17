@@ -126,3 +126,60 @@ func TestPollReturnsStructuredHTTPError(t *testing.T) {
 		t.Fatalf("body = %q, want service unavailable", httpErr.Body)
 	}
 }
+
+func TestAgentRunActivationHeartbeatRoundTripsSteerDelivery(t *testing.T) {
+	var requestBody protocol.AgentRunActivationHeartbeatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/remote/agent-run-activations/heartbeat" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(protocol.AgentRunActivationHeartbeatResponse{
+			OK:              true,
+			CancelRequested: false,
+			ActivationSteers: []protocol.ActivationSteer{
+				{
+					ID:           "steer-1",
+					ActivationID: "run-1:activation:1",
+					Source:       "user",
+					Payload: map[string]any{
+						"items": []any{
+							map[string]any{"type": "text", "text": "add context"},
+						},
+					},
+					Status: "delivering",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	resp, err := New(server.URL).AgentRunActivationHeartbeat(
+		context.Background(),
+		protocol.AgentRunActivationHeartbeatRequest{
+			PeerToken:         "peer-token",
+			RequestID:         "claim-1",
+			ActivationID:      "run-1:activation:1",
+			TaskID:            "run-1",
+			WorkerID:          "worker-1",
+			LeaseSec:          15,
+			DeliveredSteerIDs: []string{"steer-0"},
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("heartbeat returned error: %v", err)
+	}
+	if requestBody.DeliveredSteerIDs[0] != "steer-0" {
+		t.Fatalf("delivered_steer_ids = %#v", requestBody.DeliveredSteerIDs)
+	}
+	if len(resp.ActivationSteers) != 1 || resp.ActivationSteers[0].ID != "steer-1" {
+		t.Fatalf("activation steers = %#v", resp.ActivationSteers)
+	}
+	if resp.ActivationSteers[0].Payload["items"] == nil {
+		t.Fatalf("steer payload was not decoded: %#v", resp.ActivationSteers[0])
+	}
+}

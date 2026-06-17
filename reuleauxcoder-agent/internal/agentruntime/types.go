@@ -72,6 +72,15 @@ type RunOptions struct {
 	AgentRunRequestID    string
 	AgentRunActivationID string
 	AgentRunWorkerID     string
+	Steers               <-chan Steer
+}
+
+type Steer struct {
+	ID           string
+	ActivationID string
+	Source       string
+	Payload      map[string]any
+	Metadata     map[string]any
 }
 
 type RunResult struct {
