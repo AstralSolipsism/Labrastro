@@ -204,6 +204,47 @@ def upgrade() -> None:
     )
     op.execute(
         """
+        CREATE TABLE IF NOT EXISTS labrastro_session_run_bindings (
+            id TEXT PRIMARY KEY,
+            session_run_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            peer_id TEXT NOT NULL DEFAULT '',
+            branch_binding_id TEXT NOT NULL,
+            agent_run_id TEXT NOT NULL REFERENCES labrastro_agent_runs(id) ON DELETE CASCADE,
+            selected BOOLEAN NOT NULL DEFAULT true,
+            parent_branch_binding_id TEXT NOT NULL DEFAULT '',
+            base_session_item_id TEXT NOT NULL DEFAULT '',
+            source_agent_run_id TEXT NOT NULL DEFAULT '',
+            target_agent_run_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(session_run_id, branch_binding_id)
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_labrastro_session_run_bindings_selected
+            ON labrastro_session_run_bindings(session_run_id)
+            WHERE selected = true AND status = 'active'
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_labrastro_session_run_bindings_peer
+            ON labrastro_session_run_bindings(peer_id, session_run_id, status)
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_labrastro_session_run_bindings_agent_run
+            ON labrastro_session_run_bindings(agent_run_id, status)
+        """
+    )
+    op.execute(
+        """
         CREATE TABLE IF NOT EXISTS labrastro_agent_call_grants (
             user_id TEXT NOT NULL,
             grant_scope TEXT NOT NULL,
@@ -412,6 +453,7 @@ def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS labrastro_agent_call_grants")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_activation_steers")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_feedback")
+    op.execute("DROP TABLE IF EXISTS labrastro_session_run_bindings")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_thread_bindings")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_relations")
     op.execute("DROP TABLE IF EXISTS labrastro_agent_run_activations")

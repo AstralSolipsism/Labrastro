@@ -28,6 +28,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentThreadBinding,
     AgentThreadBindingLifetime,
     AgentThreadBindingStatus,
+    SessionRunBinding,
+    SessionRunBindingStatus,
     AgentRunWaitingReason,
     ArtifactStatus,
     ArtifactType,
@@ -470,6 +472,51 @@ def _parallel_binding_from_row(row: Any) -> AgentThreadBinding:
         ),
         metadata=_dict_from(row["metadata"]),
     )
+
+
+def _session_run_binding_to_dict(binding: SessionRunBinding) -> dict[str, Any]:
+    return {
+        "id": binding.id,
+        "session_run_id": binding.session_run_id,
+        "session_id": binding.session_id,
+        "peer_id": binding.peer_id,
+        "branch_binding_id": binding.branch_binding_id,
+        "agent_run_id": binding.agent_run_id,
+        "selected": binding.selected,
+        "parent_branch_binding_id": binding.parent_branch_binding_id,
+        "base_session_item_id": binding.base_session_item_id,
+        "source_agent_run_id": binding.source_agent_run_id,
+        "target_agent_run_id": binding.target_agent_run_id,
+        "status": binding.status.value,
+        "created_at": binding.created_at,
+        "updated_at": binding.updated_at,
+        "metadata": dict(binding.metadata),
+    }
+
+
+def _session_run_binding_row_to_dict(row: Any) -> dict[str, Any]:
+    row_data = _jsonable_row(row)
+    return {
+        "id": str(row_data.get("id") or ""),
+        "session_run_id": str(row_data.get("session_run_id") or ""),
+        "session_id": str(row_data.get("session_id") or ""),
+        "peer_id": str(row_data.get("peer_id") or ""),
+        "branch_binding_id": str(row_data.get("branch_binding_id") or ""),
+        "agent_run_id": str(row_data.get("agent_run_id") or ""),
+        "selected": bool(row_data.get("selected")),
+        "parent_branch_binding_id": str(row_data.get("parent_branch_binding_id") or ""),
+        "base_session_item_id": str(row_data.get("base_session_item_id") or ""),
+        "source_agent_run_id": str(row_data.get("source_agent_run_id") or ""),
+        "target_agent_run_id": str(row_data.get("target_agent_run_id") or ""),
+        "status": str(row_data.get("status") or SessionRunBindingStatus.ACTIVE.value),
+        "created_at": row_data.get("created_at"),
+        "updated_at": row_data.get("updated_at"),
+        "metadata": _dict_from(row_data.get("metadata")),
+    }
+
+
+def _session_run_binding_from_row(row: Any) -> SessionRunBinding:
+    return SessionRunBinding(**_session_run_binding_row_to_dict(row))
 
 
 def _agent_call_grant_from_row(row: Any) -> AgentCallGrant:
@@ -1113,6 +1160,156 @@ class PostgresAgentRunStore:
                 {"owner_session_run_id": session_run_id},
             )
         return bindings
+
+    def upsert_session_run_binding(self, binding: SessionRunBinding) -> None:
+        with self.engine.begin() as conn:
+            if (
+                binding.selected
+                and binding.status == SessionRunBindingStatus.ACTIVE
+                and binding.session_run_id
+            ):
+                conn.execute(
+                    text(
+                        """
+                        UPDATE labrastro_session_run_bindings
+                        SET selected=false, updated_at=now()
+                        WHERE session_run_id=:session_run_id
+                          AND id<>:id
+                          AND status='active'
+                        """
+                    ),
+                    {
+                        "session_run_id": binding.session_run_id,
+                        "id": binding.id,
+                    },
+                )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO labrastro_session_run_bindings (
+                        id, session_run_id, session_id, peer_id, branch_binding_id,
+                        agent_run_id, selected, parent_branch_binding_id,
+                        base_session_item_id, source_agent_run_id, target_agent_run_id,
+                        status, metadata, created_at, updated_at
+                    ) VALUES (
+                        :id, :session_run_id, :session_id, :peer_id,
+                        :branch_binding_id, :agent_run_id, :selected,
+                        :parent_branch_binding_id, :base_session_item_id,
+                        :source_agent_run_id, :target_agent_run_id,
+                        :status, CAST(:metadata AS JSONB),
+                        COALESCE(CAST(:created_at AS TIMESTAMPTZ), now()), now()
+                    )
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                        session_id=EXCLUDED.session_id,
+                        peer_id=EXCLUDED.peer_id,
+                        branch_binding_id=EXCLUDED.branch_binding_id,
+                        agent_run_id=EXCLUDED.agent_run_id,
+                        selected=EXCLUDED.selected,
+                        parent_branch_binding_id=EXCLUDED.parent_branch_binding_id,
+                        base_session_item_id=EXCLUDED.base_session_item_id,
+                        source_agent_run_id=EXCLUDED.source_agent_run_id,
+                        target_agent_run_id=EXCLUDED.target_agent_run_id,
+                        status=EXCLUDED.status,
+                        metadata=EXCLUDED.metadata,
+                        updated_at=now()
+                    """
+                ),
+                {
+                    "id": binding.id,
+                    "session_run_id": binding.session_run_id,
+                    "session_id": binding.session_id,
+                    "peer_id": binding.peer_id,
+                    "branch_binding_id": binding.branch_binding_id,
+                    "agent_run_id": binding.agent_run_id,
+                    "selected": bool(binding.selected),
+                    "parent_branch_binding_id": binding.parent_branch_binding_id,
+                    "base_session_item_id": binding.base_session_item_id,
+                    "source_agent_run_id": binding.source_agent_run_id,
+                    "target_agent_run_id": binding.target_agent_run_id,
+                    "status": binding.status.value,
+                    "created_at": binding.created_at,
+                    "metadata": _json(binding.metadata),
+                },
+            )
+            self._append_event(
+                conn,
+                binding.agent_run_id,
+                "session_run_binding_upserted",
+                {"binding": _session_run_binding_to_dict(binding)},
+            )
+
+    def find_session_run_binding(
+        self,
+        *,
+        session_run_id: str,
+        branch_binding_id: str = "",
+        selected_only: bool = True,
+        include_inactive: bool = False,
+    ) -> SessionRunBinding | None:
+        clauses = ["session_run_id=:session_run_id"]
+        params: dict[str, Any] = {
+            "session_run_id": str(session_run_id or "").strip(),
+        }
+        branch_id = str(branch_binding_id or "").strip()
+        if branch_id:
+            clauses.append("(branch_binding_id=:branch_binding_id OR id=:branch_binding_id)")
+            params["branch_binding_id"] = branch_id
+        elif selected_only:
+            clauses.append("selected=true")
+        if not include_inactive:
+            clauses.append("status='active'")
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    f"""
+                    SELECT id, session_run_id, session_id, peer_id, branch_binding_id,
+                           agent_run_id, selected, parent_branch_binding_id,
+                           base_session_item_id, source_agent_run_id,
+                           target_agent_run_id, status, metadata, created_at, updated_at
+                    FROM labrastro_session_run_bindings
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY updated_at DESC, id ASC
+                    LIMIT 1
+                    """
+                ),
+                params,
+            ).mappings().first()
+        return _session_run_binding_from_row(row) if row is not None else None
+
+    def list_session_run_bindings(self, **filters: Any) -> list[SessionRunBinding]:
+        clauses: list[str] = ["1=1"]
+        params: dict[str, Any] = {}
+        for key in (
+            "session_run_id",
+            "session_id",
+            "peer_id",
+            "branch_binding_id",
+            "agent_run_id",
+            "selected",
+            "status",
+        ):
+            value = filters.get(key)
+            if value is None:
+                continue
+            clauses.append(f"{key}=:{key}")
+            params[key] = bool(value) if key == "selected" else str(getattr(value, "value", value))
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, session_run_id, session_id, peer_id, branch_binding_id,
+                           agent_run_id, selected, parent_branch_binding_id,
+                           base_session_item_id, source_agent_run_id,
+                           target_agent_run_id, status, metadata, created_at, updated_at
+                    FROM labrastro_session_run_bindings
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY updated_at DESC, id ASC
+                    """
+                ),
+                params,
+            ).mappings()
+            return [_session_run_binding_from_row(row) for row in rows]
 
     def mark_agent_call_waiting(
         self,
@@ -1934,6 +2131,7 @@ class PostgresAgentRunStore:
         worker_id: str | None = None,
         peer_id: str | None = None,
     ) -> tuple[bool, str]:
+        requested_activation_id = str(activation_id or "").strip()
         with self.engine.begin() as conn:
             activation_id = ""
             if request_id or worker_id or peer_id:
@@ -1945,7 +2143,7 @@ class PostgresAgentRunStore:
                     task_id,
                     worker_id or "",
                     peer_id,
-                    activation_id=activation_id,
+                    activation_id=requested_activation_id,
                 )
                 if not ok:
                     return False, reason
@@ -2244,7 +2442,11 @@ class PostgresAgentRunStore:
                     failure_reason=:failure_reason,
                     cancel_reason=:cancel_reason,
                     metadata=CAST(:metadata AS JSONB),
-                    completed_at=now(), updated_at=now()
+                    completed_at=CASE
+                        WHEN :mark_completed THEN now()
+                        ELSE NULL
+                    END,
+                    updated_at=now()
                 WHERE id=:task_id
                 """
             ),
@@ -2263,6 +2465,7 @@ class PostgresAgentRunStore:
                 "failure_reason": failure_reason,
                 "cancel_reason": cancel_reason,
                 "metadata": _json(metadata),
+                "mark_completed": status != "waiting",
             },
         )
         if result.executor_session_id:

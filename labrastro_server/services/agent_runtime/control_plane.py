@@ -32,6 +32,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentThreadBinding,
     AgentThreadBindingLifetime,
     AgentThreadBindingStatus,
+    SessionRunBinding,
+    SessionRunBindingStatus,
     ArtifactStatus,
     ArtifactType,
     ExecutionLocation,
@@ -490,6 +492,26 @@ def _agent_thread_binding_to_dict(binding: AgentThreadBinding) -> dict[str, Any]
     }
 
 
+def _session_run_binding_to_dict(binding: SessionRunBinding) -> dict[str, Any]:
+    return {
+        "id": binding.id,
+        "session_run_id": binding.session_run_id,
+        "session_id": binding.session_id,
+        "peer_id": binding.peer_id,
+        "branch_binding_id": binding.branch_binding_id,
+        "agent_run_id": binding.agent_run_id,
+        "selected": binding.selected,
+        "parent_branch_binding_id": binding.parent_branch_binding_id,
+        "base_session_item_id": binding.base_session_item_id,
+        "source_agent_run_id": binding.source_agent_run_id,
+        "target_agent_run_id": binding.target_agent_run_id,
+        "status": binding.status.value,
+        "created_at": binding.created_at,
+        "updated_at": binding.updated_at,
+        "metadata": dict(binding.metadata),
+    }
+
+
 def _initial_activation_for_request(
     metadata: dict[str, Any],
     *,
@@ -663,6 +685,20 @@ def _agent_thread_binding_id(
             _safe_binding_part(main_agent_run_id),
             _safe_binding_part(agent_id),
             _safe_binding_part(thread_key),
+        ]
+    )
+
+
+def _session_run_binding_id(
+    *,
+    session_run_id: str,
+    branch_binding_id: str = "",
+) -> str:
+    branch_part = _safe_binding_part(branch_binding_id or "main")
+    return "session-run-binding:" + ":".join(
+        [
+            _safe_binding_part(session_run_id),
+            branch_part,
         ]
     )
 
@@ -1126,6 +1162,7 @@ class AgentRunControlPlane:
         self._steers: dict[str, list[ActivationSteer]] = {}
         self._relations: dict[str, AgentRunRelation] = {}
         self._agent_thread_bindings: dict[str, AgentThreadBinding] = {}
+        self._session_run_bindings: dict[str, SessionRunBinding] = {}
         self._agent_call_grants: dict[
             tuple[str, str, str, str, str, str, str],
             AgentCallGrant,
@@ -1438,6 +1475,7 @@ class AgentRunControlPlane:
         agent_id: str | None = None,
         prompt: str = "",
         task_id: str | None = None,
+        branch_binding_id: str | None = None,
         branch_name: str | None = None,
         base_ref: str = "HEAD",
         permission_recompute_policy: str | None = None,
@@ -1445,6 +1483,7 @@ class AgentRunControlPlane:
         executor: ExecutorType | str | None = None,
         runtime_profile_id: str | None = None,
         model: str | None = None,
+        select_branch: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> AgentRun:
         """Create a real git branch/worktree and a related target AgentRun."""
@@ -1497,7 +1536,7 @@ class AgentRunControlPlane:
             "source_workspace_root": str(prepared.source_repo),
         }
         try:
-            return self.submit_agent_run(
+            branch_run = self.submit_agent_run(
                 AgentRunRequest(
                     agent_id=target_agent_id,
                     prompt=str(prompt or ""),
@@ -1523,6 +1562,16 @@ class AgentRunControlPlane:
                 ),
                 task_id=target_task_id,
             )
+            self._create_derived_session_run_binding(
+                source=source,
+                target=branch_run,
+                relation_type=AgentRunRelationType.BRANCH,
+                base_session_item_id=base_item_id,
+                branch_binding_id=branch_binding_id,
+                target_session_run_id=source.owner_session_run_id,
+                selected=select_branch,
+            )
+            return branch_run
         except Exception:
             manager.cleanup_branch_worktree(
                 source_repo=prepared.source_repo,
@@ -1542,6 +1591,7 @@ class AgentRunControlPlane:
         agent_id: str | None = None,
         prompt: str = "",
         task_id: str | None = None,
+        branch_binding_id: str | None = None,
         provenance_status: str = "visible",
         permission_recompute_policy: str | None = None,
         cleanup_policy: str | None = None,
@@ -1550,6 +1600,7 @@ class AgentRunControlPlane:
         execution_location: ExecutionLocation | str | None = None,
         runtime_profile_id: str | None = None,
         model: str | None = None,
+        select_branch: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> AgentRun:
         """Create a derived AgentRun through the relation control-plane path."""
@@ -1595,7 +1646,7 @@ class AgentRunControlPlane:
             "cleanup_policy": _normalize_relation_cleanup_policy(cleanup_policy),
             "provenance_status": provenance,
         }
-        return self.submit_agent_run(
+        fork_run = self.submit_agent_run(
             AgentRunRequest(
                 agent_id=target_agent_id,
                 prompt=str(prompt or ""),
@@ -1619,6 +1670,16 @@ class AgentRunControlPlane:
             ),
             task_id=target_task_id,
         )
+        self._create_derived_session_run_binding(
+            source=source,
+            target=fork_run,
+            relation_type=AgentRunRelationType.FORK,
+            base_session_item_id=base_item_id,
+            branch_binding_id=branch_binding_id,
+            target_session_run_id=target_owner_id,
+            selected=select_branch,
+        )
+        return fork_run
 
     def mark_agent_call_waiting(
         self,
@@ -1735,6 +1796,220 @@ class AgentRunControlPlane:
                     continue
                 expected = getattr(value, "value", value)
                 filtered: list[AgentThreadBinding] = []
+                for binding in bindings:
+                    actual = getattr(binding, key, "")
+                    actual_value = getattr(actual, "value", actual)
+                    if str(actual_value) == str(expected):
+                        filtered.append(binding)
+                bindings = filtered
+            return bindings
+
+    def create_session_run_binding(
+        self,
+        *,
+        session_run_id: str,
+        agent_run_id: str,
+        peer_id: str = "",
+        session_id: str = "",
+        branch_binding_id: str = "",
+        selected: bool = True,
+        parent_branch_binding_id: str = "",
+        base_session_item_id: str = "",
+        source_agent_run_id: str = "",
+        target_agent_run_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRunBinding:
+        normalized_session_run_id = str(session_run_id or "").strip()
+        normalized_agent_run_id = str(agent_run_id or "").strip()
+        if not normalized_session_run_id:
+            raise ValueError("session_run_id is required")
+        if not normalized_agent_run_id:
+            raise ValueError("agent_run_id is required")
+        binding_id = _session_run_binding_id(
+            session_run_id=normalized_session_run_id,
+            branch_binding_id=branch_binding_id,
+        )
+        binding = SessionRunBinding(
+            id=binding_id,
+            session_run_id=normalized_session_run_id,
+            session_id=str(session_id or "").strip(),
+            peer_id=str(peer_id or "").strip(),
+            branch_binding_id=str(branch_binding_id or binding_id).strip(),
+            agent_run_id=normalized_agent_run_id,
+            selected=selected,
+            parent_branch_binding_id=str(parent_branch_binding_id or "").strip(),
+            base_session_item_id=str(base_session_item_id or "").strip(),
+            source_agent_run_id=str(source_agent_run_id or "").strip(),
+            target_agent_run_id=str(target_agent_run_id or normalized_agent_run_id).strip(),
+            metadata=dict(metadata or {}),
+        )
+        self.upsert_session_run_binding(binding)
+        return binding
+
+    def _create_derived_session_run_binding(
+        self,
+        *,
+        source: AgentRun,
+        target: AgentRun,
+        relation_type: AgentRunRelationType,
+        base_session_item_id: str,
+        branch_binding_id: str | None,
+        target_session_run_id: str,
+        selected: bool,
+    ) -> SessionRunBinding | None:
+        source_session_run_id = str(source.owner_session_run_id or "").strip()
+        target_session_run_id = str(target_session_run_id or "").strip()
+        if not source_session_run_id or not target_session_run_id:
+            return None
+        source_bindings = [
+            binding
+            for binding in self.list_session_run_bindings(
+                session_run_id=source_session_run_id,
+                status=SessionRunBindingStatus.ACTIVE,
+            )
+            if binding.agent_run_id == source.id
+            or binding.target_agent_run_id == source.id
+        ]
+        if not source_bindings:
+            return None
+        source_bindings.sort(
+            key=lambda binding: (
+                not binding.selected,
+                str(binding.updated_at or binding.created_at or ""),
+            )
+        )
+        source_binding = source_bindings[0]
+        derived_branch_id = str(branch_binding_id or "").strip()
+        if not derived_branch_id:
+            derived_branch_id = f"{relation_type.value}-{target.id}"
+        return self.create_session_run_binding(
+            session_run_id=target_session_run_id,
+            session_id=source_binding.session_id,
+            peer_id=source_binding.peer_id,
+            agent_run_id=target.id,
+            branch_binding_id=derived_branch_id,
+            selected=selected,
+            parent_branch_binding_id=source_binding.branch_binding_id,
+            base_session_item_id=str(base_session_item_id or "").strip(),
+            source_agent_run_id=source.id,
+            target_agent_run_id=target.id,
+            metadata={
+                "binding_kind": "derived",
+                "relation_type": relation_type.value,
+                "source_binding_id": source_binding.id,
+                "source_branch_binding_id": source_binding.branch_binding_id,
+            },
+        )
+
+    def find_session_run_binding(
+        self,
+        *,
+        session_run_id: str,
+        branch_binding_id: str = "",
+        selected_only: bool = True,
+        include_inactive: bool = False,
+    ) -> SessionRunBinding | None:
+        if self._store is not None:
+            finder = getattr(self._store, "find_session_run_binding", None)
+            if callable(finder):
+                return finder(
+                    session_run_id=session_run_id,
+                    branch_binding_id=branch_binding_id,
+                    selected_only=selected_only,
+                    include_inactive=include_inactive,
+                )
+            raise RuntimeError("AgentRun store does not support SessionRun bindings")
+        normalized_session_run_id = str(session_run_id or "").strip()
+        normalized_branch_binding_id = str(branch_binding_id or "").strip()
+        with self._lock:
+            candidates = [
+                binding
+                for binding in self._session_run_bindings.values()
+                if binding.session_run_id == normalized_session_run_id
+                and (include_inactive or binding.status == SessionRunBindingStatus.ACTIVE)
+            ]
+            if normalized_branch_binding_id:
+                candidates = [
+                    binding
+                    for binding in candidates
+                    if binding.branch_binding_id == normalized_branch_binding_id
+                    or binding.id == normalized_branch_binding_id
+                ]
+            elif selected_only:
+                candidates = [binding for binding in candidates if binding.selected]
+            candidates.sort(key=lambda binding: str(binding.updated_at or binding.created_at or ""), reverse=True)
+            return candidates[0] if candidates else None
+
+    def select_session_run_branch(
+        self,
+        *,
+        session_run_id: str,
+        branch_binding_id: str,
+        peer_id: str = "",
+    ) -> SessionRunBinding:
+        binding = self.find_session_run_binding(
+            session_run_id=session_run_id,
+            branch_binding_id=branch_binding_id,
+            selected_only=False,
+        )
+        if binding is None:
+            raise KeyError("session_run_branch_binding_not_found")
+        normalized_peer_id = str(peer_id or "").strip()
+        if normalized_peer_id and binding.peer_id and binding.peer_id != normalized_peer_id:
+            raise PermissionError("session_run_branch_peer_mismatch")
+        selected = SessionRunBinding(**_session_run_binding_to_dict(binding))
+        selected.selected = True
+        self.upsert_session_run_binding(selected)
+        refreshed = self.find_session_run_binding(
+            session_run_id=session_run_id,
+            branch_binding_id=branch_binding_id,
+            selected_only=False,
+        )
+        return refreshed or selected
+
+    def upsert_session_run_binding(self, binding: SessionRunBinding) -> None:
+        if self._store is not None:
+            writer = getattr(self._store, "upsert_session_run_binding", None)
+            if callable(writer):
+                writer(binding)
+                return
+            raise RuntimeError("AgentRun store does not support SessionRun bindings")
+        normalized = SessionRunBinding(**_session_run_binding_to_dict(binding))
+        now = datetime.now(timezone.utc).isoformat()
+        if normalized.created_at is None:
+            normalized.created_at = now
+        normalized.updated_at = now
+        with self._lock:
+            if normalized.selected and normalized.status == SessionRunBindingStatus.ACTIVE:
+                for existing in self._session_run_bindings.values():
+                    if (
+                        existing.session_run_id == normalized.session_run_id
+                        and existing.id != normalized.id
+                        and existing.status == SessionRunBindingStatus.ACTIVE
+                    ):
+                        existing.selected = False
+                        existing.updated_at = now
+            self._session_run_bindings[normalized.id] = normalized
+            if normalized.agent_run_id in self._events:
+                self._append_event_locked(
+                    normalized.agent_run_id,
+                    "session_run_binding_upserted",
+                    {"binding": _session_run_binding_to_dict(normalized)},
+                )
+
+    def list_session_run_bindings(self, **filters: Any) -> list[SessionRunBinding]:
+        if self._store is not None:
+            lister = getattr(self._store, "list_session_run_bindings", None)
+            if callable(lister):
+                return lister(**filters)
+            raise RuntimeError("AgentRun store does not support SessionRun bindings")
+        with self._lock:
+            bindings = list(self._session_run_bindings.values())
+            for key, value in filters.items():
+                if value is None:
+                    continue
+                expected = getattr(value, "value", value)
+                filtered: list[SessionRunBinding] = []
                 for binding in bindings:
                     actual = getattr(binding, key, "")
                     actual_value = getattr(actual, "value", actual)

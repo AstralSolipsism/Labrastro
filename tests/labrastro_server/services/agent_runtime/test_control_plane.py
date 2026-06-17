@@ -68,6 +68,8 @@ def _git(repo: Path, *args: str) -> str:
         capture_output=True,
         check=False,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     assert result.returncode == 0, result.stderr or result.stdout
     return result.stdout.strip()
@@ -374,6 +376,171 @@ def test_complete_agent_run_activation_requires_current_activation_id() -> None:
             ExecutorRunResult(task_id=task.id, status="completed", output="again"),
             activation_id=stale_activation_id,
         )
+
+
+def test_session_run_binding_selects_single_agent_run_mainline() -> None:
+    control = AgentRunControlPlane()
+    source = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="first",
+            owner_session_run_id="session-run-1",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-main",
+    )
+    branch = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="branch",
+            owner_session_run_id="session-run-1",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-branch",
+    )
+
+    main_binding = control.create_session_run_binding(
+        session_run_id="session-run-1",
+        session_id="chat-session-1",
+        peer_id="peer-1",
+        agent_run_id=source.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=source.id,
+    )
+    branch_binding = control.create_session_run_binding(
+        session_run_id="session-run-1",
+        session_id="chat-session-1",
+        peer_id="peer-1",
+        agent_run_id=branch.id,
+        branch_binding_id="branch-1",
+        selected=True,
+        parent_branch_binding_id=main_binding.branch_binding_id,
+        base_session_item_id="msg-1",
+        source_agent_run_id=source.id,
+        target_agent_run_id=branch.id,
+    )
+
+    selected = control.find_session_run_binding(session_run_id="session-run-1")
+    assert selected is not None
+    assert selected.id == branch_binding.id
+    assert selected.agent_run_id == branch.id
+    assert control.find_session_run_binding(
+        session_run_id="session-run-1",
+        branch_binding_id="main",
+        selected_only=False,
+    ).selected is False
+    assert control.find_session_run_binding(
+        session_run_id="session-run-1",
+        branch_binding_id="branch-1",
+    ).source_agent_run_id == source.id
+
+
+def test_select_session_run_branch_switches_input_target_without_stopping_runs() -> None:
+    control = AgentRunControlPlane()
+    source = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="first",
+            owner_session_run_id="session-run-switch",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-main",
+    )
+    branch = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="branch",
+            owner_session_run_id="session-run-switch",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-branch",
+    )
+    control.create_session_run_binding(
+        session_run_id="session-run-switch",
+        session_id="chat-session-switch",
+        peer_id="peer-1",
+        agent_run_id=source.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=source.id,
+    )
+    control.create_session_run_binding(
+        session_run_id="session-run-switch",
+        session_id="chat-session-switch",
+        peer_id="peer-1",
+        agent_run_id=branch.id,
+        branch_binding_id="branch-1",
+        selected=False,
+        parent_branch_binding_id="main",
+        base_session_item_id="msg-1",
+        source_agent_run_id=source.id,
+        target_agent_run_id=branch.id,
+    )
+
+    selected = control.select_session_run_branch(
+        session_run_id="session-run-switch",
+        branch_binding_id="branch-1",
+        peer_id="peer-1",
+    )
+
+    assert selected.agent_run_id == branch.id
+    assert control.find_session_run_binding(
+        session_run_id="session-run-switch",
+        branch_binding_id="main",
+        selected_only=False,
+    ).selected is False
+    assert control.get_agent_run(source.id).status == AgentRunStatus.QUEUED
+    assert control.get_agent_run(branch.id).status == AgentRunStatus.QUEUED
+
+
+def test_session_run_continue_reuses_bound_agent_run_mainline() -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="first",
+            owner_session_run_id="session-run-1",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-main",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-1",
+        session_id="chat-session-1",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+    first_activation_id = _current_activation_id(control, run.id)
+    control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status="completed", output="first done"),
+        activation_id=first_activation_id,
+    )
+
+    continued = control.continue_agent_run(
+        binding.agent_run_id,
+        input_kind=AgentRunActivationInputKind.USER_REQUEST,
+        input_payload={
+            "source": "session_run_continue",
+            "session_run_id": binding.session_run_id,
+            "branch_binding_id": binding.branch_binding_id,
+        },
+        resume_session=True,
+        prompt="second",
+    )
+
+    assert continued.id == run.id
+    assert continued.current_activation_id == "agent-run-main:activation:2"
+    assert [item["id"] for item in control.list_agent_runs()] == [run.id]
 
 
 def test_agent_run_request_projects_source_and_sandbox_fields() -> None:
@@ -4296,6 +4463,29 @@ def test_branch_agent_run_creates_relation_payload_and_cleans_worktree_on_cascad
         ),
         task_id="source-run",
     )
+    main_binding = control.create_session_run_binding(
+        session_run_id="session-branch",
+        session_id="chat-session-branch",
+        peer_id="peer-1",
+        agent_run_id=source.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=source.id,
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="worker-source",
+        executors=["codex"],
+    )
+    assert claim is not None
+    assert claim.task.id == source.id
+    ok, reason = control.append_executor_event(
+        source.id,
+        ExecutorEvent.status("running"),
+        request_id=claim.request_id,
+        activation_id=claim.activation_id,
+        worker_id=claim.worker_id,
+    )
+    assert ok, reason
 
     branch = control.branch_agent_run(
         source_agent_run_id=source.id,
@@ -4304,6 +4494,7 @@ def test_branch_agent_run_creates_relation_payload_and_cleans_worktree_on_cascad
         repo_root=str(repo),
         prompt="continue on branch",
         task_id="branch-run",
+        branch_binding_id="branch-edit-1",
     )
     detail = control.load_agent_run_detail(branch.id)
     relation = next(
@@ -4329,6 +4520,23 @@ def test_branch_agent_run_creates_relation_payload_and_cleans_worktree_on_cascad
     assert payload["cleanup_policy"] == "delete_with_owner_session"
     assert payload["source_workspace_root"] == str(repo)
     assert Path(payload["branch_worktree_ref"]).is_dir()
+    selected_binding = control.find_session_run_binding(session_run_id="session-branch")
+    assert selected_binding is not None
+    assert selected_binding.branch_binding_id == "branch-edit-1"
+    assert selected_binding.agent_run_id == branch.id
+    assert selected_binding.parent_branch_binding_id == main_binding.branch_binding_id
+    assert selected_binding.base_session_item_id == "session-item-1"
+    assert selected_binding.source_agent_run_id == source.id
+    assert selected_binding.target_agent_run_id == branch.id
+    source_binding = control.find_session_run_binding(
+        session_run_id="session-branch",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+    assert source_binding is not None
+    assert source_binding.selected is False
+    assert source_binding.status.value == "active"
+    assert control.get_agent_run(source.id).status == AgentRunStatus.RUNNING
 
     assert control.cancel_agent_run(source.id, reason="delete_owner_session") is True
 
@@ -4350,6 +4558,15 @@ def test_fork_agent_run_creates_typed_relation_without_reusing_live_session() ->
         ),
         task_id="source-fork-run",
     )
+    main_binding = control.create_session_run_binding(
+        session_run_id="session-fork",
+        session_id="chat-session-fork",
+        peer_id="peer-1",
+        agent_run_id=source.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=source.id,
+    )
 
     fork = control.fork_agent_run(
         source_agent_run_id=source.id,
@@ -4358,6 +4575,7 @@ def test_fork_agent_run_creates_typed_relation_without_reusing_live_session() ->
         target_owner_session_run_id="session-fork-target",
         prompt="continue from fork",
         task_id="fork-run",
+        branch_binding_id="fork-edit-1",
         provenance_status="redacted",
     )
     detail = control.load_agent_run_detail(fork.id)
@@ -4385,6 +4603,14 @@ def test_fork_agent_run_creates_typed_relation_without_reusing_live_session() ->
         "cleanup_policy": "delete_with_owner_session",
         "provenance_status": "redacted",
     }
+    selected_binding = control.find_session_run_binding(session_run_id="session-fork-target")
+    assert selected_binding is not None
+    assert selected_binding.branch_binding_id == "fork-edit-1"
+    assert selected_binding.agent_run_id == fork.id
+    assert selected_binding.parent_branch_binding_id == main_binding.branch_binding_id
+    assert selected_binding.base_session_item_id == "session-item-2"
+    assert selected_binding.source_agent_run_id == source.id
+    assert selected_binding.target_agent_run_id == fork.id
 
 
 def test_basic_scheduler_selects_lowest_running_agent() -> None:

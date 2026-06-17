@@ -24,6 +24,7 @@ from labrastro_server.services.agent_runtime.session_projection import (
 )
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentCallGrant,
+    AgentRunActivationInputKind,
     AgentRunFeedbackKind,
     AgentRunFeedbackSource,
     AgentRunRelation,
@@ -87,6 +88,7 @@ def _reset_agent_run_tables() -> None:
                     labrastro_agent_run_activation_steers,
                     labrastro_agent_run_feedback,
                     labrastro_agent_run_activations,
+                    labrastro_session_run_bindings,
                     labrastro_agent_thread_bindings,
                     labrastro_agent_call_grants,
                     labrastro_agent_run_sessions,
@@ -134,6 +136,74 @@ def _control() -> AgentRunControlPlane:
 
 def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
     return str(control.get_agent_run(task_id).current_activation_id or "")
+
+
+def _stored_completed_at(task_id: str):
+    database_url = os.environ["LABRASTRO_TEST_DATABASE_URL"]
+    engine = create_postgres_engine(database_url)
+    try:
+        with engine.begin() as conn:
+            return conn.execute(
+                text(
+                    """
+                    SELECT completed_at
+                    FROM labrastro_agent_runs
+                    WHERE id=:task_id
+                    """
+                ),
+                {"task_id": task_id},
+            ).scalar()
+    finally:
+        engine.dispose()
+
+
+def test_postgres_session_run_binding_selects_single_mainline_and_continues() -> None:
+    control = _control()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="first",
+            owner_session_run_id="session-run-1",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-main",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-1",
+        session_id="chat-session-1",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+    selected = control.find_session_run_binding(session_run_id="session-run-1")
+
+    assert selected is not None
+    assert selected.id == binding.id
+    assert selected.agent_run_id == run.id
+    assert selected.peer_id == "peer-1"
+
+    control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status="completed", output="done"),
+        activation_id=str(run.current_activation_id or ""),
+    )
+    continued = control.continue_agent_run(
+        selected.agent_run_id,
+        input_kind=AgentRunActivationInputKind.USER_REQUEST,
+        input_payload={
+            "source": "session_run_continue",
+            "session_run_id": selected.session_run_id,
+            "branch_binding_id": selected.branch_binding_id,
+        },
+        resume_session=True,
+        prompt="second",
+    )
+
+    assert continued.id == run.id
+    assert continued.current_activation_id == "agent-run-main:activation:2"
 
 
 def test_control_plane_initializes_postgres_store_runtime_snapshot_from_control_config() -> None:
@@ -224,6 +294,36 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     json.dumps(detail)
     assert detail["session"]["workdir"] == "/tmp/pg-worktree"
     assert detail["claim"]["status"] == "completed"
+
+
+def test_postgres_append_executor_event_rejects_stale_activation_id() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="pg-agent", prompt="postgres event activation"),
+        task_id="pg-event-activation-lock",
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="pg-worker",
+        executors=["fake"],
+        peer_features=["agent_runs.daemon_worktree"],
+    )
+    assert claim is not None
+
+    ok, reason = control.append_executor_event(
+        task.id,
+        ExecutorEvent.text_event("stale event should be rejected"),
+        request_id=claim.request_id,
+        activation_id=f"{task.id}:activation:999",
+        worker_id="pg-worker",
+    )
+
+    assert (ok, reason) == (False, "activation_mismatch")
+    assert not [
+        event
+        for event in control.list_events(task.id, after_seq=0)
+        if event.type == "text"
+        and event.payload.get("text") == "stale event should be rejected"
+    ]
 
 
 def test_postgres_agent_thread_binding_reuses_activation() -> None:
@@ -649,6 +749,7 @@ def test_postgres_runtime_store_host_restart_preserves_waiting_task() -> None:
     )
 
     assert waiting.status == AgentRunStatus.WAITING
+    assert _stored_completed_at(task.id) is None
     reloaded = _control()
     task_detail = reloaded.agent_run_to_dict(task.id)
     assert task_detail["status"] == "waiting"

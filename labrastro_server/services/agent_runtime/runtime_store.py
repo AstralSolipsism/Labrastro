@@ -604,6 +604,19 @@ class AgentRunStore(
         reason: str = "owner_session_deleted",
     ) -> list[Any]: ...
 
+    def find_session_run_binding(
+        self,
+        *,
+        session_run_id: str,
+        branch_binding_id: str = "",
+        selected_only: bool = True,
+        include_inactive: bool = False,
+    ) -> Any | None: ...
+
+    def upsert_session_run_binding(self, binding: Any) -> None: ...
+
+    def list_session_run_bindings(self, **filters: Any) -> list[Any]: ...
+
     def mark_agent_call_waiting(
         self,
         task_id: str,

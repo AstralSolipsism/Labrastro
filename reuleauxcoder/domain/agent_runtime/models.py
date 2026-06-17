@@ -1855,6 +1855,14 @@ class AgentThreadBindingStatus(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class SessionRunBindingStatus(str, Enum):
+    """Lifecycle status for a ChatView SessionRun branch binding."""
+
+    ACTIVE = "active"
+    CLOSED = "closed"
+    DELETED = "deleted"
+
+
 class AgentThreadWorkdirPolicy(str, Enum):
     """Workspace policy for an Agent thread binding."""
 
@@ -2120,6 +2128,44 @@ class AgentThreadBinding:
         )
         self.status = AgentThreadBindingStatus(
             _enum_value(self.status) or AgentThreadBindingStatus.ACTIVE
+        )
+        self.metadata = _dict_value(self.metadata)
+
+
+@dataclass
+class SessionRunBinding:
+    """Selected ChatView branch binding to one AgentRun mainline."""
+
+    id: str
+    session_run_id: str
+    agent_run_id: str
+    peer_id: str = ""
+    session_id: str = ""
+    branch_binding_id: str = ""
+    selected: bool = True
+    parent_branch_binding_id: str = ""
+    base_session_item_id: str = ""
+    source_agent_run_id: str = ""
+    target_agent_run_id: str = ""
+    status: SessionRunBindingStatus = SessionRunBindingStatus.ACTIVE
+    created_at: str | None = None
+    updated_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id or "")
+        self.session_run_id = str(self.session_run_id or "")
+        self.agent_run_id = str(self.agent_run_id or "")
+        self.peer_id = str(self.peer_id or "")
+        self.session_id = str(self.session_id or "")
+        self.branch_binding_id = str(self.branch_binding_id or self.id or "")
+        self.parent_branch_binding_id = str(self.parent_branch_binding_id or "")
+        self.base_session_item_id = str(self.base_session_item_id or "")
+        self.source_agent_run_id = str(self.source_agent_run_id or "")
+        self.target_agent_run_id = str(self.target_agent_run_id or self.agent_run_id or "")
+        self.selected = bool(self.selected)
+        self.status = SessionRunBindingStatus(
+            _enum_value(self.status) or SessionRunBindingStatus.ACTIVE
         )
         self.metadata = _dict_value(self.metadata)
 
