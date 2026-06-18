@@ -198,22 +198,27 @@ class ChatCommandDispatchResponse:
 class SessionRunEventsRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str | None = None
     cursor: int = 0
     timeout_sec: float = 30.0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
             "cursor": self.cursor,
             "timeout_sec": self.timeout_sec,
         }
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunEventsRequest":
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
             cursor=int(d.get("cursor", 0)),
             timeout_sec=float(d.get("timeout_sec", 30.0)),
         )
@@ -225,15 +230,19 @@ class SessionRunEventsBatch:
     next_cursor: int = 0
     error: str | None = None
     branches: list[dict[str, Any]] = field(default_factory=list)
+    branch_binding_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "events": self.events,
             "done": self.done,
             "next_cursor": self.next_cursor,
             "error": self.error,
             "branches": _dict_list(self.branches),
         }
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunEventsBatch":
@@ -243,26 +252,32 @@ class SessionRunEventsBatch:
             next_cursor=int(d.get("next_cursor", 0)),
             error=d.get("error"),
             branches=_dict_list(d.get("branches")),
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
         )
 
 @dataclass
 class SessionRunStatusRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str | None = None
     cursor: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
             "cursor": self.cursor,
         }
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunStatusRequest":
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
             cursor=int(d.get("cursor", 0)),
         )
 
@@ -392,12 +407,14 @@ class SessionRunStatusResponse:
 class SessionRunCancelRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str = ""
     reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
+            "branch_binding_id": self.branch_binding_id,
             "reason": self.reason,
         }
 
@@ -406,6 +423,7 @@ class SessionRunCancelRequest:
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=str(d.get("branch_binding_id") or ""),
             reason=d.get("reason"),
         )
 
@@ -426,6 +444,7 @@ class SessionRunCancelResponse:
 class SessionRunContinueRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str
     prompt: str
     client_request_id: str | None = None
     locale: str | None = None
@@ -435,6 +454,7 @@ class SessionRunContinueRequest:
         payload: dict[str, Any] = {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
+            "branch_binding_id": self.branch_binding_id,
             "prompt": self.prompt,
         }
         if self.client_request_id is not None:
@@ -450,6 +470,7 @@ class SessionRunContinueRequest:
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=str(d.get("branch_binding_id") or ""),
             prompt=d["prompt"],
             client_request_id=d.get("client_request_id"),
             locale=d.get("locale"),
@@ -496,12 +517,14 @@ class SessionRunContinueResponse:
 class SessionRunRecoverRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str = ""
     action: str = "continue"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
+            "branch_binding_id": self.branch_binding_id,
             "action": self.action,
         }
 
@@ -510,6 +533,7 @@ class SessionRunRecoverRequest:
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=str(d.get("branch_binding_id") or ""),
             action=str(d.get("action") or "continue"),
         )
 
@@ -543,6 +567,7 @@ class SessionRunRecoverResponse:
 class SessionRunUserInputReplyRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str
     input_id: str
     action: str
     content: dict[str, Any] = field(default_factory=dict)
@@ -552,6 +577,7 @@ class SessionRunUserInputReplyRequest:
         return {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
+            "branch_binding_id": self.branch_binding_id,
             "input_id": self.input_id,
             "action": self.action,
             "content": dict(self.content),
@@ -564,6 +590,7 @@ class SessionRunUserInputReplyRequest:
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=str(d.get("branch_binding_id") or ""),
             input_id=d.get("input_id"),
             action=str(d.get("action") or "decline"),
             content=content if isinstance(content, dict) else {},
@@ -593,6 +620,7 @@ class SessionRunUserInputReplyResponse:
 class ApprovalReplyRequest:
     peer_token: str
     session_run_id: str
+    branch_binding_id: str
     approval_id: str
     decision: str
     reason: str | None = None
@@ -602,6 +630,7 @@ class ApprovalReplyRequest:
         payload = {
             "peer_token": self.peer_token,
             "session_run_id": self.session_run_id,
+            "branch_binding_id": self.branch_binding_id,
             "approval_id": self.approval_id,
             "decision": self.decision,
             "reason": self.reason,
@@ -616,6 +645,7 @@ class ApprovalReplyRequest:
         return cls(
             peer_token=d["peer_token"],
             session_run_id=d["session_run_id"],
+            branch_binding_id=str(d.get("branch_binding_id") or ""),
             approval_id=d["approval_id"],
             decision=d["decision"],
             reason=d.get("reason"),

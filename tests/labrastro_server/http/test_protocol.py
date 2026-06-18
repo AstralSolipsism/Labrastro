@@ -447,6 +447,7 @@ class TestApprovalReplyProtocol:
         req = ApprovalReplyRequest(
             peer_token="pt_1",
             session_run_id="run-1",
+            branch_binding_id="main",
             approval_id="approval-1",
             decision="allow_once",
             reason="saved candidate",
@@ -456,6 +457,7 @@ class TestApprovalReplyProtocol:
         restored = ApprovalReplyRequest.from_dict(req.to_dict())
 
         assert restored.approved_save_candidate == candidate
+        assert restored.branch_binding_id == "main"
         assert restored.to_dict()["approved_save_candidate"] == candidate
 
 
@@ -476,11 +478,17 @@ class TestSessionRunStatusProtocol:
         assert "branchBindingId" not in restored.to_dict()
 
     def test_roundtrip_preserves_recovery_diagnostics(self) -> None:
-        req = SessionRunStatusRequest(peer_token="pt_1", session_run_id="run-1", cursor=7)
+        req = SessionRunStatusRequest(
+            peer_token="pt_1",
+            session_run_id="run-1",
+            branch_binding_id="branch-2",
+            cursor=7,
+        )
         restored_req = SessionRunStatusRequest.from_dict(req.to_dict())
 
         assert restored_req.peer_token == "pt_1"
         assert restored_req.session_run_id == "run-1"
+        assert restored_req.branch_binding_id == "branch-2"
         assert restored_req.cursor == 7
 
         resp = SessionRunStatusResponse(
