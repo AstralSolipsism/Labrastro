@@ -24,8 +24,16 @@ func TestRemoteContractFixturesDecodePeerProtocolSamples(t *testing.T) {
 	mustDecode(t, fixtures["peer.register"].Response, &RegisterResponseEnvelope{})
 	mustDecode(t, fixtures["peer.heartbeat"].Request, &Heartbeat{})
 	mustDecode(t, fixtures["session_run.start"].Request, &SessionRunStartRequest{})
-	mustDecode(t, fixtures["session_run.start"].Response, &SessionRunStartResponse{})
-	mustDecode(t, fixtures["session_run.events"].Request, &SessionRunEventsRequest{})
+	var startResponse SessionRunStartResponse
+	mustDecode(t, fixtures["session_run.start"].Response, &startResponse)
+	if startResponse.BranchBindingID != "main" {
+		t.Fatalf("session_run.start branch binding = %q, want main", startResponse.BranchBindingID)
+	}
+	var eventsRequest SessionRunEventsRequest
+	mustDecode(t, fixtures["session_run.events"].Request, &eventsRequest)
+	if eventsRequest.BranchBindingID != "main" {
+		t.Fatalf("session_run.events branch binding = %q, want main", eventsRequest.BranchBindingID)
+	}
 	mustDecode(t, fixtures["session_run.events"].Response, &SessionRunEventsBatch{})
 	mustDecode(t, fixtures["agent_run_activations.claim"].Request, &AgentRunActivationClaimRequest{})
 	mustDecode(t, fixtures["agent_run_activations.claim"].Response, &AgentRunActivationClaimResponse{})

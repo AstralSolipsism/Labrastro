@@ -82,15 +82,17 @@ type SessionRunStartRequest struct {
 }
 
 type SessionRunStartResponse struct {
-	SessionRunID string `json:"session_run_id"`
-	Error        string `json:"error,omitempty"`
+	SessionRunID    string `json:"session_run_id"`
+	BranchBindingID string `json:"branch_binding_id,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
 
 type SessionRunEventsRequest struct {
-	PeerToken    string  `json:"peer_token"`
-	SessionRunID string  `json:"session_run_id"`
-	Cursor       int     `json:"cursor"`
-	TimeoutSec   float64 `json:"timeout_sec,omitempty"`
+	PeerToken       string  `json:"peer_token"`
+	SessionRunID    string  `json:"session_run_id"`
+	BranchBindingID string  `json:"branch_binding_id,omitempty"`
+	Cursor          int     `json:"cursor"`
+	TimeoutSec      float64 `json:"timeout_sec,omitempty"`
 }
 
 type SessionRunEvent struct {
@@ -108,11 +110,12 @@ type SessionRunEventsBatch struct {
 }
 
 type ApprovalReplyRequest struct {
-	PeerToken    string `json:"peer_token"`
-	SessionRunID string `json:"session_run_id"`
-	ApprovalID   string `json:"approval_id"`
-	Decision     string `json:"decision"`
-	Reason       string `json:"reason,omitempty"`
+	PeerToken       string `json:"peer_token"`
+	SessionRunID    string `json:"session_run_id"`
+	BranchBindingID string `json:"branch_binding_id"`
+	ApprovalID      string `json:"approval_id"`
+	Decision        string `json:"decision"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 type ApprovalReplyResponse struct {

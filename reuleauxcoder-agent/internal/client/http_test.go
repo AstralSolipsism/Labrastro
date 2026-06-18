@@ -53,10 +53,11 @@ func TestSessionRunEventsStreamsSSEBatches(t *testing.T) {
 	err := client.SessionRunEvents(
 		context.Background(),
 		protocol.SessionRunEventsRequest{
-			PeerToken:    "peer-token",
-			SessionRunID: "run-1",
-			Cursor:       1,
-			TimeoutSec:   2,
+			PeerToken:       "peer-token",
+			SessionRunID:    "run-1",
+			BranchBindingID: "main",
+			Cursor:          1,
+			TimeoutSec:      2,
 		},
 		func(batch protocol.SessionRunEventsBatch) error {
 			batches = append(batches, batch)
@@ -70,7 +71,7 @@ func TestSessionRunEventsStreamsSSEBatches(t *testing.T) {
 	if requestPath != "/remote/session-runs/events" {
 		t.Fatalf("path = %s, want /remote/session-runs/events", requestPath)
 	}
-	if requestBody.PeerToken != "peer-token" || requestBody.SessionRunID != "run-1" || requestBody.Cursor != 1 {
+	if requestBody.PeerToken != "peer-token" || requestBody.SessionRunID != "run-1" || requestBody.BranchBindingID != "main" || requestBody.Cursor != 1 {
 		t.Fatalf("request body = %+v", requestBody)
 	}
 	if len(batches) != 2 {

@@ -1106,21 +1106,26 @@ func (r *Runner) runRemoteSessionRun(ctx context.Context, peerToken, prompt stri
 	if strings.TrimSpace(startResp.SessionRunID) == "" {
 		return fmt.Errorf("session run start failed: empty session run id")
 	}
+	branchBindingID := strings.TrimSpace(startResp.BranchBindingID)
+	if branchBindingID == "" {
+		branchBindingID = "main"
+	}
 
 	return r.client.SessionRunEvents(
 		ctx,
 		protocol.SessionRunEventsRequest{
-			PeerToken:    peerToken,
-			SessionRunID: startResp.SessionRunID,
-			Cursor:       0,
-			TimeoutSec:   30,
+			PeerToken:       peerToken,
+			SessionRunID:    startResp.SessionRunID,
+			BranchBindingID: branchBindingID,
+			Cursor:          0,
+			TimeoutSec:      30,
 		},
 		func(batch protocol.SessionRunEventsBatch) error {
 			if strings.TrimSpace(batch.Error) != "" {
 				return fmt.Errorf("session run events failed: %s", batch.Error)
 			}
 			for _, event := range batch.Events {
-				if err := r.handleSessionRunEvent(ctx, peerToken, startResp.SessionRunID, event); err != nil {
+				if err := r.handleSessionRunEvent(ctx, peerToken, startResp.SessionRunID, branchBindingID, event); err != nil {
 					return err
 				}
 			}
@@ -1129,7 +1134,7 @@ func (r *Runner) runRemoteSessionRun(ctx context.Context, peerToken, prompt stri
 	)
 }
 
-func (r *Runner) handleSessionRunEvent(ctx context.Context, peerToken, sessionRunID string, event protocol.SessionRunEvent) error {
+func (r *Runner) handleSessionRunEvent(ctx context.Context, peerToken, sessionRunID, branchBindingID string, event protocol.SessionRunEvent) error {
 	switch event.Type {
 	case "session_run_start":
 		return nil
@@ -1138,7 +1143,7 @@ func (r *Runner) handleSessionRunEvent(ctx context.Context, peerToken, sessionRu
 	case "tool_call_stream":
 		r.renderToolStream(event.Payload)
 	case "approval_request":
-		return r.handleApprovalRequest(ctx, peerToken, sessionRunID, event.Payload)
+		return r.handleApprovalRequest(ctx, peerToken, sessionRunID, branchBindingID, event.Payload)
 	case "approval_resolved":
 		return nil
 	case "tool_call_start":
@@ -1161,12 +1166,20 @@ func (r *Runner) handleSessionRunEvent(ctx context.Context, peerToken, sessionRu
 	return nil
 }
 
-func (r *Runner) handleApprovalRequest(ctx context.Context, peerToken, sessionRunID string, payload map[string]any) error {
+func (r *Runner) handleApprovalRequest(ctx context.Context, peerToken, sessionRunID, branchBindingID string, payload map[string]any) error {
 	r.renderOutputEvent(payload)
 
 	approvalID, _ := payload["approval_id"].(string)
 	if approvalID == "" {
 		return fmt.Errorf("approval request missing approval_id")
+	}
+	targetBranchBindingID, _ := payload["branch_binding_id"].(string)
+	targetBranchBindingID = strings.TrimSpace(targetBranchBindingID)
+	if targetBranchBindingID == "" {
+		targetBranchBindingID = branchBindingID
+	}
+	if targetBranchBindingID == "" {
+		targetBranchBindingID = "main"
 	}
 
 	fmt.Print("Approve? [y/N]: ")
@@ -1183,10 +1196,11 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, peerToken, sessionRu
 	replyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	replyResp, err := r.client.ApprovalReply(replyCtx, protocol.ApprovalReplyRequest{
-		PeerToken:    peerToken,
-		SessionRunID: sessionRunID,
-		ApprovalID:   approvalID,
-		Decision:     decision,
+		PeerToken:       peerToken,
+		SessionRunID:    sessionRunID,
+		BranchBindingID: targetBranchBindingID,
+		ApprovalID:      approvalID,
+		Decision:        decision,
 	})
 	if err != nil {
 		return fmt.Errorf("approval reply failed: %w", err)
