@@ -566,11 +566,13 @@ class _SessionRunProjection:
     user_input_waiters: dict[str, dict[str, Any]] = field(default_factory=dict)
     user_input_resolutions: dict[str, dict[str, Any]] = field(default_factory=dict)
     recovery_ticket: dict[str, Any] | None = None
+    recovery_tickets_by_branch: dict[str, dict[str, Any]] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     cond: threading.Condition = field(default_factory=threading.Condition)
     cancel_requested: bool = False
     cancel_reason: str | None = None
+    cancel_requests_by_branch: dict[str, dict[str, Any]] = field(default_factory=dict)
     cancel_callback: Callable[[str], None] | None = None
     artifact_root: Path = field(
         default_factory=lambda: Path(tempfile.gettempdir()) / "labrastro-session-run-events"
@@ -953,7 +955,11 @@ class _SessionRunProjection:
         ]
         return min(first_values) if first_values else 0
 
-    def _events_after_locked(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+    def _events_after_locked(
+        self,
+        cursor: int,
+        branch_binding_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
         durable_events, durable_cursor = self._event_buffer.events_after(cursor)
         live_events, live_cursor = self._live_event_buffer.events_after(cursor)
         events = sorted(
@@ -961,10 +967,15 @@ class _SessionRunProjection:
             key=lambda event: int(event.get("seq", 0) or 0),
         )
         events = [_hydrate_stream_event_payload(event) for event in events]
+        target_branch_id = str(branch_binding_id or "").strip()
         events = [
             event
             for event in events
-            if self._event_visible_in_selected_branch_locked(event)
+            if (
+                self._event_visible_in_branch_locked(event, target_branch_id)
+                if target_branch_id
+                else self._event_visible_in_selected_branch_locked(event)
+            )
         ]
         next_cursor = max(cursor, durable_cursor, live_cursor)
         if events:
@@ -1205,18 +1216,36 @@ class _SessionRunProjection:
     def _update_status_for_event_locked(
         self, event_type: str, payload: dict[str, Any]
     ) -> None:
+        status: str | None = None
+        last_error: str | None = None
         if event_type == "error":
-            self.status = "error"
             message = payload.get("message")
-            self.last_error = str(message) if message is not None else "error"
+            status = "error"
+            last_error = str(message) if message is not None else "error"
         elif event_type == "session_run_cancelled":
-            self.status = "cancelled"
             reason = payload.get("reason")
-            self.last_error = str(reason) if reason is not None else "session_run_cancelled"
+            status = "cancelled"
+            last_error = str(reason) if reason is not None else "session_run_cancelled"
         elif event_type == "session_run_interrupted":
-            self.status = "interrupted"
             message = payload.get("message")
-            self.last_error = str(message) if message is not None else "provider stream interrupted"
+            status = "interrupted"
+            last_error = (
+                str(message) if message is not None else "provider stream interrupted"
+            )
+        if status is None:
+            return
+        branch_id = self._payload_branch_binding_id_locked(payload)
+        binding = self.branch_bindings.get(branch_id)
+        if isinstance(binding, dict):
+            binding["status"] = status
+            binding["updated_at"] = time.time()
+        selected_branch_id = str(
+            self.selected_branch_binding_id or self.branch_binding_id or "main"
+        ).strip()
+        if branch_id and branch_id != selected_branch_id:
+            return
+        self.status = status
+        self.last_error = last_error
 
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
         if not _is_replayable_session_run_event(str(event.get("type") or "")):
@@ -1297,23 +1326,45 @@ class _SessionRunProjection:
             event["document_revision"] = int(session_event_seq)
 
     def wait_events(
-        self, cursor: int, timeout_sec: float
+        self,
+        cursor: int,
+        timeout_sec: float,
+        branch_binding_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], bool, int]:
         deadline = time.time() + max(timeout_sec, 0.0)
         with self.cond:
-            while cursor >= self._latest_stream_seq_locked() and not self.done:
+            while True:
                 now = time.time()
-                if self._flush_live_events_locked(now):
-                    break
+                self._flush_live_events_locked(now)
+                out, next_cursor = self._events_after_locked(cursor, branch_binding_id)
+                done = self._events_wait_done_locked(branch_binding_id)
+                if out or done:
+                    self.last_activity_at = time.time()
+                    return out, done, next_cursor
+                now = time.time()
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
                 live_delay = self._next_live_flush_delay_locked(time.time())
                 wait_timeout = remaining if live_delay is None else min(remaining, live_delay)
                 self.cond.wait(timeout=max(wait_timeout, 0.001))
-            out, next_cursor = self._events_after_locked(cursor)
+            out, next_cursor = self._events_after_locked(cursor, branch_binding_id)
             self.last_activity_at = time.time()
-            return out, self.done, next_cursor
+            return out, self._events_wait_done_locked(branch_binding_id), next_cursor
+
+    def _events_wait_done_locked(self, branch_binding_id: str | None = None) -> bool:
+        target_branch_id = str(branch_binding_id or "").strip()
+        if not target_branch_id:
+            return self.done
+        binding = self.branch_bindings.get(target_branch_id)
+        if isinstance(binding, dict):
+            status = str(binding.get("status") or "").strip().lower()
+            if status in {"done", "cancelled", "error", "failed", "interrupted"}:
+                return True
+        selected_branch_id = str(
+            self.selected_branch_binding_id or self.branch_binding_id or "main"
+        ).strip()
+        return self.done and target_branch_id == selected_branch_id
 
     def mark_running(self) -> None:
         with self.cond:
@@ -1321,7 +1372,12 @@ class _SessionRunProjection:
             self.status = "running"
             self.last_activity_at = time.time()
 
-    def mark_done(self, reason: str | None = None) -> None:
+    def mark_done(
+        self,
+        reason: str | None = None,
+        *,
+        branch_binding_id: str | None = None,
+    ) -> None:
         with self.cond:
             self._flush_live_events_locked(time.time(), force=True)
             close_reason = (
@@ -1330,9 +1386,15 @@ class _SessionRunProjection:
                 or self.last_error
                 or "session_run_closed"
             )
-            for event_payload in self._cancel_pending_approvals_locked(close_reason):
+            for event_payload in self._cancel_pending_approvals_locked(
+                close_reason,
+                branch_binding_id,
+            ):
                 self._append_approval_resolved_event_locked(event_payload)
-            for event_payload in self._cancel_pending_user_inputs_locked(close_reason):
+            for event_payload in self._cancel_pending_user_inputs_locked(
+                close_reason,
+                branch_binding_id,
+            ):
                 self._append_user_input_resolved_event_locked(event_payload)
             self.running = False
             self.done = True
@@ -1351,10 +1413,21 @@ class _SessionRunProjection:
         self._event_buffer.cleanup_artifacts()
         self._live_event_buffer.cleanup_artifacts()
 
-    def status_payload(self, cursor: int = 0) -> dict[str, Any]:
+    def status_payload(
+        self,
+        cursor: int = 0,
+        branch_binding_id: str | None = None,
+    ) -> dict[str, Any]:
         cursor = max(0, int(cursor or 0))
         with self.cond:
             next_cursor = self._status_next_cursor_locked(cursor)
+            target_branch_id = str(
+                branch_binding_id
+                or self.selected_branch_binding_id
+                or self.branch_binding_id
+                or ""
+            ).strip()
+            recovery_ticket = self._recovery_ticket_for_branch_locked(target_branch_id)
             return {
                 "ok": True,
                 "session_run_id": self.session_run_id,
@@ -1374,19 +1447,15 @@ class _SessionRunProjection:
                 "taskflow_id": self.taskflow_id,
                 "agent_id": self.agent_id,
                 "agent_run_id": self.agent_run_id,
-                "branch_binding_id": self.branch_binding_id,
+                "branch_binding_id": target_branch_id or self.branch_binding_id,
                 "runtime_state": dict(self.runtime_state),
                 "created_at": self.created_at,
                 "last_activity_at": self.last_activity_at,
                 "finished_at": self.finished_at,
                 "error": self.last_error,
-                "recovery": dict(self.recovery_ticket) if self.recovery_ticket else None,
-                "approvals": self._pending_approvals_locked(
-                    self.selected_branch_binding_id or self.branch_binding_id
-                ),
-                "user_inputs": self._pending_user_inputs_locked(
-                    self.selected_branch_binding_id or self.branch_binding_id
-                ),
+                "recovery": dict(recovery_ticket) if recovery_ticket else None,
+                "approvals": self._pending_approvals_locked(target_branch_id),
+                "user_inputs": self._pending_user_inputs_locked(target_branch_id),
                 "branches": self._branch_summaries_locked(cursor),
             }
 
@@ -1481,23 +1550,72 @@ class _SessionRunProjection:
             callback(reason)
         return first_request, resolved_approvals
 
+    def request_branch_cancel(
+        self,
+        reason: str,
+        branch_binding_id: str,
+    ) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            branch_id = "main"
+        callback: Callable[[str], None] | None
+        with self.cond:
+            state = self.cancel_requests_by_branch.setdefault(branch_id, {})
+            first_request = not bool(state.get("requested"))
+            state["requested"] = True
+            state["reason"] = reason
+            state["updated_at"] = time.time()
+            resolved_approvals = self._cancel_pending_approvals_locked(reason, branch_id)
+            resolved_inputs = self._cancel_pending_user_inputs_locked(reason, branch_id)
+            selected_branch_id = str(
+                self.selected_branch_binding_id or self.branch_binding_id or "main"
+            ).strip()
+            callback = self.cancel_callback if branch_id == selected_branch_id else None
+            if branch_id == selected_branch_id:
+                self.cancel_requested = True
+                self.cancel_reason = reason
+            self.cond.notify_all()
+        if callback is not None:
+            callback(reason)
+        return first_request, resolved_approvals, resolved_inputs
+
     def register_recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.cond:
+            recovery_payload = dict(payload)
+            branch_binding_id = self._payload_branch_binding_id_locked(recovery_payload)
+            recovery_payload["branch_binding_id"] = branch_binding_id
             ticket = {
                 "recovery_id": str(uuid.uuid4()),
                 "state": "pending",
                 "created_at": time.time(),
-                "actions": list(payload.get("recovery_actions") or ["continue", "retry"]),
-                "payload": dict(payload),
+                "actions": list(recovery_payload.get("recovery_actions") or ["continue", "retry"]),
+                "branch_binding_id": branch_binding_id,
+                "payload": recovery_payload,
             }
-            self.recovery_ticket = ticket
+            self.recovery_tickets_by_branch[branch_binding_id] = ticket
+            selected_branch_id = str(
+                self.selected_branch_binding_id or self.branch_binding_id or "main"
+            ).strip()
+            if branch_binding_id == selected_branch_id:
+                self.recovery_ticket = ticket
             self.cond.notify_all()
             return dict(ticket)
 
-    def consume_recovery(self, action: str) -> tuple[str, dict[str, Any]]:
+    def consume_recovery(
+        self,
+        action: str,
+        *,
+        branch_binding_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         normalized = action if action in {"continue", "retry"} else "continue"
         with self.cond:
-            ticket = self.recovery_ticket
+            target_branch_id = str(
+                branch_binding_id
+                or self.selected_branch_binding_id
+                or self.branch_binding_id
+                or "main"
+            ).strip()
+            ticket = self._recovery_ticket_for_branch_locked(target_branch_id)
             if ticket is None or ticket.get("state") != "pending":
                 raise ValueError("recovery_not_available")
             actions = ticket.get("actions")
@@ -1507,13 +1625,36 @@ class _SessionRunProjection:
             ticket["action"] = normalized
             ticket["consumed_at"] = time.time()
             prompt = self._recovery_prompt(normalized, dict(ticket.get("payload") or {}))
-            self.done = False
-            self.running = True
-            self.status = "running"
-            self.finished_at = None
-            self.last_error = None
+            if self.recovery_ticket is ticket:
+                self.recovery_ticket = ticket
             self.cond.notify_all()
             return prompt, dict(ticket)
+
+    def _recovery_ticket_for_branch_locked(
+        self,
+        branch_binding_id: str | None,
+    ) -> dict[str, Any] | None:
+        branch_id = str(
+            branch_binding_id
+            or self.selected_branch_binding_id
+            or self.branch_binding_id
+            or "main"
+        ).strip()
+        ticket = self.recovery_tickets_by_branch.get(branch_id)
+        if ticket is not None:
+            return ticket
+        legacy = self.recovery_ticket
+        if not legacy:
+            return None
+        payload = legacy.get("payload") if isinstance(legacy.get("payload"), dict) else {}
+        legacy_branch_id = str(
+            legacy.get("branch_binding_id")
+            or payload.get("branch_binding_id")
+            or self.selected_branch_binding_id
+            or self.branch_binding_id
+            or "main"
+        ).strip()
+        return legacy if legacy_branch_id == branch_id else None
 
     def _recovery_prompt(self, action: str, payload: dict[str, Any]) -> str:
         if action == "retry" and self.initial_prompt:
