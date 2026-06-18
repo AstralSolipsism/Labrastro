@@ -737,6 +737,124 @@ def test_remote_session_run_branch_projection_root_base_uses_empty_parent_prefix
     assert len(session.events) == 4
 
 
+def test_remote_session_run_explicit_branch_wait_ignores_selected_done(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-background-wait",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-background-wait",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "done",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-bg",
+            "session_run_id": "run-background-wait",
+            "branch_binding_id": "branch-bg",
+            "agent_run_id": "agent-run-bg",
+            "target_agent_run_id": "agent-run-bg",
+            "selected": False,
+            "status": "running",
+        }
+    )
+    session.mark_done(branch_binding_id="main")
+
+    def append_background_event() -> None:
+        time.sleep(0.02)
+        session.append_event(
+            "assistant_message",
+            {
+                "session_item_id": "bg-msg-1",
+                "branch_binding_id": "branch-bg",
+                "content": "background branch finished later",
+            },
+        )
+
+    thread = threading.Thread(target=append_background_event)
+    thread.start()
+    try:
+        events, done, _cursor = session.wait_events(
+            0,
+            0.5,
+            branch_binding_id="branch-bg",
+        )
+    finally:
+        thread.join(timeout=1)
+
+    assert done is False
+    assert [event["payload"].get("content") for event in events] == [
+        "background branch finished later"
+    ]
+
+
+def test_remote_session_run_wait_events_ignores_hidden_branch_activity_for_wait(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-wait-hidden",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-a",
+            "session_run_id": "run-branch-wait-hidden",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-run-a",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "selected": False,
+            "status": "running",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-b",
+            "session_run_id": "run-branch-wait-hidden",
+            "branch_binding_id": "branch-b",
+            "agent_run_id": "agent-run-b",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "selected": False,
+            "status": "running",
+        }
+    )
+    session.append_event(
+        "assistant_message",
+        {
+            "session_item_id": "branch-b-msg",
+            "branch_binding_id": "branch-b",
+            "content": "hidden from branch A",
+        },
+    )
+
+    started_at = time.monotonic()
+    events, done, _cursor = session.wait_events(
+        0,
+        0.05,
+        branch_binding_id="branch-a",
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert events == []
+    assert done is False
+    assert elapsed >= 0.03
+
+
 def test_remote_session_run_pending_inputs_are_branch_local(tmp_path: Path) -> None:
     session = _SessionRunProjection(
         session_run_id="run-branch-pending",
@@ -779,11 +897,14 @@ def test_remote_session_run_pending_inputs_are_branch_local(tmp_path: Path) -> N
         {"kind": "clarification", "branch_binding_id": "branch-1"},
     )
 
-    status = session.status_payload(0)
+    status = session.status_payload(0, branch_binding_id="branch-1")
     branches = {item["branch_binding_id"]: item for item in status["branches"]}
 
     assert status["approvals"] == []
     assert [item["input_id"] for item in status["user_inputs"]] == ["input-branch"]
+    main_status = session.status_payload(0, branch_binding_id="main")
+    assert [item["approval_id"] for item in main_status["approvals"]] == ["approval-main"]
+    assert main_status["user_inputs"] == []
     assert branches["main"]["pending_approval_count"] == 1
     assert branches["branch-1"]["pending_user_input_count"] == 1
     assert (
@@ -804,6 +925,127 @@ def test_remote_session_run_pending_inputs_are_branch_local(tmp_path: Path) -> N
         )
         == "resolved"
     )
+    assert (
+        session.resolve_user_input(
+            "input-branch",
+            "decline",
+            {},
+            None,
+            branch_binding_id="main",
+        )
+        is None
+    )
+    assert (
+        session.resolve_user_input(
+            "input-branch",
+            "decline",
+            {},
+            None,
+            branch_binding_id="branch-1",
+        )
+        == "resolved"
+    )
+
+
+def test_remote_session_run_recovery_tickets_are_branch_local(tmp_path: Path) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-recovery",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    ticket_a = session.register_recovery(
+        {
+            "response": "branch A stopped",
+            "branch_binding_id": "branch-a",
+            "recovery_actions": ["continue"],
+        }
+    )
+    ticket_b = session.register_recovery(
+        {
+            "response": "branch B stopped",
+            "branch_binding_id": "branch-b",
+            "recovery_actions": ["continue"],
+        }
+    )
+
+    assert session.status_payload(0, branch_binding_id="branch-a")["recovery"][
+        "recovery_id"
+    ] == ticket_a["recovery_id"]
+    assert session.status_payload(0, branch_binding_id="branch-b")["recovery"][
+        "recovery_id"
+    ] == ticket_b["recovery_id"]
+    assert session.status_payload(0, branch_binding_id="main")["recovery"] is None
+
+    with pytest.raises(ValueError, match="recovery_not_available"):
+        session.consume_recovery("continue", branch_binding_id="main")
+
+    prompt, consumed = session.consume_recovery(
+        "continue", branch_binding_id="branch-a"
+    )
+
+    assert "branch A stopped" in prompt
+    assert consumed["recovery_id"] == ticket_a["recovery_id"]
+    assert session.status_payload(0, branch_binding_id="branch-a")["recovery"][
+        "state"
+    ] == "consumed"
+    assert session.status_payload(0, branch_binding_id="branch-b")["recovery"][
+        "state"
+    ] == "pending"
+
+
+def test_remote_session_run_cancel_requests_are_branch_local(tmp_path: Path) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-cancel",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.register_approval(
+        "approval-a",
+        {"tool_call_id": "tool-a", "branch_binding_id": "branch-a"},
+    )
+    session.register_approval(
+        "approval-b",
+        {"tool_call_id": "tool-b", "branch_binding_id": "branch-b"},
+    )
+    session.register_user_input(
+        "input-a",
+        {"kind": "clarification", "branch_binding_id": "branch-a"},
+    )
+    session.register_user_input(
+        "input-b",
+        {"kind": "clarification", "branch_binding_id": "branch-b"},
+    )
+
+    first_a, approvals_a, inputs_a = session.request_branch_cancel(
+        "cancel-a",
+        "branch-a",
+    )
+    second_a, approvals_a_again, inputs_a_again = session.request_branch_cancel(
+        "cancel-a-again",
+        "branch-a",
+    )
+    first_b, approvals_b, inputs_b = session.request_branch_cancel(
+        "cancel-b",
+        "branch-b",
+    )
+
+    assert first_a is True
+    assert second_a is False
+    assert first_b is True
+    assert [item["approval_id"] for item in approvals_a] == ["approval-a"]
+    assert [item["input_id"] for item in inputs_a] == ["input-a"]
+    assert approvals_a_again == []
+    assert inputs_a_again == []
+    assert [item["approval_id"] for item in approvals_b] == ["approval-b"]
+    assert [item["input_id"] for item in inputs_b] == ["input-b"]
+    assert session.status_payload(0, branch_binding_id="branch-a")["approvals"] == []
+    assert session.status_payload(0, branch_binding_id="branch-a")["user_inputs"] == []
+    assert session.status_payload(0, branch_binding_id="branch-b")["approvals"] == []
+    assert session.status_payload(0, branch_binding_id="branch-b")["user_inputs"] == []
 
 
 def test_remote_session_run_document_draft_preview_chunk_is_live_only(
@@ -4454,6 +4696,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": peer_token,
                     "session_run_id": session_run_id,
+                    "branch_binding_id": approval.get("branch_binding_id") or "main",
                     "approval_id": approval["approval_id"],
                     "decision": "allow_once",
                     "reason": "ok",
@@ -5117,6 +5360,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": new_peer_token,
                     "session_run_id": session_run_id,
+                    "branch_binding_id": status_body["branch_binding_id"],
                     "reason": "user_cancelled",
                 },
             )
@@ -5674,6 +5918,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": peer_token,
                     "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
                     "prompt": "second",
                     "client_request_id": "continue-1",
                 },
@@ -5689,7 +5934,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_session_run_continue_requires_selected_binding(self) -> None:
+    def test_session_run_continue_requires_branch_binding_id(self) -> None:
         relay = RelayServer()
         relay.start()
         port = _free_port()
@@ -5721,8 +5966,322 @@ class TestRemoteRelayHTTPService:
                     },
                 )
             body = json.loads(excinfo.value.read().decode("utf-8"))
-            assert excinfo.value.code == 409
-            assert body["error"] == "session_run_binding_not_found"
+            assert excinfo.value.code == 400
+            assert body["error"] == "branch_binding_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
+    @pytest.mark.parametrize(
+        ("path", "extra_payload"),
+        [
+            ("/remote/session-runs/cancel", {"reason": "user_cancelled"}),
+            ("/remote/session-runs/recover", {"action": "continue"}),
+            (
+                "/remote/approval/reply",
+                {
+                    "approval_id": "approval-1",
+                    "decision": "deny_once",
+                },
+            ),
+            (
+                "/remote/session-runs/user-input/reply",
+                {
+                    "input_id": "input-1",
+                    "action": "decline",
+                },
+            ),
+        ],
+    )
+    def test_session_run_control_requests_require_branch_binding_id(
+        self,
+        path: str,
+        extra_payload: dict[str, object],
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=AgentRunControlPlane(),
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_id = register_body["payload"]["peer_id"]
+            peer_token = register_body["payload"]["peer_token"]
+            session = service._create_session_run(peer_id, "chat-session-1")
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}{path}",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session.session_run_id,
+                        **extra_payload,
+                    },
+                )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "branch_binding_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_continue_targets_explicit_non_selected_branch(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            main_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch first",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-explicit-branch",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-a",
+                selected=False,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=main_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+            control.complete_agent_run_activation(
+                branch.id,
+                ExecutorRunResult(
+                    task_id=branch.id,
+                    status="completed",
+                    output="branch done",
+                ),
+                activation_id=_current_activation_id(control, branch.id),
+            )
+
+            status, continue_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/continue",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                    "prompt": "branch second",
+                    "client_request_id": "continue-branch-a",
+                },
+            )
+
+            assert status == 200
+            assert continue_body["ok"] is True
+            assert continue_body["agent_run_id"] == branch.id
+            assert continue_body["activation_id"] == f"{branch.id}:activation:2"
+            selected = control.find_session_run_binding(session_run_id=session_run_id)
+            assert selected is not None
+            assert selected.branch_binding_id == "main"
+
+            _, branch_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                },
+            )
+            assert branch_status["agent_run_id"] == branch.id
+            assert branch_status["branch_binding_id"] == "branch-a"
+            selected_status_code, selected_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                },
+            )
+            active_session = service._get_session_run(session_run_id)
+            assert selected_status_code == 200
+            assert selected_status["agent_run_id"] == main_agent_run_id
+            assert selected_status["branch_binding_id"] == "main"
+            assert active_session is not None
+            assert active_session.agent_run_id == main_agent_run_id
+            assert active_session.branch_binding_id == "main"
+            assert active_session.runtime_state.get("agent_run_id") != branch.id
+            assert active_session.runtime_state.get("branch_binding_id") != "branch-a"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_recover_targets_explicit_non_selected_branch(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            main_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch first",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-recover-branch",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-a",
+                selected=False,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=main_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+            control.complete_agent_run_activation(
+                branch.id,
+                ExecutorRunResult(
+                    task_id=branch.id,
+                    status="completed",
+                    output="branch done",
+                ),
+                activation_id=_current_activation_id(control, branch.id),
+            )
+            active_session = service._get_session_run(session_run_id)
+            assert active_session is not None
+            active_session.register_recovery(
+                {
+                    "branch_binding_id": "branch-a",
+                    "response": "partial branch response",
+                    "recovery_actions": ["continue"],
+                }
+            )
+
+            status, recover_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/recover",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                    "action": "continue",
+                },
+            )
+
+            assert status == 200
+            assert recover_body["ok"] is True
+            selected = control.find_session_run_binding(session_run_id=session_run_id)
+            assert selected is not None
+            assert selected.branch_binding_id == "main"
+            assert active_session.agent_run_id == main_agent_run_id
+            assert active_session.branch_binding_id == "main"
+            assert active_session.runtime_state.get("agent_run_id") != branch.id
+            assert active_session.runtime_state.get("branch_binding_id") != "branch-a"
+
+            _, branch_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                },
+            )
+            assert branch_status["agent_run_id"] == branch.id
+            assert branch_status["branch_binding_id"] == "branch-a"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_cancel_targets_explicit_non_selected_branch_without_polluting_selected_state(
+        self,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            main_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch first",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-cancel-branch",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-a",
+                selected=False,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=main_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+            active_session = service._get_session_run(session_run_id)
+            assert active_session is not None
+
+            status, cancel_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/cancel",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                    "reason": "cancel-branch-a",
+                },
+            )
+
+            assert status == 200
+            assert cancel_body["ok"] is True
+            assert control.get_agent_run(branch.id).status.value == "cancelled"
+            selected = control.find_session_run_binding(session_run_id=session_run_id)
+            assert selected is not None
+            assert selected.branch_binding_id == "main"
+            assert active_session.agent_run_id == main_agent_run_id
+            assert active_session.branch_binding_id == "main"
+            assert active_session.status != "cancelled"
+            assert active_session.last_error is None
+            branches = {
+                item["branch_binding_id"]: item
+                for item in active_session.branch_summaries(0)
+            }
+            assert branches["branch-a"]["status"] == "cancelled"
+            assert branches["main"]["status"] != "cancelled"
+            assert any(
+                event["type"] == "session_run_cancelled"
+                and event["payload"].get("branch_binding_id") == "branch-a"
+                for event in active_session.events
+            )
         finally:
             service.stop()
             relay.stop()
@@ -5822,6 +6381,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": "main",
                     "reason": "user_cancelled",
                 },
             )

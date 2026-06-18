@@ -2934,6 +2934,7 @@ class TestRunnerRemoteExec:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": payload.get("branch_binding_id") or start_body.get("branch_binding_id") or "main",
                     "approval_id": payload["approval_id"],
                     "decision": "allow_once",
                 },
@@ -3039,6 +3040,7 @@ class TestRunnerRemoteExec:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": approval_payload.get("branch_binding_id") or start_body.get("branch_binding_id") or "main",
                     "approval_id": approval_payload["approval_id"],
                     "decision": "allow_once",
                 },
@@ -3131,6 +3133,7 @@ class TestRunnerRemoteExec:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": approval_payload.get("branch_binding_id") or start_body.get("branch_binding_id") or "main",
                     "approval_id": approval_payload["approval_id"],
                     "decision": "allow_once",
                 },
@@ -3479,6 +3482,7 @@ class TestRunnerRemoteExec:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": approval_payload.get("branch_binding_id") or start_body.get("branch_binding_id") or "main",
                     "approval_id": approval_payload["approval_id"],
                     "decision": "deny_once",
                 },
@@ -3597,6 +3601,7 @@ class TestRunnerRemoteExec:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": start_body.get("branch_binding_id") or "main",
                     "reason": "user_cancelled",
                 },
             )

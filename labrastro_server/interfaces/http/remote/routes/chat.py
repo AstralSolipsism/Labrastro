@@ -179,6 +179,51 @@ class RemoteChatRoutes:
             session.record_branch_binding(binding)
         return binding
 
+    def _session_run_binding_for_branch(
+        self,
+        session,
+        branch_binding_id: str | None,
+        peer_id: str | None = None,
+        *,
+        required: bool = True,
+    ):
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            if required:
+                self._send_error(HTTPStatus.BAD_REQUEST, "branch_binding_id_required")
+                return None
+            return self._selected_session_run_binding(session, peer_id)
+        runtime = self.service.runtime_control_plane
+        if runtime is None:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "agent_runs_unavailable")
+            return None
+        finder = getattr(runtime, "find_session_run_binding", None)
+        if not callable(finder):
+            self._send_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "session_run_bindings_unavailable",
+            )
+            return None
+        binding = finder(
+            session_run_id=session.session_run_id,
+            branch_binding_id=branch_id,
+            selected_only=False,
+        )
+        if binding is None:
+            self._send_error(HTTPStatus.NOT_FOUND, "session_run_branch_binding_not_found")
+            return None
+        if peer_id is not None and not self._session_binding_peer_matches(binding, peer_id):
+            self._send_error(HTTPStatus.FORBIDDEN, "session_run_binding_peer_mismatch")
+            return None
+        lister = getattr(runtime, "list_session_run_bindings", None)
+        if callable(lister) and hasattr(session, "sync_branch_bindings"):
+            session.sync_branch_bindings(
+                lister(session_run_id=session.session_run_id)
+            )
+        elif hasattr(session, "record_branch_binding"):
+            session.record_branch_binding(binding)
+        return binding
+
     def _send_session_run_status_response(self, session, binding, cursor: int) -> None:
         agent_run = None
         try:
@@ -188,7 +233,10 @@ class RemoteChatRoutes:
         except Exception:
             self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
             return
-        status_payload = session.status_payload(cursor)
+        status_payload = session.status_payload(
+            cursor,
+            branch_binding_id=binding.branch_binding_id,
+        )
         run_status = str(agent_run.status.value)
         terminal = bool(getattr(agent_run, "is_terminal", False))
         runtime_state = (
@@ -407,7 +455,11 @@ class RemoteChatRoutes:
         if control is None:
             return
         peer_id, session = control
-        binding = self._selected_session_run_binding(session, peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            peer_id,
+        )
         if binding is None:
             return
         try:
@@ -435,18 +487,19 @@ class RemoteChatRoutes:
                 str(exc) or "AgentRun is not continuable",
             )
             return
-        session.done = False
-        session.finished_at = None
-        session.mark_running()
-        session.agent_run_id = agent_run.id
-        session.branch_binding_id = binding.branch_binding_id
-        session.runtime_state.update(
-            {
-                "agent_run_id": agent_run.id,
-                "activation_id": str(agent_run.current_activation_id or ""),
-                "branch_binding_id": binding.branch_binding_id,
-            }
-        )
+        if getattr(binding, "selected", False):
+            session.done = False
+            session.finished_at = None
+            session.mark_running()
+            session.agent_run_id = agent_run.id
+            session.branch_binding_id = binding.branch_binding_id
+            session.runtime_state.update(
+                {
+                    "agent_run_id": agent_run.id,
+                    "activation_id": str(agent_run.current_activation_id or ""),
+                    "branch_binding_id": binding.branch_binding_id,
+                }
+            )
         session.append_event(
             "session_run_continue",
             {
@@ -510,18 +563,34 @@ class RemoteChatRoutes:
         if control is None:
             return
         control_peer_id, session = control
-        binding = self._selected_session_run_binding(session, control_peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            control_peer_id,
+            required=False,
+        )
         if binding is None:
             return
 
         self._send_sse_headers()
         cursor = int(req.cursor)
         wait_timeout = _sse_wait_timeout(req.timeout_sec)
+        explicit_branch_stream = bool(str(req.branch_binding_id or "").strip())
         while True:
             try:
                 events, done, next_cursor = session.wait_events(
-                    cursor, wait_timeout
+                    cursor,
+                    wait_timeout,
+                    branch_binding_id=binding.branch_binding_id,
                 )
+                try:
+                    agent_run = self.service.runtime_control_plane.get_agent_run(
+                        binding.agent_run_id
+                    )
+                    branch_done = bool(getattr(agent_run, "is_terminal", False))
+                    done = branch_done if explicit_branch_stream else branch_done or done
+                except Exception:
+                    done = done
                 if events or done:
                     self._write_sse_event(
                         "session_run",
@@ -530,6 +599,7 @@ class RemoteChatRoutes:
                             done=done,
                             next_cursor=next_cursor,
                             branches=session.branch_summaries(cursor),
+                            branch_binding_id=binding.branch_binding_id,
                         ).to_dict(),
                     )
                     cursor = next_cursor
@@ -572,7 +642,12 @@ class RemoteChatRoutes:
         if control is None:
             return
         control_peer_id, session = control
-        binding = self._selected_session_run_binding(session, control_peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            control_peer_id,
+            required=False,
+        )
         if binding is None:
             return
         self._send_session_run_status_response(session, binding, req.cursor)
@@ -642,14 +717,18 @@ class RemoteChatRoutes:
         if control is None:
             return
         control_peer_id, session = control
-        binding = self._selected_session_run_binding(session, control_peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            control_peer_id,
+        )
         if binding is None:
             return
 
         reason = req.reason or "session_run_cancelled"
-        first_request, resolved_approvals = session.request_cancel(
+        first_request, resolved_approvals, resolved_user_inputs = session.request_branch_cancel(
             reason,
-            branch_binding_id=binding.branch_binding_id,
+            binding.branch_binding_id,
         )
         ok = self.service.runtime_control_plane.cancel_agent_run(
             binding.agent_run_id,
@@ -657,12 +736,19 @@ class RemoteChatRoutes:
         )
         if first_request:
             session.append_event(
-                "session_run_cancel_requested", {"reason": reason}
+                "session_run_cancel_requested",
+                {"reason": reason, "branch_binding_id": binding.branch_binding_id},
             )
             for event_payload in resolved_approvals:
                 session.append_event("approval_resolved", event_payload)
-            session.append_event("session_run_cancelled", {"reason": reason})
-            session.mark_done(reason)
+            for event_payload in resolved_user_inputs:
+                session.append_event("user_input_resolved", event_payload)
+            session.append_event(
+                "session_run_cancelled",
+                {"reason": reason, "branch_binding_id": binding.branch_binding_id},
+            )
+            if getattr(binding, "selected", False):
+                session.mark_done(reason, branch_binding_id=binding.branch_binding_id)
         self._send_json(
             HTTPStatus.OK, SessionRunCancelResponse(ok=ok).to_dict()
         )
@@ -679,14 +765,21 @@ class RemoteChatRoutes:
         if control is None:
             return
         peer_id, session = control
-        binding = self._selected_session_run_binding(session, peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            peer_id,
+        )
         if binding is None:
             return
-        if session.running:
+        if getattr(binding, "selected", False) and session.running:
             self._send_error(HTTPStatus.CONFLICT, "session_run_already_running")
             return
         try:
-            prompt, ticket = session.consume_recovery(req.action)
+            prompt, ticket = session.consume_recovery(
+                req.action,
+                branch_binding_id=binding.branch_binding_id,
+            )
         except ValueError as exc:
             self._send_error(HTTPStatus.CONFLICT, str(exc) or "recovery_not_available")
             return
@@ -695,6 +788,7 @@ class RemoteChatRoutes:
             {
                 "recovery_id": ticket.get("recovery_id"),
                 "action": ticket.get("action"),
+                "branch_binding_id": binding.branch_binding_id,
             },
         )
         try:
@@ -721,18 +815,19 @@ class RemoteChatRoutes:
                 str(exc) or "AgentRun is not continuable",
             )
             return
-        session.done = False
-        session.finished_at = None
-        session.agent_run_id = agent_run.id
-        session.branch_binding_id = binding.branch_binding_id
-        session.runtime_state.update(
-            {
-                "agent_run_id": agent_run.id,
-                "activation_id": str(agent_run.current_activation_id or ""),
-                "branch_binding_id": binding.branch_binding_id,
-            }
-        )
-        session.mark_running()
+        if getattr(binding, "selected", False):
+            session.done = False
+            session.finished_at = None
+            session.agent_run_id = agent_run.id
+            session.branch_binding_id = binding.branch_binding_id
+            session.runtime_state.update(
+                {
+                    "agent_run_id": agent_run.id,
+                    "activation_id": str(agent_run.current_activation_id or ""),
+                    "branch_binding_id": binding.branch_binding_id,
+                }
+            )
+            session.mark_running()
         self._send_json(
             HTTPStatus.OK,
             SessionRunRecoverResponse(
@@ -754,7 +849,11 @@ class RemoteChatRoutes:
         if control is None:
             return
         control_peer_id, session = control
-        binding = self._selected_session_run_binding(session, control_peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            control_peer_id,
+        )
         if binding is None:
             return
         if req.decision not in {"allow_once", "deny_once"}:
@@ -792,7 +891,11 @@ class RemoteChatRoutes:
         if control is None:
             return
         control_peer_id, session = control
-        binding = self._selected_session_run_binding(session, control_peer_id)
+        binding = self._session_run_binding_for_branch(
+            session,
+            req.branch_binding_id,
+            control_peer_id,
+        )
         if binding is None:
             return
         if req.action not in {"accept", "decline", "cancel"}:
