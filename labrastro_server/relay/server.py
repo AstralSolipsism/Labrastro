@@ -1,4 +1,4 @@
-"""Host-side relay server for remote tool execution."""
+"""Host-side peer lifecycle and capability-fact control service."""
 
 from __future__ import annotations
 
@@ -13,21 +13,21 @@ from labrastro_server.relay.peer_registry import PeerRegistry
 from labrastro_server.interfaces.http.remote.protocol import (
     ErrorMessage,
     Heartbeat,
+    PeerControlMessage,
     RemoteMCPToolInfo,
     RegisterRejected,
     RegisterRequest,
     RegisterResponse,
-    RelayEnvelope,
 )
 
 
-SendFn = Callable[[str, RelayEnvelope], None]
+SendFn = Callable[[str, PeerControlMessage], None]
 
 
 class RelayServer:
     """Host relay server: manages peer lifecycle and peer capability facts.
 
-    Transport-agnostic: inject a ``send_fn(peer_id, envelope)`` that performs
+    Transport-agnostic: inject a ``send_fn(peer_id, message)`` that performs
     actual I/O (WebSocket, in-memory queue, etc.).
     """
 
@@ -102,20 +102,22 @@ class RelayServer:
     # Public: inbound message handling (called by transport layer)
     # ------------------------------------------------------------------
 
-    def handle_inbound(self, peer_id: str | None, envelope: RelayEnvelope) -> None:
+    def handle_inbound(
+        self, peer_id: str | None, message: PeerControlMessage
+    ) -> None:
         """Process a message received from a peer."""
         if self._loop is None:
             return
         asyncio.run_coroutine_threadsafe(
-            self._handle_inbound_async(peer_id, envelope), self._loop
+            self._handle_inbound_async(peer_id, message), self._loop
         )
 
     async def _handle_inbound_async(
-        self, peer_id: str | None, envelope: RelayEnvelope
+        self, peer_id: str | None, message: PeerControlMessage
     ) -> None:
-        msg_type = envelope.type
-        payload = envelope.payload
-        req_id = envelope.request_id
+        msg_type = message.type
+        payload = message.payload
+        req_id = message.request_id
 
         if msg_type == "register":
             req = RegisterRequest.from_dict(payload)
@@ -124,7 +126,7 @@ class RelayServer:
                 if isinstance(resp, RegisterResponse):
                     self._send(
                         resp.peer_id,
-                        RelayEnvelope(
+                        PeerControlMessage(
                             type="register_ok",
                             request_id=req_id,
                             peer_id=resp.peer_id,
@@ -134,7 +136,7 @@ class RelayServer:
                 else:
                     self._send(
                         "",
-                        RelayEnvelope(
+                        PeerControlMessage(
                             type="register_rejected",
                             request_id=req_id,
                             payload=resp.to_dict(),
@@ -143,7 +145,7 @@ class RelayServer:
             except RegisterRejectedError as e:
                 self._send(
                     "",
-                    RelayEnvelope(
+                    PeerControlMessage(
                         type="register_rejected",
                         request_id=req_id,
                         payload=RegisterRejected(reason=e.message).to_dict(),
@@ -167,7 +169,7 @@ class RelayServer:
             if req_id:
                 self._send(
                     peer_id or "",
-                    RelayEnvelope(
+                    PeerControlMessage(
                         type="error_ack",
                         request_id=req_id,
                         peer_id=peer_id or "",
@@ -217,10 +219,10 @@ class RelayServer:
     # Internal: request/response correlation
     # ------------------------------------------------------------------
 
-    def _send(self, peer_id: str, envelope: RelayEnvelope) -> None:
+    def _send(self, peer_id: str, message: PeerControlMessage) -> None:
         if self._send_fn is not None:
             try:
-                self._send_fn(peer_id, envelope)
+                self._send_fn(peer_id, message)
             except Exception:
                 pass
 

@@ -34,8 +34,8 @@ class Ok:
 
 
 @dataclass
-class RelayEnvelope:
-    """Top-level message wrapper for all relay communications."""
+class PeerControlMessage:
+    """Top-level message wrapper for peer lifecycle/control messages."""
 
     type: str
     request_id: str | None = None
@@ -51,7 +51,7 @@ class RelayEnvelope:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "RelayEnvelope":
+    def from_dict(cls, d: dict[str, Any]) -> "PeerControlMessage":
         return cls(
             type=d["type"],
             request_id=d.get("request_id"),
@@ -171,7 +171,7 @@ class DisconnectNotice:
 __all__ = [
     "Empty",
     "Ok",
-    "RelayEnvelope",
+    "PeerControlMessage",
     "RegisterRequest",
     "RegisterResponse",
     "RegisterRejected",

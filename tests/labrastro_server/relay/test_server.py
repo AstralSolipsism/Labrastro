@@ -1,4 +1,4 @@
-﻿"""Tests for remote execution relay server."""
+﻿"""Tests for peer lifecycle control server."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from labrastro_server.relay.errors import (
 from labrastro_server.interfaces.http.remote.protocol import (
     Heartbeat,
     RegisterRequest,
+    PeerControlMessage,
     RegisterResponse,
-    RelayEnvelope,
 )
 from labrastro_server.relay.server import RelayServer
 
@@ -110,12 +110,12 @@ class TestHeartbeat:
             before = srv.registry.get(resp.peer_id).last_seen_at
             time.sleep(0.02)
             hb = Heartbeat(peer_token=resp.peer_token)
-            env = RelayEnvelope(
+            message = PeerControlMessage(
                 type="heartbeat",
                 peer_id=resp.peer_id,
                 payload=hb.to_dict(),
             )
-            srv.handle_inbound(resp.peer_id, env)
+            srv.handle_inbound(resp.peer_id, message)
             time.sleep(0.05)
             after = srv.registry.get(resp.peer_id).last_seen_at
             assert after > before

@@ -39,11 +39,11 @@ from labrastro_server.interfaces.http.remote.protocol import (
     MCPServerManifest,
     PeerDisconnectRequest,
     PeerMCPToolsReport,
+    PeerControlMessage,
     RemoteMCPToolInfo,
     RegisterRejected,
     RegisterRequest,
     RegisterResponse,
-    RelayEnvelope,
     REMOTE_ENDPOINTS,
     SessionModelSwitchRequest,
     SessionListRequest,
@@ -66,16 +66,16 @@ def _contract_fixtures() -> dict:
     return json.loads(CONTRACT_FIXTURES_PATH.read_text(encoding="utf-8"))
 
 
-class TestRelayEnvelope:
+class TestPeerControlMessage:
     def test_roundtrip(self) -> None:
-        env = RelayEnvelope(
+        message = PeerControlMessage(
             type="heartbeat",
             request_id="req-123",
             peer_id="peer-456",
             payload={"peer_token": "pt_tok"},
         )
-        d = env.to_dict()
-        restored = RelayEnvelope.from_dict(d)
+        d = message.to_dict()
+        restored = PeerControlMessage.from_dict(d)
         assert restored.type == "heartbeat"
         assert restored.request_id == "req-123"
         assert restored.peer_id == "peer-456"
