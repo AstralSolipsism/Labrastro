@@ -93,6 +93,12 @@ from labrastro_server.services.agent_runtime.runtime_policy import (
 )
 from labrastro_server.services.agent_runtime.worktree import WorktreeManager
 from labrastro_server.services.sandbox.provider import SandboxProfile, SandboxProvider
+from reuleauxcoder.domain.config.models import (
+    AgentRegistryConfig,
+    RuntimeProfilesConfig,
+    RunLimitsConfig,
+    build_agent_run_snapshot,
+)
 
 
 def _new_id(prefix: str) -> str:
@@ -694,7 +700,10 @@ def _session_run_binding_id(
     session_run_id: str,
     branch_binding_id: str = "",
 ) -> str:
-    branch_part = _safe_binding_part(branch_binding_id or "main")
+    normalized_branch_binding_id = str(branch_binding_id or "").strip()
+    if not normalized_branch_binding_id:
+        raise ValueError("branch_binding_id is required")
+    branch_part = _safe_binding_part(normalized_branch_binding_id)
     return "session-run-binding:" + ":".join(
         [
             _safe_binding_part(session_run_id),
@@ -1127,7 +1136,15 @@ class AgentRunControlPlane:
         sandbox_profile: SandboxProfile | None = None,
     ) -> None:
         self.max_running_tasks = max(1, int(max_running_tasks or 1))
-        self.runtime_snapshot = dict(runtime_snapshot or {})
+        self.runtime_snapshot = (
+            dict(runtime_snapshot)
+            if runtime_snapshot is not None
+            else build_agent_run_snapshot(
+                agent_registry=AgentRegistryConfig(),
+                runtime_profiles=RuntimeProfilesConfig(),
+                run_limits=RunLimitsConfig(),
+            )
+        )
         self.pr_flow = pr_flow or InMemoryPRFlow()
         self._store = store
         if self._store is not None:
@@ -1148,9 +1165,19 @@ class AgentRunControlPlane:
                         or 1
                     ),
                 )
-                self.runtime_snapshot = dict(
+                store_runtime_snapshot = dict(
                     getattr(self._store, "runtime_snapshot", {}) or {}
                 )
+                if store_runtime_snapshot:
+                    self.runtime_snapshot = store_runtime_snapshot
+                else:
+                    self._store.configure(
+                        max_running_tasks=self.max_running_tasks,
+                        runtime_snapshot=self.runtime_snapshot,
+                    )
+                    self.runtime_snapshot = dict(
+                        getattr(self._store, "runtime_snapshot", {}) or self.runtime_snapshot
+                    )
         self._sandbox_provider = sandbox_provider
         self._sandbox_profile = sandbox_profile
         self._lock = threading.RLock()
@@ -1825,16 +1852,19 @@ class AgentRunControlPlane:
             raise ValueError("session_run_id is required")
         if not normalized_agent_run_id:
             raise ValueError("agent_run_id is required")
+        normalized_branch_binding_id = str(branch_binding_id or "").strip()
+        if not normalized_branch_binding_id:
+            raise ValueError("branch_binding_id is required")
         binding_id = _session_run_binding_id(
             session_run_id=normalized_session_run_id,
-            branch_binding_id=branch_binding_id,
+            branch_binding_id=normalized_branch_binding_id,
         )
         binding = SessionRunBinding(
             id=binding_id,
             session_run_id=normalized_session_run_id,
             session_id=str(session_id or "").strip(),
             peer_id=str(peer_id or "").strip(),
-            branch_binding_id=str(branch_binding_id or binding_id).strip(),
+            branch_binding_id=normalized_branch_binding_id,
             agent_run_id=normalized_agent_run_id,
             selected=selected,
             parent_branch_binding_id=str(parent_branch_binding_id or "").strip(),
@@ -2932,8 +2962,49 @@ class AgentRunControlPlane:
                 self._claims.pop(request_id, None)
         return recovered
 
+    def _session_run_binding_metadata_for_task_locked(
+        self,
+        task: AgentRun,
+    ) -> dict[str, str]:
+        session_run_id = str(task.owner_session_run_id or "").strip()
+        if not session_run_id:
+            return {}
+        if self._store is not None:
+            lister = getattr(self._store, "list_session_run_bindings", None)
+            if not callable(lister):
+                return {}
+            bindings = lister(
+                session_run_id=session_run_id,
+                status=SessionRunBindingStatus.ACTIVE,
+            )
+        else:
+            bindings = [
+                binding
+                for binding in self._session_run_bindings.values()
+                if binding.session_run_id == session_run_id
+                and binding.status == SessionRunBindingStatus.ACTIVE
+            ]
+        for binding in bindings:
+            if binding.agent_run_id != task.id and binding.target_agent_run_id != task.id:
+                continue
+            branch_binding_id = str(binding.branch_binding_id or "").strip()
+            agent_run_id = str(binding.agent_run_id or "").strip()
+            if not branch_binding_id or not agent_run_id:
+                return {}
+            return {
+                "session_run_id": str(binding.session_run_id or ""),
+                "session_run_binding_id": str(binding.id or ""),
+                "branch_binding_id": branch_binding_id,
+                "binding_agent_run_id": agent_run_id,
+                "parent_branch_binding_id": str(binding.parent_branch_binding_id or ""),
+            }
+        return {}
+
     def _executor_metadata(self, task: AgentRun) -> dict[str, Any]:
         metadata = dict(task.metadata)
+        for key, value in self._session_run_binding_metadata_for_task_locked(task).items():
+            if value:
+                metadata.setdefault(key, value)
         executor = task.executor or ExecutorType.REULEAUXCODER
         if task.worktree_role is not None:
             metadata.setdefault("worktree_role", task.worktree_role.value)

@@ -26,6 +26,12 @@ def runtime_agent_run_id(agent: Any) -> str:
     )
 
 
+def runtime_branch_binding_id(agent: Any) -> str:
+    """Return the branch binding id for the current AgentRun runtime scope."""
+
+    return _runtime_attr(agent, "runtime_branch_binding_id")
+
+
 def runtime_workspace_root(agent: Any) -> str:
     """Return the stable workspace root for the current runtime."""
 
@@ -72,6 +78,7 @@ def runtime_boundary_fields(agent: Any) -> dict[str, str]:
         return {}
     return {
         "agent_run_id": runtime_agent_run_id(agent),
+        "branch_binding_id": runtime_branch_binding_id(agent),
         "runtime_workspace_root": runtime_workspace_root(agent),
         "runtime_working_directory": runtime_working_directory(agent),
         "execution_target": runtime_execution_target(agent),

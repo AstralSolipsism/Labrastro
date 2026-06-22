@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from reuleauxcoder.domain.agent.events import AgentEvent, ToolFailureKind
 from reuleauxcoder.domain.agent.runtime_boundary import (
     runtime_agent_run_id,
+    runtime_branch_binding_id,
     runtime_path_space,
     runtime_workspace_root,
     runtime_working_directory,
@@ -192,6 +193,7 @@ class ToolExecutor:
         context = {
             "session_run_id": str(getattr(self.agent, "current_session_id", "") or ""),
             "agent_run_id": runtime_agent_run_id(self.agent),
+            "branch_binding_id": runtime_branch_binding_id(self.agent),
             "turn_id": str(getattr(self.agent, "runtime_turn_id", "") or ""),
             "tool_call_id": str(getattr(tool_call, "id", "") or ""),
             "tool_name": str(getattr(tool_call, "name", "") or ""),
@@ -207,6 +209,7 @@ class ToolExecutor:
                 event_payload = dict(payload)
                 event_payload.setdefault("session_run_id", context["session_run_id"])
                 event_payload.setdefault("agent_run_id", context["agent_run_id"])
+                event_payload.setdefault("branch_binding_id", context["branch_binding_id"])
                 event_payload.setdefault("turn_id", context["turn_id"])
                 event_payload.setdefault("tool_call_id", context["tool_call_id"])
                 event_payload.setdefault("tool_name", context["tool_name"])

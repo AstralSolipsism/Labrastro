@@ -321,6 +321,7 @@ def test_reuleauxcoder_backend_captures_mcp_elicitation_lifecycle_from_tool_cont
                     "event_name": "Elicitation",
                     "session_run_id": self.context["session_run_id"],
                     "agent_run_id": self.context["agent_run_id"],
+                    "branch_binding_id": self.context["branch_binding_id"],
                     "turn_id": self.context["turn_id"],
                     "tool_call_id": self.context["tool_call_id"],
                     "tool_name": self.context["tool_name"],
@@ -335,6 +336,7 @@ def test_reuleauxcoder_backend_captures_mcp_elicitation_lifecycle_from_tool_cont
                     "event_name": "ElicitationResult",
                     "session_run_id": self.context["session_run_id"],
                     "agent_run_id": self.context["agent_run_id"],
+                    "branch_binding_id": self.context["branch_binding_id"],
                     "turn_id": self.context["turn_id"],
                     "tool_call_id": self.context["tool_call_id"],
                     "tool_name": self.context["tool_name"],
@@ -393,6 +395,7 @@ def test_reuleauxcoder_backend_captures_mcp_elicitation_lifecycle_from_tool_cont
             agent_id="reviewer",
             executor="reuleauxcoder",
             prompt="run",
+            metadata={"branch_binding_id": "branch-a"},
         )
     )
 
@@ -404,6 +407,7 @@ def test_reuleauxcoder_backend_captures_mcp_elicitation_lifecycle_from_tool_cont
         "ElicitationResult",
     ]
     assert lifecycle_events[0]["agent_run_id"] == "agent-run-1"
+    assert lifecycle_events[0]["branch_binding_id"] == "branch-a"
     assert lifecycle_events[0]["session_run_id"] == "session-1"
     assert lifecycle_events[0]["tool_call_id"] == "call-mcp-1"
     assert lifecycle_events[0]["tool_name"] == "search"
@@ -1134,6 +1138,41 @@ def test_reuleauxcoder_backend_detaches_lifecycle_hook_handler_after_failure() -
     ]
     assert result.events[1].data["phase"] == "dispatch_failed"
     assert agent._event_handlers == []
+
+
+def test_reuleauxcoder_backend_preserves_chat_exception_diagnostics() -> None:
+    backend_module = _executor_backend()
+
+    class FakeAgent:
+        current_session_id = "session-1"
+
+        def chat(self, prompt: str, *, clear_stop_request: bool = True) -> str:  # noqa: ARG002
+            error = RuntimeError("Connection error.")
+            setattr(error, "llm_diagnostic_path", "/tmp/llm_error_session.json")
+            setattr(error, "provider_error_phase", "request_start")
+            raise error
+
+    backend = backend_module.ReuleauxCoderExecutorBackend(
+        create_agent=lambda _request: FakeAgent()
+    )
+    result = backend.start(
+        backend_module.ExecutorRunRequest(
+            task_id="task-1",
+            agent_id="reviewer",
+            executor="reuleauxcoder",
+            prompt="run",
+        )
+    )
+
+    error_events = [event for event in result.events if event.type.value == "error"]
+    assert result.status == "failed"
+    assert error_events
+    assert error_events[0].text == "Connection error."
+    assert error_events[0].data["error_type"] == "RuntimeError"
+    assert error_events[0].data["provider_error_phase"] == "request_start"
+    assert error_events[0].data["diagnostic_path"].endswith(
+        "llm_error_session.json"
+    )
 
 
 def test_reuleauxcoder_backend_binds_permission_context_to_agent() -> None:

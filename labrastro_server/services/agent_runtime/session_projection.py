@@ -16,6 +16,63 @@ PUBLIC_PAYLOAD_STRING_MAX_CHARS = 4000
 OUTPUT_SUMMARY_HEAD_CHARS = 1200
 OUTPUT_SUMMARY_TAIL_CHARS = 1200
 DEFAULT_OUTPUT_TRUNCATION_MARKER = "\n... output omitted from the main timeline; open raw events for the complete content ...\n"
+TOOL_ARGUMENTS_PREVIEW_MAX_CHARS = 240
+
+_SESSION_RUN_EVENT_PASSTHROUGH_TYPES = frozenset(
+    {
+        "agent_event",
+        "approval_event",
+        "approval_request",
+        "approval_resolved",
+        "assistant_delta",
+        "assistant_message",
+        "command_event",
+        "context_event",
+        "document_draft_cancelled",
+        "document_draft_commit_requested",
+        "document_draft_committed",
+        "document_draft_failed",
+        "document_draft_preview_chunk",
+        "document_draft_progress",
+        "document_draft_snapshot",
+        "document_draft_started",
+        "draft_body_stalled",
+        "draft_interrupted_recoverable",
+        "error",
+        "file_change_approval_requested",
+        "file_change_approval_resolved",
+        "file_change_completed",
+        "file_change_patch_updated",
+        "file_change_started",
+        "lifecycle_hook",
+        "mcp_event",
+        "memory_context",
+        "model_event",
+        "mutation_preview_failed",
+        "mutation_preview_ready",
+        "mutation_previewing",
+        "provider_stream_interrupted",
+        "provider_stream_recovered",
+        "provider_stream_recovering",
+        "reasoning_delta",
+        "reasoning_message",
+        "remote_event",
+        "runtime_status",
+        "session_event",
+        "session_run_interrupted",
+        "stream_observability",
+        "system_event",
+        "tool_arguments_complete",
+        "tool_arguments_invalid",
+        "tool_arguments_valid",
+        "tool_call_delta",
+        "tool_call_protocol_error",
+        "tool_call_stream",
+        "turn_diff_updated",
+        "ui_event",
+        "view",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -59,11 +116,27 @@ def agent_run_event_to_session_events(
         "workflow": labels.workflow,
         "raw_event_refs": [_raw_event_ref(event)],
     }
+    if event_type == "session_run_event":
+        envelope = _event_data(data)
+        session_event_type = str(envelope.get("event_type") or "").strip()
+        if session_event_type not in _SESSION_RUN_EVENT_PASSTHROUGH_TYPES:
+            return []
+        event_payload = (
+            dict(envelope.get("payload"))
+            if isinstance(envelope.get("payload"), dict)
+            else {}
+        )
+        public_payload = _session_run_event_passthrough_payload(
+            session_event_type,
+            event_payload,
+            marker=labels.output_truncation_marker,
+        )
+        return [(session_event_type, {**base, **public_payload})]
     if event_type == "queued":
         task = data.get("agent_run") if isinstance(data.get("agent_run"), dict) else {}
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     labels.queued_title,
@@ -75,7 +148,7 @@ def agent_run_event_to_session_events(
     if event_type == "claimed":
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     labels.claimed_title,
@@ -95,7 +168,7 @@ def agent_run_event_to_session_events(
         activation = data.get("activation") if isinstance(data.get("activation"), dict) else {}
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{labels.agent_id} activation queued",
@@ -114,7 +187,7 @@ def agent_run_event_to_session_events(
         activation = data.get("activation") if isinstance(data.get("activation"), dict) else {}
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{labels.agent_id} activation completed",
@@ -138,7 +211,7 @@ def agent_run_event_to_session_events(
         steer_status = str(steer.get("status") or event_type.rsplit("_", 1)[-1])
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{labels.agent_id} activation steer {steer_status}",
@@ -173,7 +246,7 @@ def agent_run_event_to_session_events(
             status = str(agent_call.get("status") or "")
             return [
                 (
-                    "context_event",
+                    "agent_run_event",
                     _context_event(
                         labels,
                         f"{agent_id} {status}".strip(),
@@ -194,7 +267,7 @@ def agent_run_event_to_session_events(
         )
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{labels.agent_id} feedback {'consumed' if event_type == 'agent_run_feedback_consumed' else 'added'}",
@@ -218,7 +291,7 @@ def agent_run_event_to_session_events(
         status = str(agent_call.get("status") or "")
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{agent_id} {status}".strip(),
@@ -239,7 +312,7 @@ def agent_run_event_to_session_events(
         )
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     title,
@@ -303,7 +376,7 @@ def agent_run_event_to_session_events(
             return []
         status_events = [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{labels.agent_id} {status}",
@@ -343,7 +416,7 @@ def agent_run_event_to_session_events(
         public_meta.update(_prefixed_projection_meta("log", text_meta))
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     text or labels.log_fallback_title,
@@ -376,7 +449,7 @@ def agent_run_event_to_session_events(
         status = str(result_data.get("status") or "completed")
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     labels.terminal_titles.get(status, f"{labels.agent_id} result"),
@@ -389,7 +462,7 @@ def agent_run_event_to_session_events(
         usage_data = _event_data(data)
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{labels.agent_id} usage updated",
@@ -443,7 +516,7 @@ def agent_run_event_to_session_events(
         error = str(data.get("error") or "")
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     f"{child_agent_id or 'related agent'} {status}",
@@ -486,6 +559,7 @@ def agent_run_event_to_session_events(
                     **base,
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
+                    **({"index": tool_data.get("index")} if tool_data.get("index") is not None else {}),
                     "tool_args": tool_args,
                     **_tool_identity_payload(
                         tool_data,
@@ -533,6 +607,7 @@ def agent_run_event_to_session_events(
                     **base,
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
+                    **({"index": tool_data.get("index")} if tool_data.get("index") is not None else {}),
                     "tool_result": projected_output,
                     **_tool_identity_payload(
                         tool_data,
@@ -561,7 +636,7 @@ def agent_run_event_to_session_events(
         )
         return [
             (
-                "context_event",
+                "agent_run_event",
                 _context_event(
                     labels,
                     labels.terminal_titles.get(event_type, event_type),
@@ -666,6 +741,22 @@ def _context_event(
 def _event_data(data: dict[str, Any]) -> dict[str, Any]:
     nested = data.get("data")
     return dict(nested) if isinstance(nested, dict) else {}
+
+
+def _session_run_event_passthrough_payload(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    marker: str,
+) -> dict[str, Any]:
+    public = _public_payload(payload, marker=marker)
+    if event_type == "tool_call_delta":
+        public.pop("arguments_delta", None)
+        preview = str(payload.get("arguments_preview") or "")
+        if len(preview) > TOOL_ARGUMENTS_PREVIEW_MAX_CHARS:
+            preview = f"{preview[:TOOL_ARGUMENTS_PREVIEW_MAX_CHARS]}..."
+        public["arguments_preview"] = preview
+    return public
 
 
 def _project_large_output(

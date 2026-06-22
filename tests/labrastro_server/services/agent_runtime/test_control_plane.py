@@ -102,6 +102,8 @@ class _FakeSandboxProvider:
 
 class _WaitingActivationCompletionStore:
     def __init__(self) -> None:
+        self.max_running_tasks = 4
+        self.runtime_snapshot: dict = {}
         self.task = AgentRun(
             id="task-store-waiting",
             agent_id="coder",
@@ -109,6 +111,17 @@ class _WaitingActivationCompletionStore:
             sandbox_session_id="sandbox-store",
             current_activation_id="task-store-waiting:activation:1",
         )
+
+    def configure(
+        self,
+        *,
+        max_running_tasks: int | None = None,
+        runtime_snapshot: dict | None = None,
+    ) -> None:
+        if max_running_tasks is not None:
+            self.max_running_tasks = int(max_running_tasks)
+        if runtime_snapshot is not None:
+            self.runtime_snapshot = dict(runtime_snapshot)
 
     def complete_agent_run_activation(
         self,
@@ -197,6 +210,23 @@ def _model_config() -> dict:
 
 def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
     return str(control.get_agent_run(task_id).current_activation_id or "")
+
+
+def test_control_plane_store_default_runtime_snapshot_is_self_contained() -> None:
+    class EmptyRuntimeStore:
+        max_running_tasks = 2
+        runtime_snapshot: dict = {}
+
+        def configure(self, **kwargs) -> None:
+            if kwargs.get("runtime_snapshot") is not None:
+                self.runtime_snapshot = dict(kwargs["runtime_snapshot"])
+
+    store = EmptyRuntimeStore()
+    control = AgentRunControlPlane(store=store)
+
+    assert "main_chat" in control.runtime_snapshot["agents"]
+    assert "environment_local" in control.runtime_snapshot["runtime_profiles"]
+    assert store.runtime_snapshot == control.runtime_snapshot
 
 
 def test_agent_call_grant_is_bound_to_capability_scope_and_config_version() -> None:
@@ -436,6 +466,66 @@ def test_session_run_binding_selects_single_agent_run_mainline() -> None:
         session_run_id="session-run-1",
         branch_binding_id="branch-1",
     ).source_agent_run_id == source.id
+
+
+def test_session_run_binding_requires_explicit_branch_binding_id() -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="main",
+            owner_session_run_id="session-run-1",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-main",
+    )
+
+    with pytest.raises(ValueError, match="branch_binding_id is required"):
+        control.create_session_run_binding(
+            session_run_id="session-run-1",
+            session_id="chat-session-1",
+            peer_id="peer-1",
+            agent_run_id=run.id,
+            branch_binding_id="",
+            selected=True,
+            target_agent_run_id=run.id,
+        )
+
+
+def test_session_run_binding_scope_is_included_in_executor_claim_metadata() -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="main",
+            owner_session_run_id="session-run-claim",
+            source="chat",
+            trigger_mode="interactive_chat",
+            executor=ExecutorType.REULEAUXCODER,
+        ),
+        task_id="agent-run-claim",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-claim",
+        session_id="chat-session-claim",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="branch-claim",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    claim = control.claim_agent_run_activation(
+        worker_id="worker-1",
+        executors=["reuleauxcoder"],
+    )
+
+    assert claim is not None
+    assert claim.executor_request.metadata["session_run_id"] == "session-run-claim"
+    assert claim.executor_request.metadata["session_run_binding_id"] == binding.id
+    assert claim.executor_request.metadata["branch_binding_id"] == "branch-claim"
+    assert claim.executor_request.metadata["binding_agent_run_id"] == run.id
 
 
 def test_select_session_run_branch_switches_input_target_without_stopping_runs() -> None:
@@ -905,7 +995,7 @@ def test_persistent_agent_terminal_state_projects_summary_to_parent() -> None:
     assert agent_call_event["payload"]["thread_key"] == "project-context"
     assert agent_call_event["payload"]["summary"] == "context summary"
     projected = agent_run_event_to_session_events(agent_call_event)[0]
-    assert projected[0] == "context_event"
+    assert projected[0] == "agent_run_event"
     assert projected[1]["phase"] == "agent_call_result"
     assert projected[1]["agent_call"]["target_agent_run_id"] == child.id
     assert projected[1]["agent_call"]["summary"] == "context summary"
@@ -1265,7 +1355,7 @@ def test_lifecycle_agent_adapter_child_completion_projects_to_parent_session() -
 
     assert agent_call_event["payload"]["target_agent_run_id"] == child["id"]
     assert agent_call_event["payload"]["conversation_scope"] == "ephemeral"
-    assert session_events[0][0] == "context_event"
+    assert session_events[0][0] == "agent_run_event"
     assert session_events[0][1]["phase"] == "agent_call_result"
     assert session_events[0][1]["agent_call"]["target_agent_run_id"] == child["id"]
     assert session_events[0][1]["agent_call"]["summary"] == "review passed"
@@ -1388,17 +1478,17 @@ def test_activation_and_feedback_events_project_without_internal_payloads() -> N
         agent_call_failed_event
     )[0]
 
-    assert projected_activation[0] == "context_event"
+    assert projected_activation[0] == "agent_run_event"
     assert projected_activation[1]["phase"] == "agent_run_activation_queued"
     assert projected_activation[1]["activation_id"] == "run-1:activation:2"
     assert projected_activation[1]["activation"]["input_kind"] == "server_feedback"
     assert "prompt" not in projected_activation[1]["activation"]
     assert "result_payload" not in projected_activation[1]["activation"]
-    assert projected_feedback[0] == "context_event"
+    assert projected_feedback[0] == "agent_run_event"
     assert projected_feedback[1]["phase"] == "agent_run_feedback_added"
     assert projected_feedback[1]["feedback"]["kind"] == "candidate_validation_failed"
     assert "payload" not in projected_feedback[1]["feedback"]
-    assert projected_steer[0] == "context_event"
+    assert projected_steer[0] == "agent_run_event"
     assert projected_steer[1]["phase"] == "agent_run_activation_steer_queued"
     assert projected_steer[1]["steer"]["status"] == "queued"
     assert "payload" not in projected_steer[1]["steer"]
@@ -1409,7 +1499,7 @@ def test_activation_and_feedback_events_project_without_internal_payloads() -> N
     assert projected_steer_delivered[1]["steer"]["status"] == "delivered"
     assert "payload" not in projected_steer_delivered[1]["steer"]
     assert "metadata" not in projected_steer_delivered[1]["steer"]
-    assert projected_agent_call_failed[0] == "context_event"
+    assert projected_agent_call_failed[0] == "agent_run_event"
     assert projected_agent_call_failed[1]["phase"] == "agent_call_failed"
     assert projected_agent_call_failed[1]["agent_call"]["agent_id"] == "Reviewer"
     assert (
@@ -1582,6 +1672,7 @@ def test_reuleauxcoder_agent_run_gets_stable_executor_session_before_claim() -> 
             agent_id="capability_packager",
             prompt="package repo",
             executor=ExecutorType.REULEAUXCODER,
+            source="capability_ingest",
         ),
         task_id="task-reuleaux",
     )
@@ -2313,6 +2404,7 @@ def test_reuleauxcoder_followup_reuses_parent_executor_session() -> None:
             executor=ExecutorType.REULEAUXCODER,
             execution_location=ExecutionLocation.REMOTE_SERVER,
             workdir="/tmp/capability",
+            source="capability_ingest",
             metadata={"worktree_branch": "agent/capability/task-parent"},
         ),
         task_id="task-capability-parent",
@@ -2405,6 +2497,7 @@ def test_environment_runtime_events_are_derived_from_allowlisted_shell_commands(
             prompt="check environment",
             executor=ExecutorType.FAKE,
             trigger_mode=TriggerMode.ENVIRONMENT_CONFIG,
+            source="environment",
             metadata={
                 "workflow": "environment_config",
                 "environment_mode": "check",
@@ -2918,6 +3011,7 @@ def test_environment_runtime_blocks_non_manifest_shell_command() -> None:
             prompt="check environment",
             executor=ExecutorType.FAKE,
             trigger_mode=TriggerMode.ENVIRONMENT_CONFIG,
+            source="environment",
             metadata={
                 "workflow": "environment_config",
                 "environment_mode": "check",
@@ -2963,6 +3057,7 @@ def test_environment_runtime_reports_failed_install_command() -> None:
             prompt="configure environment",
             executor=ExecutorType.FAKE,
             trigger_mode=TriggerMode.ENVIRONMENT_CONFIG,
+            source="environment",
             metadata={
                 "workflow": "environment_config",
                 "environment_mode": "configure",
@@ -3689,7 +3784,7 @@ def test_waiting_approval_status_projects_to_session_approval_request() -> None:
     projected = agent_run_event_to_session_events(status_event)
 
     assert [event_type for event_type, _ in projected] == [
-        "context_event",
+        "agent_run_event",
         "approval_request",
     ]
     assert projected[1][1] == {

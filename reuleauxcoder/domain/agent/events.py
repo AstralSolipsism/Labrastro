@@ -20,6 +20,7 @@ class AgentEventType(Enum):
 
     SESSION_RUN_START = "session_run_start"
     SESSION_RUN_END = "session_run_end"
+    SESSION_RUN_EVENT = "session_run_event"
     STREAM_TOKEN = "stream_token"
     REASONING_TOKEN = "reasoning_token"
     TOOL_CALL_DELTA = "tool_call_delta"
@@ -120,6 +121,22 @@ class AgentEvent:
         return cls(
             event_type=AgentEventType.SESSION_RUN_END,
             data=data,
+        )
+
+    @classmethod
+    def session_run_event(
+        cls,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> "AgentEvent":
+        """Carry a whitelisted user-visible SessionRun event through AgentRun."""
+
+        return cls(
+            event_type=AgentEventType.SESSION_RUN_EVENT,
+            data={
+                "event_type": str(event_type or ""),
+                "payload": dict(payload or {}),
+            },
         )
 
     @classmethod
