@@ -884,6 +884,68 @@ def test_remote_relay_maps_chat_mentions_to_reference_only_context() -> None:
     assert "These @ mentions are context references only and do not grant new tool permissions." in source
 
 
+def test_server_owned_session_run_executes_without_local_peer_worker() -> None:
+    relay_bind = f"127.0.0.1:{_free_port()}"
+    prompts: list[str] = []
+
+    def chat_behavior(agent, prompt: str) -> str:
+        prompts.append(prompt)
+        for handler in list(agent._event_handlers):
+            handler(AgentEvent.session_run_end("smoke-ok"))
+        return "smoke-ok"
+
+    runner = _build_runner_with_fake_agent(
+        relay_bind,
+        chat_behavior=chat_behavior,
+    )
+    ctx = runner.initialize()
+    try:
+        assert runner._relay_server is not None
+        assert runner._relay_http_service is not None
+        peer_id, peer_token = _register_peer(
+            runner._relay_http_service.base_url,
+            runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+            "/tmp/server-owned-client",
+            features=["shell"],
+        )
+
+        status, start_body = _json_request(
+            "POST",
+            f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+            {
+                "peer_token": peer_token,
+                "prompt": "server owned smoke",
+                "session_hint": "server-owned-smoke",
+                "client_request_id": "server-owned-smoke-start",
+            },
+        )
+
+        assert status == 200
+        assert start_body["agent_run_id"]
+        assert peer_id
+        events = _collect_stream_events(
+            runner._relay_http_service.base_url,
+            peer_token,
+            start_body["session_run_id"],
+            timeout_sec=3.0,
+        )
+
+        assert prompts == ["server owned smoke"]
+        assert any(
+            event["type"] == "session_run_end"
+            and event["payload"].get("response") == "smoke-ok"
+            for event in events
+        )
+        run = runner._relay_http_service.runtime_control_plane.get_agent_run(
+            start_body["agent_run_id"]
+        )
+        assert run.status.value == "completed"
+        assert run.execution_location.value == "remote_server"
+        assert run.metadata["worker_kind"] == "server_worker"
+    finally:
+        runner.cleanup(ctx.agent)
+
+
 def test_switch_session_model_updates_runtime_without_transcript_pollution() -> None:
     store = MemorySessionStore()
     config = Config(

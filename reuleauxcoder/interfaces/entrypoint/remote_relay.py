@@ -17,6 +17,7 @@ from rich.console import Console
 from reuleauxcoder.app.runtime.session_state import (
     apply_agent_default_model,
     apply_agent_config_model,
+    apply_session_model_override,
     apply_session_runtime_state,
     build_session_runtime_state,
     get_session_fingerprint,
@@ -453,6 +454,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         return
     setattr(agent, "agent_run_control_plane", runner._relay_http_service.runtime_control_plane)
 
+    service = runner._relay_http_service
     relay_server: RelayServer = runner._relay_server
     config = getattr(agent, "runtime_config", None)
     runtime_config: dict[str, Config | None] = {"value": config}
@@ -1354,10 +1356,137 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 setattr(peer_agent, "runtime_config", next_config)
             setattr(peer_agent, "locale", locale)
 
+    def _configure_server_agent_for_session_run(
+        server_agent: Agent,
+        request: Any,
+    ) -> None:
+        _configure_peer_agent_for_session_run(server_agent, request)
+        current_config = _current_config()
+        if current_config is None:
+            return
+        binding = _agent_run_binding_for_request(request)
+        remote_session = (
+            service._get_session_run(binding.session_run_id)
+            if binding is not None
+            else None
+        )
+        if remote_session is None:
+            return
+        provider_id = str(getattr(remote_session, "provider_id", "") or "").strip()
+        model_id = str(getattr(remote_session, "model_id", "") or "").strip()
+        if not provider_id or not model_id:
+            return
+        apply_session_model_override(
+            current_config,
+            server_agent,
+            provider=provider_id,
+            model=model_id,
+            parameters=dict(getattr(remote_session, "model_parameters", {}) or {}),
+        )
+
+    def _create_server_agent_for_request(request: Any) -> Agent:
+        current_config = _current_config()
+        if current_config is None:
+            return agent
+        server_llm = runner.dependencies.create_llm(current_config)
+        server_llm.ui_bus = ui_bus
+        tool_backend = runner.dependencies.create_tool_backend(current_config, ui_bus)
+        server_tools = runner.dependencies.load_tools(tool_backend)
+        server_agent = runner.dependencies.create_agent(
+            server_llm,
+            server_tools,
+            current_config,
+        )
+        setattr(server_agent, "runtime_config", current_config)
+        setattr(
+            server_agent,
+            "capability_catalog",
+            runner.build_capability_catalog(current_config),
+        )
+        setattr(server_agent, "agent_run_control_plane", service.runtime_control_plane)
+        setattr(server_agent, "skills_service", skills_service)
+        setattr(server_agent, "skills_catalog", getattr(agent, "skills_catalog", ""))
+        runner._register_hooks(server_agent, current_config)
+        runner._wire_agent_tool_parent(server_agent)
+        restore_config_runtime_defaults(current_config, server_agent)
+        _apply_chat_entrypoint_runtime(server_agent, current_config)
+        binding = _agent_run_binding_for_request(request)
+        if binding is not None and binding.session_id:
+            setattr(server_agent, "current_session_id", binding.session_id)
+        _configure_server_agent_for_session_run(server_agent, request)
+        return server_agent
+
     def _executor_failure_payload(exc: Exception) -> dict[str, Any]:
         payload = ReuleauxCoderExecutorBackend._exception_payload(exc)
         payload.setdefault("error_type", type(exc).__name__)
         return payload
+
+    def _start_server_session_run_worker() -> None:
+        service = runner._relay_http_service
+        runtime = getattr(service, "runtime_control_plane", None)
+        if service is None or runtime is None:
+            return
+        existing = getattr(service, "_server_session_run_worker_thread", None)
+        if isinstance(existing, threading.Thread) and existing.is_alive():
+            return
+        stop_event = threading.Event()
+        setattr(service, "_server_session_run_worker_stop", stop_event)
+        backend = ReuleauxCoderExecutorBackend(
+            create_agent=_create_server_agent_for_request
+        )
+
+        def _run_claim(claim: Any) -> None:
+            result: ExecutorRunResult
+            try:
+                result = backend.start(claim.executor_request)
+            except Exception as exc:
+                message = str(exc) or type(exc).__name__
+                result = ExecutorRunResult(
+                    task_id=claim.task.id,
+                    status="failed",
+                    output="",
+                    events=[
+                        ExecutorEvent.error(
+                            message,
+                            **_executor_failure_payload(exc),
+                        ),
+                    ],
+                    error=message,
+                )
+            runtime.complete_claimed_agent_run_activation(
+                claim.task.id,
+                result,
+                request_id=claim.request_id,
+                activation_id=claim.activation_id,
+                worker_id=claim.worker_id,
+                peer_id="server",
+                artifacts=list(result.artifacts),
+            )
+
+        def _loop() -> None:
+            while not stop_event.is_set():
+                if runner._relay_http_service is not service:
+                    break
+                if getattr(service, "_server", None) is None:
+                    break
+                claim = runtime.claim_agent_run_activation(
+                    worker_id="server-session-run-worker",
+                    worker_kind=WorkerKind.SERVER_WORKER,
+                    executors=[ExecutorType.REULEAUXCODER],
+                    peer_features=[
+                        "worker_kind:server_worker",
+                        "agent_runs.remote_server",
+                    ],
+                    wait_sec=0,
+                )
+                if claim is None:
+                    stop_event.wait(0.05)
+                    continue
+                _run_claim(claim)
+
+        thread = threading.Thread(target=_loop, daemon=True)
+        setattr(service, "_server_session_run_worker_thread", thread)
+        thread.start()
 
     def _start_local_peer_session_run_worker() -> None:
         service = runner._relay_http_service
@@ -1634,6 +1763,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         return response
 
     runner._relay_http_service.set_chat_command_handler(_dispatch_chat_command)
+    _start_server_session_run_worker()
     _start_local_peer_session_run_worker()
 
 
