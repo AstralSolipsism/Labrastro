@@ -11732,7 +11732,7 @@ class TestRemoteRelayHTTPService:
                 str(repo),
                 "--workspace-root",
                 str(repo),
-                "--poll-interval",
+                "--claim-interval",
                 "100ms",
                 "--agent-run-worker",
                 "--worker-session-id",

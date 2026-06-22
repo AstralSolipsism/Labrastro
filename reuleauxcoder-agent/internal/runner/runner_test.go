@@ -64,36 +64,40 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestExecToolProtocolErrorRequiresToolCallID(t *testing.T) {
-	result, invalid := execToolProtocolError(protocol.ExecToolRequest{
-		ToolName: "shell",
-		Args: map[string]any{
-			"command": "echo should-not-run",
+func TestLocalActionToolRequestBindsActionIdentity(t *testing.T) {
+	req, err := localActionToolRequest(protocol.LocalActionRecord{
+		LocalActionID: "local-action-1",
+		ActionKind:    "read_workspace_file",
+		Payload: map[string]any{
+			"args": map[string]any{"file_path": "README.md"},
 		},
 	})
 
-	if !invalid {
-		t.Fatal("missing tool_call_id should be invalid")
+	if err != nil {
+		t.Fatalf("localActionToolRequest returned error: %v", err)
 	}
-	if result.OK || result.ErrorCode != "REMOTE_PROTOCOL_ERROR" {
-		t.Fatalf("result = %#v, want protocol error", result)
+	if req.ToolName != "read_file" {
+		t.Fatalf("tool name = %q, want read_file", req.ToolName)
 	}
-	if result.ErrorMessage == "" {
-		t.Fatalf("missing protocol error message: %#v", result)
+	if req.ToolCallID != "local-action-1" {
+		t.Fatalf("tool_call_id = %q, want local-action-1", req.ToolCallID)
+	}
+	if req.Args["file_path"] != "README.md" {
+		t.Fatalf("args = %#v", req.Args)
 	}
 }
 
-func TestAttachToolCallIDToStreamChunk(t *testing.T) {
-	chunk := attachToolCallIDToStreamChunk(protocol.ToolStreamChunk{
+func TestAttachLocalActionIDToStreamChunk(t *testing.T) {
+	chunk := attachLocalActionIDToStreamChunk(protocol.ToolStreamChunk{
 		ChunkType: "stdout",
 		Data:      "hello",
-	}, "call-1")
+	}, "local-action-1")
 
-	if chunk.ToolCallID != "call-1" {
-		t.Fatalf("chunk.ToolCallID = %q, want call-1", chunk.ToolCallID)
+	if chunk.ToolCallID != "local-action-1" {
+		t.Fatalf("chunk.ToolCallID = %q, want local-action-1", chunk.ToolCallID)
 	}
-	if chunk.Meta["tool_call_id"] != "call-1" {
-		t.Fatalf("chunk meta = %#v, want tool_call_id", chunk.Meta)
+	if chunk.Meta["local_action_id"] != "local-action-1" {
+		t.Fatalf("chunk meta = %#v, want local_action_id", chunk.Meta)
 	}
 }
 
@@ -103,6 +107,9 @@ func TestBaseFeaturesAdvertisesLSPOnlyWhenAvailable(t *testing.T) {
 
 	if !containsFeature(withLSP, "lsp") {
 		t.Fatalf("features = %#v, want lsp", withLSP)
+	}
+	if !containsFeature(withoutLSP, "local_actions") || !containsFeature(withoutLSP, "local_action:read_workspace_file") {
+		t.Fatalf("features = %#v, want local action claim features", withoutLSP)
 	}
 	if containsFeature(withoutLSP, "lsp") {
 		t.Fatalf("features = %#v, want no lsp", withoutLSP)
@@ -161,7 +168,7 @@ func TestServerWorkerRuntimeLocationsAdvertiseServerLocations(t *testing.T) {
 	}
 }
 
-func TestTransientPollErrorClassification(t *testing.T) {
+func TestTransientLocalActionErrorClassification(t *testing.T) {
 	cases := []struct {
 		name      string
 		err       error
@@ -194,7 +201,7 @@ func TestTransientPollErrorClassification(t *testing.T) {
 		},
 		{
 			name:      "tls bad record mac",
-			err:       errors.New("remote poll failed: tls: bad record MAC"),
+			err:       errors.New("local action claim failed: tls: bad record MAC"),
 			transient: true,
 		},
 		{
@@ -206,18 +213,18 @@ func TestTransientPollErrorClassification(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isTransientPollError(tc.err); got != tc.transient {
-				t.Fatalf("isTransientPollError(%v) = %v, want %v", tc.err, got, tc.transient)
+			if got := isTransientLocalActionError(tc.err); got != tc.transient {
+				t.Fatalf("isTransientLocalActionError(%v) = %v, want %v", tc.err, got, tc.transient)
 			}
 		})
 	}
 }
 
-func TestPollRetryBackoffResetsAfterSuccess(t *testing.T) {
-	restore := overridePollTimingForTest(t, 50*time.Millisecond, 10*time.Millisecond, 40*time.Millisecond)
+func TestLocalActionRetryBackoffResetsAfterSuccess(t *testing.T) {
+	restore := overrideLocalActionTimingForTest(t, 50*time.Millisecond, 10*time.Millisecond, 40*time.Millisecond)
 	defer restore()
 
-	backoff := pollRetryBackoff{}
+	backoff := localActionRetryBackoff{}
 	attempt, delay := backoff.recordFailure(5 * time.Millisecond)
 	if attempt != 1 || delay != 10*time.Millisecond {
 		t.Fatalf("first retry = (%d, %s), want (1, 10ms)", attempt, delay)
@@ -234,64 +241,64 @@ func TestPollRetryBackoffResetsAfterSuccess(t *testing.T) {
 	}
 }
 
-func TestRunPollLoopRetriesContextDeadlineAndContinues(t *testing.T) {
-	restore := overridePollTimingForTest(t, 20*time.Millisecond, time.Millisecond, 5*time.Millisecond)
+func TestRunLocalActionLoopRetriesContextDeadlineAndContinues(t *testing.T) {
+	restore := overrideLocalActionTimingForTest(t, 20*time.Millisecond, time.Millisecond, 5*time.Millisecond)
 	defer restore()
 
-	var polls atomic.Int32
+	var claims atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		switch polls.Add(1) {
+		switch claims.Add(1) {
 		case 1:
 			time.Sleep(50 * time.Millisecond)
 		default:
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"type":"noop","payload":{}}`))
+			_, _ = w.Write([]byte(`{"actions":[]}`))
 			cancel()
 		}
 	}))
 	defer server.Close()
 
-	err := runPollLoopForTest(ctx, server.URL)
+	err := runLocalActionLoopForTest(ctx, server.URL, t.TempDir())
 	if err != nil {
-		t.Fatalf("runPollLoop returned error after transient timeout: %v", err)
+		t.Fatalf("runLocalActionLoop returned error after transient timeout: %v", err)
 	}
-	if polls.Load() < 2 {
-		t.Fatalf("polls = %d, want retry after timeout", polls.Load())
+	if claims.Load() < 2 {
+		t.Fatalf("claims = %d, want retry after timeout", claims.Load())
 	}
 }
 
-func TestRunPollLoopRetriesTransientHTTPStatusAndContinues(t *testing.T) {
-	restore := overridePollTimingForTest(t, 50*time.Millisecond, time.Millisecond, 5*time.Millisecond)
+func TestRunLocalActionLoopRetriesTransientHTTPStatusAndContinues(t *testing.T) {
+	restore := overrideLocalActionTimingForTest(t, 50*time.Millisecond, time.Millisecond, 5*time.Millisecond)
 	defer restore()
 
-	var polls atomic.Int32
+	var claims atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		switch polls.Add(1) {
+		switch claims.Add(1) {
 		case 1:
 			http.Error(w, "temporary upstream failure", http.StatusBadGateway)
 		default:
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"type":"noop","payload":{}}`))
+			_, _ = w.Write([]byte(`{"actions":[]}`))
 			cancel()
 		}
 	}))
 	defer server.Close()
 
-	err := runPollLoopForTest(ctx, server.URL)
+	err := runLocalActionLoopForTest(ctx, server.URL, t.TempDir())
 	if err != nil {
-		t.Fatalf("runPollLoop returned error after transient HTTP status: %v", err)
+		t.Fatalf("runLocalActionLoop returned error after transient HTTP status: %v", err)
 	}
-	if polls.Load() < 2 {
-		t.Fatalf("polls = %d, want retry after HTTP status", polls.Load())
+	if claims.Load() < 2 {
+		t.Fatalf("claims = %d, want retry after HTTP status", claims.Load())
 	}
 }
 
-func TestRunPollLoopExitsOnInvalidPeerToken(t *testing.T) {
-	restore := overridePollTimingForTest(t, 50*time.Millisecond, time.Millisecond, 5*time.Millisecond)
+func TestRunLocalActionLoopExitsOnInvalidPeerToken(t *testing.T) {
+	restore := overrideLocalActionTimingForTest(t, 50*time.Millisecond, time.Millisecond, 5*time.Millisecond)
 	defer restore()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -299,12 +306,86 @@ func TestRunPollLoopExitsOnInvalidPeerToken(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := runPollLoopForTest(context.Background(), server.URL)
+	err := runLocalActionLoopForTest(context.Background(), server.URL, t.TempDir())
 	if err == nil {
-		t.Fatal("runPollLoop returned nil error for invalid peer token")
+		t.Fatal("runLocalActionLoop returned nil error for invalid peer token")
 	}
-	if !strings.Contains(err.Error(), "poll failed") || !strings.Contains(err.Error(), "401") {
-		t.Fatalf("error = %v, want fatal poll failure with 401", err)
+	if !strings.Contains(err.Error(), "local action claim failed") || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("error = %v, want fatal local action claim failure with 401", err)
+	}
+}
+
+func TestRunLocalActionLoopClaimsReportsProgressAndCompletes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var claimReq protocol.LocalActionClaimRequest
+	var progressReq protocol.LocalActionProgressRequest
+	var completeReq protocol.LocalActionCompleteRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/remote/local-actions/claim":
+			if err := json.NewDecoder(req.Body).Decode(&claimReq); err != nil {
+				t.Errorf("decode claim: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionClaimResponse{
+				Actions: []protocol.LocalActionRecord{{
+					Scope:         "activation_scoped",
+					LocalActionID: "local-action-1",
+					ActionKind:    "read_workspace_file",
+					Status:        "started",
+					WorkspaceRoot: root,
+					Payload:       map[string]any{"args": map[string]any{"file_path": "README.md"}},
+					LeaseID:       "lease-1",
+				}},
+			})
+		case "/remote/local-actions/progress":
+			if err := json.NewDecoder(req.Body).Decode(&progressReq); err != nil {
+				t.Errorf("decode progress: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionProgressResponse{OK: true})
+		case "/remote/local-actions/complete":
+			defer cancel()
+			if err := json.NewDecoder(req.Body).Decode(&completeReq); err != nil {
+				t.Errorf("decode complete: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionCompleteResponse{OK: true})
+		default:
+			t.Errorf("unexpected path: %s", req.URL.Path)
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	err := runLocalActionLoopForTest(ctx, server.URL, root)
+	if err != nil {
+		t.Fatalf("runLocalActionLoop returned error: %v", err)
+	}
+	if claimReq.PeerToken != "peer-token" || claimReq.PeerID != "peer-1" || claimReq.WorkerKind != "local_peer" {
+		t.Fatalf("claim request = %#v", claimReq)
+	}
+	if !containsFeature(claimReq.Features, "local_actions") || !containsFeature(claimReq.Features, "local_action:read_workspace_file") {
+		t.Fatalf("claim features = %#v", claimReq.Features)
+	}
+	if progressReq.LocalActionID != "local-action-1" || progressReq.LeaseID != "lease-1" {
+		t.Fatalf("progress request = %#v", progressReq)
+	}
+	if completeReq.LocalActionID != "local-action-1" || completeReq.LeaseID != "lease-1" || completeReq.Status != "completed" {
+		t.Fatalf("complete request = %#v", completeReq)
+	}
+	if completeReq.Result["ok"] != true || !strings.Contains(fmt.Sprint(completeReq.Result["result"]), "hello") {
+		t.Fatalf("complete result = %#v", completeReq.Result)
 	}
 }
 
@@ -1017,12 +1098,12 @@ func TestAgentRunLoopCompletesFailedPublishEvents(t *testing.T) {
 	}
 }
 
-func runPollLoopForTest(ctx context.Context, serverURL string) error {
+func runLocalActionLoopForTest(ctx context.Context, serverURL string, workspaceRoot string) error {
 	r := &Runner{
 		client: client.New(serverURL),
 		active: map[string]context.CancelFunc{},
 	}
-	return r.runPollLoop(ctx, "peer-token", "", "", time.Millisecond)
+	return r.runLocalActionLoop(ctx, "peer-token", "peer-1", workspaceRoot, workspaceRoot, baseFeatures(false), time.Millisecond)
 }
 
 func createRunnerSourceRepo(t *testing.T, root string) string {
@@ -1054,23 +1135,23 @@ func createRunnerSourceRepo(t *testing.T, root string) string {
 	return repo
 }
 
-func overridePollTimingForTest(
+func overrideLocalActionTimingForTest(
 	t *testing.T,
 	requestTimeout time.Duration,
 	minDelay time.Duration,
 	maxDelay time.Duration,
 ) func() {
 	t.Helper()
-	oldRequestTimeout := pollRequestTimeout
-	oldMinDelay := pollRetryMinDelay
-	oldMaxDelay := pollRetryMaxDelay
-	pollRequestTimeout = requestTimeout
-	pollRetryMinDelay = minDelay
-	pollRetryMaxDelay = maxDelay
+	oldRequestTimeout := localActionRequestTimeout
+	oldMinDelay := localActionRetryMinDelay
+	oldMaxDelay := localActionRetryMaxDelay
+	localActionRequestTimeout = requestTimeout
+	localActionRetryMinDelay = minDelay
+	localActionRetryMaxDelay = maxDelay
 	return func() {
-		pollRequestTimeout = oldRequestTimeout
-		pollRetryMinDelay = oldMinDelay
-		pollRetryMaxDelay = oldMaxDelay
+		localActionRequestTimeout = oldRequestTimeout
+		localActionRetryMinDelay = oldMinDelay
+		localActionRetryMaxDelay = oldMaxDelay
 	}
 }
 

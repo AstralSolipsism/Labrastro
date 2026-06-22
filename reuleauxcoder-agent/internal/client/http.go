@@ -52,20 +52,40 @@ func (c *HTTPClient) Heartbeat(ctx context.Context, req protocol.Heartbeat) erro
 	return c.postJSON(ctx, "/remote/heartbeat", req, nil)
 }
 
-func (c *HTTPClient) Poll(ctx context.Context, req protocol.PollRequest) (protocol.RelayEnvelope, error) {
-	var env protocol.RelayEnvelope
-	if err := c.postJSON(ctx, "/remote/poll", req, &env); err != nil {
-		return protocol.RelayEnvelope{}, err
-	}
-	return env, nil
-}
-
-func (c *HTTPClient) SendResult(ctx context.Context, req protocol.ResultRequest) error {
-	return c.postJSON(ctx, "/remote/result", req, nil)
-}
-
 func (c *HTTPClient) Disconnect(ctx context.Context, req protocol.DisconnectRequest) error {
 	return c.postJSON(ctx, "/remote/disconnect", req, nil)
+}
+
+func (c *HTTPClient) ClaimLocalActions(ctx context.Context, req protocol.LocalActionClaimRequest) (protocol.LocalActionClaimResponse, error) {
+	var resp protocol.LocalActionClaimResponse
+	if err := c.postJSON(ctx, "/remote/local-actions/claim", req, &resp); err != nil {
+		return protocol.LocalActionClaimResponse{}, err
+	}
+	return resp, nil
+}
+
+func (c *HTTPClient) ReportLocalActionProgress(ctx context.Context, req protocol.LocalActionProgressRequest) (protocol.LocalActionProgressResponse, error) {
+	var resp protocol.LocalActionProgressResponse
+	if err := c.postJSON(ctx, "/remote/local-actions/progress", req, &resp); err != nil {
+		return protocol.LocalActionProgressResponse{}, err
+	}
+	return resp, nil
+}
+
+func (c *HTTPClient) CompleteLocalAction(ctx context.Context, req protocol.LocalActionCompleteRequest) (protocol.LocalActionCompleteResponse, error) {
+	var resp protocol.LocalActionCompleteResponse
+	if err := c.postJSON(ctx, "/remote/local-actions/complete", req, &resp); err != nil {
+		return protocol.LocalActionCompleteResponse{}, err
+	}
+	return resp, nil
+}
+
+func (c *HTTPClient) CancelLocalAction(ctx context.Context, req protocol.LocalActionCancelRequest) (protocol.LocalActionCancelResponse, error) {
+	var resp protocol.LocalActionCancelResponse
+	if err := c.postJSON(ctx, "/remote/local-actions/cancel", req, &resp); err != nil {
+		return protocol.LocalActionCancelResponse{}, err
+	}
+	return resp, nil
 }
 
 func (c *HTTPClient) SessionRunStart(ctx context.Context, req protocol.SessionRunStartRequest) (protocol.SessionRunStartResponse, error) {

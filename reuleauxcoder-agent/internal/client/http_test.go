@@ -102,18 +102,23 @@ func TestSessionRunEventsReturnsHTTPError(t *testing.T) {
 	}
 }
 
-func TestPollReturnsStructuredHTTPError(t *testing.T) {
+func TestLocalActionClaimReturnsStructuredHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
-	_, err := New(server.URL).Poll(
+	_, err := New(server.URL).ClaimLocalActions(
 		context.Background(),
-		protocol.PollRequest{PeerToken: "peer-token"},
+		protocol.LocalActionClaimRequest{
+			PeerToken:  "peer-token",
+			PeerID:     "peer-1",
+			WorkerKind: "local_peer",
+			Features:   []string{"local_actions"},
+		},
 	)
 	if err == nil {
-		t.Fatal("Poll returned nil error")
+		t.Fatal("ClaimLocalActions returned nil error")
 	}
 
 	var httpErr *HTTPError
@@ -125,6 +130,120 @@ func TestPollReturnsStructuredHTTPError(t *testing.T) {
 	}
 	if !strings.Contains(httpErr.Body, "service unavailable") {
 		t.Fatalf("body = %q, want service unavailable", httpErr.Body)
+	}
+}
+
+func TestLocalActionClientUsesTypedEndpoints(t *testing.T) {
+	var claimBody protocol.LocalActionClaimRequest
+	var progressBody protocol.LocalActionProgressRequest
+	var completeBody protocol.LocalActionCompleteRequest
+	var cancelBody protocol.LocalActionCancelRequest
+	seen := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen[r.URL.Path] = true
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/remote/local-actions/claim":
+			if err := json.NewDecoder(r.Body).Decode(&claimBody); err != nil {
+				t.Fatalf("decode claim: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionClaimResponse{
+				Actions: []protocol.LocalActionRecord{{
+					Scope:         "activation_scoped",
+					LocalActionID: "local-action-1",
+					ActionKind:    "read_workspace_file",
+					Status:        "started",
+					LeaseID:       "lease-1",
+					Payload:       map[string]any{"args": map[string]any{"path": "README.md"}},
+				}},
+			})
+		case "/remote/local-actions/progress":
+			if err := json.NewDecoder(r.Body).Decode(&progressBody); err != nil {
+				t.Fatalf("decode progress: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionProgressResponse{OK: true})
+		case "/remote/local-actions/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeBody); err != nil {
+				t.Fatalf("decode complete: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionCompleteResponse{OK: true})
+		case "/remote/local-actions/cancel":
+			if err := json.NewDecoder(r.Body).Decode(&cancelBody); err != nil {
+				t.Fatalf("decode cancel: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(protocol.LocalActionCancelResponse{OK: true})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	httpClient := New(server.URL)
+	claim, err := httpClient.ClaimLocalActions(context.Background(), protocol.LocalActionClaimRequest{
+		PeerToken:     "peer-token",
+		PeerID:        "peer-1",
+		WorkerKind:    "local_peer",
+		Features:      []string{"local_actions", "local_action:read_workspace_file"},
+		WorkspaceRoot: "D:/repo",
+		MaxActions:    1,
+	})
+	if err != nil {
+		t.Fatalf("ClaimLocalActions returned error: %v", err)
+	}
+	if len(claim.Actions) != 1 || claim.Actions[0].LocalActionID != "local-action-1" {
+		t.Fatalf("claim response = %#v", claim)
+	}
+	_, err = httpClient.ReportLocalActionProgress(context.Background(), protocol.LocalActionProgressRequest{
+		PeerToken:     "peer-token",
+		LocalActionID: "local-action-1",
+		LeaseID:       "lease-1",
+		Status:        "progress",
+		Progress:      map[string]any{"chunk_type": "stdout", "data": "hello"},
+	})
+	if err != nil {
+		t.Fatalf("ReportLocalActionProgress returned error: %v", err)
+	}
+	_, err = httpClient.CompleteLocalAction(context.Background(), protocol.LocalActionCompleteRequest{
+		PeerToken:     "peer-token",
+		LocalActionID: "local-action-1",
+		LeaseID:       "lease-1",
+		Status:        "completed",
+		Result:        map[string]any{"result": "ok"},
+	})
+	if err != nil {
+		t.Fatalf("CompleteLocalAction returned error: %v", err)
+	}
+	_, err = httpClient.CancelLocalAction(context.Background(), protocol.LocalActionCancelRequest{
+		PeerToken:     "peer-token",
+		LocalActionID: "local-action-1",
+		LeaseID:       "lease-1",
+		Reason:        "cancelled",
+	})
+	if err != nil {
+		t.Fatalf("CancelLocalAction returned error: %v", err)
+	}
+
+	for _, path := range []string{
+		"/remote/local-actions/claim",
+		"/remote/local-actions/progress",
+		"/remote/local-actions/complete",
+		"/remote/local-actions/cancel",
+	} {
+		if !seen[path] {
+			t.Fatalf("endpoint %s was not called; seen=%#v", path, seen)
+		}
+	}
+	if claimBody.PeerID != "peer-1" || claimBody.WorkerKind != "local_peer" || claimBody.Features[1] != "local_action:read_workspace_file" {
+		t.Fatalf("claim body = %#v", claimBody)
+	}
+	if progressBody.LocalActionID != "local-action-1" || progressBody.LeaseID != "lease-1" {
+		t.Fatalf("progress body = %#v", progressBody)
+	}
+	if completeBody.Status != "completed" || completeBody.Result["result"] != "ok" {
+		t.Fatalf("complete body = %#v", completeBody)
+	}
+	if cancelBody.Reason != "cancelled" {
+		t.Fatalf("cancel body = %#v", cancelBody)
 	}
 }
 

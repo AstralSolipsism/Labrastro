@@ -17,19 +17,19 @@ func main() {
 		cwd             string
 		workspaceRoot   string
 		peerInfoFile    string
-		pollInterval    time.Duration
+		claimInterval   time.Duration
 		interactive     bool
 		agentRun        bool
 		workerSessionID string
 		workerKind      string
 	)
 
-	flag.StringVar(&host, "host", "", "Remote relay host base URL")
+	flag.StringVar(&host, "host", "", "Labrastro server base URL")
 	flag.StringVar(&bootstrapToken, "bootstrap-token", "", "One-time bootstrap token")
-	flag.StringVar(&cwd, "cwd", "", "Working directory for remote tool execution")
+	flag.StringVar(&cwd, "cwd", "", "Working directory for local action execution")
 	flag.StringVar(&workspaceRoot, "workspace-root", "", "Workspace root reported to host")
 	flag.StringVar(&peerInfoFile, "peer-info-file", "", "Write peer registration info to this JSON file")
-	flag.DurationVar(&pollInterval, "poll-interval", 500*time.Millisecond, "Polling interval when no work is available")
+	flag.DurationVar(&claimInterval, "claim-interval", 500*time.Millisecond, "Interval between claim attempts when no work is available")
 	flag.BoolVar(&interactive, "interactive", false, "Run interactive chat loop proxied through host")
 	flag.BoolVar(&agentRun, "agent-run-worker", false, "Run AgentRun worker loop")
 	flag.StringVar(&workerSessionID, "worker-session-id", "", "Stable worker session id")
@@ -51,7 +51,7 @@ func main() {
 		CWD:             cwd,
 		WorkspaceRoot:   workspaceRoot,
 		PeerInfoFile:    peerInfoFile,
-		PollInterval:    pollInterval,
+		ClaimInterval:   claimInterval,
 		Interactive:     interactive,
 		AgentRun:        agentRun,
 		WorkerSessionID: workerSessionID,

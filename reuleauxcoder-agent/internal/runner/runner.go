@@ -30,9 +30,9 @@ import (
 var (
 	errExecutableNotFound       = errors.New("executable not found")
 	lookPathExecutable          = exec.LookPath
-	pollRequestTimeout          = 30 * time.Second
-	pollRetryMinDelay           = 500 * time.Millisecond
-	pollRetryMaxDelay           = 10 * time.Second
+	localActionRequestTimeout   = 30 * time.Second
+	localActionRetryMinDelay    = 500 * time.Millisecond
+	localActionRetryMaxDelay    = 10 * time.Second
 	runtimeHeartbeatInterval    = 2 * time.Second
 	runtimeSteerDeliveryTimeout = time.Second
 )
@@ -43,7 +43,7 @@ type Config struct {
 	CWD             string
 	WorkspaceRoot   string
 	PeerInfoFile    string
-	PollInterval    time.Duration
+	ClaimInterval   time.Duration
 	Interactive     bool
 	AgentRun        bool
 	WorkerSessionID string
@@ -91,7 +91,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		workspaceRoot = cwd
 	}
 
-	features := baseFeatures(tools.LSPAvailable())
+	var features []string
+	if !r.cfg.AgentRun {
+		features = baseFeatures(tools.LSPAvailable())
+	}
 	hostInfo := map[string]any{
 		"os":       runtimeOS(),
 		"arch":     runtimeArch(),
@@ -101,7 +104,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.cfg.AgentRun {
 		workerKind := runtimeWorkerKind(r.cfg.WorkerKind)
 		locations := runtimeExecutionLocationsForWorker(workerKind)
-		features = append(features, "agent_runs", "worker_kind:"+workerKind)
+		features = []string{"agent_runs", "worker_kind:" + workerKind}
 		for _, location := range locations {
 			features = append(features, "agent_runs."+location)
 		}
@@ -136,9 +139,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = 10 * time.Second
 	}
-	pollInterval := r.cfg.PollInterval
-	if pollInterval <= 0 {
-		pollInterval = 500 * time.Millisecond
+	claimInterval := r.cfg.ClaimInterval
+	if claimInterval <= 0 {
+		claimInterval = 500 * time.Millisecond
 	}
 
 	childCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -158,7 +161,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	go r.heartbeatLoop(childCtx, registerResp.PeerToken, heartbeatInterval)
 	if r.cfg.AgentRun {
-		return r.runAgentRunLoop(childCtx, registerResp.PeerToken, pollInterval, workspaceRoot)
+		return r.runAgentRunLoop(childCtx, registerResp.PeerToken, claimInterval, workspaceRoot)
 	}
 
 	r.mcp = mcp.NewSupervisor(r.client, registerResp.PeerToken, workspaceRoot)
@@ -167,7 +170,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.cfg.Interactive {
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- r.runPollLoop(childCtx, registerResp.PeerToken, cwd, workspaceRoot, pollInterval)
+			errCh <- r.runLocalActionLoop(childCtx, registerResp.PeerToken, registerResp.PeerID, cwd, workspaceRoot, features, claimInterval)
 		}()
 
 		if err := r.runInteractiveLoop(childCtx, registerResp.PeerToken); err != nil {
@@ -184,13 +187,27 @@ func (r *Runner) Run(ctx context.Context) error {
 		return nil
 	}
 
-	return r.runPollLoop(childCtx, registerResp.PeerToken, cwd, workspaceRoot, pollInterval)
+	return r.runLocalActionLoop(childCtx, registerResp.PeerToken, registerResp.PeerID, cwd, workspaceRoot, features, claimInterval)
 }
 
 func baseFeatures(lspAvailable bool) []string {
-	features := []string{"shell", "read_file", "apply_patch", "glob", "grep", "list_file", "tool_preview"}
+	features := []string{"local_actions"}
+	for _, actionKind := range []string{
+		"shell",
+		"read_file",
+		"read_workspace_file",
+		"apply_patch",
+		"draft_document_commit",
+		"glob",
+		"grep",
+		"list_file",
+		"tool_preview",
+		"mcp",
+	} {
+		features = append(features, actionKind, "local_action:"+actionKind)
+	}
 	if lspAvailable {
-		features = append(features, "lsp")
+		features = append(features, "lsp", "local_action:lsp")
 	}
 	return features
 }
@@ -210,7 +227,7 @@ func writePeerInfoFile(path string, resp protocol.RegisterResponse) error {
 	return os.WriteFile(path, payload, 0o600)
 }
 
-func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInterval time.Duration, workspaceRoot string) error {
+func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, claimInterval time.Duration, workspaceRoot string) error {
 	workerID := r.cfg.WorkerSessionID
 	if strings.TrimSpace(workerID) == "" {
 		workerID = "peer-runtime"
@@ -239,7 +256,7 @@ func (r *Runner) runAgentRunLoop(ctx context.Context, peerToken string, pollInte
 			return fmt.Errorf("agent runtime claim failed: %w", err)
 		}
 		if claimResp.Claim == nil {
-			time.Sleep(pollInterval)
+			time.Sleep(claimInterval)
 			continue
 		}
 
@@ -813,8 +830,8 @@ func runtimeUsage(usage map[string]agentruntime.TokenUsage) map[string]any {
 	return out
 }
 
-func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd, workspaceRoot string, pollInterval time.Duration) error {
-	retry := pollRetryBackoff{}
+func (r *Runner) runLocalActionLoop(ctx context.Context, peerToken, peerID, cwd, workspaceRoot string, features []string, claimInterval time.Duration) error {
+	retry := localActionRetryBackoff{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -822,143 +839,137 @@ func (r *Runner) runPollLoop(ctx context.Context, peerToken, cwd, workspaceRoot 
 		default:
 		}
 
-		pollCtx, cancelPoll := context.WithTimeout(ctx, pollRequestTimeout)
-		env, err := r.client.Poll(pollCtx, protocol.PollRequest{PeerToken: peerToken})
-		cancelPoll()
+		claimCtx, cancelClaim := context.WithTimeout(ctx, localActionRequestTimeout)
+		claimResp, err := r.client.ClaimLocalActions(claimCtx, protocol.LocalActionClaimRequest{
+			PeerToken:     peerToken,
+			PeerID:        peerID,
+			WorkerKind:    "local_peer",
+			Features:      features,
+			WorkspaceRoot: workspaceRoot,
+			MaxActions:    1,
+		})
+		cancelClaim()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			if isTransientPollError(err) {
-				attempt, delay := retry.recordFailure(pollInterval)
-				log.Printf("poll transient error: %v (attempt=%d retry_in=%s)", err, attempt, delay)
+			if isTransientLocalActionError(err) {
+				attempt, delay := retry.recordFailure(claimInterval)
+				log.Printf("local action claim transient error: %v (attempt=%d retry_in=%s)", err, attempt, delay)
 				if !sleepWithContext(ctx, delay) {
 					return nil
 				}
 				continue
 			}
-			return fmt.Errorf("poll failed: %w", err)
+			return fmt.Errorf("local action claim failed: %w", err)
 		}
 		retry.reset()
 
-		switch env.Type {
-		case "noop", "":
-			if !sleepWithContext(ctx, pollInterval) {
+		if len(claimResp.Actions) == 0 {
+			if !sleepWithContext(ctx, claimInterval) {
 				return nil
 			}
 			continue
-		case "exec_tool":
-			execReq, err := protocol.DecodeExecToolRequest(env.Payload)
+		}
+		for _, action := range claimResp.Actions {
+			actionID := strings.TrimSpace(action.LocalActionID)
+			if actionID == "" || strings.TrimSpace(action.LeaseID) == "" {
+				return fmt.Errorf("local action claim missing local_action_id or lease_id")
+			}
+			actionCtx, cancelAction := context.WithCancel(ctx)
+			r.registerActiveRequest(actionID, cancelAction)
+			err := r.executeLocalAction(actionCtx, peerToken, cwd, workspaceRoot, action)
+			r.unregisterActiveRequest(actionID)
+			cancelAction()
 			if err != nil {
-				if sendErr := r.sendToolResult(ctx, peerToken, env.RequestID, protocol.ExecToolResult{
-					OK:           false,
-					ErrorCode:    "REMOTE_TOOL_ERROR",
-					ErrorMessage: err.Error(),
-				}); sendErr != nil {
-					return sendErr
-				}
-				continue
-			}
-			if result, invalid := execToolProtocolError(execReq); invalid {
-				if sendErr := r.sendToolResult(ctx, peerToken, env.RequestID, result); sendErr != nil {
-					return sendErr
-				}
-				continue
-			}
-			execCtx, cancelExec := context.WithCancel(ctx)
-			r.registerActiveRequest(env.RequestID, cancelExec)
-			go func(requestID string, execReq protocol.ExecToolRequest) {
-				defer r.unregisterActiveRequest(requestID)
-				var result protocol.ExecToolResult
-				if execReq.ToolName == "mcp" {
-					if r.mcp == nil {
-						result = protocol.ExecToolResult{OK: false, ErrorCode: "REMOTE_MCP_ERROR", ErrorMessage: "MCP supervisor is not running"}
-					} else {
-						result = r.mcp.Execute(execReq.Args)
-					}
-				} else {
-					result = tools.ExecuteWithContext(execCtx, execReq, cwd, workspaceRoot, func(chunk protocol.ToolStreamChunk) {
-						chunk = attachToolCallIDToStreamChunk(chunk, execReq.ToolCallID)
-						if sendErr := r.sendToolStream(context.Background(), peerToken, requestID, chunk); sendErr != nil {
-							log.Printf("stream send failed: %v", sendErr)
-						}
-					})
-				}
-				if result.Meta == nil {
-					result.Meta = map[string]any{}
-				}
-				result.Meta["tool_call_id"] = execReq.ToolCallID
-				if sendErr := r.sendToolResult(context.Background(), peerToken, requestID, result); sendErr != nil {
-					log.Printf("tool result send failed: %v", sendErr)
-				}
-			}(env.RequestID, execReq)
-		case "cancel_tool":
-			requestID := env.RequestID
-			if requestID == "" {
-				if payloadRequestID, _ := env.Payload["request_id"].(string); payloadRequestID != "" {
-					requestID = payloadRequestID
-				}
-			}
-			if requestID != "" {
-				r.cancelActiveRequest(requestID)
-			}
-		case "preview_tool":
-			previewReq, err := protocol.DecodeToolPreviewRequest(env.Payload)
-			if err != nil {
-				if sendErr := r.sendToolPreviewResult(ctx, peerToken, env.RequestID, protocol.ToolPreviewResult{
-					OK:           false,
-					ErrorCode:    "REMOTE_TOOL_ERROR",
-					ErrorMessage: err.Error(),
-				}); sendErr != nil {
-					return sendErr
-				}
-				continue
-			}
-			result := tools.Preview(previewReq, cwd)
-			if sendErr := r.sendToolPreviewResult(ctx, peerToken, env.RequestID, result); sendErr != nil {
-				return sendErr
-			}
-		case "cleanup":
-			cleanup := protocol.CleanupResult{OK: true, RemovedItems: []string{}}
-			if err := r.sendCleanupResult(ctx, peerToken, env.RequestID, cleanup); err != nil {
 				return err
-			}
-		default:
-			log.Printf("ignoring unsupported envelope type=%s", env.Type)
-			if !sleepWithContext(ctx, pollInterval) {
-				return nil
 			}
 		}
 	}
 }
 
-type pollRetryBackoff struct {
+func (r *Runner) executeLocalAction(ctx context.Context, peerToken, cwd, workspaceRoot string, action protocol.LocalActionRecord) error {
+	_ = r.reportLocalActionProgress(ctx, peerToken, action, map[string]any{
+		"status":      "started",
+		"action_kind": action.ActionKind,
+	})
+	if localActionKind(action) == "tool_preview" {
+		previewReq, err := localActionPreviewRequest(action)
+		if err != nil {
+			result := protocol.ToolPreviewResult{OK: false, ErrorCode: "LOCAL_ACTION_ERROR", ErrorMessage: err.Error()}
+			return r.completeLocalAction(context.Background(), peerToken, action, "failed", mapFromStruct(result), err.Error())
+		}
+		result := tools.Preview(previewReq, cwd)
+		status := "completed"
+		errMessage := ""
+		if !result.OK {
+			status = "failed"
+			errMessage = firstNonEmpty(result.ErrorMessage, result.ErrorCode)
+		}
+		return r.completeLocalAction(context.Background(), peerToken, action, status, mapFromStruct(result), errMessage)
+	}
+
+	req, err := localActionToolRequest(action)
+	var result protocol.ExecToolResult
+	if err != nil {
+		result = protocol.ExecToolResult{OK: false, ErrorCode: "LOCAL_ACTION_ERROR", ErrorMessage: err.Error()}
+	} else if req.ToolName == "mcp" {
+		if r.mcp == nil {
+			result = protocol.ExecToolResult{OK: false, ErrorCode: "REMOTE_MCP_ERROR", ErrorMessage: "MCP supervisor is not running"}
+		} else {
+			result = r.mcp.Execute(req.Args)
+		}
+	} else {
+		result = tools.ExecuteWithContext(ctx, req, cwd, workspaceRoot, func(chunk protocol.ToolStreamChunk) {
+			chunk = attachLocalActionIDToStreamChunk(chunk, action.LocalActionID)
+			if sendErr := r.reportLocalActionProgress(context.Background(), peerToken, action, mapFromStruct(chunk)); sendErr != nil {
+				log.Printf("local action progress report failed: %v", sendErr)
+			}
+		})
+	}
+	if result.Meta == nil {
+		result.Meta = map[string]any{}
+	}
+	result.Meta["local_action_id"] = action.LocalActionID
+	if req.ToolCallID != "" {
+		result.Meta["tool_call_id"] = req.ToolCallID
+	}
+	status := "completed"
+	errMessage := ""
+	if !result.OK {
+		status = "failed"
+		errMessage = firstNonEmpty(result.ErrorMessage, result.ErrorCode)
+	}
+	return r.completeLocalAction(context.Background(), peerToken, action, status, mapFromStruct(result), errMessage)
+}
+
+type localActionRetryBackoff struct {
 	attempt int
 	delay   time.Duration
 }
 
-func (b *pollRetryBackoff) recordFailure(pollInterval time.Duration) (int, time.Duration) {
+func (b *localActionRetryBackoff) recordFailure(claimInterval time.Duration) (int, time.Duration) {
 	b.attempt++
 	if b.delay <= 0 {
-		b.delay = pollRetryMinDelay
-		if pollInterval > b.delay {
-			b.delay = pollInterval
+		b.delay = localActionRetryMinDelay
+		if claimInterval > b.delay {
+			b.delay = claimInterval
 		}
 	} else {
 		b.delay *= 2
-		if b.delay > pollRetryMaxDelay {
-			b.delay = pollRetryMaxDelay
+		if b.delay > localActionRetryMaxDelay {
+			b.delay = localActionRetryMaxDelay
 		}
 	}
 	return b.attempt, b.delay
 }
 
-func (b *pollRetryBackoff) reset() {
+func (b *localActionRetryBackoff) reset() {
 	b.attempt = 0
 	b.delay = 0
 }
 
-func isTransientPollError(err error) bool {
+func isTransientLocalActionError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -1001,6 +1012,158 @@ func isTransientPollError(err error) bool {
 		strings.Contains(message, "server misbehaving")
 }
 
+func localActionToolRequest(action protocol.LocalActionRecord) (protocol.ExecToolRequest, error) {
+	payload := action.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	toolName := localActionToolName(action, payload)
+	if toolName == "" || toolName == "tool_preview" {
+		return protocol.ExecToolRequest{}, fmt.Errorf("unsupported local action kind %q", action.ActionKind)
+	}
+	cwd := optionalString(payload, "cwd", "workdir")
+	req := protocol.ExecToolRequest{
+		ToolName:              toolName,
+		Args:                  localActionArgs(toolName, payload),
+		CWD:                   optionalStringPointer(cwd),
+		TimeoutSec:            optionalInt(payload, "timeout_sec"),
+		PreviewIdentity:       optionalMap(payload, "preview_identity"),
+		ApprovedSaveCandidate: firstOptionalMap(payload, "approved_save_candidate", "save_candidate", "candidate"),
+		ToolCallID:            firstNonEmpty(optionalString(payload, "tool_call_id"), action.LocalActionID),
+	}
+	return req, nil
+}
+
+func localActionPreviewRequest(action protocol.LocalActionRecord) (protocol.ToolPreviewRequest, error) {
+	payload := action.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	toolName := firstNonEmpty(optionalString(payload, "preview_target_tool"), optionalString(payload, "tool_name"))
+	if toolName == "" {
+		return protocol.ToolPreviewRequest{}, fmt.Errorf("tool_preview local action requires tool_name")
+	}
+	cwd := optionalString(payload, "cwd", "workdir")
+	return protocol.ToolPreviewRequest{
+		ToolName:   toolName,
+		Args:       localActionArgs(toolName, payload),
+		CWD:        optionalStringPointer(cwd),
+		TimeoutSec: optionalInt(payload, "timeout_sec"),
+	}, nil
+}
+
+func localActionToolName(action protocol.LocalActionRecord, payload map[string]any) string {
+	switch localActionKind(action) {
+	case "read_workspace_file":
+		return "read_file"
+	case "shell", "read_file", "apply_patch", "draft_document_commit", "glob", "grep", "list_file", "lsp", "mcp", "tool_preview":
+		return localActionKind(action)
+	}
+	return optionalString(payload, "tool_name")
+}
+
+func localActionKind(action protocol.LocalActionRecord) string {
+	return strings.TrimSpace(action.ActionKind)
+}
+
+func localActionArgs(toolName string, payload map[string]any) map[string]any {
+	if args := optionalMap(payload, "args"); args != nil {
+		return args
+	}
+	args := map[string]any{}
+	for key, value := range payload {
+		if isLocalActionControlField(toolName, key) {
+			continue
+		}
+		args[key] = value
+	}
+	return args
+}
+
+func isLocalActionControlField(toolName, key string) bool {
+	switch key {
+	case "args", "cwd", "workdir", "timeout_sec", "preview_identity", "approved_save_candidate", "save_candidate", "candidate", "tool_call_id", "preview_target_tool":
+		return true
+	case "tool_name":
+		return toolName != "mcp"
+	default:
+		return false
+	}
+}
+
+func optionalString(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := payload[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func optionalStringPointer(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	copied := value
+	return &copied
+}
+
+func optionalInt(payload map[string]any, key string) int {
+	switch value := payload[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		n, _ := value.Int64()
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func optionalMap(payload map[string]any, key string) map[string]any {
+	value, ok := payload[key]
+	if !ok {
+		return nil
+	}
+	if mapped, ok := value.(map[string]any); ok {
+		return mapped
+	}
+	return nil
+}
+
+func firstOptionalMap(payload map[string]any, keys ...string) map[string]any {
+	for _, key := range keys {
+		if value := optionalMap(payload, key); value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func attachLocalActionIDToStreamChunk(chunk protocol.ToolStreamChunk, localActionID string) protocol.ToolStreamChunk {
+	chunk.ToolCallID = localActionID
+	if chunk.Meta == nil {
+		chunk.Meta = map[string]any{}
+	}
+	chunk.Meta["local_action_id"] = localActionID
+	return chunk
+}
+
 func sleepWithContext(ctx context.Context, delay time.Duration) bool {
 	if delay <= 0 {
 		return ctx.Err() == nil
@@ -1013,26 +1176,6 @@ func sleepWithContext(ctx context.Context, delay time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
-}
-
-func execToolProtocolError(req protocol.ExecToolRequest) (protocol.ExecToolResult, bool) {
-	if strings.TrimSpace(req.ToolCallID) != "" {
-		return protocol.ExecToolResult{}, false
-	}
-	return protocol.ExecToolResult{
-		OK:           false,
-		ErrorCode:    "REMOTE_PROTOCOL_ERROR",
-		ErrorMessage: "exec_tool request missing tool_call_id",
-	}, true
-}
-
-func attachToolCallIDToStreamChunk(chunk protocol.ToolStreamChunk, toolCallID string) protocol.ToolStreamChunk {
-	chunk.ToolCallID = toolCallID
-	if chunk.Meta == nil {
-		chunk.Meta = map[string]any{}
-	}
-	chunk.Meta["tool_call_id"] = toolCallID
-	return chunk
 }
 
 func (r *Runner) registerActiveRequest(requestID string, cancel context.CancelFunc) {
@@ -1273,48 +1416,43 @@ func (r *Runner) heartbeatLoop(ctx context.Context, peerToken string, interval t
 	}
 }
 
-func (r *Runner) sendToolResult(ctx context.Context, peerToken, requestID string, result protocol.ExecToolResult) error {
+func (r *Runner) reportLocalActionProgress(ctx context.Context, peerToken string, action protocol.LocalActionRecord, progress map[string]any) error {
 	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	return r.client.SendResult(sendCtx, protocol.ResultRequest{
-		PeerToken: peerToken,
-		RequestID: requestID,
-		Type:      "tool_result",
-		Payload:   mapFromStruct(result),
+	resp, err := r.client.ReportLocalActionProgress(sendCtx, protocol.LocalActionProgressRequest{
+		PeerToken:     peerToken,
+		LocalActionID: action.LocalActionID,
+		LeaseID:       action.LeaseID,
+		Status:        "progress",
+		Progress:      progress,
 	})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("local action progress failed: %s", resp.Error)
+	}
+	return nil
 }
 
-func (r *Runner) sendToolStream(ctx context.Context, peerToken, requestID string, chunk protocol.ToolStreamChunk) error {
+func (r *Runner) completeLocalAction(ctx context.Context, peerToken string, action protocol.LocalActionRecord, status string, result map[string]any, errorMessage string) error {
 	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	return r.client.SendResult(sendCtx, protocol.ResultRequest{
-		PeerToken: peerToken,
-		RequestID: requestID,
-		Type:      "tool_stream",
-		Payload:   mapFromStruct(chunk),
+	resp, err := r.client.CompleteLocalAction(sendCtx, protocol.LocalActionCompleteRequest{
+		PeerToken:     peerToken,
+		LocalActionID: action.LocalActionID,
+		LeaseID:       action.LeaseID,
+		Status:        status,
+		Result:        result,
+		Error:         errorMessage,
 	})
-}
-
-func (r *Runner) sendToolPreviewResult(ctx context.Context, peerToken, requestID string, result protocol.ToolPreviewResult) error {
-	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	return r.client.SendResult(sendCtx, protocol.ResultRequest{
-		PeerToken: peerToken,
-		RequestID: requestID,
-		Type:      "tool_preview_result",
-		Payload:   mapFromStruct(result),
-	})
-}
-
-func (r *Runner) sendCleanupResult(ctx context.Context, peerToken, requestID string, result protocol.CleanupResult) error {
-	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	return r.client.SendResult(sendCtx, protocol.ResultRequest{
-		PeerToken: peerToken,
-		RequestID: requestID,
-		Type:      "cleanup_result",
-		Payload:   mapFromStruct(result),
-	})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("local action complete failed: %s", resp.Error)
+	}
+	return nil
 }
 
 // mapFromStruct converts a small control-plane struct to map[string]any via JSON roundtrip.

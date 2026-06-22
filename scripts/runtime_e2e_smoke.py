@@ -1232,7 +1232,7 @@ class ServerRunner:
                 fixture["repo"],
                 "--peer-info-file",
                 str(peer_info),
-                "--poll-interval",
+                "--claim-interval",
                 "200ms",
                 "--agent-run-worker",
                 "--worker-session-id",

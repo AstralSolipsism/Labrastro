@@ -1,7 +1,5 @@
 package protocol
 
-import "encoding/json"
-
 type ErrorResponse struct {
 	OK        bool           `json:"ok"`
 	Error     string         `json:"error"`
@@ -43,27 +41,87 @@ type Heartbeat struct {
 	TS        float64 `json:"ts"`
 }
 
-type RelayEnvelope struct {
-	Type      string         `json:"type"`
-	RequestID string         `json:"request_id,omitempty"`
-	PeerID    string         `json:"peer_id,omitempty"`
-	Payload   map[string]any `json:"payload,omitempty"`
-}
-
-type PollRequest struct {
-	PeerToken string `json:"peer_token"`
-}
-
-type ResultRequest struct {
-	PeerToken string         `json:"peer_token"`
-	RequestID string         `json:"request_id"`
-	Type      string         `json:"type"`
-	Payload   map[string]any `json:"payload"`
-}
-
 type DisconnectRequest struct {
 	PeerToken string `json:"peer_token"`
 	Reason    string `json:"reason"`
+}
+
+type LocalActionRecord struct {
+	Scope           string         `json:"scope"`
+	LocalActionID   string         `json:"local_action_id"`
+	ActionKind      string         `json:"action_kind"`
+	Status          string         `json:"status,omitempty"`
+	AgentRunID      string         `json:"agent_run_id,omitempty"`
+	ActivationID    string         `json:"activation_id,omitempty"`
+	SessionRunID    string         `json:"session_run_id,omitempty"`
+	BranchBindingID string         `json:"branch_binding_id,omitempty"`
+	AdminTaskID     string         `json:"admin_task_id,omitempty"`
+	RequestedBy     string         `json:"requested_by,omitempty"`
+	PeerID          string         `json:"peer_id,omitempty"`
+	WorkspaceRoot   string         `json:"workspace_root,omitempty"`
+	Payload         map[string]any `json:"payload,omitempty"`
+	Progress        map[string]any `json:"progress,omitempty"`
+	Result          map[string]any `json:"result,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	LeaseID         string         `json:"lease_id,omitempty"`
+	LeaseExpiresAt  float64        `json:"lease_expires_at,omitempty"`
+	CreatedAt       float64        `json:"created_at,omitempty"`
+	UpdatedAt       float64        `json:"updated_at,omitempty"`
+}
+
+type LocalActionClaimRequest struct {
+	PeerToken     string   `json:"peer_token"`
+	PeerID        string   `json:"peer_id"`
+	WorkerKind    string   `json:"worker_kind"`
+	Features      []string `json:"features,omitempty"`
+	WorkspaceRoot string   `json:"workspace_root,omitempty"`
+	MaxActions    int      `json:"max_actions,omitempty"`
+}
+
+type LocalActionClaimResponse struct {
+	Actions []LocalActionRecord `json:"actions,omitempty"`
+}
+
+type LocalActionProgressRequest struct {
+	PeerToken     string         `json:"peer_token"`
+	LocalActionID string         `json:"local_action_id"`
+	LeaseID       string         `json:"lease_id"`
+	Status        string         `json:"status,omitempty"`
+	Progress      map[string]any `json:"progress,omitempty"`
+}
+
+type LocalActionProgressResponse struct {
+	OK     bool               `json:"ok"`
+	Action *LocalActionRecord `json:"action,omitempty"`
+	Error  string             `json:"error,omitempty"`
+}
+
+type LocalActionCompleteRequest struct {
+	PeerToken     string         `json:"peer_token"`
+	LocalActionID string         `json:"local_action_id"`
+	LeaseID       string         `json:"lease_id"`
+	Status        string         `json:"status"`
+	Result        map[string]any `json:"result,omitempty"`
+	Error         string         `json:"error,omitempty"`
+}
+
+type LocalActionCompleteResponse struct {
+	OK     bool               `json:"ok"`
+	Action *LocalActionRecord `json:"action,omitempty"`
+	Error  string             `json:"error,omitempty"`
+}
+
+type LocalActionCancelRequest struct {
+	PeerToken     string `json:"peer_token"`
+	LocalActionID string `json:"local_action_id"`
+	LeaseID       string `json:"lease_id"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+type LocalActionCancelResponse struct {
+	OK     bool               `json:"ok"`
+	Action *LocalActionRecord `json:"action,omitempty"`
+	Error  string             `json:"error,omitempty"`
 }
 
 type SessionRunStartRequest struct {
@@ -256,12 +314,6 @@ type ToolStreamChunk struct {
 	Meta       map[string]any `json:"meta,omitempty"`
 }
 
-type CleanupResult struct {
-	OK           bool     `json:"ok"`
-	RemovedItems []string `json:"removed_items,omitempty"`
-	ErrorMessage string   `json:"error_message,omitempty"`
-}
-
 type AgentRunActivationClaimRequest struct {
 	PeerToken  string   `json:"peer_token"`
 	WorkerID   string   `json:"worker_id,omitempty"`
@@ -412,31 +464,4 @@ type AgentRunActivationSessionPinRequest struct {
 type AgentRunActivationSessionPinResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
-}
-
-type NoopEnvelope struct {
-	Type    string         `json:"type"`
-	Payload map[string]any `json:"payload"`
-}
-
-// DecodeExecToolRequest converts a map payload to ExecToolRequest via JSON roundtrip.
-// The marshal-unmarshal pattern keeps map-to-struct conversion consistent.
-func DecodeExecToolRequest(payload map[string]any) (ExecToolRequest, error) {
-	var req ExecToolRequest
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return req, err
-	}
-	err = json.Unmarshal(buf, &req)
-	return req, err
-}
-
-func DecodeToolPreviewRequest(payload map[string]any) (ToolPreviewRequest, error) {
-	var req ToolPreviewRequest
-	buf, err := json.Marshal(payload)
-	if err != nil {
-		return req, err
-	}
-	err = json.Unmarshal(buf, &req)
-	return req, err
 }
