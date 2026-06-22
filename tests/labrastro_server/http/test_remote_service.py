@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib import request
 from urllib.error import HTTPError
@@ -33,6 +34,9 @@ from labrastro_server.interfaces.http.remote.service import (
 from labrastro_server.interfaces.http.remote.routes.chat import (
     _remote_runtime_error_payload,
 )
+from labrastro_server.interfaces.http.remote.routes.admin import (
+    _session_run_failed_http_error,
+)
 from labrastro_server.services.auth.models import AuthPrincipal
 from labrastro_server.services.admin.service import RemoteAdminConfigManager
 from reuleauxcoder.domain.config.models import (
@@ -46,6 +50,7 @@ from reuleauxcoder.domain.config.models import (
     MCPServerConfig,
 )
 from reuleauxcoder.domain.providers.models import ProviderResponse
+from reuleauxcoder.domain.agent_runtime.models import AgentRunSource
 from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
@@ -87,6 +92,107 @@ TEST_ADMIN_TOKEN = "test-admin-token"
 
 def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
     return str(control.get_agent_run(task_id).current_activation_id or "")
+
+
+def _with_main_branch(payload: dict | None = None) -> dict:
+    out = dict(payload or {})
+    out.setdefault("branch_binding_id", "main")
+    return out
+
+
+def _append_main_event(
+    session: _SessionRunProjection,
+    event_type: str,
+    payload: dict | None = None,
+) -> int:
+    _ensure_main_branch(session)
+    return session.append_event(event_type, _with_main_branch(payload))
+
+
+def _append_main_live_event(
+    session: _SessionRunProjection,
+    event_type: str,
+    payload: dict | None = None,
+) -> int:
+    _ensure_main_branch(session)
+    return session.append_live_event(event_type, _with_main_branch(payload))
+
+
+def _record_session_branch(
+    session: _SessionRunProjection,
+    branch_binding_id: str,
+    *,
+    agent_run_id: str | None = None,
+    selected: bool = False,
+) -> None:
+    session.record_branch_binding(
+        {
+            "id": f"binding-{branch_binding_id}",
+            "session_run_id": session.session_run_id,
+            "branch_binding_id": branch_binding_id,
+            "agent_run_id": agent_run_id or f"agent-{branch_binding_id}",
+            "target_agent_run_id": agent_run_id or f"agent-{branch_binding_id}",
+            "selected": selected,
+            "status": "active",
+        }
+    )
+
+
+def _ensure_session_branch(
+    session: _SessionRunProjection,
+    branch_binding_id: str,
+    *,
+    agent_run_id: str | None = None,
+    selected: bool = False,
+) -> None:
+    existing = session.branch_bindings.get(branch_binding_id)
+    if isinstance(existing, dict):
+        if not str(existing.get("agent_run_id") or "").strip():
+            session.record_branch_binding(
+                {
+                    **existing,
+                    "agent_run_id": agent_run_id or f"agent-{branch_binding_id}",
+                    "target_agent_run_id": agent_run_id or f"agent-{branch_binding_id}",
+                    "selected": selected or bool(existing.get("selected")),
+                }
+            )
+        return
+    _record_session_branch(
+        session,
+        branch_binding_id,
+        agent_run_id=agent_run_id,
+        selected=selected,
+    )
+
+
+def _ensure_main_branch(session: _SessionRunProjection) -> None:
+    _ensure_session_branch(
+        session,
+        "main",
+        agent_run_id=str(session.agent_run_id or "agent-run-main"),
+        selected=True,
+    )
+
+
+def test_session_run_start_failure_retry_ignores_runtime_failure_events() -> None:
+    session = _SessionRunProjection(
+        session_run_id="session-run-runtime-failed-not-start",
+        peer_id="peer-1",
+        branch_binding_id="main",
+        agent_run_id="agent-main",
+    )
+    session.append_event(
+        "session_run_failed",
+        {
+            "branch_binding_id": "main",
+            "operation": "runtime",
+            "http_status": 409,
+            "code": "runtime_failed",
+            "message": "runtime failed",
+        },
+    )
+
+    assert _session_run_failed_http_error(session) is None
 
 
 def test_remote_runtime_error_payload_preserves_remote_protocol_code() -> None:
@@ -384,13 +490,16 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
     session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
         artifact_root=tmp_path,
         trace_event_sink=sink,
     )
 
     session.append_event("session_run_start", {"prompt": "hi"})
-    session.append_event("assistant_delta", {"content": "live-coalesced"})
-    session.append_event(
+    _append_main_event(session, "assistant_delta", {"content": "live-coalesced"})
+    _append_main_event(
+        session,
         "document_draft_progress",
         {
             "draft_id": "draft-1",
@@ -400,7 +509,8 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
             "last_chunk_seq": 1,
         },
     )
-    session.append_event(
+    _append_main_event(
+        session,
         "document_draft_snapshot",
         {
             "draft_id": "draft-1",
@@ -413,15 +523,15 @@ def test_remote_session_run_session_flushes_pending_replayable_events_when_trace
             "last_chunk_seq": 1,
         },
     )
-    session.append_event("tool_call_stream", {"tool_call_id": "tool-1", "content": "live"})
+    _append_main_event(session, "tool_call_stream", {"tool_call_id": "tool-1", "content": "live"})
     assert persisted == []
 
-    session.append_event("remote_peer_ready", {"session_id": "session-1"})
+    _append_main_event(session, "remote_peer_ready", {"session_id": "session-1"})
     assert persisted == []
 
     session.enable_trace_persistence("session-1")
-    session.append_event("assistant_message", {"content": "stored"})
-    session.append_event("session_run_end", {"response": "done"})
+    _append_main_event(session, "assistant_message", {"content": "stored"})
+    _append_main_event(session, "session_run_end", {"response": "done"})
 
     assert [event["type"] for event in persisted] == [
         "session_run_start",
@@ -452,7 +562,8 @@ def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: 
         locale="zh-CN",
     )
 
-    session.append_event(
+    _append_main_event(
+        session,
         "provider_stream_interrupted",
         {
             "message_key": "provider_stream_interrupted.recovering",
@@ -469,6 +580,199 @@ def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: 
     )
 
 
+def test_session_run_terminal_event_updates_selected_runtime_lifecycle(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-terminal-event-lifecycle",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+    writer.mark_running()
+
+    writer.append_event("session_run_end", {"response": "done"})
+    status = session.status_payload(0, branch_binding_id="main")
+
+    assert status["status"] == "done"
+    assert status["done"] is True
+    assert session.status == "done"
+    assert session.running is False
+    assert session.done is True
+    assert session.finished_at is not None
+
+
+def test_session_run_sibling_terminal_event_does_not_update_selected_lifecycle(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-sibling-terminal-event-lifecycle",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-a",
+            "session_run_id": "run-sibling-terminal-event-lifecycle",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-run-a",
+            "target_agent_run_id": "agent-run-a",
+            "selected": False,
+            "status": "active",
+        }
+    )
+    branch_writer = session.scoped_writer(
+        branch_binding_id="branch-a",
+        agent_run_id="agent-run-a",
+    )
+    branch_writer.mark_running()
+    selected_model_status_before = session.status
+
+    branch_writer.append_event("session_run_end", {"response": "branch done"})
+    branch_status = session.status_payload(0, branch_binding_id="branch-a")
+    selected_status = session.status_payload(0, branch_binding_id="main")
+
+    assert branch_status["status"] == "done"
+    assert branch_status["done"] is True
+    assert selected_status["status"] == "active"
+    assert selected_status["done"] is False
+    assert session.status == selected_model_status_before
+    assert session.running is False
+    assert session.done is False
+    assert session.finished_at is None
+
+
+def test_session_run_status_response_fails_closed_for_unbound_branch(tmp_path: Path) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-response-unbound-branch",
+        peer_id="peer-1",
+        agent_run_id="agent-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.scoped_writer(
+            branch_binding_id="branch-a",
+            agent_run_id="agent-branch-a",
+        )
+
+
+def test_peer_disconnect_without_scoped_branch_fails_closed(tmp_path: Path) -> None:
+    relay = RelayServer()
+    service = RemoteRelayHTTPService(
+        relay_server=relay,
+        bind="127.0.0.1:0",
+        session_run_artifact_root=tmp_path,
+    )
+    session = _SessionRunProjection(
+        session_run_id="run-disconnect-unscoped",
+        peer_id="peer-unscoped",
+        artifact_root=tmp_path,
+        status="running",
+        running=True,
+    )
+    session.branch_bindings["branch-without-agent"] = {
+        "branch_binding_id": "branch-without-agent",
+        "agent_run_id": "",
+        "selected": True,
+        "status": "active",
+    }
+
+    with service._session_runs_lock:
+        service._session_runs[session.session_run_id] = session
+
+    service._abort_peer_session_runs("peer-unscoped", "peer_disconnected")
+
+    assert session.status == "running"
+    assert session.running is True
+    assert session.done is False
+    assert session.finished_at is None
+    assert session.events == []
+
+
+def test_session_run_agent_projection_is_raw_event_idempotent(tmp_path: Path) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-agent-projection-idempotent",
+        peer_id="peer-1",
+        session_hint="session-1",
+        branch_binding_id="main",
+        agent_run_id="agent-main",
+        artifact_root=tmp_path,
+    )
+    _ensure_main_branch(session)
+    events = [
+        {
+            "agent_run_id": "agent-main",
+            "seq": 1,
+            "type": "log",
+            "payload": {
+                "type": "log",
+                "text": "loading source bundle",
+                "data": {"level": "info"},
+            },
+        },
+        {
+            "agent_run_id": "agent-main",
+            "seq": 2,
+            "type": "error",
+            "payload": {"message": "preview failed"},
+        },
+    ]
+
+    assert session.project_agent_run_events("main", events) == 2
+    first_snapshot = session.events
+    session._agent_run_projection_cursors_by_branch["main"] = 0
+
+    assert session.project_agent_run_events("main", events) == 0
+    assert session.events == first_snapshot
+
+
+def test_session_run_agent_projection_maps_cancelled_terminal_to_cancelled(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-agent-projection-cancelled",
+        peer_id="peer-1",
+        session_hint="session-1",
+        branch_binding_id="main",
+        agent_run_id="agent-main",
+        artifact_root=tmp_path,
+    )
+    _ensure_main_branch(session)
+
+    assert session.project_agent_run_events(
+        "main",
+        [
+            {
+                "agent_run_id": "agent-main",
+                "seq": 1,
+                "type": "cancelled",
+                "payload": {
+                    "agent_run": {
+                        "status": "cancelled",
+                        "cancel_reason": "user_stop",
+                    }
+                },
+            }
+        ],
+    ) == 2
+
+    event_types = [event["type"] for event in session.events]
+    assert "session_run_cancelled" in event_types
+    assert "session_run_failed" not in event_types
+    assert session.branch_bindings["main"]["status"] == "cancelled"
+    assert session.status == "cancelled"
+    assert session.last_error == "user_stop"
+
+
 def test_remote_session_run_adds_server_enqueue_latency_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -483,7 +787,7 @@ def test_remote_session_run_adds_server_enqueue_latency_metrics(
         artifact_root=tmp_path,
     )
 
-    session.append_event("stream_observability", {"emitted_at": 10.0})
+    _append_main_event(session, "stream_observability", {"emitted_at": 10.0})
 
     payload = session.events[0]["payload"]
     assert payload["server_enqueued_at"] == 10.25
@@ -498,7 +802,8 @@ def test_remote_session_run_uses_english_notice_for_english_locale(tmp_path: Pat
         locale="en",
     )
 
-    session.append_event(
+    _append_main_event(
+        session,
         "error",
         {
             "code": "capability_package_session_failed",
@@ -519,18 +824,241 @@ def test_remote_session_run_session_coalesces_fast_live_events(tmp_path: Path) -
         artifact_root=tmp_path,
     )
 
-    session.append_event("assistant_delta", {"content": "A"})
-    events, _done, cursor = session.wait_events(0, 0)
+    _append_main_event(session, "assistant_delta", {"content": "A"})
+    events, _done, cursor = session.wait_events(0, 0, branch_binding_id="main")
     assert [event["payload"]["content"] for event in events] == ["A"]
 
-    session.append_event("assistant_delta", {"content": "B"})
-    session.append_event("assistant_delta", {"content": "C"})
-    events, _done, cursor = session.wait_events(cursor, 0)
+    _append_main_event(session, "assistant_delta", {"content": "B"})
+    _append_main_event(session, "assistant_delta", {"content": "C"})
+    events, _done, cursor = session.wait_events(cursor, 0, branch_binding_id="main")
     assert events == []
 
-    events, _done, _cursor = session.wait_events(cursor, 0.2)
+    events, _done, _cursor = session.wait_events(
+        cursor,
+        0.2,
+        branch_binding_id="main",
+    )
     assert [event["type"] for event in events] == ["assistant_delta"]
     assert events[0]["payload"]["content"] == "BC"
+
+
+def test_remote_session_run_live_coalescing_is_branch_scoped(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-live-branch-scope",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-a",
+            "session_run_id": "run-live-branch-scope",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-a",
+            "selected": True,
+            "status": "running",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-b",
+            "session_run_id": "run-live-branch-scope",
+            "branch_binding_id": "branch-b",
+            "agent_run_id": "agent-b",
+            "selected": False,
+            "status": "running",
+        }
+    )
+
+    session.append_event(
+        "assistant_delta",
+        {
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-a",
+            "content": "A0",
+        },
+    )
+    events, _done, cursor_a = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-a",
+    )
+    assert [event["payload"]["content"] for event in events] == ["A0"]
+
+    session.append_event(
+        "assistant_delta",
+        {
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-a",
+            "content": "A1",
+        },
+    )
+    session.append_event(
+        "assistant_delta",
+        {
+            "branch_binding_id": "branch-b",
+            "agent_run_id": "agent-b",
+            "content": "B1",
+        },
+    )
+
+    branch_b_events, _done, _cursor_b = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-b",
+    )
+    assert [event["payload"]["content"] for event in branch_b_events] == ["B1"]
+
+    branch_a_events, _done, _cursor_a = session.wait_events(
+        cursor_a,
+        0.2,
+        branch_binding_id="branch-a",
+    )
+    assert [event["payload"]["content"] for event in branch_a_events] == ["A1"]
+
+
+def test_remote_session_run_tool_call_stream_coalescing_is_branch_scoped(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-tool-stream-branch-scope",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+    for branch_binding_id, agent_run_id, selected in (
+        ("branch-a", "agent-a", True),
+        ("branch-b", "agent-b", False),
+    ):
+        session.record_branch_binding(
+            {
+                "id": f"binding-{branch_binding_id}",
+                "session_run_id": "run-tool-stream-branch-scope",
+                "branch_binding_id": branch_binding_id,
+                "agent_run_id": agent_run_id,
+                "selected": selected,
+                "status": "running",
+            }
+        )
+
+    base_payload = {
+        "tool_call_id": "tool-call-shared",
+        "tool_name": "lookup",
+        "stream": "stdout",
+        "format": "text",
+    }
+    session.append_event(
+        "tool_call_stream",
+        {
+            **base_payload,
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-a",
+            "content": "A0",
+        },
+    )
+    events, _done, cursor_a = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-a",
+    )
+    assert [event["payload"]["content"] for event in events] == ["A0"]
+
+    session.append_event(
+        "tool_call_stream",
+        {
+            **base_payload,
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-a",
+            "content": "A1",
+        },
+    )
+    session.append_event(
+        "tool_call_stream",
+        {
+            **base_payload,
+            "branch_binding_id": "branch-b",
+            "agent_run_id": "agent-b",
+            "content": "B1",
+        },
+    )
+
+    branch_b_events, _done, _cursor_b = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-b",
+    )
+    assert [event["payload"]["content"] for event in branch_b_events] == ["B1"]
+
+    branch_a_events, _done, _cursor_a = session.wait_events(
+        cursor_a,
+        0.2,
+        branch_binding_id="branch-a",
+    )
+    assert [event["payload"]["content"] for event in branch_a_events] == ["A1"]
+
+
+def test_remote_session_run_wait_events_requires_branch_scope(tmp_path: Path) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-events-require-scope",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.wait_events(0, 0)
+
+
+def test_remote_session_run_does_not_create_main_scope_without_explicit_branch(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-no-implicit-main",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    assert session.branch_binding_id is None
+    assert session.selected_branch_binding_id == ""
+    assert session.branch_summaries() == []
+
+
+def test_remote_session_run_lifecycle_mutators_require_branch_scope(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-lifecycle-require-scope",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.mark_running()
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.mark_done()
+
+
+def test_remote_session_run_events_lost_notice_is_scoped_to_requested_branch(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-events-lost-scope",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+        max_events=1,
+    )
+    _append_main_event(session, "assistant_message", {"content": "dropped"})
+    _append_main_event(session, "assistant_message", {"content": "kept"})
+
+    events, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="main",
+    )
+
+    assert [event["type"] for event in events] == ["events_lost", "assistant_message"]
+    assert events[0]["payload"]["branch_binding_id"] == "main"
+    assert events[0]["payload"]["dropped_count"] == 1
+    assert events[1]["payload"]["content"] == "kept"
 
 
 def test_remote_session_run_branch_projection_uses_parent_prefix_without_sibling_tail(
@@ -623,7 +1151,7 @@ def test_remote_session_run_branch_projection_uses_parent_prefix_without_sibling
         },
     )
 
-    events, _done, _cursor = session.wait_events(0, 0)
+    events, _done, _cursor = session.wait_events(0, 0, branch_binding_id="branch-1")
     contents = [event["payload"].get("content") for event in events]
 
     assert contents == [
@@ -647,16 +1175,94 @@ def test_remote_session_run_branch_projection_uses_parent_prefix_without_sibling
         )
         == "edited question"
     )
+    assert (
+        session.compose_branch_prompt(
+            source_branch_binding_id="",
+            base_session_item_id="msg-1",
+            prompt="edited question",
+        )
+        == "edited question"
+    )
     assert len(session.events) == 5
     branches = {
         item["branch_binding_id"]: item
-        for item in session.status_payload(0)["branches"]
+        for item in session.status_payload(0, branch_binding_id="branch-1")["branches"]
     }
     assert branches["branch-1"]["selected"] is True
     assert branches["branch-1"]["current_index"] == 1
     assert branches["branch-1"]["total_sibling_count"] == 2
     assert branches["branch-2"]["total_sibling_count"] == 2
     assert branches["main"]["has_updates"] is True
+
+
+def test_remote_session_run_branch_summary_sibling_order_uses_created_at_not_binding_id(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-summary-order",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-branch-summary-order",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "active",
+            "created_at": "2026-06-20T00:00:00+00:00",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-z",
+            "session_run_id": "run-branch-summary-order",
+            "branch_binding_id": "branch-z",
+            "agent_run_id": "agent-run-branch-z",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "source_agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-branch-z",
+            "selected": False,
+            "status": "active",
+            "created_at": "2026-06-20T00:00:01+00:00",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-a",
+            "session_run_id": "run-branch-summary-order",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-run-branch-a",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "source_agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-branch-a",
+            "selected": False,
+            "status": "active",
+            "created_at": "2026-06-20T00:00:02+00:00",
+        }
+    )
+
+    summaries = session.status_payload(0, branch_binding_id="branch-z")["branches"]
+    sibling_summaries = [
+        item
+        for item in summaries
+        if item["parent_branch_binding_id"] == "main"
+        and item["base_session_item_id"] == "msg-1"
+    ]
+    by_branch = {item["branch_binding_id"]: item for item in sibling_summaries}
+
+    assert [item["branch_binding_id"] for item in sibling_summaries] == [
+        "branch-z",
+        "branch-a",
+    ]
+    assert by_branch["branch-z"]["current_index"] == 1
+    assert by_branch["branch-a"]["current_index"] == 2
 
 
 def test_remote_session_run_branch_projection_root_base_uses_empty_parent_prefix(
@@ -727,7 +1333,7 @@ def test_remote_session_run_branch_projection_root_base_uses_empty_parent_prefix
         },
     )
 
-    events, _done, _cursor = session.wait_events(0, 0)
+    events, _done, _cursor = session.wait_events(0, 0, branch_binding_id="branch-root")
     contents = [event["payload"].get("content") for event in events]
 
     assert contents == [
@@ -947,6 +1553,1263 @@ def test_remote_session_run_pending_inputs_are_branch_local(tmp_path: Path) -> N
     )
 
 
+def test_remote_session_run_approval_ids_are_branch_local(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-approval-id-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    for branch_binding_id, tool_call_id in (
+        ("branch-a", "tool-a"),
+        ("branch-b", "tool-b"),
+    ):
+        session.record_branch_binding(
+            {
+                "id": f"binding-{branch_binding_id}",
+                "session_run_id": "run-approval-id-scope",
+                "branch_binding_id": branch_binding_id,
+                "agent_run_id": f"agent-{branch_binding_id}",
+                "selected": branch_binding_id == "branch-a",
+                "status": "active",
+            }
+        )
+        session.register_approval(
+            "approval-shared",
+            {
+                "tool_call_id": tool_call_id,
+                "branch_binding_id": branch_binding_id,
+                "agent_run_id": f"agent-{branch_binding_id}",
+            },
+        )
+
+    status_a = session.status_payload(0, branch_binding_id="branch-a")
+    status_b = session.status_payload(0, branch_binding_id="branch-b")
+    assert [item["tool_call_id"] for item in status_a["approvals"]] == ["tool-a"]
+    assert [item["tool_call_id"] for item in status_b["approvals"]] == ["tool-b"]
+
+    assert (
+        session.resolve_approval(
+            "approval-shared",
+            "allow_once",
+            None,
+            branch_binding_id="branch-a",
+        )
+        == "resolved"
+    )
+    assert (
+        session.resolve_approval(
+            "approval-shared",
+            "deny_once",
+            "branch-b denied",
+            branch_binding_id="branch-b",
+        )
+        == "resolved"
+    )
+
+    session.append_event(
+        "approval_resolved",
+        {
+            "approval_id": "approval-shared",
+            "decision": "allow_once",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-branch-a",
+        },
+    )
+    session.append_event(
+        "approval_resolved",
+        {
+            "approval_id": "approval-shared",
+            "decision": "deny_once",
+            "reason": "branch-b denied",
+            "branch_binding_id": "branch-b",
+            "agent_run_id": "agent-branch-b",
+        },
+    )
+
+    events_a, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-a",
+    )
+    events_b, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-b",
+    )
+    approval_a = [
+        event for event in events_a if event["type"] == "approval_resolved"
+    ]
+    approval_b = [
+        event for event in events_b if event["type"] == "approval_resolved"
+    ]
+    assert [event["payload"]["decision"] for event in approval_a] == ["allow_once"]
+    assert [event["payload"]["decision"] for event in approval_b] == ["deny_once"]
+
+
+def test_remote_session_run_approval_payload_id_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-approval-id-mismatch",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="approval_id_mismatch"):
+        session.register_approval(
+            "approval-state-key",
+            {
+                "approval_id": "approval-visible-payload",
+                "branch_binding_id": "main",
+                "tool_call_id": "tool-main",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "id_field", "payload_extra"),
+    [
+        ("approval_resolved", "approval_id", {"decision": "allow_once"}),
+        ("user_input_resolved", "input_id", {"action": "accept", "content": {}}),
+    ],
+)
+def test_remote_session_run_resolved_event_unknown_branch_failure_does_not_poison_dedupe(
+    tmp_path: Path,
+    event_type: str,
+    id_field: str,
+    payload_extra: dict,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id=f"run-{event_type}-unknown-branch-dedupe",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    payload = {
+        id_field: "shared-id",
+        "branch_binding_id": "branch-late",
+        "agent_run_id": "agent-late",
+        **payload_extra,
+    }
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.append_event(event_type, dict(payload))
+
+    _record_session_branch(session, "branch-late", agent_run_id="agent-late")
+    session.append_event(event_type, dict(payload))
+
+    events, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-late",
+    )
+    assert [event["type"] for event in events if event["type"] == event_type] == [
+        event_type
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "id_field", "payload_extra"),
+    [
+        ("approval_resolved", "approval_id", {"decision": "allow_once"}),
+        ("user_input_resolved", "input_id", {"action": "accept", "content": {}}),
+    ],
+)
+def test_remote_session_run_resolved_event_missing_agent_failure_does_not_poison_dedupe(
+    tmp_path: Path,
+    event_type: str,
+    id_field: str,
+    payload_extra: dict,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id=f"run-{event_type}-missing-agent-dedupe",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-metadata-only",
+            "session_run_id": session.session_run_id,
+            "branch_binding_id": "metadata-only",
+            "selected": False,
+            "status": "active",
+        }
+    )
+    payload = {
+        id_field: "shared-id",
+        "branch_binding_id": "metadata-only",
+        "agent_run_id": "agent-metadata",
+        **payload_extra,
+    }
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.append_event(event_type, dict(payload))
+
+    _record_session_branch(session, "metadata-only", agent_run_id="agent-metadata")
+    session.append_event(event_type, dict(payload))
+
+    events, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="metadata-only",
+    )
+    assert [event["type"] for event in events if event["type"] == event_type] == [
+        event_type
+    ]
+
+
+def test_remote_session_run_user_input_ids_are_branch_local(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-user-input-id-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    for branch_binding_id, message in (
+        ("branch-a", "question A"),
+        ("branch-b", "question B"),
+    ):
+        session.record_branch_binding(
+            {
+                "id": f"binding-{branch_binding_id}",
+                "session_run_id": "run-user-input-id-scope",
+                "branch_binding_id": branch_binding_id,
+                "agent_run_id": f"agent-{branch_binding_id}",
+                "selected": branch_binding_id == "branch-a",
+                "status": "active",
+            }
+        )
+        session.register_user_input(
+            "input-shared",
+            {
+                "kind": "clarification",
+                "message": message,
+                "branch_binding_id": branch_binding_id,
+                "agent_run_id": f"agent-{branch_binding_id}",
+            },
+        )
+
+    status_a = session.status_payload(0, branch_binding_id="branch-a")
+    status_b = session.status_payload(0, branch_binding_id="branch-b")
+    assert [item["message"] for item in status_a["user_inputs"]] == ["question A"]
+    assert [item["message"] for item in status_b["user_inputs"]] == ["question B"]
+
+    assert (
+        session.resolve_user_input(
+            "input-shared",
+            "accept",
+            {"answer": "A"},
+            None,
+            branch_binding_id="branch-a",
+        )
+        == "resolved"
+    )
+    assert session.wait_user_input(
+        "input-shared",
+        timeout_sec=0,
+        branch_binding_id="branch-a",
+    ) == ("accept", {"answer": "A"}, None)
+    assert (
+        session.resolve_user_input(
+            "input-shared",
+            "decline",
+            {},
+            "branch-b declined",
+            branch_binding_id="branch-b",
+        )
+        == "resolved"
+    )
+    assert session.wait_user_input(
+        "input-shared",
+        timeout_sec=0,
+        branch_binding_id="branch-b",
+    ) == ("decline", {}, "branch-b declined")
+
+    session.append_event(
+        "user_input_resolved",
+        {
+            "input_id": "input-shared",
+            "action": "accept",
+            "content": {"answer": "A"},
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-branch-a",
+        },
+    )
+    session.append_event(
+        "user_input_resolved",
+        {
+            "input_id": "input-shared",
+            "action": "decline",
+            "content": {},
+            "reason": "branch-b declined",
+            "branch_binding_id": "branch-b",
+            "agent_run_id": "agent-branch-b",
+        },
+    )
+
+    events_a, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-a",
+    )
+    events_b, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-b",
+    )
+    input_a = [
+        event for event in events_a if event["type"] == "user_input_resolved"
+    ]
+    input_b = [
+        event for event in events_b if event["type"] == "user_input_resolved"
+    ]
+    assert [event["payload"]["action"] for event in input_a] == ["accept"]
+    assert [event["payload"]["action"] for event in input_b] == ["decline"]
+
+
+def test_remote_session_run_user_input_payload_id_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-user-input-id-mismatch",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="input_id_mismatch"):
+        session.register_user_input(
+            "input-state-key",
+            {
+                "input_id": "input-visible-payload",
+                "branch_binding_id": "main",
+                "kind": "clarification",
+            },
+        )
+
+
+def test_remote_session_run_revision_feedback_ids_are_branch_local(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-revision-feedback-id-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    _record_session_branch(session, "branch-a", agent_run_id="agent-branch-a")
+    _record_session_branch(session, "branch-b", agent_run_id="agent-branch-b")
+
+    ticket_a = session.submit_revision_feedback(
+        "revise branch A",
+        revision_feedback_id="revision-shared",
+        branch_binding_id="branch-a",
+    )
+    ticket_b = session.submit_revision_feedback(
+        "revise branch B",
+        revision_feedback_id="revision-shared",
+        branch_binding_id="branch-b",
+    )
+
+    assert ticket_a["text"] == "revise branch A"
+    assert ticket_b["text"] == "revise branch B"
+
+    session.mark_revision_feedback_consumed(
+        "revision-shared",
+        branch_binding_id="branch-b",
+    )
+
+    live_a = session.revision_feedback_ticket(
+        "revision-shared",
+        branch_binding_id="branch-a",
+    )
+    live_b = session.revision_feedback_ticket(
+        "revision-shared",
+        branch_binding_id="branch-b",
+    )
+    assert live_a is not None
+    assert live_b is not None
+    assert live_a["state"] == "pending"
+    assert live_b["state"] == "consumed"
+
+    events_a, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-a",
+    )
+    events_b, _done, _cursor = session.wait_events(
+        0,
+        0,
+        branch_binding_id="branch-b",
+    )
+    assert [
+        event["payload"]["text"]
+        for event in events_a
+        if event["type"] == "session_run_revision_feedback_accepted"
+    ] == ["revise branch A"]
+    assert [
+        event["payload"]["text"]
+        for event in events_b
+        if event["type"] == "session_run_revision_feedback_accepted"
+    ] == ["revise branch B"]
+    assert [
+        event["payload"]["branch_binding_id"]
+        for event in events_b
+        if event["type"] == "session_run_revision_feedback_consumed"
+    ] == ["branch-b"]
+
+
+def test_remote_session_run_revision_feedback_unknown_branch_fails_without_ticket(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-revision-feedback-unknown-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.submit_revision_feedback(
+            "orphan revision",
+            revision_feedback_id="revision-orphan",
+            branch_binding_id="branch-missing",
+        )
+
+    assert (
+        session.revision_feedback_ticket(
+            "revision-orphan",
+            branch_binding_id="branch-missing",
+        )
+        is None
+    )
+    assert [
+        event
+        for event in session.events
+        if event["type"] == "session_run_revision_feedback_accepted"
+    ] == []
+
+
+def test_remote_session_run_revision_feedback_requires_branch_agent_without_ticket(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-revision-feedback-missing-agent",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-metadata-only",
+            "session_run_id": "run-revision-feedback-missing-agent",
+            "branch_binding_id": "metadata-only",
+            "selected": False,
+            "status": "active",
+        }
+    )
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.submit_revision_feedback(
+            "metadata-only revision",
+            revision_feedback_id="revision-metadata-only",
+            branch_binding_id="metadata-only",
+        )
+
+    assert (
+        session.revision_feedback_ticket(
+            "revision-metadata-only",
+            branch_binding_id="metadata-only",
+        )
+        is None
+    )
+    assert [
+        event
+        for event in session.events
+        if event["type"] == "session_run_revision_feedback_accepted"
+    ] == []
+
+
+def test_remote_session_run_status_payload_is_branch_runtime_scoped(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-status-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-a",
+            "session_run_id": "run-branch-status-scope",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-run-a",
+            "parent_branch_binding_id": "main",
+            "base_session_item_id": "msg-1",
+            "selected": False,
+            "status": "running",
+        }
+    )
+
+    session.append_event(
+        "error",
+        {
+            "branch_binding_id": "branch-a",
+            "message": "branch A failed",
+        },
+    )
+
+    branch_status = session.status_payload(0, branch_binding_id="branch-a")
+    main_status = session.status_payload(0, branch_binding_id="main")
+    branch_summaries = {
+        item["branch_binding_id"]: item for item in branch_status["branches"]
+    }
+
+    assert branch_status["status"] == "error"
+    assert branch_status["done"] is True
+    assert branch_status["running"] is False
+    assert branch_status["reconnectable"] is False
+    assert branch_status["error"] == "branch A failed"
+    assert main_status["status"] == "active"
+    assert main_status["done"] is False
+    assert main_status["error"] is None
+    assert branch_summaries["branch-a"]["status"] == "error"
+    assert branch_summaries["main"]["status"] == "active"
+
+
+def test_remote_session_run_status_payload_rejects_unknown_branch_scope(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-unknown-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.status_payload(0, branch_binding_id="branch-missing")
+
+
+def test_remote_session_run_branch_summaries_do_not_fabricate_selected_scope(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-summary-no-fabricated-selected",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.selected_branch_binding_id = "branch-ghost"
+
+    status = session.status_payload(0, branch_binding_id="main")
+
+    assert {
+        item["branch_binding_id"] for item in status["branches"]
+    } == {"main"}
+
+
+def test_remote_session_run_branch_summaries_skip_branch_without_agent_proof(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-summary-skip-metadata-only",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-metadata-only",
+            "session_run_id": "run-summary-skip-metadata-only",
+            "branch_binding_id": "metadata-only",
+            "selected": False,
+            "status": "active",
+        }
+    )
+
+    status = session.status_payload(0, branch_binding_id="main")
+
+    assert {
+        item["branch_binding_id"] for item in status["branches"]
+    } == {"main"}
+
+
+def test_remote_session_run_projection_requires_branch_proof_after_start(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-requires-branch-proof",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    session.append_event("session_run_start", {"prompt": "hello"})
+    start_event = session.events[-1]
+    assert start_event["payload"]["branch_binding_id"] == "main"
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.append_event("assistant_message", {"content": "missing scope"})
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.append_live_event(
+            "document_draft_preview_chunk",
+            {"draft_id": "draft-1", "content": "missing scope"},
+        )
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.register_approval("approval-missing", {"tool_call_id": "tool-1"})
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.register_user_input("input-missing", {"kind": "clarification"})
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.register_recovery({"response": "missing scope"})
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.request_cancel("missing scope")
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.cancel_pending_approvals("missing scope")
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.cancel_pending_user_inputs("missing scope")
+
+
+def test_remote_session_run_start_without_existing_branch_scope_fails_closed(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-start-requires-branch-proof",
+        peer_id="peer-1",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.append_event("session_run_start", {"prompt": "missing scope"})
+
+
+def test_remote_session_run_events_response_reads_runtime_snapshot_after_wait(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-events-runtime-after-wait",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+    append_done = threading.Event()
+
+    def append_after_wait_starts() -> None:
+        time.sleep(0.05)
+        writer.append_event("assistant_message", {"content": "wake wait"})
+        append_done.set()
+
+    def runtime_snapshot() -> tuple[str, bool]:
+        assert append_done.is_set()
+        return "completed", True
+
+    thread = threading.Thread(target=append_after_wait_starts)
+    thread.start()
+    try:
+        batch = writer.events_response_payload(
+            0,
+            1,
+            runtime_snapshot=runtime_snapshot,
+            selected=True,
+        )
+    finally:
+        thread.join(timeout=2)
+
+    assert batch["done"] is True
+    assert batch["events"]
+
+
+def test_remote_session_run_selected_runtime_scope_does_not_reuse_previous_error(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-selected-error-isolation",
+        peer_id="peer-1",
+        agent_run_id="agent-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.last_error = "main failed"
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-a",
+            "session_run_id": "run-selected-error-isolation",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-branch-a",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="branch-a",
+        agent_run_id="agent-branch-a",
+    )
+
+    writer.apply_selected_runtime_scope(
+        runtime_status="cancelled",
+        terminal=True,
+    )
+
+    assert session.status == "cancelled"
+    assert session.last_error is None
+
+
+def test_remote_session_run_projection_rejects_unknown_branch_scope_after_start(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-unknown-branch-event",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.append_event(
+            "assistant_message",
+            {"branch_binding_id": "branch-missing", "content": "orphan"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.register_approval(
+            "approval-missing-branch",
+            {"branch_binding_id": "branch-missing", "tool_call_id": "tool-1"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.register_user_input(
+            "input-missing-branch",
+            {"branch_binding_id": "branch-missing", "kind": "clarification"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.register_recovery(
+            {"branch_binding_id": "branch-missing", "response": "orphan recovery"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.mark_running(branch_binding_id="branch-missing")
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.mark_done(branch_binding_id="branch-missing")
+
+
+def test_remote_session_run_projection_rejects_branch_scope_without_agent_proof(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-missing-branch-agent",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-metadata-only",
+            "session_run_id": "run-missing-branch-agent",
+            "branch_binding_id": "metadata-only",
+            "selected": False,
+            "status": "active",
+        }
+    )
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.append_event(
+            "assistant_message",
+            {"branch_binding_id": "metadata-only", "content": "orphan"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.register_approval(
+            "approval-metadata-only",
+            {"branch_binding_id": "metadata-only", "tool_call_id": "tool-1"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.register_user_input(
+            "input-metadata-only",
+            {"branch_binding_id": "metadata-only", "kind": "clarification"},
+        )
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.mark_running(branch_binding_id="metadata-only")
+
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.mark_done(branch_binding_id="metadata-only")
+
+
+def test_remote_session_run_scoped_writer_requires_agent_and_known_branch(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-scoped-writer-proof",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="agent_run_id_required"):
+        session.scoped_writer(branch_binding_id="main")
+
+    with pytest.raises(ValueError, match="session_run_branch_binding_not_found"):
+        session.scoped_writer(
+            branch_binding_id="branch-missing",
+            agent_run_id="agent-run-main",
+        )
+
+    with pytest.raises(ValueError, match="agent_run_id_mismatch"):
+        session.scoped_writer(
+            branch_binding_id="main",
+            agent_run_id="agent-run-other",
+        )
+
+    session.record_branch_binding(
+        {
+            "id": "binding-metadata-only",
+            "session_run_id": "run-scoped-writer-proof",
+            "branch_binding_id": "metadata-only",
+            "selected": False,
+            "status": "active",
+        }
+    )
+    with pytest.raises(ValueError, match="session_run_branch_agent_run_required"):
+        session.scoped_writer(
+            branch_binding_id="metadata-only",
+            agent_run_id="agent-run-metadata",
+        )
+
+
+def test_remote_session_run_branch_runtime_marks_do_not_pollute_selected_scope(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-runtime-mark-scope",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-branch-runtime-mark-scope",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "active",
+        }
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-branch-a",
+            "session_run_id": "run-branch-runtime-mark-scope",
+            "branch_binding_id": "branch-a",
+            "agent_run_id": "agent-run-a",
+            "target_agent_run_id": "agent-run-a",
+            "selected": False,
+            "status": "active",
+        }
+    )
+    branch_writer = session.scoped_writer(
+        branch_binding_id="branch-a",
+        agent_run_id="agent-run-a",
+    )
+
+    branch_writer.mark_running()
+
+    branch_status = session.status_payload(0, branch_binding_id="branch-a")
+    main_status = session.status_payload(0, branch_binding_id="main")
+    assert branch_status["status"] == "running"
+    assert branch_status["running"] is True
+    assert branch_status["agent_run_id"] == "agent-run-a"
+    assert branch_status["runtime_state"]["agent_run_id"] == "agent-run-a"
+    assert branch_status["runtime_state"]["branch_binding_id"] == "branch-a"
+    assert main_status["status"] == "active"
+    assert main_status["running"] is False
+    assert main_status["agent_run_id"] == "agent-run-main"
+    assert session.running is False
+
+    session.append_event(
+        "error",
+        {
+            "branch_binding_id": "main",
+            "message": "main failed",
+        },
+    )
+    selected_finished_at = session.finished_at
+
+    branch_writer.mark_done("branch finished")
+
+    branch_status = session.status_payload(0, branch_binding_id="branch-a")
+    main_status = session.status_payload(0, branch_binding_id="main")
+    assert branch_status["status"] == "done"
+    assert branch_status["done"] is True
+    assert branch_status["finished_at"] is not None
+    assert branch_status["error"] is None
+    assert main_status["status"] == "error"
+    assert main_status["error"] == "main failed"
+    assert main_status["finished_at"] is not None
+    assert session.status == "error"
+    assert session.finished_at == selected_finished_at
+
+
+def test_remote_session_run_status_response_updates_target_branch_runtime_metadata(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-response-sync",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+
+    response = writer.status_response_payload(
+        0,
+        agent_run_status="completed",
+        terminal=True,
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+    _, wait_done, _ = writer.wait_events(0, 0)
+
+    assert response["done"] is True
+    assert response["branches"][0]["status"] == "done"
+    assert persisted["status"] == "done"
+    assert persisted["branches"][0]["status"] == "done"
+    assert wait_done is True
+
+
+def test_remote_session_run_status_response_uses_branch_runtime_truth_for_done(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-response-runtime-truth",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+
+    response = writer.status_response_payload(
+        0,
+        agent_run_status="failed",
+        terminal=False,
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+
+    assert response["status"] == "error"
+    assert response["done"] is True
+    assert response["reconnectable"] is False
+    assert response["branches"][0]["status"] == "error"
+    assert response["runtime_state"]["agent_run_status"] == "failed"
+    assert persisted["status"] == "error"
+    assert persisted["done"] is True
+
+
+def test_remote_session_run_status_response_treats_waiting_as_active_runtime(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-response-waiting-active",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+
+    response = writer.status_response_payload(
+        0,
+        agent_run_status="waiting",
+        terminal=False,
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+
+    assert response["status"] == "waiting"
+    assert response["running"] is True
+    assert response["done"] is False
+    assert persisted["running"] is True
+    assert session.running is True
+
+
+def test_remote_session_run_status_response_preserves_terminal_branch_against_stale_running(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-response-terminal-absorbs-stale",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+    writer.append_event("session_run_failed", {"message": "model failed"})
+
+    response = writer.status_response_payload(
+        0,
+        agent_run_status="running",
+        terminal=False,
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+
+    assert response["status"] == "error"
+    assert response["done"] is True
+    assert response["running"] is False
+    assert response["branches"][0]["status"] == "error"
+    assert response["runtime_state"]["agent_run_status"] == "running"
+    assert response["finished_at"] is not None
+    assert persisted["status"] == "error"
+    assert persisted["done"] is True
+
+
+def test_remote_session_run_events_response_updates_target_branch_runtime_metadata(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-events-response-sync",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+
+    response = writer.events_response_payload(
+        0,
+        0,
+        runtime_snapshot=lambda: ("completed", True),
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+    _, wait_done, _ = writer.wait_events(0, 0)
+
+    assert response["done"] is True
+    assert response["branches"][0]["status"] == "done"
+    assert persisted["status"] == "done"
+    assert persisted["branches"][0]["status"] == "done"
+    assert wait_done is True
+
+
+def test_remote_session_run_events_response_preserves_terminal_branch_against_stale_running(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-events-response-terminal-absorbs-stale",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+    writer.append_event("session_run_failed", {"message": "model failed"})
+
+    response = writer.events_response_payload(
+        0,
+        0,
+        runtime_snapshot=lambda: ("running", False),
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+
+    assert response["done"] is True
+    assert response["branches"][0]["status"] == "error"
+    assert persisted["status"] == "error"
+    assert persisted["done"] is True
+
+
+def test_remote_session_run_status_response_preserves_interrupted_branch_metadata(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-status-response-interrupted",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    session.record_branch_binding(
+        {
+            "id": "binding-main",
+            "session_run_id": "run-status-response-interrupted",
+            "branch_binding_id": "main",
+            "agent_run_id": "agent-run-main",
+            "target_agent_run_id": "agent-run-main",
+            "selected": True,
+            "status": "interrupted",
+            "last_error": "provider stream interrupted",
+        }
+    )
+    writer = session.scoped_writer(
+        branch_binding_id="main",
+        agent_run_id="agent-run-main",
+    )
+
+    response = writer.status_response_payload(
+        0,
+        agent_run_status="completed",
+        terminal=True,
+        selected=True,
+    )
+    persisted = session.status_payload(0, branch_binding_id="main")
+
+    assert response["branches"][0]["status"] == "interrupted"
+    assert persisted["status"] == "interrupted"
+    assert persisted["branches"][0]["status"] == "interrupted"
+    assert persisted["error"] == "provider stream interrupted"
+
+
+def test_remote_session_run_mark_done_preserves_sibling_branch_error_reason(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-done-preserves-error",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    _record_session_branch(session, "branch-a", agent_run_id="agent-branch-a")
+
+    session.append_event(
+        "error",
+        {
+            "branch_binding_id": "branch-a",
+            "message": "branch A failed",
+        },
+    )
+    session.mark_done(branch_binding_id="branch-a")
+
+    branch_status = session.status_payload(0, branch_binding_id="branch-a")
+    main_status = session.status_payload(0, branch_binding_id="main")
+    assert branch_status["status"] == "error"
+    assert branch_status["error"] == "branch A failed"
+    assert main_status["status"] == "active"
+    assert main_status["error"] is None
+
+
+def test_remote_session_run_mark_done_does_not_use_selected_error_for_sibling_cancel(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branch-done-selected-error-isolated",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    _record_session_branch(session, "branch-a", agent_run_id="agent-branch-a")
+    session.append_event(
+        "error",
+        {
+            "branch_binding_id": "main",
+            "message": "main failed",
+        },
+    )
+    session.register_approval(
+        "approval-branch-a",
+        {
+            "branch_binding_id": "branch-a",
+            "tool_call_id": "tool-branch-a",
+        },
+    )
+
+    session.mark_done(branch_binding_id="branch-a")
+
+    decision, reason, _meta = session.wait_approval(
+        "approval-branch-a",
+        timeout_sec=0,
+        branch_binding_id="branch-a",
+    )
+    branch_status = session.status_payload(0, branch_binding_id="branch-a")
+    assert decision == "deny_once"
+    assert reason == "session_run_closed"
+    assert branch_status["status"] == "done"
+    assert branch_status["error"] is None
+
+
+def test_remote_session_run_explicit_branch_stream_rejects_branchless_events(
+    tmp_path: Path,
+) -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-branchless-filter",
+        peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
+        artifact_root=tmp_path,
+    )
+    branchless_event = {
+        "session_run_id": session.session_run_id,
+        "seq": 1,
+        "type": "assistant_message",
+        "payload": {"content": "no branch proof"},
+    }
+
+    assert session._event_visible_in_branch_locked(branchless_event, "main") is False
+    assert session._event_visible_in_branch_locked(branchless_event, "branch-a") is False
+
+
 def test_remote_session_run_recovery_tickets_are_branch_local(tmp_path: Path) -> None:
     session = _SessionRunProjection(
         session_run_id="run-branch-recovery",
@@ -955,6 +2818,8 @@ def test_remote_session_run_recovery_tickets_are_branch_local(tmp_path: Path) ->
         branch_binding_id="main",
         artifact_root=tmp_path,
     )
+    _record_session_branch(session, "branch-a", agent_run_id="agent-run-a")
+    _record_session_branch(session, "branch-b", agent_run_id="agent-run-b")
     ticket_a = session.register_recovery(
         {
             "response": "branch A stopped",
@@ -977,6 +2842,9 @@ def test_remote_session_run_recovery_tickets_are_branch_local(tmp_path: Path) ->
         "recovery_id"
     ] == ticket_b["recovery_id"]
     assert session.status_payload(0, branch_binding_id="main")["recovery"] is None
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.consume_recovery("continue")
 
     with pytest.raises(ValueError, match="recovery_not_available"):
         session.consume_recovery("continue", branch_binding_id="main")
@@ -1003,6 +2871,8 @@ def test_remote_session_run_cancel_requests_are_branch_local(tmp_path: Path) -> 
         branch_binding_id="main",
         artifact_root=tmp_path,
     )
+    _record_session_branch(session, "branch-a", agent_run_id="agent-run-a")
+    _record_session_branch(session, "branch-b", agent_run_id="agent-run-b")
     session.register_approval(
         "approval-a",
         {"tool_call_id": "tool-a", "branch_binding_id": "branch-a"},
@@ -1019,6 +2889,9 @@ def test_remote_session_run_cancel_requests_are_branch_local(tmp_path: Path) -> 
         "input-b",
         {"kind": "clarification", "branch_binding_id": "branch-b"},
     )
+
+    with pytest.raises(ValueError, match="branch_binding_id_required"):
+        session.request_branch_cancel("cancel-missing-branch", "")
 
     first_a, approvals_a, inputs_a = session.request_branch_cancel(
         "cancel-a",
@@ -1083,7 +2956,8 @@ def test_remote_session_run_document_draft_preview_chunk_is_live_only(
     )
     session.enable_trace_persistence("session-1")
 
-    session.append_live_event(
+    _append_main_live_event(
+        session,
         "document_draft_preview_chunk",
         {
             "draft_id": "draft-1",
@@ -1096,7 +2970,7 @@ def test_remote_session_run_document_draft_preview_chunk_is_live_only(
         },
     )
 
-    events, _done, _cursor = session.wait_events(0, 0)
+    events, _done, _cursor = session.wait_events(0, 0, branch_binding_id="main")
     assert [event["type"] for event in events] == ["document_draft_preview_chunk"]
     assert events[0]["payload"]["content"] == "A"
     assert persisted == []
@@ -1114,7 +2988,8 @@ def test_remote_session_run_document_draft_preview_chunk_keeps_large_body_withou
     )
     content = "live preview body " * 16
 
-    session.append_live_event(
+    _append_main_live_event(
+        session,
         "document_draft_preview_chunk",
         {
             "draft_id": "draft-1",
@@ -1127,7 +3002,7 @@ def test_remote_session_run_document_draft_preview_chunk_keeps_large_body_withou
         },
     )
 
-    events, _done, _cursor = session.wait_events(0, 0)
+    events, _done, _cursor = session.wait_events(0, 0, branch_binding_id="main")
 
     assert [event["type"] for event in events] == ["document_draft_preview_chunk"]
     payload = events[0]["payload"]
@@ -1142,12 +3017,15 @@ def test_remote_session_run_hydrates_large_document_draft_snapshot_for_stream(
     session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
         artifact_root=tmp_path,
         max_payload_bytes=128,
     )
     content = "# Architecture\n\n" + ("large body\n" * 64)
 
-    session.append_event(
+    _append_main_event(
+        session,
         "document_draft_snapshot",
         {
             "draft_id": "draft-1",
@@ -1166,7 +3044,7 @@ def test_remote_session_run_hydrates_large_document_draft_snapshot_for_stream(
     assert "artifact_ref" in stored_payload
     assert "content" not in stored_payload
 
-    events, _done, _cursor = session.wait_events(0, 0)
+    events, _done, _cursor = session.wait_events(0, 0, branch_binding_id="main")
 
     payload = events[-1]["payload"]
     assert payload["content"] == content
@@ -1217,7 +3095,8 @@ def test_remote_session_run_persists_document_draft_snapshot_trace_without_body(
     session.enable_trace_persistence("session-1")
     content = "# Architecture\n\nTrace must not store this body."
 
-    session.append_event(
+    _append_main_event(
+        session,
         "document_draft_snapshot",
         {
             "draft_id": "draft-1",
@@ -1247,7 +3126,7 @@ def test_remote_session_run_persists_document_draft_snapshot_trace_without_body(
     assert stored_payload["artifact_ref"] == artifact
     assert content not in json.dumps(stored_payload, ensure_ascii=False)
 
-    events, _done, _cursor = session.wait_events(0, 0)
+    events, _done, _cursor = session.wait_events(0, 0, branch_binding_id="main")
     assert events[-1]["payload"]["content"] == content
     assert events[-1]["payload"]["artifact_ref"] == artifact
 
@@ -1287,7 +3166,8 @@ def test_remote_session_run_flushes_pending_document_draft_snapshot_trace_withou
     )
     content = "# Architecture\n\nPending trace must not store this body."
 
-    session.append_event(
+    _append_main_event(
+        session,
         "document_draft_snapshot",
         {
             "draft_id": "draft-1",
@@ -1321,11 +3201,14 @@ def test_remote_session_run_status_does_not_hydrate_large_document_draft_snapsho
     session = _SessionRunProjection(
         session_run_id="run-1",
         peer_id="peer-1",
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
         artifact_root=tmp_path,
         max_payload_bytes=128,
     )
     content = "# Architecture\n\n" + ("large body\n" * 64)
-    session.append_event(
+    _append_main_event(
+        session,
         "document_draft_snapshot",
         {
             "draft_id": "draft-1",
@@ -1349,7 +3232,7 @@ def test_remote_session_run_status_does_not_hydrate_large_document_draft_snapsho
         fail_hydration,
     )
 
-    status = session.status_payload(0)
+    status = session.status_payload(0, branch_binding_id="main")
 
     assert status["next_cursor"] == 1
     assert status["latest_seq"] == 1
@@ -1364,7 +3247,8 @@ def test_remote_session_run_interleaves_live_and_durable_events_without_false_lo
         artifact_root=tmp_path,
     )
 
-    session.append_live_event(
+    _append_main_live_event(
+        session,
         "document_draft_preview_chunk",
         {
             "draft_id": "draft-1",
@@ -1376,7 +3260,8 @@ def test_remote_session_run_interleaves_live_and_durable_events_without_false_lo
             "content_sha256": "sha-a",
         },
     )
-    session.append_event(
+    _append_main_event(
+        session,
         "document_draft_progress",
         {
             "draft_id": "draft-1",
@@ -1387,7 +3272,7 @@ def test_remote_session_run_interleaves_live_and_durable_events_without_false_lo
         },
     )
 
-    events, _done, cursor = session.wait_events(0, 0)
+    events, _done, cursor = session.wait_events(0, 0, branch_binding_id="main")
 
     assert [event["type"] for event in events] == [
         "document_draft_preview_chunk",
@@ -1827,8 +3712,151 @@ class TestRemoteRelayHTTPService:
             branches = {item["branch_binding_id"]: item for item in body["branches"]}
             assert branches["main"]["selected"] is False
             assert branches["branch-select-1"]["selected"] is True
+            active_session = service._get_session_run(session_run_id)
+            assert active_session is not None
+            assert active_session.agent_run_id == branch.id
+            assert active_session.branch_binding_id == "branch-select-1"
+            assert active_session.runtime_state["agent_run_id"] == branch.id
+            assert active_session.runtime_state["branch_binding_id"] == "branch-select-1"
+            assert active_session.runtime_state["scope_id"] == (
+                f"{session_run_id}:branch-select-1"
+            )
             assert control.agent_run_to_dict(source_agent_run_id)["status"] == "queued"
             assert control.agent_run_to_dict(branch.id)["status"] == "queued"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_branch_select_reports_binding_store_unavailable_when_selection_write_fails(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+
+            def fail_selection_write(*_args, **_kwargs):
+                raise RuntimeError("binding store unavailable")
+
+            control.select_session_run_branch = fail_selection_write  # type: ignore[method-assign]
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/branches/select",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "cursor": 0,
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 503
+            assert body["error"] == "session_run_binding_store_unavailable"
+        finally:
+            service.stop()
+            relay.stop()
+
+    @pytest.mark.parametrize(
+        ("path", "payload"),
+        [
+            (
+                "/remote/admin/agent-runs/branch",
+                {
+                    "source_agent_run_id": "agent-source",
+                    "base_session_item_id": "message-1",
+                    "runtime_root": "D:/repo",
+                    "prompt": "branch",
+                },
+            ),
+            (
+                "/remote/admin/agent-runs/fork",
+                {
+                    "source_agent_run_id": "agent-source",
+                    "base_session_item_id": "message-1",
+                    "fork_workspace_ref": "workspace-ref",
+                    "target_owner_session_run_id": "run-target",
+                    "prompt": "fork",
+                },
+            ),
+        ],
+    )
+    def test_admin_agent_run_branching_requires_target_branch_binding_id(
+        self,
+        path: str,
+        payload: dict[str, object],
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=AgentRunControlPlane(),
+        )
+        service.start()
+        try:
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}{path}",
+                    payload,
+                    headers=TEST_ADMIN_HEADERS,
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "branch_binding_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_admin_agent_run_branch_response_keeps_target_branch_proof_when_projection_is_empty(
+        self,
+    ) -> None:
+        class FakeControlPlane:
+            def get_agent_run(self, _agent_run_id: str) -> SimpleNamespace:
+                return SimpleNamespace(owner_session_run_id="")
+
+            def branch_agent_run(self, **kwargs: object) -> SimpleNamespace:
+                assert kwargs["branch_binding_id"] == "branch-response-1"
+                return SimpleNamespace(id="branch-run-1")
+
+            def agent_run_to_dict(self, agent_run_id: str) -> dict[str, object]:
+                return {"id": agent_run_id}
+
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=FakeControlPlane(),
+        )
+        service.start()
+        try:
+            with patch(
+                "labrastro_server.interfaces.http.remote.routes.admin._record_agent_run_branch_projection",
+                return_value="",
+            ):
+                status, body = _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/agent-runs/branch",
+                    {
+                        "source_agent_run_id": "agent-source",
+                        "base_session_item_id": "message-1",
+                        "runtime_root": "D:/repo",
+                        "branch_binding_id": "branch-response-1",
+                        "prompt": "branch",
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+
+            assert status == 200
+            assert body["branch_binding_id"] == "branch-response-1"
+            assert body["agent_run"]["id"] == "branch-run-1"
         finally:
             service.stop()
             relay.stop()
@@ -1964,6 +3992,7 @@ class TestRemoteRelayHTTPService:
                 )
 
             assert status == 200
+            assert body["branch_binding_id"] == "branch-edit-1"
             detail = control.load_agent_run_detail(body["agent_run"]["id"])
             assert detail["activations"][-1]["prompt"] == (
                 "User: original question\n\nUser: edited question"
@@ -1972,7 +4001,11 @@ class TestRemoteRelayHTTPService:
                 "source branch answer after edit point"
                 not in detail["activations"][-1]["prompt"]
             )
-            events, _done, _cursor = session.wait_events(0, 0)
+            events, _done, _cursor = session.wait_events(
+                0,
+                0,
+                branch_binding_id="branch-edit-1",
+            )
             assert [event["payload"].get("content") for event in events] == [
                 "original question",
                 "edited question",
@@ -4423,7 +6456,15 @@ class TestRemoteRelayHTTPService:
             assert ingest_status == 200
             assert ingest_body["session_run_id"]
             assert ingest_body["session_id"] == "session-capability-1"
+            assert ingest_body["agent_run_id"]
+            assert ingest_body["branch_binding_id"] == "main"
+            assert ingest_body["scope_id"] == f"{ingest_body['session_run_id']}:main"
+            assert ingest_body["selected"] is True
             assert ingest_body["runtime_state"]["agent_id"] == "capability_packager"
+            assert ingest_body["runtime_state"]["agent_run_id"] == ingest_body["agent_run_id"]
+            assert ingest_body["activation_id"] == ingest_body["runtime_state"]["activation_id"]
+            assert ingest_body["activation_id"] == f"{ingest_body['agent_run_id']}:activation:1"
+            assert ingest_body["runtime_state"]["scope_id"] == ingest_body["scope_id"]
             assert ingest_body["runtime_state"]["active_model_provider"] == "deepseek"
             assert any(
                 event["type"] == "session_run_start"
@@ -4432,6 +6473,15 @@ class TestRemoteRelayHTTPService:
                 and event["payload"]["workflow_mode"] == "capability_package_ingest"
                 for event in persisted_trace_events
             )
+            persisted_session_event_types = [
+                event["type"]
+                for event in persisted_trace_events
+                if event["session_run_id"] == ingest_body["session_run_id"]
+            ]
+            assert persisted_session_event_types[0] == "session_run_start"
+            assert persisted_session_event_types.count("session_run_start") == 1
+            first_workflow_index = persisted_session_event_types.index("workflow_step")
+            assert persisted_session_event_types.index("session_run_start") < first_workflow_index
             retry_status, retry_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
@@ -4441,9 +6491,20 @@ class TestRemoteRelayHTTPService:
             assert retry_status == 200
             assert retry_body["session_run_id"] == ingest_body["session_run_id"]
             assert retry_body["session_id"] == ingest_body["session_id"]
+            assert retry_body["agent_run_id"] == ingest_body["agent_run_id"]
+            assert retry_body["activation_id"] == ingest_body["activation_id"]
+            assert retry_body["runtime_state"]["activation_id"] == ingest_body["activation_id"]
+            assert retry_body["branch_binding_id"] == "main"
+            assert retry_body["scope_id"] == ingest_body["scope_id"]
             session_run_id = ingest_body["session_run_id"]
             session = service._get_session_run(session_run_id)
             assert session is not None
+            session_event_types = [event.get("type") for event in session.events]
+            assert session_event_types[0] == "session_run_start"
+            assert session_event_types.count("session_run_start") == 1
+            assert session_event_types.index("session_run_start") < session_event_types.index(
+                "workflow_step"
+            )
             assert session.locale == "zh-CN"
             assert any(
                 event.get("type") == "session_run_start"
@@ -4530,6 +6591,134 @@ class TestRemoteRelayHTTPService:
                 and event.payload.get("data", {}).get("status") == "model_request_started"
                 for event in control.list_events(agent_run_id)
             )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_session_start_reports_ingest_error_not_scope_proof(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from http import HTTPStatus
+
+        from labrastro_server.services.capability_packages import (
+            CapabilityPackageIngestError,
+        )
+
+        def fail_start(_self, _payload, *, agent_run_metadata=None):
+            raise CapabilityPackageIngestError(
+                "capability_source_invalid",
+                "source could not be ingested",
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+
+        monkeypatch.setattr(
+            "labrastro_server.services.capability_packages.CapabilityPackageIngestService.start",
+            fail_start,
+        )
+        config_path = tmp_path / "config.yaml"
+        save_yaml_config(config_path, {"providers": {"items": {}}})
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane(
+            runtime_snapshot={
+                "runtime_profiles": {
+                    "packager": {
+                        "executor": "reuleauxcoder",
+                        "execution_location": "remote_server",
+                        "worker_kind": "sandbox_worker",
+                        "model_request_origin": "server",
+                    }
+                },
+                "agents": {
+                    "capability_packager": {
+                        "visibility": "system",
+                        "system_flow_only": ["capability_ingest"],
+                        "runtime_profile": "packager",
+                    }
+                },
+            }
+        )
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+            admin_config_path=config_path,
+        )
+        service.start()
+        try:
+            bootstrap_token = relay.issue_bootstrap_token(ttl_sec=60)
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                {
+                    "bootstrap_token": bootstrap_token,
+                    "cwd": "/tmp/peer",
+                    "workspace_root": "/tmp/peer",
+                    "features": ["agent_runs", "worker_kind:sandbox_worker"],
+                },
+            )
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
+                    {
+                        "peer_token": register_body["payload"]["peer_token"],
+                        "session_id": "session-capability-fail",
+                        "client_request_id": "capability-ingest-fail",
+                        "source": {
+                            "type": "github_repo",
+                            "url": "https://github.com/acme/broken-tool",
+                        },
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 422
+            assert body["error"] == "capability_source_invalid"
+            assert body["message"] == "source could not be ingested"
+            failed_session = service._get_session_run_by_request(
+                register_body["payload"]["peer_id"],
+                "session-capability-fail",
+                "capability-ingest-fail",
+            )
+            assert failed_session is not None
+            assert "session_run_start_failure" not in failed_session.runtime_state
+            failed_events = [
+                event
+                for event in failed_session.events
+                if event["type"] == "session_run_failed"
+            ]
+            assert failed_events
+            failed_payload = failed_events[-1]["payload"]
+            assert failed_payload["operation"] == "start"
+            assert failed_payload["branch_binding_id"] == "main"
+            assert failed_payload["http_status"] == 422
+            assert failed_payload["code"] == "capability_source_invalid"
+            assert failed_payload["message"] == "source could not be ingested"
+
+            with pytest.raises(HTTPError) as retry_excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/admin/capability-packages/ingest/session/start",
+                    {
+                        "peer_token": register_body["payload"]["peer_token"],
+                        "session_id": "session-capability-fail",
+                        "client_request_id": "capability-ingest-fail",
+                        "source": {
+                            "type": "github_repo",
+                            "url": "https://github.com/acme/broken-tool",
+                        },
+                    },
+                    headers=TEST_ADMIN_HEADERS,
+                )
+
+            retry_body = json.loads(retry_excinfo.value.read().decode("utf-8"))
+            assert retry_excinfo.value.code == 422
+            assert retry_body["error"] == "capability_source_invalid"
+            assert retry_body["message"] == "source could not be ingested"
         finally:
             service.stop()
             relay.stop()
@@ -4681,7 +6870,9 @@ class TestRemoteRelayHTTPService:
                 lambda: next(
                     (
                         item
-                        for item in service._get_session_run(session_run_id).status_payload().get("approvals", [])
+                        for item in service._get_session_run(session_run_id)
+                        .status_payload(branch_binding_id=ingest_body["branch_binding_id"])
+                        .get("approvals", [])
                         if item.get("decision_type") == "capability_package_install"
                     ),
                     None,
@@ -4803,6 +6994,7 @@ class TestRemoteRelayHTTPService:
             control.submit_agent_run(
                 AgentRunRequest(
                     agent_id="capability_packager",
+                    source=AgentRunSource.CAPABILITY_INGEST,
                     prompt="package repo",
                     executor="reuleauxcoder",
                     execution_location="remote_server",
@@ -4919,6 +7111,7 @@ class TestRemoteRelayHTTPService:
             control.submit_agent_run(
                 AgentRunRequest(
                     agent_id="capability_packager",
+                    source=AgentRunSource.CAPABILITY_INGEST,
                     prompt="package repo",
                     executor="reuleauxcoder",
                     execution_location="remote_server",
@@ -5049,6 +7242,7 @@ class TestRemoteRelayHTTPService:
             control.submit_agent_run(
                 AgentRunRequest(
                     agent_id="capability_packager",
+                    source=AgentRunSource.CAPABILITY_INGEST,
                     prompt="package repo",
                     executor="reuleauxcoder",
                     execution_location="remote_server",
@@ -5181,6 +7375,7 @@ class TestRemoteRelayHTTPService:
             control.submit_agent_run(
                 AgentRunRequest(
                     agent_id="capability_packager",
+                    source=AgentRunSource.CAPABILITY_INGEST,
                     prompt="package repo",
                     executor="reuleauxcoder",
                     execution_location="remote_server",
@@ -5303,6 +7498,7 @@ class TestRemoteRelayHTTPService:
                 headers=TEST_ADMIN_HEADERS,
             )
             session_run_id = ingest_body["session_run_id"]
+            branch_binding_id = ingest_body["branch_binding_id"]
             agent_run_id = ""
             deadline = time.time() + 3
             while time.time() < deadline and not agent_run_id:
@@ -5342,6 +7538,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": new_peer_token,
                     "session_run_id": session_run_id,
+                    "branch_binding_id": branch_binding_id,
                     "cursor": 0,
                 },
             )
@@ -5742,7 +7939,16 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    cwd="/tmp/peer-chat",
+                    workspace_root="/tmp/peer-chat",
+                    features=[
+                        "shell",
+                        "agent_runs.local_workspace",
+                        "worker_kind:local_peer",
+                    ],
+                ),
             )
             peer_id = register_body["payload"]["peer_id"]
             peer_token = register_body["payload"]["peer_token"]
@@ -5803,7 +8009,16 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    cwd="/tmp/peer-chat",
+                    workspace_root="/tmp/peer-chat",
+                    features=[
+                        "shell",
+                        "agent_runs.local_workspace",
+                        "worker_kind:local_peer",
+                    ],
+                ),
             )
 
             with pytest.raises(HTTPError) as excinfo:
@@ -5838,7 +8053,16 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    cwd="/tmp/peer-chat",
+                    workspace_root="/tmp/peer-chat",
+                    features=[
+                        "shell",
+                        "agent_runs.local_workspace",
+                        "worker_kind:local_peer",
+                    ],
+                ),
             )
             peer_token = register_body["payload"]["peer_token"]
             peer_id = register_body["payload"]["peer_id"]
@@ -5858,6 +8082,8 @@ class TestRemoteRelayHTTPService:
             session_run_id = start_body["session_run_id"]
             agent_run_id = start_body["agent_run_id"]
             assert start_body["branch_binding_id"] == "main"
+            assert start_body["scope_id"] == f"{session_run_id}:main"
+            assert start_body["selected"] is True
             assert start_body["activation_id"] == f"{agent_run_id}:activation:1"
             binding = control.find_session_run_binding(session_run_id=session_run_id)
             assert binding is not None
@@ -5867,6 +8093,120 @@ class TestRemoteRelayHTTPService:
             assert run.owner_session_run_id == session_run_id
             assert run.source.value == "chat"
             assert run.trigger_mode.value == "interactive_chat"
+            assert run.execution_location.value == "local_workspace"
+            assert run.metadata["worker_kind"] == "local_peer"
+            assert run.metadata["workspace_root"] == "/tmp/peer-chat"
+            claim_status, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/agent-run-activations/claim",
+                {
+                    "peer_token": peer_token,
+                    "worker_id": "peer-chat-worker",
+                    "worker_kind": "local_peer",
+                    "executors": ["reuleauxcoder"],
+                },
+            )
+            assert claim_status == 200
+            claim = claim_body["claim"]
+            assert claim["agent_run"]["id"] == agent_run_id
+            assert claim["executor_request"]["metadata"]["workspace_root"] == "/tmp/peer-chat"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_start_idempotent_response_fails_closed_when_agent_run_missing(
+        self,
+        monkeypatch,
+    ) -> None:
+        relay, service, control, register_body, _start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+
+            def missing_agent_run(_agent_run_id: str):
+                raise KeyError(_agent_run_id)
+
+            monkeypatch.setattr(control, "get_agent_run", missing_agent_run)
+
+            with pytest.raises(HTTPError) as raised:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/start",
+                    {
+                        "peer_token": peer_token,
+                        "prompt": "first",
+                        "session_hint": "chat-session-steer",
+                        "client_request_id": "start-steer-1",
+                    },
+                )
+
+            assert raised.value.code == 404
+            body = json.loads(raised.value.read().decode("utf-8"))
+            assert body["error"] == "agent_run_not_found"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_start_idempotent_response_keeps_main_after_branch_select(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            main_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch first",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-start-idempotent-branch",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-a",
+                selected=False,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=main_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+
+            select_status, select_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/branches/select",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                },
+            )
+            assert select_status == 200
+            assert select_body["branch_binding_id"] == "branch-a"
+
+            replay_status, replay_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {
+                    "peer_token": peer_token,
+                    "prompt": "first",
+                    "session_hint": "chat-session-steer",
+                    "client_request_id": "start-steer-1",
+                },
+            )
+
+            assert replay_status == 200
+            assert replay_body["session_run_id"] == session_run_id
+            assert replay_body["agent_run_id"] == main_agent_run_id
+            assert replay_body["branch_binding_id"] == "main"
         finally:
             service.stop()
             relay.stop()
@@ -5928,8 +8268,340 @@ class TestRemoteRelayHTTPService:
             assert continue_body["ok"] is True
             assert continue_body["session_run_id"] == session_run_id
             assert continue_body["agent_run_id"] == agent_run_id
+            assert continue_body["branch_binding_id"] == "main"
+            assert continue_body["scope_id"] == f"{session_run_id}:main"
+            assert continue_body["selected"] is True
             assert continue_body["activation_id"] == f"{agent_run_id}:activation:2"
             assert [item["id"] for item in control.list_agent_runs()] == [agent_run_id]
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_control_routes_report_unavailable_projection_when_binding_persists(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            assert control.find_session_run_binding(session_run_id=session_run_id) is not None
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            requests = [
+                (
+                    "/remote/session-runs/continue",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "prompt": "second",
+                    },
+                ),
+                (
+                    "/remote/session-runs/events",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "cursor": 0,
+                        "timeout_sec": 0.05,
+                    },
+                ),
+                (
+                    "/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                    },
+                ),
+                (
+                    "/remote/session-runs/recover",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "action": "continue",
+                    },
+                ),
+                (
+                    "/remote/session-runs/cancel",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "reason": "user_cancelled",
+                    },
+                ),
+                (
+                    "/remote/session-runs/branches/select",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "cursor": 0,
+                    },
+                ),
+                (
+                    "/remote/session-runs/user-input/reply",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "input_id": "input-1",
+                        "action": "submit",
+                        "content": {"text": "answer"},
+                    },
+                ),
+                (
+                    "/remote/approval/reply",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "approval_id": "approval-1",
+                        "decision": "deny_once",
+                    },
+                ),
+            ]
+
+            for path, payload in requests:
+                with pytest.raises(HTTPError) as excinfo:
+                    _json_request(
+                        "POST",
+                        f"{service.base_url}{path}",
+                        payload,
+                    )
+
+                body = json.loads(excinfo.value.read().decode("utf-8"))
+                assert excinfo.value.code == 409, path
+                assert body["error"] == "session_run_projection_unavailable", path
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_control_routes_report_binding_store_unavailable_when_binding_lookup_fails(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            def fail_binding_lookup(*_args, **_kwargs):
+                raise RuntimeError("binding store unavailable")
+
+            control.list_session_run_bindings = fail_binding_lookup  # type: ignore[method-assign]
+            control.find_session_run_binding = fail_binding_lookup  # type: ignore[method-assign]
+
+            requests = [
+                (
+                    "/remote/session-runs/continue",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "prompt": "second",
+                    },
+                ),
+                (
+                    "/remote/session-runs/events",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "cursor": 0,
+                        "timeout_sec": 0.05,
+                    },
+                ),
+                (
+                    "/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                    },
+                ),
+                (
+                    "/remote/session-runs/recover",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "action": "continue",
+                    },
+                ),
+                (
+                    "/remote/session-runs/cancel",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "reason": "user_cancelled",
+                    },
+                ),
+                (
+                    "/remote/session-runs/branches/select",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "cursor": 0,
+                    },
+                ),
+                (
+                    "/remote/session-runs/user-input/reply",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "input_id": "input-1",
+                        "action": "submit",
+                        "content": {"text": "answer"},
+                    },
+                ),
+                (
+                    "/remote/approval/reply",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                        "approval_id": "approval-1",
+                        "decision": "deny_once",
+                    },
+                ),
+            ]
+
+            for path, payload in requests:
+                with pytest.raises(HTTPError) as excinfo:
+                    _json_request(
+                        "POST",
+                        f"{service.base_url}{path}",
+                        payload,
+                    )
+
+                body = json.loads(excinfo.value.read().decode("utf-8"))
+                assert excinfo.value.code == 503, path
+                assert body["error"] == "session_run_binding_store_unavailable", path
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_control_missing_projection_reports_requested_branch_not_found(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            assert control.find_session_run_binding(session_run_id=session_run_id) is not None
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "branch-missing",
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 404
+            assert body["error"] == "session_run_branch_binding_not_found"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_control_missing_projection_reports_binding_api_unavailable(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            assert control.find_session_run_binding(session_run_id=session_run_id) is not None
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+            control.find_session_run_binding = None  # type: ignore[method-assign]
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 503
+            assert body["error"] == "session_run_bindings_unavailable"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_control_missing_projection_reports_requested_branch_peer_mismatch(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            _, other_peer = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(
+                    relay,
+                    features=["agent_runs", "agent_runs.local_workspace"],
+                ),
+            )
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="other peer branch",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-other-peer-branch",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=other_peer["payload"]["peer_id"],
+                agent_run_id=branch.id,
+                branch_binding_id="branch-other-peer",
+                selected=False,
+                parent_branch_binding_id="main",
+                source_agent_run_id=start_body["agent_run_id"],
+                target_agent_run_id=branch.id,
+            )
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "branch-other-peer",
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 403
+            assert body["error"] == "session_run_binding_peer_mismatch"
         finally:
             service.stop()
             relay.stop()
@@ -5968,6 +8640,104 @@ class TestRemoteRelayHTTPService:
             body = json.loads(excinfo.value.read().decode("utf-8"))
             assert excinfo.value.code == 400
             assert body["error"] == "branch_binding_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
+    @pytest.mark.parametrize("path", ["/remote/session-runs/events", "/remote/session-runs/status"])
+    def test_session_run_ui_read_routes_require_branch_scope_proof(self, path: str) -> None:
+        relay, service, _control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}{path}",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": start_body["session_run_id"],
+                        "cursor": 0,
+                        "timeout_sec": 0.01,
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "branch_binding_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_status_unknown_branch_requires_binding_error(self) -> None:
+        relay, service, _control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": start_body["session_run_id"],
+                        "branch_binding_id": "branch-missing",
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 404
+            assert body["error"] == "session_run_branch_binding_not_found"
+        finally:
+            service.stop()
+            relay.stop()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/remote/session-runs/events",
+            "/remote/session-runs/status",
+            "/remote/session-runs/cancel",
+            "/remote/session-runs/recover",
+            "/remote/approval/reply",
+            "/remote/session-runs/user-input/reply",
+        ],
+    )
+    def test_session_run_scoped_routes_require_session_run_id(
+        self,
+        path: str,
+    ) -> None:
+        relay, service, _control, register_body, _start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            payload: dict[str, object] = {
+                "peer_token": peer_token,
+                "branch_binding_id": "main",
+                "cursor": 0,
+                "timeout_sec": 0.01,
+                "reason": "user_cancelled",
+                "action": "continue",
+                "approval_id": "approval-1",
+                "decision": "deny_once",
+                "input_id": "input-1",
+            }
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}{path}",
+                    payload,
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "session_run_id_required"
         finally:
             service.stop()
             relay.stop()
@@ -6106,6 +8876,8 @@ class TestRemoteRelayHTTPService:
             )
             assert branch_status["agent_run_id"] == branch.id
             assert branch_status["branch_binding_id"] == "branch-a"
+            assert branch_status["scope_id"] == f"{session_run_id}:branch-a"
+            assert branch_status["selected"] is False
             selected_status_code, selected_status = _json_request(
                 "POST",
                 f"{service.base_url}/remote/session-runs/status",
@@ -6119,6 +8891,8 @@ class TestRemoteRelayHTTPService:
             assert selected_status_code == 200
             assert selected_status["agent_run_id"] == main_agent_run_id
             assert selected_status["branch_binding_id"] == "main"
+            assert selected_status["scope_id"] == f"{session_run_id}:main"
+            assert selected_status["selected"] is True
             assert active_session is not None
             assert active_session.agent_run_id == main_agent_run_id
             assert active_session.branch_binding_id == "main"
@@ -6170,6 +8944,9 @@ class TestRemoteRelayHTTPService:
             )
             active_session = service._get_session_run(session_run_id)
             assert active_session is not None
+            active_session.sync_branch_bindings(
+                control.list_session_run_bindings(session_run_id=session_run_id)
+            )
             active_session.register_recovery(
                 {
                     "branch_binding_id": "branch-a",
@@ -6210,6 +8987,166 @@ class TestRemoteRelayHTTPService:
             )
             assert branch_status["agent_run_id"] == branch.id
             assert branch_status["branch_binding_id"] == "branch-a"
+            assert branch_status["scope_id"] == f"{session_run_id}:branch-a"
+            assert branch_status["selected"] is False
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_recover_after_selecting_finished_branch_uses_selected_scope_status(
+        self,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            main_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch first",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-recover-selected-finished-branch",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-a",
+                selected=False,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=main_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+            control.complete_agent_run_activation(
+                branch.id,
+                ExecutorRunResult(
+                    task_id=branch.id,
+                    status="completed",
+                    output="branch done",
+                ),
+                activation_id=_current_activation_id(control, branch.id),
+            )
+            active_session = service._get_session_run(session_run_id)
+            assert active_session is not None
+            active_session.sync_branch_bindings(
+                control.list_session_run_bindings(session_run_id=session_run_id)
+            )
+            active_session.register_recovery(
+                {
+                    "branch_binding_id": "branch-a",
+                    "response": "partial branch response",
+                    "recovery_actions": ["continue"],
+                }
+            )
+
+            select_status, _select_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/branches/select",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                },
+            )
+            assert select_status == 200
+
+            status, recover_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/recover",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                    "action": "continue",
+                },
+            )
+
+            assert status == 200
+            assert recover_body["ok"] is True
+            assert recover_body["branch_binding_id"] == "branch-a"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_recover_uses_bound_agent_run_status_for_selected_binding(
+        self,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            peer_id = register_body["payload"]["peer_id"]
+            session_run_id = start_body["session_run_id"]
+            main_agent_run_id = start_body["agent_run_id"]
+            branch = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="branch first",
+                    owner_session_run_id=session_run_id,
+                    source="chat",
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-recover-selected-binding-runtime",
+            )
+            control.create_session_run_binding(
+                session_run_id=session_run_id,
+                session_id=start_body.get("session_id") or "chat-session-steer",
+                peer_id=peer_id,
+                agent_run_id=branch.id,
+                branch_binding_id="branch-a",
+                selected=True,
+                parent_branch_binding_id="main",
+                base_session_item_id="msg-1",
+                source_agent_run_id=main_agent_run_id,
+                target_agent_run_id=branch.id,
+            )
+            control.complete_agent_run_activation(
+                branch.id,
+                ExecutorRunResult(
+                    task_id=branch.id,
+                    status="completed",
+                    output="branch done",
+                ),
+                activation_id=_current_activation_id(control, branch.id),
+            )
+            active_session = service._get_session_run(session_run_id)
+            assert active_session is not None
+            assert active_session.running is True
+            active_session.sync_branch_bindings(
+                control.list_session_run_bindings(session_run_id=session_run_id)
+            )
+            active_session.register_recovery(
+                {
+                    "branch_binding_id": "branch-a",
+                    "response": "partial branch response",
+                    "recovery_actions": ["continue"],
+                }
+            )
+
+            status, recover_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/recover",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "branch-a",
+                    "action": "continue",
+                },
+            )
+
+            assert status == 200
+            assert recover_body["ok"] is True
+            assert recover_body["branch_binding_id"] == "branch-a"
         finally:
             service.stop()
             relay.stop()
@@ -6317,6 +9254,7 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": "main",
                 },
             )
 
@@ -6325,6 +9263,8 @@ class TestRemoteRelayHTTPService:
             assert status_body["running"] is True
             assert status_body["agent_run_id"] == agent_run_id
             assert status_body["branch_binding_id"] == "main"
+            assert status_body["scope_id"] == f"{start_body['session_run_id']}:main"
+            assert status_body["selected"] is True
 
             control.complete_agent_run_activation(
                 agent_run_id,
@@ -6341,11 +9281,79 @@ class TestRemoteRelayHTTPService:
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": "main",
                 },
             )
-            assert completed_status["status"] == "completed"
+            assert completed_status["status"] == "done"
             assert completed_status["running"] is False
             assert completed_status["done"] is True
+            assert completed_status["runtime_state"]["agent_run_status"] == "completed"
+            completed_branches = {
+                branch["branch_binding_id"]: branch
+                for branch in completed_status["branches"]
+            }
+            assert completed_branches["main"]["status"] == "done"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_events_project_bound_agent_terminal_status_to_branch_summary(
+        self,
+    ) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "first"},
+            )
+            agent_run_id = start_body["agent_run_id"]
+
+            control.complete_agent_run_activation(
+                agent_run_id,
+                ExecutorRunResult(
+                    task_id=agent_run_id,
+                    status="failed",
+                    output="",
+                    error="failed branch",
+                ),
+                activation_id=start_body["activation_id"],
+            )
+            status, content_type, frame = _sse_first_frame_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/events",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": "main",
+                    "cursor": 999,
+                    "timeout_sec": 0.05,
+                },
+            )
+
+            assert status == 200
+            assert content_type.startswith("text/event-stream")
+            assert frame["data"]["done"] is True
+            branches = {
+                branch["branch_binding_id"]: branch
+                for branch in frame["data"]["branches"]
+            }
+            assert branches["main"]["status"] == "error"
         finally:
             service.stop()
             relay.stop()
@@ -6417,6 +9425,7 @@ class TestRemoteRelayHTTPService:
             steer_payload = {
                 "peer_token": peer_token,
                 "session_run_id": start_body["session_run_id"],
+                "branch_binding_id": "main",
                 "activation_id": start_body["activation_id"],
                 "idempotency_key": "user-steer-1",
                 "payload": {
@@ -6460,6 +9469,56 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
+    def test_user_agent_run_steer_requires_branch_binding_id(self) -> None:
+        relay, service, _control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/{start_body['agent_run_id']}/steer",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": start_body["session_run_id"],
+                        "activation_id": start_body["activation_id"],
+                        "idempotency_key": "user-steer-missing-branch",
+                        "payload": {"items": [{"type": "text", "text": "missing branch"}]},
+                    },
+                )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "branch_binding_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_user_agent_run_steer_requires_session_run_id(self) -> None:
+        relay, service, _control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-runs/{start_body['agent_run_id']}/steer",
+                    {
+                        "peer_token": peer_token,
+                        "branch_binding_id": "main",
+                        "activation_id": start_body["activation_id"],
+                        "idempotency_key": "user-steer-missing-session",
+                        "payload": {"items": [{"type": "text", "text": "missing session"}]},
+                    },
+                )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "session_run_id_required"
+        finally:
+            service.stop()
+            relay.stop()
+
     def test_user_agent_run_steer_requires_active_claim_and_matching_activation(self) -> None:
         relay, service, control, register_body, start_body = (
             self._start_bound_agent_run_session()
@@ -6476,6 +9535,7 @@ class TestRemoteRelayHTTPService:
                     {
                         "peer_token": peer_token,
                         "session_run_id": start_body["session_run_id"],
+                        "branch_binding_id": "main",
                         "activation_id": start_body["activation_id"],
                         "idempotency_key": "user-steer-too-early",
                         "payload": {"items": [{"type": "text", "text": "too early"}]},
@@ -6504,6 +9564,7 @@ class TestRemoteRelayHTTPService:
                     {
                         "peer_token": peer_token,
                         "session_run_id": start_body["session_run_id"],
+                        "branch_binding_id": "main",
                         "activation_id": "stale-activation",
                         "idempotency_key": "user-steer-mismatch",
                         "payload": {"items": [{"type": "text", "text": "wrong"}]},
@@ -6538,6 +9599,7 @@ class TestRemoteRelayHTTPService:
                     {
                         "peer_token": other_register["payload"]["peer_token"],
                         "session_run_id": start_body["session_run_id"],
+                        "branch_binding_id": "main",
                         "activation_id": start_body["activation_id"],
                         "idempotency_key": "user-steer-other-peer",
                         "payload": {"items": [{"type": "text", "text": "cross"}]},
@@ -6563,6 +9625,7 @@ class TestRemoteRelayHTTPService:
                     {
                         "peer_token": peer_token,
                         "session_run_id": "missing-session-run",
+                        "branch_binding_id": "main",
                         "activation_id": start_body["activation_id"],
                         "idempotency_key": "user-steer-missing-binding",
                         "payload": {"items": [{"type": "text", "text": "missing"}]},
