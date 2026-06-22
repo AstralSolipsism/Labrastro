@@ -91,6 +91,9 @@ from labrastro_server.interfaces.http.remote.routes.capability_packages import (
     RemoteCapabilityPackageRoutes,
 )
 from labrastro_server.interfaces.http.remote.routes.github import RemoteGitHubRoutes
+from labrastro_server.interfaces.http.remote.routes.local_actions import (
+    RemoteLocalActionRoutes,
+)
 from labrastro_server.interfaces.http.remote.routes.manifests import RemoteManifestRoutes
 from labrastro_server.interfaces.http.remote.routes.peer import RemotePeerRoutes
 from labrastro_server.interfaces.http.remote.routes.agent_runs import RemoteAgentRunRoutes
@@ -106,6 +109,7 @@ from labrastro_server.services.github.service import (
     WebhookService,
 )
 from labrastro_server.taskflow.application.taskflow_service import TaskflowService
+from labrastro_server.services.agent_runtime.local_actions import LocalActionService
 
 logger = logging.getLogger(__name__)
 
@@ -3360,6 +3364,7 @@ class RemoteRelayHTTPService:
         admin_provider_test_handler: ProviderTestHandler | None = None,
         admin_provider_models_handler: ProviderModelsHandler | None = None,
         runtime_control_plane: Any | None = None,
+        local_action_service: Any | None = None,
         taskflow_service: TaskflowService | None = None,
         issue_assignment_service: IssueAssignmentService | None = None,
         github_pr_service: PullRequestService | None = None,
@@ -3416,6 +3421,9 @@ class RemoteRelayHTTPService:
             ),
         )
         self.runtime_control_plane = runtime_control_plane
+        self.local_action_service = local_action_service or LocalActionService(
+            event_sink=self._append_local_action_event,
+        )
         self.taskflow_service = taskflow_service or TaskflowService(
             dispatcher=(
                 ReuleauxCoderTaskflowDispatcher(runtime_control_plane)
@@ -3839,6 +3847,19 @@ class RemoteRelayHTTPService:
                     writer.append_event("user_input_resolved", event_payload)
                 writer.mark_done(reason)
 
+    def _append_local_action_event(
+        self,
+        agent_run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self.runtime_control_plane is None:
+            return
+        appender = getattr(self.runtime_control_plane, "append_agent_run_event", None)
+        if not callable(appender):
+            return
+        appender(agent_run_id, event_type, payload)
+
     def _enqueue_outbound(self, peer_id: str, envelope: RelayEnvelope) -> None:
         with self._queues_lock:
             peer_queue = self._queues.setdefault(peer_id, queue.Queue())
@@ -3861,6 +3882,7 @@ class RemoteRelayHTTPService:
             RemoteSessionRoutes,
             RemoteChatRoutes,
             RemoteAgentRunRoutes,
+            RemoteLocalActionRoutes,
             RemoteGitHubRoutes,
             RemoteCollaborationRoutes,
             RemoteCapabilityPackageRoutes,
@@ -3969,6 +3991,18 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/agent-run-activations/complete":
                     self._handle_agent_run_activation_complete()
+                    return
+                if parsed.path == "/remote/local-actions/claim":
+                    self._handle_local_action_claim()
+                    return
+                if parsed.path == "/remote/local-actions/progress":
+                    self._handle_local_action_progress()
+                    return
+                if parsed.path == "/remote/local-actions/complete":
+                    self._handle_local_action_complete()
+                    return
+                if parsed.path == "/remote/local-actions/cancel":
+                    self._handle_local_action_cancel()
                     return
                 if parsed.path == "/remote/disconnect":
                     self._handle_disconnect()

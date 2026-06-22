@@ -69,6 +69,17 @@ from labrastro_server.interfaces.http.remote.protocol.chat import (
     SessionRunUserInputReplyRequest,
     SessionRunUserInputReplyResponse,
 )
+from labrastro_server.interfaces.http.remote.protocol.local_actions import (
+    LocalActionCancelRequest,
+    LocalActionCancelResponse,
+    LocalActionClaimRequest,
+    LocalActionClaimResponse,
+    LocalActionCompleteRequest,
+    LocalActionCompleteResponse,
+    LocalActionProgressRequest,
+    LocalActionProgressResponse,
+    LocalActionRecord,
+)
 from labrastro_server.interfaces.http.remote.protocol.environment import (
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
@@ -140,6 +151,15 @@ __all__ = [
     "ApprovalReplyResponse",
     "CapabilityPackageIngestSessionStartRequest",
     "CapabilityPackageInstallResultRecord",
+    "LocalActionCancelRequest",
+    "LocalActionCancelResponse",
+    "LocalActionClaimRequest",
+    "LocalActionClaimResponse",
+    "LocalActionCompleteRequest",
+    "LocalActionCompleteResponse",
+    "LocalActionProgressRequest",
+    "LocalActionProgressResponse",
+    "LocalActionRecord",
     "SessionRunCancelRequest",
     "SessionRunCancelResponse",
     "ChatCommandDispatchRequest",

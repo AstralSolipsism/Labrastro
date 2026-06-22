@@ -2266,6 +2266,24 @@ class PostgresAgentRunStore:
                     )
             return True, ""
 
+    def append_agent_run_event(
+        self,
+        task_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event_type = str(event_type or "").strip()
+        if not event_type:
+            raise ValueError("agent_run_event_type_required")
+        with self.engine.begin() as conn:
+            self._task_row(conn, task_id)
+            self._append_event(
+                conn,
+                task_id,
+                event_type,
+                dict(payload) if isinstance(payload, dict) else {},
+            )
+
     def complete_claimed_agent_run_activation(
         self,
         task_id: str,

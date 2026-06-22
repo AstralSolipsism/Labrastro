@@ -68,6 +68,7 @@ from reuleauxcoder.services.config.loader import ConfigLoader
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
+    LocalActionRecord,
     SessionRunStartRequest,
     CleanupResult,
     ExecToolResult,
@@ -3436,6 +3437,111 @@ class TestRemoteRelayHTTPService:
         )
         assert claim is not None
         return claim.to_dict()
+
+    def test_local_action_claim_complete_uses_lease_and_agent_run_events(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(
+                    relay,
+                    workspace_root=r"D:\AboutDEV\vika_mcp",
+                    features=["local_actions", "local_action:read_workspace_file"],
+                ),
+            )
+            peer = register_body["payload"]
+            task = control.submit_agent_run(
+                AgentRunRequest(
+                    agent_id="chat",
+                    prompt="needs local file",
+                    owner_session_run_id="session-run-local-action",
+                    source=AgentRunSource.CHAT,
+                    trigger_mode="interactive_chat",
+                ),
+                task_id="agent-run-local-action-http",
+            )
+            service.local_action_service.create_local_action(
+                LocalActionRecord.from_dict(
+                    {
+                        "scope": "activation_scoped",
+                        "local_action_id": "local-action-http-1",
+                        "agent_run_id": task.id,
+                        "activation_id": "activation-local-action-1",
+                        "session_run_id": "session-run-local-action",
+                        "branch_binding_id": "main",
+                        "action_kind": "read_workspace_file",
+                        "status": "waiting_peer",
+                        "workspace_root": r"D:\AboutDEV\vika_mcp",
+                        "payload": {"path": "README.md"},
+                    }
+                )
+            )
+
+            status, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/claim",
+                {
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": ["local_actions", "local_action:read_workspace_file"],
+                    "workspace_root": r"D:\AboutDEV\vika_mcp",
+                    "max_actions": 1,
+                },
+            )
+
+            assert status == 200
+            claimed = claim_body["actions"][0]
+            assert claimed["local_action_id"] == "local-action-http-1"
+            assert claimed["lease_id"]
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/local-actions/complete",
+                    {
+                        "peer_token": peer["peer_token"],
+                        "local_action_id": "local-action-http-1",
+                        "lease_id": "wrong-lease",
+                        "status": "completed",
+                        "result": {"summary": "read 120 lines"},
+                    },
+                )
+            assert excinfo.value.code == 409
+
+            status, complete_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/complete",
+                {
+                    "peer_token": peer["peer_token"],
+                    "local_action_id": "local-action-http-1",
+                    "lease_id": claimed["lease_id"],
+                    "status": "completed",
+                    "result": {"summary": "read 120 lines"},
+                },
+            )
+
+            assert status == 200
+            assert complete_body["ok"] is True
+            assert complete_body["action"]["status"] == "completed"
+            event_types = [event.type for event in control.list_events(task.id)]
+            assert "local_action_requested" in event_types
+            assert "local_action_waiting_peer" in event_types
+            assert "local_action_started" in event_types
+            assert "local_action_completed" in event_types
+        finally:
+            service.stop()
+            relay.stop()
 
     def test_relay_send_preview_request_roundtrips_result(self) -> None:
         captured: list[RelayEnvelope] = []

@@ -98,6 +98,7 @@ class TestRemoteHTTPContract:
             name.startswith("session_run.")
             or name.startswith("agent_runs.")
             or name.startswith("agent_run_activations.")
+            or name.startswith("local_actions.")
             or name.startswith("admin.agent_runs.")
             or name == "admin.capability_packages.ingest_session_start"
         )

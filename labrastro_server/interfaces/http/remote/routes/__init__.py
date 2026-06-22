@@ -12,6 +12,9 @@ from labrastro_server.interfaces.http.remote.routes.capability_packages import (
 from labrastro_server.interfaces.http.remote.routes.manifests import RemoteManifestRoutes
 from labrastro_server.interfaces.http.remote.routes.peer import RemotePeerRoutes
 from labrastro_server.interfaces.http.remote.routes.agent_runs import RemoteAgentRunRoutes
+from labrastro_server.interfaces.http.remote.routes.local_actions import (
+    RemoteLocalActionRoutes,
+)
 from labrastro_server.interfaces.http.remote.routes.sessions import RemoteSessionRoutes
 from labrastro_server.interfaces.http.remote.routes.taskflow import RemoteTaskflowRoutes
 
@@ -23,6 +26,7 @@ __all__ = [
     "RemoteChatRoutes",
     "RemoteCollaborationRoutes",
     "RemoteManifestRoutes",
+    "RemoteLocalActionRoutes",
     "RemotePeerRoutes",
     "RemoteRelayBaseHandler",
     "RemoteAgentRunRoutes",

@@ -219,6 +219,32 @@ def _model_config() -> dict:
     }
 
 
+def test_control_plane_appends_named_local_action_event_for_projection() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(agent_id="chat", prompt="read local file"),
+        task_id="agent-run-local-action-event",
+    )
+
+    event = control.append_agent_run_event(
+        task.id,
+        "local_action_waiting_peer",
+        {
+            "local_action_id": "local-action-1",
+            "action_kind": "read_workspace_file",
+            "workspace_root": "D:\\AboutDEV\\vika_mcp",
+            "status": "waiting_peer",
+        },
+    )
+
+    assert event is not None
+    assert event.type == "local_action_waiting_peer"
+    projected_type, projected = agent_run_event_to_session_events(event.to_dict())[0]
+    assert projected_type == "local_action"
+    assert projected["kind"] == "local_action"
+    assert projected["status"] == "waiting_peer"
+
+
 def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
     return str(control.get_agent_run(task_id).current_activation_id or "")
 

@@ -500,6 +500,152 @@
       }
     },
     {
+      "name": "local_actions.claim",
+      "method": "POST",
+      "path": "/remote/local-actions/claim",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "peer_id": "peer_contract",
+        "worker_kind": "local_peer",
+        "features": ["local_actions", "local_action:read_workspace_file"],
+        "workspace_root": "/workspace",
+        "max_actions": 1
+      },
+      "response": {
+        "actions": [
+          {
+            "scope": "activation_scoped",
+            "local_action_id": "local_action_contract",
+            "agent_run_id": "agent_run_main_contract",
+            "activation_id": "activation_contract",
+            "session_run_id": "session_run_contract",
+            "branch_binding_id": "main",
+            "action_kind": "read_workspace_file",
+            "status": "started",
+            "peer_id": "peer_contract",
+            "workspace_root": "/workspace",
+            "payload": {
+              "path": "README.md"
+            },
+            "lease_id": "lease_contract",
+            "lease_expires_at": 1893456000.0,
+            "created_at": 1893455900.0,
+            "updated_at": 1893455901.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "local_actions.progress",
+      "method": "POST",
+      "path": "/remote/local-actions/progress",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "local_action_id": "local_action_contract",
+        "lease_id": "lease_contract",
+        "status": "progress",
+        "progress": {
+          "summary": "reading README.md"
+        }
+      },
+      "response": {
+        "ok": true,
+        "action": {
+          "scope": "activation_scoped",
+          "local_action_id": "local_action_contract",
+          "agent_run_id": "agent_run_main_contract",
+          "activation_id": "activation_contract",
+          "session_run_id": "session_run_contract",
+          "branch_binding_id": "main",
+          "action_kind": "read_workspace_file",
+          "status": "progress",
+          "peer_id": "peer_contract",
+          "workspace_root": "/workspace",
+          "payload": {
+            "path": "README.md"
+          },
+          "progress": {
+            "summary": "reading README.md"
+          },
+          "lease_id": "lease_contract"
+        }
+      }
+    },
+    {
+      "name": "local_actions.complete",
+      "method": "POST",
+      "path": "/remote/local-actions/complete",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "local_action_id": "local_action_contract",
+        "lease_id": "lease_contract",
+        "status": "completed",
+        "result": {
+          "summary": "read 120 lines"
+        }
+      },
+      "response": {
+        "ok": true,
+        "action": {
+          "scope": "activation_scoped",
+          "local_action_id": "local_action_contract",
+          "agent_run_id": "agent_run_main_contract",
+          "activation_id": "activation_contract",
+          "session_run_id": "session_run_contract",
+          "branch_binding_id": "main",
+          "action_kind": "read_workspace_file",
+          "status": "completed",
+          "peer_id": "peer_contract",
+          "workspace_root": "/workspace",
+          "payload": {
+            "path": "README.md"
+          },
+          "result": {
+            "summary": "read 120 lines"
+          },
+          "lease_id": "lease_contract"
+        }
+      }
+    },
+    {
+      "name": "local_actions.cancel",
+      "method": "POST",
+      "path": "/remote/local-actions/cancel",
+      "auth": "peer_token",
+      "request": {
+        "peer_token": "pt_contract",
+        "local_action_id": "local_action_contract",
+        "lease_id": "lease_contract",
+        "reason": "user_cancelled"
+      },
+      "response": {
+        "ok": true,
+        "action": {
+          "scope": "activation_scoped",
+          "local_action_id": "local_action_contract",
+          "agent_run_id": "agent_run_main_contract",
+          "activation_id": "activation_contract",
+          "session_run_id": "session_run_contract",
+          "branch_binding_id": "main",
+          "action_kind": "read_workspace_file",
+          "status": "cancelled",
+          "peer_id": "peer_contract",
+          "workspace_root": "/workspace",
+          "payload": {
+            "path": "README.md"
+          },
+          "result": {
+            "reason": "user_cancelled"
+          },
+          "error": "user_cancelled",
+          "lease_id": "lease_contract"
+        }
+      }
+    },
+    {
       "name": "admin.agent_runs.submit",
       "method": "POST",
       "path": "/remote/admin/agent-runs/submit",

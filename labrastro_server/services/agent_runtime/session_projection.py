@@ -99,6 +99,18 @@ class AgentRunSessionProjectionLabels:
 DEFAULT_AGENT_RUN_SESSION_PROJECTION_LABELS = AgentRunSessionProjectionLabels()
 
 
+_LOCAL_ACTION_STATUS_BY_EVENT = {
+    "local_action_requested": "requested",
+    "local_action_waiting_peer": "waiting_peer",
+    "local_action_started": "started",
+    "local_action_progress": "progress",
+    "local_action_completed": "completed",
+    "local_action_failed": "failed",
+    "local_action_cancelled": "cancelled",
+    "local_action_timed_out": "timed_out",
+}
+
+
 def agent_run_event_to_session_events(
     event: dict[str, Any],
     *,
@@ -116,6 +128,18 @@ def agent_run_event_to_session_events(
         "workflow": labels.workflow,
         "raw_event_refs": [_raw_event_ref(event)],
     }
+    if event_type in _LOCAL_ACTION_STATUS_BY_EVENT:
+        return [
+            (
+                "local_action",
+                _local_action_process_item(
+                    labels,
+                    event_type,
+                    data,
+                    base,
+                ),
+            )
+        ]
     if event_type == "session_run_event":
         envelope = _event_data(data)
         session_event_type = str(envelope.get("event_type") or "").strip()
@@ -736,6 +760,90 @@ def _context_event(
         "workflow": labels.workflow,
         **(extra or {}),
     }
+
+
+def _local_action_process_item(
+    labels: AgentRunSessionProjectionLabels,
+    event_type: str,
+    data: dict[str, Any],
+    base: dict[str, Any],
+) -> dict[str, Any]:
+    status = str(
+        data.get("status")
+        or _LOCAL_ACTION_STATUS_BY_EVENT.get(event_type)
+        or "progress"
+    )
+    action_kind = str(data.get("action_kind") or "local_action")
+    workspace_root = str(data.get("workspace_root") or "").strip()
+    message = _local_action_message(
+        status,
+        action_kind=action_kind,
+        workspace_root=workspace_root,
+        error=str(data.get("error") or ""),
+    )
+    item: dict[str, Any] = {
+        **base,
+        "kind": "local_action",
+        "title": message,
+        "message": message,
+        "phase": f"local_action_{status}",
+        "status": status,
+        "local_action_id": str(data.get("local_action_id") or ""),
+        "action_kind": action_kind,
+        "scope": str(data.get("scope") or ""),
+    }
+    for key in (
+        "activation_id",
+        "session_run_id",
+        "branch_binding_id",
+        "admin_task_id",
+        "requested_by",
+        "peer_id",
+    ):
+        value = str(data.get(key) or "").strip()
+        if value:
+            item[key] = value
+    if workspace_root:
+        item["workspace_root"] = workspace_root
+    for key in ("progress", "result", "payload"):
+        value = data.get(key)
+        if isinstance(value, dict) and value:
+            item[key] = _public_payload(
+                value,
+                marker=labels.output_truncation_marker,
+            )
+    error = str(data.get("error") or "").strip()
+    if error:
+        item["error"] = error
+    return item
+
+
+def _local_action_message(
+    status: str,
+    *,
+    action_kind: str,
+    workspace_root: str,
+    error: str = "",
+) -> str:
+    target = f"：{workspace_root}" if workspace_root else ""
+    if status == "waiting_peer":
+        return f"等待本地工作区连接{target}"
+    if status == "requested":
+        return f"等待本地动作排队：{action_kind}"
+    if status == "started":
+        return f"本地动作执行中：{action_kind}"
+    if status == "progress":
+        return f"本地动作进行中：{action_kind}"
+    if status == "completed":
+        return f"本地动作已完成：{action_kind}"
+    if status == "failed":
+        detail = f"：{error}" if error else f"：{action_kind}"
+        return f"本地动作失败{detail}"
+    if status == "cancelled":
+        return f"本地动作已取消：{action_kind}"
+    if status == "timed_out":
+        return f"本地动作超时：{action_kind}"
+    return f"本地动作状态更新：{action_kind}"
 
 
 def _event_data(data: dict[str, Any]) -> dict[str, Any]:

@@ -3362,6 +3362,28 @@ class AgentRunControlPlane:
                     task.cancel_reason = None
             return True, ""
 
+    def append_agent_run_event(
+        self,
+        task_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AgentRunEvent | None:
+        """Append a named AgentRun event that is not an executor event."""
+        event_type = str(event_type or "").strip()
+        if not event_type:
+            raise ValueError("agent_run_event_type_required")
+        public_payload = dict(payload) if isinstance(payload, dict) else {}
+        if self._store is not None:
+            appender = getattr(self._store, "append_agent_run_event", None)
+            if not callable(appender):
+                raise RuntimeError("agent_run_event_append_unavailable")
+            result = appender(task_id, event_type, public_payload)
+            self.notify_task_available()
+            return result
+        with self._lock:
+            self._task_locked(task_id)
+            return self._append_event_locked(task_id, event_type, public_payload)
+
     def complete_claimed_agent_run_activation(
         self,
         task_id: str,
