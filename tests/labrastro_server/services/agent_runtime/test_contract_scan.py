@@ -1035,6 +1035,18 @@ def test_mcp_elicitation_and_entrypoint_producers_require_scoped_branch_proof() 
     assert offenders == []
 
 
+def test_server_owned_session_worker_renews_agent_run_claim_lease() -> None:
+    source = _read("reuleauxcoder/interfaces/entrypoint/remote_relay.py")
+    start = source.index("def _start_server_session_run_worker()")
+    end = source.index("def _start_local_peer_session_run_worker()")
+    server_worker = source[start:end]
+
+    assert "worker_kind=WorkerKind.SERVER_WORKER" in server_worker
+    assert "agent_runs.remote_server" in server_worker
+    assert "heartbeat_agent_run_activation(" in server_worker
+    assert "lease_sec=SERVER_SESSION_RUN_WORKER_LEASE_SEC" in server_worker
+
+
 def test_backend_session_run_ui_producers_use_scoped_writer_ports() -> None:
     scanned = {
         "chat_routes": _read("labrastro_server/interfaces/http/remote/routes/chat.py"),

@@ -85,6 +85,9 @@ from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_WORKFLOW_MODE,
 )
 
+SERVER_SESSION_RUN_WORKER_LEASE_SEC = 120
+SERVER_SESSION_RUN_WORKER_HEARTBEAT_SEC = 10.0
+
 def _stable_digest(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -1437,6 +1440,29 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
 
         def _run_claim(claim: Any) -> None:
             result: ExecutorRunResult
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat_loop() -> None:
+                while not heartbeat_stop.wait(SERVER_SESSION_RUN_WORKER_HEARTBEAT_SEC):
+                    heartbeat = runtime.heartbeat_agent_run_activation(
+                        request_id=claim.request_id,
+                        task_id=claim.task.id,
+                        activation_id=claim.activation_id,
+                        worker_id=claim.worker_id,
+                        peer_id="server",
+                        lease_sec=SERVER_SESSION_RUN_WORKER_LEASE_SEC,
+                    )
+                    if heartbeat.get("cancel_requested"):
+                        backend.cancel(
+                            claim.task.id,
+                            reason=str(heartbeat.get("reason") or "cancel_requested"),
+                        )
+                        break
+                    if not heartbeat.get("ok"):
+                        break
+
+            heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+            heartbeat_thread.start()
             try:
                 result = backend.start(claim.executor_request)
             except Exception as exc:
@@ -1453,6 +1479,9 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     ],
                     error=message,
                 )
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
             runtime.complete_claimed_agent_run_activation(
                 claim.task.id,
                 result,
@@ -1477,6 +1506,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                         "worker_kind:server_worker",
                         "agent_runs.remote_server",
                     ],
+                    lease_sec=SERVER_SESSION_RUN_WORKER_LEASE_SEC,
                     wait_sec=0,
                 )
                 if claim is None:
