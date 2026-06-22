@@ -1756,7 +1756,7 @@ class PostgresAgentRunStore:
                         executor=task.executor or ExecutorType.REULEAUXCODER,
                         prompt=activation.prompt,
                         execution_location=(
-                            task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+                            task.execution_location or ExecutionLocation.REMOTE_SERVER
                         ),
                         runtime_profile_id=task.runtime_profile_id,
                         worker_kind=metadata.get("worker_kind"),
@@ -2098,7 +2098,7 @@ class PostgresAgentRunStore:
                 agent_id=task.agent_id,
                 executor=task.executor or ExecutorType.REULEAUXCODER,
                 execution_location=(
-                    task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+                    task.execution_location or ExecutionLocation.REMOTE_SERVER
                 ),
                 task_id=task_id,
                 workdir=workdir if workdir else None,
@@ -3457,7 +3457,7 @@ class PostgresAgentRunStore:
         request.execution_location = (
             request.execution_location
             or _optional_location(raw_profile.get("execution_location"))
-            or ExecutionLocation.LOCAL_WORKSPACE
+            or ExecutionLocation.REMOTE_SERVER
         )
         request.worker_kind = request.worker_kind or worker_kind_for_runtime(
             raw_profile,
@@ -4236,7 +4236,7 @@ class PostgresAgentRunStore:
                 "agent_id": task.agent_id,
                 "executor": (task.executor or ExecutorType.REULEAUXCODER).value,
                 "execution_location": (
-                    task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+                    task.execution_location or ExecutionLocation.REMOTE_SERVER
                 ).value,
                 "workdir": session.workdir,
                 "branch": session.branch,
@@ -4287,7 +4287,7 @@ class PostgresAgentRunStore:
                 "agent_id": task.agent_id,
                 "executor": (task.executor or ExecutorType.REULEAUXCODER).value,
                 "execution_location": (
-                    task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+                    task.execution_location or ExecutionLocation.REMOTE_SERVER
                 ).value,
                 "workdir": task.workdir,
                 "branch": session.branch,

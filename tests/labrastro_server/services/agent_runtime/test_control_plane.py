@@ -19,16 +19,19 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunResumePolicy,
     AgentRunRelation,
     AgentRunRelationType,
+    AgentRunSource,
     AgentRunWaitingReason,
     AgentThreadBinding,
     AgentThreadBindingLifetime,
     AgentThreadBindingStatus,
     ExecutionLocation,
     ExecutorType,
+    ModelRequestOrigin,
     PublishPolicy,
     TaskSessionRef,
     AgentRunStatus,
     TriggerMode,
+    WorkerKind,
     WorktreeRole,
 )
 from reuleauxcoder.domain.config.models import build_agent_run_snapshot
@@ -228,7 +231,7 @@ def test_postgres_resolve_request_without_relation_does_not_reference_parent() -
     resolved = store._resolve_request(request)
 
     assert resolved.executor == ExecutorType.REULEAUXCODER
-    assert resolved.execution_location == ExecutionLocation.LOCAL_WORKSPACE
+    assert resolved.execution_location == ExecutionLocation.REMOTE_SERVER
     assert resolved.executor_session_id is None
 
 
@@ -3451,6 +3454,56 @@ def test_local_peer_cannot_claim_remote_server_agent_run() -> None:
     assert claim.executor_request.metadata["worker_kind"] == "server_worker"
 
 
+def test_local_peer_cannot_claim_ordinary_chat_agent_run() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="main_chat",
+            prompt="hello",
+            owner_session_run_id="session-run-ordinary-chat",
+            source=AgentRunSource.CHAT,
+            trigger_mode=TriggerMode.INTERACTIVE_CHAT,
+            metadata={"session_hint": "chat-session-ordinary"},
+        ),
+        task_id="task-ordinary-chat",
+    )
+
+    assert task.execution_location == ExecutionLocation.REMOTE_SERVER
+    assert task.metadata["worker_kind"] == WorkerKind.SERVER_WORKER.value
+    assert task.metadata["model_request_origin"] == ModelRequestOrigin.SERVER.value
+    assert (
+        control.claim_agent_run_activation(
+            worker_id="local-peer",
+            worker_kind=WorkerKind.LOCAL_PEER,
+            executors=["reuleauxcoder"],
+            peer_features=[
+                "agent_runs",
+                "worker_kind:local_peer",
+                "agent_runs.local_workspace",
+            ],
+            workspace_root="D:\\AboutDEV\\vika_mcp",
+        )
+        is None
+    )
+
+    claim = control.claim_agent_run_activation(
+        worker_id="server-worker",
+        worker_kind=WorkerKind.SERVER_WORKER,
+        executors=["reuleauxcoder"],
+        peer_features=[
+            "agent_runs",
+            "worker_kind:server_worker",
+            "agent_runs.remote_server",
+        ],
+    )
+
+    assert claim is not None
+    assert claim.task.id == task.id
+    assert claim.executor_request.execution_location == ExecutionLocation.REMOTE_SERVER
+    assert claim.executor_request.worker_kind == WorkerKind.SERVER_WORKER
+    assert claim.executor_request.model_request_origin == ModelRequestOrigin.SERVER
+
+
 @pytest.mark.parametrize(
     "execution_location",
     [ExecutionLocation.REMOTE_SERVER, ExecutionLocation.DAEMON_WORKTREE],
@@ -4088,6 +4141,8 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.FAKE,
+            execution_location=ExecutionLocation.LOCAL_WORKSPACE,
+            worker_kind=WorkerKind.LOCAL_PEER,
         ),
         task_id="task-heartbeat",
     )
@@ -4154,6 +4209,8 @@ def test_heartbeat_cancel_and_stale_recovery() -> None:
             agent_id="coder",
             prompt="stale",
             executor=ExecutorType.FAKE,
+            execution_location=ExecutionLocation.LOCAL_WORKSPACE,
+            worker_kind=WorkerKind.LOCAL_PEER,
         ),
         task_id="task-stale",
     )
@@ -4180,6 +4237,8 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
             agent_id="coder",
             prompt="run",
             executor=ExecutorType.FAKE,
+            execution_location=ExecutionLocation.LOCAL_WORKSPACE,
+            worker_kind=WorkerKind.LOCAL_PEER,
         ),
         task_id="task-owner",
     )

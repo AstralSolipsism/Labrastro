@@ -131,8 +131,8 @@ def validate_agent_run_runtime_policy(
     *,
     agent_config: AgentConfig | None,
 ) -> None:
-    worker_kind = request.worker_kind or WorkerKind.LOCAL_PEER
-    location = request.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+    worker_kind = request.worker_kind or WorkerKind.SERVER_WORKER
+    location = request.execution_location or ExecutionLocation.REMOTE_SERVER
     validate_runtime_profile_model_request_origin(
         executor=request.executor,
         worker_kind=worker_kind,
@@ -199,7 +199,7 @@ def worker_matches_agent_run(
     features: set[str] | None,
     workspace_root: str | None,
 ) -> bool:
-    location = task.execution_location or ExecutionLocation.LOCAL_WORKSPACE
+    location = task.execution_location or ExecutionLocation.REMOTE_SERVER
     expected_worker = optional_worker_kind(task.metadata.get("worker_kind"))
     if expected_worker is None:
         expected_worker = (

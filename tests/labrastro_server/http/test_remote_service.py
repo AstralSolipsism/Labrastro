@@ -50,7 +50,12 @@ from reuleauxcoder.domain.config.models import (
     MCPServerConfig,
 )
 from reuleauxcoder.domain.providers.models import ProviderResponse
-from reuleauxcoder.domain.agent_runtime.models import AgentRunSource
+from reuleauxcoder.domain.agent_runtime.models import (
+    AgentRunSource,
+    ExecutionLocation,
+    ModelRequestOrigin,
+    WorkerKind,
+)
 from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 from labrastro_server.services.agent_runtime.control_plane import (
     AgentRunControlPlane,
@@ -3414,6 +3419,23 @@ class TestRemoteRelayHTTPService:
             peer_id=peer_id,
         )
         assert ok, reason
+
+    def _claim_bound_agent_run_server_worker(
+        self,
+        control: AgentRunControlPlane,
+    ) -> dict:
+        claim = control.claim_agent_run_activation(
+            worker_id="server-worker-1",
+            worker_kind=WorkerKind.SERVER_WORKER,
+            executors=["reuleauxcoder", "codex", "fake"],
+            peer_features=[
+                "agent_runs",
+                "worker_kind:server_worker",
+                "agent_runs.remote_server",
+            ],
+        )
+        assert claim is not None
+        return claim.to_dict()
 
     def test_relay_send_preview_request_roundtrips_result(self) -> None:
         captured: list[RelayEnvelope] = []
@@ -8093,10 +8115,14 @@ class TestRemoteRelayHTTPService:
             assert run.owner_session_run_id == session_run_id
             assert run.source.value == "chat"
             assert run.trigger_mode.value == "interactive_chat"
-            assert run.execution_location.value == "local_workspace"
-            assert run.metadata["worker_kind"] == "local_peer"
-            assert run.metadata["workspace_root"] == "/tmp/peer-chat"
-            claim_status, claim_body = _json_request(
+            assert run.execution_location == ExecutionLocation.REMOTE_SERVER
+            assert run.metadata.get("worker_kind") in (
+                None,
+                WorkerKind.SERVER_WORKER.value,
+                "server_worker",
+            )
+            assert run.metadata["model_request_origin"] == ModelRequestOrigin.SERVER.value
+            local_claim_status, local_claim_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/agent-run-activations/claim",
                 {
@@ -8106,10 +8132,25 @@ class TestRemoteRelayHTTPService:
                     "executors": ["reuleauxcoder"],
                 },
             )
-            assert claim_status == 200
-            claim = claim_body["claim"]
-            assert claim["agent_run"]["id"] == agent_run_id
-            assert claim["executor_request"]["metadata"]["workspace_root"] == "/tmp/peer-chat"
+            assert local_claim_status == 200
+            assert local_claim_body["claim"] is None
+            assert "workspace_root" not in run.metadata
+            assert "cwd" not in run.metadata
+            server_claim = control.claim_agent_run_activation(
+                worker_id="server-chat-worker",
+                worker_kind=WorkerKind.SERVER_WORKER,
+                executors=["reuleauxcoder"],
+                peer_features=["worker_kind:server_worker", "agent_runs.remote_server"],
+            )
+            assert server_claim is not None
+            assert server_claim.task.id == agent_run_id
+            assert server_claim.executor_request.execution_location == (
+                ExecutionLocation.REMOTE_SERVER
+            )
+            assert server_claim.executor_request.worker_kind == WorkerKind.SERVER_WORKER
+            assert server_claim.executor_request.model_request_origin == (
+                ModelRequestOrigin.SERVER
+            )
         finally:
             service.stop()
             relay.stop()
@@ -9409,17 +9450,7 @@ class TestRemoteRelayHTTPService:
             peer_token = register_body["payload"]["peer_token"]
             peer_id = register_body["payload"]["peer_id"]
             agent_run_id = start_body["agent_run_id"]
-            _, claim_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/agent-run-activations/claim",
-                {
-                    "peer_token": peer_token,
-                    "worker_id": "worker-1",
-                    "executors": ["reuleauxcoder", "codex", "fake"],
-                },
-            )
-            claim = claim_body["claim"]
-            assert claim is not None
+            claim = self._claim_bound_agent_run_server_worker(control)
             self._mark_claim_running(control, peer_id, claim)
 
             steer_payload = {
@@ -9545,17 +9576,7 @@ class TestRemoteRelayHTTPService:
             assert no_claim.value.code == 409
             assert no_claim_body["error"] == "agent_run_not_steerable"
 
-            _, claim_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/agent-run-activations/claim",
-                {
-                    "peer_token": peer_token,
-                    "worker_id": "worker-1",
-                    "executors": ["reuleauxcoder", "codex", "fake"],
-                },
-            )
-            claim = claim_body["claim"]
-            assert claim is not None
+            claim = self._claim_bound_agent_run_server_worker(control)
             self._mark_claim_running(control, peer_id, claim)
             with pytest.raises(HTTPError) as mismatch:
                 _json_request(

@@ -71,10 +71,10 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 )
 from reuleauxcoder.domain.agent_runtime.models import (
     ExecutionLocation,
+    ModelRequestOrigin,
     WorkerKind,
 )
 from reuleauxcoder.domain.config.models import (
-    DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
     DEFAULT_MAIN_CHAT_AGENT_ID,
 )
 from reuleauxcoder.interfaces.events import UIEventKind
@@ -410,17 +410,10 @@ class RemoteChatRoutes:
             initial_prompt=req.prompt,
         )
         agent_id = str(req.taskflow_id or DEFAULT_MAIN_CHAT_AGENT_ID).strip()
-        peer = self.service.relay_server.registry.get(peer_id)
-        peer_workspace_root = str(getattr(peer, "workspace_root", "") or "").strip()
-        peer_cwd = str(getattr(peer, "cwd", "") or "").strip()
         metadata: dict[str, Any] = {
             "remote_peer_id": peer_id,
             "session_hint": str(req.session_hint or ""),
         }
-        if peer_workspace_root:
-            metadata["workspace_root"] = peer_workspace_root
-        if peer_cwd:
-            metadata["cwd"] = peer_cwd
         if workflow_mode:
             metadata["workflow_mode"] = workflow_mode
         if req.mode:
@@ -437,9 +430,9 @@ class RemoteChatRoutes:
                     owner_session_run_id=session.session_run_id,
                     source="chat",
                     trigger_mode="interactive_chat",
-                    execution_location=ExecutionLocation.LOCAL_WORKSPACE,
-                    worker_kind=WorkerKind.LOCAL_PEER,
-                    runtime_profile_id=DEFAULT_ENVIRONMENT_RUNTIME_PROFILE_ID,
+                    execution_location=ExecutionLocation.REMOTE_SERVER,
+                    worker_kind=WorkerKind.SERVER_WORKER,
+                    model_request_origin=ModelRequestOrigin.SERVER,
                     model=req.model_id,
                     metadata=metadata,
                 )
