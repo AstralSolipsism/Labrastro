@@ -7,6 +7,7 @@ import hashlib
 import json
 import inspect
 from pathlib import Path
+import threading
 import time
 import uuid
 from typing import Any, Callable
@@ -17,7 +18,6 @@ from reuleauxcoder.app.runtime.session_state import (
     apply_agent_default_model,
     apply_agent_config_model,
     apply_session_runtime_state,
-    apply_session_model_override,
     build_session_runtime_state,
     get_session_fingerprint,
     restore_config_runtime_defaults,
@@ -76,9 +76,16 @@ from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
+    ToolPreviewRequest,
     ToolPreviewResult,
 )
 from labrastro_server.relay.server import RelayServer
+from labrastro_server.services.agent_runtime.executor_backend import (
+    ExecutorEvent,
+    ExecutorRunResult,
+    ReuleauxCoderExecutorBackend,
+)
+from reuleauxcoder.domain.agent_runtime.models import ExecutorType, WorkerKind
 from reuleauxcoder.extensions.skills.service import SkillsService
 from reuleauxcoder.extensions.tools.backend import ExecutionContext
 from reuleauxcoder.interfaces.cli.commands import handle_command
@@ -113,6 +120,18 @@ class RemoteToolProtocolError(RuntimeError):
         self.tool_call_id = tool_call_id
         self.code = code
         self.message = message
+        self.failure_kind = ToolFailureKind.TOOL_PROTOCOL_ERROR.value
+        self.recoverable = False
+        self.tool_diagnostics = [
+            tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PROTOCOL,
+                kind=ToolDiagnosticKind.TOOL_PROTOCOL_ERROR,
+                code=code,
+                message=message,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            ).to_dict()
+        ]
 
     def payload(self) -> dict[str, Any]:
         diagnostic = tool_diagnostic_from_failure(
@@ -130,6 +149,7 @@ class RemoteToolProtocolError(RuntimeError):
             "message": self.message,
             "failure_kind": ToolFailureKind.TOOL_PROTOCOL_ERROR.value,
             "tool_diagnostics": [diagnostic.to_dict()],
+            "recoverable": False,
         }
 
 
@@ -1186,98 +1206,6 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         if session_id and callable(enable_trace_persistence):
             enable_trace_persistence(session_id)
 
-    def _apply_remote_session_run_model_override(
-        peer_agent: Agent,
-        peer_id: str,
-        remote_session: Any,
-        *,
-        ensure_session_run_start: Callable[[], None] | None = None,
-    ) -> bool:
-        def _ensure_start() -> None:
-            if callable(ensure_session_run_start):
-                ensure_session_run_start()
-
-        provider_id = str(getattr(remote_session, "provider_id", "") or "").strip()
-        model_id = str(getattr(remote_session, "model_id", "") or "").strip()
-        parameters = getattr(remote_session, "model_parameters", None)
-        if not isinstance(parameters, dict):
-            parameters = {}
-        if not provider_id and not model_id:
-            return True
-        if not provider_id or not model_id:
-            _ensure_start()
-            remote_session.append_event(
-                "error",
-                {
-                    "message": "provider_model_required",
-                    "provider_id": provider_id,
-                    "model_id": model_id,
-                },
-            )
-            remote_session.append_event("session_run_end", {"response": ""})
-            return False
-        current_config = _current_config()
-        if current_config is None:
-            _ensure_start()
-            remote_session.append_event("error", {"message": "config_unavailable"})
-            remote_session.append_event("session_run_end", {"response": ""})
-            return False
-        session_id = str(
-            getattr(peer_agent, "current_session_id", None)
-            or getattr(remote_session, "session_hint", None)
-            or ""
-        ).strip()
-        result = switch_session_model(
-            current_config,
-            session_store,
-            _peer_fingerprint(peer_id),
-            {
-                "session_id": session_id,
-                "provider_id": provider_id,
-                "model_id": model_id,
-                "parameters": dict(parameters),
-            },
-        )
-        if not result.get("ok"):
-            _ensure_start()
-            remote_session.append_event(
-                "error",
-                {
-                    "message": str(result.get("error") or "model_override_failed"),
-                    "provider_id": provider_id,
-                    "model_id": model_id,
-                    "status": result.get("_status"),
-                },
-            )
-            remote_session.append_event("session_run_end", {"response": ""})
-            return False
-        resolved_session_id = str(result.get("session_id") or session_id).strip()
-        if resolved_session_id:
-            setattr(peer_agent, "current_session_id", resolved_session_id)
-            remote_session.session_id = resolved_session_id
-        try:
-            apply_session_model_override(
-                current_config,
-                peer_agent,
-                provider=provider_id,
-                model=model_id,
-                display_name=model_id,
-                parameters=parameters,
-            )
-        except Exception as exc:
-            _ensure_start()
-            remote_session.append_event(
-                "error",
-                {
-                    "message": str(exc),
-                    "provider_id": provider_id,
-                    "model_id": model_id,
-                },
-            )
-            remote_session.append_event("session_run_end", {"response": ""})
-            return False
-        return True
-
     def _agent_chat(agent_obj: Any, prompt: str, *, clear_stop_request: bool) -> str:
         signature = inspect.signature(agent_obj.chat)
         if "clear_stop_request" in signature.parameters:
@@ -1324,6 +1252,594 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             "These @ mentions are context references only and do not grant new tool permissions."
         )
         return f"{prompt}\n" + "\n".join(lines)
+
+    def _agent_run_binding_for_request(request: Any) -> Any | None:
+        service = runner._relay_http_service
+        runtime = getattr(service, "runtime_control_plane", None)
+        if runtime is None:
+            return None
+        metadata = dict(getattr(request, "metadata", {}) or {})
+        expected_session_run_id = str(metadata.get("session_run_id") or "").strip()
+        expected_branch_id = str(metadata.get("branch_binding_id") or "").strip()
+        bindings = runtime.list_session_run_bindings(agent_run_id=request.task_id)
+        for binding in bindings:
+            if expected_session_run_id and binding.session_run_id != expected_session_run_id:
+                continue
+            if expected_branch_id and binding.branch_binding_id != expected_branch_id:
+                continue
+            return binding
+        return None
+
+    def _wait_agent_run_binding_for_request(
+        request: Any,
+        *,
+        timeout_sec: float = 1.0,
+    ) -> Any | None:
+        deadline = time.time() + max(0.0, timeout_sec)
+        while True:
+            binding = _agent_run_binding_for_request(request)
+            if binding is not None:
+                return binding
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.01)
+
+    def _session_run_writer_for_binding(binding: Any) -> Any:
+        service = runner._relay_http_service
+        if service is None:
+            raise RuntimeError("remote relay service unavailable")
+        session = service._get_session_run(binding.session_run_id)
+        if session is None:
+            raise RuntimeError("session_run_not_found")
+        return session.scoped_writer(
+            branch_binding_id=binding.branch_binding_id,
+            agent_run_id=binding.agent_run_id,
+        )
+
+    def _emit_agent_session_run_event(
+        peer_agent: Any,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event = AgentEvent.session_run_event(event_type, payload)
+        emit_event = getattr(peer_agent, "_emit_event", None)
+        if callable(emit_event):
+            emit_event(event)
+            return
+        for handler in list(getattr(peer_agent, "_event_handlers", []) or []):
+            handler(event)
+
+    def _install_session_run_ui_bus(peer_agent: Any) -> None:
+        session_bus = UIEventBus(
+            lifecycle_dispatcher=getattr(peer_agent, "lifecycle_dispatcher", None)
+        )
+
+        def _forward_ui_event(event: Any) -> None:
+            _emit_agent_session_run_event(
+                peer_agent,
+                _structured_ui_event_type(event),
+                _structured_ui_event_payload(event),
+            )
+
+        session_bus.subscribe(_forward_ui_event, replay_history=False)
+        context = getattr(peer_agent, "context", None)
+        if context is not None:
+            context._ui_bus = session_bus
+
+    def _install_session_run_command_dispatch(
+        peer_agent: Any,
+        peer_id: str,
+    ) -> None:
+        original_chat = getattr(peer_agent, "chat", None)
+        if not callable(original_chat):
+            return
+
+        def _call_original_chat(prompt: str, *args: Any, **kwargs: Any) -> Any:
+            signature = inspect.signature(original_chat)
+            if "clear_stop_request" in signature.parameters:
+                return original_chat(
+                    prompt,
+                    clear_stop_request=bool(kwargs.get("clear_stop_request", True)),
+                )
+            return original_chat(prompt)
+
+        def _session_run_chat(prompt: str, *args: Any, **kwargs: Any) -> Any:
+            command_text = str(prompt or "")
+            if command_text.startswith("/"):
+                response = _dispatch_vscode_command(
+                    peer_agent,
+                    peer_id,
+                    command_text,
+                    invalid_as_chat=True,
+                )
+                for event in list(response.events or []):
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = str(event.get("type") or "").strip()
+                    payload = (
+                        dict(event.get("payload"))
+                        if isinstance(event.get("payload"), dict)
+                        else {}
+                    )
+                    if event_type:
+                        _emit_agent_session_run_event(peer_agent, event_type, payload)
+                if response.action != "chat":
+                    return ""
+            return _call_original_chat(command_text, *args, **kwargs)
+
+        peer_agent.chat = _session_run_chat
+
+    def _remote_stream_handler_for_binding(binding: Any) -> Callable[..., None]:
+        writer = _session_run_writer_for_binding(binding)
+
+        def _handle(
+            tool_name: str,
+            chunk: Any,
+            tool_call_id: str | None = None,
+        ) -> None:
+            resolved_tool_call_id = str(
+                getattr(chunk, "tool_call_id", None)
+                or tool_call_id
+                or ""
+            ).strip()
+            if not resolved_tool_call_id:
+                writer.append_event(
+                    "tool_call_protocol_error",
+                    RemoteToolProtocolError(
+                        tool_name=str(tool_name or ""),
+                        tool_call_id=None,
+                        code="REMOTE_TOOL_CALL_ID_REQUIRED",
+                        message="Remote tool stream chunks must include tool_call_id.",
+                    ).payload(),
+                )
+                return
+            writer.append_event(
+                "tool_call_stream",
+                {
+                    "tool_name": str(tool_name or ""),
+                    "tool_call_id": resolved_tool_call_id,
+                    "stream": str(getattr(chunk, "chunk_type", "") or ""),
+                    "content": str(getattr(chunk, "data", "") or ""),
+                    "format": "plain",
+                    "meta": dict(getattr(chunk, "meta", {}) or {}),
+                },
+            )
+
+        return _handle
+
+    class _ScopedSessionRunApprovalProvider(ApprovalProvider):
+        def __init__(
+            self,
+            *,
+            writer: Any,
+            peer_id: str,
+            peer_agent: Any,
+            peer_backend: RemoteRelayToolBackend,
+        ) -> None:
+            self._writer = writer
+            self._peer_id = peer_id
+            self._peer_agent = peer_agent
+            self._peer_backend = peer_backend
+
+        def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+            metadata = dict(request.metadata or {})
+            tool_name = str(request.tool_name or "").strip()
+            tool_call_id = str(metadata.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                tool_call_id = f"approval-tool-call:{uuid.uuid4()}"
+            approval_id = str(metadata.get("approval_id") or "").strip()
+            if not approval_id:
+                approval_id = f"approval:{tool_call_id}:{uuid.uuid4()}"
+            tool_args = dict(request.tool_args or {})
+            public_args = self._public_tool_args(tool_name, tool_args)
+            intent = str(request.intent or tool_args.get("intent") or "").strip()
+            payload: dict[str, Any] = {
+                "approval_id": approval_id,
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "tool_args": public_args,
+                "tool_source": str(request.tool_source or ""),
+                "reason": request.reason or "",
+                "intent": intent,
+                "content": self._approval_content(request, public_args),
+                "preview_unavailable": True,
+                "sections": [],
+            }
+            for key in ("lifecycle_event", "lifecycle_hooks"):
+                value = metadata.get(key)
+                if value not in (None, ""):
+                    payload[key] = value
+
+            preview_decision = self._attach_preview_or_fail_closed(
+                request,
+                payload,
+                tool_args,
+                tool_call_id,
+            )
+            if preview_decision is not None:
+                return preview_decision
+
+            self._writer.register_approval(approval_id, payload)
+            self._writer.append_event("approval_request", payload)
+            decision, reason, resolution_meta = self._writer.wait_approval(
+                approval_id,
+                timeout_sec=60.0,
+            )
+            resolved_payload = {
+                "approval_id": approval_id,
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "decision": decision,
+                "reason": reason or "",
+                "meta": dict(resolution_meta),
+            }
+            self._writer.append_event("approval_resolved", resolved_payload)
+            if decision == "allow_once":
+                candidate = resolution_meta.get("approved_save_candidate")
+                if not isinstance(candidate, dict):
+                    candidate = payload.get("approved_save_candidate")
+                if isinstance(candidate, dict) and candidate:
+                    self._peer_backend.remember_approved_candidate(
+                        tool_name,
+                        tool_args,
+                        candidate,
+                    )
+                return ApprovalDecision.allow_once(
+                    reason,
+                    meta=dict(resolution_meta),
+                )
+            return ApprovalDecision.deny_once(reason, meta=dict(resolution_meta))
+
+        @staticmethod
+        def _public_tool_args(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
+            blocked = {"intent"}
+            if tool_name == "draft_document_commit":
+                blocked.update({"content", "diff", "draft_document_content", "body"})
+            return {
+                str(key): value
+                for key, value in tool_args.items()
+                if str(key) not in blocked
+            }
+
+        @staticmethod
+        def _approval_content(
+            request: ApprovalRequest,
+            public_args: dict[str, Any],
+        ) -> str:
+            reason = str(request.reason or "Tool call requires approval.").strip()
+            tool_name = str(request.tool_name or "").strip()
+            return f"{reason}\n\nTool: {tool_name}\nArguments: {json.dumps(public_args, ensure_ascii=False, sort_keys=True)}"
+
+        def _attach_preview_or_fail_closed(
+            self,
+            request: ApprovalRequest,
+            payload: dict[str, Any],
+            tool_args: dict[str, Any],
+            tool_call_id: str,
+        ) -> ApprovalDecision | None:
+            tool_name = str(request.tool_name or "").strip()
+            if tool_name not in REMOTE_PREVIEW_TOOLS:
+                return None
+            if tool_name == "draft_document_commit" and str(tool_args.get("diff") or ""):
+                target_path = str(tool_args.get("target_path") or "")
+                payload["tool_args"] = self._public_tool_args(tool_name, tool_args)
+                payload["preview_unavailable"] = False
+                payload["sections"] = [
+                    {
+                        "id": "diff",
+                        "title": "Proposed file diff",
+                        "kind": "diff",
+                        "content": str(tool_args.get("diff") or ""),
+                        "path": target_path,
+                        "resolved_path": target_path,
+                    }
+                ]
+                return None
+            peer = relay_server.registry.get(self._peer_id)
+            features = set(str(item) for item in getattr(peer, "features", []) or [])
+            if "tool_preview" not in features:
+                self._raise_protocol_error(
+                    tool_name,
+                    tool_call_id,
+                    "REMOTE_PREVIEW_REQUIRED",
+                    "Remote peer must advertise tool_preview before write approval.",
+                )
+            preview = relay_server.send_preview_request(
+                self._peer_id,
+                ToolPreviewRequest(
+                    tool_name=tool_name,
+                    args=tool_args,
+                    cwd=getattr(getattr(self._peer_backend, "context", None), "cwd", None),
+                    timeout_sec=30,
+                ),
+                timeout_sec=30,
+            )
+            if not preview.ok:
+                return self._preview_denial(tool_name, tool_call_id, preview)
+            sections = [dict(item) for item in preview.sections if isinstance(item, dict)]
+            if not sections and preview.diff:
+                sections = [
+                    {
+                        "id": "diff",
+                        "title": "Proposed file diff",
+                        "kind": "diff",
+                        "content": preview.diff,
+                        "resolved_path": preview.resolved_path or "",
+                    }
+                ]
+            if not sections:
+                self._raise_protocol_error(
+                    tool_name,
+                    tool_call_id,
+                    "REMOTE_PREVIEW_EMPTY",
+                    "Remote peer returned an empty write preview.",
+                )
+            candidate = (
+                dict(preview.meta.get("approved_save_candidate"))
+                if isinstance(preview.meta.get("approved_save_candidate"), dict)
+                else {}
+            )
+            if not candidate:
+                self._raise_protocol_error(
+                    tool_name,
+                    tool_call_id,
+                    "REMOTE_PREVIEW_SAVE_CANDIDATE_REQUIRED",
+                    "Remote preview must include an approved_save_candidate.",
+                )
+            payload["preview_unavailable"] = False
+            payload["sections"] = sections
+            payload["resolved_path"] = preview.resolved_path or ""
+            payload["approved_save_candidate"] = candidate
+            return None
+
+        @staticmethod
+        def _preview_denial(
+            tool_name: str,
+            tool_call_id: str,
+            preview: ToolPreviewResult,
+        ) -> ApprovalDecision:
+            code = str(preview.error_code or "REMOTE_TOOL_ERROR")
+            message = str(preview.error_message or "remote preview failed")
+            reason = f"Error [{code}]: {message}"
+            diagnostic = tool_diagnostic_from_failure(
+                stage=ToolDiagnosticStage.PREVIEW,
+                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
+                code=code,
+                message=message,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                repairable=True,
+            ).to_dict()
+            return ApprovalDecision.deny_once(
+                reason,
+                meta={
+                    "failure_kind": ToolFailureKind.TOOL_RESULT_ERROR.value,
+                    "code": code,
+                    "message": message,
+                    "tool_diagnostics": [diagnostic],
+                },
+            )
+
+        def _raise_protocol_error(
+            self,
+            tool_name: str,
+            tool_call_id: str,
+            code: str,
+            message: str,
+        ) -> None:
+            error = RemoteToolProtocolError(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                code=code,
+                message=message,
+            )
+            _emit_agent_session_run_event(
+                self._peer_agent,
+                "tool_call_protocol_error",
+                error.payload(),
+            )
+            raise error
+
+    def _remote_peer_ready_payload(peer_agent: Agent, peer_id: str) -> dict[str, Any]:
+        current_config = _current_config()
+        model = str(getattr(getattr(peer_agent, "llm", None), "model", "") or "")
+        if not model and current_config is not None:
+            model = str(resolve_model_runtime(current_config).model or "")
+        return {
+            "peer_id": peer_id,
+            "session_id": str(getattr(peer_agent, "current_session_id", "") or ""),
+            "fingerprint": str(getattr(peer_agent, "session_fingerprint", "") or ""),
+            "mode": str(getattr(peer_agent, "active_mode", "") or ""),
+            "model": model,
+            "main_agent_id": str(getattr(peer_agent, "main_agent_id", "") or ""),
+            "agent_config_id": str(getattr(peer_agent, "agent_config_id", "") or ""),
+            "effective_capabilities": dict(
+                getattr(peer_agent, "effective_capabilities", {}) or {}
+            ),
+        }
+
+    def _configure_peer_agent_for_session_run(
+        peer_agent: Agent,
+        request: Any,
+    ) -> None:
+        metadata = dict(getattr(request, "metadata", {}) or {})
+        mode = str(metadata.get("mode") or "").strip()
+        if mode:
+            set_mode = getattr(peer_agent, "set_mode", None)
+            if callable(set_mode):
+                set_mode(mode)
+        locale = str(metadata.get("locale") or "").strip()
+        if locale:
+            next_config = _runtime_config_with_chat_locale(
+                getattr(peer_agent, "runtime_config", _current_config()),
+                locale,
+            )
+            if next_config is not None:
+                setattr(peer_agent, "runtime_config", next_config)
+            setattr(peer_agent, "locale", locale)
+
+    def _executor_failure_payload(exc: Exception) -> dict[str, Any]:
+        payload = ReuleauxCoderExecutorBackend._exception_payload(exc)
+        payload.setdefault("error_type", type(exc).__name__)
+        return payload
+
+    def _start_local_peer_session_run_worker() -> None:
+        service = runner._relay_http_service
+        runtime = getattr(service, "runtime_control_plane", None)
+        if service is None or runtime is None:
+            return
+        existing = getattr(service, "_local_peer_session_run_worker_thread", None)
+        if isinstance(existing, threading.Thread) and existing.is_alive():
+            return
+        stop_event = threading.Event()
+        setattr(service, "_local_peer_session_run_worker_stop", stop_event)
+        active_claims: dict[str, Any] = {}
+        active_agents: dict[str, tuple[Agent, str]] = {}
+
+        def _create_agent_for_request(request: Any) -> Agent:
+            claim = active_claims.get(request.task_id)
+            binding = _wait_agent_run_binding_for_request(request)
+            if binding is None:
+                raise RuntimeError("session_run_binding_required")
+            metadata = dict(getattr(request, "metadata", {}) or {})
+            peer_id = str(
+                metadata.get("remote_peer_id")
+                or getattr(binding, "peer_id", "")
+                or ""
+            ).strip()
+            if not peer_id:
+                raise RuntimeError("remote_peer_id_required")
+            session_hint = str(metadata.get("session_hint") or "").strip() or None
+            remote_session = service._get_session_run(binding.session_run_id)
+            peer_agent = _create_peer_agent(
+                peer_id,
+                remote_stream_handler=_remote_stream_handler_for_binding(binding),
+                session_hint=session_hint,
+                resume_latest=False,
+            )
+            _install_session_run_ui_bus(peer_agent)
+            _configure_peer_agent_for_session_run(peer_agent, request)
+            _bind_main_chat_account_memory_scope(peer_agent, peer_id)
+            _install_session_run_command_dispatch(peer_agent, peer_id)
+            if remote_session is not None:
+                _enable_remote_session_trace_persistence(
+                    peer_agent,
+                    peer_id,
+                    remote_session,
+                )
+            if claim is not None:
+                runtime.pin_claimed_activation_session(
+                    request_id=claim.request_id,
+                    task_id=claim.task.id,
+                    activation_id=claim.activation_id,
+                    worker_id=claim.worker_id,
+                    peer_id=peer_id,
+                    workdir=str(getattr(peer_agent, "runtime_working_directory", "") or ""),
+                    executor_session_id=str(
+                        getattr(peer_agent, "current_session_id", "") or ""
+                    ),
+                    metadata={
+                        "session_id": str(
+                            getattr(peer_agent, "current_session_id", "") or ""
+                        ),
+                        "peer_id": peer_id,
+                        "mode": str(getattr(peer_agent, "active_mode", "") or ""),
+                    },
+                )
+            writer = _session_run_writer_for_binding(binding)
+            peer_backend = getattr(peer_agent, "workspace_mutation_backend", None)
+            if isinstance(peer_backend, RemoteRelayToolBackend):
+                peer_agent.approval_provider = _ScopedSessionRunApprovalProvider(
+                    writer=writer,
+                    peer_id=peer_id,
+                    peer_agent=peer_agent,
+                    peer_backend=peer_backend,
+                )
+            writer.append_event(
+                "remote_peer_ready",
+                _remote_peer_ready_payload(peer_agent, peer_id),
+            )
+            mentions = _normalized_chat_mentions(metadata.get("mentions"))
+            if mentions:
+                metadata["mention_context"] = {
+                    "mentions": [dict(item) for item in mentions],
+                    "reference_only": True,
+                }
+                request.metadata = metadata
+                request.prompt = _prompt_with_mention_context(request.prompt, mentions)
+            active_agents[request.task_id] = (peer_agent, peer_id)
+            return peer_agent
+
+        backend = ReuleauxCoderExecutorBackend(
+            create_agent=_create_agent_for_request
+        )
+
+        def _run_claim(claim: Any, peer_id: str) -> None:
+            active_claims[claim.task.id] = claim
+            try:
+                try:
+                    result = backend.start(claim.executor_request)
+                except Exception as exc:
+                    message = str(exc) or type(exc).__name__
+                    result = ExecutorRunResult(
+                        task_id=claim.task.id,
+                        status="failed",
+                        output="",
+                        events=[
+                            ExecutorEvent.error(
+                                message,
+                                **_executor_failure_payload(exc),
+                            ),
+                        ],
+                        error=message,
+                    )
+                agent_pair = active_agents.get(claim.task.id)
+                if agent_pair is not None:
+                    peer_agent, agent_peer_id = agent_pair
+                    _save_peer_session(peer_agent, agent_peer_id)
+                runtime.complete_claimed_agent_run_activation(
+                    claim.task.id,
+                    result,
+                    request_id=claim.request_id,
+                    activation_id=claim.activation_id,
+                    worker_id=claim.worker_id,
+                    peer_id=peer_id,
+                    artifacts=list(result.artifacts),
+                )
+            finally:
+                active_claims.pop(claim.task.id, None)
+                active_agents.pop(claim.task.id, None)
+
+        def _loop() -> None:
+            while not stop_event.is_set():
+                if runner._relay_http_service is not service:
+                    break
+                if getattr(service, "_server", None) is None:
+                    break
+                claimed_any = False
+                for peer in list(relay_server.registry.list_online()):
+                    features = [str(item) for item in getattr(peer, "features", []) or []]
+                    if "agent_runs.local_workspace" not in set(features):
+                        continue
+                    claim = runtime.claim_agent_run_activation(
+                        worker_id=f"local-peer-session-run:{peer.peer_id}",
+                        worker_kind=WorkerKind.LOCAL_PEER,
+                        executors=[ExecutorType.REULEAUXCODER],
+                        peer_id=peer.peer_id,
+                        peer_features=features,
+                        workspace_root=getattr(peer, "workspace_root", None),
+                        wait_sec=0,
+                    )
+                    if claim is None:
+                        continue
+                    claimed_any = True
+                    _run_claim(claim, peer.peer_id)
+                if not claimed_any:
+                    stop_event.wait(0.05)
+
+        thread = threading.Thread(target=_loop, daemon=True)
+        setattr(service, "_local_peer_session_run_worker_thread", thread)
+        thread.start()
 
     def _dispatch_vscode_command(
         peer_agent: Agent,
@@ -1450,6 +1966,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         return response
 
     runner._relay_http_service.set_chat_command_handler(_dispatch_chat_command)
+    _start_local_peer_session_run_worker()
 
 
 def _structured_ui_event_type(event) -> str:

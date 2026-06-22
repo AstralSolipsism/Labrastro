@@ -640,6 +640,7 @@ class MCPClient:
             "input_schema": dict(input_schema),
             "session_run_id": str(context.get("session_run_id") or ""),
             "agent_run_id": str(context.get("agent_run_id") or ""),
+            "branch_binding_id": str(context.get("branch_binding_id") or ""),
             "turn_id": str(context.get("turn_id") or ""),
             "tool_call_id": str(context.get("tool_call_id") or ""),
         }
@@ -685,6 +686,7 @@ class MCPClient:
             "placement": "server",
             "session_run_id": str(payload.get("session_run_id") or ""),
             "agent_run_id": str(payload.get("agent_run_id") or ""),
+            "branch_binding_id": str(payload.get("branch_binding_id") or ""),
             "turn_id": str(payload.get("turn_id") or ""),
             "tool_call_id": str(payload.get("tool_call_id") or ""),
             "tool_name": str(payload.get("tool_name") or ""),

@@ -27,7 +27,12 @@ def _same_bound_method(left, right) -> bool:
 
 
 def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> None:
-    session = _SessionRunProjection(session_run_id="run-1", peer_id="peer-1")
+    session = _SessionRunProjection(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        agent_run_id="agent-run-1",
+        branch_binding_id="branch-a",
+    )
     runner = AppRunner()
     runner._relay_http_service = SimpleNamespace(
         _get_session_run=lambda session_run_id: (
@@ -42,6 +47,7 @@ def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> No
             {
                 "session_run_id": "run-1",
                 "agent_run_id": "agent-run-1",
+                "branch_binding_id": "branch-a",
                 "turn_id": "turn-1",
                 "tool_call_id": "tool-call-1",
                 "mcp_server": "docs",
@@ -73,6 +79,7 @@ def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> No
         assert payload["event_name"] == "Elicitation"
         assert payload["session_run_id"] == "run-1"
         assert payload["agent_run_id"] == "agent-run-1"
+        assert payload["branch_binding_id"] == "branch-a"
         assert payload["turn_id"] == "turn-1"
         assert payload["tool_call_id"] == "tool-call-1"
         assert payload["mcp_server"] == "docs"
@@ -85,6 +92,7 @@ def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> No
             "accept",
             {"format": "markdown"},
             "chosen",
+            branch_binding_id="branch-a",
         )
         thread.join(timeout=2)
         assert not thread.is_alive()
@@ -95,12 +103,20 @@ def test_runner_mcp_elicitation_handler_waits_for_session_run_user_input() -> No
         }
     finally:
         if thread.is_alive():
-            session.cancel_pending_user_inputs("test cleanup")
+            session.cancel_pending_user_inputs(
+                "test cleanup",
+                branch_binding_id="branch-a",
+            )
             thread.join(timeout=2)
 
 
 def test_runner_mcp_elicitation_handler_timeout_declines_and_audits_reason() -> None:
-    session = _SessionRunProjection(session_run_id="run-1", peer_id="peer-1")
+    session = _SessionRunProjection(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        agent_run_id="agent-run-1",
+        branch_binding_id="branch-a",
+    )
     runner = AppRunner()
     runner._relay_http_service = SimpleNamespace(
         _get_session_run=lambda session_run_id: (
@@ -111,6 +127,8 @@ def test_runner_mcp_elicitation_handler_timeout_declines_and_audits_reason() -> 
     result = runner._mcp_elicitation_handler(
         {
             "session_run_id": "run-1",
+            "agent_run_id": "agent-run-1",
+            "branch_binding_id": "branch-a",
             "tool_call_id": "tool-call-1",
             "request_id": "timeout",
             "message": "Pick a format",
@@ -129,6 +147,71 @@ def test_runner_mcp_elicitation_handler_timeout_declines_and_audits_reason() -> 
     assert resolved_events
     assert resolved_events[-1]["payload"]["action"] == "decline"
     assert resolved_events[-1]["payload"]["reason"] == "user_input_timeout"
+    assert resolved_events[-1]["payload"]["branch_binding_id"] == "branch-a"
+
+
+def test_runner_mcp_elicitation_handler_fails_closed_without_branch_scope() -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        agent_run_id="agent-run-1",
+        branch_binding_id="branch-a",
+    )
+    runner = AppRunner()
+    runner._relay_http_service = SimpleNamespace(
+        _get_session_run=lambda session_run_id: (
+            session if session_run_id == "run-1" else None
+        )
+    )
+
+    result = runner._mcp_elicitation_handler(
+        {
+            "session_run_id": "run-1",
+            "agent_run_id": "agent-run-1",
+            "tool_call_id": "tool-call-1",
+            "request_id": "missing-branch",
+            "message": "Pick a format",
+        }
+    )
+
+    assert result == {
+        "action": "decline",
+        "content": {},
+        "reason": "branch_binding_id_required",
+    }
+    assert session.events == []
+
+
+def test_runner_mcp_elicitation_handler_fails_closed_without_agent_run_scope() -> None:
+    session = _SessionRunProjection(
+        session_run_id="run-1",
+        peer_id="peer-1",
+        agent_run_id="agent-run-1",
+        branch_binding_id="branch-a",
+    )
+    runner = AppRunner()
+    runner._relay_http_service = SimpleNamespace(
+        _get_session_run=lambda session_run_id: (
+            session if session_run_id == "run-1" else None
+        )
+    )
+
+    result = runner._mcp_elicitation_handler(
+        {
+            "session_run_id": "run-1",
+            "branch_binding_id": "branch-a",
+            "tool_call_id": "tool-call-1",
+            "request_id": "missing-agent",
+            "message": "Pick a format",
+        }
+    )
+
+    assert result == {
+        "action": "decline",
+        "content": {},
+        "reason": "agent_run_id_required",
+    }
+    assert session.events == []
 
 
 def test_runner_init_mcp_installs_elicitation_handler_before_connect() -> None:

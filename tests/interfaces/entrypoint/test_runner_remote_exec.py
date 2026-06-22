@@ -16,6 +16,7 @@ import pytest
 
 
 _URLOPEN = request.build_opener(request.ProxyHandler({})).open
+_SESSION_RUN_BRANCH_BINDINGS: dict[str, str] = {}
 
 from reuleauxcoder.domain.agent.events import AgentEvent, ToolFailureKind
 from reuleauxcoder.domain.config.models import (
@@ -84,6 +85,10 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+SESSION_RUN_PEER_FEATURES = ["shell", "agent_runs.local_workspace", "worker_kind:local_peer"]
+SESSION_RUN_PEER_FEATURES_WITH_PREVIEW = [*SESSION_RUN_PEER_FEATURES, "tool_preview"]
 
 
 def _remote_preview_meta(
@@ -315,7 +320,23 @@ def _json_request(
     req = request.Request(url, data=data, headers=headers, method=method)
     with _URLOPEN(req, timeout=5) as resp:
         body = resp.read().decode("utf-8")
-        return resp.status, json.loads(body) if body else {}
+        response_body = json.loads(body) if body else {}
+        _remember_session_run_branch_binding(response_body)
+        return resp.status, response_body
+
+
+def _remember_session_run_branch_binding(payload: dict) -> None:
+    session_run_id = str(payload.get("session_run_id") or "").strip()
+    branch_binding_id = str(payload.get("branch_binding_id") or "").strip()
+    if session_run_id and branch_binding_id:
+        _SESSION_RUN_BRANCH_BINDINGS[session_run_id] = branch_binding_id
+
+
+def _known_session_run_branch_binding_id(session_run_id: str) -> str:
+    branch_binding_id = _SESSION_RUN_BRANCH_BINDINGS.get(str(session_run_id or "").strip(), "")
+    if not branch_binding_id:
+        raise AssertionError("session run branch binding proof was not captured")
+    return branch_binding_id
 
 
 def _session_run_events_request(base_url: str, peer_token: str, session_run_id: str) -> list[dict]:
@@ -342,6 +363,7 @@ def _session_run_events_until(
     payload = {
         "peer_token": peer_token,
         "session_run_id": session_run_id,
+        "branch_binding_id": _known_session_run_branch_binding_id(session_run_id),
         "cursor": 0,
         "timeout_sec": 0.5,
     }
@@ -779,6 +801,11 @@ def _register_peer(
     features: list[str] | None = None,
     host_info_min: dict | None = None,
 ) -> tuple[str, str]:
+    advertised_features = (
+        list(features)
+        if features is not None
+        else ["shell", "agent_runs.local_workspace", "worker_kind:local_peer"]
+    )
     _, register_body = _json_request(
         "POST",
         f"{base_url}/remote/register",
@@ -786,7 +813,7 @@ def _register_peer(
             "bootstrap_token": bootstrap_token,
             "cwd": cwd,
             "workspace_root": cwd,
-            "features": features or [],
+            "features": advertised_features,
             "host_info_min": host_info_min
             or {
                 "os": "test-os",
@@ -1144,11 +1171,14 @@ class TestRunnerRemoteExec:
                 "session-admin",
                 mode="capability_package",
                 workflow_mode="capability_package_ingest",
+                agent_run_id="agent-run-main",
+                branch_binding_id="main",
             )
             session.enable_trace_persistence("session-admin")
             session.append_event(
                 "workflow_decision",
                 {
+                    "branch_binding_id": "main",
                     "approval_id": "approval-1",
                     "tool_name": "install_capability_package",
                     "tool_call_id": "install-1",
@@ -1573,14 +1603,22 @@ class TestRunnerRemoteExec:
                 start_body["session_run_id"],
             )
 
-            assert [event["type"] for event in events[:3]] == [
-                "session_run_start",
-                "error",
-                "session_run_end",
-            ]
+            event_types = [event["type"] for event in events]
+            assert event_types[0] == "session_run_start"
+            assert "error" in event_types
+            assert "session_run_failed" in event_types
+            assert "session_run_end" not in event_types
+            assert event_types.index("session_run_start") < event_types.index("error")
+            assert event_types.index("error") < event_types.index("session_run_failed")
             assert events[0]["payload"]["prompt"] == "hello"
             assert events[0]["payload"]["mode"] == "unknown-mode"
-            assert events[1]["payload"]["message"] == "Unknown mode: unknown-mode"
+            error_event = next(event for event in events if event["type"] == "error")
+            failed_event = next(
+                event for event in events if event["type"] == "session_run_failed"
+            )
+            assert error_event["payload"]["message"] == "Unknown mode: unknown-mode"
+            assert failed_event["payload"]["message"] == "Unknown mode: unknown-mode"
+            assert failed_event["payload"]["code"] == "REMOTE_CHAT_ERROR"
         finally:
             runner.cleanup(ctx.agent)
 
@@ -2137,9 +2175,11 @@ class TestRunnerRemoteExec:
             live_session = runner._relay_http_service._create_session_run(
                 peer_id,
                 session_hint=session_id,
+                agent_run_id="agent-run-done-memory",
+                branch_binding_id="main",
             )
-            live_session.mark_running()
-            live_session.mark_done()
+            live_session.mark_running(branch_binding_id="main")
+            live_session.mark_done(branch_binding_id="main")
             session_store.append_trace_event(
                 session_id,
                 "session_run_start",
@@ -2203,8 +2243,10 @@ class TestRunnerRemoteExec:
             live_session = runner._relay_http_service._create_session_run(
                 peer_id,
                 session_hint=session_id,
+                agent_run_id="agent-run-running-memory",
+                branch_binding_id="main",
             )
-            live_session.mark_running()
+            live_session.mark_running(branch_binding_id="main")
             session_store.append_trace_event(
                 session_id,
                 "session_run_start",
@@ -2902,7 +2944,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=["tool_preview"],
+                features=SESSION_RUN_PEER_FEATURES_WITH_PREVIEW,
             )
             _, start_body = _json_request(
                 "POST",
@@ -2996,7 +3038,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=[],
+                features=SESSION_RUN_PEER_FEATURES,
             )
             _, start_body = _json_request(
                 "POST",
@@ -3098,7 +3140,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=[],
+                features=SESSION_RUN_PEER_FEATURES,
             )
             _, start_body = _json_request(
                 "POST",
@@ -3179,7 +3221,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=["tool_preview"],
+                features=SESSION_RUN_PEER_FEATURES_WITH_PREVIEW,
             )
             _, start_body = _json_request(
                 "POST",
@@ -3256,7 +3298,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=[],
+                features=SESSION_RUN_PEER_FEATURES,
             )
             _, start_body = _json_request(
                 "POST",
@@ -3323,7 +3365,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=["tool_preview"],
+                features=SESSION_RUN_PEER_FEATURES_WITH_PREVIEW,
             )
             _, start_body = _json_request(
                 "POST",
@@ -3397,7 +3439,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=["tool_preview"],
+                features=SESSION_RUN_PEER_FEATURES_WITH_PREVIEW,
             )
             _, start_body = _json_request(
                 "POST",
@@ -3449,7 +3491,7 @@ class TestRunnerRemoteExec:
                 runner._relay_http_service.base_url,
                 runner._relay_server.issue_bootstrap_token(ttl_sec=60),
                 str(tmp_path),
-                features=[],
+                features=SESSION_RUN_PEER_FEATURES,
             )
             _, start_body = _json_request(
                 "POST",

@@ -522,6 +522,21 @@ class AppRunner:
                 "reason": "mcp_elicitation_session_unavailable",
             }
 
+        branch_binding_id = str(request.get("branch_binding_id") or "").strip()
+        agent_run_id = str(request.get("agent_run_id") or "").strip()
+        if not branch_binding_id:
+            return {
+                "action": "decline",
+                "content": {},
+                "reason": "branch_binding_id_required",
+            }
+        if not agent_run_id:
+            return {
+                "action": "decline",
+                "content": {},
+                "reason": "agent_run_id_required",
+            }
+
         request_id = str(request.get("request_id") or "")
         tool_call_id = str(request.get("tool_call_id") or "")
         input_id_parts = [
@@ -546,8 +561,12 @@ class AppRunner:
             "message": str(request.get("message") or "MCP elicitation requested."),
             "input_schema": dict(input_schema) if isinstance(input_schema, dict) else {},
         }
-        session.register_user_input(input_id, payload)
-        session.append_event("user_input_request", payload)
+        writer = session.scoped_writer(
+            branch_binding_id=branch_binding_id,
+            agent_run_id=agent_run_id,
+        )
+        writer.register_user_input(input_id, payload)
+        writer.append_event("user_input_request", payload)
         timeout_sec = request.get("timeout_sec")
         try:
             timeout = (
@@ -557,7 +576,7 @@ class AppRunner:
             )
         except (TypeError, ValueError):
             timeout = MCP_ELICITATION_TIMEOUT_SEC
-        action, content, reason = session.wait_user_input(input_id, timeout_sec=timeout)
+        action, content, reason = writer.wait_user_input(input_id, timeout_sec=timeout)
         resolved_payload: dict[str, Any] = {
             "input_id": input_id,
             "kind": "mcp_elicitation",
@@ -566,7 +585,7 @@ class AppRunner:
         }
         if reason is not None:
             resolved_payload["reason"] = reason
-        session.append_event("user_input_resolved", resolved_payload)
+        writer.append_event("user_input_resolved", resolved_payload)
         result: dict[str, Any] = {"action": action, "content": dict(content)}
         if reason is not None:
             result["reason"] = reason

@@ -763,6 +763,7 @@ def test_mcp_client_serializes_tool_calls_so_elicitation_uses_matching_context()
                 lifecycle_context={
                     "session_run_id": "session-1",
                     "agent_run_id": "agent-run-1",
+                    "branch_binding_id": "branch-alpha",
                     "turn_id": "turn-1",
                     "tool_call_id": "call-alpha",
                     "tool_name": "search",
@@ -775,6 +776,7 @@ def test_mcp_client_serializes_tool_calls_so_elicitation_uses_matching_context()
                 lifecycle_context={
                     "session_run_id": "session-1",
                     "agent_run_id": "agent-run-1",
+                    "branch_binding_id": "branch-beta",
                     "turn_id": "turn-1",
                     "tool_call_id": "call-beta",
                     "tool_name": "search",
@@ -795,6 +797,14 @@ def test_mcp_client_serializes_tool_calls_so_elicitation_uses_matching_context()
     assert requests_by_query == {
         "alpha": "call-alpha",
         "beta": "call-beta",
+    }
+    branch_by_query = {
+        request["tool_arguments"]["query"]: request["branch_binding_id"]
+        for request in requests
+    }
+    assert branch_by_query == {
+        "alpha": "branch-alpha",
+        "beta": "branch-beta",
     }
 
 
@@ -984,7 +994,12 @@ while True:
         encoding="utf-8",
     )
 
-    session = _SessionRunProjection(session_run_id="run-live", peer_id="peer-live")
+    session = _SessionRunProjection(
+        session_run_id="run-live",
+        peer_id="peer-live",
+        agent_run_id="agent-run-live",
+        branch_binding_id="branch-live",
+    )
     runner = AppRunner()
     runner._relay_http_service = SimpleNamespace(
         _get_session_run=lambda session_run_id: (
@@ -1022,6 +1037,7 @@ while True:
                         "accept",
                         {"repo": "Labrastro"},
                         "selected",
+                        branch_binding_id="branch-live",
                     )
                     return
                 time.sleep(0.01)
@@ -1036,6 +1052,7 @@ while True:
                 lifecycle_context={
                     "session_run_id": "run-live",
                     "agent_run_id": "agent-run-live",
+                    "branch_binding_id": "branch-live",
                     "turn_id": "turn-live",
                     "tool_call_id": "tool-call-live",
                     "tool_name": "search",
@@ -1055,18 +1072,20 @@ while True:
     assert request_events
     assert request_events[-1]["payload"]["message"] == "Choose repository"
     assert request_events[-1]["payload"]["session_run_id"] == "run-live"
+    assert request_events[-1]["payload"]["branch_binding_id"] == "branch-live"
     assert request_events[-1]["payload"]["tool_call_id"] == "tool-call-live"
     resolved_events = [event for event in events if event["type"] == "user_input_resolved"]
     resolved_payload = resolved_events[-1]["payload"]
     assert {
         key: resolved_payload[key]
-        for key in ("input_id", "kind", "action", "content", "reason")
+        for key in ("input_id", "kind", "action", "content", "reason", "branch_binding_id")
     } == {
         "input_id": request_events[-1]["payload"]["input_id"],
         "kind": "mcp_elicitation",
         "action": "accept",
         "content": {"repo": "Labrastro"},
         "reason": "selected",
+        "branch_binding_id": "branch-live",
     }
 
 
@@ -1086,6 +1105,7 @@ def test_mcp_client_emits_elicitation_lifecycle_to_bound_agent_event_emitter() -
         client._active_lifecycle_context = {
             "session_run_id": "session-1",
             "agent_run_id": "agent-run-1",
+            "branch_binding_id": "branch-a",
             "turn_id": "turn-1",
             "tool_call_id": "call-mcp-1",
             "tool_name": "search",
@@ -1118,11 +1138,13 @@ def test_mcp_client_emits_elicitation_lifecycle_to_bound_agent_event_emitter() -
     ]
     assert emitted[0]["session_run_id"] == "session-1"
     assert emitted[0]["agent_run_id"] == "agent-run-1"
+    assert emitted[0]["branch_binding_id"] == "branch-a"
     assert emitted[0]["turn_id"] == "turn-1"
     assert emitted[0]["tool_call_id"] == "call-mcp-1"
     assert emitted[0]["tool_name"] == "search"
     assert emitted[0]["mcp_server"] == "docs"
     assert emitted[0]["payload"]["message"] == "Choose repository"
+    assert emitted[1]["branch_binding_id"] == "branch-a"
     assert emitted[1]["payload"]["result_action"] == "accept"
     assert emitted[1]["payload"]["result_content"] == {"repo": "Labrastro"}
 
