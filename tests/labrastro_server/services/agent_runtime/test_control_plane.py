@@ -147,6 +147,14 @@ class _WaitingActivationCompletionStore:
         return True, "", self.task
 
 
+def _postgres_store_for_resolve_request(
+    runtime_snapshot: dict | None = None,
+) -> PostgresAgentRunStore:
+    store = object.__new__(PostgresAgentRunStore)
+    store.runtime_snapshot = dict(runtime_snapshot or {})
+    return store
+
+
 def _relation(
     owner_agent_run_id: str,
     *,
@@ -210,6 +218,50 @@ def _model_config() -> dict:
 
 def _current_activation_id(control: AgentRunControlPlane, task_id: str) -> str:
     return str(control.get_agent_run(task_id).current_activation_id or "")
+
+
+def test_postgres_resolve_request_without_relation_does_not_reference_parent() -> None:
+    store = _postgres_store_for_resolve_request()
+
+    request = AgentRunRequest(agent_id="coder", prompt="run")
+
+    resolved = store._resolve_request(request)
+
+    assert resolved.executor == ExecutorType.REULEAUXCODER
+    assert resolved.execution_location == ExecutionLocation.LOCAL_WORKSPACE
+    assert resolved.executor_session_id is None
+
+
+def test_postgres_resolve_relation_request_inherits_owner_runtime_session() -> None:
+    parent = AgentRun(
+        id="parent-run",
+        agent_id="coder",
+        executor=ExecutorType.CLAUDE,
+        execution_location=ExecutionLocation.DAEMON_WORKTREE,
+        workdir="/tmp/project",
+        executor_session_id="claude-session-1",
+    )
+    store = _postgres_store_for_resolve_request()
+    loaded_parent_ids: list[str] = []
+
+    def get_agent_run(task_id: str) -> AgentRun:
+        loaded_parent_ids.append(task_id)
+        return parent
+
+    store.get_agent_run = get_agent_run  # type: ignore[method-assign]
+    request = AgentRunRequest(
+        agent_id="coder",
+        prompt="child",
+        relation=_relation(parent.id),
+    )
+
+    resolved = store._resolve_request(request)
+
+    assert loaded_parent_ids == [parent.id]
+    assert resolved.executor == parent.executor
+    assert resolved.execution_location == parent.execution_location
+    assert resolved.workdir == parent.workdir
+    assert resolved.executor_session_id == parent.executor_session_id
 
 
 def test_control_plane_store_default_runtime_snapshot_is_self_contained() -> None:

@@ -3408,6 +3408,24 @@ class PostgresAgentRunStore:
         }
 
     def _resolve_request(self, request: Any) -> Any:
+        parent = None
+        relation = getattr(request, "relation", None)
+        if relation is not None and relation.relation_type in {
+            AgentRunRelationType.AGENT_CALL_EPHEMERAL,
+            AgentRunRelationType.AGENT_CALL_PERSISTENT,
+        }:
+            owner_agent_run_id = str(relation.owner_agent_run_id or "").strip()
+            if owner_agent_run_id:
+                parent = self.get_agent_run(owner_agent_run_id)
+        if parent is not None:
+            if request.runtime_profile_id is None:
+                request.runtime_profile_id = parent.runtime_profile_id
+            if request.executor is None:
+                request.executor = parent.executor
+            if request.execution_location is None:
+                request.execution_location = parent.execution_location
+            if request.workdir is None:
+                request.workdir = parent.workdir
         agents = _dict_from(self.runtime_snapshot.get("agents"))
         profiles = _dict_from(self.runtime_snapshot.get("runtime_profiles"))
         raw_agent = _dict_from(agents.get(request.agent_id))
