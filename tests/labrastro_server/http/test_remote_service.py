@@ -10699,6 +10699,23 @@ class TestRemoteRelayHTTPService:
             )
             assert invalid_body["error"] == "invalid_worker_kind"
 
+            with pytest.raises(HTTPError) as invalid_executor:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/agent-run-activations/claim",
+                    {
+                        "peer_token": peer_token,
+                        "worker_id": "worker-local",
+                        "worker_kind": "local_peer",
+                        "executors": ["remote_server"],
+                    },
+                )
+            assert invalid_executor.value.code == 400
+            invalid_executor_body = json.loads(
+                invalid_executor.value.read().decode("utf-8")
+            )
+            assert invalid_executor_body["error"] == "invalid_executor"
+
             with pytest.raises(HTTPError) as unregistered_worker_kind:
                 _json_request(
                     "POST",

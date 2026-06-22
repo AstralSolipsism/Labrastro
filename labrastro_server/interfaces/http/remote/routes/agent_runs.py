@@ -55,7 +55,11 @@ from labrastro_server.services.agent_runtime.model_bridge import (
     provider_response_to_dict,
 )
 from labrastro_server.services.agent_runtime.runtime_store import clamp_event_limit
-from reuleauxcoder.domain.agent_runtime.models import AgentRunStatus, WorkerKind
+from reuleauxcoder.domain.agent_runtime.models import (
+    AgentRunStatus,
+    ExecutorType,
+    WorkerKind,
+)
 from reuleauxcoder.interfaces.events import UIEventKind
 from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
 
@@ -390,6 +394,17 @@ class RemoteAgentRunRoutes:
         self.service.relay_server.registry.update_heartbeat(peer_id)
         raw_executors = payload.get("executors", [])
         executors = raw_executors if isinstance(raw_executors, list) else []
+        try:
+            executor_values = [
+                ExecutorType(str(executor)).value for executor in executors
+            ]
+        except ValueError:
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_executor",
+                "executor must be one of reuleauxcoder, fake, codex, claude, gemini",
+            )
+            return
         worker_id = str(payload.get("worker_id") or peer_id)
         peer = self.service.relay_server.registry.get(peer_id)
         peer_features = list(peer.features) if peer is not None else []
@@ -415,7 +430,7 @@ class RemoteAgentRunRoutes:
         claim = self.service.runtime_control_plane.claim_agent_run_activation(
             worker_id=worker_id,
             worker_kind=worker_kind,
-            executors=[str(executor) for executor in executors],
+            executors=executor_values,
             peer_id=peer_id,
             peer_features=peer_features,
             workspace_root=workspace_root,
