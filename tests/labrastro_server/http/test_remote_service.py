@@ -11028,7 +11028,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_capability_package_peer_install_plan_waits_for_peer_result(
+    def test_capability_package_peer_fact_requires_local_action_completion(
         self, tmp_path: Path
     ) -> None:
         del tmp_path
@@ -11065,14 +11065,20 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    features=[
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                ),
             )
-            peer_token = register_body["payload"]["peer_token"]
+            peer = register_body["payload"]
 
             status, plan_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/capability-packages/install/plan",
-                {"peer_token": peer_token},
+                {"peer_token": peer["peer_token"]},
             )
 
             assert status == 200
@@ -11086,11 +11092,65 @@ class TestRemoteRelayHTTPService:
             assert peer_status["install_state"] != "installed"
             assert peer_status["peer_result"] is None
 
-            _, result_body = _json_request(
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/capability-packages/install/result",
+                    {
+                        "peer_token": peer["peer_token"],
+                        "result": {
+                            "plan_id": "plan-waza",
+                            "action_id": "install-waza-python",
+                            "package_id": "waza",
+                            "component_id": "skill:waza/read",
+                            "target": "local_peer",
+                            "status": "passed",
+                            "content_hash": "sha256:abc",
+                        },
+                    },
+                )
+            assert excinfo.value.code == 404
+
+            _, unchanged_plan = _json_request(
                 "POST",
-                f"{service.base_url}/remote/capability-packages/install/result",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer["peer_token"]},
+            )
+            unchanged = unchanged_plan["peer_status"]["actions"][action_key]
+            assert unchanged["install_state"] != "installed"
+
+            status, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/claim",
                 {
-                    "peer_token": peer_token,
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": [
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                    "max_actions": 1,
+                },
+            )
+
+            assert status == 200
+            claimed = claim_body["actions"][0]
+            assert claimed["scope"] == "admin_task_scoped"
+            assert claimed["action_kind"] == "install_python_packages"
+            assert claimed["lease_id"]
+            desired = claimed["payload"]["desired_action"]
+            assert desired["action_id"] == "install-waza-python"
+            assert desired["package_id"] == "waza"
+
+            _, complete_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/complete",
+                {
+                    "peer_token": peer["peer_token"],
+                    "local_action_id": claimed["local_action_id"],
+                    "lease_id": claimed["lease_id"],
+                    "status": "completed",
                     "result": {
                         "plan_id": "plan-waza",
                         "action_id": "install-waza-python",
@@ -11106,16 +11166,24 @@ class TestRemoteRelayHTTPService:
                 },
             )
 
-            assert result_body["type"] == "capabilityPackage.installResult"
-            updated = result_body["peer_status"]["actions"][action_key]
+            assert complete_body["ok"] is True
+            assert complete_body["action"]["status"] == "completed"
+
+            _, updated_plan = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer["peer_token"]},
+            )
+            updated = updated_plan["peer_status"]["actions"][action_key]
             assert updated["check_state"] == "passed"
             assert updated["install_state"] == "installed"
             assert updated["peer_result"]["content_hash"] == "sha256:abc"
+            assert updated["peer_result"]["local_action_id"] == claimed["local_action_id"]
         finally:
             service.stop()
             relay.stop()
 
-    def test_capability_package_peer_results_do_not_collide_on_action_id(
+    def test_capability_package_local_action_results_do_not_collide_on_action_id(
         self, tmp_path: Path
     ) -> None:
         del tmp_path
@@ -11165,15 +11233,44 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    features=[
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                ),
             )
-            peer_token = register_body["payload"]["peer_token"]
+            peer = register_body["payload"]
 
-            _, result_body = _json_request(
+            _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/capability-packages/install/result",
+                f"{service.base_url}/remote/local-actions/claim",
                 {
-                    "peer_token": peer_token,
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": [
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                    "max_actions": 2,
+                },
+            )
+            waza_action = next(
+                item
+                for item in claim_body["actions"]
+                if item["payload"]["desired_action"]["package_id"] == "waza"
+            )
+
+            _, complete_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/complete",
+                {
+                    "peer_token": peer["peer_token"],
+                    "local_action_id": waza_action["local_action_id"],
+                    "lease_id": waza_action["lease_id"],
+                    "status": "completed",
                     "result": {
                         "plan_id": "plan-python",
                         "action_id": "install-python",
@@ -11186,11 +11283,19 @@ class TestRemoteRelayHTTPService:
                 },
             )
 
-            actions = result_body["peer_status"]["actions"]
+            assert complete_body["ok"] is True
+            _, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer["peer_token"]},
+            )
+
+            actions = status_body["peer_status"]["actions"]
             waza_key = "waza|plan-python|install-python|skill:waza/read"
             docs_key = "docs|plan-python|install-python|skill:docs/read"
             assert actions[waza_key]["check_state"] == "passed"
             assert actions[waza_key]["install_state"] == "installed"
+            assert actions[waza_key]["peer_result"]["local_action_id"] == waza_action["local_action_id"]
             assert actions[docs_key]["check_state"] == "pending"
             assert actions[docs_key]["install_state"] == "registered"
             assert actions[docs_key]["peer_result"] is None
@@ -11198,7 +11303,7 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_capability_package_peer_result_matches_params_component_id(
+    def test_capability_package_local_action_result_matches_params_component_id(
         self, tmp_path: Path
     ) -> None:
         del tmp_path
@@ -11235,23 +11340,42 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    features=[
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                ),
             )
-            peer_token = register_body["payload"]["peer_token"]
+            peer = register_body["payload"]
 
-            _, plan_body = _json_request(
+            _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/capability-packages/install/plan",
-                {"peer_token": peer_token},
-            )
-            action_key = "waza|plan-python|install-python|skill:waza/read"
-            assert action_key in plan_body["peer_status"]["actions"]
-
-            _, result_body = _json_request(
-                "POST",
-                f"{service.base_url}/remote/capability-packages/install/result",
+                f"{service.base_url}/remote/local-actions/claim",
                 {
-                    "peer_token": peer_token,
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": [
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                    "max_actions": 1,
+                },
+            )
+            claimed = claim_body["actions"][0]
+            action_key = "waza|plan-python|install-python|skill:waza/read"
+            assert claimed["payload"]["desired_action"]["component_id"] == "skill:waza/read"
+
+            _, complete_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/complete",
+                {
+                    "peer_token": peer["peer_token"],
+                    "local_action_id": claimed["local_action_id"],
+                    "lease_id": claimed["lease_id"],
+                    "status": "completed",
                     "result": {
                         "plan_id": "plan-python",
                         "action_id": "install-python",
@@ -11262,15 +11386,22 @@ class TestRemoteRelayHTTPService:
                     },
                 },
             )
+            assert complete_body["ok"] is True
 
-            updated = result_body["peer_status"]["actions"][action_key]
+            _, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer["peer_token"]},
+            )
+
+            updated = status_body["peer_status"]["actions"][action_key]
             assert updated["check_state"] == "passed"
             assert updated["install_state"] == "installed"
         finally:
             service.stop()
             relay.stop()
 
-    def test_capability_package_peer_result_with_stale_hash_requires_retry(
+    def test_capability_package_local_action_result_with_stale_hash_requires_retry(
         self, tmp_path: Path
     ) -> None:
         del tmp_path
@@ -11308,14 +11439,38 @@ class TestRemoteRelayHTTPService:
             _, register_body = _json_request(
                 "POST",
                 f"{service.base_url}/remote/register",
-                _peer_register_payload(relay),
+                _peer_register_payload(
+                    relay,
+                    features=[
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                ),
             )
-            peer_token = register_body["payload"]["peer_token"]
-            _, result_body = _json_request(
+            peer = register_body["payload"]
+            _, claim_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/capability-packages/install/result",
+                f"{service.base_url}/remote/local-actions/claim",
                 {
-                    "peer_token": peer_token,
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": [
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                    "max_actions": 1,
+                },
+            )
+            claimed = claim_body["actions"][0]
+            _, complete_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/complete",
+                {
+                    "peer_token": peer["peer_token"],
+                    "local_action_id": claimed["local_action_id"],
+                    "lease_id": claimed["lease_id"],
+                    "status": "completed",
                     "result": {
                         "plan_id": "plan-python",
                         "action_id": "install-python",
@@ -11327,11 +11482,122 @@ class TestRemoteRelayHTTPService:
                     },
                 },
             )
+            assert complete_body["ok"] is True
 
             action_key = "waza|plan-python|install-python|skill:waza/read"
-            updated = result_body["peer_status"]["actions"][action_key]
+            _, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer["peer_token"]},
+            )
+            updated = status_body["peer_status"]["actions"][action_key]
             assert updated["check_state"] == "stale"
             assert updated["install_state"] == "registered"
+
+            _, retry_claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/claim",
+                {
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": [
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                    "max_actions": 1,
+                },
+            )
+            retry_action = retry_claim_body["actions"][0]
+            assert retry_action["local_action_id"] != claimed["local_action_id"]
+            assert (
+                retry_action["payload"]["desired_action"]["expected_content_hash"]
+                == "sha256:new"
+            )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_capability_package_cancelled_local_action_does_not_mark_installed(
+        self, tmp_path: Path
+    ) -> None:
+        del tmp_path
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            capability_packages={
+                "waza": {
+                    "install_plans": [
+                        {
+                            "plan_id": "plan-python",
+                            "actions": [
+                                {
+                                    "id": "install-python",
+                                    "type": "install_python_packages",
+                                    "target": "local_peer",
+                                    "package_id": "waza",
+                                    "component_id": "skill:waza/read",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(
+                    relay,
+                    features=[
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                ),
+            )
+            peer = register_body["payload"]
+            _, claim_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/claim",
+                {
+                    "peer_token": peer["peer_token"],
+                    "peer_id": peer["peer_id"],
+                    "worker_kind": "local_peer",
+                    "features": [
+                        "local_actions",
+                        "local_action:install_python_packages",
+                    ],
+                    "max_actions": 1,
+                },
+            )
+            claimed = claim_body["actions"][0]
+            _, cancel_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/local-actions/cancel",
+                {
+                    "peer_token": peer["peer_token"],
+                    "local_action_id": claimed["local_action_id"],
+                    "lease_id": claimed["lease_id"],
+                    "reason": "user_cancelled",
+                },
+            )
+            assert cancel_body["ok"] is True
+
+            action_key = "waza|plan-python|install-python|skill:waza/read"
+            _, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/capability-packages/install/plan",
+                {"peer_token": peer["peer_token"]},
+            )
+            updated = status_body["peer_status"]["actions"][action_key]
+            assert updated["check_state"] == "failed"
+            assert updated["install_state"] == "failed"
+            assert updated["peer_result"]["local_action_id"] == claimed["local_action_id"]
         finally:
             service.stop()
             relay.stop()

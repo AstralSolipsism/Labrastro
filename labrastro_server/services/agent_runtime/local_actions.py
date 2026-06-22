@@ -75,6 +75,10 @@ class LocalActionService:
         with self._lock:
             return self._clone(self._action_locked(local_action_id))
 
+    def list_local_actions(self) -> list[LocalActionRecord]:
+        with self._lock:
+            return [self._clone(action) for action in self._actions.values()]
+
     def claim_local_actions(
         self,
         *,
@@ -97,6 +101,7 @@ class LocalActionService:
                     break
                 if not self._claim_match(
                     action,
+                    peer_id=peer_id,
                     worker_kind=worker_kind,
                     features=feature_set,
                     workspace_root=workspace_root,
@@ -186,12 +191,16 @@ class LocalActionService:
         self,
         action: LocalActionRecord,
         *,
+        peer_id: str,
         worker_kind: WorkerKind,
         features: set[str],
         workspace_root: str | None,
         now: float,
     ) -> bool:
         if worker_kind != WorkerKind.LOCAL_PEER:
+            return False
+        assigned_peer = str(action.peer_id or "").strip()
+        if assigned_peer and assigned_peer != str(peer_id or "").strip():
             return False
         if action.status in LOCAL_ACTION_TERMINAL_STATUSES:
             return False

@@ -32,6 +32,13 @@ class RemoteLocalActionRoutes:
         if req.peer_id != peer_id:
             self._send_error(HTTPStatus.FORBIDDEN, "peer_identity_mismatch")
             return
+        sync_capability_actions = getattr(
+            self,
+            "_sync_capability_package_local_actions",
+            None,
+        )
+        if callable(sync_capability_actions):
+            sync_capability_actions(peer_id)
         service = self._local_action_service()
         if service is None:
             return
@@ -126,6 +133,13 @@ class RemoteLocalActionRoutes:
         except Exception:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_local_action_complete")
             return
+        record_capability_result = getattr(
+            self,
+            "_record_capability_package_local_action_result",
+            None,
+        )
+        if callable(record_capability_result):
+            record_capability_result(peer_id, action)
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(
             HTTPStatus.OK,
@@ -168,6 +182,13 @@ class RemoteLocalActionRoutes:
         except Exception:
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid_local_action_cancel")
             return
+        record_capability_result = getattr(
+            self,
+            "_record_capability_package_local_action_result",
+            None,
+        )
+        if callable(record_capability_result):
+            record_capability_result(peer_id, action)
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(
             HTTPStatus.OK,

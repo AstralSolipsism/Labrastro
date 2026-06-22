@@ -122,7 +122,6 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("mcp.artifact", "GET", "/remote/mcp/artifacts/{artifact_path}", "none", "Binary", "peer_token"),
     RemoteEndpoint("environment.manifest", "POST", "/remote/environment/manifest", "EnvironmentManifestRequest", "EnvironmentManifestResponse", "peer_token"),
     RemoteEndpoint("capability_package.install_plan", "POST", "/remote/capability-packages/install/plan", "CapabilityPackageInstallPlanRequest", "CapabilityPackageInstallPlanResponse", "peer_token"),
-    RemoteEndpoint("capability_package.install_result", "POST", "/remote/capability-packages/install/result", "CapabilityPackageInstallResultRequest", "CapabilityPackageInstallResultResponse", "peer_token"),
     RemoteEndpoint("artifacts.get", "GET", "/remote/artifacts/{os}/{arch}/{artifact_name}", "none", "Binary", "none"),
     RemoteEndpoint("github.webhook", "POST", "/remote/github/webhook", "WebhookPayload", "Ok", "webhook"),
     RemoteEndpoint("taskflow.get", "GET", "/remote/taskflow/{path}", "TaskflowQuery", "TaskflowResponse", "peer_token"),

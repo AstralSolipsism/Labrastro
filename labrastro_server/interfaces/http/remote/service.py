@@ -3938,9 +3938,6 @@ class RemoteRelayHTTPService:
                 if parsed.path == "/remote/capability-packages/install/plan":
                     self._handle_capability_package_install_plan()
                     return
-                if parsed.path == "/remote/capability-packages/install/result":
-                    self._handle_capability_package_install_result()
-                    return
                 if (
                     parsed.path.startswith("/remote/agent-runs/")
                     and parsed.path.endswith("/steer")
