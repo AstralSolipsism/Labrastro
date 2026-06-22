@@ -9,11 +9,17 @@ import pytest
 
 import labrastro_server.interfaces.http.remote.protocol as remote_protocol
 from labrastro_server.interfaces.http.remote.protocol import (
+    AgentRunBranchRequest,
+    AgentRunForkRequest,
     CleanupRequest,
     CleanupResult,
+    SessionRunAgentRunSteerRequest,
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
     ApprovalReplyRequest,
+    SessionRunCancelRequest,
+    SessionRunContinueRequest,
+    SessionRunRecoverRequest,
     SessionRunStartRequest,
     SessionRunStartResponse,
     SessionRunBranchSelectRequest,
@@ -21,6 +27,7 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionRunStatusResponse,
     SessionRunEventsRequest,
     SessionRunEventsBatch,
+    SessionRunUserInputReplyRequest,
     DisconnectNotice,
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
@@ -223,7 +230,7 @@ class TestRemoteHTTPContract:
             "/remote/agent-runs/{agent_run_id}/steer"
         )
         assert registry["agent_runs.steer"]["request_model"] == (
-            "AgentRunSteerRequest"
+            "SessionRunAgentRunSteerRequest"
         )
         assert registry["agent_runs.steer"]["auth"] == "peer_token"
         assert registry["admin.models.delete"]["path"] == "/remote/admin/models/delete"
@@ -462,6 +469,466 @@ class TestApprovalReplyProtocol:
 
 
 class TestSessionRunStatusProtocol:
+    @pytest.mark.parametrize(
+        ("request_cls", "payload"),
+        [
+            (
+                SessionRunEventsRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "cursor": 0,
+                    "timeout_sec": 1,
+                },
+            ),
+            (
+                SessionRunStatusRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "cursor": 0},
+            ),
+            (
+                SessionRunBranchSelectRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "cursor": 0},
+            ),
+            (
+                SessionRunCancelRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "reason": "user_cancelled",
+                },
+            ),
+            (
+                SessionRunContinueRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "prompt": "continue",
+                },
+            ),
+            (
+                SessionRunRecoverRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "action": "continue"},
+            ),
+            (
+                SessionRunUserInputReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "input_id": "input-1",
+                    "action": "submit",
+                    "content": {"value": "ok"},
+                },
+            ),
+            (
+                ApprovalReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "approval_id": "approval-1",
+                    "decision": "allow_once",
+                },
+            ),
+            (
+                SessionRunAgentRunSteerRequest,
+                {
+                    "peer_token": "pt_1",
+                    "agent_run_id": "agent-1",
+                    "session_run_id": "run-1",
+                    "payload": {"type": "user_text", "text": "guide"},
+                },
+            ),
+            (
+                AgentRunBranchRequest,
+                {
+                    "source_agent_run_id": "agent-1",
+                    "base_session_item_id": "message-1",
+                    "runtime_root": "D:/repo",
+                    "prompt": "branch",
+                },
+            ),
+            (
+                AgentRunForkRequest,
+                {
+                    "source_agent_run_id": "agent-1",
+                    "base_session_item_id": "message-1",
+                    "fork_workspace_ref": "workspace-ref",
+                    "target_owner_session_run_id": "run-1",
+                    "prompt": "fork",
+                },
+            ),
+        ],
+    )
+    def test_branch_scoped_requests_reject_missing_branch_binding(
+        self,
+        request_cls: type,
+        payload: dict,
+    ) -> None:
+        with pytest.raises(ValueError, match="branch_binding_id_required"):
+            request_cls.from_dict(payload)
+
+    @pytest.mark.parametrize(
+        ("request_cls", "payload"),
+        [
+            (
+                SessionRunEventsRequest,
+                {"peer_token": "pt_1", "branch_binding_id": "branch-1", "cursor": 0},
+            ),
+            (
+                SessionRunStatusRequest,
+                {"peer_token": "pt_1", "branch_binding_id": "branch-1", "cursor": 0},
+            ),
+            (
+                SessionRunBranchSelectRequest,
+                {"peer_token": "pt_1", "branch_binding_id": "branch-1", "cursor": 0},
+            ),
+            (
+                SessionRunCancelRequest,
+                {"peer_token": "pt_1", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunContinueRequest,
+                {"peer_token": "pt_1", "branch_binding_id": "branch-1", "prompt": "continue"},
+            ),
+            (
+                SessionRunRecoverRequest,
+                {"peer_token": "pt_1", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunUserInputReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "branch_binding_id": "branch-1",
+                    "input_id": "input-1",
+                    "action": "submit",
+                },
+            ),
+            (
+                ApprovalReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "branch_binding_id": "branch-1",
+                    "approval_id": "approval-1",
+                    "decision": "allow_once",
+                },
+            ),
+            (
+                SessionRunAgentRunSteerRequest,
+                {
+                    "peer_token": "pt_1",
+                    "agent_run_id": "agent-1",
+                    "branch_binding_id": "branch-1",
+                    "payload": {"type": "user_text", "text": "guide"},
+                },
+            ),
+        ],
+    )
+    def test_branch_scoped_requests_reject_missing_session_run_id(
+        self,
+        request_cls: type,
+        payload: dict,
+    ) -> None:
+        with pytest.raises(ValueError, match="session_run_id_required"):
+            request_cls.from_dict(payload)
+
+    @pytest.mark.parametrize(
+        ("request_cls", "kwargs"),
+        [
+            (
+                SessionRunEventsRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "branch_binding_id": ""},
+            ),
+            (
+                SessionRunStatusRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "branch_binding_id": ""},
+            ),
+            (
+                SessionRunBranchSelectRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "branch_binding_id": ""},
+            ),
+            (
+                SessionRunCancelRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "branch_binding_id": ""},
+            ),
+            (
+                SessionRunContinueRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "branch_binding_id": "",
+                    "prompt": "continue",
+                },
+            ),
+            (
+                SessionRunRecoverRequest,
+                {"peer_token": "pt_1", "session_run_id": "run-1", "branch_binding_id": ""},
+            ),
+            (
+                SessionRunUserInputReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "branch_binding_id": "",
+                    "input_id": "input-1",
+                    "action": "submit",
+                },
+            ),
+            (
+                ApprovalReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "branch_binding_id": "",
+                    "approval_id": "approval-1",
+                    "decision": "allow_once",
+                },
+            ),
+            (
+                SessionRunAgentRunSteerRequest,
+                {
+                    "peer_token": "pt_1",
+                    "agent_run_id": "agent-1",
+                    "session_run_id": "run-1",
+                    "branch_binding_id": "",
+                    "payload": {"type": "user_text", "text": "guide"},
+                },
+            ),
+            (
+                AgentRunBranchRequest,
+                {
+                    "source_agent_run_id": "agent-1",
+                    "base_session_item_id": "message-1",
+                    "runtime_root": "D:/repo",
+                    "prompt": "branch",
+                    "branch_binding_id": "",
+                },
+            ),
+            (
+                AgentRunForkRequest,
+                {
+                    "source_agent_run_id": "agent-1",
+                    "base_session_item_id": "message-1",
+                    "fork_workspace_ref": "workspace-ref",
+                    "target_owner_session_run_id": "run-1",
+                    "prompt": "fork",
+                    "branch_binding_id": "",
+                },
+            ),
+        ],
+    )
+    def test_branch_scoped_requests_cannot_serialize_blank_branch_binding(
+        self,
+        request_cls: type,
+        kwargs: dict,
+    ) -> None:
+        with pytest.raises(ValueError, match="branch_binding_id_required"):
+            request_cls(**kwargs).to_dict()
+
+    @pytest.mark.parametrize(
+        ("request_cls", "kwargs"),
+        [
+            (
+                SessionRunEventsRequest,
+                {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunStatusRequest,
+                {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunBranchSelectRequest,
+                {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunCancelRequest,
+                {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunContinueRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "",
+                    "branch_binding_id": "branch-1",
+                    "prompt": "continue",
+                },
+            ),
+            (
+                SessionRunRecoverRequest,
+                {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
+            ),
+            (
+                SessionRunUserInputReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "",
+                    "branch_binding_id": "branch-1",
+                    "input_id": "input-1",
+                    "action": "submit",
+                },
+            ),
+            (
+                ApprovalReplyRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "",
+                    "branch_binding_id": "branch-1",
+                    "approval_id": "approval-1",
+                    "decision": "allow_once",
+                },
+            ),
+            (
+                SessionRunAgentRunSteerRequest,
+                {
+                    "peer_token": "pt_1",
+                    "agent_run_id": "agent-1",
+                    "session_run_id": "",
+                    "branch_binding_id": "branch-1",
+                    "payload": {"type": "user_text", "text": "guide"},
+                },
+            ),
+        ],
+    )
+    def test_branch_scoped_requests_cannot_serialize_blank_session_run_id(
+        self,
+        request_cls: type,
+        kwargs: dict,
+    ) -> None:
+        with pytest.raises(ValueError, match="session_run_id_required"):
+            request_cls(**kwargs).to_dict()
+
+    def test_branch_scoped_request_serialization_revalidates_mutated_scope_fields(
+        self,
+    ) -> None:
+        session_scoped_requests = [
+            SessionRunEventsRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunStatusRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunBranchSelectRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunCancelRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunContinueRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                prompt="continue",
+            ),
+            SessionRunRecoverRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunUserInputReplyRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                input_id="input-1",
+                action="submit",
+            ),
+            ApprovalReplyRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                approval_id="approval-1",
+                decision="allow_once",
+            ),
+            SessionRunAgentRunSteerRequest(
+                peer_token="pt_1",
+                agent_run_id="agent-1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                payload={"type": "user_text", "text": "guide"},
+            ),
+        ]
+        for request in session_scoped_requests:
+            request.session_run_id = ""
+            with pytest.raises(ValueError, match="session_run_id_required"):
+                request.to_dict()
+
+        branch_scoped_requests = [
+            SessionRunEventsRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunStatusRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunBranchSelectRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunCancelRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunContinueRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                prompt="continue",
+            ),
+            SessionRunRecoverRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunUserInputReplyRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                input_id="input-1",
+                action="submit",
+            ),
+            ApprovalReplyRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                approval_id="approval-1",
+                decision="allow_once",
+            ),
+            SessionRunAgentRunSteerRequest(
+                peer_token="pt_1",
+                agent_run_id="agent-1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+                payload={"type": "user_text", "text": "guide"},
+            ),
+            AgentRunBranchRequest(
+                source_agent_run_id="agent-1",
+                base_session_item_id="message-1",
+                runtime_root="D:/repo",
+                branch_binding_id="branch-1",
+            ),
+            AgentRunForkRequest(
+                source_agent_run_id="agent-1",
+                base_session_item_id="message-1",
+                fork_workspace_ref="workspace-ref",
+                target_owner_session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+        ]
+        for request in branch_scoped_requests:
+            request.branch_binding_id = ""
+            with pytest.raises(ValueError, match="branch_binding_id_required"):
+                request.to_dict()
+
     def test_branch_select_request_roundtrip_preserves_branch_binding(self) -> None:
         req = SessionRunBranchSelectRequest(
             peer_token="pt_1",
@@ -508,6 +975,10 @@ class TestSessionRunStatusProtocol:
             mode="planner",
             workflow_mode="taskflow",
             taskflow_id="taskflow-1",
+            agent_run_id="agent-1",
+            branch_binding_id="branch-2",
+            scope_id="run-1:branch-2",
+            selected=False,
             created_at=1.0,
             last_activity_at=2.0,
             finished_at=None,
@@ -529,6 +1000,10 @@ class TestSessionRunStatusProtocol:
         assert restored_resp.next_cursor == 9
         assert restored_resp.session_id == "session-1"
         assert restored_resp.workflow_mode == "taskflow"
+        assert restored_resp.agent_run_id == "agent-1"
+        assert restored_resp.branch_binding_id == "branch-2"
+        assert restored_resp.scope_id == "run-1:branch-2"
+        assert restored_resp.selected is False
         assert restored_resp.approvals == [
             {
                 "approval_id": "approval-1",

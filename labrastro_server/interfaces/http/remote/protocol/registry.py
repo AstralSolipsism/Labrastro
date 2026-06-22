@@ -59,7 +59,7 @@ REMOTE_ENDPOINTS: tuple[RemoteEndpoint, ...] = (
     RemoteEndpoint("session_run.user_input_reply", "POST", "/remote/session-runs/user-input/reply", "SessionRunUserInputReplyRequest", "SessionRunUserInputReplyResponse", "peer_token"),
     RemoteEndpoint("chat.approval_reply", "POST", "/remote/approval/reply", "ApprovalReplyRequest", "ApprovalReplyResponse", "peer_token"),
     RemoteEndpoint("agent_runs.events", "GET", "/remote/agent-runs/{agent_run_id}/events", "AgentRunEventsQuery", "AgentRunEventsResponse", "peer_token"),
-    RemoteEndpoint("agent_runs.steer", "POST", "/remote/agent-runs/{agent_run_id}/steer", "AgentRunSteerRequest", "AgentRunSteerResponse", "peer_token"),
+    RemoteEndpoint("agent_runs.steer", "POST", "/remote/agent-runs/{agent_run_id}/steer", "SessionRunAgentRunSteerRequest", "AgentRunSteerResponse", "peer_token"),
     RemoteEndpoint("agent_run_activations.claim", "POST", "/remote/agent-run-activations/claim", "AgentRunActivationClaimRequest", "AgentRunActivationClaimResponse", "peer_token"),
     RemoteEndpoint("agent_run_activations.heartbeat", "POST", "/remote/agent-run-activations/heartbeat", "AgentRunActivationHeartbeatRequest", "AgentRunActivationHeartbeatResponse", "peer_token"),
     RemoteEndpoint("agent_run_activations.session", "POST", "/remote/agent-run-activations/session", "AgentRunActivationSessionPinRequest", "AgentRunActivationSessionPinResponse", "peer_token"),

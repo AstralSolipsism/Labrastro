@@ -42,6 +42,7 @@ from labrastro_server.interfaces.http.remote.protocol.agent_runs import (
     AgentRunRetryRequest,
     AgentRunSteerRequest,
     AgentRunSteerResponse,
+    SessionRunAgentRunSteerRequest,
 )
 from labrastro_server.interfaces.http.remote.protocol.capability_packages import (
     CapabilityPackageIngestSessionStartRequest,
@@ -134,6 +135,7 @@ __all__ = [
     "AgentRunRetryRequest",
     "AgentRunSteerRequest",
     "AgentRunSteerResponse",
+    "SessionRunAgentRunSteerRequest",
     "ApprovalReplyRequest",
     "ApprovalReplyResponse",
     "CapabilityPackageIngestSessionStartRequest",

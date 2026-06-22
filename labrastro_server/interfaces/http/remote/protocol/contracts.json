@@ -170,7 +170,10 @@
       },
       "response": {
         "session_run_id": "session_run_contract",
+        "agent_run_id": "agent_run_main_contract",
         "branch_binding_id": "main",
+        "scope_id": "session_run_contract:main",
+        "selected": true,
         "error": null
       }
     },
@@ -234,7 +237,10 @@
         ],
         "done": false,
         "next_cursor": 1,
+        "agent_run_id": "agent_run_main_contract",
         "branch_binding_id": "main",
+        "scope_id": "session_run_contract:main",
+        "selected": true,
         "error": null
       }
     },
@@ -266,7 +272,15 @@
         "mode": "chat",
         "workflow_mode": null,
         "taskflow_id": null,
+        "agent_run_id": "agent_run_main_contract",
         "branch_binding_id": "main",
+        "scope_id": "session_run_contract:main",
+        "selected": true,
+        "runtime_state": {
+          "agent_run_id": "agent_run_main_contract",
+          "branch_binding_id": "main",
+          "scope_id": "session_run_contract:main"
+        },
         "created_at": 1760000000.0,
         "last_activity_at": 1760000001.0,
         "finished_at": null,
@@ -304,9 +318,12 @@
         "taskflow_id": null,
         "agent_run_id": "agent_run_branch_contract",
         "branch_binding_id": "branch_contract",
+        "scope_id": "session_run_contract:branch_contract",
+        "selected": true,
         "runtime_state": {
           "agent_run_id": "agent_run_branch_contract",
-          "branch_binding_id": "branch_contract"
+          "branch_binding_id": "branch_contract",
+          "scope_id": "session_run_contract:branch_contract"
         },
         "created_at": 1760000000.0,
         "last_activity_at": 1760000002.0,
@@ -370,7 +387,10 @@
         ],
         "done": false,
         "next_cursor": 42,
+        "agent_run_id": "agent_run_main_contract",
         "branch_binding_id": "main",
+        "scope_id": "session_run_contract:main",
+        "selected": true,
         "error": null
       }
     },
@@ -451,6 +471,8 @@
             "peer_id": "peer_contract",
             "session_run_id": "session_run_contract",
             "branch_binding_id": "main",
+            "scope_id": "session_run_contract:main",
+            "selected": true,
             "expected_activation_id": "activation_contract"
           }
         }
@@ -782,6 +804,7 @@
       },
       "response": {
         "ok": true,
+        "branch_binding_id": "branch_contract",
         "agent_run": {
           "id": "agent_run_branch_contract"
         }

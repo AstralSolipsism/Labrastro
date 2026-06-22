@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._scope import required_branch_binding_id, required_session_run_id
+
 def _dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -76,6 +78,8 @@ class SessionRunStartResponse:
     agent_run_id: str | None = None
     activation_id: str | None = None
     branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
     agent_id: str | None = None
     workflow_mode: str | None = None
     runtime_state: dict[str, Any] = field(default_factory=dict)
@@ -91,6 +95,10 @@ class SessionRunStartResponse:
             payload["activation_id"] = self.activation_id
         if self.branch_binding_id is not None:
             payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
         if self.agent_id is not None:
             payload["agent_id"] = self.agent_id
         if self.workflow_mode is not None:
@@ -107,6 +115,8 @@ class SessionRunStartResponse:
             agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
             activation_id=d.get("activation_id") if isinstance(d.get("activation_id"), str) else None,
             branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
             agent_id=d.get("agent_id") if isinstance(d.get("agent_id"), str) else None,
             workflow_mode=d.get("workflow_mode") if isinstance(d.get("workflow_mode"), str) else None,
             runtime_state=d.get("runtime_state") if isinstance(d.get("runtime_state"), dict) else {},
@@ -198,27 +208,30 @@ class ChatCommandDispatchResponse:
 class SessionRunEventsRequest:
     peer_token: str
     session_run_id: str
-    branch_binding_id: str | None = None
+    branch_binding_id: str
     cursor: int = 0
     timeout_sec: float = 30.0
+
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "cursor": self.cursor,
             "timeout_sec": self.timeout_sec,
         }
-        if self.branch_binding_id is not None:
-            payload["branch_binding_id"] = self.branch_binding_id
         return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunEventsRequest":
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             cursor=int(d.get("cursor", 0)),
             timeout_sec=float(d.get("timeout_sec", 30.0)),
         )
@@ -230,7 +243,10 @@ class SessionRunEventsBatch:
     next_cursor: int = 0
     error: str | None = None
     branches: list[dict[str, Any]] = field(default_factory=list)
+    agent_run_id: str | None = None
     branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -240,8 +256,14 @@ class SessionRunEventsBatch:
             "error": self.error,
             "branches": _dict_list(self.branches),
         }
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
         if self.branch_binding_id is not None:
             payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
         return payload
 
     @classmethod
@@ -252,32 +274,38 @@ class SessionRunEventsBatch:
             next_cursor=int(d.get("next_cursor", 0)),
             error=d.get("error"),
             branches=_dict_list(d.get("branches")),
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
             branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
         )
 
 @dataclass
 class SessionRunStatusRequest:
     peer_token: str
     session_run_id: str
-    branch_binding_id: str | None = None
+    branch_binding_id: str
     cursor: int = 0
+
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "cursor": self.cursor,
         }
-        if self.branch_binding_id is not None:
-            payload["branch_binding_id"] = self.branch_binding_id
         return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunStatusRequest":
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             cursor=int(d.get("cursor", 0)),
         )
 
@@ -288,11 +316,15 @@ class SessionRunBranchSelectRequest:
     branch_binding_id: str
     cursor: int = 0
 
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "branch_binding_id": self.branch_binding_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "cursor": self.cursor,
         }
 
@@ -300,8 +332,8 @@ class SessionRunBranchSelectRequest:
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunBranchSelectRequest":
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=d["branch_binding_id"],
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             cursor=int(d.get("cursor", 0)),
         )
 
@@ -326,6 +358,8 @@ class SessionRunStatusResponse:
     agent_id: str | None = None
     agent_run_id: str | None = None
     branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
     runtime_state: dict[str, Any] = field(default_factory=dict)
     created_at: float | None = None
     last_activity_at: float | None = None
@@ -357,6 +391,8 @@ class SessionRunStatusResponse:
             "agent_id": self.agent_id,
             "agent_run_id": self.agent_run_id,
             "branch_binding_id": self.branch_binding_id,
+            "scope_id": self.scope_id,
+            "selected": self.selected,
             "runtime_state": dict(self.runtime_state),
             "created_at": self.created_at,
             "last_activity_at": self.last_activity_at,
@@ -390,6 +426,8 @@ class SessionRunStatusResponse:
             agent_id=d.get("agent_id") if isinstance(d.get("agent_id"), str) else None,
             agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
             branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
             runtime_state=d.get("runtime_state") if isinstance(d.get("runtime_state"), dict) else {},
             created_at=float(d["created_at"]) if d.get("created_at") is not None else None,
             last_activity_at=float(d["last_activity_at"])
@@ -407,14 +445,18 @@ class SessionRunStatusResponse:
 class SessionRunCancelRequest:
     peer_token: str
     session_run_id: str
-    branch_binding_id: str = ""
+    branch_binding_id: str
     reason: str | None = None
+
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "branch_binding_id": self.branch_binding_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "reason": self.reason,
         }
 
@@ -422,22 +464,46 @@ class SessionRunCancelRequest:
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunCancelRequest":
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=str(d.get("branch_binding_id") or ""),
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             reason=d.get("reason"),
         )
 
 @dataclass
 class SessionRunCancelResponse:
     ok: bool
+    session_run_id: str | None = None
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "error": self.error}
+        payload: dict[str, Any] = {"ok": self.ok, "error": self.error}
+        if self.session_run_id is not None:
+            payload["session_run_id"] = self.session_run_id
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunCancelResponse":
-        return cls(ok=bool(d.get("ok", False)), error=d.get("error"))
+        return cls(
+            ok=bool(d.get("ok", False)),
+            session_run_id=d.get("session_run_id") if isinstance(d.get("session_run_id"), str) else None,
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
+            error=d.get("error"),
+        )
 
 
 @dataclass
@@ -450,11 +516,15 @@ class SessionRunContinueRequest:
     locale: str | None = None
     mentions: list[dict[str, Any]] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
+
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "branch_binding_id": self.branch_binding_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "prompt": self.prompt,
         }
         if self.client_request_id is not None:
@@ -469,8 +539,8 @@ class SessionRunContinueRequest:
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunContinueRequest":
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=str(d.get("branch_binding_id") or ""),
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             prompt=d["prompt"],
             client_request_id=d.get("client_request_id"),
             locale=d.get("locale"),
@@ -484,6 +554,9 @@ class SessionRunContinueResponse:
     session_run_id: str
     activation_id: str | None = None
     agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -496,6 +569,12 @@ class SessionRunContinueResponse:
             payload["activation_id"] = self.activation_id
         if self.agent_run_id is not None:
             payload["agent_run_id"] = self.agent_run_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
         return payload
 
     @classmethod
@@ -509,6 +588,11 @@ class SessionRunContinueResponse:
             agent_run_id=d.get("agent_run_id")
             if isinstance(d.get("agent_run_id"), str)
             else None,
+            branch_binding_id=d.get("branch_binding_id")
+            if isinstance(d.get("branch_binding_id"), str)
+            else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
             error=d.get("error") if isinstance(d.get("error"), str) else None,
         )
 
@@ -517,14 +601,18 @@ class SessionRunContinueResponse:
 class SessionRunRecoverRequest:
     peer_token: str
     session_run_id: str
-    branch_binding_id: str = ""
+    branch_binding_id: str
     action: str = "continue"
+
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "branch_binding_id": self.branch_binding_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "action": self.action,
         }
 
@@ -532,8 +620,8 @@ class SessionRunRecoverRequest:
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunRecoverRequest":
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=str(d.get("branch_binding_id") or ""),
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             action=str(d.get("action") or "continue"),
         )
 
@@ -541,6 +629,10 @@ class SessionRunRecoverRequest:
 class SessionRunRecoverResponse:
     ok: bool
     session_run_id: str
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
     state: str | None = None
     error: str | None = None
 
@@ -552,6 +644,14 @@ class SessionRunRecoverResponse:
         }
         if self.state is not None:
             payload["state"] = self.state
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
         return payload
 
     @classmethod
@@ -559,6 +659,10 @@ class SessionRunRecoverResponse:
         return cls(
             ok=bool(d.get("ok", False)),
             session_run_id=str(d.get("session_run_id") or ""),
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
             state=d.get("state") if isinstance(d.get("state"), str) else None,
             error=d.get("error"),
         )
@@ -573,11 +677,15 @@ class SessionRunUserInputReplyRequest:
     content: dict[str, Any] = field(default_factory=dict)
     reason: str | None = None
 
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "branch_binding_id": self.branch_binding_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "input_id": self.input_id,
             "action": self.action,
             "content": dict(self.content),
@@ -589,8 +697,8 @@ class SessionRunUserInputReplyRequest:
         content = d.get("content")
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=str(d.get("branch_binding_id") or ""),
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             input_id=d.get("input_id"),
             action=str(d.get("action") or "decline"),
             content=content if isinstance(content, dict) else {},
@@ -603,9 +711,25 @@ class SessionRunUserInputReplyResponse:
     ok: bool
     error: str | None = None
     state: str | None = None
+    session_run_id: str | None = None
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "error": self.error, "state": self.state}
+        payload: dict[str, Any] = {"ok": self.ok, "error": self.error, "state": self.state}
+        if self.session_run_id is not None:
+            payload["session_run_id"] = self.session_run_id
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunUserInputReplyResponse":
@@ -613,6 +737,11 @@ class SessionRunUserInputReplyResponse:
             ok=bool(d.get("ok", False)),
             error=d.get("error"),
             state=d.get("state") if isinstance(d.get("state"), str) else None,
+            session_run_id=d.get("session_run_id") if isinstance(d.get("session_run_id"), str) else None,
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
         )
 
 
@@ -626,11 +755,15 @@ class ApprovalReplyRequest:
     reason: str | None = None
     approved_save_candidate: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
+
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "peer_token": self.peer_token,
-            "session_run_id": self.session_run_id,
-            "branch_binding_id": self.branch_binding_id,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "approval_id": self.approval_id,
             "decision": self.decision,
             "reason": self.reason,
@@ -644,8 +777,8 @@ class ApprovalReplyRequest:
         approved_save_candidate = d.get("approved_save_candidate")
         return cls(
             peer_token=d["peer_token"],
-            session_run_id=d["session_run_id"],
-            branch_binding_id=str(d.get("branch_binding_id") or ""),
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             approval_id=d["approval_id"],
             decision=d["decision"],
             reason=d.get("reason"),
@@ -661,9 +794,25 @@ class ApprovalReplyResponse:
     ok: bool
     error: str | None = None
     state: str | None = None
+    session_run_id: str | None = None
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "error": self.error, "state": self.state}
+        payload: dict[str, Any] = {"ok": self.ok, "error": self.error, "state": self.state}
+        if self.session_run_id is not None:
+            payload["session_run_id"] = self.session_run_id
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ApprovalReplyResponse":
@@ -671,6 +820,11 @@ class ApprovalReplyResponse:
             ok=bool(d.get("ok", False)),
             error=d.get("error"),
             state=d.get("state") if isinstance(d.get("state"), str) else None,
+            session_run_id=d.get("session_run_id") if isinstance(d.get("session_run_id"), str) else None,
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
         )
 
 
