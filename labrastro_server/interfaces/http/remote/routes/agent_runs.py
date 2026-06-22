@@ -16,9 +16,12 @@ from labrastro_server.interfaces.http.remote.helpers import (
     package_version,
     strong_etag,
 )
+from labrastro_server.interfaces.http.remote.session_run_control import (
+    SessionRunControlScopeProof,
+)
 from labrastro_server.interfaces.http.remote.protocol import (
-    AgentRunSteerRequest,
     AgentRunSteerResponse,
+    SessionRunAgentRunSteerRequest,
     ApprovalReplyRequest,
     ApprovalReplyResponse,
     SessionRunCancelRequest,
@@ -98,6 +101,15 @@ def _agent_run_model_unhandled_error_payload(exc: Exception) -> dict[str, Any]:
         "diagnostic_error_type": type(exc).__name__,
         "diagnostic_message": str(exc),
     }
+
+
+def _required_scope_error(exc: Exception) -> str:
+    if not isinstance(exc, ValueError):
+        return ""
+    code = str(exc).strip()
+    if code in {"branch_binding_id_required", "session_run_id_required"}:
+        return code
+    return ""
 
 
 def _activation_steer_response_payload(steer: Any) -> dict[str, Any]:
@@ -233,9 +245,13 @@ class RemoteAgentRunRoutes:
         payload = self._read_json()
         payload["agent_run_id"] = parts[2]
         try:
-            req = AgentRunSteerRequest.from_dict(payload)
-        except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_agent_run_steer_request")
+            req = SessionRunAgentRunSteerRequest.from_dict(payload)
+        except Exception as exc:
+            scope_error = _required_scope_error(exc)
+            if scope_error:
+                self._send_error(HTTPStatus.BAD_REQUEST, scope_error)
+            else:
+                self._send_error(HTTPStatus.BAD_REQUEST, "invalid_agent_run_steer_request")
             return
         peer_id = self._verify_peer_token(req.peer_token)
         if peer_id is None:
@@ -247,6 +263,9 @@ class RemoteAgentRunRoutes:
         if not req.session_run_id:
             self._send_error(HTTPStatus.BAD_REQUEST, "session_run_id_required")
             return
+        if not req.branch_binding_id:
+            self._send_error(HTTPStatus.BAD_REQUEST, "branch_binding_id_required")
+            return
         finder = getattr(self.service.runtime_control_plane, "find_session_run_binding", None)
         if not callable(finder):
             self._send_error(
@@ -256,11 +275,18 @@ class RemoteAgentRunRoutes:
             return
         binding = finder(
             session_run_id=req.session_run_id,
-            branch_binding_id=req.branch_binding_id or "",
-            selected_only=not bool(req.branch_binding_id),
+            branch_binding_id=req.branch_binding_id,
+            selected_only=False,
         )
         if binding is None:
             self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        scope = SessionRunControlScopeProof.from_binding(
+            session_run_id=req.session_run_id,
+            binding=binding,
+        )
+        if scope is None:
+            self._send_error(HTTPStatus.CONFLICT, "session_run_scope_proof_invalid")
             return
         if not self._session_binding_peer_matches(binding, peer_id):
             self._send_error(HTTPStatus.FORBIDDEN, "forbidden")
@@ -302,6 +328,8 @@ class RemoteAgentRunRoutes:
                 "peer_id": peer_id,
                 "session_run_id": binding.session_run_id,
                 "branch_binding_id": binding.branch_binding_id,
+                "scope_id": scope.scope_id,
+                "selected": scope.selected,
                 "expected_activation_id": req.activation_id or current_activation_id,
             }
         )

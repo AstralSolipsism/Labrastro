@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._scope import required_branch_binding_id, required_session_run_id
+
 
 def _dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -473,13 +475,23 @@ class AgentRunRequest:
 class AgentRunResponse:
     ok: bool
     agent_run: dict[str, Any] = field(default_factory=dict)
+    branch_binding_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "agent_run": dict(self.agent_run)}
+        payload = {"ok": self.ok, "agent_run": dict(self.agent_run)}
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "AgentRunResponse":
-        return cls(ok=bool(d.get("ok", False)), agent_run=_dict(d.get("agent_run")))
+        return cls(
+            ok=bool(d.get("ok", False)),
+            agent_run=_dict(d.get("agent_run")),
+            branch_binding_id=d.get("branch_binding_id")
+            if isinstance(d.get("branch_binding_id"), str)
+            else None,
+        )
 
 
 @dataclass
@@ -556,9 +568,12 @@ class AgentRunBranchRequest:
     runtime_root: str
     prompt: str = ""
     agent_run_id: str | None = None
-    branch_binding_id: str | None = None
+    branch_binding_id: str = ""
     select_branch: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -566,12 +581,11 @@ class AgentRunBranchRequest:
             "base_session_item_id": self.base_session_item_id,
             "runtime_root": self.runtime_root,
             "prompt": self.prompt,
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "metadata": dict(self.metadata),
         }
         if self.agent_run_id is not None:
             payload["agent_run_id"] = self.agent_run_id
-        if self.branch_binding_id is not None:
-            payload["branch_binding_id"] = self.branch_binding_id
         payload["select_branch"] = self.select_branch
         return payload
 
@@ -585,9 +599,7 @@ class AgentRunBranchRequest:
             agent_run_id=d.get("agent_run_id")
             if isinstance(d.get("agent_run_id"), str)
             else None,
-            branch_binding_id=d.get("branch_binding_id")
-            if isinstance(d.get("branch_binding_id"), str)
-            else None,
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             select_branch=bool(d.get("select_branch", True)),
             metadata=_dict(d.get("metadata")),
         )
@@ -601,9 +613,12 @@ class AgentRunForkRequest:
     target_owner_session_run_id: str
     prompt: str = ""
     agent_run_id: str | None = None
-    branch_binding_id: str | None = None
+    branch_binding_id: str = ""
     select_branch: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -612,12 +627,11 @@ class AgentRunForkRequest:
             "fork_workspace_ref": self.fork_workspace_ref,
             "target_owner_session_run_id": self.target_owner_session_run_id,
             "prompt": self.prompt,
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
             "metadata": dict(self.metadata),
         }
         if self.agent_run_id is not None:
             payload["agent_run_id"] = self.agent_run_id
-        if self.branch_binding_id is not None:
-            payload["branch_binding_id"] = self.branch_binding_id
         payload["select_branch"] = self.select_branch
         return payload
 
@@ -632,9 +646,7 @@ class AgentRunForkRequest:
             agent_run_id=d.get("agent_run_id")
             if isinstance(d.get("agent_run_id"), str)
             else None,
-            branch_binding_id=d.get("branch_binding_id")
-            if isinstance(d.get("branch_binding_id"), str)
-            else None,
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             select_branch=bool(d.get("select_branch", True)),
             metadata=_dict(d.get("metadata")),
         )
@@ -687,6 +699,64 @@ class AgentRunSteerRequest:
             branch_binding_id=d.get("branch_binding_id")
             if isinstance(d.get("branch_binding_id"), str)
             else None,
+            activation_id=d.get("activation_id")
+            if isinstance(d.get("activation_id"), str)
+            else None,
+            idempotency_key=d.get("idempotency_key")
+            if isinstance(d.get("idempotency_key"), str)
+            else None,
+            client_steer_id=d.get("client_steer_id")
+            if isinstance(d.get("client_steer_id"), str)
+            else None,
+            metadata=_dict(d.get("metadata")),
+        )
+
+
+@dataclass
+class SessionRunAgentRunSteerRequest:
+    payload: dict[str, Any]
+    session_run_id: str
+    branch_binding_id: str
+    agent_run_id: str = ""
+    source: str = "user"
+    peer_token: str | None = None
+    activation_id: str | None = None
+    idempotency_key: str | None = None
+    client_steer_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "agent_run_id": self.agent_run_id,
+            "payload": dict(self.payload),
+            "source": self.source,
+            "metadata": dict(self.metadata),
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
+        }
+        if self.peer_token is not None:
+            result["peer_token"] = self.peer_token
+        if self.activation_id is not None:
+            result["activation_id"] = self.activation_id
+        if self.idempotency_key is not None:
+            result["idempotency_key"] = self.idempotency_key
+        if self.client_steer_id is not None:
+            result["client_steer_id"] = self.client_steer_id
+        return result
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunAgentRunSteerRequest":
+        return cls(
+            agent_run_id=str(d.get("agent_run_id") or ""),
+            payload=_dict(d.get("payload")),
+            source=str(d.get("source") or "user"),
+            peer_token=d.get("peer_token") if isinstance(d.get("peer_token"), str) else None,
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
             activation_id=d.get("activation_id")
             if isinstance(d.get("activation_id"), str)
             else None,

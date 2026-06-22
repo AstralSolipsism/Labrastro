@@ -15,6 +15,9 @@ from labrastro_server.interfaces.http.remote.helpers import (
     package_version,
     strong_etag,
 )
+from labrastro_server.interfaces.http.remote.session_run_control import (
+    SessionRunControlScopeProof,
+)
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
@@ -40,6 +43,9 @@ from labrastro_server.interfaces.http.remote.protocol import (
     SessionModelSwitchRequest,
     SessionNewRequest,
     ToolPreviewResult,
+)
+from labrastro_server.interfaces.http.remote.protocol._scope import (
+    required_branch_binding_id,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
 from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
@@ -72,6 +78,30 @@ def _binding_value(binding: Any, name: str, default: Any = "") -> Any:
     if isinstance(binding, dict):
         return binding.get(name, default)
     return getattr(binding, name, default)
+
+
+def _session_run_failed_http_error(session: Any) -> tuple[HTTPStatus, str, str] | None:
+    events = getattr(session, "events", [])
+    if not isinstance(events, list):
+        return None
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("type") != "session_run_failed":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("operation") or "").strip() != "start":
+            continue
+        try:
+            status = HTTPStatus(int(payload.get("http_status")))
+        except (TypeError, ValueError):
+            return None
+        code = str(payload.get("code") or "").strip()
+        if not code:
+            return None
+        message = str(payload.get("message") or "").strip()
+        return status, code, message
+    return None
 
 
 def _branch_source_binding_id(
@@ -157,30 +187,36 @@ def _record_agent_run_branch_projection(
     *,
     agent_run_id: str,
     raw_prompt: str,
-) -> None:
+) -> str:
     normalized_prompt = str(raw_prompt or "").strip()
     if not normalized_prompt:
-        return
+        return ""
     control = getattr(service, "runtime_control_plane", None)
     if control is None:
-        return
+        return ""
     source_agent_run_id = str(payload.get("source_agent_run_id") or "").strip()
     if not source_agent_run_id:
-        return
-    source = control.get_agent_run(source_agent_run_id)
+        return ""
+    try:
+        source = control.get_agent_run(source_agent_run_id)
+    except Exception:
+        return ""
     session_run_id = str(getattr(source, "owner_session_run_id", "") or "").strip()
     if not session_run_id:
-        return
+        return ""
     get_session_run = getattr(service, "_get_session_run", None)
     if not callable(get_session_run):
-        return
+        return ""
     session = get_session_run(session_run_id)
     if session is None:
-        return
-    bindings = control.list_session_run_bindings(
-        session_run_id=session_run_id,
-        status="active",
-    )
+        return ""
+    try:
+        bindings = control.list_session_run_bindings(
+            session_run_id=session_run_id,
+            status="active",
+        )
+    except Exception:
+        return ""
     target_binding = next(
         (
             binding
@@ -191,34 +227,83 @@ def _record_agent_run_branch_projection(
         ),
         None,
     )
-    branch_binding_id = str(
-        _binding_value(target_binding, "branch_binding_id")
-        or payload.get("branch_binding_id")
-        or ""
-    ).strip()
-    if not branch_binding_id:
-        return
-    if target_binding is not None and hasattr(session, "record_branch_binding"):
+    if target_binding is None:
+        return ""
+    scope = SessionRunControlScopeProof.from_binding(
+        session_run_id=session_run_id,
+        binding=target_binding,
+    )
+    if scope is None:
+        return ""
+    if hasattr(session, "record_branch_binding"):
         session.record_branch_binding(target_binding)
     session_item_id = str(
         payload.get("session_item_id")
         or payload.get("item_id")
-        or f"{branch_binding_id}:user:{agent_run_id}"
+        or f"{scope.branch_binding_id}:user:{agent_run_id}"
     ).strip()
-    session.append_event(
+    writer = session.scoped_writer(
+        branch_binding_id=scope.branch_binding_id,
+        agent_run_id=scope.agent_run_id,
+    )
+    writer.append_event(
         "user_message",
         {
             "session_item_id": session_item_id,
-            "branch_binding_id": branch_binding_id,
+            "branch_binding_id": scope.branch_binding_id,
             "agent_run_id": agent_run_id,
             "source_agent_run_id": source_agent_run_id,
             "base_session_item_id": str(payload.get("base_session_item_id") or ""),
             "content": normalized_prompt,
         },
     )
+    return scope.branch_binding_id
 
 
 class RemoteAdminRoutes:
+    def _session_run_start_response_from_scope(
+        self,
+        session: Any,
+        scope: SessionRunControlScopeProof,
+    ) -> SessionRunStartResponse:
+        writer = session.scoped_writer(
+            branch_binding_id=scope.branch_binding_id,
+            agent_run_id=scope.agent_run_id,
+        )
+        agent_run = self.service.runtime_control_plane.get_agent_run(
+            scope.agent_run_id
+        )
+        activation_id = str(getattr(agent_run, "current_activation_id", "") or "")
+        status_payload = writer.status_response_payload(
+            0,
+            agent_run_status=str(agent_run.status.value),
+            activation_id=activation_id,
+            terminal=bool(getattr(agent_run, "is_terminal", False)),
+            selected=scope.selected,
+        )
+        runtime_state = (
+            dict(status_payload.get("runtime_state"))
+            if isinstance(status_payload.get("runtime_state"), dict)
+            else {}
+        )
+        response_agent_id = (
+            str(getattr(agent_run, "agent_id", "") or "").strip()
+            or str(runtime_state.get("agent_id") or "").strip()
+            or str(getattr(session, "agent_id", "") or "").strip()
+        )
+        return SessionRunStartResponse(
+            session_run_id=session.session_run_id,
+            session_id=session.session_id,
+            agent_run_id=scope.agent_run_id,
+            activation_id=activation_id or None,
+            branch_binding_id=scope.branch_binding_id,
+            scope_id=scope.scope_id,
+            selected=scope.selected,
+            agent_id=response_agent_id or None,
+            workflow_mode=session.workflow_mode,
+            runtime_state=runtime_state,
+        )
+
     def _handle_admin(self, path: str) -> None:
         payload = self._read_json()
         principal = self._require_auth_scopes({self._admin_scope_for_path(path)})
@@ -332,6 +417,18 @@ class RemoteAdminRoutes:
                         "agent_runs_unavailable",
                     )
                     return
+                try:
+                    target_branch_binding_id = required_branch_binding_id(
+                        payload.get("branch_binding_id")
+                    )
+                except ValueError as exc:
+                    if str(exc).strip() == "branch_binding_id_required":
+                        self._send_error(
+                            HTTPStatus.BAD_REQUEST,
+                            "branch_binding_id_required",
+                        )
+                        return
+                    raise
                 metadata = (
                     dict(payload.get("metadata", {}))
                     if isinstance(payload.get("metadata"), dict)
@@ -356,10 +453,7 @@ class RemoteAdminRoutes:
                         agent_id=optional_payload_str(payload, "agent_id"),
                         prompt=branch_prompt,
                         task_id=optional_payload_str(payload, "agent_run_id"),
-                        branch_binding_id=optional_payload_str(
-                            payload,
-                            "branch_binding_id",
-                        ),
+                        branch_binding_id=target_branch_binding_id,
                         branch_name=optional_payload_str(payload, "branch_name"),
                         base_ref=optional_payload_str(payload, "base_ref") or "HEAD",
                         permission_recompute_policy=optional_payload_str(
@@ -379,7 +473,7 @@ class RemoteAdminRoutes:
                         select_branch=bool(payload.get("select_branch", True)),
                         metadata=metadata,
                     )
-                    _record_agent_run_branch_projection(
+                    projected_branch_binding_id = _record_agent_run_branch_projection(
                         self.service,
                         payload,
                         agent_run_id=agent_run.id,
@@ -395,15 +489,15 @@ class RemoteAdminRoutes:
                         str(exc) or "invalid AgentRun branch",
                     )
                     return
-                self._send_json(
-                    HTTPStatus.OK,
-                    {
-                        "ok": True,
-                        "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
-                            agent_run.id
-                        ),
-                    },
-                )
+                response = {
+                    "ok": True,
+                    "agent_run": self.service.runtime_control_plane.agent_run_to_dict(
+                        agent_run.id
+                    ),
+                    "branch_binding_id": projected_branch_binding_id
+                    or target_branch_binding_id,
+                }
+                self._send_json(HTTPStatus.OK, response)
                 return
             if path == "/remote/admin/agent-runs/fork":
                 if self.service.runtime_control_plane is None:
@@ -412,6 +506,18 @@ class RemoteAdminRoutes:
                         "agent_runs_unavailable",
                     )
                     return
+                try:
+                    target_branch_binding_id = required_branch_binding_id(
+                        payload.get("branch_binding_id")
+                    )
+                except ValueError as exc:
+                    if str(exc).strip() == "branch_binding_id_required":
+                        self._send_error(
+                            HTTPStatus.BAD_REQUEST,
+                            "branch_binding_id_required",
+                        )
+                        return
+                    raise
                 metadata = (
                     dict(payload.get("metadata", {}))
                     if isinstance(payload.get("metadata"), dict)
@@ -434,10 +540,7 @@ class RemoteAdminRoutes:
                         agent_id=optional_payload_str(payload, "agent_id"),
                         prompt=str(payload.get("prompt") or ""),
                         task_id=optional_payload_str(payload, "agent_run_id"),
-                        branch_binding_id=optional_payload_str(
-                            payload,
-                            "branch_binding_id",
-                        ),
+                        branch_binding_id=target_branch_binding_id,
                         provenance_status=optional_payload_str(
                             payload,
                             "provenance_status",
@@ -810,18 +913,49 @@ class RemoteAdminRoutes:
                         client_request_id,
                     )
                     if existing is not None:
-                        status_payload = existing.status_payload()
+                        try:
+                            binding = self.service.runtime_control_plane.find_session_run_binding(
+                                session_run_id=existing.session_run_id,
+                                branch_binding_id="main",
+                                selected_only=False,
+                            )
+                        except Exception as exc:
+                            self._send_error(
+                                HTTPStatus.SERVICE_UNAVAILABLE,
+                                "session_run_binding_store_unavailable",
+                                str(exc) or "SessionRun binding store is unavailable.",
+                            )
+                            return
+                        scope = (
+                            SessionRunControlScopeProof.from_binding(
+                                session_run_id=existing.session_run_id,
+                                binding=binding,
+                            )
+                            if binding is not None
+                            else None
+                        )
+                        if scope is None:
+                            failure = _session_run_failed_http_error(existing)
+                            if failure is not None:
+                                status, code, message = failure
+                                self._send_error(status, code, message)
+                                return
+                            self._send_error(
+                                HTTPStatus.CONFLICT,
+                                "session_run_scope_proof_invalid",
+                            )
+                            return
+                        try:
+                            response = self._session_run_start_response_from_scope(
+                                existing,
+                                scope,
+                            )
+                        except KeyError:
+                            self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+                            return
                         self._send_json(
                             HTTPStatus.OK,
-                            SessionRunStartResponse(
-                                session_run_id=existing.session_run_id,
-                                session_id=existing.session_id,
-                                agent_id=existing.agent_id,
-                                workflow_mode=existing.workflow_mode,
-                                runtime_state=status_payload.get("runtime_state")
-                                if isinstance(status_payload.get("runtime_state"), dict)
-                                else {},
-                            ).to_dict(),
+                            response.to_dict(),
                         )
                         return
                 runner = CapabilityPackageSessionRunService(
@@ -842,36 +976,48 @@ class RemoteAdminRoutes:
                     if isinstance(runtime_state.get("agent_id"), str)
                     else None,
                     client_request_id=client_request_id,
+                    branch_binding_id="main",
                     runtime_state=runtime_state,
                     locale=locale,
                     initial_prompt=prompt,
                 )
                 if session_id:
                     session.enable_trace_persistence(session_id)
-                session.append_event(
-                    "session_run_start",
-                    {
-                        "prompt": prompt,
-                        "mode": "capability_package",
-                        "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
-                        "agent_id": runtime_state.get("agent_id"),
-                        "session_id": session_id,
-                        "locale": locale,
-                    },
+                start_result = runner.start(session, payload)
+                if start_result.failure is not None:
+                    session.record_start_failure(start_result.failure)
+                    self._send_error(
+                        start_result.failure.status,
+                        start_result.failure.error,
+                        start_result.failure.message,
+                    )
+                    return
+                binding = start_result.binding
+                scope = (
+                    SessionRunControlScopeProof.from_binding(
+                        session_run_id=session.session_run_id,
+                        binding=binding,
+                    )
+                    if binding is not None
+                    else None
                 )
-                session.mark_running()
-                runner.start(session, payload)
+                if scope is None:
+                    self._send_error(
+                        HTTPStatus.CONFLICT,
+                        "session_run_scope_proof_invalid",
+                    )
+                    return
+                try:
+                    response = self._session_run_start_response_from_scope(
+                        session,
+                        scope,
+                    )
+                except KeyError:
+                    self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
+                    return
                 self._send_json(
                     HTTPStatus.OK,
-                    SessionRunStartResponse(
-                        session_run_id=session.session_run_id,
-                        session_id=session.session_id,
-                        agent_id=runtime_state.get("agent_id")
-                        if isinstance(runtime_state.get("agent_id"), str)
-                        else None,
-                        workflow_mode=CAPABILITY_INGEST_WORKFLOW,
-                        runtime_state=runtime_state,
-                    ).to_dict(),
+                    response.to_dict(),
                 )
                 return
             if path == "/remote/admin/capability-packages/candidates/build":

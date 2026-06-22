@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,10 @@ from labrastro_server.services.admin.service import (
     lifecycle_hook_recent_results_from_agent_runs,
 )
 from labrastro_server.services.auth.service import AuthService
+from labrastro_server.services.agent_runtime.session_projection import (
+    agent_run_events_to_session_events,
+)
+from labrastro_server.services.agent_runtime.session_branch_runtime import scope_id_for
 from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyRequest,
     ApprovalReplyResponse,
@@ -65,6 +70,10 @@ from reuleauxcoder.domain.environment_requirements import (
     normalize_environment_placement,
     normalize_environment_requirement_id,
     normalize_environment_requirement_kind,
+)
+from reuleauxcoder.domain.agent.tool_diagnostics import (
+    ToolDiagnosticKind,
+    ToolDiagnosticStage,
 )
 from reuleauxcoder.domain.capability_packages import capability_package_is_active
 from reuleauxcoder.domain.session.locale import session_notice_text
@@ -115,8 +124,56 @@ _COALESCED_SESSION_RUN_EVENTS = frozenset(
     {"assistant_delta", "reasoning_delta", "tool_call_stream"}
 )
 _LIVE_ONLY_SESSION_RUN_EVENTS = frozenset({"document_draft_preview_chunk"})
+_TERMINAL_BRANCH_BINDING_STATUSES = frozenset(
+    {"done", "cancelled", "error", "failed", "interrupted"}
+)
+_ACTIVE_BRANCH_BINDING_STATUSES = frozenset(
+    {"queued", "waiting", "running", "dispatched"}
+)
 _LIVE_EVENT_FLUSH_INTERVAL_SEC = 0.04
 _LIVE_EVENT_MAX_CONTENT_CHARS = 1024
+
+
+def _session_run_branch_status_from_runtime_status(raw_status: Any) -> str:
+    status = str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+    if status in {"queued", "waiting"}:
+        return status
+    if status in {"dispatched", "running"}:
+        return "running"
+    if status in {"completed", "complete", "done"}:
+        return "done"
+    if status == "cancelled":
+        return "cancelled"
+    if status in {"failed", "blocked", "error"}:
+        return "error"
+    return ""
+
+
+def _merged_branch_summary_status(existing: Any, incoming: str) -> str:
+    current = str(existing or "").strip().lower()
+    runtime_status = str(incoming or "").strip().lower()
+    if not runtime_status:
+        return current
+    if current == "failed":
+        current = "error"
+    if current in _TERMINAL_BRANCH_BINDING_STATUSES:
+        return current
+    return runtime_status
+
+
+def _raw_event_ref_keys(value: Any) -> set[tuple[str, str, str]]:
+    if not isinstance(value, list):
+        return set()
+    keys: set[tuple[str, str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        agent_run_id = str(item.get("agent_run_id") or "").strip()
+        seq = str(item.get("seq") or "").strip()
+        event_type = str(item.get("type") or "").strip()
+        if agent_run_id and seq and event_type:
+            keys.add((agent_run_id, seq, event_type))
+    return keys
 
 
 def _is_replayable_session_run_event(event_type: str) -> bool:
@@ -203,6 +260,34 @@ def _optional_float_metric(value: Any) -> float | None:
     return parsed if parsed >= 0 else None
 
 
+def _has_branch_binding_order_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _branch_binding_created_at_order(binding: dict[str, Any], branch_id: str) -> float:
+    raw = binding.get("created_at")
+    if not _has_branch_binding_order_value(raw):
+        raise ValueError(f"branch_binding_created_at_required:{branch_id}")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw).strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"branch_binding_created_at_invalid:{branch_id}") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError(f"branch_binding_created_at_timezone_required:{branch_id}")
+    return timestamp.timestamp()
+
+
 @dataclass
 class _PendingLiveSessionRunEvent:
     key: str
@@ -237,6 +322,7 @@ class _SessionRunEventBuffer:
     _ENVELOPE_PAYLOAD_FIELDS = {
         "approval_id",
         "approvalId",
+        "branch_binding_id",
         "created_at",
         "createdAt",
         "draft_id",
@@ -590,11 +676,12 @@ class _SessionRunProjection:
     _last_live_flush_at: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _approval_resolved_event_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _user_input_resolved_event_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _agent_run_projection_cursors_by_branch: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.session_id is None:
             self.session_id = self.session_hint
-        initial_branch_id = str(self.branch_binding_id or self.selected_branch_binding_id or "main").strip()
+        initial_branch_id = str(self.branch_binding_id or "").strip()
         if initial_branch_id:
             self.branch_binding_id = initial_branch_id
             self.selected_branch_binding_id = initial_branch_id
@@ -636,6 +723,33 @@ class _SessionRunProjection:
             self._flush_live_events_locked(time.time(), force=True)
             return self._event_buffer.snapshot()
 
+    def scoped_writer(
+        self,
+        *,
+        branch_binding_id: str,
+        agent_run_id: str | None = None,
+    ) -> "_ScopedSessionRunWriter":
+        return _ScopedSessionRunWriter(
+            self,
+            branch_binding_id=branch_binding_id,
+            agent_run_id=agent_run_id,
+        )
+
+    def record_start_failure(self, failure: Any) -> int:
+        branch_id = str(self.branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        return self.append_event(
+            "session_run_failed",
+            {
+                "branch_binding_id": branch_id,
+                "operation": "start",
+                "http_status": int(getattr(failure, "status", HTTPStatus.INTERNAL_SERVER_ERROR)),
+                "code": str(getattr(failure, "error", "") or ""),
+                "message": str(getattr(failure, "message", "") or ""),
+            },
+        )
+
     def append_event(
         self, event_type: str, payload: dict[str, Any] | None = None
     ) -> int:
@@ -644,6 +758,9 @@ class _SessionRunProjection:
                 event_type,
                 payload if isinstance(payload, dict) else {},
                 self.locale,
+            )
+            normalized_payload["branch_binding_id"] = (
+                self._event_branch_binding_id_locked(event_type, normalized_payload)
             )
             now = time.time()
             if event_type in _COALESCED_SESSION_RUN_EVENTS:
@@ -671,6 +788,9 @@ class _SessionRunProjection:
                 payload if isinstance(payload, dict) else {},
                 self.locale,
             )
+            normalized_payload["branch_binding_id"] = (
+                self._event_branch_binding_id_locked(event_type, normalized_payload)
+            )
             now = time.time()
             self._flush_live_events_locked(now, force=True)
             seq = self._append_live_only_event_locked(event_type, normalized_payload)
@@ -682,6 +802,290 @@ class _SessionRunProjection:
         with self.cond:
             self._flush_live_events_locked(time.time(), force=True)
             return any(event.get("type") == event_type for event in self._event_buffer.snapshot())
+
+    def has_branch_terminal_event_at_or_before(
+        self,
+        branch_binding_id: str,
+        cursor: int,
+    ) -> bool:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        cursor_value = max(0, int(cursor or 0))
+        with self.cond:
+            self._flush_live_events_locked(time.time(), force=True)
+            for event in self._event_buffer.snapshot():
+                if str(event.get("type") or "") not in {
+                    "session_run_end",
+                    "session_run_failed",
+                    "session_run_cancelled",
+                }:
+                    continue
+                try:
+                    seq = int(event.get("seq") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if seq > cursor_value:
+                    continue
+                payload = event.get("payload")
+                if (
+                    isinstance(payload, dict)
+                    and str(payload.get("branch_binding_id") or "").strip() == branch_id
+                ):
+                    return True
+            return False
+
+    def agent_run_projection_cursor(self, branch_binding_id: str) -> int:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        with self.cond:
+            return int(self._agent_run_projection_cursors_by_branch.get(branch_id, 0) or 0)
+
+    def project_agent_run_events(
+        self,
+        branch_binding_id: str,
+        events: list[Any],
+    ) -> int:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        with self.cond:
+            self._require_branch_binding_locked(branch_id)
+            cursor = int(self._agent_run_projection_cursors_by_branch.get(branch_id, 0) or 0)
+            event_dicts: list[dict[str, Any]] = []
+            max_seq = cursor
+            for event in events:
+                raw = event.to_dict() if hasattr(event, "to_dict") else event
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    seq = int(raw.get("seq") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if seq <= cursor:
+                    continue
+                event_dict = dict(raw)
+                event_dicts.append(event_dict)
+                max_seq = max(max_seq, seq)
+            if not event_dicts:
+                return 0
+
+            projected = agent_run_events_to_session_events(event_dicts)
+            projected_count = 0
+            projected_has_end = False
+            had_start = self._has_event_type_locked("session_run_start", branch_id)
+            for event_type, payload in projected:
+                if event_type == "session_run_start" and had_start:
+                    continue
+                scoped_payload = dict(payload)
+                scoped_payload["branch_binding_id"] = branch_id
+                if self._has_projected_raw_event_locked(
+                    event_type,
+                    scoped_payload,
+                    branch_id,
+                ):
+                    continue
+                self._append_event_locked(event_type, scoped_payload)
+                self._update_status_for_event_locked(event_type, scoped_payload)
+                projected_count += 1
+                if event_type == "session_run_start":
+                    had_start = True
+                if event_type == "session_run_end":
+                    projected_has_end = True
+
+            terminal_event = self._last_terminal_agent_run_event(event_dicts)
+            if terminal_event is not None and not projected_has_end:
+                terminal_type = str(terminal_event.get("type") or "")
+                terminal_payload = (
+                    terminal_event.get("payload")
+                    if isinstance(terminal_event.get("payload"), dict)
+                    else {}
+                )
+                if terminal_type == "completed" and not self._has_event_type_locked(
+                    "session_run_end",
+                    branch_id,
+                ):
+                    self._append_event_locked(
+                        "session_run_end",
+                        {
+                            "response": self._terminal_agent_run_response(terminal_payload),
+                            "response_rendered": True,
+                            "branch_binding_id": branch_id,
+                            "agent_run_id": str(terminal_event.get("agent_run_id") or ""),
+                        },
+                    )
+                    self._update_status_for_event_locked(
+                        "session_run_end",
+                        {
+                            "branch_binding_id": branch_id,
+                            "agent_run_id": str(terminal_event.get("agent_run_id") or ""),
+                        },
+                    )
+                    projected_count += 1
+                elif terminal_type == "cancelled" and not self._has_event_type_locked(
+                    "session_run_cancelled",
+                    branch_id,
+                ):
+                    cancel_payload = {
+                        "reason": self._terminal_agent_run_response(terminal_payload)
+                        or "cancelled",
+                        "status": terminal_type,
+                        "branch_binding_id": branch_id,
+                        "agent_run_id": str(terminal_event.get("agent_run_id") or ""),
+                    }
+                    self._append_event_locked(
+                        "session_run_cancelled",
+                        cancel_payload,
+                    )
+                    self._update_status_for_event_locked(
+                        "session_run_cancelled",
+                        cancel_payload,
+                    )
+                    projected_count += 1
+                elif terminal_type in {"failed", "blocked"} and not self._has_event_type_locked(
+                    "session_run_failed",
+                    branch_id,
+                ):
+                    failure_payload = {
+                        "message": self._terminal_agent_run_response(terminal_payload)
+                        or terminal_type,
+                        "code": "REMOTE_CHAT_ERROR",
+                        "status": terminal_type,
+                        "branch_binding_id": branch_id,
+                        "agent_run_id": str(terminal_event.get("agent_run_id") or ""),
+                    }
+                    failure_payload.update(
+                        self._terminal_agent_run_failure_diagnostics(terminal_payload)
+                    )
+                    self._append_event_locked(
+                        "session_run_failed",
+                        failure_payload,
+                    )
+                    self._update_status_for_event_locked(
+                        "session_run_failed",
+                        failure_payload,
+                    )
+                    projected_count += 1
+
+            self._agent_run_projection_cursors_by_branch[branch_id] = max_seq
+            if projected_count:
+                self.last_activity_at = time.time()
+                self.cond.notify_all()
+            return projected_count
+
+    def _has_event_type_locked(self, event_type: str, branch_binding_id: str | None = None) -> bool:
+        branch_id = str(branch_binding_id or "").strip()
+        for event in self._event_buffer.snapshot():
+            if event.get("type") != event_type:
+                continue
+            if not branch_id:
+                return True
+            payload = event.get("payload")
+            if isinstance(payload, dict) and str(payload.get("branch_binding_id") or "").strip() == branch_id:
+                return True
+        return False
+
+    def _has_projected_raw_event_locked(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        branch_binding_id: str,
+    ) -> bool:
+        refs = _raw_event_ref_keys(payload.get("raw_event_refs"))
+        if not refs:
+            return False
+        branch_id = str(branch_binding_id or "").strip()
+        for event in self._event_buffer.snapshot():
+            if str(event.get("type") or "") != event_type:
+                continue
+            event_payload = event.get("payload")
+            if not isinstance(event_payload, dict):
+                continue
+            if str(event_payload.get("branch_binding_id") or "").strip() != branch_id:
+                continue
+            if refs.intersection(_raw_event_ref_keys(event_payload.get("raw_event_refs"))):
+                return True
+        return False
+
+    @staticmethod
+    def _last_terminal_agent_run_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for event in reversed(events):
+            if str(event.get("type") or "") in {"completed", "failed", "cancelled", "blocked"}:
+                return event
+        return None
+
+    @staticmethod
+    def _terminal_agent_run_response(payload: dict[str, Any]) -> str:
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        agent_run = payload.get("agent_run") if isinstance(payload.get("agent_run"), dict) else {}
+        for value in (
+            result.get("output"),
+            result.get("error"),
+            payload.get("error"),
+            payload.get("message"),
+            agent_run.get("output"),
+            agent_run.get("failure_reason"),
+            agent_run.get("cancel_reason"),
+        ):
+            text = str(value or "")
+            if text.strip():
+                return text
+        return ""
+
+    @staticmethod
+    def _terminal_agent_run_failure_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        events = result.get("events") if isinstance(result.get("events"), list) else []
+        diagnostic_keys = {
+            "code",
+            "error_type",
+            "failure_kind",
+            "provider_error_phase",
+            "diagnostic_path",
+            "provider_id",
+            "provider_type",
+            "recoverable",
+            "tool_call_id",
+            "tool_diagnostics",
+            "tool_name",
+            "upstream_status",
+        }
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("type") or "") != "error":
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            diagnostics = {
+                key: value
+                for key, value in data.items()
+                if key in diagnostic_keys and value not in (None, "")
+            }
+            if isinstance(diagnostics.get("tool_diagnostics"), list):
+                diagnostics["tool_diagnostics"] = [
+                    _SessionRunProjection._terminal_failure_tool_diagnostic(item)
+                    for item in diagnostics["tool_diagnostics"]
+                    if isinstance(item, dict)
+                ]
+            return diagnostics
+        return {}
+
+    @staticmethod
+    def _terminal_failure_tool_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+        out = dict(diagnostic)
+        source_stage = str(out.get("stage") or "").strip()
+        source_kind = str(out.get("kind") or "").strip()
+        metadata = dict(out.get("metadata")) if isinstance(out.get("metadata"), dict) else {}
+        if source_stage and source_stage != ToolDiagnosticStage.CHAT.value:
+            metadata.setdefault("source_stage", source_stage)
+        if source_kind and source_kind != ToolDiagnosticKind.CHAT_TERMINAL_ERROR.value:
+            metadata.setdefault("source_kind", source_kind)
+        if metadata:
+            out["metadata"] = metadata
+        out["stage"] = ToolDiagnosticStage.CHAT.value
+        out["kind"] = ToolDiagnosticKind.CHAT_TERMINAL_ERROR.value
+        return out
 
     def ensure_session_run_start(self, prompt: str | None = None) -> int | None:
         if self.has_event_type("session_run_start"):
@@ -726,6 +1130,11 @@ class _SessionRunProjection:
         if not branch_id:
             return
         existing = self.branch_bindings.get(branch_id)
+        existing_created_at = (
+            existing.get("created_at")
+            if isinstance(existing, dict)
+            else None
+        )
         if isinstance(existing, dict):
             merged = {**existing, **data}
             metadata = {}
@@ -735,6 +1144,14 @@ class _SessionRunProjection:
                 metadata.update(data["metadata"])
             merged["metadata"] = metadata
             data = merged
+        if not _has_branch_binding_order_value(data.get("created_at")):
+            data["created_at"] = (
+                existing_created_at
+                if _has_branch_binding_order_value(existing_created_at)
+                else time.time()
+            )
+        if not _has_branch_binding_order_value(data.get("updated_at")):
+            data["updated_at"] = time.time()
         if data.get("selected"):
             for item in self.branch_bindings.values():
                 item["selected"] = False
@@ -770,6 +1187,7 @@ class _SessionRunProjection:
             "source_agent_run_id": str(value("source_agent_run_id") or ""),
             "target_agent_run_id": str(value("target_agent_run_id") or value("agent_run_id") or ""),
             "status": str(status_value or "active"),
+            "last_error": value("last_error", None),
             "created_at": value("created_at", None),
             "updated_at": value("updated_at", None),
             "metadata": dict(metadata) if isinstance(metadata, dict) else {},
@@ -778,7 +1196,7 @@ class _SessionRunProjection:
     def _append_event_locked(self, event_type: str, payload: dict[str, Any]) -> int:
         seq = self.seq_next
         self.seq_next += 1
-        payload = self._session_event_payload_locked(payload, seq)
+        payload = self._session_event_payload_locked(event_type, payload, seq)
         payload = _payload_with_server_enqueue_metrics(payload, time.time())
         event = {
             "session_run_id": self.session_run_id,
@@ -796,32 +1214,36 @@ class _SessionRunProjection:
         self._persist_or_queue_trace_event(durable_event)
         return seq
 
-    def _session_event_payload_locked(self, payload: dict[str, Any], seq: int) -> dict[str, Any]:
+    def _session_event_payload_locked(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        seq: int,
+    ) -> dict[str, Any]:
         out = dict(payload)
-        branch_id = str(
-            out.get("branch_binding_id")
-            or self.selected_branch_binding_id
-            or self.branch_binding_id
-            or "main"
-        ).strip()
-        if branch_id:
-            out["branch_binding_id"] = branch_id
-            self.branch_bindings.setdefault(
-                branch_id,
-                {
-                    "branch_binding_id": branch_id,
-                    "agent_run_id": str(self.agent_run_id or ""),
-                    "selected": branch_id == self.selected_branch_binding_id,
-                    "status": "active",
-                    "parent_branch_binding_id": "",
-                    "base_session_item_id": "",
-                    "source_agent_run_id": "",
-                    "target_agent_run_id": str(self.agent_run_id or ""),
-                    "created_at": time.time(),
-                    "updated_at": time.time(),
-                    "metadata": {},
-                },
-            )
+        branch_id = self._payload_branch_binding_id_locked(out)
+        out["branch_binding_id"] = branch_id
+        if branch_id not in self.branch_bindings:
+            if event_type != "session_run_start":
+                raise ValueError("session_run_branch_binding_not_found")
+            self.branch_bindings[branch_id] = {
+                "branch_binding_id": branch_id,
+                "agent_run_id": str(self.agent_run_id or ""),
+                "selected": branch_id == self.selected_branch_binding_id,
+                "status": "active",
+                "parent_branch_binding_id": "",
+                "base_session_item_id": "",
+                "source_agent_run_id": "",
+                "target_agent_run_id": str(self.agent_run_id or ""),
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "metadata": {},
+            }
+        elif event_type != "session_run_start" and not (
+            event_type == "session_run_failed"
+            and str(out.get("operation") or "").strip() == "start"
+        ):
+            self._require_branch_binding_locked(branch_id)
         session_item_id = str(
             out.get("session_item_id")
             or out.get("item_id")
@@ -833,6 +1255,20 @@ class _SessionRunProjection:
         out["session_item_id"] = session_item_id
         return out
 
+    def _event_branch_binding_id_locked(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> str:
+        branch_id = str(payload.get("branch_binding_id") or "").strip()
+        if branch_id:
+            return branch_id
+        if event_type == "session_run_start":
+            initial_branch_id = str(self.branch_binding_id or "").strip()
+            if initial_branch_id:
+                return initial_branch_id
+        raise ValueError("branch_binding_id_required")
+
     def _append_live_only_event_locked(
         self,
         event_type: str,
@@ -840,7 +1276,7 @@ class _SessionRunProjection:
     ) -> int:
         seq = self.seq_next
         self.seq_next += 1
-        payload = self._session_event_payload_locked(payload, seq)
+        payload = self._session_event_payload_locked(event_type, payload, seq)
         payload = _payload_with_server_enqueue_metrics(payload, time.time())
         event = {
             "session_run_id": self.session_run_id,
@@ -854,17 +1290,27 @@ class _SessionRunProjection:
     def _append_approval_resolved_event_locked(self, payload: dict[str, Any]) -> int:
         approval_id = str(payload.get("approval_id") or "")
         if approval_id:
-            if approval_id in self._approval_resolved_event_ids:
+            resolved_event_key = self._payload_scoped_state_key_locked(
+                payload,
+                "approval_resolved",
+                approval_id,
+            )
+            if resolved_event_key in self._approval_resolved_event_ids:
                 return self._event_buffer.latest_seq
-            self._approval_resolved_event_ids.add(approval_id)
+            self._approval_resolved_event_ids.add(resolved_event_key)
         return self._append_event_locked("approval_resolved", payload)
 
     def _append_user_input_resolved_event_locked(self, payload: dict[str, Any]) -> int:
         input_id = str(payload.get("input_id") or "")
         if input_id:
-            if input_id in self._user_input_resolved_event_ids:
+            resolved_event_key = self._payload_scoped_state_key_locked(
+                payload,
+                "user_input_resolved",
+                input_id,
+            )
+            if resolved_event_key in self._user_input_resolved_event_ids:
                 return self._event_buffer.latest_seq
-            self._user_input_resolved_event_ids.add(input_id)
+            self._user_input_resolved_event_ids.add(resolved_event_key)
         return self._append_event_locked("user_input_resolved", payload)
 
     def _append_live_event_locked(
@@ -874,7 +1320,7 @@ class _SessionRunProjection:
         if not content:
             return self._event_buffer.latest_seq
         self._flush_live_events_locked(now)
-        key = self._live_event_key(event_type, payload)
+        key = self._live_event_key_locked(event_type, payload)
         last_flush_at = self._last_live_flush_at.get(key, 0.0)
         if now - last_flush_at >= _LIVE_EVENT_FLUSH_INTERVAL_SEC:
             seq = self._append_event_locked(event_type, dict(payload))
@@ -960,6 +1406,9 @@ class _SessionRunProjection:
         cursor: int,
         branch_binding_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
+        target_branch_id = str(branch_binding_id or "").strip()
+        if not target_branch_id:
+            raise ValueError("branch_binding_id_required")
         durable_events, durable_cursor = self._event_buffer.events_after(cursor)
         live_events, live_cursor = self._live_event_buffer.events_after(cursor)
         events = sorted(
@@ -967,15 +1416,14 @@ class _SessionRunProjection:
             key=lambda event: int(event.get("seq", 0) or 0),
         )
         events = [_hydrate_stream_event_payload(event) for event in events]
-        target_branch_id = str(branch_binding_id or "").strip()
+        events = [
+            self._scope_events_lost_event(event, target_branch_id)
+            for event in events
+        ]
         events = [
             event
             for event in events
-            if (
-                self._event_visible_in_branch_locked(event, target_branch_id)
-                if target_branch_id
-                else self._event_visible_in_selected_branch_locked(event)
-            )
+            if self._event_visible_in_branch_locked(event, target_branch_id)
         ]
         next_cursor = max(cursor, durable_cursor, live_cursor)
         if events:
@@ -985,11 +1433,16 @@ class _SessionRunProjection:
             )
         return events, next_cursor
 
-    def _event_visible_in_selected_branch_locked(self, event: dict[str, Any]) -> bool:
-        selected_branch_id = str(
-            self.selected_branch_binding_id or self.branch_binding_id or "main"
-        ).strip()
-        return self._event_visible_in_branch_locked(event, selected_branch_id)
+    @staticmethod
+    def _scope_events_lost_event(
+        event: dict[str, Any],
+        branch_binding_id: str,
+    ) -> dict[str, Any]:
+        if str(event.get("type") or "") != "events_lost":
+            return event
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        scoped_payload = {**payload, "branch_binding_id": branch_binding_id}
+        return {**event, "payload": scoped_payload}
 
     def _event_visible_in_branch_locked(
         self,
@@ -1000,7 +1453,9 @@ class _SessionRunProjection:
         if not selected_branch_id:
             return True
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        event_branch_id = str(payload.get("branch_binding_id") or selected_branch_id).strip()
+        event_branch_id = str(payload.get("branch_binding_id") or "").strip()
+        if not event_branch_id:
+            return False
         if event_branch_id == selected_branch_id:
             return True
         ancestor_limits = self._selected_branch_ancestor_limits_locked(selected_branch_id)
@@ -1053,12 +1508,7 @@ class _SessionRunProjection:
         normalized_prompt = str(prompt or "").strip()
         with self.cond:
             self._flush_live_events_locked(time.time(), force=True)
-            source_branch_id = str(
-                source_branch_binding_id
-                or self.selected_branch_binding_id
-                or self.branch_binding_id
-                or "main"
-            ).strip()
+            source_branch_id = str(source_branch_binding_id or "").strip()
             base_item_id = str(base_session_item_id or "").strip()
             if not source_branch_id:
                 return normalized_prompt
@@ -1110,13 +1560,11 @@ class _SessionRunProjection:
 
     def _branch_summaries_locked(self, cursor: int = 0) -> list[dict[str, Any]]:
         self._flush_live_events_locked(time.time(), force=True)
-        selected_branch_id = str(
-            self.selected_branch_binding_id or self.branch_binding_id or "main"
-        ).strip()
+        selected_branch_id = str(self.selected_branch_binding_id or "").strip()
         event_stats: dict[str, dict[str, Any]] = {}
         for event in self._event_buffer.snapshot():
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            branch_id = str(payload.get("branch_binding_id") or "main").strip()
+            branch_id = str(payload.get("branch_binding_id") or "").strip()
             if not branch_id:
                 continue
             seq = int(event.get("seq", 0) or 0)
@@ -1128,27 +1576,24 @@ class _SessionRunProjection:
         for waiter in self.approval_waiters.values():
             if waiter.get("done"):
                 continue
-            branch_id = self._waiter_branch_binding_id(waiter) or selected_branch_id
+            branch_id = self._waiter_branch_binding_id(waiter)
+            if not branch_id:
+                continue
             pending_approvals[branch_id] = pending_approvals.get(branch_id, 0) + 1
         pending_user_inputs: dict[str, int] = {}
         for waiter in self.user_input_waiters.values():
             if waiter.get("done"):
                 continue
-            branch_id = self._waiter_branch_binding_id(waiter) or selected_branch_id
+            branch_id = self._waiter_branch_binding_id(waiter)
+            if not branch_id:
+                continue
             pending_user_inputs[branch_id] = pending_user_inputs.get(branch_id, 0) + 1
-        bindings = dict(self.branch_bindings)
-        if selected_branch_id and selected_branch_id not in bindings:
-            bindings[selected_branch_id] = {
-                "branch_binding_id": selected_branch_id,
-                "agent_run_id": str(self.agent_run_id or ""),
-                "selected": True,
-                "status": "active",
-                "parent_branch_binding_id": "",
-                "base_session_item_id": "",
-                "source_agent_run_id": "",
-                "target_agent_run_id": str(self.agent_run_id or ""),
-                "metadata": {},
-            }
+        bindings = {
+            branch_id: binding
+            for branch_id, binding in self.branch_bindings.items()
+            if isinstance(binding, dict)
+            and str(binding.get("agent_run_id") or "").strip()
+        }
         sibling_groups: dict[tuple[str, str], list[str]] = {}
         for branch_id, binding in bindings.items():
             group_key = (
@@ -1157,9 +1602,20 @@ class _SessionRunProjection:
             )
             sibling_groups.setdefault(group_key, []).append(branch_id)
         for siblings in sibling_groups.values():
-            siblings.sort()
+            siblings.sort(
+                key=lambda branch_id: self._branch_binding_summary_order_key_locked(
+                    bindings[branch_id],
+                    branch_id,
+                )
+            )
         summaries: list[dict[str, Any]] = []
-        for branch_id in sorted(bindings):
+        for branch_id in sorted(
+            bindings,
+            key=lambda branch_id: self._branch_binding_summary_order_key_locked(
+                bindings[branch_id],
+                branch_id,
+            ),
+        ):
             binding = bindings[branch_id]
             stats = event_stats.get(branch_id, {})
             group_key = (
@@ -1182,6 +1638,7 @@ class _SessionRunProjection:
                     "target_agent_run_id": str(binding.get("target_agent_run_id") or ""),
                     "selected": branch_id == selected_branch_id,
                     "status": str(binding.get("status") or "active"),
+                    "finished_at": binding.get("finished_at"),
                     "has_updates": branch_id != selected_branch_id and last_seq > int(cursor or 0),
                     "last_seq": last_seq,
                     "last_event_at": stats.get("last_event_at"),
@@ -1196,21 +1653,39 @@ class _SessionRunProjection:
             )
         return summaries
 
+    def _branch_binding_summary_order_key_locked(
+        self,
+        binding: dict[str, Any],
+        branch_id: str,
+    ) -> tuple[float, str]:
+        return (_branch_binding_created_at_order(binding, branch_id), branch_id)
+
     def _status_next_cursor_locked(self, cursor: int) -> int:
         return max(cursor, self._latest_stream_seq_locked())
 
-    @staticmethod
-    def _live_event_key(event_type: str, payload: dict[str, Any]) -> str:
+    def _live_event_key_locked(self, event_type: str, payload: dict[str, Any]) -> str:
+        branch_id = self._payload_branch_binding_id_locked(payload)
+        self._require_branch_binding_locked(branch_id)
+        agent_run_id = str(payload.get("agent_run_id") or "").strip()
+        binding = self.branch_bindings.get(branch_id)
+        if not agent_run_id and isinstance(binding, dict):
+            agent_run_id = str(binding.get("agent_run_id") or "").strip()
         if event_type != "tool_call_stream":
-            return event_type
-        return ":".join(
-            [
+            return self._scoped_state_key_locked(
+                branch_id,
+                "live_event",
+                agent_run_id,
                 event_type,
-                str(payload.get("tool_call_id") or ""),
-                str(payload.get("tool_name") or ""),
-                str(payload.get("stream") or ""),
-                str(payload.get("format") or ""),
-            ]
+            )
+        return self._scoped_state_key_locked(
+            branch_id,
+            "live_event",
+            agent_run_id,
+            event_type,
+            str(payload.get("tool_call_id") or ""),
+            str(payload.get("tool_name") or ""),
+            str(payload.get("stream") or ""),
+            str(payload.get("format") or ""),
         )
 
     def _update_status_for_event_locked(
@@ -1222,6 +1697,12 @@ class _SessionRunProjection:
             message = payload.get("message")
             status = "error"
             last_error = str(message) if message is not None else "error"
+        elif event_type == "session_run_end":
+            status = "done"
+        elif event_type == "session_run_failed":
+            message = payload.get("message") or payload.get("code")
+            status = "error"
+            last_error = str(message) if message is not None else "session_run_failed"
         elif event_type == "session_run_cancelled":
             reason = payload.get("reason")
             status = "cancelled"
@@ -1235,17 +1716,29 @@ class _SessionRunProjection:
         if status is None:
             return
         branch_id = self._payload_branch_binding_id_locked(payload)
-        binding = self.branch_bindings.get(branch_id)
-        if isinstance(binding, dict):
-            binding["status"] = status
-            binding["updated_at"] = time.time()
+        self._mark_branch_binding_status_locked(
+            branch_id,
+            status,
+            time.time(),
+            last_error=last_error,
+        )
         selected_branch_id = str(
-            self.selected_branch_binding_id or self.branch_binding_id or "main"
+            self.selected_branch_binding_id or ""
         ).strip()
         if branch_id and branch_id != selected_branch_id:
             return
         self.status = status
         self.last_error = last_error
+        if event_type in {
+            "session_run_end",
+            "session_run_failed",
+            "session_run_cancelled",
+            "session_run_interrupted",
+        }:
+            self.running = False
+            self.done = True
+            if self.finished_at is None:
+                self.finished_at = time.time()
 
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
         if not _is_replayable_session_run_event(str(event.get("type") or "")):
@@ -1355,21 +1848,104 @@ class _SessionRunProjection:
     def _events_wait_done_locked(self, branch_binding_id: str | None = None) -> bool:
         target_branch_id = str(branch_binding_id or "").strip()
         if not target_branch_id:
-            return self.done
+            raise ValueError("branch_binding_id_required")
         binding = self.branch_bindings.get(target_branch_id)
         if isinstance(binding, dict):
             status = str(binding.get("status") or "").strip().lower()
-            if status in {"done", "cancelled", "error", "failed", "interrupted"}:
+            if status in _TERMINAL_BRANCH_BINDING_STATUSES:
                 return True
-        selected_branch_id = str(
-            self.selected_branch_binding_id or self.branch_binding_id or "main"
-        ).strip()
-        return self.done and target_branch_id == selected_branch_id
+        return False
 
-    def mark_running(self) -> None:
+    def _mark_branch_binding_status_locked(
+        self,
+        branch_binding_id: str | None,
+        status: str,
+        updated_at: float,
+        *,
+        last_error: str | None = None,
+    ) -> None:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            return
+        binding = self.branch_bindings.get(branch_id)
+        if isinstance(binding, dict):
+            binding["status"] = status
+            binding["updated_at"] = updated_at
+            if str(status or "").strip().lower() in _TERMINAL_BRANCH_BINDING_STATUSES:
+                binding["finished_at"] = updated_at
+            else:
+                binding.pop("finished_at", None)
+            if last_error is not None:
+                binding["last_error"] = last_error
+
+    def _branch_runtime_status_locked(self, branch_binding_id: str) -> dict[str, Any]:
+        branch_id = str(branch_binding_id or "").strip()
+        binding = self.branch_bindings.get(branch_id)
+        if not isinstance(binding, dict):
+            raise ValueError("session_run_branch_binding_not_found")
+        status = str(binding.get("status") or "active").strip() or "active"
+        last_error = binding.get("last_error")
+        normalized = status.lower()
+        done = normalized in _TERMINAL_BRANCH_BINDING_STATUSES
+        running = normalized in _ACTIVE_BRANCH_BINDING_STATUSES
+        finished_at = binding.get("finished_at")
+        if done and finished_at is None:
+            finished_at = binding.get("updated_at")
+        return {
+            "status": status,
+            "running": running,
+            "done": done,
+            "reconnectable": not done,
+            "error": str(last_error) if last_error is not None else None,
+            "finished_at": finished_at if done else None,
+        }
+
+    def _require_branch_binding_locked(self, branch_binding_id: str) -> dict[str, Any]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        binding = self.branch_bindings.get(branch_id)
+        if not isinstance(binding, dict):
+            raise ValueError("session_run_branch_binding_not_found")
+        if not str(binding.get("agent_run_id") or "").strip():
+            raise ValueError("session_run_branch_agent_run_required")
+        return binding
+
+    def _branch_close_reason_locked(
+        self,
+        branch_binding_id: str,
+        reason: str | None,
+    ) -> str:
+        explicit_reason = str(reason or "").strip()
+        if explicit_reason:
+            return explicit_reason
+        cancel_state = self.cancel_requests_by_branch.get(branch_binding_id)
+        if isinstance(cancel_state, dict):
+            cancel_reason = str(cancel_state.get("reason") or "").strip()
+            if cancel_reason:
+                return cancel_reason
+        binding = self.branch_bindings.get(branch_binding_id)
+        if isinstance(binding, dict):
+            last_error = str(binding.get("last_error") or "").strip()
+            if last_error:
+                return last_error
+        return "session_run_closed"
+
+    def mark_running(self, *, branch_binding_id: str | None = None) -> None:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         with self.cond:
-            self.running = True
-            self.status = "running"
+            self._require_branch_binding_locked(branch_id)
+            selected_branch_id = str(self.selected_branch_binding_id or "").strip()
+            self._mark_branch_binding_status_locked(
+                branch_id,
+                "running",
+                time.time(),
+            )
+            if branch_id == selected_branch_id:
+                self.running = True
+                self.status = "running"
             self.last_activity_at = time.time()
 
     def mark_done(
@@ -1378,31 +1954,168 @@ class _SessionRunProjection:
         *,
         branch_binding_id: str | None = None,
     ) -> None:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         with self.cond:
+            self._require_branch_binding_locked(branch_id)
             self._flush_live_events_locked(time.time(), force=True)
-            close_reason = (
-                reason
-                or self.cancel_reason
-                or self.last_error
-                or "session_run_closed"
-            )
+            close_reason = self._branch_close_reason_locked(branch_id, reason)
             for event_payload in self._cancel_pending_approvals_locked(
                 close_reason,
-                branch_binding_id,
+                branch_id,
             ):
                 self._append_approval_resolved_event_locked(event_payload)
             for event_payload in self._cancel_pending_user_inputs_locked(
                 close_reason,
-                branch_binding_id,
+                branch_id,
             ):
                 self._append_user_input_resolved_event_locked(event_payload)
-            self.running = False
-            self.done = True
-            if self.status not in {"error", "cancelled", "interrupted"}:
-                self.status = "done"
-            self.finished_at = time.time()
-            self.last_activity_at = self.finished_at
+            selected_branch_id = str(self.selected_branch_binding_id or "").strip()
+            binding = self.branch_bindings.get(branch_id)
+            branch_status = (
+                str(binding.get("status") or "active").strip().lower()
+                if isinstance(binding, dict)
+                else "active"
+            )
+            if branch_id == selected_branch_id:
+                self.running = False
+                self.done = True
+                if self.status not in {"error", "cancelled", "interrupted"}:
+                    self.status = "done"
+                branch_status = self.status
+            elif branch_status not in {"error", "cancelled", "interrupted"}:
+                branch_status = "done"
+            finished_at = time.time()
+            if branch_id == selected_branch_id:
+                self.finished_at = finished_at
+            self._mark_branch_binding_status_locked(
+                branch_id,
+                branch_status,
+                finished_at,
+                last_error=close_reason if branch_status != "done" else None,
+            )
+            self.last_activity_at = finished_at
             self.cond.notify_all()
+
+    def apply_selected_runtime_scope(
+        self,
+        *,
+        branch_binding_id: str,
+        agent_run_id: str,
+        activation_id: str | None = None,
+        runtime_status: Any = "",
+        terminal: bool | None = None,
+        reset_terminal: bool = False,
+        runtime_state_updates: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        scoped_agent_run_id = str(agent_run_id or "").strip()
+        if not scoped_agent_run_id:
+            raise ValueError("agent_run_id_required")
+        with self.cond:
+            binding = self._require_branch_binding_locked(branch_id)
+            binding_agent_run_id = str(binding.get("agent_run_id") or "").strip()
+            if not binding_agent_run_id:
+                raise ValueError("session_run_branch_agent_run_required")
+            if scoped_agent_run_id != binding_agent_run_id:
+                raise ValueError("agent_run_id_mismatch")
+            self.agent_run_id = scoped_agent_run_id
+            self.branch_binding_id = branch_id
+            if reset_terminal:
+                self.done = False
+                self.finished_at = None
+            self._apply_branch_runtime_status_locked(
+                branch_id,
+                runtime_status,
+                terminal=terminal,
+                selected=True,
+            )
+            runtime_state = dict(self.runtime_state)
+            if isinstance(runtime_state_updates, dict):
+                runtime_state.update(runtime_state_updates)
+            runtime_state.update(
+                {
+                    "agent_run_id": scoped_agent_run_id,
+                    "activation_id": str(activation_id or ""),
+                    "branch_binding_id": branch_id,
+                    "scope_id": scope_id_for(self.session_run_id, branch_id),
+                }
+            )
+            self.runtime_state = runtime_state
+            self.last_activity_at = time.time()
+            self.cond.notify_all()
+            return dict(runtime_state)
+
+    def apply_branch_runtime_status(
+        self,
+        branch_binding_id: str,
+        runtime_status: Any,
+        *,
+        terminal: bool | None = None,
+        selected: bool = False,
+    ) -> str:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        with self.cond:
+            status = self._apply_branch_runtime_status_locked(
+                branch_id,
+                runtime_status,
+                terminal=terminal,
+                selected=selected,
+            )
+            self.last_activity_at = time.time()
+            self.cond.notify_all()
+            return status
+
+    def _apply_branch_runtime_status_locked(
+        self,
+        branch_binding_id: str,
+        runtime_status: Any,
+        *,
+        terminal: bool | None = None,
+        selected: bool = False,
+    ) -> str:
+        branch_id = str(branch_binding_id or "").strip()
+        binding = self._require_branch_binding_locked(branch_id)
+        branch_runtime_status = _session_run_branch_status_from_runtime_status(
+            runtime_status
+        )
+        if not branch_runtime_status:
+            return ""
+        now = time.time()
+        merged_status = _merged_branch_summary_status(
+            binding.get("status"),
+            branch_runtime_status,
+        )
+        self._mark_branch_binding_status_locked(branch_id, merged_status, now)
+        branch_done = bool(terminal) or merged_status in {
+            "done",
+            "cancelled",
+            "error",
+            "interrupted",
+        }
+        selected_branch_id = str(self.selected_branch_binding_id or "").strip()
+        if selected or branch_id == selected_branch_id:
+            self.status = merged_status
+            self.running = (
+                not branch_done
+                and merged_status in _ACTIVE_BRANCH_BINDING_STATUSES
+            )
+            self.done = branch_done
+            if branch_done:
+                if self.finished_at is None:
+                    self.finished_at = now
+            else:
+                self.finished_at = None
+            if merged_status in {"error", "cancelled", "interrupted"}:
+                self.last_error = str(binding.get("last_error") or "").strip() or None
+            else:
+                self.last_error = None
+        return merged_status
 
     def is_stale(self, now: float, *, closed_ttl_sec: float, idle_ttl_sec: float) -> bool:
         if self.done and self.finished_at is not None:
@@ -1421,21 +2134,35 @@ class _SessionRunProjection:
         cursor = max(0, int(cursor or 0))
         with self.cond:
             next_cursor = self._status_next_cursor_locked(cursor)
-            target_branch_id = str(
-                branch_binding_id
-                or self.selected_branch_binding_id
-                or self.branch_binding_id
-                or ""
-            ).strip()
+            target_branch_id = str(branch_binding_id or "").strip()
+            if not target_branch_id:
+                raise ValueError("branch_binding_id_required")
+            binding = self.branch_bindings.get(target_branch_id)
+            if not isinstance(binding, dict):
+                raise ValueError("session_run_branch_binding_not_found")
+            branch_runtime = self._branch_runtime_status_locked(target_branch_id)
+            branch_agent_run_id = (
+                str(binding.get("agent_run_id") or "").strip()
+            )
+            if not branch_agent_run_id:
+                raise ValueError("session_run_branch_agent_run_required")
+            runtime_state = dict(self.runtime_state)
+            runtime_state.update(
+                {
+                    "agent_run_id": branch_agent_run_id,
+                    "branch_binding_id": target_branch_id,
+                    "scope_id": scope_id_for(self.session_run_id, target_branch_id),
+                }
+            )
             recovery_ticket = self._recovery_ticket_for_branch_locked(target_branch_id)
             return {
                 "ok": True,
                 "session_run_id": self.session_run_id,
                 "peer_id": self.peer_id,
-                "status": self.status,
-                "running": self.running,
-                "done": self.done,
-                "reconnectable": not self.done,
+                "status": branch_runtime["status"],
+                "running": branch_runtime["running"],
+                "done": branch_runtime["done"],
+                "reconnectable": branch_runtime["reconnectable"],
                 "cursor": cursor,
                 "next_cursor": next_cursor,
                 "first_available_seq": self._first_available_stream_seq_locked(),
@@ -1446,13 +2173,13 @@ class _SessionRunProjection:
                 "workflow_mode": self.workflow_mode,
                 "taskflow_id": self.taskflow_id,
                 "agent_id": self.agent_id,
-                "agent_run_id": self.agent_run_id,
-                "branch_binding_id": target_branch_id or self.branch_binding_id,
-                "runtime_state": dict(self.runtime_state),
+                "agent_run_id": branch_agent_run_id,
+                "branch_binding_id": target_branch_id,
+                "runtime_state": runtime_state,
                 "created_at": self.created_at,
                 "last_activity_at": self.last_activity_at,
-                "finished_at": self.finished_at,
-                "error": self.last_error,
+                "finished_at": branch_runtime["finished_at"],
+                "error": branch_runtime["error"],
                 "recovery": dict(recovery_ticket) if recovery_ticket else None,
                 "approvals": self._pending_approvals_locked(target_branch_id),
                 "user_inputs": self._pending_user_inputs_locked(target_branch_id),
@@ -1483,24 +2210,36 @@ class _SessionRunProjection:
         *,
         revision_feedback_id: str | None = None,
         client_request_id: str | None = None,
+        branch_binding_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_text = str(text or "").strip()
         if not normalized_text:
             raise ValueError("revision_feedback_empty")
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         normalized_id = str(revision_feedback_id or "").strip() or f"revision-{uuid.uuid4().hex}"
         callback: Callable[[dict[str, Any]], None] | None
         with self.cond:
-            existing = self.revision_feedback_tickets.get(normalized_id)
+            self._require_branch_binding_locked(branch_id)
+            state_key = self._scoped_state_key_locked(
+                branch_id,
+                "revision_feedback",
+                normalized_id,
+            )
+            existing = self.revision_feedback_tickets.get(state_key)
             if isinstance(existing, dict):
                 return dict(existing)
             ticket = {
                 "revision_feedback_id": normalized_id,
+                "state_key": state_key,
                 "text": normalized_text,
                 "client_request_id": str(client_request_id or "").strip(),
                 "state": "pending",
                 "created_at": time.time(),
+                "branch_binding_id": branch_id,
             }
-            self.revision_feedback_tickets[normalized_id] = ticket
+            self.revision_feedback_tickets[state_key] = ticket
             self._flush_live_events_locked(time.time(), force=True)
             self._append_event_locked("session_run_revision_feedback_accepted", dict(ticket))
             self.last_activity_at = time.time()
@@ -1511,12 +2250,46 @@ class _SessionRunProjection:
             callback(dict(out))
         return out
 
-    def mark_revision_feedback_consumed(self, revision_feedback_id: str) -> None:
+    def revision_feedback_ticket(
+        self,
+        revision_feedback_id: str,
+        *,
+        branch_binding_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_id = str(revision_feedback_id or "").strip()
+        branch_id = str(branch_binding_id or "").strip()
+        if not normalized_id or not branch_id:
+            return None
+        with self.cond:
+            ticket = self.revision_feedback_tickets.get(
+                self._scoped_state_key_locked(
+                    branch_id,
+                    "revision_feedback",
+                    normalized_id,
+                )
+            )
+            return dict(ticket) if isinstance(ticket, dict) else None
+
+    def mark_revision_feedback_consumed(
+        self,
+        revision_feedback_id: str,
+        *,
+        branch_binding_id: str | None = None,
+    ) -> None:
         normalized_id = str(revision_feedback_id or "").strip()
         if not normalized_id:
             return
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         with self.cond:
-            ticket = self.revision_feedback_tickets.get(normalized_id)
+            self._require_branch_binding_locked(branch_id)
+            state_key = self._scoped_state_key_locked(
+                branch_id,
+                "revision_feedback",
+                normalized_id,
+            )
+            ticket = self.revision_feedback_tickets.get(state_key)
             if not isinstance(ticket, dict) or ticket.get("state") == "consumed":
                 return
             ticket["state"] = "consumed"
@@ -1532,22 +2305,13 @@ class _SessionRunProjection:
         *,
         branch_binding_id: str | None = None,
     ) -> tuple[bool, list[dict[str, Any]]]:
-        callback: Callable[[str], None] | None
-        first_request = False
-        resolved_approvals: list[dict[str, Any]]
-        with self.cond:
-            if not self.cancel_requested:
-                first_request = True
-            self.cancel_requested = True
-            self.cancel_reason = reason
-            resolved_approvals = self._cancel_pending_approvals_locked(
-                reason,
-                branch_binding_id,
-            )
-            callback = self.cancel_callback
-            self.cond.notify_all()
-        if callback is not None:
-            callback(reason)
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        first_request, resolved_approvals, _resolved_inputs = self.request_branch_cancel(
+            reason,
+            branch_id,
+        )
         return first_request, resolved_approvals
 
     def request_branch_cancel(
@@ -1557,9 +2321,10 @@ class _SessionRunProjection:
     ) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
         branch_id = str(branch_binding_id or "").strip()
         if not branch_id:
-            branch_id = "main"
+            raise ValueError("branch_binding_id_required")
         callback: Callable[[str], None] | None
         with self.cond:
+            self._require_branch_binding_locked(branch_id)
             state = self.cancel_requests_by_branch.setdefault(branch_id, {})
             first_request = not bool(state.get("requested"))
             state["requested"] = True
@@ -1568,7 +2333,7 @@ class _SessionRunProjection:
             resolved_approvals = self._cancel_pending_approvals_locked(reason, branch_id)
             resolved_inputs = self._cancel_pending_user_inputs_locked(reason, branch_id)
             selected_branch_id = str(
-                self.selected_branch_binding_id or self.branch_binding_id or "main"
+                self.selected_branch_binding_id or ""
             ).strip()
             callback = self.cancel_callback if branch_id == selected_branch_id else None
             if branch_id == selected_branch_id:
@@ -1583,6 +2348,7 @@ class _SessionRunProjection:
         with self.cond:
             recovery_payload = dict(payload)
             branch_binding_id = self._payload_branch_binding_id_locked(recovery_payload)
+            self._require_branch_binding_locked(branch_binding_id)
             recovery_payload["branch_binding_id"] = branch_binding_id
             ticket = {
                 "recovery_id": str(uuid.uuid4()),
@@ -1594,7 +2360,7 @@ class _SessionRunProjection:
             }
             self.recovery_tickets_by_branch[branch_binding_id] = ticket
             selected_branch_id = str(
-                self.selected_branch_binding_id or self.branch_binding_id or "main"
+                self.selected_branch_binding_id or ""
             ).strip()
             if branch_binding_id == selected_branch_id:
                 self.recovery_ticket = ticket
@@ -1609,12 +2375,9 @@ class _SessionRunProjection:
     ) -> tuple[str, dict[str, Any]]:
         normalized = action if action in {"continue", "retry"} else "continue"
         with self.cond:
-            target_branch_id = str(
-                branch_binding_id
-                or self.selected_branch_binding_id
-                or self.branch_binding_id
-                or "main"
-            ).strip()
+            target_branch_id = str(branch_binding_id or "").strip()
+            if not target_branch_id:
+                raise ValueError("branch_binding_id_required")
             ticket = self._recovery_ticket_for_branch_locked(target_branch_id)
             if ticket is None or ticket.get("state") != "pending":
                 raise ValueError("recovery_not_available")
@@ -1634,12 +2397,9 @@ class _SessionRunProjection:
         self,
         branch_binding_id: str | None,
     ) -> dict[str, Any] | None:
-        branch_id = str(
-            branch_binding_id
-            or self.selected_branch_binding_id
-            or self.branch_binding_id
-            or "main"
-        ).strip()
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            return None
         ticket = self.recovery_tickets_by_branch.get(branch_id)
         if ticket is not None:
             return ticket
@@ -1650,9 +2410,6 @@ class _SessionRunProjection:
         legacy_branch_id = str(
             legacy.get("branch_binding_id")
             or payload.get("branch_binding_id")
-            or self.selected_branch_binding_id
-            or self.branch_binding_id
-            or "main"
         ).strip()
         return legacy if legacy_branch_id == branch_id else None
 
@@ -1672,12 +2429,32 @@ class _SessionRunProjection:
         )
 
     def _payload_branch_binding_id_locked(self, payload: dict[str, Any]) -> str:
-        return str(
-            payload.get("branch_binding_id")
-            or self.selected_branch_binding_id
-            or self.branch_binding_id
-            or "main"
-        ).strip()
+        branch_id = str(payload.get("branch_binding_id") or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        return branch_id
+
+    def _scoped_state_key_locked(self, branch_binding_id: str, *parts: object) -> str:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        return json.dumps(
+            [self.session_run_id, branch_id, *[str(part or "") for part in parts]],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _payload_scoped_state_key_locked(
+        self,
+        payload: dict[str, Any],
+        *parts: object,
+    ) -> str:
+        payload_session_run_id = str(payload.get("session_run_id") or "").strip()
+        if payload_session_run_id and payload_session_run_id != self.session_run_id:
+            raise ValueError("session_run_id_mismatch")
+        branch_id = self._payload_branch_binding_id_locked(payload)
+        self._require_branch_binding_locked(branch_id)
+        return self._scoped_state_key_locked(branch_id, *parts)
 
     @staticmethod
     def _waiter_branch_binding_id(waiter: dict[str, Any]) -> str:
@@ -1697,24 +2474,32 @@ class _SessionRunProjection:
         if not expected:
             return True
         actual = self._waiter_branch_binding_id(waiter)
-        return not actual or actual == expected
+        return actual == expected
 
     def register_approval(
         self, approval_id: str, payload: dict[str, Any] | None = None
     ) -> None:
         with self.cond:
-            approval_id = str(approval_id)
+            approval_id = str(approval_id or "").strip()
             approval_payload = self._approval_payload(approval_id, payload)
+            approval_id = str(approval_payload.get("approval_id") or "").strip()
             branch_binding_id = self._payload_branch_binding_id_locked(approval_payload)
+            self._require_branch_binding_locked(branch_binding_id)
             approval_payload["branch_binding_id"] = branch_binding_id
-            self.approval_waiters[approval_id] = {
+            state_key = self._scoped_state_key_locked(
+                branch_binding_id,
+                "approval",
+                approval_id,
+            )
+            self.approval_waiters[state_key] = {
                 "approval_id": approval_id,
+                "state_key": state_key,
                 "state": "requested",
                 "branch_binding_id": branch_binding_id,
                 "payload": approval_payload,
                 "registered": True,
             }
-            self.approval_resolutions.pop(approval_id, None)
+            self.approval_resolutions.pop(state_key, None)
 
     def resolve_approval(
         self,
@@ -1726,14 +2511,25 @@ class _SessionRunProjection:
         branch_binding_id: str | None = None,
     ) -> str | None:
         with self.cond:
+            approval_id = str(approval_id or "").strip()
+            if not approval_id:
+                raise ValueError("approval_id_required")
+            branch_id = str(branch_binding_id or "").strip()
+            if not branch_id:
+                raise ValueError("branch_binding_id_required")
+            state_key = self._scoped_state_key_locked(
+                branch_id,
+                "approval",
+                approval_id,
+            )
             resolution_meta = dict(meta or {})
-            waiter = self.approval_waiters.get(approval_id)
+            waiter = self.approval_waiters.get(state_key)
             if waiter is None:
-                resolved = self.approval_resolutions.get(approval_id)
+                resolved = self.approval_resolutions.get(state_key)
                 if resolved and resolved.get("decision") == decision:
                     return "already_resolved"
                 return None
-            if not self._waiter_matches_branch(waiter, branch_binding_id):
+            if not self._waiter_matches_branch(waiter, branch_id):
                 return None
             if waiter.get("done"):
                 if waiter.get("decision") == decision:
@@ -1745,35 +2541,39 @@ class _SessionRunProjection:
             waiter["meta"] = resolution_meta
             waiter["state"] = "resolved"
             self._record_approval_resolution_locked(
-                approval_id, decision, reason, "resolved", resolution_meta
+                approval_id,
+                decision,
+                reason,
+                "resolved",
+                resolution_meta,
+                branch_binding_id=branch_id,
             )
             self.cond.notify_all()
             return "resolved"
 
     def wait_approval(
-        self, approval_id: str, timeout_sec: float | None = None
+        self,
+        approval_id: str,
+        timeout_sec: float | None = None,
+        *,
+        branch_binding_id: str | None = None,
     ) -> tuple[str, str | None, dict[str, Any]]:
         deadline = time.time() + timeout_sec if timeout_sec else None
         with self.cond:
-            waiter = self.approval_waiters.setdefault(
+            approval_id = str(approval_id or "").strip()
+            if not approval_id:
+                raise ValueError("approval_id_required")
+            branch_id = str(branch_binding_id or "").strip()
+            if not branch_id:
+                raise ValueError("branch_binding_id_required")
+            state_key = self._scoped_state_key_locked(
+                branch_id,
+                "approval",
                 approval_id,
-                {
-                    "approval_id": str(approval_id),
-                    "state": "requested",
-                    "branch_binding_id": self.selected_branch_binding_id
-                    or self.branch_binding_id
-                    or "main",
-                    "payload": self._approval_payload(
-                        approval_id,
-                        {
-                            "branch_binding_id": self.selected_branch_binding_id
-                            or self.branch_binding_id
-                            or "main"
-                        },
-                    ),
-                    "registered": False,
-                },
             )
+            waiter = self.approval_waiters.get(state_key)
+            if waiter is None:
+                raise ValueError("approval_not_found")
             waiter.setdefault("approval_id", str(approval_id))
             while not waiter.get("done"):
                 if deadline is None:
@@ -1792,8 +2592,9 @@ class _SessionRunProjection:
                 reason if isinstance(reason, str) else None,
                 str(waiter.get("state") or "resolved"),
                 dict(meta),
+                branch_binding_id=branch_id,
             )
-            self.approval_waiters.pop(approval_id, None)
+            self.approval_waiters.pop(state_key, None)
             return decision, reason if isinstance(reason, str) else None, dict(meta)
 
     def cancel_pending_approvals(
@@ -1801,10 +2602,13 @@ class _SessionRunProjection:
         reason: str,
         branch_binding_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         with self.cond:
             resolved_approvals = self._cancel_pending_approvals_locked(
                 reason,
-                branch_binding_id,
+                branch_id,
             )
             self.cond.notify_all()
             return resolved_approvals
@@ -1814,11 +2618,14 @@ class _SessionRunProjection:
         reason: str,
         branch_binding_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         resolved_approvals: list[dict[str, Any]] = []
         for waiter in self.approval_waiters.values():
             if waiter.get("done"):
                 continue
-            if not self._waiter_matches_branch(waiter, branch_binding_id):
+            if not self._waiter_matches_branch(waiter, branch_id):
                 continue
             waiter["done"] = True
             waiter["decision"] = "deny_once"
@@ -1830,6 +2637,7 @@ class _SessionRunProjection:
                 reason,
                 "cancelled",
                 {},
+                branch_binding_id=self._waiter_branch_binding_id(waiter),
             )
             if waiter.get("registered"):
                 event_payload = self._approval_resolved_event_payload_locked(
@@ -1869,7 +2677,14 @@ class _SessionRunProjection:
         approval_id: str, payload: dict[str, Any] | None
     ) -> dict[str, Any]:
         out = dict(payload) if isinstance(payload, dict) else {}
-        out["approval_id"] = str(out.get("approval_id") or approval_id)
+        expected_id = str(approval_id or "").strip()
+        payload_id = str(out.get("approval_id") or "").strip()
+        if expected_id and payload_id and payload_id != expected_id:
+            raise ValueError("approval_id_mismatch")
+        canonical_id = payload_id or expected_id
+        if not canonical_id:
+            raise ValueError("approval_id_required")
+        out["approval_id"] = canonical_id
         return out
 
     def _pending_approvals_locked(
@@ -1877,11 +2692,12 @@ class _SessionRunProjection:
         branch_binding_id: str | None = None,
     ) -> list[dict[str, Any]]:
         approvals: list[dict[str, Any]] = []
-        for approval_id, waiter in self.approval_waiters.items():
+        for waiter in self.approval_waiters.values():
             if waiter.get("done"):
                 continue
             if not self._waiter_matches_branch(waiter, branch_binding_id):
                 continue
+            approval_id = str(waiter.get("approval_id") or "")
             payload = self._approval_payload(
                 approval_id,
                 waiter.get("payload") if isinstance(waiter.get("payload"), dict) else None,
@@ -1897,11 +2713,22 @@ class _SessionRunProjection:
         reason: str | None,
         state: str,
         meta: dict[str, Any] | None = None,
+        *,
+        branch_binding_id: str | None = None,
     ) -> None:
         if not approval_id:
             return
-        self.approval_resolutions[approval_id] = {
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        state_key = self._scoped_state_key_locked(
+            branch_id,
+            "approval",
+            approval_id,
+        )
+        self.approval_resolutions[state_key] = {
             "approval_id": approval_id,
+            "branch_binding_id": branch_id,
             "decision": decision,
             "reason": reason,
             "state": state,
@@ -1912,18 +2739,26 @@ class _SessionRunProjection:
         self, input_id: str, payload: dict[str, Any] | None = None
     ) -> None:
         with self.cond:
-            input_id = str(input_id)
+            input_id = str(input_id or "").strip()
             input_payload = self._user_input_payload(input_id, payload)
+            input_id = str(input_payload.get("input_id") or "").strip()
             branch_binding_id = self._payload_branch_binding_id_locked(input_payload)
+            self._require_branch_binding_locked(branch_binding_id)
             input_payload["branch_binding_id"] = branch_binding_id
-            self.user_input_waiters[input_id] = {
+            state_key = self._scoped_state_key_locked(
+                branch_binding_id,
+                "user_input",
+                input_id,
+            )
+            self.user_input_waiters[state_key] = {
                 "input_id": input_id,
+                "state_key": state_key,
                 "state": "requested",
                 "branch_binding_id": branch_binding_id,
                 "payload": input_payload,
                 "registered": True,
             }
-            self.user_input_resolutions.pop(input_id, None)
+            self.user_input_resolutions.pop(state_key, None)
 
     def resolve_user_input(
         self,
@@ -1935,11 +2770,21 @@ class _SessionRunProjection:
         branch_binding_id: str | None = None,
     ) -> str | None:
         with self.cond:
-            input_id = str(input_id)
-            waiter = self.user_input_waiters.get(input_id)
+            input_id = str(input_id or "").strip()
+            if not input_id:
+                raise ValueError("input_id_required")
+            branch_id = str(branch_binding_id or "").strip()
+            if not branch_id:
+                raise ValueError("branch_binding_id_required")
+            state_key = self._scoped_state_key_locked(
+                branch_id,
+                "user_input",
+                input_id,
+            )
+            waiter = self.user_input_waiters.get(state_key)
             normalized_content = dict(content) if isinstance(content, dict) else {}
             if waiter is None:
-                resolved = self.user_input_resolutions.get(input_id)
+                resolved = self.user_input_resolutions.get(state_key)
                 if (
                     resolved
                     and resolved.get("action") == action
@@ -1962,36 +2807,39 @@ class _SessionRunProjection:
             waiter["reason"] = reason
             waiter["state"] = "resolved"
             self._record_user_input_resolution_locked(
-                input_id, action, normalized_content, reason, "resolved"
+                input_id,
+                action,
+                normalized_content,
+                reason,
+                "resolved",
+                branch_binding_id=branch_id,
             )
             self.cond.notify_all()
             return "resolved"
 
     def wait_user_input(
-        self, input_id: str, timeout_sec: float | None = None
+        self,
+        input_id: str,
+        timeout_sec: float | None = None,
+        *,
+        branch_binding_id: str | None = None,
     ) -> tuple[str, dict[str, Any], str | None]:
         deadline = time.time() + timeout_sec if timeout_sec else None
         with self.cond:
-            input_id = str(input_id)
-            waiter = self.user_input_waiters.setdefault(
+            input_id = str(input_id or "").strip()
+            if not input_id:
+                raise ValueError("input_id_required")
+            branch_id = str(branch_binding_id or "").strip()
+            if not branch_id:
+                raise ValueError("branch_binding_id_required")
+            state_key = self._scoped_state_key_locked(
+                branch_id,
+                "user_input",
                 input_id,
-                {
-                    "input_id": input_id,
-                    "state": "requested",
-                    "branch_binding_id": self.selected_branch_binding_id
-                    or self.branch_binding_id
-                    or "main",
-                    "payload": self._user_input_payload(
-                        input_id,
-                        {
-                            "branch_binding_id": self.selected_branch_binding_id
-                            or self.branch_binding_id
-                            or "main"
-                        },
-                    ),
-                    "registered": False,
-                },
             )
+            waiter = self.user_input_waiters.get(state_key)
+            if waiter is None:
+                raise ValueError("user_input_not_found")
             waiter.setdefault("input_id", input_id)
             while not waiter.get("done"):
                 if deadline is None:
@@ -2017,8 +2865,9 @@ class _SessionRunProjection:
                 dict(content),
                 reason if isinstance(reason, str) else None,
                 str(waiter.get("state") or "resolved"),
+                branch_binding_id=branch_id,
             )
-            self.user_input_waiters.pop(input_id, None)
+            self.user_input_waiters.pop(state_key, None)
             return action, dict(content), reason if isinstance(reason, str) else None
 
     def cancel_pending_user_inputs(
@@ -2026,10 +2875,13 @@ class _SessionRunProjection:
         reason: str,
         branch_binding_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         with self.cond:
             resolved_inputs = self._cancel_pending_user_inputs_locked(
                 reason,
-                branch_binding_id,
+                branch_id,
             )
             self.cond.notify_all()
             return resolved_inputs
@@ -2039,11 +2891,14 @@ class _SessionRunProjection:
         reason: str,
         branch_binding_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
         resolved_inputs: list[dict[str, Any]] = []
         for waiter in self.user_input_waiters.values():
             if waiter.get("done"):
                 continue
-            if not self._waiter_matches_branch(waiter, branch_binding_id):
+            if not self._waiter_matches_branch(waiter, branch_id):
                 continue
             waiter["done"] = True
             waiter["action"] = "cancel"
@@ -2056,6 +2911,7 @@ class _SessionRunProjection:
                 {},
                 reason,
                 "cancelled",
+                branch_binding_id=self._waiter_branch_binding_id(waiter),
             )
             if waiter.get("registered"):
                 event_payload = self._user_input_resolved_event_payload_locked(
@@ -2117,7 +2973,14 @@ class _SessionRunProjection:
         input_id: str, payload: dict[str, Any] | None
     ) -> dict[str, Any]:
         out = dict(payload) if isinstance(payload, dict) else {}
-        out["input_id"] = str(out.get("input_id") or input_id)
+        expected_id = str(input_id or "").strip()
+        payload_id = str(out.get("input_id") or "").strip()
+        if expected_id and payload_id and payload_id != expected_id:
+            raise ValueError("input_id_mismatch")
+        canonical_id = payload_id or expected_id
+        if not canonical_id:
+            raise ValueError("input_id_required")
+        out["input_id"] = canonical_id
         return out
 
     def _record_user_input_resolution_locked(
@@ -2127,16 +2990,345 @@ class _SessionRunProjection:
         content: dict[str, Any],
         reason: str | None,
         state: str,
+        *,
+        branch_binding_id: str | None = None,
     ) -> None:
         if not input_id:
             return
-        self.user_input_resolutions[input_id] = {
+        branch_id = str(branch_binding_id or "").strip()
+        if not branch_id:
+            raise ValueError("branch_binding_id_required")
+        state_key = self._scoped_state_key_locked(
+            branch_id,
+            "user_input",
+            input_id,
+        )
+        self.user_input_resolutions[state_key] = {
             "input_id": input_id,
+            "branch_binding_id": branch_id,
             "action": action,
             "content": dict(content),
             "reason": reason,
             "state": state,
         }
+
+
+class _ScopedSessionRunWriter:
+    def __init__(
+        self,
+        session: _SessionRunProjection,
+        *,
+        branch_binding_id: str,
+        agent_run_id: str | None = None,
+    ) -> None:
+        self._session = session
+        self._branch_binding_id = str(branch_binding_id or "").strip()
+        if not self._branch_binding_id:
+            raise ValueError("branch_binding_id_required")
+        self._agent_run_id = str(agent_run_id or "").strip()
+        if not self._agent_run_id:
+            raise ValueError("agent_run_id_required")
+        binding = session.branch_bindings.get(self._branch_binding_id)
+        if not isinstance(binding, dict):
+            raise ValueError("session_run_branch_binding_not_found")
+        binding_agent_run_id = str(binding.get("agent_run_id") or "").strip()
+        if not binding_agent_run_id:
+            raise ValueError("session_run_branch_agent_run_required")
+        if self._agent_run_id != binding_agent_run_id:
+            raise ValueError("agent_run_id_mismatch")
+
+    @property
+    def branch_binding_id(self) -> str:
+        return self._branch_binding_id
+
+    @property
+    def agent_run_id(self) -> str:
+        return self._agent_run_id
+
+    def scoped_payload(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        scoped = dict(payload or {})
+        scoped["session_run_id"] = self._session.session_run_id
+        scoped["branch_binding_id"] = self._branch_binding_id
+        scoped["agent_run_id"] = self._agent_run_id
+        return scoped
+
+    def append_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        return self._session.append_event(event_type, self.scoped_payload(payload))
+
+    def append_live_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        return self._session.append_live_event(event_type, self.scoped_payload(payload))
+
+    def register_user_input(
+        self,
+        input_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._session.register_user_input(input_id, self.scoped_payload(payload))
+
+    def register_approval(
+        self,
+        approval_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._session.register_approval(approval_id, self.scoped_payload(payload))
+
+    def resolve_approval(
+        self,
+        approval_id: str,
+        decision: str,
+        reason: str | None,
+        meta: dict[str, Any] | None = None,
+    ) -> str | None:
+        return self._session.resolve_approval(
+            approval_id,
+            decision,
+            reason,
+            meta,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def wait_approval(
+        self,
+        approval_id: str,
+        timeout_sec: float | None = None,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        return self._session.wait_approval(
+            approval_id,
+            timeout_sec,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def resolve_user_input(
+        self,
+        input_id: str,
+        action: str,
+        content: dict[str, Any] | None,
+        reason: str | None,
+    ) -> str | None:
+        return self._session.resolve_user_input(
+            input_id,
+            action,
+            content,
+            reason,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def wait_user_input(
+        self,
+        input_id: str,
+        timeout_sec: float | None = None,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        return self._session.wait_user_input(
+            input_id,
+            timeout_sec,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def mark_running(self) -> None:
+        self._session.mark_running(branch_binding_id=self._branch_binding_id)
+
+    def mark_done(self, reason: str | None = None) -> None:
+        self._session.mark_done(reason, branch_binding_id=self._branch_binding_id)
+
+    def apply_selected_runtime_scope(
+        self,
+        *,
+        activation_id: str | None = None,
+        runtime_status: Any = "",
+        terminal: bool | None = None,
+        reset_terminal: bool = False,
+        runtime_state_updates: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._session.apply_selected_runtime_scope(
+            branch_binding_id=self._branch_binding_id,
+            agent_run_id=self._agent_run_id,
+            activation_id=activation_id,
+            runtime_status=runtime_status,
+            terminal=terminal,
+            reset_terminal=reset_terminal,
+            runtime_state_updates=runtime_state_updates,
+        )
+
+    def cancel_pending_approvals(self, reason: str) -> list[dict[str, Any]]:
+        return self._session.cancel_pending_approvals(
+            reason,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def cancel_pending_user_inputs(self, reason: str) -> list[dict[str, Any]]:
+        return self._session.cancel_pending_user_inputs(
+            reason,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def status_payload(self, cursor: int = 0) -> dict[str, Any]:
+        return self._session.status_payload(
+            cursor,
+            branch_binding_id=self._branch_binding_id,
+        )
+
+    def status_response_payload(
+        self,
+        cursor: int = 0,
+        *,
+        agent_run_status: Any,
+        activation_id: str | None = None,
+        terminal: bool = False,
+        selected: bool = False,
+    ) -> dict[str, Any]:
+        run_status = str(getattr(agent_run_status, "value", agent_run_status) or "")
+        self._session.apply_branch_runtime_status(
+            self._branch_binding_id,
+            run_status,
+            terminal=terminal,
+            selected=selected,
+        )
+        status_payload = self.status_payload(cursor)
+        branch_runtime_status = _session_run_branch_status_from_runtime_status(
+            run_status
+        )
+        response_status = str(
+            status_payload.get("status") or branch_runtime_status or ""
+        )
+        response_running = bool(status_payload.get("running"))
+        response_done = bool(status_payload.get("done"))
+        runtime_state = (
+            dict(status_payload.get("runtime_state"))
+            if isinstance(status_payload.get("runtime_state"), dict)
+            else {}
+        )
+        runtime_state.update(
+            {
+                "agent_run_id": self._agent_run_id,
+                "activation_id": str(activation_id or ""),
+                "branch_binding_id": self._branch_binding_id,
+                "scope_id": scope_id_for(
+                    self._session.session_run_id,
+                    self._branch_binding_id,
+                ),
+                "agent_run_status": run_status,
+            }
+        )
+        status_payload.update(
+            {
+                "status": response_status,
+                "running": response_running,
+                "done": response_done,
+                "reconnectable": not response_done,
+                "agent_run_id": self._agent_run_id,
+                "branch_binding_id": self._branch_binding_id,
+                "scope_id": scope_id_for(
+                    self._session.session_run_id,
+                    self._branch_binding_id,
+                ),
+                "selected": bool(selected),
+                "runtime_state": runtime_state,
+            }
+        )
+        return status_payload
+
+    def events_response_payload(
+        self,
+        cursor: int,
+        timeout_sec: float | None = 0,
+        *,
+        agent_run_status: Any = "",
+        terminal: bool | None = None,
+        runtime_snapshot: Callable[[], tuple[Any, bool | None]] | None = None,
+        require_terminal_event_for_done: bool = False,
+        selected: bool = False,
+    ) -> dict[str, Any]:
+        events, wait_done, next_cursor = self.wait_events(cursor, timeout_sec)
+        if runtime_snapshot is not None:
+            try:
+                agent_run_status, terminal = runtime_snapshot()
+            except Exception:
+                agent_run_status = ""
+                terminal = None
+        run_status = str(getattr(agent_run_status, "value", agent_run_status) or "")
+        branch_runtime_status = _session_run_branch_status_from_runtime_status(
+            run_status
+        )
+        if branch_runtime_status:
+            self._session.apply_branch_runtime_status(
+                self._branch_binding_id,
+                run_status,
+                terminal=terminal,
+                selected=selected,
+            )
+        if terminal is None:
+            done = wait_done
+        else:
+            runtime_done = bool(terminal) or branch_runtime_status in {
+                "done",
+                "cancelled",
+                "error",
+                "interrupted",
+            }
+            if require_terminal_event_for_done and runtime_done:
+                runtime_done = any(
+                    str(event.get("type") or "")
+                    in {
+                        "session_run_end",
+                        "session_run_failed",
+                        "session_run_cancelled",
+                    }
+                    for event in events
+                    if isinstance(event, dict)
+                )
+            done = wait_done or runtime_done
+        if require_terminal_event_for_done and done:
+            terminal_event_in_batch = any(
+                str(event.get("type") or "")
+                in {
+                    "session_run_end",
+                    "session_run_failed",
+                    "session_run_cancelled",
+                }
+                for event in events
+                if isinstance(event, dict)
+            )
+            terminal_event_consumed = (
+                not terminal_event_in_batch
+                and wait_done
+                and self._session.has_branch_terminal_event_at_or_before(
+                    self._branch_binding_id,
+                    cursor,
+                )
+            )
+            done = terminal_event_in_batch or terminal_event_consumed
+        return {
+            "events": events,
+            "done": done,
+            "next_cursor": next_cursor,
+            "branches": self._session.branch_summaries(cursor),
+            "agent_run_id": self._agent_run_id,
+            "branch_binding_id": self._branch_binding_id,
+            "scope_id": scope_id_for(
+                self._session.session_run_id,
+                self._branch_binding_id,
+            ),
+            "selected": bool(selected),
+        }
+
+    def wait_events(
+        self,
+        cursor: int,
+        timeout_sec: float | None = 0,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        return self._session.wait_events(
+            cursor,
+            timeout_sec,
+            branch_binding_id=self._branch_binding_id,
+        )
 
 
 class RemoteRelayHTTPService:
@@ -2547,6 +3739,31 @@ class RemoteRelayHTTPService:
         with self._session_runs_lock:
             return self._session_runs.get(session_run_id)
 
+    def _project_agent_run_events_to_session_run(
+        self,
+        session: _SessionRunProjection,
+        binding: Any,
+    ) -> int:
+        runtime = self.runtime_control_plane
+        if runtime is None:
+            return 0
+        branch_binding_id = str(getattr(binding, "branch_binding_id", "") or "").strip()
+        agent_run_id = str(getattr(binding, "agent_run_id", "") or "").strip()
+        if not branch_binding_id or not agent_run_id:
+            return 0
+        projected_count = 0
+        while True:
+            cursor = session.agent_run_projection_cursor(branch_binding_id)
+            events = runtime.list_events(agent_run_id, after_seq=cursor, limit=100)
+            if not events:
+                return projected_count
+            projected_count += session.project_agent_run_events(
+                branch_binding_id,
+                list(events),
+            )
+            if len(events) < 100:
+                return projected_count
+
     def _get_peer_chat_lock(self, peer_id: str) -> threading.Lock:
         with self._peer_chat_locks_lock:
             return self._peer_chat_locks.setdefault(peer_id, threading.Lock())
@@ -2560,34 +3777,67 @@ class RemoteRelayHTTPService:
             ]
         for session in peer_sessions:
             runtime_state = session.runtime_state if isinstance(session.runtime_state, dict) else {}
+            scoped_writers: list[_ScopedSessionRunWriter] = []
+            for binding in session.branch_bindings.values():
+                if not isinstance(binding, dict):
+                    continue
+                status = str(binding.get("status") or "active").strip().lower()
+                if status in _TERMINAL_BRANCH_BINDING_STATUSES:
+                    continue
+                branch_binding_id = str(binding.get("branch_binding_id") or "").strip()
+                agent_run_id = str(binding.get("agent_run_id") or "").strip()
+                if not branch_binding_id or not agent_run_id:
+                    continue
+                try:
+                    scoped_writers.append(
+                        session.scoped_writer(
+                            branch_binding_id=branch_binding_id,
+                            agent_run_id=agent_run_id,
+                        )
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Skipping peer disconnect SessionRun event with invalid scope "
+                        "session_run_id=%s branch_binding_id=%s",
+                        getattr(session, "session_run_id", ""),
+                        branch_binding_id,
+                    )
+            if not scoped_writers:
+                logger.warning(
+                    "Skipping peer disconnect SessionRun event without branch scope session_run_id=%s",
+                    getattr(session, "session_run_id", ""),
+                )
+                continue
             if (
                 session.mode == "capability_package"
                 or session.workflow_mode == "capability_package_ingest"
                 or runtime_state.get("workflow_mode") == "capability_package_ingest"
             ):
-                session.append_event(
-                    "workflow_step",
-                    {
-                        "lane": "process",
-                        "workflow": "capability_package_ingest",
-                        "stage": "prepare",
-                        "status": "warning",
-                        "title": "前端连接已断开，能力包任务继续在服务端运行",
-                        "message": "前端连接已断开，能力包任务继续在服务端运行",
-                        "summary": "peer_disconnected",
-                        "details": {"phase": "peer_disconnected", "reason": reason},
-                        "reason": reason,
-                    },
-                )
+                for writer in scoped_writers:
+                    writer.append_event(
+                        "workflow_step",
+                        {
+                            "lane": "process",
+                            "workflow": "capability_package_ingest",
+                            "stage": "prepare",
+                            "status": "warning",
+                            "title": "前端连接已断开，能力包任务继续在服务端运行",
+                            "message": "前端连接已断开，能力包任务继续在服务端运行",
+                            "summary": "peer_disconnected",
+                            "details": {"phase": "peer_disconnected", "reason": reason},
+                            "reason": reason,
+                        },
+                    )
                 continue
-            resolved_approvals = session.cancel_pending_approvals(reason)
-            resolved_user_inputs = session.cancel_pending_user_inputs(reason)
-            session.append_event("error", {"message": reason})
-            for event_payload in resolved_approvals:
-                session.append_event("approval_resolved", event_payload)
-            for event_payload in resolved_user_inputs:
-                session.append_event("user_input_resolved", event_payload)
-            session.mark_done(reason)
+            for writer in scoped_writers:
+                resolved_approvals = writer.cancel_pending_approvals(reason)
+                resolved_user_inputs = writer.cancel_pending_user_inputs(reason)
+                writer.append_event("error", {"message": reason})
+                for event_payload in resolved_approvals:
+                    writer.append_event("approval_resolved", event_payload)
+                for event_payload in resolved_user_inputs:
+                    writer.append_event("user_input_resolved", event_payload)
+                writer.mark_done(reason)
 
     def _enqueue_outbound(self, peer_id: str, envelope: RelayEnvelope) -> None:
         with self._queues_lock:
