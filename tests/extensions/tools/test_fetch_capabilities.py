@@ -8,8 +8,6 @@ import socket
 from http.client import RemoteDisconnected
 from urllib.error import HTTPError, URLError
 
-from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
-from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.extensions.tools.builtin import fetch_capabilities as fetch_module
 from reuleauxcoder.extensions.tools.builtin.fetch_capabilities import (
     FetchCapabilitiesTool,
@@ -388,24 +386,3 @@ def test_retries_remote_disconnected_before_reporting_network_error(monkeypatch)
     assert payload["errors"][0]["retryable"] is True
     assert payload["errors"][0]["url"] == url
     assert opener.calls == [url, url, url]
-
-
-def test_remote_backend_uses_server_side_local_fallback(monkeypatch) -> None:
-    url = "https://docs.example.com/tool.md"
-    _install_fake_network(
-        monkeypatch,
-        {url: FakeResponse(url, "# Tool\n\n## Install\n`tool --version`\n", content_type="text/markdown")},
-    )
-    srv = RelayServer()
-    srv.start()
-    try:
-        backend = RemoteRelayToolBackend(relay_server=srv)
-        tool = FetchCapabilitiesTool(backend=backend)
-
-        payload = json.loads(tool.execute(url=url, focus="install"))
-
-        assert payload["ok"] is True
-        assert payload["source_kind"] == "markdown"
-        assert "no remote peer" not in json.dumps(payload).lower()
-    finally:
-        srv.stop()

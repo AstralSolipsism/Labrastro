@@ -6,8 +6,6 @@ from labrastro_server.interfaces.http.remote.protocol.base import (
     DisconnectNotice,
     Ok,
     PeerDisconnectRequest,
-    PeerPollRequest,
-    PeerResultRequest,
     RegisterRejected,
     RegisterRequest,
     RegisterResponse,
@@ -107,15 +105,6 @@ from labrastro_server.interfaces.http.remote.protocol.sessions import (
     SessionModelSwitchRequest,
     SessionNewRequest,
 )
-from labrastro_server.interfaces.http.remote.protocol.tools import (
-    CleanupRequest,
-    CleanupResult,
-    ExecToolRequest,
-    ExecToolResult,
-    ToolPreviewRequest,
-    ToolPreviewResult,
-    ToolStreamChunk,
-)
 
 __all__ = [
     "AgentRunActivationClaimRequest",
@@ -178,15 +167,11 @@ __all__ = [
     "SessionRunEventsBatch",
     "SessionRunUserInputReplyRequest",
     "SessionRunUserInputReplyResponse",
-    "CleanupRequest",
-    "CleanupResult",
     "DisconnectNotice",
     "EnvironmentManifestRequest",
     "EnvironmentManifestResponse",
     "EnvironmentRequirementManifest",
     "ErrorMessage",
-    "ExecToolRequest",
-    "ExecToolResult",
     "Heartbeat",
     "MCPArtifactManifest",
     "MCPLaunchManifest",
@@ -196,8 +181,6 @@ __all__ = [
     "Ok",
     "PeerDisconnectRequest",
     "PeerMCPToolsReport",
-    "PeerPollRequest",
-    "PeerResultRequest",
     "RegisterRejected",
     "RegisterRequest",
     "RegisterResponse",
@@ -210,8 +193,5 @@ __all__ = [
     "SessionLoadRequest",
     "SessionModelSwitchRequest",
     "SessionNewRequest",
-    "ToolPreviewRequest",
-    "ToolPreviewResult",
-    "ToolStreamChunk",
     "endpoint_registry",
 ]

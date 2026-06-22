@@ -5,32 +5,19 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-import uuid
 from typing import Any, Callable
 
 from labrastro_server.relay.auth import TokenManager
-from labrastro_server.relay.errors import (
-    PeerDisconnectedError,
-    PeerNotFoundError,
-    RemoteTimeoutError,
-    RegisterRejectedError,
-)
+from labrastro_server.relay.errors import RegisterRejectedError
 from labrastro_server.relay.peer_registry import PeerRegistry
 from labrastro_server.interfaces.http.remote.protocol import (
-    CleanupRequest,
-    CleanupResult,
     ErrorMessage,
-    ExecToolRequest,
-    ExecToolResult,
     Heartbeat,
     RemoteMCPToolInfo,
     RegisterRejected,
     RegisterRequest,
     RegisterResponse,
     RelayEnvelope,
-    ToolPreviewRequest,
-    ToolPreviewResult,
-    ToolStreamChunk,
 )
 
 
@@ -38,7 +25,7 @@ SendFn = Callable[[str, RelayEnvelope], None]
 
 
 class RelayServer:
-    """Host relay server: manages peers, routes tool requests, handles heartbeats.
+    """Host relay server: manages peer lifecycle and peer capability facts.
 
     Transport-agnostic: inject a ``send_fn(peer_id, envelope)`` that performs
     actual I/O (WebSocket, in-memory queue, etc.).
@@ -57,16 +44,11 @@ class RelayServer:
         self._token_manager = TokenManager()
         self._registry = PeerRegistry(heartbeat_timeout_sec=heartbeat_timeout_sec)
         self._heartbeat_interval_sec = heartbeat_interval_sec
-        self._default_tool_timeout_sec = default_tool_timeout_sec
-        self._shell_timeout_sec = shell_timeout_sec
         self._peer_token_ttl_sec = peer_token_ttl_sec
 
         # asyncio plumbing
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._pending: dict[str, asyncio.Future] = {}
-        self._pending_peer_ids: dict[str, str] = {}
-        self._stream_handlers: dict[str, Callable[[ToolStreamChunk], None]] = {}
         self._lock = threading.Lock()
         self._prune_task: asyncio.Task | None = None
         self._shutdown_event = threading.Event()
@@ -91,13 +73,9 @@ class RelayServer:
             pass
 
     def stop(self) -> None:
-        """Stop the relay server and cancel pending requests."""
+        """Stop the relay server."""
         self._shutdown_event.set()
         if self._loop is not None:
-            # cancel pending futures
-            for fut in list(self._pending.values()):
-                if not fut.done():
-                    self._loop.call_soon_threadsafe(fut.cancel)
             if self._prune_task is not None:
                 self._loop.call_soon_threadsafe(self._prune_task.cancel)
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -180,46 +158,6 @@ class RelayServer:
             if peer:
                 self._registry.update_heartbeat(peer)
 
-        elif msg_type == "tool_stream":
-            if req_id:
-                chunk = ToolStreamChunk.from_dict(payload)
-                with self._lock:
-                    handler = self._stream_handlers.get(req_id)
-                if handler is not None:
-                    try:
-                        handler(chunk)
-                    except Exception:
-                        pass
-
-        elif msg_type == "tool_result":
-            result = ExecToolResult.from_dict(payload)
-            if req_id:
-                with self._lock:
-                    fut = self._pending.pop(req_id, None)
-                    self._pending_peer_ids.pop(req_id, None)
-                    self._stream_handlers.pop(req_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result(result)
-
-        elif msg_type == "tool_preview_result":
-            result = ToolPreviewResult.from_dict(payload)
-            if req_id:
-                with self._lock:
-                    fut = self._pending.pop(req_id, None)
-                    self._pending_peer_ids.pop(req_id, None)
-                    self._stream_handlers.pop(req_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result(result)
-
-        elif msg_type == "cleanup_result":
-            result = CleanupResult.from_dict(payload)
-            if req_id:
-                with self._lock:
-                    fut = self._pending.pop(req_id, None)
-                    self._pending_peer_ids.pop(req_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result(result)
-
         elif msg_type == "disconnect":
             if peer_id:
                 self.disconnect_peer(peer_id, "peer_initiated")
@@ -227,140 +165,19 @@ class RelayServer:
         elif msg_type == "error":
             err = ErrorMessage.from_dict(payload)
             if req_id:
-                with self._lock:
-                    fut = self._pending.pop(req_id, None)
-                    self._pending_peer_ids.pop(req_id, None)
-                    self._stream_handlers.pop(req_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_exception(
-                        PeerDisconnectedError(peer_id or "unknown")
-                        if err.code == "PEER_DISCONNECTED"
-                        else Exception(f"[{err.code}] {err.message}")
-                    )
+                self._send(
+                    peer_id or "",
+                    RelayEnvelope(
+                        type="error_ack",
+                        request_id=req_id,
+                        peer_id=peer_id or "",
+                        payload=err.to_dict(),
+                    ),
+                )
 
     # ------------------------------------------------------------------
-    # Public: host-initiated actions (sync API for callers)
+    # Public: peer facts
     # ------------------------------------------------------------------
-
-    def send_exec_request(
-        self,
-        peer_id: str,
-        request: ExecToolRequest,
-        timeout_sec: int | None = None,
-        stream_handler: Callable[[ToolStreamChunk], None] | None = None,
-    ) -> ExecToolResult:
-        """Send a tool execution request to a peer and wait for the result."""
-        if self._loop is None:
-            raise RuntimeError("RelayServer not started")
-
-        peer = self._registry.get(peer_id)
-        if peer is None:
-            raise PeerNotFoundError(peer_id)
-
-        req_id = str(uuid.uuid4())
-        envelope = RelayEnvelope(
-            type="exec_tool",
-            request_id=req_id,
-            peer_id=peer_id,
-            payload=request.to_dict(),
-        )
-
-        # determine timeout
-        effective_timeout = (
-            timeout_sec
-            if timeout_sec is not None
-            else (
-                self._shell_timeout_sec
-                if request.tool_name == "shell"
-                else self._default_tool_timeout_sec
-            )
-        )
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._send_and_wait(
-                req_id,
-                peer_id,
-                envelope,
-                effective_timeout,
-                stream_handler=stream_handler,
-            ),
-            self._loop,
-        )
-        return future.result()
-
-    def send_preview_request(
-        self,
-        peer_id: str,
-        request: ToolPreviewRequest,
-        timeout_sec: int | None = None,
-    ) -> ToolPreviewResult:
-        """Send an internal tool preview request to a peer and wait for the result."""
-        if self._loop is None:
-            raise RuntimeError("RelayServer not started")
-
-        peer = self._registry.get(peer_id)
-        if peer is None:
-            raise PeerNotFoundError(peer_id)
-
-        req_id = str(uuid.uuid4())
-        envelope = RelayEnvelope(
-            type="preview_tool",
-            request_id=req_id,
-            peer_id=peer_id,
-            payload=request.to_dict(),
-        )
-        effective_timeout = timeout_sec if timeout_sec is not None else 30
-        future = asyncio.run_coroutine_threadsafe(
-            self._send_and_wait(req_id, peer_id, envelope, effective_timeout),
-            self._loop,
-        )
-        return future.result()
-
-    def request_cleanup(self, peer_id: str, timeout_sec: int = 10) -> CleanupResult:
-        """Request cleanup on a peer. Returns best-effort result."""
-        if self._loop is None:
-            raise RuntimeError("RelayServer not started")
-
-        peer = self._registry.get(peer_id)
-        if peer is None:
-            return CleanupResult(ok=False, error_message=f"Peer '{peer_id}' is offline")
-
-        req_id = str(uuid.uuid4())
-        envelope = RelayEnvelope(
-            type="cleanup",
-            request_id=req_id,
-            peer_id=peer_id,
-            payload=CleanupRequest().to_dict(),
-        )
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._send_and_wait(req_id, peer_id, envelope, timeout_sec),
-            self._loop,
-        )
-        try:
-            return future.result(timeout=timeout_sec + 2)
-        except Exception as e:
-            return CleanupResult(ok=False, error_message=str(e))
-
-    def cancel_pending_requests(self, peer_id: str, reason: str = "session_run_cancelled") -> int:
-        """Ask a peer to cancel all in-flight tool requests for that peer."""
-        with self._lock:
-            request_ids = [
-                req_id
-                for req_id, pending_peer_id in self._pending_peer_ids.items()
-                if pending_peer_id == peer_id
-            ]
-        for req_id in request_ids:
-            self._send(
-                peer_id,
-                RelayEnvelope(
-                    type="cancel_tool",
-                    request_id=req_id,
-                    peer_id=peer_id,
-                    payload={"request_id": req_id, "reason": reason},
-                ),
-            )
-        return len(request_ids)
 
     def update_peer_mcp_tools(
         self,
@@ -392,38 +209,13 @@ class RelayServer:
         ]
 
     def disconnect_peer(self, peer_id: str, reason: str = "peer_initiated") -> None:
-        """Mark a peer disconnected and fail host-side pending requests."""
+        """Mark a peer disconnected."""
         self._registry.mark_disconnected(peer_id, reason)
         self._fail_pending_for_peer(peer_id)
 
     # ------------------------------------------------------------------
     # Internal: request/response correlation
     # ------------------------------------------------------------------
-
-    async def _send_and_wait(
-        self,
-        req_id: str,
-        peer_id: str,
-        envelope: RelayEnvelope,
-        timeout_sec: float,
-        stream_handler: Callable[[ToolStreamChunk], None] | None = None,
-    ) -> Any:
-        fut = self._loop.create_future()
-        with self._lock:
-            self._pending[req_id] = fut
-            self._pending_peer_ids[req_id] = peer_id
-            if stream_handler is not None:
-                self._stream_handlers[req_id] = stream_handler
-        try:
-            self._send(peer_id, envelope)
-            return await asyncio.wait_for(fut, timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            raise RemoteTimeoutError(int(timeout_sec))
-        finally:
-            with self._lock:
-                self._pending.pop(req_id, None)
-                self._pending_peer_ids.pop(req_id, None)
-                self._stream_handlers.pop(req_id, None)
 
     def _send(self, peer_id: str, envelope: RelayEnvelope) -> None:
         if self._send_fn is not None:
@@ -433,24 +225,7 @@ class RelayServer:
                 pass
 
     def _fail_pending_for_peer(self, peer_id: str) -> None:
-        """Fail all pending requests for a disconnected peer."""
-        with self._lock:
-            pending = [
-                (req_id, fut)
-                for req_id, fut in self._pending.items()
-                if self._pending_peer_ids.get(req_id) == peer_id
-            ]
-            for req_id, _ in pending:
-                self._pending.pop(req_id, None)
-                self._pending_peer_ids.pop(req_id, None)
-                self._stream_handlers.pop(req_id, None)
-        for _, fut in pending:
-            if fut.done():
-                continue
-            self._loop.call_soon_threadsafe(
-                fut.set_exception,
-                PeerDisconnectedError(peer_id),
-            )
+        return None
 
     # ------------------------------------------------------------------
     # Internal: registration / heartbeat

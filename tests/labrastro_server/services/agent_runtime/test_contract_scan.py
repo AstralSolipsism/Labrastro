@@ -306,6 +306,45 @@ def test_session_run_continue_and_agent_run_protocol_contract_are_required() -> 
     assert missing == []
 
 
+def test_legacy_relay_tool_execution_backend_is_not_production_reachable() -> None:
+    scanned = {
+        "relay_server": _read("labrastro_server/relay/server.py"),
+        "peer_routes": _read("labrastro_server/interfaces/http/remote/routes/peer.py"),
+        "remote_service": _read("labrastro_server/interfaces/http/remote/service.py"),
+        "runner": _read("reuleauxcoder/interfaces/entrypoint/runner.py"),
+        "remote_relay": _read("reuleauxcoder/interfaces/entrypoint/remote_relay.py"),
+        "adapter_init": _read("labrastro_server/adapters/reuleauxcoder/__init__.py"),
+    }
+    remote_backend_path = REPO_ROOT / "labrastro_server/adapters/reuleauxcoder/remote_backend.py"
+    if remote_backend_path.exists():
+        scanned["remote_backend"] = remote_backend_path.read_text(encoding="utf-8")
+    mcp_tools_path = REPO_ROOT / "labrastro_server/adapters/reuleauxcoder/mcp_tools.py"
+    if mcp_tools_path.exists():
+        scanned["mcp_tools"] = mcp_tools_path.read_text(encoding="utf-8")
+
+    forbidden = [
+        "Remote" + "RelayToolBackend",
+        "send_" + "exec_request(",
+        "send_" + "preview_request(",
+        "request_" + "cleanup(",
+        "cancel_" + "pending_requests(",
+        'parsed.path == "/remote/' + 'poll"',
+        'parsed.path == "/remote/' + 'result"',
+        "def _handle_" + "poll(",
+        "def _handle_" + "result(",
+        "def _enqueue_" + "outbound(",
+        "def _next_" + "envelope(",
+    ]
+    offenders = [
+        f"{name}: {pattern}"
+        for name, source in scanned.items()
+        for pattern in forbidden
+        if pattern in source
+    ]
+
+    assert offenders == []
+
+
 def test_public_remote_interfaces_do_not_accept_camel_case_aliases() -> None:
     scanned = {
         "chat_protocol": _read("labrastro_server/interfaces/http/remote/protocol/chat.py"),
@@ -1008,7 +1047,7 @@ def test_backend_session_run_ui_producers_use_scoped_writer_ports() -> None:
     abort_peer_session_runs = _section(
         remote_service,
         "def _abort_peer_session_runs(",
-        "def _enqueue_outbound(",
+        "def _build_handler(",
     )
 
     mutators = [

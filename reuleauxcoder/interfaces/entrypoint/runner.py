@@ -45,7 +45,6 @@ from reuleauxcoder.domain.hooks.lifecycle import (
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 from reuleauxcoder.extensions.mcp.manager import MCPManager
 from reuleauxcoder.extensions.mcp.timeouts import MCP_ELICITATION_TIMEOUT_SEC
-from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
 from labrastro_server.interfaces.http.remote.service import RemoteRelayHTTPService
 from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.extensions.lsp.config import LspConfig
@@ -204,10 +203,6 @@ class AppRunner:
         llm = self.dependencies.create_llm(config)
         llm.ui_bus = ui_bus
         tool_backend = self.dependencies.create_tool_backend(config, ui_bus)
-        if self._relay_server is not None:
-            tool_backend = RemoteRelayToolBackend(
-                relay_server=self._relay_server, ui_bus=ui_bus
-            )
         tools = self.dependencies.load_tools(tool_backend)
         agent = self.dependencies.create_agent(llm, tools, config)
         main_agent_id = _agent_config_id(config, agent)
@@ -433,11 +428,6 @@ class AppRunner:
             if isinstance(build_dir, Path):
                 shutil.rmtree(build_dir, ignore_errors=True)
         if self._relay_server is not None:
-            for peer in self._relay_server.registry.list_online():
-                try:
-                    self._relay_server.request_cleanup(peer.peer_id, timeout_sec=5)
-                except Exception:
-                    pass
             self._relay_server.stop()
             self._relay_server = None
         if self._mcp_manager:

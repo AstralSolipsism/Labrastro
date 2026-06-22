@@ -32,25 +32,13 @@ from reuleauxcoder.domain.memory.runtime import (
     bind_memory_scope_to_agent,
 )
 from reuleauxcoder.domain.session.locale import session_locale_prompt_append
-from reuleauxcoder.domain.agent.events import (
-    AgentEvent,
-    AgentEventType,
-    ToolFailureKind,
-)
+from reuleauxcoder.domain.agent.events import AgentEvent, AgentEventType
 from reuleauxcoder.domain.agent.runtime_boundary import runtime_agent_run_id
 from reuleauxcoder.domain.agent.tool_diagnostics import (
     ToolDiagnostic,
-    ToolDiagnosticKind,
-    ToolDiagnosticStage,
     diagnostic_to_dict,
-    tool_diagnostic_from_failure,
 )
-from reuleauxcoder.domain.approval import (
-    ApprovalDecision,
-    ApprovalProvider,
-    ApprovalRequest,
-    PendingApproval,
-)
+from reuleauxcoder.domain.approval import PendingApproval
 from reuleauxcoder.domain.config.models import (
     Config,
     DEFAULT_MAIN_CHAT_AGENT_ID,
@@ -71,13 +59,9 @@ from reuleauxcoder.domain.hooks.lifecycle import (
 from reuleauxcoder.domain.hooks.registry import HookRegistry
 from reuleauxcoder.domain.session.models import Session, SessionMetadata, SessionRuntimeState
 from reuleauxcoder.domain.session.document import settle_orphaned_running_session_run
-from labrastro_server.adapters.reuleauxcoder.remote_backend import RemoteRelayToolBackend
-from labrastro_server.adapters.reuleauxcoder.mcp_tools import RemotePeerMCPTool
 from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
-    ToolPreviewRequest,
-    ToolPreviewResult,
 )
 from labrastro_server.relay.server import RelayServer
 from labrastro_server.services.agent_runtime.executor_backend import (
@@ -87,7 +71,6 @@ from labrastro_server.services.agent_runtime.executor_backend import (
 )
 from reuleauxcoder.domain.agent_runtime.models import ExecutorType, WorkerKind
 from reuleauxcoder.extensions.skills.service import SkillsService
-from reuleauxcoder.extensions.tools.backend import ExecutionContext
 from reuleauxcoder.interfaces.cli.commands import handle_command
 from reuleauxcoder.interfaces.cli.render import CLIRenderer
 from reuleauxcoder.interfaces.entrypoint.dependencies import AppDependencies
@@ -100,58 +83,6 @@ from labrastro_server.taskflow.application.taskflow_service import (
     TASKFLOW_SYSTEM_PROMPT,
     TASKFLOW_WORKFLOW_MODE,
 )
-
-REMOTE_PREVIEW_TOOLS = {"apply_patch", "draft_document_commit"}
-
-
-class RemoteToolProtocolError(RuntimeError):
-    """Protocol boundary error for remote peer tool lifecycle events."""
-
-    def __init__(
-        self,
-        *,
-        tool_name: str,
-        tool_call_id: str | None,
-        code: str,
-        message: str,
-    ):
-        super().__init__(message)
-        self.tool_name = tool_name
-        self.tool_call_id = tool_call_id
-        self.code = code
-        self.message = message
-        self.failure_kind = ToolFailureKind.TOOL_PROTOCOL_ERROR.value
-        self.recoverable = False
-        self.tool_diagnostics = [
-            tool_diagnostic_from_failure(
-                stage=ToolDiagnosticStage.PROTOCOL,
-                kind=ToolDiagnosticKind.TOOL_PROTOCOL_ERROR,
-                code=code,
-                message=message,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-            ).to_dict()
-        ]
-
-    def payload(self) -> dict[str, Any]:
-        diagnostic = tool_diagnostic_from_failure(
-            stage=ToolDiagnosticStage.PROTOCOL,
-            kind=ToolDiagnosticKind.TOOL_PROTOCOL_ERROR,
-            code=self.code,
-            message=self.message,
-            tool_name=self.tool_name,
-            tool_call_id=self.tool_call_id,
-        )
-        return {
-            "tool_name": self.tool_name,
-            "tool_call_id": self.tool_call_id,
-            "code": self.code,
-            "message": self.message,
-            "failure_kind": ToolFailureKind.TOOL_PROTOCOL_ERROR.value,
-            "tool_diagnostics": [diagnostic.to_dict()],
-            "recoverable": False,
-        }
-
 
 def _stable_digest(value: Any) -> str:
     encoded = json.dumps(
@@ -1079,15 +1010,9 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
 
         peer_llm = runner.dependencies.create_llm(current_config)
         peer_llm.ui_bus = ui_bus
-        peer_backend = RemoteRelayToolBackend(relay_server=relay_server, ui_bus=ui_bus)
-        peer_tools = runner.dependencies.load_tools(peer_backend)
         peer_agent = runner.dependencies.create_agent(
-            peer_llm, peer_tools, current_config
+            peer_llm, [], current_config
         )
-        server_mcp_manager = getattr(agent, "mcp_manager", None)
-        server_mcp_tools = list(getattr(server_mcp_manager, "tools", []) or [])
-        if server_mcp_tools:
-            peer_agent.add_tools(server_mcp_tools)
         setattr(peer_agent, "runtime_config", current_config)
         setattr(peer_agent, "capability_catalog", runner.build_capability_catalog(current_config))
         bind_memory_scope_to_agent(
@@ -1109,27 +1034,10 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         peer_context = _peer_runtime_context(peer_id)
         workspace_root = peer_context["workspace_root"]
         runtime_cwd = peer_context["cwd"]
-        setattr(peer_agent, "runtime_execution_target", "remote_peer")
+        setattr(peer_agent, "runtime_execution_target", "local_peer")
         setattr(peer_agent, "runtime_peer_context", peer_context)
         setattr(peer_agent, "runtime_working_directory", runtime_cwd)
-        setattr(peer_agent, "workspace_mutation_backend", peer_backend)
-        peer_backend.workspace_id = str(workspace_root)
-        peer_backend.execution_target = "remote_peer"
-        peer_backend.path_space = "remote_peer_workspace"
-        for tool_info in relay_server.get_peer_mcp_tools(peer_id):
-            peer_agent.add_tools([RemotePeerMCPTool(peer_backend, tool_info)])
-        for tool in peer_agent.tools:
-            backend = getattr(tool, "backend", None)
-            if getattr(backend, "backend_id", None) != "remote_relay":
-                continue
-            context = getattr(backend, "context", None)
-            if not isinstance(context, ExecutionContext):
-                continue
-            context.peer_id = peer_id
-            context.remote_stream_handler = remote_stream_handler
-            context.execution_target = "remote_peer"
-            context.cwd = runtime_cwd
-            context.workspace_root = workspace_root
+        setattr(peer_agent, "runtime_workspace_root", workspace_root)
 
         fingerprint = _peer_fingerprint(peer_id)
         setattr(peer_agent, "session_fingerprint", fingerprint)
@@ -1385,12 +1293,13 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             if not resolved_tool_call_id:
                 writer.append_event(
                     "tool_call_protocol_error",
-                    RemoteToolProtocolError(
-                        tool_name=str(tool_name or ""),
-                        tool_call_id=None,
-                        code="REMOTE_TOOL_CALL_ID_REQUIRED",
-                        message="Remote tool stream chunks must include tool_call_id.",
-                    ).payload(),
+                    {
+                        "tool_name": str(tool_name or ""),
+                        "tool_call_id": None,
+                        "code": "LOCAL_ACTION_TOOL_CALL_ID_REQUIRED",
+                        "message": "Local action tool stream chunks must include tool_call_id.",
+                        "recoverable": False,
+                    },
                 )
                 return
             writer.append_event(
@@ -1406,239 +1315,6 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             )
 
         return _handle
-
-    class _ScopedSessionRunApprovalProvider(ApprovalProvider):
-        def __init__(
-            self,
-            *,
-            writer: Any,
-            peer_id: str,
-            peer_agent: Any,
-            peer_backend: RemoteRelayToolBackend,
-        ) -> None:
-            self._writer = writer
-            self._peer_id = peer_id
-            self._peer_agent = peer_agent
-            self._peer_backend = peer_backend
-
-        def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
-            metadata = dict(request.metadata or {})
-            tool_name = str(request.tool_name or "").strip()
-            tool_call_id = str(metadata.get("tool_call_id") or "").strip()
-            if not tool_call_id:
-                tool_call_id = f"approval-tool-call:{uuid.uuid4()}"
-            approval_id = str(metadata.get("approval_id") or "").strip()
-            if not approval_id:
-                approval_id = f"approval:{tool_call_id}:{uuid.uuid4()}"
-            tool_args = dict(request.tool_args or {})
-            public_args = self._public_tool_args(tool_name, tool_args)
-            intent = str(request.intent or tool_args.get("intent") or "").strip()
-            payload: dict[str, Any] = {
-                "approval_id": approval_id,
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "tool_args": public_args,
-                "tool_source": str(request.tool_source or ""),
-                "reason": request.reason or "",
-                "intent": intent,
-                "content": self._approval_content(request, public_args),
-                "preview_unavailable": True,
-                "sections": [],
-            }
-            for key in ("lifecycle_event", "lifecycle_hooks"):
-                value = metadata.get(key)
-                if value not in (None, ""):
-                    payload[key] = value
-
-            preview_decision = self._attach_preview_or_fail_closed(
-                request,
-                payload,
-                tool_args,
-                tool_call_id,
-            )
-            if preview_decision is not None:
-                return preview_decision
-
-            self._writer.register_approval(approval_id, payload)
-            self._writer.append_event("approval_request", payload)
-            decision, reason, resolution_meta = self._writer.wait_approval(
-                approval_id,
-                timeout_sec=60.0,
-            )
-            resolved_payload = {
-                "approval_id": approval_id,
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "decision": decision,
-                "reason": reason or "",
-                "meta": dict(resolution_meta),
-            }
-            self._writer.append_event("approval_resolved", resolved_payload)
-            if decision == "allow_once":
-                candidate = resolution_meta.get("approved_save_candidate")
-                if not isinstance(candidate, dict):
-                    candidate = payload.get("approved_save_candidate")
-                if isinstance(candidate, dict) and candidate:
-                    self._peer_backend.remember_approved_candidate(
-                        tool_name,
-                        tool_args,
-                        candidate,
-                    )
-                return ApprovalDecision.allow_once(
-                    reason,
-                    meta=dict(resolution_meta),
-                )
-            return ApprovalDecision.deny_once(reason, meta=dict(resolution_meta))
-
-        @staticmethod
-        def _public_tool_args(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
-            blocked = {"intent"}
-            if tool_name == "draft_document_commit":
-                blocked.update({"content", "diff", "draft_document_content", "body"})
-            return {
-                str(key): value
-                for key, value in tool_args.items()
-                if str(key) not in blocked
-            }
-
-        @staticmethod
-        def _approval_content(
-            request: ApprovalRequest,
-            public_args: dict[str, Any],
-        ) -> str:
-            reason = str(request.reason or "Tool call requires approval.").strip()
-            tool_name = str(request.tool_name or "").strip()
-            return f"{reason}\n\nTool: {tool_name}\nArguments: {json.dumps(public_args, ensure_ascii=False, sort_keys=True)}"
-
-        def _attach_preview_or_fail_closed(
-            self,
-            request: ApprovalRequest,
-            payload: dict[str, Any],
-            tool_args: dict[str, Any],
-            tool_call_id: str,
-        ) -> ApprovalDecision | None:
-            tool_name = str(request.tool_name or "").strip()
-            if tool_name not in REMOTE_PREVIEW_TOOLS:
-                return None
-            if tool_name == "draft_document_commit" and str(tool_args.get("diff") or ""):
-                target_path = str(tool_args.get("target_path") or "")
-                payload["tool_args"] = self._public_tool_args(tool_name, tool_args)
-                payload["preview_unavailable"] = False
-                payload["sections"] = [
-                    {
-                        "id": "diff",
-                        "title": "Proposed file diff",
-                        "kind": "diff",
-                        "content": str(tool_args.get("diff") or ""),
-                        "path": target_path,
-                        "resolved_path": target_path,
-                    }
-                ]
-                return None
-            peer = relay_server.registry.get(self._peer_id)
-            features = set(str(item) for item in getattr(peer, "features", []) or [])
-            if "tool_preview" not in features:
-                self._raise_protocol_error(
-                    tool_name,
-                    tool_call_id,
-                    "REMOTE_PREVIEW_REQUIRED",
-                    "Remote peer must advertise tool_preview before write approval.",
-                )
-            preview = relay_server.send_preview_request(
-                self._peer_id,
-                ToolPreviewRequest(
-                    tool_name=tool_name,
-                    args=tool_args,
-                    cwd=getattr(getattr(self._peer_backend, "context", None), "cwd", None),
-                    timeout_sec=30,
-                ),
-                timeout_sec=30,
-            )
-            if not preview.ok:
-                return self._preview_denial(tool_name, tool_call_id, preview)
-            sections = [dict(item) for item in preview.sections if isinstance(item, dict)]
-            if not sections and preview.diff:
-                sections = [
-                    {
-                        "id": "diff",
-                        "title": "Proposed file diff",
-                        "kind": "diff",
-                        "content": preview.diff,
-                        "resolved_path": preview.resolved_path or "",
-                    }
-                ]
-            if not sections:
-                self._raise_protocol_error(
-                    tool_name,
-                    tool_call_id,
-                    "REMOTE_PREVIEW_EMPTY",
-                    "Remote peer returned an empty write preview.",
-                )
-            candidate = (
-                dict(preview.meta.get("approved_save_candidate"))
-                if isinstance(preview.meta.get("approved_save_candidate"), dict)
-                else {}
-            )
-            if not candidate:
-                self._raise_protocol_error(
-                    tool_name,
-                    tool_call_id,
-                    "REMOTE_PREVIEW_SAVE_CANDIDATE_REQUIRED",
-                    "Remote preview must include an approved_save_candidate.",
-                )
-            payload["preview_unavailable"] = False
-            payload["sections"] = sections
-            payload["resolved_path"] = preview.resolved_path or ""
-            payload["approved_save_candidate"] = candidate
-            return None
-
-        @staticmethod
-        def _preview_denial(
-            tool_name: str,
-            tool_call_id: str,
-            preview: ToolPreviewResult,
-        ) -> ApprovalDecision:
-            code = str(preview.error_code or "REMOTE_TOOL_ERROR")
-            message = str(preview.error_message or "remote preview failed")
-            reason = f"Error [{code}]: {message}"
-            diagnostic = tool_diagnostic_from_failure(
-                stage=ToolDiagnosticStage.PREVIEW,
-                kind=ToolDiagnosticKind.TOOL_RESULT_ERROR,
-                code=code,
-                message=message,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                repairable=True,
-            ).to_dict()
-            return ApprovalDecision.deny_once(
-                reason,
-                meta={
-                    "failure_kind": ToolFailureKind.TOOL_RESULT_ERROR.value,
-                    "code": code,
-                    "message": message,
-                    "tool_diagnostics": [diagnostic],
-                },
-            )
-
-        def _raise_protocol_error(
-            self,
-            tool_name: str,
-            tool_call_id: str,
-            code: str,
-            message: str,
-        ) -> None:
-            error = RemoteToolProtocolError(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                code=code,
-                message=message,
-            )
-            _emit_agent_session_run_event(
-                self._peer_agent,
-                "tool_call_protocol_error",
-                error.payload(),
-            )
-            raise error
 
     def _remote_peer_ready_payload(peer_agent: Agent, peer_id: str) -> dict[str, Any]:
         current_config = _current_config()
@@ -1747,14 +1423,6 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     },
                 )
             writer = _session_run_writer_for_binding(binding)
-            peer_backend = getattr(peer_agent, "workspace_mutation_backend", None)
-            if isinstance(peer_backend, RemoteRelayToolBackend):
-                peer_agent.approval_provider = _ScopedSessionRunApprovalProvider(
-                    writer=writer,
-                    peer_id=peer_id,
-                    peer_agent=peer_agent,
-                    peer_backend=peer_backend,
-                )
             writer.append_event(
                 "remote_peer_ready",
                 _remote_peer_ready_payload(peer_agent, peer_id),

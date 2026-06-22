@@ -19,6 +19,15 @@ from reuleauxcoder.domain.hooks.lifecycle import (
     LifecycleHookRuntimeAdapterRegistry,
 )
 from reuleauxcoder.domain.llm.models import LLMResponse, ToolCall
+from reuleauxcoder.extensions.tools.spec import (
+    ToolExecutionSpec,
+    ToolExposure,
+    ToolOutputStrategy,
+    ToolPermissionSpec,
+    ToolMutationSpec,
+    ToolRisk,
+    ToolSpec,
+)
 
 
 class _LLM:
@@ -80,6 +89,23 @@ class _VisibleTool:
     description = "Read a file"
     parameters = {}
     tool_source = "builtin"
+
+    def tool_spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.name,
+            namespace="builtin",
+            description=self.description,
+            input_schema={"type": "object", "properties": {}},
+            output_schema=None,
+            output_strategy=ToolOutputStrategy.TEXT,
+            risk=ToolRisk.READ_ONLY,
+            exposure=ToolExposure.DIRECT,
+            search_text=self.description,
+            search_keywords=(self.name,),
+            permission=ToolPermissionSpec(policy="read_only"),
+            mutation=ToolMutationSpec(),
+            execution=ToolExecutionSpec(executor_ref="test._VisibleTool"),
+        )
 
     def schema(self) -> dict:
         return {"name": self.name, "description": self.description, "parameters": {}}

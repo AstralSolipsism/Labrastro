@@ -5,7 +5,6 @@ from __future__ import annotations
 import gzip
 import json
 import logging
-import queue
 import shutil
 import tempfile
 import threading
@@ -40,12 +39,10 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchResponse,
     SessionRunStartRequest,
     SessionRunStartResponse,
-    CleanupResult,
     DisconnectNotice,
     EnvironmentManifestRequest,
     EnvironmentManifestResponse,
     EnvironmentRequirementManifest,
-    ExecToolResult,
     Heartbeat,
     MCPArtifactManifest,
     MCPLaunchManifest,
@@ -55,13 +52,11 @@ from labrastro_server.interfaces.http.remote.protocol import (
     PeerMCPToolsReport,
     RegisterRejected,
     RegisterRequest,
-    RelayEnvelope,
     SessionDeleteRequest,
     SessionListRequest,
     SessionLoadRequest,
     SessionModelSwitchRequest,
     SessionNewRequest,
-    ToolPreviewResult,
 )
 from labrastro_server.relay.server import RelayServer
 from reuleauxcoder.domain.environment_requirements import (
@@ -3452,8 +3447,6 @@ class RemoteRelayHTTPService:
         self.max_request_body_bytes = max(1, int(max_request_body_bytes or 1))
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._queues: dict[str, queue.Queue[RelayEnvelope]] = {}
-        self._queues_lock = threading.Lock()
         self._peer_chat_locks: dict[str, threading.Lock] = {}
         self._peer_chat_locks_lock = threading.Lock()
         self._capability_package_peer_results: dict[
@@ -3483,7 +3476,6 @@ class RemoteRelayHTTPService:
         self._agent_run_recovery_interval_sec = 2.0
         self._github_reconcile_stop = threading.Event()
         self._github_reconcile_thread: threading.Thread | None = None
-        self.relay_server._send_fn = self._enqueue_outbound
 
     @property
     def base_url(self) -> str:
@@ -3860,19 +3852,6 @@ class RemoteRelayHTTPService:
             return
         appender(agent_run_id, event_type, payload)
 
-    def _enqueue_outbound(self, peer_id: str, envelope: RelayEnvelope) -> None:
-        with self._queues_lock:
-            peer_queue = self._queues.setdefault(peer_id, queue.Queue())
-        peer_queue.put(envelope)
-
-    def _next_envelope(self, peer_id: str) -> RelayEnvelope | None:
-        with self._queues_lock:
-            peer_queue = self._queues.setdefault(peer_id, queue.Queue())
-        try:
-            return peer_queue.get_nowait()
-        except queue.Empty:
-            return None
-
     def _build_handler(self):
         service = self
 
@@ -3943,12 +3922,6 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/heartbeat":
                     self._handle_heartbeat()
-                    return
-                if parsed.path == "/remote/poll":
-                    self._handle_poll()
-                    return
-                if parsed.path == "/remote/result":
-                    self._handle_result()
                     return
                 if parsed.path == "/remote/github/webhook":
                     self._handle_github_webhook()

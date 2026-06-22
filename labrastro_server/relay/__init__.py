@@ -1,7 +1,6 @@
 """Server-side remote relay primitives."""
 
 from labrastro_server.relay.auth import TokenManager
-from labrastro_server.relay.cleanup import cleanup_all_peers, request_peer_cleanup
 from labrastro_server.relay.errors import (
     AuthError,
     PeerDisconnectedError,
@@ -26,6 +25,4 @@ __all__ = [
     "RemoteTimeoutError",
     "RemoteToolError",
     "TokenManager",
-    "cleanup_all_peers",
-    "request_peer_cleanup",
 ]

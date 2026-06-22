@@ -470,7 +470,6 @@ class AgentEventBridge:
             AgentEventType.TOOL_CALL_DELTA,
             AgentEventType.TOOL_CALL_START,
             AgentEventType.TOOL_CALL_END,
-            AgentEventType.DELEGATED_RUN_COMPLETED,
             AgentEventType.FILE_CHANGE_STARTED,
             AgentEventType.FILE_CHANGE_PATCH_UPDATED,
             AgentEventType.FILE_CHANGE_APPROVAL_REQUESTED,

@@ -15,30 +15,11 @@ from labrastro_server.interfaces.http.remote.helpers import (
     strong_etag,
 )
 from labrastro_server.interfaces.http.remote.protocol import (
-    ApprovalReplyRequest,
-    ApprovalReplyResponse,
-    SessionRunCancelRequest,
-    SessionRunCancelResponse,
-    SessionRunStartRequest,
-    SessionRunStartResponse,
-    CleanupResult,
     DisconnectNotice,
-    EnvironmentManifestRequest,
-    EnvironmentManifestResponse,
-    ExecToolResult,
     Heartbeat,
-    MCPManifestRequest,
-    MCPManifestResponse,
     PeerMCPToolsReport,
     RegisterRejected,
     RegisterRequest,
-    RelayEnvelope,
-    SessionDeleteRequest,
-    SessionListRequest,
-    SessionLoadRequest,
-    SessionModelSwitchRequest,
-    SessionNewRequest,
-    ToolPreviewResult,
 )
 from labrastro_server.relay.errors import RegisterRejectedError
 from labrastro_server.services.agent_runtime.control_plane import AgentRunRequest
@@ -181,78 +162,6 @@ class RemotePeerRoutes:
             return
         self.service.relay_server.registry.update_heartbeat(peer_id)
         self._send_json(HTTPStatus.OK, {"ok": True, "peer_id": peer_id})
-
-    def _handle_poll(self) -> None:
-        payload = self._read_json()
-        peer_token = payload.get("peer_token")
-        if not isinstance(peer_token, str) or not peer_token:
-            self._send_error(HTTPStatus.BAD_REQUEST, "peer_token_required")
-            return
-        peer_id = self.service.relay_server.token_manager.verify_peer_token(
-            peer_token
-        )
-        if peer_id is None:
-            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
-            return
-        self.service.relay_server.registry.update_heartbeat(peer_id)
-        env = self.service._next_envelope(peer_id)
-        if env is None:
-            self._send_json(HTTPStatus.OK, {"type": "noop", "payload": {}})
-            return
-        self._send_json(HTTPStatus.OK, env.to_dict())
-
-    def _handle_result(self) -> None:
-        payload = self._read_json()
-        peer_token = payload.get("peer_token")
-        request_id = payload.get("request_id")
-        result_type = payload.get("type", "tool_result")
-        result_payload = payload.get("payload", {})
-        peer_id = self.service.relay_server.token_manager.verify_peer_token(
-            peer_token
-        )
-        if peer_id is None:
-            self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
-            return
-        if not isinstance(request_id, str) or not request_id:
-            self._send_error(HTTPStatus.BAD_REQUEST, "request_id_required")
-            return
-        try:
-            if result_type == "cleanup_result":
-                result = CleanupResult.from_dict(result_payload)
-                env = RelayEnvelope(
-                    type="cleanup_result",
-                    request_id=request_id,
-                    peer_id=peer_id,
-                    payload=result.to_dict(),
-                )
-            elif result_type == "tool_stream":
-                env = RelayEnvelope(
-                    type="tool_stream",
-                    request_id=request_id,
-                    peer_id=peer_id,
-                    payload=result_payload,
-                )
-            elif result_type == "tool_preview_result":
-                result = ToolPreviewResult.from_dict(result_payload)
-                env = RelayEnvelope(
-                    type="tool_preview_result",
-                    request_id=request_id,
-                    peer_id=peer_id,
-                    payload=result.to_dict(),
-                )
-            else:
-                result = ExecToolResult.from_dict(result_payload)
-                env = RelayEnvelope(
-                    type="tool_result",
-                    request_id=request_id,
-                    peer_id=peer_id,
-                    payload=result.to_dict(),
-                )
-        except Exception:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid_result_request")
-            return
-        self.service.relay_server.handle_inbound(peer_id, env)
-        self._send_json(HTTPStatus.OK, {"ok": True})
 
     def _handle_disconnect(self) -> None:
         payload = self._read_json()

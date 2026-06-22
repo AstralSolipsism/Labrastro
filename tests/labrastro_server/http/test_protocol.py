@@ -11,8 +11,6 @@ import labrastro_server.interfaces.http.remote.protocol as remote_protocol
 from labrastro_server.interfaces.http.remote.protocol import (
     AgentRunBranchRequest,
     AgentRunForkRequest,
-    CleanupRequest,
-    CleanupResult,
     SessionRunAgentRunSteerRequest,
     ChatCommandDispatchRequest,
     ChatCommandDispatchResponse,
@@ -33,8 +31,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     EnvironmentManifestResponse,
     EnvironmentRequirementManifest,
     ErrorMessage,
-    ExecToolRequest,
-    ExecToolResult,
     Heartbeat,
     MCPArtifactManifest,
     MCPLaunchManifest,
@@ -42,8 +38,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     MCPManifestResponse,
     MCPServerManifest,
     PeerDisconnectRequest,
-    PeerPollRequest,
-    PeerResultRequest,
     PeerMCPToolsReport,
     RemoteMCPToolInfo,
     RegisterRejected,
@@ -53,9 +47,6 @@ from labrastro_server.interfaces.http.remote.protocol import (
     REMOTE_ENDPOINTS,
     SessionModelSwitchRequest,
     SessionListRequest,
-    ToolPreviewRequest,
-    ToolPreviewResult,
-    ToolStreamChunk,
     endpoint_registry,
 )
 
@@ -78,17 +69,17 @@ def _contract_fixtures() -> dict:
 class TestRelayEnvelope:
     def test_roundtrip(self) -> None:
         env = RelayEnvelope(
-            type="exec_tool",
+            type="heartbeat",
             request_id="req-123",
             peer_id="peer-456",
-            payload={"tool_name": "shell", "args": {"command": "ls"}},
+            payload={"peer_token": "pt_tok"},
         )
         d = env.to_dict()
         restored = RelayEnvelope.from_dict(d)
-        assert restored.type == "exec_tool"
+        assert restored.type == "heartbeat"
         assert restored.request_id == "req-123"
         assert restored.peer_id == "peer-456"
-        assert restored.payload["tool_name"] == "shell"
+        assert restored.payload["peer_token"] == "pt_tok"
 
 
 class TestRemoteHTTPContract:
@@ -323,28 +314,6 @@ class TestHeartbeat:
 
 
 class TestPeerControlPlaneRequests:
-    def test_poll_request_roundtrip(self) -> None:
-        req = PeerPollRequest(peer_token="pt_1")
-
-        restored = PeerPollRequest.from_dict(req.to_dict())
-
-        assert restored.peer_token == "pt_1"
-
-    def test_result_request_roundtrip(self) -> None:
-        req = PeerResultRequest(
-            peer_token="pt_1",
-            request_id="req-1",
-            type="tool_result",
-            payload={"ok": True},
-        )
-
-        restored = PeerResultRequest.from_dict(req.to_dict())
-
-        assert restored.peer_token == "pt_1"
-        assert restored.request_id == "req-1"
-        assert restored.type == "tool_result"
-        assert restored.payload == {"ok": True}
-
     def test_disconnect_request_roundtrip(self) -> None:
         req = PeerDisconnectRequest(peer_token="pt_1", reason="shutdown")
 
@@ -1183,147 +1152,6 @@ class TestEnvironmentManifest:
         assert restored.agent_id == "reviewer"
 
 
-class TestExecToolRequest:
-    def test_roundtrip(self) -> None:
-        req = ExecToolRequest(
-            tool_name="shell",
-            args={"command": "ls"},
-            cwd="/tmp",
-            timeout_sec=60,
-            permission_context={
-                "agent_id": "main_chat",
-                "decision": {"action": "allow", "authorized": True},
-            },
-        )
-        d = req.to_dict()
-        restored = ExecToolRequest.from_dict(d)
-        assert restored.tool_name == "shell"
-        assert restored.args == {"command": "ls"}
-        assert restored.cwd == "/tmp"
-        assert restored.timeout_sec == 60
-        assert ("expected" + "_state") not in d
-        assert restored.permission_context == {
-            "agent_id": "main_chat",
-            "decision": {"action": "allow", "authorized": True},
-        }
-
-    def test_defaults(self) -> None:
-        req = ExecToolRequest(tool_name="read_file")
-        assert req.args == {}
-        assert req.cwd is None
-        assert req.timeout_sec == 30
-        assert req.permission_context == {}
-
-    def test_roundtrip_save_candidate_fields(self) -> None:
-        preview_identity = {
-            "plan_id": "plan-1",
-            "candidate_hash": "candidate-1",
-            "tool_name": "apply_patch",
-            "workspace_id": "/repo",
-            "execution_target": "remote_peer",
-            "path_space": "remote_peer_workspace",
-            "args_hash": "args-1",
-        }
-        candidate = {
-            "tool_name": "apply_patch",
-            "preview_identity": preview_identity,
-            "operations": [
-                {
-                    "kind": "update",
-                    "path": "a.txt",
-                    "new_content": "new\n",
-                }
-            ],
-        }
-        req = ExecToolRequest(
-            tool_name="apply_patch",
-            args={},
-            cwd="/repo",
-            preview_identity=preview_identity,
-            approved_save_candidate=candidate,
-        )
-
-        restored = ExecToolRequest.from_dict(req.to_dict())
-
-        assert restored.preview_identity == preview_identity
-        assert restored.approved_save_candidate == candidate
-
-
-class TestExecToolResult:
-    def test_roundtrip(self) -> None:
-        res = ExecToolResult(
-            ok=False,
-            result="",
-            error_code="PEER_DISCONNECTED",
-            error_message="peer gone",
-            meta={"exit_code": 1},
-        )
-        d = res.to_dict()
-        restored = ExecToolResult.from_dict(d)
-        assert restored.ok is False
-        assert restored.error_code == "PEER_DISCONNECTED"
-        assert restored.meta["exit_code"] == 1
-
-
-class TestToolPreview:
-    def test_request_roundtrip(self) -> None:
-        req = ToolPreviewRequest(
-            tool_name="apply_patch",
-            args={"file_path": "a.txt", "content": "hello"},
-            cwd="/repo",
-            timeout_sec=12,
-        )
-
-        restored = ToolPreviewRequest.from_dict(req.to_dict())
-
-        assert restored.tool_name == "apply_patch"
-        assert restored.args["file_path"] == "a.txt"
-        assert restored.cwd == "/repo"
-        assert restored.timeout_sec == 12
-
-    def test_result_roundtrip(self) -> None:
-        result = ToolPreviewResult(
-            ok=True,
-            sections=[
-                {
-                    "id": "diff",
-                    "kind": "diff",
-                    "content": "--- a/a.txt\n+++ b/a.txt\n",
-                }
-            ],
-            resolved_path="/repo/a.txt",
-            diff="diff",
-            original_text="old",
-            modified_text="new",
-            meta={"mode": "preview"},
-        )
-
-        restored = ToolPreviewResult.from_dict(result.to_dict())
-
-        assert restored.ok is True
-        assert restored.sections[0]["kind"] == "diff"
-        assert restored.resolved_path == "/repo/a.txt"
-        assert restored.original_text == "old"
-        assert restored.modified_text == "new"
-        assert restored.meta["mode"] == "preview"
-
-
-class TestToolStreamChunk:
-    def test_roundtrip(self) -> None:
-        chunk = ToolStreamChunk(
-            chunk_type="stdout",
-            data="hello",
-            meta={"seq": 1},
-            tool_call_id="call-1",
-        )
-        d = chunk.to_dict()
-        restored = ToolStreamChunk.from_dict(d)
-        assert restored.chunk_type == "stdout"
-        assert restored.data == "hello"
-        assert restored.meta == {"seq": 1}
-        assert restored.tool_call_id == "call-1"
-
-
 class TestDisconnectNotice:
     def test_roundtrip(self) -> None:
         n = DisconnectNotice(reason="shutdown")
@@ -1334,23 +1162,6 @@ class TestDisconnectNotice:
     def test_default_reason(self) -> None:
         n = DisconnectNotice.from_dict({})
         assert n.reason == "peer_initiated"
-
-
-class TestCleanupRequest:
-    def test_roundtrip(self) -> None:
-        req = CleanupRequest()
-        d = req.to_dict()
-        restored = CleanupRequest.from_dict(d)
-        assert isinstance(restored, CleanupRequest)
-
-
-class TestCleanupResult:
-    def test_roundtrip(self) -> None:
-        res = CleanupResult(ok=True, removed_items=["/tmp/a"], error_message=None)
-        d = res.to_dict()
-        restored = CleanupResult.from_dict(d)
-        assert restored.ok is True
-        assert restored.removed_items == ["/tmp/a"]
 
 
 class TestErrorMessage:
