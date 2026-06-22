@@ -531,7 +531,7 @@ def test_agent_run_log_event_projects_as_process_context() -> None:
         }
     )
 
-    assert [event_type for event_type, _ in session_events] == ["context_event"]
+    assert [event_type for event_type, _ in session_events] == ["agent_run_event"]
     payload = session_events[0][1]
     assert payload["phase"] == "agent_run_log"
     assert payload["log"] == "loading source bundle"
@@ -969,7 +969,7 @@ def test_delegated_agent_run_completion_projects_as_process_context() -> None:
         }
     )
 
-    assert [event_type for event_type, _ in session_events] == ["context_event"]
+    assert [event_type for event_type, _ in session_events] == ["agent_run_event"]
     payload = session_events[0][1]
     assert payload["phase"] == "agent_relation_completed"
     assert payload["title"] == "reviewer completed"
@@ -1035,7 +1035,7 @@ def test_agent_run_usage_event_projects_lifecycle_prompt_token_accounting() -> N
         }
     )
 
-    assert session_events[0][0] == "context_event"
+    assert session_events[0][0] == "agent_run_event"
     payload = session_events[0][1]
     assert payload["phase"] == "agent_run_usage"
     assert payload["usage"]["prompt_tokens"] == 7
@@ -1673,7 +1673,7 @@ def test_agent_run_result_event_projects_as_structured_process_context() -> None
         }
     )
 
-    assert [event_type for event_type, _ in session_events] == ["context_event"]
+    assert [event_type for event_type, _ in session_events] == ["agent_run_event"]
     payload = session_events[0][1]
     assert payload["phase"] == "agent_run_result"
     assert payload["agent_run_status"] == "completed"
@@ -1988,6 +1988,7 @@ def test_revision_feedback_uses_public_draft_without_new_agent_run() -> None:
         session_hint="session-1",
         locale="zh-CN",
         artifact_root=Path.cwd(),
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(control, object(), poll_timeout_sec=0.05)
     draft = {
@@ -5087,6 +5088,46 @@ def test_ingest_status_reports_unsupported_external_install_envreq() -> None:
     )
 
 
+def test_capability_package_session_start_writes_start_event_before_progress(
+    tmp_path: Path,
+) -> None:
+    class FakeAdminManager(_CandidateAdminMixin):
+        def _unexpected_legacy_install(self, payload: dict[str, object]):
+            raise AssertionError("order test must not install")
+
+    control = _control_plane()
+    session = _SessionRunProjection(
+        session_run_id="session-run-start-order",
+        peer_id="peer-1",
+        session_hint="session-1",
+        artifact_root=tmp_path,
+        branch_binding_id="main",
+        initial_prompt="Create capability package",
+        locale="en",
+    )
+    service = CapabilityPackageSessionRunService(
+        control,
+        FakeAdminManager(),
+        poll_timeout_sec=0.05,
+    )
+
+    service.start(
+        session,
+        {
+            "source": {
+                "type": "project_notes",
+                "notes": "Install gh, then use gh pr view for review.",
+            }
+        },
+    )
+
+    event_types = [event["type"] for event in session.events]
+    assert event_types[0] == "session_run_start", event_types
+    assert event_types.index("session_run_start") < event_types.index("workflow_step")
+    assert session.runtime_state["branch_binding_id"] == "main"
+    assert session.runtime_state["scope_id"] == "session-run-start-order:main"
+
+
 def test_capability_package_session_reports_structured_skill_content_failure(
     tmp_path: Path,
 ) -> None:
@@ -5100,13 +5141,14 @@ def test_capability_package_session_reports_structured_skill_content_failure(
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
         FakeAdminManager(),
         poll_timeout_sec=0.05,
     )
-    service.start(
+    result = service.start(
         session,
         {
             "source": {
@@ -5184,13 +5226,14 @@ def test_capability_package_session_reports_incomplete_field_generation_without_
         session_hint="session-1",
         artifact_root=tmp_path,
         locale="en",
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
         FakeAdminManager(),
         poll_timeout_sec=0.05,
     )
-    service.start(
+    result = service.start(
         session,
         {"repoUrl": "https://github.com/greensock/gsap-skills"},
     )
@@ -5283,6 +5326,7 @@ def test_capability_package_session_reports_interrupted_output_beyond_display_ev
         session_hint="session-1",
         artifact_root=tmp_path,
         locale="en",
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -5378,13 +5422,14 @@ def test_capability_package_session_requests_approval_from_patch_stream_with_emp
         session_hint="session-1",
         artifact_root=tmp_path,
         locale="en",
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
         admin,
         poll_timeout_sec=0.05,
     )
-    service.start(
+    result = service.start(
         session,
         {
             "source": {
@@ -5458,7 +5503,12 @@ def test_capability_package_session_requests_approval_from_patch_stream_with_emp
     assert approval["tool_name"] == "install_capability_package"
     assert approval["decision_type"] == "capability_package_install"
     assert approval["review"]["package_id"] == "review-empty-plan"
-    session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
+    session.resolve_approval(
+        str(approval["approval_id"]),
+        "allow_once",
+        None,
+        branch_binding_id=str(approval["branch_binding_id"]),
+    )
     _wait_for(lambda: session.done)
 
     assert admin.payloads
@@ -5512,27 +5562,20 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
         session_run_id="session-run-1",
         peer_id="peer-1",
         session_hint="session-1",
+        agent_run_id="agent-run-main",
         artifact_root=tmp_path,
         locale="en",
+        branch_binding_id="main",
+        initial_prompt="Create capability package",
         trace_event_sink=trace_sink,
     )
     session.enable_trace_persistence("session-1")
-    session.append_event(
-        "session_run_start",
-        {
-            "prompt": "Create capability package",
-            "mode": "capability_package",
-            "workflow_mode": "capability_package_ingest",
-            "locale": "en",
-        },
-    )
-    session.mark_running()
     service = CapabilityPackageSessionRunService(
         control,
         admin,
         poll_timeout_sec=0.05,
     )
-    service.start(
+    result = service.start(
         session,
         {
             "source": {
@@ -5541,6 +5584,12 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
             }
         },
     )
+    assert result.failure is None
+    assert result.binding is not None
+    session_start = session.events[0]
+    assert session_start["type"] == "session_run_start"
+    assert session_start["payload"]["agent_run_id"] == result.binding.agent_run_id
+    assert session_start["payload"]["branch_binding_id"] == result.binding.branch_binding_id
     agent_run_id = _wait_for(
         lambda: next(
             (
@@ -5628,15 +5677,23 @@ def test_capability_package_session_run_requests_install_approval_and_installs(t
     assert approval["sections"][2]["items"][1]["value"] == "Local client"
     assert approval["decision_type"] == "capability_package_install"
     assert approval["review"]["package_id"] == "review"
-    status_approvals = session.status_payload()["approvals"]
+    status_approvals = session.status_payload(branch_binding_id="main")["approvals"]
     assert len(status_approvals) == 1
     assert status_approvals[0]["approval_id"] == approval["approval_id"]
     assert status_approvals[0]["decision_type"] == "capability_package_install"
     assert status_approvals[0]["tool_name"] == "install_capability_package"
     assert status_approvals[0]["review"]["package_id"] == "review"
     assert status_approvals[0]["state"] == "requested"
-    session.append_event("reasoning_delta", {"content": "Installing package."})
-    session.resolve_approval(str(approval["approval_id"]), "allow_once", None)
+    session.append_event(
+        "reasoning_delta",
+        {"content": "Installing package.", "branch_binding_id": "main"},
+    )
+    session.resolve_approval(
+        str(approval["approval_id"]),
+        "allow_once",
+        None,
+        branch_binding_id=str(approval["branch_binding_id"]),
+    )
     _wait_for(lambda: session.done)
 
     assert admin.payloads
@@ -5694,6 +5751,7 @@ def test_capability_package_session_process_text_follows_english_locale(tmp_path
         session_hint="session-1",
         artifact_root=tmp_path,
         locale="en",
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -5769,6 +5827,7 @@ def test_capability_package_session_unknown_failure_uses_session_locale(
         session_hint="session-1",
         artifact_root=tmp_path,
         locale="zh-CN",
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -5776,7 +5835,7 @@ def test_capability_package_session_unknown_failure_uses_session_locale(
         poll_timeout_sec=0.05,
     )
 
-    service.start(
+    result = service.start(
         session,
         {
             "source": {
@@ -5785,14 +5844,12 @@ def test_capability_package_session_unknown_failure_uses_session_locale(
             }
         },
     )
-    _wait_for(lambda: session.done)
 
-    error_event = next(event for event in session.events if event["type"] == "error")
-    failed_event = next(event for event in session.events if event["type"] == "session_run_failed")
-    assert error_event["payload"]["message"] == "能力包流程执行失败。"
-    assert error_event["payload"]["message_key"] == "capability_package.session_failed"
-    assert error_event["payload"]["diagnostic_message"] == "boom"
-    assert failed_event["payload"]["message"] == "能力包流程执行失败。"
+    assert result.failure is not None
+    assert result.failure.error == "capability_package_session_failed"
+    assert result.failure.message == "能力包流程执行失败。"
+    assert session.done is False
+    assert session.events == []
 
 
 def test_capability_package_session_revision_feedback_revises_pending_draft(tmp_path: Path) -> None:
@@ -5812,6 +5869,7 @@ def test_capability_package_session_revision_feedback_revises_pending_draft(tmp_
         session_hint="session-1",
         locale="zh-CN",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(control, admin, poll_timeout_sec=0.05)
     service.start(
@@ -5866,6 +5924,7 @@ def test_capability_package_session_revision_feedback_revises_pending_draft(tmp_
         "把依赖改成 gh，不要用 hub",
         revision_feedback_id="revision-revise",
         client_request_id="pending-revise",
+        branch_binding_id="main",
     )
     _wait_for(
         lambda: control.agent_run_to_dict(str(first_agent_run_id)).get(
@@ -5950,7 +6009,12 @@ def test_capability_package_session_revision_feedback_revises_pending_draft(tmp_
     assert second_approval["tool_name"] == "install_capability_package"
     assert second_approval["tool_args"]["agent_run_id"] == second_agent_run_id
 
-    session.resolve_approval(str(second_approval["approval_id"]), "deny_once", "test_cleanup")
+    session.resolve_approval(
+        str(second_approval["approval_id"]),
+        "deny_once",
+        "test_cleanup",
+        branch_binding_id=str(second_approval["branch_binding_id"]),
+    )
     _wait_for(lambda: session.done)
     assert admin.payloads == []
 
@@ -5970,6 +6034,7 @@ def test_capability_package_session_repairs_candidate_build_field_errors(
         session_hint="session-1",
         locale="zh-CN",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(control, admin, poll_timeout_sec=0.05)
     service.start(
@@ -6113,7 +6178,12 @@ def test_capability_package_session_repairs_candidate_build_field_errors(
     assert approval["tool_args"]["agent_run_id"] == second_agent_run_id
     assert "mcp:github:search" in json.dumps(approval, ensure_ascii=False)
 
-    session.resolve_approval(str(approval["approval_id"]), "deny_once", "test_cleanup")
+    session.resolve_approval(
+        str(approval["approval_id"]),
+        "deny_once",
+        "test_cleanup",
+        branch_binding_id=str(approval["branch_binding_id"]),
+    )
     _wait_for(lambda: session.done)
     assert admin.payloads == []
 
@@ -6135,6 +6205,7 @@ def test_peer_shutdown_keeps_capability_package_session_run_active(tmp_path: Pat
         workflow_mode="capability_package_ingest",
         runtime_state={"mode": "capability_package", "workflow_mode": "capability_package_ingest"},
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     http_service._session_runs[session.session_run_id] = session
     service = CapabilityPackageSessionRunService(
@@ -6176,7 +6247,7 @@ def test_peer_shutdown_keeps_capability_package_session_run_active(tmp_path: Pat
         for event in session.events
     )
 
-    session.request_cancel("test_cleanup")
+    session.request_branch_cancel("test_cleanup", "main")
     _wait_for(lambda: session.done)
 
 
@@ -6193,6 +6264,7 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -6257,7 +6329,7 @@ def test_capability_package_session_stays_attached_when_agent_run_lease_expires(
     assert approval["tool_args"]["agent_run_id"] == agent_run_id
     assert session.done is False
 
-    session.request_cancel("test_cleanup")
+    session.request_branch_cancel("test_cleanup", "main")
     _wait_for(lambda: session.done)
 
 
@@ -6272,6 +6344,7 @@ def test_capability_package_session_cancel_cancels_agent_run(tmp_path: Path) -> 
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -6298,7 +6371,7 @@ def test_capability_package_session_cancel_cancels_agent_run(tmp_path: Path) -> 
             "",
         )
     )
-    session.request_cancel("user_cancelled")
+    session.request_branch_cancel("user_cancelled", "main")
     _wait_for(lambda: session.done)
 
     task = control.agent_run_to_dict(str(agent_run_id))
@@ -6323,6 +6396,7 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -6391,13 +6465,24 @@ def test_capability_package_session_cancel_during_install_approval_does_not_appe
     )
     assert approval["tool_name"] == "install_capability_package"
 
-    first_request, resolved_approvals = session.request_cancel("user_cancelled")
+    first_request, resolved_approvals, resolved_inputs = session.request_branch_cancel(
+        "user_cancelled",
+        "main",
+    )
     assert first_request is True
-    session.append_event("session_run_cancel_requested", {"reason": "user_cancelled"})
+    session.append_event(
+        "session_run_cancel_requested",
+        {"reason": "user_cancelled", "branch_binding_id": "main"},
+    )
     for event_payload in resolved_approvals:
         session.append_event("approval_resolved", event_payload)
-    session.append_event("session_run_cancelled", {"reason": "user_cancelled"})
-    session.mark_done("user_cancelled")
+    for event_payload in resolved_inputs:
+        session.append_event("user_input_resolved", event_payload)
+    session.append_event(
+        "session_run_cancelled",
+        {"reason": "user_cancelled", "branch_binding_id": "main"},
+    )
+    session.mark_done("user_cancelled", branch_binding_id="main")
     time.sleep(0.2)
 
     events = session.events
@@ -6449,6 +6534,7 @@ def test_capability_package_session_persists_agent_run_progress_and_failure(
         session_hint="session-1",
         artifact_root=tmp_path,
         trace_event_sink=trace_sink,
+        branch_binding_id="main",
     )
     session.enable_trace_persistence("session-1")
     service = CapabilityPackageSessionRunService(
@@ -6558,12 +6644,18 @@ def test_remote_session_run_replays_pending_trace_events_when_sink_is_attached(
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
     )
     http_service._session_runs[session.session_run_id] = session
     session.enable_trace_persistence("session-1")
     session.append_event(
         "context_event",
-        {"message": "sink not attached yet", "phase": "late_sink"},
+        {
+            "message": "sink not attached yet",
+            "phase": "late_sink",
+            "branch_binding_id": "main",
+        },
     )
     persisted: list[dict[str, object]] = []
 
@@ -6614,11 +6706,17 @@ def test_remote_session_run_does_not_persist_when_sink_is_attached_without_trace
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        agent_run_id="agent-run-main",
+        branch_binding_id="main",
     )
     http_service._session_runs[session.session_run_id] = session
     session.append_event(
         "context_event",
-        {"message": "memory only", "phase": "memory_only"},
+        {
+            "message": "memory only",
+            "phase": "memory_only",
+            "branch_binding_id": "main",
+        },
     )
     persisted: list[dict[str, object]] = []
 
@@ -6698,6 +6796,7 @@ def test_capability_package_session_surfaces_source_bundle_errors(
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -6737,7 +6836,7 @@ def test_capability_package_session_surfaces_source_bundle_errors(
             "",
         )
     )
-    session.request_cancel("test_cleanup")
+    session.request_branch_cancel("test_cleanup", "main")
     _wait_for(lambda: session.done)
 def test_capability_package_session_softens_partial_source_fetch_errors(
     tmp_path: Path,
@@ -6790,6 +6889,7 @@ def test_capability_package_session_softens_partial_source_fetch_errors(
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -6826,7 +6926,7 @@ def test_capability_package_session_softens_partial_source_fetch_errors(
             "",
         )
     )
-    session.request_cancel("test_cleanup")
+    session.request_branch_cancel("test_cleanup", "main")
     _wait_for(lambda: session.done)
 
 
@@ -6861,6 +6961,7 @@ def test_capability_package_session_surfaces_empty_source_evidence(
         peer_id="peer-1",
         session_hint="session-1",
         artifact_root=tmp_path,
+        branch_binding_id="main",
     )
     service = CapabilityPackageSessionRunService(
         control,
@@ -6894,5 +6995,5 @@ def test_capability_package_session_surfaces_empty_source_evidence(
             "",
         )
     )
-    session.request_cancel("test_cleanup")
+    session.request_branch_cancel("test_cleanup", "main")
     _wait_for(lambda: session.done)

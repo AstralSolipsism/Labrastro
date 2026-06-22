@@ -174,6 +174,7 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "skill_content_unresolved": "无法定位能力包 Skill 内容",
         "command_evidence_missing": "能力包依赖命令缺少来源证据",
         "source_discovery_incomplete": "能力包来源探索不完整",
+        "session_failed": "能力包流程执行失败。",
         "field_generation_incomplete": "能力包字段生成不完整",
         "draft_generation_interrupted": "能力安装候选生成中断",
         "draft_field_missing": "能力安装候选缺少必要字段",
@@ -229,6 +230,7 @@ _CAPABILITY_TEXT: dict[str, dict[str, str]] = {
         "skill_content_unresolved": "Could not resolve capability package Skill content",
         "command_evidence_missing": "Capability package dependency commands lack source evidence",
         "source_discovery_incomplete": "Capability package source discovery is incomplete",
+        "session_failed": "Capability package session failed.",
         "field_generation_incomplete": "Capability package field generation is incomplete",
         "draft_generation_interrupted": "Capability install candidate generation was interrupted",
         "draft_field_missing": "Capability install candidate is missing required fields",
@@ -326,6 +328,128 @@ def _session_locale(session: Any) -> str:
     return _capability_locale(getattr(session, "locale", "") or "")
 
 
+def _session_scope_binding(session: Any) -> dict[str, Any]:
+    agent_run_id = str(getattr(session, "agent_run_id", "") or "").strip()
+    if not agent_run_id:
+        raise ValueError("agent_run_id_required")
+    bindings = getattr(session, "branch_bindings", None)
+    if not isinstance(bindings, dict):
+        raise ValueError("session_run_branch_binding_not_found")
+    matches = [
+        binding
+        for binding in bindings.values()
+        if isinstance(binding, dict)
+        and str(binding.get("branch_binding_id") or "").strip()
+        and (
+            str(binding.get("agent_run_id") or "").strip() == agent_run_id
+            or str(binding.get("target_agent_run_id") or "").strip() == agent_run_id
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError("session_run_branch_binding_not_found")
+    binding = dict(matches[0])
+    if not str(binding.get("agent_run_id") or "").strip():
+        raise ValueError("session_run_branch_agent_run_required")
+    return binding
+
+
+def _session_start_scope_branch_binding_id(session: Any) -> str:
+    branch_binding_id = str(getattr(session, "branch_binding_id", "") or "").strip()
+    if not branch_binding_id:
+        raise ValueError("branch_binding_id_required")
+    return branch_binding_id
+
+
+def _session_branch_binding_id(session: Any) -> str:
+    branch_binding_id = str(
+        _session_scope_binding(session).get("branch_binding_id") or ""
+    ).strip()
+    if not branch_binding_id:
+        raise ValueError("branch_binding_id_required")
+    return branch_binding_id
+
+
+def _session_agent_run_id(session: Any) -> str:
+    agent_run_id = str(_session_scope_binding(session).get("agent_run_id") or "").strip()
+    if not agent_run_id:
+        raise ValueError("agent_run_id_required")
+    return agent_run_id
+
+
+def _session_scoped_writer(session: Any) -> Any:
+    scoped_writer = getattr(session, "scoped_writer", None)
+    if not callable(scoped_writer):
+        raise ValueError("session_run_scoped_writer_required")
+    return scoped_writer(
+        branch_binding_id=_session_branch_binding_id(session),
+        agent_run_id=_session_agent_run_id(session),
+    )
+
+
+def _append_session_event(
+    session: Any,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> int:
+    return _session_scoped_writer(session).append_event(event_type, payload)
+
+
+def _session_has_scoped_session_run_start(
+    session: Any,
+    *,
+    branch_binding_id: str,
+    agent_run_id: str,
+) -> bool:
+    events = getattr(session, "events", [])
+    if not isinstance(events, list):
+        return False
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "session_run_start":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_branch_binding_id = str(
+            payload.get("branch_binding_id") or event.get("branch_binding_id") or ""
+        ).strip()
+        event_agent_run_id = str(
+            payload.get("agent_run_id") or event.get("agent_run_id") or ""
+        ).strip()
+        if (
+            event_branch_binding_id == branch_binding_id
+            and event_agent_run_id == agent_run_id
+        ):
+            return True
+        raise ValueError("session_run_start_scope_mismatch")
+    return False
+
+
+def _ensure_capability_session_run_start(session: Any, agent_run_id: str) -> None:
+    branch_binding_id = _session_branch_binding_id(session)
+    scoped_agent_run_id = _session_agent_run_id(session)
+    if str(agent_run_id or "").strip() != scoped_agent_run_id:
+        raise ValueError("agent_run_id_mismatch")
+    if _session_has_scoped_session_run_start(
+        session,
+        branch_binding_id=branch_binding_id,
+        agent_run_id=scoped_agent_run_id,
+    ):
+        return
+    locale = _session_locale(session)
+    _append_session_event(
+        session,
+        "session_run_start",
+        {
+            "prompt": str(getattr(session, "initial_prompt", "") or ""),
+            "mode": "capability_package",
+            "workflow_mode": CAPABILITY_INGEST_WORKFLOW,
+            "agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID,
+            "session_id": str(getattr(session, "session_id", "") or ""),
+            "locale": locale,
+            "agent_run_id": scoped_agent_run_id,
+            "branch_binding_id": branch_binding_id,
+        },
+    )
+
+
 def _capability_text(locale: object, key: str, **values: object) -> str:
     normalized = _capability_locale(locale)
     labels = _CAPABILITY_TEXT.get(normalized) or _CAPABILITY_TEXT["en"]
@@ -371,6 +495,19 @@ class CapabilityPackageIngestError(Exception):
         self.error = error
         self.message = message
         self.status = status
+
+
+@dataclass(frozen=True)
+class CapabilityPackageSessionRunStartFailure:
+    status: HTTPStatus
+    error: str
+    message: str
+
+
+@dataclass(frozen=True)
+class CapabilityPackageSessionRunStartResult:
+    binding: Any | None = None
+    failure: CapabilityPackageSessionRunStartFailure | None = None
 
 
 @dataclass(frozen=True)
@@ -1745,15 +1882,75 @@ class CapabilityPackageSessionRunService:
     def initial_runtime_state(self) -> dict[str, Any]:
         return _capability_session_runtime_state(self.runtime_control_plane)
 
-    def start(self, session: Any, payload: dict[str, Any]) -> None:
+    def start(
+        self,
+        session: Any,
+        payload: dict[str, Any],
+    ) -> CapabilityPackageSessionRunStartResult:
+        result = self._start_initial_agent_run(session, payload)
+        if isinstance(result, CapabilityPackageSessionRunStartFailure):
+            return CapabilityPackageSessionRunStartResult(failure=result)
+        binding = self._bind_agent_run(session, result.agent_run)
+        _session_scoped_writer(session).mark_running()
+        _append_session_event(
+            session,
+            "workflow_step",
+            _capability_workflow_step_event(
+                _capability_text(_session_locale(session), "start_draft"),
+                "prepare",
+                {"agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID},
+                status="running",
+            ),
+        )
+        _append_source_bundle_notices(session, result.source_bundle)
         thread = threading.Thread(
             target=self._run,
-            args=(session, dict(payload)),
+            args=(session, dict(payload), result),
             daemon=True,
         )
         thread.start()
+        return CapabilityPackageSessionRunStartResult(binding=binding)
 
-    def _run(self, session: Any, payload: dict[str, Any]) -> None:
+    def _start_initial_agent_run(
+        self,
+        session: Any,
+        payload: dict[str, Any],
+    ) -> CapabilityPackageIngestResult | CapabilityPackageSessionRunStartFailure:
+        try:
+            if getattr(session, "cancel_requested", False):
+                return CapabilityPackageSessionRunStartFailure(
+                    status=HTTPStatus.CONFLICT,
+                    error="session_run_cancelled",
+                    message="session run was cancelled before start",
+                )
+            result = CapabilityPackageIngestService(self.runtime_control_plane).start(
+                payload,
+                agent_run_metadata=self._agent_run_metadata(session),
+            )
+            return result
+        except CapabilityPackageIngestError as exc:
+            return CapabilityPackageSessionRunStartFailure(
+                status=exc.status,
+                error=exc.error,
+                message=exc.message,
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "Capability package SessionRun failed during start session_run_id=%s",
+                getattr(session, "session_run_id", ""),
+            )
+            return CapabilityPackageSessionRunStartFailure(
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                error="capability_package_session_failed",
+                message=_capability_text(_session_locale(session), "session_failed"),
+            )
+
+    def _run(
+        self,
+        session: Any,
+        payload: dict[str, Any],
+        result: CapabilityPackageIngestResult,
+    ) -> None:
         revision_lock = threading.Lock()
         revision_queue: list[dict[str, Any]] = []
         active_approval_id: dict[str, str] = {"value": ""}
@@ -1774,7 +1971,7 @@ class CapabilityPackageSessionRunService:
                 revision_queue.append(dict(ticket))
                 approval_id = active_approval_id.get("value", "")
             if approval_id:
-                session.resolve_approval(
+                _session_scoped_writer(session).resolve_approval(
                     approval_id,
                     "deny_once",
                     revision_reason,
@@ -1782,23 +1979,6 @@ class CapabilityPackageSessionRunService:
 
         session.set_revision_feedback_callback(on_revision_feedback)
         try:
-            if getattr(session, "cancel_requested", False):
-                return
-            session.mark_running()
-            session.append_event(
-                "workflow_step",
-                _capability_workflow_step_event(
-                    _capability_text(_session_locale(session), "start_draft"),
-                    "prepare",
-                    {"agent_id": DEFAULT_CAPABILITY_PACKAGER_AGENT_ID},
-                    status="running",
-                ),
-            )
-            result = CapabilityPackageIngestService(self.runtime_control_plane).start(
-                payload,
-                agent_run_metadata=self._agent_run_metadata(session),
-            )
-            _append_source_bundle_notices(session, result.source_bundle)
             while True:
                 if getattr(session, "cancel_requested", False):
                     return
@@ -1852,8 +2032,8 @@ class CapabilityPackageSessionRunService:
                     input_kind=AgentRunActivationInputKind.USER_FEEDBACK,
                 )
         except CapabilityPackageIngestError as exc:
-            session.append_event("error", {"message": exc.message, "code": exc.error})
-            session.append_event(
+            _append_session_event(session, "error", {"message": exc.message, "code": exc.error})
+            _append_session_event(session,
                 "session_run_failed",
                 {"message": exc.message, "code": exc.error, "recoverable": False},
             )
@@ -1862,7 +2042,7 @@ class CapabilityPackageSessionRunService:
                 "Capability package SessionRun failed session_run_id=%s",
                 getattr(session, "session_run_id", ""),
             )
-            session.append_event(
+            _append_session_event(session,
                 "error",
                 {
                     "code": "capability_package_session_failed",
@@ -1871,7 +2051,7 @@ class CapabilityPackageSessionRunService:
                     "diagnostic_message": str(exc),
                 },
             )
-            session.append_event(
+            _append_session_event(session,
                 "session_run_failed",
                 {
                     "code": "capability_package_session_failed",
@@ -1881,7 +2061,7 @@ class CapabilityPackageSessionRunService:
             )
         finally:
             session.set_revision_feedback_callback(None)
-            session.mark_done()
+            _session_scoped_writer(session).mark_done()
 
     def _agent_run_metadata(
         self,
@@ -1903,9 +2083,9 @@ class CapabilityPackageSessionRunService:
             metadata["locale"] = normalize_session_locale(metadata["locale"])
         return metadata
 
-    def _bind_agent_run(self, session: Any, agent_run: AgentRun) -> None:
+    def _bind_agent_run(self, session: Any, agent_run: AgentRun) -> Any:
         agent_run_id = agent_run.id
-        branch_binding_id = str(getattr(session, "branch_binding_id", "") or "main").strip()
+        branch_binding_id = _session_start_scope_branch_binding_id(session)
         try:
             binding = self.runtime_control_plane.find_session_run_binding(
                 session_run_id=str(getattr(session, "session_run_id", "") or ""),
@@ -1927,20 +2107,15 @@ class CapabilityPackageSessionRunService:
             )
         if hasattr(session, "record_branch_binding"):
             session.record_branch_binding(binding)
-        session.agent_run_id = agent_run_id
-        session.branch_binding_id = binding.branch_binding_id
         session.set_cancel_callback(
             lambda reason, run_id=agent_run_id: self.runtime_control_plane.cancel_agent_run(
                 run_id,
                 reason=reason,
             )
         )
-        _set_session_runtime_state(
-            session,
-            _capability_session_runtime_state(
-                self.runtime_control_plane,
-                agent_run=agent_run,
-            ),
+        capability_runtime_state = _capability_session_runtime_state(
+            self.runtime_control_plane,
+            agent_run=agent_run,
         )
         raw_activation_payload: Any = {}
         try:
@@ -1969,6 +2144,14 @@ class CapabilityPackageSessionRunService:
             ),
             activations[-1] if activations and isinstance(activations[-1], dict) else {},
         )
+        _session_scoped_writer(session).apply_selected_runtime_scope(
+            activation_id=current_activation_id,
+            runtime_status="running",
+            terminal=bool(getattr(agent_run, "is_terminal", False)),
+            reset_terminal=True,
+            runtime_state_updates=capability_runtime_state,
+        )
+        _ensure_capability_session_run_start(session, agent_run_id)
         raw_activation_payload = current_activation.get("input_payload")
         activation_payload = (
             dict(raw_activation_payload)
@@ -1977,7 +2160,7 @@ class CapabilityPackageSessionRunService:
         )
         is_revision = bool(activation_payload.get("revision_feedback_id"))
         locale = _session_locale(session)
-        session.append_event(
+        _append_session_event(session,
             "workflow_step",
             _capability_workflow_step_event(
                 _capability_text(locale, "revision_bound" if is_revision else "ingest_bound"),
@@ -2000,6 +2183,7 @@ class CapabilityPackageSessionRunService:
                 },
             ),
         )
+        return binding
 
     def _completed_draft_status(
         self,
@@ -2016,14 +2200,14 @@ class CapabilityPackageSessionRunService:
         if task_status in {"failed", "blocked", "cancelled"}:
             events = status.get("events") if isinstance(status.get("events"), list) else []
             message = _agent_run_terminal_message(task, events, task_status)
-            session.append_event("error", {"message": message, "code": task_status})
-            session.append_event(
+            _append_session_event(session, "error", {"message": message, "code": task_status})
+            _append_session_event(session,
                 "session_run_failed",
                 {"message": message, "code": task_status, "recoverable": False},
             )
             return None
         locale = _session_locale(session)
-        session.append_event(
+        _append_session_event(session,
             "workflow_step",
             _capability_workflow_step_event(
                 _capability_text(locale, "materialize_draft"),
@@ -2064,7 +2248,7 @@ class CapabilityPackageSessionRunService:
                     result_type if result_type in _CAPABILITY_TEXT["en"] else "draft_invalid",
                 )
             )
-            session.append_event(
+            _append_session_event(session,
                 "workflow_step",
                 _capability_workflow_step_event(
                     title,
@@ -2077,7 +2261,7 @@ class CapabilityPackageSessionRunService:
                     status="error",
                 ),
             )
-            session.append_event(
+            _append_session_event(session,
                 "workflow_result",
                 _capability_workflow_result_event(
                     title,
@@ -2086,7 +2270,7 @@ class CapabilityPackageSessionRunService:
                     failure,
                 ),
             )
-            session.append_event(
+            _append_session_event(session,
                 "error",
                 {
                     "message": title,
@@ -2094,7 +2278,7 @@ class CapabilityPackageSessionRunService:
                     "details": failure,
                 },
             )
-            session.append_event(
+            _append_session_event(session,
                 "session_run_failed",
                 {
                     "message": title,
@@ -2104,7 +2288,7 @@ class CapabilityPackageSessionRunService:
             )
             return None
         source_bundle = status.get("source_bundle") if isinstance(status.get("source_bundle"), dict) else {}
-        session.append_event(
+        _append_session_event(session,
             "workflow_step",
             _capability_workflow_step_event(
                 _capability_text(locale, "materialize_draft"),
@@ -2117,7 +2301,7 @@ class CapabilityPackageSessionRunService:
                 status="done",
             ),
         )
-        session.append_event(
+        _append_session_event(session,
             "workflow_step",
             _capability_workflow_step_event(
                 _capability_text(locale, "materialize_candidate"),
@@ -2155,7 +2339,7 @@ class CapabilityPackageSessionRunService:
                 else [],
             )
             if repair_request is not None:
-                session.append_event(
+                _append_session_event(session,
                     "workflow_step",
                     _capability_workflow_step_event(
                         _capability_text(locale, "candidate_repair_requested"),
@@ -2171,7 +2355,7 @@ class CapabilityPackageSessionRunService:
                     ),
                 )
                 return repair_request
-            session.append_event(
+            _append_session_event(session,
                 "workflow_step",
                 _capability_workflow_step_event(
                     message,
@@ -2184,8 +2368,8 @@ class CapabilityPackageSessionRunService:
                     status="error",
                 ),
             )
-            session.append_event("error", {"message": message, "code": "capability_install_candidate_blocked"})
-            session.append_event(
+            _append_session_event(session, "error", {"message": message, "code": "capability_install_candidate_blocked"})
+            _append_session_event(session,
                 "session_run_failed",
                 {
                     "message": message,
@@ -2200,7 +2384,7 @@ class CapabilityPackageSessionRunService:
             else None
         )
         if not isinstance(candidate_payload, dict):
-            session.append_event(
+            _append_session_event(session,
                 "session_run_failed",
                 {
                     "message": "capability install candidate missing from generation result",
@@ -2209,7 +2393,7 @@ class CapabilityPackageSessionRunService:
                 },
             )
             return None
-        session.append_event(
+        _append_session_event(session,
             "workflow_step",
             _capability_workflow_step_event(
                 _capability_text(locale, "materialize_candidate"),
@@ -2223,7 +2407,7 @@ class CapabilityPackageSessionRunService:
                 status="done",
             ),
         )
-        session.append_event(
+        _append_session_event(session,
             "workflow_artifact",
             _capability_install_candidate_artifact_event_payload(
                 candidate_payload,
@@ -2360,7 +2544,7 @@ class CapabilityPackageSessionRunService:
                     locale=_session_locale(session),
                 )
                 if projected is not None:
-                    session.append_event(projected[0], projected[1])
+                    _append_session_event(session, projected[0], projected[1])
             try:
                 task = self.runtime_control_plane.agent_run_to_dict(agent_run_id)
             except KeyError:
@@ -2368,7 +2552,7 @@ class CapabilityPackageSessionRunService:
             status = str(task.get("status") or "").strip()
             if status in self.TERMINAL_AGENT_STATUSES:
                 if not any(str(event.get("type") or "") in self.TERMINAL_AGENT_STATUSES for event in event_dicts):
-                    session.append_event(
+                    _append_session_event(session,
                         "workflow_step",
                         _capability_workflow_step_event(
                             _agent_run_terminal_message(task, event_dicts, status),
@@ -2420,19 +2604,21 @@ class CapabilityPackageSessionRunService:
             agent_run_id,
             locale=locale,
         )
-        session.register_approval(approval_id, approval_payload)
-        session.append_event("workflow_decision", approval_payload)
+        approval_payload["branch_binding_id"] = _session_branch_binding_id(session)
+        session_writer = _session_scoped_writer(session)
+        session_writer.register_approval(approval_id, approval_payload)
+        _append_session_event(session, "workflow_decision", approval_payload)
         with revision_lock:
             active_approval_id["value"] = approval_id
             has_pending_revision = bool(revision_queue)
         if has_pending_revision:
-            session.resolve_approval(
+            session_writer.resolve_approval(
                 approval_id,
                 "deny_once",
                 _capability_text(locale, "revision_approval_reason"),
             )
         try:
-            decision, reason, _resolution_meta = session.wait_approval(approval_id)
+            decision, reason, _resolution_meta = session_writer.wait_approval(approval_id)
         finally:
             with revision_lock:
                 if active_approval_id.get("value") == approval_id:
@@ -2464,7 +2650,7 @@ class CapabilityPackageSessionRunService:
                     },
                 ),
             )
-            session.append_event(
+            _append_session_event(session,
                 "approval_resolved",
                 {
                     "approval_id": approval_id,
@@ -2474,7 +2660,7 @@ class CapabilityPackageSessionRunService:
                 },
             )
             response = _capability_text(locale, "revision_ack")
-            session.append_event(
+            _append_session_event(session,
                 "workflow_result",
                 _capability_workflow_result_event(
                     response,
@@ -2485,7 +2671,10 @@ class CapabilityPackageSessionRunService:
             )
             revision_feedback_id = str(revision_ticket.get("revision_feedback_id") or "")
             if revision_feedback_id:
-                session.mark_revision_feedback_consumed(revision_feedback_id)
+                session.mark_revision_feedback_consumed(
+                    revision_feedback_id,
+                    branch_binding_id=str(revision_ticket.get("branch_binding_id") or ""),
+                )
             instruction = str(revision_ticket.get("text") or "").strip()
             instruction_title = (
                 _capability_text(
@@ -2496,7 +2685,7 @@ class CapabilityPackageSessionRunService:
                 if instruction
                 else _capability_text(locale, "revision_requested")
             )
-            session.append_event(
+            _append_session_event(session,
                 "workflow_step",
                 _capability_workflow_step_event(
                     instruction_title,
@@ -2536,7 +2725,7 @@ class CapabilityPackageSessionRunService:
                 },
             ),
         )
-        session.append_event(
+        _append_session_event(session,
             "approval_resolved",
             {
                 "approval_id": approval_id,
@@ -2547,7 +2736,7 @@ class CapabilityPackageSessionRunService:
         )
         if decision != "allow_once":
             response = _capability_text(locale, "install_cancelled", package_id=package_id)
-            session.append_event(
+            _append_session_event(session,
                 "workflow_result",
                 _capability_workflow_result_event(
                     response,
@@ -2556,9 +2745,9 @@ class CapabilityPackageSessionRunService:
                     {"package_id": package_id, "agent_run_id": agent_run_id},
                 ),
             )
-            session.append_event("session_run_end", {"response": response, "response_rendered": True})
+            _append_session_event(session, "session_run_end", {"response": response, "response_rendered": True})
             return None
-        session.append_event(
+        _append_session_event(session,
             "workflow_step",
             _capability_workflow_step_event(
                 _capability_text(locale, "install_title", package_id=package_id),
@@ -2580,8 +2769,8 @@ class CapabilityPackageSessionRunService:
                 if isinstance(payload, dict)
                 else ""
             ).strip() or "capability package install failed"
-            session.append_event("error", {"message": message, "code": "capability_package_install_failed"})
-            session.append_event(
+            _append_session_event(session, "error", {"message": message, "code": "capability_package_install_failed"})
+            _append_session_event(session,
                 "workflow_result",
                 _capability_workflow_result_event(
                     message,
@@ -2590,7 +2779,7 @@ class CapabilityPackageSessionRunService:
                     {"package_id": package_id, "agent_run_id": agent_run_id, "result": payload if isinstance(payload, dict) else {}},
                 ),
             )
-            session.append_event(
+            _append_session_event(session,
                 "session_run_failed",
                 {
                     "message": message,
@@ -2600,7 +2789,7 @@ class CapabilityPackageSessionRunService:
             )
             return None
         response = _capability_text(locale, "install_completed", package_id=package_id)
-        session.append_event(
+        _append_session_event(session,
             "workflow_result",
             _capability_workflow_result_event(
                 response,
@@ -2613,7 +2802,7 @@ class CapabilityPackageSessionRunService:
                 },
             ),
         )
-        session.append_event("session_run_end", {"response": response, "response_rendered": True})
+        _append_session_event(session, "session_run_end", {"response": response, "response_rendered": True})
         return None
 
     def _pop_revision_ticket(
@@ -2634,7 +2823,13 @@ class CapabilityPackageSessionRunService:
             if cond is None:
                 return dict(ticket)
             with cond:
-                live_ticket = getattr(session, "revision_feedback_tickets", {}).get(revision_feedback_id)
+                live_ticket_provider = getattr(session, "revision_feedback_ticket", None)
+                if not callable(live_ticket_provider):
+                    return dict(ticket)
+                live_ticket = live_ticket_provider(
+                    revision_feedback_id,
+                    branch_binding_id=str(ticket.get("branch_binding_id") or ""),
+                )
                 if not isinstance(live_ticket, dict):
                     return dict(ticket)
                 if live_ticket.get("state") == "pending":
@@ -2774,15 +2969,6 @@ def _capability_session_runtime_state(
     return state
 
 
-def _set_session_runtime_state(session: Any, runtime_state: dict[str, Any]) -> None:
-    cond = getattr(session, "cond", None)
-    if cond is None:
-        session.runtime_state = dict(runtime_state)
-        return
-    with cond:
-        session.runtime_state = dict(runtime_state)
-
-
 def _append_source_bundle_notices(session: Any, source_bundle: dict[str, Any]) -> None:
     if not isinstance(source_bundle, dict):
         return
@@ -2814,7 +3000,7 @@ def _append_source_bundle_notices(session: Any, source_bundle: dict[str, Any]) -
         if has_usable_source
         else _capability_text(locale, "source_empty")
     )
-    session.append_event(
+    _append_session_event(session,
         "output",
         {
             "content": detail,
@@ -2951,7 +3137,7 @@ def _capability_projected_session_event(
 ) -> tuple[str, dict[str, Any]] | None:
     if event_type == "assistant_delta":
         return None
-    if event_type == "context_event":
+    if event_type in {"agent_run_event", "context_event"}:
         return "workflow_step", _capability_workflow_step_from_context(payload)
     if event_type in _CAPABILITY_AGENT_TOOL_EVENTS:
         return "workflow_step", _capability_workflow_step_from_tool_event(

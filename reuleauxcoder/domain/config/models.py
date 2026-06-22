@@ -1822,6 +1822,12 @@ def build_agent_run_snapshot(
     """Return the server-authoritative AgentRun snapshot for executors."""
 
     packages = dict(capability_packages or {})
+    registry_defaults, runtime_profile_defaults = (
+        ensure_default_environment_agent_registry(
+            agent_registry.to_dict(),
+            runtime_profiles.to_dict(),
+        )
+    )
     components = {
         component_id: CapabilityComponentConfig.from_dict(component_id, component_data)
         for component_id, component_data in ensure_default_capability_components(
@@ -1854,7 +1860,8 @@ def build_agent_run_snapshot(
             )
         )
     agents: dict[str, dict[str, Any]] = {}
-    for agent_id, agent in agent_registry.agents.items():
+    resolved_agent_registry = AgentRegistryConfig.from_dict(registry_defaults)
+    for agent_id, agent in resolved_agent_registry.agents.items():
         agent_dict = agent.to_dict()
         agent_dict["resolved_capabilities"] = resolve_capability_refs(
             agent.capability_refs,
@@ -1874,7 +1881,7 @@ def build_agent_run_snapshot(
             "local_peer_agent_run_slots": run_limits.local_peer_agent_run_slots,
             "model_request_slots": run_limits.model_request_slots,
         },
-        "runtime_profiles": runtime_profiles.to_dict(),
+        "runtime_profiles": runtime_profile_defaults,
         "agents": agents,
         "capability_packages": {
             package_id: package.to_dict()
