@@ -164,6 +164,8 @@
 - 后端命令必须区分 select/switch、hide、stop branch run、close binding、delete/cleanup resources，不能合并成一个含糊的 branch close 接口。
 - parent 和 sibling branch 不受 stop/delete 派生操作影响。
 
+> **2026-06-18 correction:** Source review found that this lifecycle command surface is not fully implemented yet. Current code covers branch select/switch and branch-scoped run control paths, plus lower-level AgentThread/worktree cleanup primitives. It does not yet expose a complete SessionRun branch lifecycle API for `hide`, `close SessionRun binding`, or destructive `delete branch resources`. Until that API is implemented, UI/backend work must not introduce a generic "close branch" action or mark hide/close/delete as complete. Any future implementation must keep the five operations separate: select/switch, hide, stop active branch run, close SessionRun binding, delete branch resources.
+
 ### Branch Transcript Storage
 
 - branch transcript 使用 structural sharing。
@@ -567,8 +569,8 @@ gitnexus detect-changes -r Labrastro --scope unstaged
 - [x] Only user-authored messages support edit-and-branch; non-user facts remain immutable.
 - [x] Branch transcript storage uses structural sharing.
 - [x] Sibling branch output does not enter selected transcript.
-- [x] Branch switch/hide/stop/delete are separate operations.
-- [x] Branch lifecycle backend commands separate selection, hiding, stopping, binding close, and resource cleanup.
+- [ ] Branch switch/hide/stop/delete are separate operations. **Deferred correction 2026-06-18:** select/switch exists; hide, SessionRun binding close, and destructive delete/resource cleanup are not complete public SessionRun branch commands.
+- [ ] Branch lifecycle backend commands separate selection, hiding, stopping, binding close, and resource cleanup. **Deferred correction 2026-06-18:** do not expose or document a generic branch close/delete until these are implemented as distinct operations.
 - [x] Pending approval/user-input is branch-local.
 - [x] `pending_next_turn` is branch-local, does not follow branch switch, and can be edited or cancelled before send.
 - [x] Capability package ingest has one public route.
