@@ -158,6 +158,15 @@ def _postgres_store_for_resolve_request(
     return store
 
 
+class _CaptureExecuteConn:
+    def __init__(self) -> None:
+        self.params: list[dict] = []
+
+    def execute(self, _statement, params=None):
+        self.params.append(dict(params or {}))
+        return None
+
+
 def _relation(
     owner_agent_run_id: str,
     *,
@@ -189,6 +198,30 @@ def _relation(
         payload=relation_payload,
         metadata=dict(metadata or {}),
     )
+
+
+def test_postgres_session_upsert_uses_task_and_metadata_without_pinned_session() -> None:
+    store = object.__new__(PostgresAgentRunStore)
+    store._session_metadata = lambda _task, metadata=None: dict(metadata or {})
+    conn = _CaptureExecuteConn()
+    task = AgentRun(
+        id="task-upsert-session",
+        agent_id="coder",
+        executor=ExecutorType.REULEAUXCODER,
+        execution_location=ExecutionLocation.REMOTE_SERVER,
+        workdir="/srv/labrastro",
+    )
+
+    store._upsert_session_with_conn(
+        conn,
+        task,
+        executor_session_id="server-session-1",
+        metadata={"branch": "main"},
+    )
+
+    assert conn.params[0]["workdir"] == "/srv/labrastro"
+    assert conn.params[0]["branch"] == "main"
+    assert conn.params[0]["executor_session_id"] == "server-session-1"
 from labrastro_server.services.agent_runtime.session_projection import (
     agent_run_event_to_session_events,
 )

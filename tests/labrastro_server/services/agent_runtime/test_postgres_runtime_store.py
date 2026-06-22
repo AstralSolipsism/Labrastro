@@ -296,6 +296,40 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     assert detail["claim"]["status"] == "completed"
 
 
+def test_postgres_runtime_store_completion_upserts_executor_session_without_pin() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="postgres runtime executor session",
+        )
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="pg-worker",
+        executors=["fake"],
+        peer_features=["agent_runs.daemon_worktree"],
+    )
+    assert claim is not None
+
+    ok, reason, completed = control.complete_claimed_agent_run_activation(
+        task.id,
+        ExecutorRunResult(
+            task_id=task.id,
+            status="completed",
+            output="done",
+            executor_session_id="server-session-1",
+        ),
+        request_id=claim.request_id,
+        activation_id=claim.activation_id,
+        worker_id="pg-worker",
+    )
+
+    assert (ok, reason) == (True, "")
+    assert completed is not None
+    detail = _control().load_agent_run_detail(task.id, event_limit=1)
+    assert detail["session"]["executor_session_id"] == "server-session-1"
+
+
 def test_postgres_append_executor_event_rejects_stale_activation_id() -> None:
     control = _control()
     task = control.submit_agent_run(

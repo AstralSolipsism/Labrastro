@@ -4308,7 +4308,7 @@ class PostgresAgentRunStore:
                     task.execution_location or ExecutionLocation.REMOTE_SERVER
                 ).value,
                 "workdir": task.workdir,
-                "branch": session.branch,
+                "branch": session_metadata.get("branch"),
                 "executor_session_id": executor_session_id,
                 "metadata": _json(session_metadata),
             },
