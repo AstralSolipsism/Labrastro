@@ -16,6 +16,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ChatCommandDispatchResponse,
     ApprovalReplyRequest,
     SessionRunCancelRequest,
+    SessionRunStopResponse,
+    SessionRunStopRequest,
     SessionRunContinueRequest,
     SessionRunRecoverRequest,
     SessionRunStartRequest,
@@ -199,6 +201,8 @@ class TestRemoteHTTPContract:
         SessionRunStatusResponse.from_dict(fixtures["session_run.status"]["response"])
         SessionRunBranchSelectRequest.from_dict(fixtures["session_run.branch_select"]["request"])
         SessionRunStatusResponse.from_dict(fixtures["session_run.branch_select"]["response"])
+        SessionRunStopRequest.from_dict(fixtures["session_run.stop"]["request"])
+        SessionRunStopResponse.from_dict(fixtures["session_run.stop"]["response"])
         EnvironmentManifestRequest.from_dict(fixtures["environment.manifest"]["request"])
         EnvironmentManifestResponse.from_dict(fixtures["environment.manifest"]["response"])
 
@@ -335,7 +339,7 @@ class TestSessionRunStartRequest:
             peer_token="pt_1",
             prompt="plan this",
             session_hint="session-1",
-            mode="taskflow",
+            mode="coder",
             workflow_mode="taskflow",
             taskflow_id="taskflow-1",
             locale="zh-CN",
@@ -347,7 +351,7 @@ class TestSessionRunStartRequest:
         assert restored.peer_token == "pt_1"
         assert restored.prompt == "plan this"
         assert restored.session_hint == "session-1"
-        assert restored.mode == "taskflow"
+        assert restored.mode == "coder"
         assert restored.workflow_mode == "taskflow"
         assert restored.taskflow_id == "taskflow-1"
         assert restored.locale == "zh-CN"
@@ -465,6 +469,14 @@ class TestSessionRunStatusProtocol:
                     "peer_token": "pt_1",
                     "session_run_id": "run-1",
                     "reason": "user_cancelled",
+                },
+            ),
+            (
+                SessionRunStopRequest,
+                {
+                    "peer_token": "pt_1",
+                    "session_run_id": "run-1",
+                    "reason": "user_stop",
                 },
             ),
             (
@@ -713,6 +725,10 @@ class TestSessionRunStatusProtocol:
                 {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
             ),
             (
+                SessionRunStopRequest,
+                {"peer_token": "pt_1", "session_run_id": "", "branch_binding_id": "branch-1"},
+            ),
+            (
                 SessionRunContinueRequest,
                 {
                     "peer_token": "pt_1",
@@ -789,6 +805,11 @@ class TestSessionRunStatusProtocol:
                 session_run_id="run-1",
                 branch_binding_id="branch-1",
             ),
+            SessionRunStopRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
             SessionRunContinueRequest(
                 peer_token="pt_1",
                 session_run_id="run-1",
@@ -844,6 +865,11 @@ class TestSessionRunStatusProtocol:
                 branch_binding_id="branch-1",
             ),
             SessionRunCancelRequest(
+                peer_token="pt_1",
+                session_run_id="run-1",
+                branch_binding_id="branch-1",
+            ),
+            SessionRunStopRequest(
                 peer_token="pt_1",
                 session_run_id="run-1",
                 branch_binding_id="branch-1",
@@ -936,6 +962,17 @@ class TestSessionRunStatusProtocol:
             running=True,
             done=False,
             reconnectable=True,
+            terminal=False,
+            bindingStatus="active",
+            recoverable=True,
+            eventStreamAllowed=True,
+            projectionState="recovered",
+            mainlineState="executing",
+            agentRunState="executing",
+            activationState="running",
+            working=True,
+            continuable=False,
+            transportState="streaming",
             cursor=7,
             next_cursor=9,
             first_available_seq=1,
@@ -967,6 +1004,18 @@ class TestSessionRunStatusProtocol:
         assert restored_resp.session_run_id == "run-1"
         assert restored_resp.status == "running"
         assert restored_resp.reconnectable is True
+        assert restored_resp.terminal is False
+        assert restored_resp.bindingStatus == "active"
+        assert restored_resp.recoverable is True
+        assert restored_resp.eventStreamAllowed is True
+        assert restored_resp.projectionState == "recovered"
+        assert restored_resp.mainlineState == "executing"
+        assert restored_resp.agentRunState == "executing"
+        assert restored_resp.activationState == "running"
+        assert restored_resp.working is True
+        assert restored_resp.continuable is False
+        assert restored_resp.closedReason is None
+        assert restored_resp.transportState == "streaming"
         assert restored_resp.next_cursor == 9
         assert restored_resp.session_id == "session-1"
         assert restored_resp.workflow_mode == "taskflow"

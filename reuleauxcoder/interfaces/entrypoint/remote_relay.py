@@ -771,6 +771,12 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         append_event = getattr(session_store, "append_trace_event", None)
         if not callable(append_event):
             return None
+        fingerprint: str | None = None
+        if session_run_id:
+            live_session = runner._relay_http_service._get_session_run(session_run_id)
+            live_peer_id = str(getattr(live_session, "peer_id", "") or "").strip()
+            if live_peer_id:
+                fingerprint = _peer_fingerprint(live_peer_id)
         return append_event(
             session_id,
             event_type,
@@ -779,6 +785,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             session_run_seq=session_run_seq,
             source=source,
             replayable=replayable,
+            fingerprint=fingerprint,
         )
 
     def _persist_session_placeholder(peer_agent: Agent, peer_id: str) -> None:
@@ -1328,6 +1335,7 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             model = str(resolve_model_runtime(current_config).model or "")
         return {
             "peer_id": peer_id,
+            "local_peer_reason": "local_workspace_executor",
             "session_id": str(getattr(peer_agent, "current_session_id", "") or ""),
             "fingerprint": str(getattr(peer_agent, "session_fingerprint", "") or ""),
             "mode": str(getattr(peer_agent, "active_mode", "") or ""),
@@ -1424,6 +1432,192 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         payload.setdefault("error_type", type(exc).__name__)
         return payload
 
+    def _attach_claim_live_event_sink(
+        runtime: Any,
+        claim: Any,
+        *,
+        peer_id: str,
+    ) -> set[int]:
+        delivered_event_ids: set[int] = set()
+
+        def _project_claim_events() -> None:
+            metadata = getattr(claim.executor_request, "metadata", None)
+            if not isinstance(metadata, dict):
+                return
+            session_run_id = str(metadata.get("session_run_id") or "").strip()
+            branch_binding_id = str(metadata.get("branch_binding_id") or "").strip()
+            if not session_run_id or not branch_binding_id:
+                return
+            session = service._get_session_run(session_run_id)
+            if session is None:
+                return
+            finder = getattr(runtime, "find_session_run_binding", None)
+            if not callable(finder):
+                return
+            binding = finder(
+                session_run_id=session_run_id,
+                branch_binding_id=branch_binding_id,
+                selected_only=False,
+                include_inactive=True,
+            )
+            if binding is None:
+                return
+            service._project_agent_run_events_to_session_run(session, binding)
+
+        def _event_sink(event: ExecutorEvent) -> None:
+            try:
+                ok, _reason = runtime.append_executor_event(
+                    claim.task.id,
+                    event,
+                    request_id=claim.request_id,
+                    activation_id=claim.activation_id,
+                    worker_id=claim.worker_id,
+                    peer_id=peer_id,
+                )
+            except Exception:
+                return
+            if ok:
+                delivered_event_ids.add(id(event))
+                try:
+                    _project_claim_events()
+                except Exception:
+                    return
+
+        claim.executor_request.event_sink = _event_sink
+        return delivered_event_ids
+
+    def _executor_result_without_delivered_events(
+        result: ExecutorRunResult,
+        delivered_event_ids: set[int],
+    ) -> ExecutorRunResult:
+        if not delivered_event_ids:
+            return result
+        events = [
+            event
+            for event in result.events
+            if id(event) not in delivered_event_ids
+        ]
+        if len(events) == len(result.events):
+            return result
+        return replace(result, events=events)
+
+    def _binding_status_value(binding: Any) -> str:
+        status = getattr(binding, "status", "")
+        return str(getattr(status, "value", status) or "").strip().lower()
+
+    def _agent_run_status_value(agent_run: Any) -> str:
+        status = getattr(agent_run, "status", "")
+        return str(getattr(status, "value", status) or "").strip().lower()
+
+    def _non_continuable_agent_run_closes_session_run_binding(agent_run: Any) -> bool:
+        return _agent_run_status_value(agent_run) in {"failed", "cancelled"}
+
+    def _claim_session_run_binding(runtime: Any, claim: Any, completed: Any | None) -> Any | None:
+        metadata = getattr(claim.executor_request, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        session_run_id = str(
+            metadata.get("session_run_id")
+            or getattr(completed, "owner_session_run_id", "")
+            or ""
+        ).strip()
+        branch_binding_id = str(metadata.get("branch_binding_id") or "").strip()
+        finder = getattr(runtime, "find_session_run_binding", None)
+        if callable(finder) and session_run_id:
+            binding = finder(
+                session_run_id=session_run_id,
+                branch_binding_id=branch_binding_id,
+                selected_only=False,
+                include_inactive=True,
+            )
+            if binding is not None:
+                return binding
+        agent_run_id = str(getattr(completed, "id", "") or getattr(claim.task, "id", "") or "").strip()
+        lister = getattr(runtime, "list_session_run_bindings", None)
+        if not callable(lister) or not agent_run_id:
+            return None
+        filters: dict[str, Any] = {
+            "agent_run_id": agent_run_id,
+            "include_terminal": True,
+        }
+        if session_run_id:
+            filters["session_run_id"] = session_run_id
+        bindings = lister(**filters)
+        if not bindings:
+            return None
+        for binding in bindings:
+            if branch_binding_id and branch_binding_id not in {
+                str(getattr(binding, "branch_binding_id", "") or ""),
+                str(getattr(binding, "id", "") or ""),
+            }:
+                continue
+            if bool(getattr(binding, "selected", False)):
+                return binding
+        return bindings[0]
+
+    def _finalize_claim_session_run(runtime: Any, claim: Any, completed: Any | None) -> None:
+        if completed is None:
+            return
+        binding = _claim_session_run_binding(runtime, claim, completed)
+        if binding is None:
+            return
+        session_run_id = str(getattr(binding, "session_run_id", "") or "").strip()
+        branch_binding_id = str(getattr(binding, "branch_binding_id", "") or "").strip()
+        if not session_run_id or not branch_binding_id:
+            return
+        session = service._get_session_run(session_run_id)
+        if session is None:
+            recover = getattr(service, "recover_session_run_projection_from_binding", None)
+            if callable(recover):
+                try:
+                    recover(binding, agent_run=completed)
+                except Exception:
+                    return
+            return
+        try:
+            service._project_agent_run_events_to_session_run(session, binding)
+        except Exception:
+            return
+        completed_status = _agent_run_status_value(completed)
+        terminal = _non_continuable_agent_run_closes_session_run_binding(completed)
+        selected = bool(getattr(binding, "selected", False))
+        if terminal and _binding_status_value(binding) == "active":
+            closer = getattr(runtime, "close_session_run_binding", None)
+            if callable(closer):
+                try:
+                    closed_ok = closer(
+                        str(getattr(binding, "id", "") or ""),
+                        reason=f"agent_run_closed:{completed_status}",
+                    )
+                except Exception:
+                    closed_ok = False
+                if closed_ok:
+                    finder = getattr(runtime, "find_session_run_binding", None)
+                    if callable(finder):
+                        closed = finder(
+                            session_run_id=session_run_id,
+                            branch_binding_id=branch_binding_id,
+                            selected_only=False,
+                            include_inactive=True,
+                        )
+                        if closed is not None:
+                            binding = closed
+                            selected = bool(getattr(closed, "selected", False))
+                            try:
+                                session.record_branch_binding(closed)
+                            except Exception:
+                                return
+        try:
+            runtime_status = "settled" if completed_status == "completed" else getattr(completed, "status", "")
+            session.apply_branch_runtime_status(
+                branch_binding_id,
+                runtime_status,
+                terminal=terminal,
+                selected=selected,
+            )
+            service._project_agent_run_events_to_session_run(session, binding)
+        except Exception:
+            return
+
     def _start_server_session_run_worker() -> None:
         service = runner._relay_http_service
         runtime = getattr(service, "runtime_control_plane", None)
@@ -1441,6 +1635,11 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
         def _run_claim(claim: Any) -> None:
             result: ExecutorRunResult
             heartbeat_stop = threading.Event()
+            delivered_event_ids = _attach_claim_live_event_sink(
+                runtime,
+                claim,
+                peer_id="server",
+            )
 
             def _heartbeat_loop() -> None:
                 while not heartbeat_stop.wait(SERVER_SESSION_RUN_WORKER_HEARTBEAT_SEC):
@@ -1482,7 +1681,12 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=1.0)
-            runtime.complete_claimed_agent_run_activation(
+                claim.executor_request.event_sink = None
+            result = _executor_result_without_delivered_events(
+                result,
+                delivered_event_ids,
+            )
+            ok, _reason, completed = runtime.complete_claimed_agent_run_activation(
                 claim.task.id,
                 result,
                 request_id=claim.request_id,
@@ -1491,6 +1695,8 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 peer_id="server",
                 artifacts=list(result.artifacts),
             )
+            if ok:
+                _finalize_claim_session_run(runtime, claim, completed)
 
         def _loop() -> None:
             while not stop_event.is_set():
@@ -1603,6 +1809,11 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
 
         def _run_claim(claim: Any, peer_id: str) -> None:
             active_claims[claim.task.id] = claim
+            delivered_event_ids = _attach_claim_live_event_sink(
+                runtime,
+                claim,
+                peer_id=peer_id,
+            )
             try:
                 try:
                     result = backend.start(claim.executor_request)
@@ -1624,7 +1835,11 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                 if agent_pair is not None:
                     peer_agent, agent_peer_id = agent_pair
                     _save_peer_session(peer_agent, agent_peer_id)
-                runtime.complete_claimed_agent_run_activation(
+                result = _executor_result_without_delivered_events(
+                    result,
+                    delivered_event_ids,
+                )
+                ok, _reason, completed = runtime.complete_claimed_agent_run_activation(
                     claim.task.id,
                     result,
                     request_id=claim.request_id,
@@ -1633,7 +1848,10 @@ def bind_remote_session_run_handler(runner, agent: Agent) -> None:
                     peer_id=peer_id,
                     artifacts=list(result.artifacts),
                 )
+                if ok:
+                    _finalize_claim_session_run(runtime, claim, completed)
             finally:
+                claim.executor_request.event_sink = None
                 active_claims.pop(claim.task.id, None)
                 active_agents.pop(claim.task.id, None)
 

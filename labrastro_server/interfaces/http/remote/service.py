@@ -139,8 +139,8 @@ def _session_run_branch_status_from_runtime_status(raw_status: Any) -> str:
         return status
     if status in {"dispatched", "running"}:
         return "running"
-    if status in {"completed", "complete", "done"}:
-        return "done"
+    if status in {"completed", "complete", "done", "settled"}:
+        return "settled"
     if status == "cancelled":
         return "cancelled"
     if status in {"failed", "blocked", "error"}:
@@ -1697,7 +1697,7 @@ class _SessionRunProjection:
             status = "error"
             last_error = str(message) if message is not None else "error"
         elif event_type == "session_run_end":
-            status = "done"
+            status = "settled"
         elif event_type == "session_run_failed":
             message = payload.get("message") or payload.get("code")
             status = "error"
@@ -1729,15 +1729,16 @@ class _SessionRunProjection:
         self.status = status
         self.last_error = last_error
         if event_type in {
-            "session_run_end",
             "session_run_failed",
             "session_run_cancelled",
             "session_run_interrupted",
         }:
             self.running = False
             self.done = True
-            if self.finished_at is None:
-                self.finished_at = time.time()
+        elif event_type == "session_run_end":
+            self.running = False
+            self.done = False
+            self.finished_at = None
 
     def _persist_or_queue_trace_event(self, event: dict[str, Any]) -> None:
         if not _is_replayable_session_run_event(str(event.get("type") or "")):
@@ -3184,15 +3185,20 @@ class _ScopedSessionRunWriter:
         selected: bool = False,
     ) -> dict[str, Any]:
         run_status = str(getattr(agent_run_status, "value", agent_run_status) or "")
+        branch_update_status = (
+            "settled"
+            if run_status.strip().lower() == "completed" and not bool(terminal)
+            else run_status
+        )
         self._session.apply_branch_runtime_status(
             self._branch_binding_id,
-            run_status,
+            branch_update_status,
             terminal=terminal,
             selected=selected,
         )
         status_payload = self.status_payload(cursor)
         branch_runtime_status = _session_run_branch_status_from_runtime_status(
-            run_status
+            branch_update_status
         )
         response_status = str(
             status_payload.get("status") or branch_runtime_status or ""
@@ -3284,7 +3290,7 @@ class _ScopedSessionRunWriter:
                     if isinstance(event, dict)
                 )
             done = wait_done or runtime_done
-        if require_terminal_event_for_done and done:
+        if require_terminal_event_for_done:
             terminal_event_in_batch = any(
                 str(event.get("type") or "")
                 in {
@@ -3297,7 +3303,6 @@ class _ScopedSessionRunWriter:
             )
             terminal_event_consumed = (
                 not terminal_event_in_batch
-                and wait_done
                 and self._session.has_branch_terminal_event_at_or_before(
                     self._branch_binding_id,
                     cursor,
@@ -3685,6 +3690,7 @@ class RemoteRelayHTTPService:
         )
         with self._session_runs_lock:
             self._session_runs[session.session_run_id] = session
+        session.enable_trace_persistence(session.session_id)
         return session
 
     def _get_session_run_by_request(
@@ -3738,6 +3744,123 @@ class RemoteRelayHTTPService:
         self._gc_session_runs()
         with self._session_runs_lock:
             return self._session_runs.get(session_run_id)
+
+    def recover_session_run_projection_from_binding(
+        self,
+        binding: Any,
+        *,
+        agent_run: Any | None = None,
+    ) -> tuple[_SessionRunProjection, Any, str] | None:
+        session_run_id = str(getattr(binding, "session_run_id", "") or "").strip()
+        branch_binding_id = str(getattr(binding, "branch_binding_id", "") or "").strip()
+        agent_run_id = str(getattr(binding, "agent_run_id", "") or "").strip()
+        peer_id = str(getattr(binding, "peer_id", "") or "").strip()
+        session_id = str(getattr(binding, "session_id", "") or "").strip()
+        if not session_run_id or not branch_binding_id or not agent_run_id or not peer_id:
+            return None
+        runtime = self.runtime_control_plane
+        if runtime is None:
+            return None
+        if agent_run is None:
+            try:
+                agent_run = runtime.get_agent_run(agent_run_id)
+            except Exception:
+                return None
+        metadata = getattr(agent_run, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        session = _SessionRunProjection(
+            session_run_id=session_run_id,
+            peer_id=peer_id,
+            session_hint=session_id or None,
+            mode=str(metadata.get("mode") or "") or None,
+            workflow_mode=str(metadata.get("workflow_mode") or "") or None,
+            taskflow_id=str(metadata.get("taskflow_id") or "") or None,
+            agent_id=str(getattr(agent_run, "agent_id", "") or "") or None,
+            model_id=str(metadata.get("model") or "") or None,
+            agent_run_id=agent_run_id,
+            branch_binding_id=branch_binding_id,
+            runtime_state={},
+            locale=str(metadata.get("locale") or "") or None,
+            mentions=list(metadata.get("mentions") or [])
+            if isinstance(metadata.get("mentions"), list)
+            else [],
+            initial_prompt=self._agent_run_initial_prompt(agent_run_id),
+            artifact_root=self._session_run_artifact_root,
+            max_events=self._session_run_max_events,
+            max_payload_bytes=self._session_run_max_payload_bytes,
+            max_total_bytes=self._session_run_max_total_bytes,
+            trace_event_sink=getattr(self, "session_trace_event_sink", None),
+        )
+        with self._session_runs_lock:
+            self._session_runs[session_run_id] = session
+        session.enable_trace_persistence(session.session_id)
+        session.record_branch_binding(binding)
+        self._project_agent_run_events_to_session_run(session, binding)
+
+        agent_run_status = str(
+            getattr(getattr(agent_run, "status", ""), "value", getattr(agent_run, "status", ""))
+            or ""
+        ).strip().lower()
+        terminal = agent_run_status in {"failed", "cancelled"}
+        binding_status = str(
+            getattr(getattr(binding, "status", ""), "value", getattr(binding, "status", ""))
+            or "active"
+        ).strip().lower()
+        recovered_binding = binding
+        if terminal and binding_status == "active":
+            closer = getattr(runtime, "close_session_run_binding", None)
+            if callable(closer):
+                closed_ok = closer(
+                    str(getattr(binding, "id", "") or ""),
+                    reason=f"agent_run_closed:{agent_run_status}",
+                )
+                closed = None
+                finder = getattr(runtime, "find_session_run_binding", None)
+                if closed_ok and callable(finder):
+                    closed = finder(
+                        session_run_id=session_run_id,
+                        branch_binding_id=branch_binding_id,
+                        selected_only=False,
+                        include_inactive=True,
+                    )
+                if closed is not None:
+                    recovered_binding = closed
+                    session.record_branch_binding(closed)
+        session.apply_branch_runtime_status(
+            branch_binding_id,
+            "settled" if agent_run_status == "completed" and not terminal else getattr(agent_run, "status", ""),
+            terminal=terminal,
+            selected=bool(getattr(recovered_binding, "selected", False)),
+        )
+        projection_state = (
+            "nonrecoverable"
+            if terminal or binding_status in {"closed", "deleted"}
+            else "drained"
+            if agent_run_status == "completed"
+            else "recovered"
+        )
+        return session, recovered_binding, projection_state
+
+    def _agent_run_initial_prompt(self, agent_run_id: str) -> str:
+        runtime = self.runtime_control_plane
+        detail_loader = getattr(runtime, "load_agent_run_detail", None)
+        if not callable(detail_loader):
+            return ""
+        try:
+            detail = detail_loader(agent_run_id, event_limit=1)
+        except Exception:
+            return ""
+        activations = detail.get("activations") if isinstance(detail, dict) else None
+        if not isinstance(activations, list):
+            return ""
+        for activation in sorted(
+            (item for item in activations if isinstance(item, dict)),
+            key=lambda item: int(item.get("seq") or 0),
+        ):
+            prompt = str(activation.get("prompt") or "").strip()
+            if prompt:
+                return prompt
+        return ""
 
     def _project_agent_run_events_to_session_run(
         self,
@@ -3997,6 +4120,9 @@ class RemoteRelayHTTPService:
                     return
                 if parsed.path == "/remote/session-runs/recover":
                     self._handle_session_run_recover()
+                    return
+                if parsed.path == "/remote/session-runs/stop":
+                    self._handle_session_run_stop()
                     return
                 if parsed.path == "/remote/session-runs/cancel":
                     self._handle_session_run_cancel()

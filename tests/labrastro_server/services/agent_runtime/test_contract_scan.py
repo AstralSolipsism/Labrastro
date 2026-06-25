@@ -877,7 +877,6 @@ def test_session_run_projection_does_not_fabricate_branch_scope_from_selected_st
         (update_status, "self._mark_branch_binding_status_locked("),
         (update_status, "self.running = False"),
         (update_status, "self.done = True"),
-        (update_status, "self.finished_at = time.time()"),
         (cancel_approvals, 'raise ValueError("branch_binding_id_required")'),
         (cancel_approvals_locked, 'raise ValueError("branch_binding_id_required")'),
         (cancel_user_inputs, 'raise ValueError("branch_binding_id_required")'),
@@ -914,6 +913,8 @@ def test_session_run_projection_does_not_fabricate_branch_scope_from_selected_st
         (mark_running, "self._require_branch_binding_locked(branch_id)"),
         (mark_done, "self._require_branch_binding_locked(branch_id)"),
         (mark_done, "self._branch_close_reason_locked(branch_id, reason)"),
+        (mark_done, "finished_at = time.time()"),
+        (mark_done, "self.finished_at = finished_at"),
         (event_buffer_fields, '"branch_binding_id"'),
     ]
     forbidden = [
@@ -1030,6 +1031,33 @@ def test_mcp_elicitation_and_entrypoint_producers_require_scoped_branch_proof() 
         for name, pattern in forbidden
         if pattern in scanned[name]
     ]
+
+    assert missing == []
+    assert offenders == []
+
+
+def test_remote_relay_does_not_close_session_run_binding_on_completed_activation() -> None:
+    source = _read("reuleauxcoder/interfaces/entrypoint/remote_relay.py")
+    finalize_claim = _section(
+        source,
+        "def _finalize_claim_session_run(",
+        "def _start_server_session_run_worker()",
+    )
+
+    required = [
+        "def _non_continuable_agent_run_closes_session_run_binding(",
+        'return _agent_run_status_value(agent_run) in {"failed", "cancelled"}',
+        "terminal = _non_continuable_agent_run_closes_session_run_binding(completed)",
+        'runtime_status = "settled" if completed_status == "completed" else getattr(completed, "status", "")',
+        'reason=f"agent_run_closed:{completed_status}"',
+    ]
+    forbidden = [
+        'terminal = bool(getattr(completed, "is_terminal", False))',
+        "reason=f\"agent_run_terminal:",
+        "_completed_agent_run_closes_session_run_binding",
+    ]
+    missing = [pattern for pattern in required if pattern not in source]
+    offenders = [pattern for pattern in forbidden if pattern in finalize_claim]
 
     assert missing == []
     assert offenders == []

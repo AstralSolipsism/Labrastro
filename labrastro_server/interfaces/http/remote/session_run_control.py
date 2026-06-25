@@ -10,7 +10,7 @@ SessionRunControlKind = Literal[
     "ok",
     "invalid_peer_token",
     "session_run_not_found",
-    "session_run_projection_unavailable",
+    "session_run_projection_nonrecoverable",
     "session_run_binding_store_unavailable",
     "agent_runs_unavailable",
     "session_run_bindings_unavailable",
@@ -28,6 +28,7 @@ BindingLookupKind = Literal["ok", "not_found", "unavailable", "store_unavailable
 class SessionRunControlPolicy:
     branch_binding_id: str | None = None
     require_branch_binding_id: bool = True
+    include_inactive_binding: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class SessionRunControlResolution:
     session: Any | None = None
     binding: Any | None = None
     scope: SessionRunControlScopeProof | None = None
+    projection_state: str = "live"
     details: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -91,8 +93,16 @@ class SessionRunControlResolution:
         session: Any,
         binding: Any,
         scope: SessionRunControlScopeProof,
+        projection_state: str = "live",
     ) -> "SessionRunControlResolution":
-        return cls("ok", peer_id=peer_id, session=session, binding=binding, scope=scope)
+        return cls(
+            "ok",
+            peer_id=peer_id,
+            session=session,
+            binding=binding,
+            scope=scope,
+            projection_state=projection_state,
+        )
 
 
 @dataclass(frozen=True)
@@ -153,6 +163,7 @@ class SessionRunControlResolver:
             runtime,
             session_run_id,
             branch_id or None,
+            include_inactive=policy.include_inactive_binding,
         )
         if lookup.kind == "unavailable":
             return SessionRunControlResolution("session_run_bindings_unavailable", peer_id=peer_id)
@@ -181,14 +192,52 @@ class SessionRunControlResolver:
                 peer_id=peer_id,
                 binding=binding,
             )
-        return SessionRunControlResolution(
-            "session_run_projection_unavailable",
-            peer_id=peer_id,
-            binding=binding,
-            scope=scope,
-            details={
-                **scope.to_dict(),
-            },
+        recover = getattr(
+            self._service,
+            "recover_session_run_projection_from_binding",
+            None,
+        )
+        if not callable(recover):
+            return SessionRunControlResolution(
+                "session_run_projection_nonrecoverable",
+                peer_id=peer_id,
+                binding=binding,
+                scope=scope,
+                details={**scope.to_dict()},
+            )
+        recovered = recover(binding)
+        if recovered is None:
+            closer = getattr(runtime, "close_session_run_binding", None)
+            if callable(closer):
+                closer(
+                    str(getattr(binding, "id", "") or ""),
+                    reason="session_run_projection_nonrecoverable",
+                )
+            return SessionRunControlResolution(
+                "session_run_projection_nonrecoverable",
+                peer_id=peer_id,
+                binding=binding,
+                scope=scope,
+                details={**scope.to_dict()},
+            )
+        session, recovered_binding, projection_state = recovered
+        recovered_scope = SessionRunControlScopeProof.from_binding(
+            session_run_id=session_run_id,
+            binding=recovered_binding,
+        )
+        if recovered_scope is None:
+            return SessionRunControlResolution(
+                "session_run_scope_proof_invalid",
+                peer_id=peer_id,
+                session=session,
+                binding=recovered_binding,
+            )
+        return SessionRunControlResolution.ok(
+            peer_id,
+            session,
+            recovered_binding,
+            recovered_scope,
+            projection_state=projection_state,
         )
 
     def _resolve_binding(
@@ -209,6 +258,7 @@ class SessionRunControlResolver:
             runtime,
             session.session_run_id,
             branch_id or None,
+            include_inactive=policy.include_inactive_binding,
         )
         if lookup.kind == "unavailable":
             return SessionRunControlResolution("session_run_bindings_unavailable", peer_id=peer_id, session=session)
@@ -249,13 +299,26 @@ class SessionRunControlResolver:
                 session=session,
                 binding=binding,
             )
-        return SessionRunControlResolution.ok(peer_id, session, binding, scope)
+        projection_state = (
+            "closed"
+            if _binding_status_value(binding) in {"closed", "deleted"}
+            else "live"
+        )
+        return SessionRunControlResolution.ok(
+            peer_id,
+            session,
+            binding,
+            scope,
+            projection_state=projection_state,
+        )
 
     def _lookup_binding(
         self,
         runtime: Any,
         session_run_id: str,
         branch_binding_id: str | None,
+        *,
+        include_inactive: bool = False,
     ) -> _BindingLookup:
         finder = getattr(runtime, "find_session_run_binding", None)
         if not callable(finder):
@@ -267,6 +330,7 @@ class SessionRunControlResolver:
                 session_run_id=session_run_id,
                 branch_binding_id=branch_binding_id,
                 selected_only=False,
+                include_inactive=include_inactive,
             )
         except Exception as exc:
             return _BindingLookup(
@@ -307,3 +371,8 @@ class SessionRunControlResolver:
 
 def _normalized(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _binding_status_value(binding: Any) -> str:
+    status = getattr(binding, "status", "active")
+    return str(getattr(status, "value", status) or "active").strip().lower()

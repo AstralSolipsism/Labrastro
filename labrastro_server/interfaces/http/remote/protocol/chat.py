@@ -369,6 +369,18 @@ class SessionRunStatusResponse:
     approvals: list[dict[str, Any]] = field(default_factory=list)
     user_inputs: list[dict[str, Any]] = field(default_factory=list)
     branches: list[dict[str, Any]] = field(default_factory=list)
+    terminal: bool = False
+    bindingStatus: str = "active"
+    recoverable: bool = False
+    eventStreamAllowed: bool = False
+    projectionState: str = "live"
+    mainlineState: str = "none"
+    agentRunState: str = "none"
+    activationState: str = "none"
+    working: bool = False
+    continuable: bool = False
+    closedReason: str | None = None
+    transportState: str = "disconnected"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -379,6 +391,18 @@ class SessionRunStatusResponse:
             "running": self.running,
             "done": self.done,
             "reconnectable": self.reconnectable,
+            "terminal": self.terminal,
+            "bindingStatus": self.bindingStatus,
+            "recoverable": self.recoverable,
+            "eventStreamAllowed": self.eventStreamAllowed,
+            "projectionState": self.projectionState,
+            "mainlineState": self.mainlineState,
+            "agentRunState": self.agentRunState,
+            "activationState": self.activationState,
+            "working": self.working,
+            "continuable": self.continuable,
+            "closedReason": self.closedReason,
+            "transportState": self.transportState,
             "cursor": self.cursor,
             "next_cursor": self.next_cursor,
             "first_available_seq": self.first_available_seq,
@@ -414,6 +438,18 @@ class SessionRunStatusResponse:
             running=bool(d.get("running", False)),
             done=bool(d.get("done", False)),
             reconnectable=bool(d.get("reconnectable", False)),
+            terminal=bool(d.get("terminal", False)),
+            bindingStatus=str(d.get("bindingStatus") or "active"),
+            recoverable=bool(d.get("recoverable", False)),
+            eventStreamAllowed=bool(d.get("eventStreamAllowed", False)),
+            projectionState=str(d.get("projectionState") or "live"),
+            mainlineState=str(d.get("mainlineState") or "none"),
+            agentRunState=str(d.get("agentRunState") or "none"),
+            activationState=str(d.get("activationState") or "none"),
+            working=bool(d.get("working", False)),
+            continuable=bool(d.get("continuable", False)),
+            closedReason=d.get("closedReason") if isinstance(d.get("closedReason"), str) else None,
+            transportState=str(d.get("transportState") or "disconnected"),
             cursor=int(d.get("cursor", 0)),
             next_cursor=int(d.get("next_cursor", 0)),
             first_available_seq=int(d.get("first_available_seq", 0)),
@@ -495,6 +531,72 @@ class SessionRunCancelResponse:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRunCancelResponse":
+        return cls(
+            ok=bool(d.get("ok", False)),
+            session_run_id=d.get("session_run_id") if isinstance(d.get("session_run_id"), str) else None,
+            agent_run_id=d.get("agent_run_id") if isinstance(d.get("agent_run_id"), str) else None,
+            branch_binding_id=d.get("branch_binding_id") if isinstance(d.get("branch_binding_id"), str) else None,
+            scope_id=d.get("scope_id") if isinstance(d.get("scope_id"), str) else None,
+            selected=bool(d.get("selected")) if "selected" in d else None,
+            error=d.get("error"),
+        )
+
+
+@dataclass
+class SessionRunStopRequest:
+    peer_token: str
+    session_run_id: str
+    branch_binding_id: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        self.session_run_id = required_session_run_id(self.session_run_id)
+        self.branch_binding_id = required_branch_binding_id(self.branch_binding_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "peer_token": self.peer_token,
+            "session_run_id": required_session_run_id(self.session_run_id),
+            "branch_binding_id": required_branch_binding_id(self.branch_binding_id),
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunStopRequest":
+        return cls(
+            peer_token=d["peer_token"],
+            session_run_id=required_session_run_id(d.get("session_run_id")),
+            branch_binding_id=required_branch_binding_id(d.get("branch_binding_id")),
+            reason=d.get("reason"),
+        )
+
+
+@dataclass
+class SessionRunStopResponse:
+    ok: bool
+    session_run_id: str | None = None
+    agent_run_id: str | None = None
+    branch_binding_id: str | None = None
+    scope_id: str | None = None
+    selected: bool | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"ok": self.ok, "error": self.error}
+        if self.session_run_id is not None:
+            payload["session_run_id"] = self.session_run_id
+        if self.agent_run_id is not None:
+            payload["agent_run_id"] = self.agent_run_id
+        if self.branch_binding_id is not None:
+            payload["branch_binding_id"] = self.branch_binding_id
+        if self.scope_id is not None:
+            payload["scope_id"] = self.scope_id
+        if self.selected is not None:
+            payload["selected"] = self.selected
+        return payload
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRunStopResponse":
         return cls(
             ok=bool(d.get("ok", False)),
             session_run_id=d.get("session_run_id") if isinstance(d.get("session_run_id"), str) else None,
@@ -841,6 +943,8 @@ __all__ = [
     "SessionRunStatusResponse",
     "SessionRunCancelRequest",
     "SessionRunCancelResponse",
+    "SessionRunStopRequest",
+    "SessionRunStopResponse",
     "SessionRunContinueRequest",
     "SessionRunContinueResponse",
     "SessionRunRecoverRequest",

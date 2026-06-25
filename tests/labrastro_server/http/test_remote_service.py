@@ -54,6 +54,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunSource,
     ExecutionLocation,
     ModelRequestOrigin,
+    SessionRunBindingStatus,
     WorkerKind,
 )
 from reuleauxcoder.services.providers.stream_supervisor import ProviderStreamInterruptedError
@@ -575,7 +576,7 @@ def test_remote_session_run_localizes_message_key_at_session_boundary(tmp_path: 
     )
 
 
-def test_session_run_terminal_event_updates_selected_runtime_lifecycle(
+def test_session_run_end_event_settles_selected_activation_without_closing_mainline(
     tmp_path: Path,
 ) -> None:
     session = _SessionRunProjection(
@@ -594,15 +595,15 @@ def test_session_run_terminal_event_updates_selected_runtime_lifecycle(
     writer.append_event("session_run_end", {"response": "done"})
     status = session.status_payload(0, branch_binding_id="main")
 
-    assert status["status"] == "done"
-    assert status["done"] is True
-    assert session.status == "done"
+    assert status["status"] == "settled"
+    assert status["done"] is False
+    assert session.status == "settled"
     assert session.running is False
-    assert session.done is True
-    assert session.finished_at is not None
+    assert session.done is False
+    assert session.finished_at is None
 
 
-def test_session_run_sibling_terminal_event_does_not_update_selected_lifecycle(
+def test_session_run_sibling_end_event_does_not_update_selected_lifecycle(
     tmp_path: Path,
 ) -> None:
     session = _SessionRunProjection(
@@ -634,8 +635,8 @@ def test_session_run_sibling_terminal_event_does_not_update_selected_lifecycle(
     branch_status = session.status_payload(0, branch_binding_id="branch-a")
     selected_status = session.status_payload(0, branch_binding_id="main")
 
-    assert branch_status["status"] == "done"
-    assert branch_status["done"] is True
+    assert branch_status["status"] == "settled"
+    assert branch_status["done"] is False
     assert selected_status["status"] == "active"
     assert selected_status["done"] is False
     assert session.status == selected_model_status_before
@@ -2510,11 +2511,11 @@ def test_remote_session_run_status_response_updates_target_branch_runtime_metada
     persisted = session.status_payload(0, branch_binding_id="main")
     _, wait_done, _ = writer.wait_events(0, 0)
 
-    assert response["done"] is True
-    assert response["branches"][0]["status"] == "done"
-    assert persisted["status"] == "done"
-    assert persisted["branches"][0]["status"] == "done"
-    assert wait_done is True
+    assert response["done"] is False
+    assert response["branches"][0]["status"] == "settled"
+    assert persisted["status"] == "settled"
+    assert persisted["branches"][0]["status"] == "settled"
+    assert wait_done is False
 
 
 def test_remote_session_run_status_response_uses_branch_runtime_truth_for_done(
@@ -2631,17 +2632,17 @@ def test_remote_session_run_events_response_updates_target_branch_runtime_metada
     response = writer.events_response_payload(
         0,
         0,
-        runtime_snapshot=lambda: ("completed", True),
+        runtime_snapshot=lambda: ("completed", False),
         selected=True,
     )
     persisted = session.status_payload(0, branch_binding_id="main")
     _, wait_done, _ = writer.wait_events(0, 0)
 
-    assert response["done"] is True
-    assert response["branches"][0]["status"] == "done"
-    assert persisted["status"] == "done"
-    assert persisted["branches"][0]["status"] == "done"
-    assert wait_done is True
+    assert response["done"] is False
+    assert response["branches"][0]["status"] == "settled"
+    assert persisted["status"] == "settled"
+    assert persisted["branches"][0]["status"] == "settled"
+    assert wait_done is False
 
 
 def test_remote_session_run_events_response_preserves_terminal_branch_against_stale_running(
@@ -7810,11 +7811,37 @@ class TestRemoteRelayHTTPService:
         relay.start()
         port = _free_port()
         control = AgentRunControlPlane()
+        persisted_trace_events: list[dict] = []
+
+        def trace_sink(
+            session_id: str,
+            event_type: str,
+            payload: dict,
+            session_run_id: str | None,
+            session_run_seq: int | None,
+            source: str,
+            replayable: bool,
+        ) -> int:
+            seq = len(persisted_trace_events) + 1
+            persisted_trace_events.append(
+                {
+                    "session_id": session_id,
+                    "type": event_type,
+                    "payload": payload,
+                    "session_run_id": session_run_id,
+                    "session_run_seq": session_run_seq,
+                    "source": source,
+                    "replayable": replayable,
+                }
+            )
+            return seq
+
         service = RemoteRelayHTTPService(
             relay_server=relay,
             bind=f"127.0.0.1:{port}",
             runtime_control_plane=control,
         )
+        service.set_session_trace_event_sink(trace_sink)
         service.start()
         try:
             _, register_body = _json_request(
@@ -7848,6 +7875,13 @@ class TestRemoteRelayHTTPService:
             assert status == 200
             session_run_id = start_body["session_run_id"]
             agent_run_id = start_body["agent_run_id"]
+            assert any(
+                event["type"] == "session_run_start"
+                and event["session_id"] == "chat-session-1"
+                and event["session_run_id"] == session_run_id
+                and event["payload"]["prompt"] == "first"
+                for event in persisted_trace_events
+            )
             assert start_body["branch_binding_id"] == "main"
             assert start_body["scope_id"] == f"{session_run_id}:main"
             assert start_body["selected"] is True
@@ -7896,6 +7930,50 @@ class TestRemoteRelayHTTPService:
             assert server_claim.executor_request.model_request_origin == (
                 ModelRequestOrigin.SERVER
             )
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_start_rejects_workflow_name_as_executor_mode(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(
+                    relay,
+                    cwd="/tmp/peer-chat",
+                    workspace_root="/tmp/peer-chat",
+                    features=["shell", "agent_runs.local_workspace"],
+                ),
+            )
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/start",
+                    {
+                        "peer_token": register_body["payload"]["peer_token"],
+                        "prompt": "first",
+                        "mode": "taskflow",
+                        "workflow_mode": "taskflow",
+                        "client_request_id": "start-invalid-mode",
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 400
+            assert body["error"] == "invalid_session_run_mode"
+            assert "workflow_mode" in body["message"]
         finally:
             service.stop()
             relay.stop()
@@ -8063,7 +8141,50 @@ class TestRemoteRelayHTTPService:
             service.stop()
             relay.stop()
 
-    def test_session_run_control_routes_report_unavailable_projection_when_binding_persists(self) -> None:
+    @pytest.mark.parametrize(
+        ("path", "payload", "expected_code", "expected_error"),
+        [
+            (
+                "/remote/session-runs/continue",
+                {"branch_binding_id": "main", "prompt": "second"},
+                409,
+                "agent_run_not_continuable",
+            ),
+            (
+                "/remote/session-runs/recover",
+                {"branch_binding_id": "main", "action": "continue"},
+                409,
+                "session_run_already_running",
+            ),
+            (
+                "/remote/approval/reply",
+                {
+                    "branch_binding_id": "main",
+                    "approval_id": "approval-1",
+                    "decision": "deny_once",
+                },
+                404,
+                "approval_not_found",
+            ),
+            (
+                "/remote/session-runs/user-input/reply",
+                {
+                    "branch_binding_id": "main",
+                    "input_id": "input-1",
+                    "action": "decline",
+                },
+                404,
+                "user_input_not_found",
+            ),
+        ],
+    )
+    def test_session_run_control_routes_recover_missing_projection_before_route_logic(
+        self,
+        path: str,
+        payload: dict[str, object],
+        expected_code: int,
+        expected_error: str,
+    ) -> None:
         relay, service, control, register_body, start_body = (
             self._start_bound_agent_run_session()
         )
@@ -8074,95 +8195,68 @@ class TestRemoteRelayHTTPService:
             with service._session_runs_lock:
                 service._session_runs.pop(session_run_id, None)
 
-            requests = [
-                (
-                    "/remote/session-runs/continue",
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}{path}",
                     {
                         "peer_token": peer_token,
                         "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "prompt": "second",
+                        **payload,
                     },
-                ),
-                (
-                    "/remote/session-runs/events",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "cursor": 0,
-                        "timeout_sec": 0.05,
-                    },
-                ),
-                (
-                    "/remote/session-runs/status",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                    },
-                ),
-                (
-                    "/remote/session-runs/recover",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "action": "continue",
-                    },
-                ),
-                (
-                    "/remote/session-runs/cancel",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "reason": "user_cancelled",
-                    },
-                ),
-                (
-                    "/remote/session-runs/branches/select",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "cursor": 0,
-                    },
-                ),
-                (
-                    "/remote/session-runs/user-input/reply",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "input_id": "input-1",
-                        "action": "submit",
-                        "content": {"text": "answer"},
-                    },
-                ),
-                (
-                    "/remote/approval/reply",
-                    {
-                        "peer_token": peer_token,
-                        "session_run_id": session_run_id,
-                        "branch_binding_id": "main",
-                        "approval_id": "approval-1",
-                        "decision": "deny_once",
-                    },
-                ),
-            ]
+                )
 
-            for path, payload in requests:
-                with pytest.raises(HTTPError) as excinfo:
-                    _json_request(
-                        "POST",
-                        f"{service.base_url}{path}",
-                        payload,
-                    )
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == expected_code
+            assert body["error"] == expected_error
+            assert service._get_session_run(session_run_id) is not None
+            assert control.find_session_run_binding(session_run_id=session_run_id) is not None
+        finally:
+            service.stop()
+            relay.stop()
 
-                body = json.loads(excinfo.value.read().decode("utf-8"))
-                assert excinfo.value.code == 409, path
-                assert body["error"] == "session_run_projection_unavailable", path
+    def test_session_run_status_closes_binding_when_projection_recovery_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            monkeypatch.setattr(
+                service,
+                "recover_session_run_projection_from_binding",
+                lambda *_args, **_kwargs: None,
+            )
+
+            with pytest.raises(HTTPError) as excinfo:
+                _json_request(
+                    "POST",
+                    f"{service.base_url}/remote/session-runs/status",
+                    {
+                        "peer_token": peer_token,
+                        "session_run_id": session_run_id,
+                        "branch_binding_id": "main",
+                    },
+                )
+
+            body = json.loads(excinfo.value.read().decode("utf-8"))
+            assert excinfo.value.code == 409
+            assert body["error"] == "session_run_projection_nonrecoverable"
+            assert control.find_session_run_binding(session_run_id=session_run_id) is None
+            closed = control.find_session_run_binding(
+                session_run_id=session_run_id,
+                branch_binding_id="main",
+                selected_only=False,
+                include_inactive=True,
+            )
+            assert closed is not None
+            assert closed.status == SessionRunBindingStatus.CLOSED
         finally:
             service.stop()
             relay.stop()
@@ -8487,6 +8581,7 @@ class TestRemoteRelayHTTPService:
         [
             "/remote/session-runs/events",
             "/remote/session-runs/status",
+            "/remote/session-runs/stop",
             "/remote/session-runs/cancel",
             "/remote/session-runs/recover",
             "/remote/approval/reply",
@@ -8531,6 +8626,7 @@ class TestRemoteRelayHTTPService:
     @pytest.mark.parametrize(
         ("path", "extra_payload"),
         [
+            ("/remote/session-runs/stop", {"reason": "user_stop"}),
             ("/remote/session-runs/cancel", {"reason": "user_cancelled"}),
             ("/remote/session-runs/recover", {"action": "continue"}),
             (
@@ -9047,6 +9143,17 @@ class TestRemoteRelayHTTPService:
             assert status == 200
             assert status_body["status"] == "queued"
             assert status_body["running"] is True
+            assert status_body["terminal"] is False
+            assert status_body["bindingStatus"] == "active"
+            assert status_body["recoverable"] is True
+            assert status_body["eventStreamAllowed"] is True
+            assert status_body["projectionState"] == "live"
+            assert status_body["mainlineState"] == "executing"
+            assert status_body["agentRunState"] == "executing"
+            assert status_body["activationState"] == "queued"
+            assert status_body["working"] is True
+            assert status_body["continuable"] is False
+            assert status_body["transportState"] == "streaming"
             assert status_body["agent_run_id"] == agent_run_id
             assert status_body["branch_binding_id"] == "main"
             assert status_body["scope_id"] == f"{start_body['session_run_id']}:main"
@@ -9070,15 +9177,204 @@ class TestRemoteRelayHTTPService:
                     "branch_binding_id": "main",
                 },
             )
-            assert completed_status["status"] == "done"
+            assert completed_status["status"] == "settled"
             assert completed_status["running"] is False
-            assert completed_status["done"] is True
+            assert completed_status["done"] is False
+            assert completed_status["terminal"] is False
+            assert completed_status["bindingStatus"] == "active"
+            assert completed_status["recoverable"] is True
+            assert completed_status["eventStreamAllowed"] is False
+            assert completed_status["projectionState"] == "drained"
+            assert completed_status["mainlineState"] == "settled"
+            assert completed_status["agentRunState"] == "continuable"
+            assert completed_status["activationState"] == "completed"
+            assert completed_status["working"] is False
+            assert completed_status["continuable"] is True
+            assert completed_status["closedReason"] is None
+            assert completed_status["transportState"] == "disconnected"
             assert completed_status["runtime_state"]["agent_run_status"] == "completed"
             completed_branches = {
                 branch["branch_binding_id"]: branch
                 for branch in completed_status["branches"]
             }
-            assert completed_branches["main"]["status"] == "done"
+            assert completed_branches["main"]["status"] == "settled"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_status_recovers_missing_projection_for_active_non_terminal_binding(
+        self,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                },
+            )
+
+            assert status == 200
+            assert status_body["status"] == "queued"
+            assert status_body["terminal"] is False
+            assert status_body["bindingStatus"] == "active"
+            assert status_body["recoverable"] is True
+            assert status_body["eventStreamAllowed"] is True
+            assert status_body["projectionState"] == "recovered"
+            assert status_body["mainlineState"] == "executing"
+            assert status_body["activationState"] == "queued"
+            assert status_body["working"] is True
+            assert status_body["transportState"] == "streaming"
+            assert status_body["agent_run_id"] == start_body["agent_run_id"]
+            assert service._get_session_run(session_run_id) is not None
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_status_recovers_drained_projection_for_settled_binding(
+        self,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            agent_run_id = start_body["agent_run_id"]
+            control.complete_agent_run_activation(
+                agent_run_id,
+                ExecutorRunResult(
+                    task_id=agent_run_id,
+                    status="completed",
+                    output="done",
+                ),
+                activation_id=start_body["activation_id"],
+            )
+            active = control.find_session_run_binding(
+                session_run_id=session_run_id,
+                branch_binding_id="main",
+                include_inactive=True,
+            )
+            assert active is not None
+            assert active.status == SessionRunBindingStatus.ACTIVE
+            with service._session_runs_lock:
+                service._session_runs.pop(session_run_id, None)
+
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                },
+            )
+
+            assert status == 200
+            assert status_body["terminal"] is False
+            assert status_body["bindingStatus"] == "active"
+            assert status_body["recoverable"] is True
+            assert status_body["eventStreamAllowed"] is False
+            assert status_body["projectionState"] == "drained"
+            assert status_body["mainlineState"] == "settled"
+            assert status_body["agentRunState"] == "continuable"
+            assert status_body["activationState"] == "completed"
+            assert status_body["working"] is False
+            assert status_body["continuable"] is True
+            assert status_body["transportState"] == "disconnected"
+            assert status_body["runtime_state"]["agent_run_status"] == "completed"
+            refreshed = control.find_session_run_binding(
+                session_run_id=session_run_id,
+                branch_binding_id="main",
+                include_inactive=True,
+            )
+            assert refreshed is not None
+            assert refreshed.status == SessionRunBindingStatus.ACTIVE
+            assert control.find_session_run_binding(
+                session_run_id=session_run_id,
+                branch_binding_id="main",
+            ) is not None
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_continue_reuses_settled_agent_run_for_second_turn(
+        self,
+    ) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            agent_run_id = start_body["agent_run_id"]
+            control.complete_agent_run_activation(
+                agent_run_id,
+                ExecutorRunResult(
+                    task_id=agent_run_id,
+                    status="completed",
+                    output="first done",
+                ),
+                activation_id=start_body["activation_id"],
+            )
+
+            status, continue_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/continue",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                    "prompt": "second",
+                    "client_request_id": "turn-2",
+                },
+            )
+
+            assert status == 200
+            assert continue_body["ok"] is True
+            assert continue_body["session_run_id"] == session_run_id
+            assert continue_body["agent_run_id"] == agent_run_id
+            assert continue_body["branch_binding_id"] == "main"
+            assert continue_body["activation_id"] == f"{agent_run_id}:activation:2"
+            detail = control.load_agent_run_detail(agent_run_id)
+            assert [activation["id"] for activation in detail["activations"]] == [
+                start_body["activation_id"],
+                f"{agent_run_id}:activation:2",
+            ]
+            assert detail["activations"][1]["prompt"] == "second"
+            assert detail["activations"][1]["input_payload"]["source"] == "session_run_continue"
+            active = control.find_session_run_binding(
+                session_run_id=session_run_id,
+                branch_binding_id="main",
+            )
+            assert active is not None
+            assert active.agent_run_id == agent_run_id
+
+            _, continued_status = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                },
+            )
+            assert continued_status["mainlineState"] == "executing"
+            assert continued_status["agentRunState"] == "executing"
+            assert continued_status["activationState"] == "queued"
+            assert continued_status["working"] is True
+            assert continued_status["continuable"] is False
+            assert continued_status["eventStreamAllowed"] is True
         finally:
             service.stop()
             relay.stop()
@@ -9120,24 +9416,33 @@ class TestRemoteRelayHTTPService:
                 ),
                 activation_id=start_body["activation_id"],
             )
-            status, content_type, frame = _sse_first_frame_request(
+            status, status_body = _json_request(
                 "POST",
-                f"{service.base_url}/remote/session-runs/events",
+                f"{service.base_url}/remote/session-runs/status",
                 {
                     "peer_token": peer_token,
                     "session_run_id": start_body["session_run_id"],
                     "branch_binding_id": "main",
-                    "cursor": 999,
-                    "timeout_sec": 0.05,
                 },
             )
 
             assert status == 200
-            assert content_type.startswith("text/event-stream")
-            assert frame["data"]["done"] is True
+            assert status_body["done"] is True
+            assert status_body["terminal"] is True
+            assert status_body["bindingStatus"] == "closed"
+            assert status_body["recoverable"] is False
+            assert status_body["eventStreamAllowed"] is False
+            assert status_body["projectionState"] == "drained"
+            assert status_body["mainlineState"] == "failed"
+            assert status_body["agentRunState"] == "failed"
+            assert status_body["activationState"] == "failed"
+            assert status_body["working"] is False
+            assert status_body["continuable"] is False
+            assert status_body["closedReason"] == "mainline_failed"
+            assert status_body["transportState"] == "closed"
             branches = {
                 branch["branch_binding_id"]: branch
-                for branch in frame["data"]["branches"]
+                for branch in status_body["branches"]
             }
             assert branches["main"]["status"] == "error"
         finally:
@@ -9183,6 +9488,170 @@ class TestRemoteRelayHTTPService:
             assert status == 200
             assert cancel_body["ok"] is True
             assert control.get_agent_run(agent_run_id).status.value == "cancelled"
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": start_body["session_run_id"],
+                    "branch_binding_id": "main",
+                },
+            )
+            assert status == 200
+            assert status_body["terminal"] is True
+            assert status_body["bindingStatus"] == "closed"
+            assert status_body["projectionState"] == "drained"
+            assert status_body["mainlineState"] == "cancelled"
+            assert status_body["agentRunState"] == "cancelled"
+            assert status_body["activationState"] == "cancelled"
+            assert status_body["working"] is False
+            assert status_body["continuable"] is False
+            assert status_body["eventStreamAllowed"] is False
+            assert status_body["closedReason"] == "user_cancelled"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_stop_settles_current_activation_and_keeps_mainline_continuable(self) -> None:
+        relay = RelayServer()
+        relay.start()
+        port = _free_port()
+        control = AgentRunControlPlane()
+        service = RemoteRelayHTTPService(
+            relay_server=relay,
+            bind=f"127.0.0.1:{port}",
+            runtime_control_plane=control,
+        )
+        service.start()
+        try:
+            _, register_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/register",
+                _peer_register_payload(relay),
+            )
+            peer_token = register_body["payload"]["peer_token"]
+            _, start_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/start",
+                {"peer_token": peer_token, "prompt": "first"},
+            )
+            session_run_id = start_body["session_run_id"]
+            agent_run_id = start_body["agent_run_id"]
+
+            status, stop_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/stop",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                    "reason": "user_stop",
+                },
+            )
+
+            assert status == 200
+            assert stop_body["ok"] is True
+            stopped = control.get_agent_run(agent_run_id)
+            assert stopped.status.value == "completed"
+            assert stopped.mainline_state.value == "continuable"
+            assert stopped.activation_state.value == "cancelled"
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                },
+            )
+            assert status == 200
+            assert status_body["terminal"] is False
+            assert status_body["bindingStatus"] == "active"
+            assert status_body["projectionState"] == "drained"
+            assert status_body["mainlineState"] == "settled"
+            assert status_body["agentRunState"] == "continuable"
+            assert status_body["activationState"] == "cancelled"
+            assert status_body["working"] is False
+            assert status_body["continuable"] is True
+            assert status_body["eventStreamAllowed"] is False
+            assert status_body["closedReason"] is None
+
+            status, continue_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/continue",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                    "prompt": "second",
+                    "client_request_id": "continue-after-stop",
+                },
+            )
+            assert status == 200
+            assert continue_body["ok"] is True
+            assert continue_body["session_run_id"] == session_run_id
+            assert continue_body["agent_run_id"] == agent_run_id
+            assert continue_body["branch_binding_id"] == "main"
+            assert continue_body["activation_id"] == f"{agent_run_id}:activation:2"
+        finally:
+            service.stop()
+            relay.stop()
+
+    def test_session_run_stop_completed_activation_returns_not_stoppable_noop(self) -> None:
+        relay, service, control, register_body, start_body = (
+            self._start_bound_agent_run_session()
+        )
+        try:
+            peer_token = register_body["payload"]["peer_token"]
+            session_run_id = start_body["session_run_id"]
+            agent_run_id = start_body["agent_run_id"]
+            control.complete_agent_run_activation(
+                agent_run_id,
+                ExecutorRunResult(
+                    task_id=agent_run_id,
+                    status="completed",
+                    output="done",
+                ),
+                activation_id=start_body["activation_id"],
+            )
+
+            status, stop_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/stop",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                    "reason": "user_stop",
+                },
+            )
+
+            assert status == 200
+            assert stop_body["ok"] is False
+            assert stop_body["error"] == "session_run_not_stoppable"
+            stopped = control.get_agent_run(agent_run_id)
+            assert stopped.status.value == "completed"
+            assert stopped.mainline_state.value == "continuable"
+            assert stopped.activation_state.value == "completed"
+            status, status_body = _json_request(
+                "POST",
+                f"{service.base_url}/remote/session-runs/status",
+                {
+                    "peer_token": peer_token,
+                    "session_run_id": session_run_id,
+                    "branch_binding_id": "main",
+                },
+            )
+            assert status == 200
+            assert status_body["terminal"] is False
+            assert status_body["bindingStatus"] == "active"
+            assert status_body["projectionState"] == "drained"
+            assert status_body["mainlineState"] == "settled"
+            assert status_body["agentRunState"] == "continuable"
+            assert status_body["activationState"] == "completed"
+            assert status_body["working"] is False
+            assert status_body["continuable"] is True
+            assert status_body["eventStreamAllowed"] is False
         finally:
             service.stop()
             relay.stop()
@@ -9426,7 +9895,6 @@ class TestRemoteRelayHTTPService:
             {
                 "peer_token": "peer-token",
                 "prompt": "hello",
-                "mode": "taskflow",
                 "workflow_mode": "taskflow",
                 "taskflow_id": "taskflow-1",
             }
@@ -9434,7 +9902,6 @@ class TestRemoteRelayHTTPService:
             "peer_token": "peer-token",
             "prompt": "hello",
             "session_hint": None,
-            "mode": "taskflow",
             "workflow_mode": "taskflow",
             "taskflow_id": "taskflow-1",
         }

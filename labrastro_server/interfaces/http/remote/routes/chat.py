@@ -27,6 +27,8 @@ from labrastro_server.interfaces.http.remote.protocol import (
     ApprovalReplyResponse,
     SessionRunCancelRequest,
     SessionRunCancelResponse,
+    SessionRunStopRequest,
+    SessionRunStopResponse,
     ChatCommandDispatchRequest,
     SessionRunContinueRequest,
     SessionRunContinueResponse,
@@ -117,6 +119,256 @@ def _sse_wait_timeout(timeout_sec: float) -> float:
     return min(max(timeout_sec, 0.05), 30.0)
 
 
+_WORKFLOW_MODE_VALUES = frozenset({"chat", "taskflow", "capability_package_ingest"})
+
+
+def _reserved_workflow_mode_name(value: str | None) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _WORKFLOW_MODE_VALUES else ""
+
+
+def _binding_status_value(binding: Any) -> str:
+    status = getattr(binding, "status", "active")
+    return str(getattr(status, "value", status) or "active").strip().lower()
+
+
+def _enum_str(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").strip().lower()
+
+
+def _agent_run_status_value(agent_run: Any) -> str:
+    return _enum_str(getattr(agent_run, "status", ""))
+
+
+def _agent_run_mainline_state_value(agent_run: Any) -> str:
+    return _enum_str(getattr(agent_run, "mainline_state", ""))
+
+
+def _agent_run_activation_state_value(agent_run: Any) -> str:
+    return _enum_str(getattr(agent_run, "activation_state", ""))
+
+
+def _agent_run_waiting_reason_value(agent_run: Any) -> str:
+    return _enum_str(getattr(agent_run, "waiting_reason", ""))
+
+
+def _current_activation_status(control_plane: Any, agent_run: Any) -> str:
+    activation_id = str(getattr(agent_run, "current_activation_id", "") or "").strip()
+    if not activation_id:
+        return "none"
+    loader = getattr(control_plane, "load_agent_run_detail", None)
+    if callable(loader):
+        try:
+            detail = loader(str(getattr(agent_run, "id", "") or ""), event_limit=1)
+        except Exception:
+            detail = {}
+        activations = detail.get("activations") if isinstance(detail, dict) else None
+        if isinstance(activations, list):
+            for activation in activations:
+                if not isinstance(activation, dict):
+                    continue
+                if str(activation.get("id") or activation.get("activation_id") or "") != activation_id:
+                    continue
+                status = str(activation.get("status") or "").strip().lower()
+                if status:
+                    return status
+    return _agent_run_status_value(agent_run) or "none"
+
+
+def _activation_state_for(agent_run: Any, activation_status: str) -> str:
+    stored = _agent_run_activation_state_value(agent_run)
+    if stored:
+        return stored
+    status = str(activation_status or "").strip().lower()
+    if not status:
+        return "none"
+    if status == "waiting":
+        if _agent_run_waiting_reason_value(agent_run) in {"user_approval", "user_input"}:
+            return "waiting_user"
+        return "waiting_server"
+    return status
+
+
+def _agent_run_state_for(agent_run: Any, binding_status: str) -> str:
+    status = _agent_run_status_value(agent_run)
+    stored = _agent_run_mainline_state_value(agent_run)
+    if binding_status in {"closed", "deleted"}:
+        if status == "cancelled":
+            return "cancelled"
+        if status == "failed":
+            return "failed"
+        if status == "blocked" or stored == "unrecoverable":
+            return "unrecoverable"
+        return "closed"
+    if stored:
+        return stored
+    if status in {"queued", "dispatched", "running"}:
+        return "executing"
+    if status == "waiting":
+        if _agent_run_waiting_reason_value(agent_run) in {"user_approval", "user_input"}:
+            return "waiting_feedback"
+        return "executing"
+    if status == "completed":
+        return "continuable"
+    if status == "blocked":
+        return "blocked"
+    if status in {"cancelled", "failed"}:
+        return status
+    return "none"
+
+
+def _mainline_state_for(
+    agent_run: Any,
+    *,
+    binding_status: str,
+    agent_run_state: str,
+    activation_state: str,
+) -> str:
+    status = _agent_run_status_value(agent_run)
+    stored = _agent_run_mainline_state_value(agent_run)
+    if binding_status in {"closed", "deleted"}:
+        if status == "cancelled":
+            return "cancelled"
+        if status == "failed":
+            return "failed"
+        if status == "blocked" or stored == "unrecoverable":
+            return "unrecoverable"
+        return "closed"
+    if stored == "continuable":
+        return "settled"
+    if stored == "waiting_feedback":
+        return "waiting_user"
+    if stored:
+        return stored
+    if status in {"queued", "dispatched", "running"}:
+        return "executing"
+    if status == "waiting":
+        return "waiting_user" if activation_state == "waiting_user" else "executing"
+    if status == "completed" and agent_run_state == "continuable":
+        return "settled"
+    if status == "blocked":
+        return "blocked"
+    if status in {"cancelled", "failed"}:
+        return status
+    return "none"
+
+
+def _projection_state_for(
+    projection_state: str,
+    *,
+    mainline_state: str,
+    binding_status: str,
+) -> str:
+    if mainline_state == "unrecoverable":
+        return "nonrecoverable"
+    if binding_status in {"closed", "deleted"} or mainline_state in {
+        "closed",
+        "cancelled",
+        "failed",
+    }:
+        return "drained"
+    if mainline_state == "settled":
+        return "drained"
+    state = str(projection_state or "").strip().lower()
+    if state in {"live", "recovered", "drained", "nonrecoverable"}:
+        return state
+    return "live"
+
+
+def _closed_reason_for(binding: Any, agent_run: Any) -> str | None:
+    binding_status = _binding_status_value(binding)
+    if binding_status not in {"closed", "deleted"}:
+        return None
+    metadata = getattr(binding, "metadata", None)
+    reason = ""
+    if isinstance(metadata, dict):
+        reason = str(metadata.get("status_reason") or "").strip().lower()
+    agent_status = _agent_run_status_value(agent_run)
+    if binding_status == "deleted" or "branch_deleted" in reason:
+        return "branch_deleted"
+    if "scope" in reason or "owner_session_deleted" in reason:
+        return "scope_invalid"
+    if agent_status == "cancelled":
+        return "user_cancelled"
+    if agent_status == "failed":
+        return "mainline_failed"
+    if agent_status == "blocked" or "unrecoverable" in reason:
+        return "unrecoverable_failure"
+    if "explicit" in reason or "user_closed" in reason:
+        return "explicit_close"
+    return "explicit_close"
+
+
+def _session_run_status_facts(
+    *,
+    control_plane: Any,
+    agent_run: Any,
+    binding: Any,
+    projection_state: str,
+) -> dict[str, Any]:
+    binding_status = _binding_status_value(binding)
+    activation_status = _current_activation_status(control_plane, agent_run)
+    activation_state = _activation_state_for(agent_run, activation_status)
+    agent_run_state = _agent_run_state_for(agent_run, binding_status)
+    mainline_state = _mainline_state_for(
+        agent_run,
+        binding_status=binding_status,
+        agent_run_state=agent_run_state,
+        activation_state=activation_state,
+    )
+    working = (
+        binding_status == "active"
+        and activation_state in {"queued", "dispatched", "running", "waiting_server"}
+        and mainline_state == "executing"
+    )
+    continuable = (
+        binding_status == "active"
+        and mainline_state == "settled"
+        and agent_run_state == "continuable"
+    )
+    resolved_projection_state = _projection_state_for(
+        projection_state,
+        mainline_state=mainline_state,
+        binding_status=binding_status,
+    )
+    recoverable = (
+        binding_status == "active"
+        and mainline_state
+        in {"executing", "waiting_user", "blocked", "settled"}
+        and resolved_projection_state in {"live", "recovered", "drained"}
+    )
+    event_stream_allowed = (
+        working and resolved_projection_state in {"live", "recovered"}
+    )
+    terminal = binding_status in {"closed", "deleted"} or mainline_state in {
+        "closed",
+        "cancelled",
+        "failed",
+        "unrecoverable",
+    }
+    transport_state = (
+        "streaming"
+        if event_stream_allowed
+        else "closed"
+        if terminal
+        else "disconnected"
+    )
+    return {
+        "mainlineState": mainline_state,
+        "agentRunState": agent_run_state,
+        "activationState": activation_state,
+        "bindingStatus": binding_status,
+        "projectionState": resolved_projection_state,
+        "working": working,
+        "continuable": continuable,
+        "recoverable": recoverable,
+        "eventStreamAllowed": event_stream_allowed,
+        "terminal": terminal,
+        "closedReason": _closed_reason_for(binding, agent_run),
+        "transportState": transport_state,
+    }
+
+
 class RemoteChatRoutes:
     def _has_chat_model_context(self, peer_id: str, req: SessionRunStartRequest) -> bool:
         provider_id = str(req.provider_id or "").strip()
@@ -170,17 +422,34 @@ class RemoteChatRoutes:
         branch_binding_id: str | None,
         *,
         required: bool = True,
+        include_inactive_binding: bool = False,
     ):
-        resolution = self._session_run_control_resolver().resolve(
+        resolution = self._resolve_session_run_control_resolution(
             peer_token,
             session_run_id,
             SessionRunControlPolicy(
                 branch_binding_id=branch_binding_id,
                 require_branch_binding_id=required,
+                include_inactive_binding=include_inactive_binding,
             ),
         )
-        if resolution.kind == "ok":
+        if resolution is not None:
             return resolution.peer_id, resolution.session, resolution.binding, resolution.scope
+        return None
+
+    def _resolve_session_run_control_resolution(
+        self,
+        peer_token: str,
+        session_run_id: str,
+        policy: SessionRunControlPolicy,
+    ) -> SessionRunControlResolution | None:
+        resolution = self._session_run_control_resolver().resolve(
+            peer_token,
+            session_run_id,
+            policy,
+        )
+        if resolution.kind == "ok":
+            return resolution
         self._send_session_run_control_error(resolution)
         return None
 
@@ -192,11 +461,11 @@ class RemoteChatRoutes:
             self._send_error(HTTPStatus.UNAUTHORIZED, "invalid_peer_token")
         elif resolution.kind == "session_run_not_found":
             self._send_error(HTTPStatus.NOT_FOUND, "session_run_not_found")
-        elif resolution.kind == "session_run_projection_unavailable":
+        elif resolution.kind == "session_run_projection_nonrecoverable":
             self._send_error(
                 HTTPStatus.CONFLICT,
-                "session_run_projection_unavailable",
-                "SessionRun projection is unavailable while a persisted AgentRun binding remains.",
+                "session_run_projection_nonrecoverable",
+                "SessionRun projection cannot be recovered from persisted binding and AgentRun facts.",
                 resolution.details,
             )
         elif resolution.kind == "session_run_binding_store_unavailable":
@@ -250,6 +519,8 @@ class RemoteChatRoutes:
         binding,
         cursor: int,
         scope: SessionRunControlScopeProof,
+        *,
+        projection_state: str = "live",
     ) -> None:
         agent_run = None
         try:
@@ -259,19 +530,66 @@ class RemoteChatRoutes:
         except Exception:
             self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
             return
+        binding_status = _binding_status_value(binding)
+        agent_run_status = _agent_run_status_value(agent_run)
+        if binding_status == "active" and agent_run_status in {"failed", "cancelled"}:
+            closer = getattr(self.service.runtime_control_plane, "close_session_run_binding", None)
+            if callable(closer):
+                closed_ok = closer(
+                    str(getattr(binding, "id", "") or ""),
+                    reason=f"agent_run_closed:{agent_run_status}",
+                )
+                closed = None
+                finder = getattr(self.service.runtime_control_plane, "find_session_run_binding", None)
+                if closed_ok and callable(finder):
+                    closed = finder(
+                        session_run_id=str(getattr(binding, "session_run_id", "") or ""),
+                        branch_binding_id=str(getattr(binding, "branch_binding_id", "") or ""),
+                        selected_only=False,
+                        include_inactive=True,
+                    )
+                if closed is not None:
+                    binding = closed
+                    binding_status = _binding_status_value(binding)
+                    if hasattr(session, "record_branch_binding"):
+                        session.record_branch_binding(binding)
+        facts = _session_run_status_facts(
+            control_plane=self.service.runtime_control_plane,
+            agent_run=agent_run,
+            binding=binding,
+            projection_state=projection_state,
+        )
         writer = session.scoped_writer(
             branch_binding_id=scope.branch_binding_id,
             agent_run_id=scope.agent_run_id,
         )
         run_status = str(agent_run.status.value)
-        terminal = bool(getattr(agent_run, "is_terminal", False))
         status_payload = writer.status_response_payload(
             cursor,
             agent_run_status=run_status,
             activation_id=str(agent_run.current_activation_id or ""),
-            terminal=terminal,
+            terminal=bool(facts["terminal"]),
             selected=scope.selected,
         )
+        status_payload["running"] = bool(facts["working"])
+        status_payload["done"] = bool(facts["terminal"])
+        status_payload["reconnectable"] = bool(facts["eventStreamAllowed"])
+        if facts["mainlineState"] in {"settled", "blocked", "waiting_user"}:
+            status_payload["status"] = facts["mainlineState"]
+        elif facts["terminal"]:
+            status_payload["status"] = facts["mainlineState"]
+        status_payload["terminal"] = bool(facts["terminal"])
+        status_payload["bindingStatus"] = facts["bindingStatus"]
+        status_payload["recoverable"] = bool(facts["recoverable"])
+        status_payload["eventStreamAllowed"] = bool(facts["eventStreamAllowed"])
+        status_payload["projectionState"] = facts["projectionState"]
+        status_payload["mainlineState"] = facts["mainlineState"]
+        status_payload["agentRunState"] = facts["agentRunState"]
+        status_payload["activationState"] = facts["activationState"]
+        status_payload["working"] = bool(facts["working"])
+        status_payload["continuable"] = bool(facts["continuable"])
+        status_payload["closedReason"] = facts["closedReason"]
+        status_payload["transportState"] = facts["transportState"]
 
         self._send_json(
             HTTPStatus.OK,
@@ -298,7 +616,8 @@ class RemoteChatRoutes:
             0,
             agent_run_status=str(agent_run.status.value),
             activation_id=activation_id,
-            terminal=bool(getattr(agent_run, "is_terminal", False)),
+            terminal=str(agent_run.status.value).strip().lower()
+            in {"failed", "cancelled"},
             selected=scope.selected,
         )
         runtime_state = (
@@ -342,6 +661,14 @@ class RemoteChatRoutes:
             if req.workflow_mode is not None
             else None
         )
+        reserved_mode = _reserved_workflow_mode_name(req.mode)
+        if reserved_mode:
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_session_run_mode",
+                "mode selects an executor mode profile; use workflow_mode for chat/taskflow routing",
+            )
+            return
         has_provider = bool(str(req.provider_id or "").strip())
         has_model = bool(str(req.model_id or "").strip())
         if has_provider != has_model:
@@ -518,6 +845,7 @@ class RemoteChatRoutes:
             req.peer_token,
             req.session_run_id,
             req.branch_binding_id,
+            include_inactive_binding=True,
         )
         if control is None:
             return
@@ -650,9 +978,8 @@ class RemoteChatRoutes:
             agent_run = self.service.runtime_control_plane.get_agent_run(
                 scope.agent_run_id
             )
-            return str(agent_run.status.value), bool(
-                getattr(agent_run, "is_terminal", False)
-            )
+            status = str(agent_run.status.value)
+            return status, status.strip().lower() in {"failed", "cancelled"}
 
         self._send_sse_headers()
         cursor = int(req.cursor)
@@ -727,16 +1054,31 @@ class RemoteChatRoutes:
             )
             return
 
-        control = self._resolve_session_run_control(
+        resolution = self._resolve_session_run_control_resolution(
             req.peer_token,
             req.session_run_id,
-            req.branch_binding_id,
+            SessionRunControlPolicy(
+                branch_binding_id=req.branch_binding_id,
+                require_branch_binding_id=True,
+                include_inactive_binding=True,
+            ),
         )
-        if control is None:
+        if resolution is None:
             return
-        _peer_id, session, binding, scope = control
+        session = resolution.session
+        binding = resolution.binding
+        scope = resolution.scope
+        if session is None or binding is None or scope is None:
+            self._send_error(HTTPStatus.CONFLICT, "session_run_scope_proof_invalid")
+            return
         self.service._project_agent_run_events_to_session_run(session, binding)
-        self._send_session_run_status_response(session, binding, req.cursor, scope)
+        self._send_session_run_status_response(
+            session,
+            binding,
+            req.cursor,
+            scope,
+            projection_state=resolution.projection_state,
+        )
 
     def _handle_session_run_branch_select(self) -> None:
         payload = self._read_json()
@@ -753,6 +1095,7 @@ class RemoteChatRoutes:
             req.peer_token,
             req.session_run_id,
             req.branch_binding_id,
+            include_inactive_binding=True,
         )
         if control is None:
             return
@@ -814,7 +1157,10 @@ class RemoteChatRoutes:
             )
             selected_activation_id = str(selected_agent_run.current_activation_id or "")
             selected_runtime_status = str(selected_agent_run.status.value)
-            selected_terminal = bool(getattr(selected_agent_run, "is_terminal", False))
+            selected_terminal = selected_runtime_status.strip().lower() in {
+                "failed",
+                "cancelled",
+            }
         except Exception:
             selected_terminal = None
         selected_writer.apply_selected_runtime_scope(
@@ -884,6 +1230,59 @@ class RemoteChatRoutes:
             ).to_dict(),
         )
 
+    def _handle_session_run_stop(self) -> None:
+        payload = self._read_json()
+        try:
+            req = SessionRunStopRequest.from_dict(payload)
+        except Exception as exc:
+            self._send_invalid_session_run_request_error(
+                exc,
+                "invalid_session_run_stop_request",
+            )
+            return
+
+        control = self._resolve_session_run_control(
+            req.peer_token,
+            req.session_run_id,
+            req.branch_binding_id,
+        )
+        if control is None:
+            return
+        _peer_id, session, binding, scope = control
+        writer = session.scoped_writer(
+            branch_binding_id=scope.branch_binding_id,
+            agent_run_id=scope.agent_run_id,
+        )
+
+        reason = req.reason or "user_stop"
+        writer.append_event(
+            "session_run_stop_requested",
+            {"reason": reason, "branch_binding_id": binding.branch_binding_id},
+        )
+        ok = self.service.runtime_control_plane.stop_agent_run_activation(
+            binding.agent_run_id,
+            reason=reason,
+        )
+        if ok:
+            writer.append_event(
+                "session_run_stopped",
+                {"reason": reason, "branch_binding_id": binding.branch_binding_id},
+            )
+            if getattr(binding, "selected", False):
+                writer.mark_done()
+        self._send_json(
+            HTTPStatus.OK,
+            SessionRunStopResponse(
+                ok=ok,
+                session_run_id=session.session_run_id,
+                agent_run_id=scope.agent_run_id,
+                branch_binding_id=scope.branch_binding_id,
+                scope_id=scope.scope_id,
+                selected=scope.selected,
+                error=None if ok else "session_run_not_stoppable",
+            ).to_dict(),
+        )
+
     def _handle_session_run_recover(self) -> None:
         payload = self._read_json()
         try:
@@ -899,6 +1298,7 @@ class RemoteChatRoutes:
             req.peer_token,
             req.session_run_id,
             req.branch_binding_id,
+            include_inactive_binding=True,
         )
         if control is None:
             return
@@ -916,7 +1316,7 @@ class RemoteChatRoutes:
                 self._send_error(HTTPStatus.NOT_FOUND, "agent_run_not_found")
                 return
             selected_status = str(selected_agent_run.status.value).strip().lower()
-            selected_terminal = bool(getattr(selected_agent_run, "is_terminal", False))
+            selected_terminal = selected_status in {"failed", "cancelled"}
             if (
                 not selected_terminal
                 and selected_status in {"queued", "waiting", "dispatched", "running"}
@@ -997,6 +1397,7 @@ class RemoteChatRoutes:
             req.peer_token,
             req.session_run_id,
             req.branch_binding_id,
+            include_inactive_binding=True,
         )
         if control is None:
             return
@@ -1050,6 +1451,7 @@ class RemoteChatRoutes:
             req.peer_token,
             req.session_run_id,
             req.branch_binding_id,
+            include_inactive_binding=True,
         )
         if control is None:
             return

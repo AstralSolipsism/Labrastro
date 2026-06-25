@@ -527,6 +527,7 @@ class MemorySessionStore:
         session_run_seq: int | None = None,
         source: str = "remote_session_run",
         replayable: bool = True,
+        fingerprint: str | None = None,
     ) -> int:
         events = getattr(self, "trace_events", None)
         if events is None:
@@ -555,6 +556,17 @@ class MemorySessionStore:
             session_event_seq=seq,
             session_run_id=session_run_id,
             session_run_seq=session_run_seq,
+        )
+        self.sessions.setdefault(
+            session_id,
+            Session(
+                id=session_id,
+                model="",
+                saved_at="memory",
+                fingerprint=fingerprint or "local",
+                messages=[],
+                runtime_state=SessionRuntimeState(model=""),
+            ),
         )
         return seq
 
@@ -936,12 +948,127 @@ def test_server_owned_session_run_executes_without_local_peer_worker() -> None:
             and event["payload"].get("response") == "smoke-ok"
             for event in events
         )
-        run = runner._relay_http_service.runtime_control_plane.get_agent_run(
-            start_body["agent_run_id"]
-        )
+        control = runner._relay_http_service.runtime_control_plane
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            run = control.get_agent_run(start_body["agent_run_id"])
+            if run.status.value == "completed":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("server-owned AgentRun did not complete")
         assert run.status.value == "completed"
         assert run.execution_location.value == "remote_server"
         assert run.metadata["worker_kind"] == "server_worker"
+        binding = control.find_session_run_binding(
+            session_run_id=start_body["session_run_id"],
+            branch_binding_id=start_body["branch_binding_id"],
+            selected_only=False,
+            include_inactive=True,
+        )
+        assert binding is not None
+        assert binding.status.value == "active"
+        assert run.mainline_state.value == "continuable"
+        assert run.activation_state.value == "completed"
+        status, status_body = _json_request(
+            "POST",
+            f"{runner._relay_http_service.base_url}/remote/session-runs/status",
+            {
+                "peer_token": peer_token,
+                "session_run_id": start_body["session_run_id"],
+                "branch_binding_id": start_body["branch_binding_id"],
+                "cursor": 0,
+            },
+        )
+        assert status == 200
+        assert status_body["mainlineState"] == "settled"
+        assert status_body["agentRunState"] == "continuable"
+        assert status_body["activationState"] == "completed"
+        assert status_body["bindingStatus"] == "active"
+        assert status_body["working"] is False
+        assert status_body["continuable"] is True
+        assert status_body["eventStreamAllowed"] is False
+    finally:
+        runner.cleanup(ctx.agent)
+
+
+def test_server_owned_session_run_persists_history_without_status_polling() -> None:
+    relay_bind = f"127.0.0.1:{_free_port()}"
+    session_store = MemorySessionStore()
+
+    def chat_behavior(agent, prompt: str) -> str:
+        for handler in list(agent._event_handlers):
+            handler(AgentEvent.session_run_end("durable-ok"))
+        return "durable-ok"
+
+    runner = _build_runner_with_fake_agent(
+        relay_bind,
+        chat_behavior=chat_behavior,
+        session_store=session_store,
+    )
+    ctx = runner.initialize()
+    try:
+        assert runner._relay_server is not None
+        assert runner._relay_http_service is not None
+        _peer_id, peer_token = _register_peer(
+            runner._relay_http_service.base_url,
+            runner._relay_server.issue_bootstrap_token(ttl_sec=60),
+            "/tmp/server-owned-history-client",
+            features=["shell"],
+        )
+
+        status, start_body = _json_request(
+            "POST",
+            f"{runner._relay_http_service.base_url}/remote/session-runs/start",
+            {
+                "peer_token": peer_token,
+                "prompt": "server owned durable history",
+                "session_hint": "server-owned-history",
+                "client_request_id": "server-owned-history-start",
+            },
+        )
+
+        assert status == 200
+        control = runner._relay_http_service.runtime_control_plane
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            run = control.get_agent_run(start_body["agent_run_id"])
+            if run.status.value == "completed":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("server-owned AgentRun did not complete")
+        binding = control.find_session_run_binding(
+            session_run_id=start_body["session_run_id"],
+            branch_binding_id=start_body["branch_binding_id"],
+            selected_only=False,
+            include_inactive=True,
+        )
+        assert binding is not None
+        assert binding.status.value == "active"
+
+        events = session_store.list_trace_events("server-owned-history")
+        event_types = [event["type"] for event in events]
+        assert event_types[0] == "session_run_start"
+        assert "session_run_end" in event_types
+        assert any(
+            event["type"] == "session_run_start"
+            and event["payload"].get("prompt") == "server owned durable history"
+            for event in events
+        )
+        assert any(
+            event["type"] == "session_run_end"
+            and event["payload"].get("response") == "durable-ok"
+            for event in events
+        )
+
+        document = session_store.load_document("server-owned-history")
+        assert document is not None
+        assert document["turns"][0]["userMessage"]["text"] == "server owned durable history"
+        assert "durable-ok" in str(document["turns"][0]["assistantMessages"])
+        assert session_store.list(limit=10, fingerprint=None)[0].id == "server-owned-history"
+        expected_fingerprint = "remote:test-peer:/tmp/server-owned-history-client"
+        assert session_store.list(limit=10, fingerprint=expected_fingerprint)[0].id == "server-owned-history"
     finally:
         runner.cleanup(ctx.agent)
 
