@@ -10,6 +10,7 @@ import time
 import pytest
 
 from reuleauxcoder.domain.agent_runtime.models import (
+    AgentRunActivationState,
     AgentRunActivationInputKind,
     AgentRun,
     AgentCallGrant,
@@ -24,6 +25,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentThreadBinding,
     AgentThreadBindingLifetime,
     AgentThreadBindingStatus,
+    AgentRunMainlineState,
+    SessionRunBindingStatus,
     ExecutionLocation,
     ExecutorType,
     ModelRequestOrigin,
@@ -582,6 +585,247 @@ def test_session_run_binding_selects_single_agent_run_mainline() -> None:
     ).source_agent_run_id == source.id
 
 
+@pytest.mark.parametrize(
+    "closed_status",
+    ["failed", "cancelled"],
+)
+def test_session_run_binding_closes_when_bound_agent_run_closed(
+    closed_status: str,
+) -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="main",
+            owner_session_run_id="session-run-terminal",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id=f"agent-run-{closed_status}",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-terminal",
+        session_id="chat-session-terminal",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    if closed_status == "failed":
+        control.fail_agent_run(run.id, error="boom")
+    elif closed_status == "cancelled":
+        assert control.cancel_agent_run(run.id, reason="user_stop") is True
+
+    assert (
+        control.find_session_run_binding(
+            session_run_id="session-run-terminal",
+            branch_binding_id="main",
+            selected_only=False,
+        )
+        is None
+    )
+    closed = control.find_session_run_binding(
+        session_run_id="session-run-terminal",
+        branch_binding_id="main",
+        selected_only=False,
+        include_inactive=True,
+    )
+    assert closed is not None
+    assert closed.id == binding.id
+    assert closed.status == SessionRunBindingStatus.CLOSED
+    assert closed.metadata["status_reason"] == f"agent_run_closed:{closed_status}"
+    assert control.list_session_run_bindings(
+        session_run_id="session-run-terminal",
+        status=SessionRunBindingStatus.ACTIVE,
+    ) == []
+    with pytest.raises(ValueError, match="not continuable"):
+        control.continue_agent_run(
+            run.id,
+            input_kind=AgentRunActivationInputKind.USER_REQUEST,
+            input_payload={
+                "source": "session_run_continue",
+                "session_run_id": binding.session_run_id,
+                "branch_binding_id": binding.branch_binding_id,
+            },
+            resume_session=True,
+            prompt="ordinary next turn",
+        )
+    events = [event.to_dict() for event in control.list_events(run.id)]
+    closed_events = [
+        event for event in events if event["type"] == "session_run_binding_closed"
+    ]
+    assert closed_events
+    assert closed_events[-1]["payload"]["binding_id"] == binding.id
+
+
+@pytest.mark.parametrize("settled_status", ["completed", "blocked"])
+def test_session_run_binding_stays_active_when_activation_settled(
+    settled_status: str,
+) -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="main",
+            owner_session_run_id="session-run-settled",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id=f"agent-run-settled-{settled_status}",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-settled",
+        session_id="chat-session-settled",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    completed = control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status=settled_status, output="done"),
+        activation_id=_current_activation_id(control, run.id),
+    )
+
+    expected_mainline_state = (
+        AgentRunMainlineState.CONTINUABLE
+        if settled_status == "completed"
+        else AgentRunMainlineState.BLOCKED
+    )
+    expected_activation_state = (
+        AgentRunActivationState.COMPLETED
+        if settled_status == "completed"
+        else AgentRunActivationState.BLOCKED
+    )
+    assert completed.mainline_state == expected_mainline_state
+    assert completed.activation_state == expected_activation_state
+
+    active = control.find_session_run_binding(
+        session_run_id="session-run-settled",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+
+    assert active is not None
+    assert active.id == binding.id
+    assert active.status == SessionRunBindingStatus.ACTIVE
+    assert [
+        item.id
+        for item in control.list_session_run_bindings(
+            session_run_id="session-run-settled",
+            status=SessionRunBindingStatus.ACTIVE,
+        )
+    ] == [binding.id]
+    events = [event.to_dict() for event in control.list_events(run.id)]
+    assert not [
+        event for event in events if event["type"] == "session_run_binding_closed"
+    ]
+
+
+def test_stop_agent_run_activation_settles_mainline_without_closing_binding() -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="main",
+            owner_session_run_id="session-run-stop",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-stop",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-stop",
+        session_id="chat-session-stop",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    assert control.stop_agent_run_activation(run.id, reason="user_stop") is True
+    stopped = control.get_agent_run(run.id)
+
+    assert stopped.status == AgentRunStatus.COMPLETED
+    assert stopped.mainline_state == AgentRunMainlineState.CONTINUABLE
+    assert stopped.activation_state == AgentRunActivationState.CANCELLED
+    assert stopped.cancel_reason == "user_stop"
+    stopped_activation_id = stopped.current_activation_id
+    active = control.find_session_run_binding(
+        session_run_id="session-run-stop",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+    assert active is not None
+    assert active.id == binding.id
+    assert active.status == SessionRunBindingStatus.ACTIVE
+
+    continued = control.continue_agent_run(
+        run.id,
+        input_kind=AgentRunActivationInputKind.USER_REQUEST,
+        input_payload={
+            "source": "session_run_continue",
+            "session_run_id": binding.session_run_id,
+            "branch_binding_id": binding.branch_binding_id,
+        },
+        resume_session=True,
+        prompt="ordinary next turn",
+    )
+    assert continued.id == run.id
+    assert continued.current_activation_id != stopped_activation_id
+    assert continued.status == AgentRunStatus.QUEUED
+
+
+def test_session_run_binding_active_lookup_keeps_settled_continuable_binding() -> None:
+    control = AgentRunControlPlane()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="main",
+            owner_session_run_id="session-run-stale",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-stale-terminal",
+    )
+    control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status="completed", output="done"),
+        activation_id=_current_activation_id(control, run.id),
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-stale",
+        session_id="chat-session-stale",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    active = control.find_session_run_binding(
+        session_run_id="session-run-stale",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+
+    assert active is not None
+    assert active.id == binding.id
+    assert active.status == SessionRunBindingStatus.ACTIVE
+    assert [
+        item.id
+        for item in control.list_session_run_bindings(
+            session_run_id="session-run-stale",
+            status=SessionRunBindingStatus.ACTIVE,
+        )
+    ] == [binding.id]
+
+
 def test_session_run_binding_requires_explicit_branch_binding_id() -> None:
     control = AgentRunControlPlane()
     run = control.submit_agent_run(
@@ -702,6 +946,91 @@ def test_select_session_run_branch_switches_input_target_without_stopping_runs()
     assert control.get_agent_run(branch.id).status == AgentRunStatus.QUEUED
 
 
+def test_select_session_run_branch_can_select_closed_history_branch_without_reactivating() -> None:
+    control = AgentRunControlPlane()
+    source = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="first",
+            owner_session_run_id="session-run-history-select",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-history-main",
+    )
+    branch = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="chat",
+            prompt="branch",
+            owner_session_run_id="session-run-history-select",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-history-branch",
+    )
+    control.create_session_run_binding(
+        session_run_id="session-run-history-select",
+        session_id="chat-session-history-select",
+        peer_id="peer-1",
+        agent_run_id=source.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=source.id,
+    )
+    branch_binding = control.create_session_run_binding(
+        session_run_id="session-run-history-select",
+        session_id="chat-session-history-select",
+        peer_id="peer-1",
+        agent_run_id=branch.id,
+        branch_binding_id="branch-closed",
+        selected=False,
+        parent_branch_binding_id="main",
+        base_session_item_id="msg-1",
+        source_agent_run_id=source.id,
+        target_agent_run_id=branch.id,
+    )
+    control.complete_agent_run_activation(
+        branch.id,
+        ExecutorRunResult(task_id=branch.id, status="cancelled", output="stopped"),
+        activation_id=_current_activation_id(control, branch.id),
+    )
+    assert (
+        control.find_session_run_binding(
+            session_run_id="session-run-history-select",
+            branch_binding_id="branch-closed",
+            selected_only=False,
+        )
+        is None
+    )
+
+    selected = control.select_session_run_branch(
+        session_run_id="session-run-history-select",
+        branch_binding_id="branch-closed",
+        peer_id="peer-1",
+    )
+
+    assert selected.id == branch_binding.id
+    assert selected.selected is True
+    assert selected.status == SessionRunBindingStatus.CLOSED
+    assert (
+        control.find_session_run_binding(
+            session_run_id="session-run-history-select",
+            branch_binding_id="branch-closed",
+            selected_only=False,
+        )
+        is None
+    )
+    closed = control.find_session_run_binding(
+        session_run_id="session-run-history-select",
+        branch_binding_id="branch-closed",
+        selected_only=False,
+        include_inactive=True,
+    )
+    assert closed is not None
+    assert closed.selected is True
+    assert closed.status == SessionRunBindingStatus.CLOSED
+
+
 def test_session_run_continue_reuses_bound_agent_run_mainline() -> None:
     control = AgentRunControlPlane()
     run = control.submit_agent_run(
@@ -724,11 +1053,13 @@ def test_session_run_continue_reuses_bound_agent_run_mainline() -> None:
         target_agent_run_id=run.id,
     )
     first_activation_id = _current_activation_id(control, run.id)
-    control.complete_agent_run_activation(
+    completed = control.complete_agent_run_activation(
         run.id,
         ExecutorRunResult(task_id=run.id, status="completed", output="first done"),
         activation_id=first_activation_id,
     )
+    assert completed.mainline_state == AgentRunMainlineState.CONTINUABLE
+    assert completed.activation_state == AgentRunActivationState.COMPLETED
 
     continued = control.continue_agent_run(
         binding.agent_run_id,
@@ -744,6 +1075,17 @@ def test_session_run_continue_reuses_bound_agent_run_mainline() -> None:
 
     assert continued.id == run.id
     assert continued.current_activation_id == "agent-run-main:activation:2"
+    assert continued.mainline_state == AgentRunMainlineState.EXECUTING
+    assert continued.activation_state == AgentRunActivationState.QUEUED
+    active_binding = control.find_session_run_binding(
+        session_run_id="session-run-1",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+    assert active_binding is not None
+    assert active_binding.id == binding.id
+    assert active_binding.status == SessionRunBindingStatus.ACTIVE
+    assert active_binding.metadata["status_reason"] == "session_run_continue"
     assert [item["id"] for item in control.list_agent_runs()] == [run.id]
 
 
@@ -4387,6 +4729,64 @@ def test_claim_owner_validates_session_event_and_complete() -> None:
     ][0]
     assert activation_completed.payload["activation_id"] == claim.activation_id
     assert activation_completed.payload["activation"]["status"] == "completed"
+
+
+def test_claimed_executor_process_event_is_visible_before_terminal_completion() -> None:
+    control = AgentRunControlPlane()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="coder",
+            prompt="run",
+            executor=ExecutorType.REULEAUXCODER,
+            execution_location=ExecutionLocation.REMOTE_SERVER,
+        ),
+        task_id="task-live-event",
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="server-session-run-worker",
+        worker_kind="server_worker",
+        executors=["reuleauxcoder"],
+        peer_id="server",
+        peer_features=["agent_runs.remote_server"],
+    )
+
+    assert claim is not None
+    ok, reason = control.append_executor_event(
+        task.id,
+        ExecutorEvent.status("running", task_id=task.id),
+        request_id=claim.request_id,
+        activation_id=claim.activation_id,
+        worker_id=claim.worker_id,
+        peer_id="server",
+    )
+    assert ok is True
+    assert reason == ""
+    ok, reason = control.append_executor_event(
+        task.id,
+        ExecutorEvent.session_run_event("reasoning_delta", {"content": "live"}),
+        request_id=claim.request_id,
+        activation_id=claim.activation_id,
+        worker_id=claim.worker_id,
+        peer_id="server",
+    )
+
+    assert ok is True
+    assert reason == ""
+    events = control.list_events(task.id)
+    event_types = [event.type for event in events]
+    assert "session_run_event" in event_types
+    assert not {"activation_completed", "completed", "failed", "cancelled"} & set(
+        event_types
+    )
+    live_event = [
+        event for event in events if event.type == "session_run_event"
+    ][0]
+    assert live_event.payload["activation_id"] == claim.activation_id
+    assert live_event.payload["data"] == {
+        "event_type": "reasoning_delta",
+        "payload": {"content": "live"},
+    }
+    assert control.get_agent_run(task.id).status == AgentRunStatus.RUNNING
 
 
 def test_blocked_complete_and_retry_terminal_task() -> None:

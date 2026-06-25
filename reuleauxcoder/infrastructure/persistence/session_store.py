@@ -284,6 +284,7 @@ class SessionStore:
         session_run_seq: int | None = None,
         source: str = "remote_session_run",
         replayable: bool = True,
+        fingerprint: str | None = None,
     ) -> int:
         """Append a replayable session trace event to the unified session record."""
         with self._lock:
@@ -309,6 +310,7 @@ class SessionStore:
                     id=session_id,
                     model="",
                     saved_at=datetime.now().isoformat(timespec="microseconds"),
+                    fingerprint=fingerprint or DEFAULT_SESSION_FINGERPRINT,
                     messages=[],
                 )
                 events = []

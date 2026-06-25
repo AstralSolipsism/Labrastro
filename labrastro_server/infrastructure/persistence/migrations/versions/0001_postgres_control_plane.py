@@ -21,6 +21,8 @@ def upgrade() -> None:
             source TEXT NOT NULL DEFAULT 'manual',
             trigger_mode TEXT NOT NULL,
             status TEXT NOT NULL,
+            mainline_state TEXT NOT NULL DEFAULT 'executing',
+            activation_state TEXT NOT NULL DEFAULT 'queued',
             waiting_reason TEXT,
             resume_policy TEXT,
             runtime_profile_id TEXT,

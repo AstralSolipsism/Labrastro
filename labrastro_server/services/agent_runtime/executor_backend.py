@@ -24,6 +24,8 @@ from reuleauxcoder.domain.agent.events import AgentEventType
 from reuleauxcoder.domain.agent.runtime_budget import normalize_runtime_budget
 from reuleauxcoder.domain.memory.runtime import bind_memory_scope_to_agent
 
+ExecutorEventSink = Callable[["ExecutorEvent"], None]
+
 
 class ExecutorEventType(str, Enum):
     """Normalized executor output event types."""
@@ -85,6 +87,11 @@ class ExecutorRunRequest:
     executor_session_id: str | None = None
     budget: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    event_sink: ExecutorEventSink | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         self.executor = _coerce_executor(self.executor)
@@ -454,7 +461,15 @@ class ReuleauxCoderExecutorBackend:
         return True
 
     def _run_agent(self, request: ExecutorRunRequest, agent: Any) -> ExecutorRunResult:
-        events = [ExecutorEvent.status("running", task_id=request.task_id)]
+        events: list[ExecutorEvent] = []
+
+        def record(event: ExecutorEvent) -> ExecutorEvent:
+            events.append(event)
+            if request.event_sink is not None:
+                request.event_sink(event)
+            return event
+
+        record(ExecutorEvent.status("running", task_id=request.task_id))
         runtime_artifacts: list[dict[str, Any]] = []
         capture_state: dict[str, Any] = {
             "assistant_chunks": [],
@@ -471,7 +486,7 @@ class ReuleauxCoderExecutorBackend:
         }
         lifecycle_handler = self._attach_lifecycle_event_capture(
             agent,
-            events,
+            record,
             runtime_artifacts,
             capture_state,
         )
@@ -479,8 +494,8 @@ class ReuleauxCoderExecutorBackend:
             output = self._agent_chat(agent, request.prompt)
         except Exception as exc:  # pragma: no cover - defensive adapter boundary
             message = str(exc)
-            events.append(ExecutorEvent.error(message, **self._exception_payload(exc)))
-            events.append(ExecutorEvent.status("failed", task_id=request.task_id))
+            record(ExecutorEvent.error(message, **self._exception_payload(exc)))
+            record(ExecutorEvent.status("failed", task_id=request.task_id))
             return ExecutorRunResult(
                 task_id=request.task_id,
                 status="failed",
@@ -499,10 +514,10 @@ class ReuleauxCoderExecutorBackend:
             events,
             output,
         )
-        self._append_captured_session_run_summaries(events, capture_state)
+        self._append_captured_session_run_summaries(record, capture_state)
         if output and not bool(capture_state.get("explicit_rendered_output")):
-            events.append(ExecutorEvent.text_event(output))
-        events.append(ExecutorEvent.status(result_status, task_id=request.task_id))
+            record(ExecutorEvent.text_event(output))
+        record(ExecutorEvent.status(result_status, task_id=request.task_id))
         return ExecutorRunResult(
             task_id=request.task_id,
             status=result_status,
@@ -581,7 +596,7 @@ class ReuleauxCoderExecutorBackend:
 
     @staticmethod
     def _append_captured_session_run_summaries(
-        events: list[ExecutorEvent],
+        record: Callable[[ExecutorEvent], ExecutorEvent],
         capture_state: dict[str, Any],
     ) -> None:
         reasoning = "".join(
@@ -595,14 +610,14 @@ class ReuleauxCoderExecutorBackend:
             if chunk is not None
         )
         if reasoning:
-            events.append(
+            record(
                 ExecutorEvent.session_run_event(
                     "reasoning_message",
                     {"content": reasoning},
                 )
             )
         if assistant:
-            events.append(
+            record(
                 ExecutorEvent.session_run_event(
                     "assistant_message",
                     {"content": assistant},
@@ -615,7 +630,7 @@ class ReuleauxCoderExecutorBackend:
             or capture_state.get("patch_syntax_error_codes")
             or capture_state.get("patch_semantic_error_codes")
         ):
-            events.append(
+            record(
                 ExecutorEvent.session_run_event(
                     "stream_observability",
                     {
@@ -664,7 +679,7 @@ class ReuleauxCoderExecutorBackend:
     @staticmethod
     def _attach_lifecycle_event_capture(
         agent: Any,
-        events: list[ExecutorEvent],
+        record: Callable[[ExecutorEvent], ExecutorEvent],
         runtime_artifacts: list[dict[str, Any]],
         capture_state: dict[str, Any],
     ) -> Callable[[Any], None] | None:
@@ -685,7 +700,7 @@ class ReuleauxCoderExecutorBackend:
                     else {}
                 )
                 if session_event_type:
-                    events.append(
+                    record(
                         ExecutorEvent.session_run_event(
                             session_event_type,
                             session_payload,
@@ -707,7 +722,7 @@ class ReuleauxCoderExecutorBackend:
                 for artifact in getattr(event, "runtime_artifacts", []) or []:
                     if isinstance(artifact, dict):
                         runtime_artifacts.append(dict(artifact))
-                events.append(
+                record(
                     ExecutorEvent(
                         type=ExecutorEventType.LIFECYCLE_HOOK,
                         data=payload,
@@ -716,12 +731,12 @@ class ReuleauxCoderExecutorBackend:
                 return
             if event_type_value == AgentEventType.SESSION_RUN_START.value:
                 prompt = str(payload.get("user_input") or payload.get("prompt") or "")
-                events.append(ExecutorEvent.session_run_start(prompt))
+                record(ExecutorEvent.session_run_start(prompt))
                 return
             if event_type_value == AgentEventType.SESSION_RUN_END.value:
                 response = str(payload.get("response") or "")
                 response_rendered = payload.get("response_rendered", True)
-                events.append(
+                record(
                     ExecutorEvent.session_run_end(
                         response,
                         response_rendered=bool(response_rendered),
@@ -749,7 +764,7 @@ class ReuleauxCoderExecutorBackend:
                         getattr(event, "timestamp", None) or time.time()
                     )
                     capture_state["explicit_rendered_output"] = True
-                    events.append(
+                    record(
                         ExecutorEvent.session_run_event(
                             "assistant_delta",
                             {"content": token},
@@ -766,7 +781,7 @@ class ReuleauxCoderExecutorBackend:
                     capture_state["last_reasoning_chunk_at"] = float(
                         getattr(event, "timestamp", None) or time.time()
                     )
-                    events.append(
+                    record(
                         ExecutorEvent.session_run_event(
                             "reasoning_delta",
                             {"content": token},
@@ -780,12 +795,12 @@ class ReuleauxCoderExecutorBackend:
                 capture_state["last_tool_delta_at"] = float(
                     getattr(event, "timestamp", None) or time.time()
                 )
-                events.append(
+                record(
                     ExecutorEvent.session_run_event("tool_call_delta", payload)
                 )
                 return
             if event_type_value == AgentEventType.TOOL_CALL_START.value:
-                events.append(
+                record(
                     ExecutorEvent.tool_use(
                         tool_name=str(getattr(event, "tool_name", "") or ""),
                         tool_call_id=getattr(event, "tool_call_id", None),
@@ -799,7 +814,7 @@ class ReuleauxCoderExecutorBackend:
                 )
                 return
             if event_type_value == AgentEventType.TOOL_CALL_END.value:
-                events.append(
+                record(
                     ExecutorEvent.tool_result(
                         tool_name=str(getattr(event, "tool_name", "") or ""),
                         tool_call_id=getattr(event, "tool_call_id", None),
@@ -818,10 +833,10 @@ class ReuleauxCoderExecutorBackend:
                 )
                 return
             if event_type_value == AgentEventType.USAGE_UPDATE.value:
-                events.append(ExecutorEvent.usage(**payload))
+                record(ExecutorEvent.usage(**payload))
                 return
             if event_type_value == AgentEventType.AGENT_RELATION_COMPLETED.value:
-                events.append(
+                record(
                     ExecutorEvent(
                         type=ExecutorEventType.AGENT_RELATION_COMPLETED,
                         data=payload,
@@ -830,7 +845,7 @@ class ReuleauxCoderExecutorBackend:
                 return
             if event_type_value == AgentEventType.ERROR.value:
                 message = str(getattr(event, "error_message", None) or payload.get("message") or "")
-                events.append(
+                record(
                     ExecutorEvent.session_run_event(
                         "error",
                         {
@@ -888,7 +903,7 @@ class ReuleauxCoderExecutorBackend:
                     AgentEventType.DRAFT_INTERRUPTED_RECOVERABLE.value,
                 }:
                     capture_state["explicit_rendered_output"] = True
-                events.append(ExecutorEvent.session_run_event(event_type_value, payload))
+                record(ExecutorEvent.session_run_event(event_type_value, payload))
 
         add_event_handler(_on_agent_event)
         return _on_agent_event
@@ -996,6 +1011,7 @@ __all__ = [
     "ExecutionLocation",
     "ExecutorBackendRegistry",
     "ExecutorEvent",
+    "ExecutorEventSink",
     "ExecutorEventType",
     "ExecutorRunRequest",
     "ExecutorRunResult",

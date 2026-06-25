@@ -24,12 +24,15 @@ from labrastro_server.services.agent_runtime.session_projection import (
 )
 from reuleauxcoder.domain.agent_runtime.models import (
     AgentCallGrant,
+    AgentRunActivationState,
     AgentRunActivationInputKind,
     AgentRunFeedbackKind,
     AgentRunFeedbackSource,
+    AgentRunMainlineState,
     AgentRunRelation,
     AgentRunRelationType,
     AgentRunStatus,
+    SessionRunBindingStatus,
 )
 
 
@@ -185,11 +188,14 @@ def test_postgres_session_run_binding_selects_single_mainline_and_continues() ->
     assert selected.agent_run_id == run.id
     assert selected.peer_id == "peer-1"
 
-    control.complete_agent_run_activation(
+    completed = control.complete_agent_run_activation(
         run.id,
         ExecutorRunResult(task_id=run.id, status="completed", output="done"),
         activation_id=str(run.current_activation_id or ""),
     )
+    assert completed.mainline_state == AgentRunMainlineState.CONTINUABLE
+    assert completed.activation_state == AgentRunActivationState.COMPLETED
+
     continued = control.continue_agent_run(
         selected.agent_run_id,
         input_kind=AgentRunActivationInputKind.USER_REQUEST,
@@ -204,6 +210,174 @@ def test_postgres_session_run_binding_selects_single_mainline_and_continues() ->
 
     assert continued.id == run.id
     assert continued.current_activation_id == "agent-run-main:activation:2"
+    assert continued.mainline_state == AgentRunMainlineState.EXECUTING
+    assert continued.activation_state == AgentRunActivationState.QUEUED
+    active_binding = control.find_session_run_binding(
+        session_run_id="session-run-1",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+    assert active_binding is not None
+    assert active_binding.id == binding.id
+    assert active_binding.status == SessionRunBindingStatus.ACTIVE
+    assert active_binding.metadata["status_reason"] == "session_run_continue"
+
+
+def test_postgres_session_run_binding_stays_active_when_activation_completed() -> None:
+    control = _control()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="first",
+            owner_session_run_id="session-run-terminal",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-terminal",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-terminal",
+        session_id="chat-session-terminal",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    completed = control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status="completed", output="done"),
+        activation_id=str(run.current_activation_id or ""),
+    )
+    assert completed.mainline_state == AgentRunMainlineState.CONTINUABLE
+    assert completed.activation_state == AgentRunActivationState.COMPLETED
+
+    active = control.find_session_run_binding(
+        session_run_id="session-run-terminal",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+
+    assert active is not None
+    assert active.id == binding.id
+    assert active.status == SessionRunBindingStatus.ACTIVE
+    assert [
+        item.id
+        for item in control.list_session_run_bindings(
+            session_run_id="session-run-terminal",
+            status=SessionRunBindingStatus.ACTIVE,
+        )
+    ] == [binding.id]
+
+
+def test_postgres_session_run_binding_closes_when_bound_agent_run_cancelled() -> None:
+    control = _control()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="first",
+            owner_session_run_id="session-run-cancelled",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-cancelled",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-cancelled",
+        session_id="chat-session-cancelled",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status="cancelled", output="stop"),
+        activation_id=str(run.current_activation_id or ""),
+    )
+
+    assert (
+        control.find_session_run_binding(
+            session_run_id="session-run-cancelled",
+            branch_binding_id="main",
+            selected_only=False,
+        )
+        is None
+    )
+    closed = control.find_session_run_binding(
+        session_run_id="session-run-cancelled",
+        branch_binding_id="main",
+        selected_only=False,
+        include_inactive=True,
+    )
+    assert closed is not None
+    assert closed.id == binding.id
+    assert closed.status == SessionRunBindingStatus.CLOSED
+    assert closed.metadata["status_reason"] == "agent_run_closed:cancelled"
+    assert control.list_session_run_bindings(
+        session_run_id="session-run-cancelled",
+        status=SessionRunBindingStatus.ACTIVE,
+    ) == []
+    with pytest.raises(ValueError, match="not continuable"):
+        control.continue_agent_run(
+            run.id,
+            input_kind=AgentRunActivationInputKind.USER_REQUEST,
+            input_payload={
+                "source": "session_run_continue",
+                "session_run_id": binding.session_run_id,
+                "branch_binding_id": binding.branch_binding_id,
+            },
+            resume_session=True,
+            prompt="ordinary next turn",
+        )
+
+
+def test_postgres_session_run_binding_active_lookup_keeps_settled_continuable_binding() -> None:
+    control = _control()
+    run = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="first",
+            owner_session_run_id="session-run-stale",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-stale",
+    )
+    control.complete_agent_run_activation(
+        run.id,
+        ExecutorRunResult(task_id=run.id, status="completed", output="done"),
+        activation_id=str(run.current_activation_id or ""),
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-stale",
+        session_id="chat-session-stale",
+        peer_id="peer-1",
+        agent_run_id=run.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=run.id,
+    )
+
+    active = control.find_session_run_binding(
+        session_run_id="session-run-stale",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+
+    assert active is not None
+    assert active.id == binding.id
+    assert active.status == SessionRunBindingStatus.ACTIVE
+    assert [
+        item.id
+        for item in control.list_session_run_bindings(
+            session_run_id="session-run-stale",
+            status=SessionRunBindingStatus.ACTIVE,
+        )
+    ] == [binding.id]
 
 
 def test_control_plane_initializes_postgres_store_runtime_snapshot_from_control_config() -> None:
@@ -294,6 +468,56 @@ def test_postgres_runtime_store_claim_complete_and_reload() -> None:
     json.dumps(detail)
     assert detail["session"]["workdir"] == "/tmp/pg-worktree"
     assert detail["claim"]["status"] == "completed"
+
+
+def test_postgres_claimed_completion_keeps_session_run_binding_active() -> None:
+    control = _control()
+    task = control.submit_agent_run(
+        AgentRunRequest(
+            agent_id="pg-agent",
+            prompt="postgres claimed session run",
+            owner_session_run_id="session-run-claimed",
+            source="chat",
+            trigger_mode="interactive_chat",
+        ),
+        task_id="agent-run-claimed",
+    )
+    binding = control.create_session_run_binding(
+        session_run_id="session-run-claimed",
+        session_id="chat-session-claimed",
+        peer_id="peer-claimed",
+        agent_run_id=task.id,
+        branch_binding_id="main",
+        selected=True,
+        target_agent_run_id=task.id,
+    )
+    claim = control.claim_agent_run_activation(
+        worker_id="pg-worker",
+        executors=["fake"],
+        peer_features=["agent_runs.daemon_worktree"],
+    )
+    assert claim is not None
+
+    ok, reason, completed = control.complete_claimed_agent_run_activation(
+        task.id,
+        ExecutorRunResult(task_id=task.id, status="completed", output="done"),
+        request_id=claim.request_id,
+        activation_id=claim.activation_id,
+        worker_id="pg-worker",
+    )
+
+    assert (ok, reason) == (True, "")
+    assert completed is not None
+    assert completed.status == AgentRunStatus.COMPLETED
+    active = control.find_session_run_binding(
+        session_run_id="session-run-claimed",
+        branch_binding_id="main",
+        selected_only=False,
+    )
+
+    assert active is not None
+    assert active.id == binding.id
+    assert active.status == SessionRunBindingStatus.ACTIVE
 
 
 def test_postgres_runtime_store_completion_upserts_executor_session_without_pin() -> None:

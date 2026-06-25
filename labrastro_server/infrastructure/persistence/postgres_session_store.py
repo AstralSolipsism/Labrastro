@@ -202,7 +202,6 @@ class PostgresSessionStore:
             total_completion_tokens=total_completion_tokens,
             runtime_state=effective_runtime,
         )
-        has_history = SessionStore.has_history_content(saved_messages)
         with self.engine.begin() as conn:
             self._lock_session(conn, session.id)
             existing_record = self._load_record(conn, session.id, promote_legacy=True)
@@ -219,6 +218,7 @@ class PostgresSessionStore:
                 transcript=document,
                 events=self._record_events(existing_record),
             )
+            has_history = self._record_has_history_content(session, record)
             self._upsert_session_record(
                 conn,
                 session,
@@ -415,6 +415,7 @@ class PostgresSessionStore:
         session_run_seq: int | None = None,
         source: str = "remote_session_run",
         replayable: bool = True,
+        fingerprint: str | None = None,
     ) -> int:
         with self.engine.begin() as conn:
             self._lock_session(conn, session_id)
@@ -424,16 +425,15 @@ class PostgresSessionStore:
                     id=session_id,
                     model="",
                     saved_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    fingerprint=fingerprint or DEFAULT_SESSION_FINGERPRINT,
                     messages=[],
                 )
                 record = session.to_record(
                     transcript=empty_session_document(session_id),
                     events=[],
                 )
-                has_history = False
             else:
                 session = self._session_from_record(record)
-                has_history = SessionStore.has_history_content(session.messages)
             seq = self._latest_record_event_seq(record) + 1
             event_payload = _jsonb_safe(payload if isinstance(payload, dict) else {})
             event = {
@@ -469,6 +469,7 @@ class PostgresSessionStore:
                 session_run_seq=session_run_seq,
             )
             record = session.to_record(transcript=document, events=events)
+            has_history = self._record_has_history_content(session, record)
             self._upsert_session_record(
                 conn,
                 session,
@@ -661,6 +662,20 @@ class PostgresSessionStore:
         if not isinstance(events, list):
             return []
         return [dict(event) for event in events if isinstance(event, dict)]
+
+    @classmethod
+    def _record_has_history_content(
+        cls,
+        session: Session,
+        record: dict[str, Any],
+    ) -> bool:
+        if SessionStore.has_history_content(session.messages):
+            return True
+        document = cls._record_document(record)
+        if not isinstance(document, dict):
+            return False
+        turns = document.get("turns")
+        return isinstance(turns, list) and bool(turns)
 
     @staticmethod
     def _filter_trace_events(

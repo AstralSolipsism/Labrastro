@@ -548,6 +548,7 @@ class AgentRunStore(
         resume_session: bool = False,
         feedback_id: str | None = None,
         prompt: str | None = None,
+        allow_closed_for_admin_retry: bool = False,
     ) -> AgentRun: ...
 
     def append_agent_run_feedback(
@@ -617,6 +618,15 @@ class AgentRunStore(
 
     def list_session_run_bindings(self, **filters: Any) -> list[Any]: ...
 
+    def set_session_run_binding_status(
+        self,
+        binding_id: str,
+        *,
+        status: Any,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> Any | None: ...
+
     def mark_agent_call_waiting(
         self,
         task_id: str,
@@ -642,5 +652,7 @@ class AgentRunStore(
     def upsert_agent_call_grant(self, grant: Any) -> None: ...
 
     def fail_agent_run(self, task_id: str, *, error: str) -> AgentRun: ...
+
+    def stop_agent_run_activation(self, task_id: str, *, reason: str = "user_stop") -> bool: ...
 
     def cancel_agent_run(self, task_id: str, *, reason: str = "user_cancelled") -> bool: ...

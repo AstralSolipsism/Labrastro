@@ -13,6 +13,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentRun,
     AgentRunStatus,
     TriggerMode,
+    agent_run_activation_state_for_status,
+    agent_run_mainline_state_for_status,
 )
 
 
@@ -77,6 +79,14 @@ class TaskLifecycleState:
 
     def complete_task_lifecycle(self, *, output: str) -> None:
         self.task.status = AgentRunStatus.COMPLETED
+        self.task.mainline_state = agent_run_mainline_state_for_status(
+            self.task.status,
+            self.task.waiting_reason,
+        )
+        self.task.activation_state = agent_run_activation_state_for_status(
+            self.task.status,
+            self.task.waiting_reason,
+        )
         self.task.terminal_result = {"output": output}
         self.issue_status = (
             IssueStatus.IN_REVIEW

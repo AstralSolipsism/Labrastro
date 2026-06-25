@@ -16,6 +16,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AGENT_RUN_METADATA_FORBIDDEN_KEYS,
     AgentRunActivation,
     AgentRunActivationInputKind,
+    AgentRunActivationState,
     AgentRunActivationStatus,
     ActivationSteer,
     ActivationSteerSource,
@@ -29,6 +30,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRelationType,
     AgentRunSource,
     AgentRunResumePolicy,
+    AgentRunMainlineState,
     AgentThreadBinding,
     AgentThreadBindingLifetime,
     AgentThreadBindingStatus,
@@ -48,6 +50,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ModelRequestOrigin,
     WorkerKind,
     WorktreeRole,
+    agent_run_activation_state_for_status,
+    agent_run_mainline_state_for_status,
 )
 from reuleauxcoder.domain.agent.runtime_budget import RUNTIME_BUDGET_FIELDS
 from labrastro_server.services.agent_runtime.executor_backend import (
@@ -227,6 +231,8 @@ def _agent_run_to_dict(task: AgentRun) -> dict[str, Any]:
         "source": task.source.value,
         "trigger_mode": task.trigger_mode.value,
         "status": task.status.value,
+        "mainline_state": task.mainline_state.value,
+        "activation_state": task.activation_state.value,
         "waiting_reason": task.waiting_reason.value if task.waiting_reason else None,
         "resume_policy": task.resume_policy.value if task.resume_policy else None,
         "runtime_profile_id": task.runtime_profile_id,
@@ -249,6 +255,39 @@ def _agent_run_to_dict(task: AgentRun) -> dict[str, Any]:
         "budget": _dict_from(metadata.get("budget")),
         "metadata": public_metadata,
     }
+
+
+def _sync_agent_run_semantic_state(task: AgentRun) -> AgentRun:
+    task.mainline_state = agent_run_mainline_state_for_status(
+        task.status,
+        task.waiting_reason,
+    )
+    task.activation_state = agent_run_activation_state_for_status(
+        task.status,
+        task.waiting_reason,
+    )
+    return task
+
+
+def _set_agent_run_status(
+    task: AgentRun,
+    status: AgentRunStatus,
+    *,
+    waiting_reason: AgentRunWaitingReason | None = None,
+    mainline_state: AgentRunMainlineState | None = None,
+    activation_state: AgentRunActivationState | None = None,
+) -> AgentRun:
+    task.status = status
+    task.waiting_reason = waiting_reason
+    task.mainline_state = mainline_state or agent_run_mainline_state_for_status(
+        status,
+        waiting_reason,
+    )
+    task.activation_state = activation_state or agent_run_activation_state_for_status(
+        status,
+        waiting_reason,
+    )
+    return task
 
 
 def _public_agent_run_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -765,6 +804,10 @@ _ACTIVE_AGENT_RUN_STATUSES = {
     AgentRunStatus.RUNNING,
     AgentRunStatus.WAITING,
 }
+_SESSION_RUN_BINDING_CLOSED_AGENT_RUN_STATUSES = {
+    AgentRunStatus.FAILED,
+    AgentRunStatus.CANCELLED,
+}
 _AGENT_CALL_FEEDBACK_KINDS = {
     AgentRunFeedbackKind.AGENT_CALL_RESULT,
     AgentRunFeedbackKind.AGENT_CALL_FAILED,
@@ -878,6 +921,10 @@ def _activation_can_resume_from_feedback(
         AgentRunActivationStatus.BLOCKED,
         AgentRunActivationStatus.WAITING,
     }
+
+
+def _agent_run_closes_session_run_binding(task: AgentRun) -> bool:
+    return task.status in _SESSION_RUN_BINDING_CLOSED_AGENT_RUN_STATUSES
 
 
 def _normalize_agent_run_budget(value: Any) -> dict[str, int]:
@@ -1356,7 +1403,7 @@ class AgentRunControlPlane:
                     },
                 )
             if sandbox_error:
-                task.status = AgentRunStatus.FAILED
+                _set_agent_run_status(task, AgentRunStatus.FAILED)
                 _set_terminal_result(task, output=sandbox_error)
                 task.failure_reason = sandbox_error
                 task.cancel_reason = None
@@ -1739,8 +1786,11 @@ class AgentRunControlPlane:
             task = self._task_locked(owner_run_id)
             if task.is_terminal:
                 return
-            task.status = AgentRunStatus.WAITING
-            task.waiting_reason = AgentRunWaitingReason.AGENT_CALL
+            _set_agent_run_status(
+                task,
+                AgentRunStatus.WAITING,
+                waiting_reason=AgentRunWaitingReason.AGENT_CALL,
+            )
             task.resume_policy = AgentRunResumePolicy.EXTERNAL_EVENT
             task.terminal_result = {}
             self._append_event_locked(
@@ -1956,7 +2006,10 @@ class AgentRunControlPlane:
                 binding
                 for binding in self._session_run_bindings.values()
                 if binding.session_run_id == normalized_session_run_id
-                and (include_inactive or binding.status == SessionRunBindingStatus.ACTIVE)
+                and (
+                    include_inactive
+                    or self._session_run_binding_is_observable_active_locked(binding)
+                )
             ]
             if normalized_branch_binding_id:
                 candidates = [
@@ -1981,6 +2034,7 @@ class AgentRunControlPlane:
             session_run_id=session_run_id,
             branch_binding_id=branch_binding_id,
             selected_only=False,
+            include_inactive=True,
         )
         if binding is None:
             raise KeyError("session_run_branch_binding_not_found")
@@ -1994,6 +2048,7 @@ class AgentRunControlPlane:
             session_run_id=session_run_id,
             branch_binding_id=branch_binding_id,
             selected_only=False,
+            include_inactive=True,
         )
         return refreshed or selected
 
@@ -2033,6 +2088,9 @@ class AgentRunControlPlane:
             if callable(lister):
                 return lister(**filters)
             raise RuntimeError("AgentRun store does not support SessionRun bindings")
+        include_terminal = bool(filters.pop("include_terminal", False))
+        status_filter = filters.get("status")
+        status_filter_value = str(getattr(status_filter, "value", status_filter or ""))
         with self._lock:
             bindings = list(self._session_run_bindings.values())
             for key, value in filters.items():
@@ -2046,7 +2104,147 @@ class AgentRunControlPlane:
                     if str(actual_value) == str(expected):
                         filtered.append(binding)
                 bindings = filtered
+            if (
+                not include_terminal
+                and status_filter_value == SessionRunBindingStatus.ACTIVE.value
+            ):
+                bindings = [
+                    binding
+                    for binding in bindings
+                    if self._session_run_binding_is_observable_active_locked(binding)
+                ]
             return bindings
+
+    def _session_run_binding_is_observable_active_locked(
+        self,
+        binding: SessionRunBinding,
+    ) -> bool:
+        if binding.status != SessionRunBindingStatus.ACTIVE:
+            return False
+        task_id = str(binding.agent_run_id or binding.target_agent_run_id or "").strip()
+        if not task_id:
+            return False
+        state = self._states.get(task_id)
+        if state is None:
+            return False
+        return not _agent_run_closes_session_run_binding(state.task)
+
+    def _append_session_run_binding_status_event_locked(
+        self,
+        binding: SessionRunBinding,
+        event_type: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        binding.updated_at = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "binding_id": binding.id,
+            "reason": str(reason or ""),
+            "binding": _session_run_binding_to_dict(binding),
+        }
+        task_id = str(binding.agent_run_id or "").strip()
+        if task_id in self._events:
+            self._append_event_locked(task_id, event_type, payload)
+
+    def _set_session_run_binding_status_locked(
+        self,
+        binding: SessionRunBinding,
+        *,
+        status: SessionRunBindingStatus,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRunBinding:
+        binding.status = status
+        if metadata:
+            binding.metadata.update(dict(metadata))
+        if reason:
+            binding.metadata["status_reason"] = str(reason)
+        self._session_run_bindings[binding.id] = binding
+        event_type = (
+            "session_run_binding_deleted"
+            if status == SessionRunBindingStatus.DELETED
+            else "session_run_binding_closed"
+            if status == SessionRunBindingStatus.CLOSED
+            else "session_run_binding_upserted"
+        )
+        self._append_session_run_binding_status_event_locked(
+            binding,
+            event_type,
+            reason=reason,
+        )
+        return binding
+
+    def set_session_run_binding_status(
+        self,
+        binding_id: str,
+        *,
+        status: SessionRunBindingStatus | str,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRunBinding | None:
+        normalized_id = str(binding_id or "").strip()
+        binding_status = SessionRunBindingStatus(str(getattr(status, "value", status)))
+        if self._store is not None:
+            setter = getattr(self._store, "set_session_run_binding_status", None)
+            if not callable(setter):
+                raise RuntimeError("AgentRun store does not support SessionRun bindings")
+            return setter(
+                normalized_id,
+                status=binding_status,
+                reason=reason,
+                metadata=metadata,
+            )
+        with self._lock:
+            binding = self._session_run_bindings.get(normalized_id)
+            if binding is None:
+                return None
+            return self._set_session_run_binding_status_locked(
+                binding,
+                status=binding_status,
+                reason=reason,
+                metadata=metadata,
+            )
+
+    def close_session_run_binding(
+        self,
+        binding_id: str,
+        *,
+        reason: str = "explicit_close",
+    ) -> bool:
+        return (
+            self.set_session_run_binding_status(
+                binding_id,
+                status=SessionRunBindingStatus.CLOSED,
+                reason=reason,
+            )
+            is not None
+        )
+
+    def _reactivate_session_run_binding_for_continue_locked(
+        self,
+        task: AgentRun,
+        activation_payload: dict[str, Any],
+    ) -> None:
+        source = str(activation_payload.get("source") or "")
+        if source not in {"session_run_continue", "session_run_recover"}:
+            return
+        session_run_id = str(activation_payload.get("session_run_id") or "").strip()
+        branch_binding_id = str(activation_payload.get("branch_binding_id") or "").strip()
+        if not session_run_id or not branch_binding_id:
+            return
+        for binding in self._session_run_bindings.values():
+            if binding.session_run_id != session_run_id:
+                continue
+            if binding.agent_run_id != task.id:
+                continue
+            if branch_binding_id not in {binding.branch_binding_id, binding.id}:
+                continue
+            self._set_session_run_binding_status_locked(
+                binding,
+                status=SessionRunBindingStatus.ACTIVE,
+                reason=source,
+            )
+            return
 
     def _append_agent_thread_binding_status_event_locked(
         self,
@@ -2285,6 +2483,17 @@ class AgentRunControlPlane:
                     reason=f"target_agent_run_terminal:{task.status.value}",
                     cancel_target=False,
                 )
+        if _agent_run_closes_session_run_binding(task):
+            for binding in list(self._session_run_bindings.values()):
+                if binding.status != SessionRunBindingStatus.ACTIVE:
+                    continue
+                if binding.agent_run_id != task.id and binding.target_agent_run_id != task.id:
+                    continue
+                self._set_session_run_binding_status_locked(
+                    binding,
+                    status=SessionRunBindingStatus.CLOSED,
+                    reason=f"agent_run_closed:{task.status.value}",
+                )
 
     def _cleanup_bindings_for_terminal_task(self, task: AgentRun) -> None:
         if not task.is_terminal:
@@ -2293,6 +2502,30 @@ class AgentRunControlPlane:
             with self._lock:
                 self._cleanup_bindings_for_terminal_task_locked(task)
             return
+        if _agent_run_closes_session_run_binding(task):
+            closed_session_binding_ids: set[str] = set()
+            for binding in self.list_session_run_bindings(
+                agent_run_id=task.id,
+                status=SessionRunBindingStatus.ACTIVE.value,
+                include_terminal=True,
+            ):
+                if self.close_session_run_binding(
+                    binding.id,
+                    reason=f"agent_run_closed:{task.status.value}",
+                ):
+                    closed_session_binding_ids.add(binding.id)
+            for binding in self.list_session_run_bindings(
+                target_agent_run_id=task.id,
+                status=SessionRunBindingStatus.ACTIVE.value,
+                include_terminal=True,
+            ):
+                if binding.id in closed_session_binding_ids:
+                    continue
+                if self.close_session_run_binding(
+                    binding.id,
+                    reason=f"agent_run_closed:{task.status.value}",
+                ):
+                    closed_session_binding_ids.add(binding.id)
         for binding in self.list_agent_thread_bindings(
             main_agent_run_id=task.id,
             status=AgentThreadBindingStatus.ACTIVE.value,
@@ -2699,7 +2932,7 @@ class AgentRunControlPlane:
                     max_running_tasks=self.max_running_tasks,
                 ):
                     continue
-                task.status = AgentRunStatus.DISPATCHED
+                _set_agent_run_status(task, AgentRunStatus.DISPATCHED)
                 activation = _activation_with_runtime_state(
                     self._activations.get(task.current_activation_id or "")
                     or _activation_from_task(task),
@@ -2834,7 +3067,7 @@ class AgentRunControlPlane:
             lease["lease_sec"] = effective_lease_sec
             reason = self._cancel_requests.get(task_id, "")
             if task.status == AgentRunStatus.DISPATCHED:
-                task.status = AgentRunStatus.RUNNING
+                _set_agent_run_status(task, AgentRunStatus.RUNNING)
             activation_id = str(
                 lease.get("activation_id")
                 or task.current_activation_id
@@ -2927,7 +3160,7 @@ class AgentRunControlPlane:
                     AgentRunStatus.RUNNING,
                     AgentRunStatus.WAITING,
                 }:
-                    task.status = AgentRunStatus.QUEUED
+                    _set_agent_run_status(task, AgentRunStatus.QUEUED)
                     activation_id = str(
                         lease.get("activation_id")
                         or task.current_activation_id
@@ -2982,7 +3215,7 @@ class AgentRunControlPlane:
                 binding
                 for binding in self._session_run_bindings.values()
                 if binding.session_run_id == session_run_id
-                and binding.status == SessionRunBindingStatus.ACTIVE
+                and self._session_run_binding_is_observable_active_locked(binding)
             ]
         for binding in bindings:
             if binding.agent_run_id != task.id and binding.target_agent_run_id != task.id:
@@ -3143,7 +3376,7 @@ class AgentRunControlPlane:
             return
         with self._lock:
             task = self._task_locked(task_id)
-            task.status = AgentRunStatus.RUNNING
+            _set_agent_run_status(task, AgentRunStatus.RUNNING)
             if session.executor_session_id is not None:
                 task.executor_session_id = session.executor_session_id
             if session.workdir is not None:
@@ -3318,7 +3551,7 @@ class AgentRunControlPlane:
                 self._append_event_locked(task_id, event_type, payload)
             if expansion.policy_error:
                 task.metadata["environment_policy_violation"] = expansion.policy_error
-                task.status = AgentRunStatus.BLOCKED
+                _set_agent_run_status(task, AgentRunStatus.BLOCKED)
                 task.failure_reason = expansion.policy_error
                 task.cancel_reason = None
                 self._append_event_locked(
@@ -3330,7 +3563,7 @@ class AgentRunControlPlane:
                 status = str(event.data.get("status", ""))
                 if status == "waiting_approval":
                     if should_block_waiting_approval(task.source):
-                        task.status = AgentRunStatus.BLOCKED
+                        _set_agent_run_status(task, AgentRunStatus.BLOCKED)
                         task.failure_reason = str(
                             event.data.get("reason")
                             or event.data.get("message")
@@ -3343,16 +3576,17 @@ class AgentRunControlPlane:
                             blocked_review_event_payload(event.data),
                         )
                     else:
-                        task.status = AgentRunStatus.WAITING
-                        task.waiting_reason = AgentRunWaitingReason.USER_APPROVAL
+                        _set_agent_run_status(
+                            task,
+                            AgentRunStatus.WAITING,
+                            waiting_reason=AgentRunWaitingReason.USER_APPROVAL,
+                        )
                         task.resume_policy = AgentRunResumePolicy.USER_ACTION
                 elif status == "running":
-                    task.status = AgentRunStatus.RUNNING
-                    task.waiting_reason = None
+                    _set_agent_run_status(task, AgentRunStatus.RUNNING)
                     task.resume_policy = None
                 elif status == "blocked":
-                    task.status = AgentRunStatus.BLOCKED
-                    task.waiting_reason = None
+                    _set_agent_run_status(task, AgentRunStatus.BLOCKED)
                     task.resume_policy = None
                     task.failure_reason = str(
                         event.data.get("reason")
@@ -3476,11 +3710,15 @@ class AgentRunControlPlane:
                     task.status == AgentRunStatus.WAITING
                     or required_feedback_waiting_reason is not None
                 ):
-                    task.status = AgentRunStatus.WAITING
-                    task.waiting_reason = (
+                    waiting_reason = (
                         task.waiting_reason
                         or required_feedback_waiting_reason
                         or AgentRunWaitingReason.SERVER_PROCESSING
+                    )
+                    _set_agent_run_status(
+                        task,
+                        AgentRunStatus.WAITING,
+                        waiting_reason=waiting_reason,
                     )
                     task.resume_policy = (
                         task.resume_policy
@@ -3500,7 +3738,7 @@ class AgentRunControlPlane:
                 task.failure_reason = None
                 task.cancel_reason = None
             elif policy_error:
-                task.status = AgentRunStatus.BLOCKED
+                _set_agent_run_status(task, AgentRunStatus.BLOCKED)
                 _set_terminal_result(task, output=policy_error)
                 task.failure_reason = policy_error
                 task.cancel_reason = None
@@ -3511,17 +3749,17 @@ class AgentRunControlPlane:
                     or result.error
                     or "cancelled"
                 )
-                task.status = AgentRunStatus.CANCELLED
+                _set_agent_run_status(task, AgentRunStatus.CANCELLED)
                 _set_terminal_result(task, output=result.output or cancel_reason)
                 task.failure_reason = "cancelled"
                 task.cancel_reason = cancel_reason
             elif result.status == "blocked":
-                task.status = AgentRunStatus.BLOCKED
+                _set_agent_run_status(task, AgentRunStatus.BLOCKED)
                 _set_terminal_result(task, output=result.output or result.error)
                 task.failure_reason = result.error or result.output or "blocked"
                 task.cancel_reason = None
             else:
-                task.status = AgentRunStatus.FAILED
+                _set_agent_run_status(task, AgentRunStatus.FAILED)
                 _set_terminal_result(task, output=result.output)
                 task.failure_reason = result.error or "agent_error"
                 task.cancel_reason = None
@@ -3552,7 +3790,7 @@ class AgentRunControlPlane:
                 if expansion.policy_error and not policy_error:
                     policy_error = expansion.policy_error
                     task.metadata["environment_policy_violation"] = policy_error
-                    task.status = AgentRunStatus.BLOCKED
+                    _set_agent_run_status(task, AgentRunStatus.BLOCKED)
                     _set_terminal_result(task, output=policy_error)
                     task.failure_reason = policy_error
                     task.cancel_reason = None
@@ -3623,6 +3861,7 @@ class AgentRunControlPlane:
             input_kind=AgentRunActivationInputKind.ADMIN_RESUME,
             input_payload={"resume_session": bool(resume_session)},
             resume_session=resume_session,
+            allow_closed_for_admin_retry=True,
         )
 
     def append_agent_run_feedback(
@@ -3848,6 +4087,7 @@ class AgentRunControlPlane:
         resume_session: bool = False,
         feedback_id: str | None = None,
         prompt: str | None = None,
+        allow_closed_for_admin_retry: bool = False,
     ) -> AgentRun:
         if self._store is not None:
             task = self._store.continue_agent_run(
@@ -3857,6 +4097,7 @@ class AgentRunControlPlane:
                 resume_session=resume_session,
                 feedback_id=feedback_id,
                 prompt=prompt,
+                allow_closed_for_admin_retry=allow_closed_for_admin_retry,
             )
             self.notify_task_available()
             return task
@@ -3865,8 +4106,19 @@ class AgentRunControlPlane:
         )
         with self._lock:
             task = self._task_locked(task_id)
-            if not task.is_terminal and task.status != AgentRunStatus.WAITING:
-                raise ValueError("only terminal or waiting AgentRuns can be continued")
+            continuable_statuses = {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.WAITING,
+                AgentRunStatus.BLOCKED,
+            }
+            if allow_closed_for_admin_retry:
+                continuable_statuses = {
+                    *continuable_statuses,
+                    AgentRunStatus.FAILED,
+                    AgentRunStatus.CANCELLED,
+                }
+            if task.status not in continuable_statuses:
+                raise ValueError("AgentRun is not continuable")
             previous_activation = self._activations.get(task.current_activation_id or "")
             previous_seq = (
                 previous_activation.seq
@@ -3906,14 +4158,17 @@ class AgentRunControlPlane:
                 },
             )
             task.current_activation_id = activation.id
-            task.status = AgentRunStatus.QUEUED
-            task.waiting_reason = None
+            _set_agent_run_status(task, AgentRunStatus.QUEUED)
             task.resume_policy = None
             task.terminal_result = {}
             task.failure_reason = None
             task.cancel_reason = None
             if not resume_session:
                 task.executor_session_id = None
+            self._reactivate_session_run_binding_for_continue_locked(
+                task,
+                activation_payload,
+            )
             self._activations[activation.id] = activation
             if feedback_id:
                 for feedback in self._feedbacks.get(task.id, []):
@@ -3951,7 +4206,7 @@ class AgentRunControlPlane:
             return task
         with self._lock:
             task = self._task_locked(task_id)
-            task.status = AgentRunStatus.FAILED
+            _set_agent_run_status(task, AgentRunStatus.FAILED)
             _set_terminal_result(task, output=error)
             task.failure_reason = error
             task.cancel_reason = None
@@ -4096,6 +4351,94 @@ class AgentRunControlPlane:
                 self._cleanup_child_branch_worktrees_locked(task_id)
             return changed
 
+    def stop_agent_run_activation(self, task_id: str, *, reason: str = "user_stop") -> bool:
+        if self._store is not None:
+            task_before = self._store.get_agent_run(task_id)
+            ok = self._store.stop_agent_run_activation(task_id, reason=reason)
+            if ok and task_before.sandbox_session_id:
+                self._stop_sandbox_for_task(task_before, cancel=True)
+            self.notify_task_available()
+            return ok
+        with self._lock:
+            task = self._task_locked(task_id)
+            if task.status in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED,
+                AgentRunStatus.BLOCKED,
+            }:
+                return False
+            activation_id = str(task.current_activation_id or "").strip()
+            if not activation_id:
+                return False
+            claim = self._active_claim_for_task_locked(task_id)
+            if task.sandbox_session_id:
+                self._stop_sandbox_for_task(task, cancel=True)
+            if task.status in {
+                AgentRunStatus.DISPATCHED,
+                AgentRunStatus.RUNNING,
+                AgentRunStatus.WAITING,
+            }:
+                self._cancel_requests[task.id] = reason
+                self._append_event_locked(
+                    task.id,
+                    "cancel_requested",
+                    {
+                        "reason": reason,
+                        "activation_id": str(claim.get("activation_id") or "") if claim else activation_id,
+                        "worker_id": str(claim.get("worker_id") or "") if claim else "",
+                    },
+                )
+            _set_agent_run_status(
+                task,
+                AgentRunStatus.COMPLETED,
+                mainline_state=AgentRunMainlineState.CONTINUABLE,
+                activation_state=AgentRunActivationState.CANCELLED,
+            )
+            _set_terminal_result(task, output=reason)
+            task.failure_reason = None
+            task.cancel_reason = reason
+            existing_activation = self._activations.get(activation_id) or _activation_from_task(
+                task,
+                activation_id=activation_id,
+                status=AgentRunActivationStatus.CANCELLED,
+            )
+            stopped_activation = _activation_with_runtime_state(
+                existing_activation,
+                status=AgentRunActivationStatus.CANCELLED,
+                request_id=str(claim.get("request_id") or "") if claim else None,
+                worker_id=str(claim.get("worker_id") or "") if claim else None,
+                output=reason,
+                result_payload={
+                    "status": "cancelled",
+                    "output": reason,
+                    "reason": reason,
+                },
+            )
+            stopped_activation.ended_at = datetime.now(timezone.utc).isoformat()
+            self._activations[stopped_activation.id] = stopped_activation
+            self._append_event_locked(
+                task.id,
+                "activation_completed",
+                {
+                    "activation_id": stopped_activation.id,
+                    "activation": _activation_to_dict(stopped_activation),
+                    "result": stopped_activation.result_payload,
+                },
+            )
+            self._append_event_locked(
+                task.id,
+                "activation_stopped",
+                {
+                    "reason": reason,
+                    "activation_id": stopped_activation.id,
+                    "agent_run": _agent_run_to_dict(task),
+                },
+            )
+            self._clear_task_claims_locked(task.id)
+            self._cancel_requests.pop(task.id, None)
+            return True
+
     def _cancel_task_locked(
         self,
         task: AgentRun,
@@ -4106,7 +4449,7 @@ class AgentRunControlPlane:
             return False
         if task.sandbox_session_id:
             self._stop_sandbox_for_task(task, cancel=True)
-            task.status = AgentRunStatus.CANCELLED
+            _set_agent_run_status(task, AgentRunStatus.CANCELLED)
             _set_terminal_result(task, output=reason)
             task.failure_reason = "cancelled"
             task.cancel_reason = reason
@@ -4133,7 +4476,7 @@ class AgentRunControlPlane:
                 },
             )
             return True
-        task.status = AgentRunStatus.CANCELLED
+        _set_agent_run_status(task, AgentRunStatus.CANCELLED)
         _set_terminal_result(task, output=reason)
         task.failure_reason = "cancelled"
         task.cancel_reason = reason

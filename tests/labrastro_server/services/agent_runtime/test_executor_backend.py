@@ -145,6 +145,52 @@ def test_reuleauxcoder_backend_wraps_chat_output_as_executor_events() -> None:
     assert agents[0].clear_stop_request is True
 
 
+def test_reuleauxcoder_backend_event_sink_receives_events_during_chat() -> None:
+    backend_module = _executor_backend()
+    live_events = []
+    live_checkpoints: list[str] = []
+
+    class FakeAgent:
+        current_session_id = "session-1"
+
+        def __init__(self) -> None:
+            self._event_handlers = []
+
+        def add_event_handler(self, handler) -> None:
+            self._event_handlers.append(handler)
+
+        def chat(self, prompt: str, *, clear_stop_request: bool = True) -> str:  # noqa: ARG002
+            live_checkpoints.append(live_events[-1].data["status"])
+            for handler in list(self._event_handlers):
+                handler(AgentEvent.reasoning_token("thinking"))
+            live_checkpoints.append(live_events[-1].data["event_type"])
+            return "done"
+
+    agent = FakeAgent()
+    backend = backend_module.ReuleauxCoderExecutorBackend(
+        create_agent=lambda _request: agent
+    )
+
+    result = backend.start(
+        backend_module.ExecutorRunRequest(
+            task_id="task-1",
+            agent_id="reviewer",
+            executor="reuleauxcoder",
+            prompt="run",
+            event_sink=live_events.append,
+        )
+    )
+
+    assert live_checkpoints == ["running", "reasoning_delta"]
+    assert [event.type.value for event in live_events] == [
+        event.type.value for event in result.events
+    ]
+    assert result.events[1].data == {
+        "event_type": "reasoning_delta",
+        "payload": {"content": "thinking"},
+    }
+
+
 def test_reuleauxcoder_backend_captures_lifecycle_hook_events() -> None:
     backend_module = _executor_backend()
 

@@ -1578,7 +1578,7 @@ class AgentMemoryPolicyConfig:
 
 
 class AgentRunStatus(str, Enum):
-    """Durable lifecycle status for a long-lived AgentRun mainline."""
+    """Executor-facing lifecycle status for the current AgentRun activation."""
 
     QUEUED = "queued"
     DISPATCHED = "dispatched"
@@ -1588,6 +1588,19 @@ class AgentRunStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     BLOCKED = "blocked"
+
+
+class AgentRunMainlineState(str, Enum):
+    """Durable state of the long-lived AgentRun mainline."""
+
+    EXECUTING = "executing"
+    CONTINUABLE = "continuable"
+    WAITING_FEEDBACK = "waiting_feedback"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    UNRECOVERABLE = "unrecoverable"
 
 
 class AgentRunWaitingReason(str, Enum):
@@ -1630,6 +1643,20 @@ class AgentRunActivationStatus(str, Enum):
     DISPATCHED = "dispatched"
     RUNNING = "running"
     WAITING = "waiting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    BLOCKED = "blocked"
+
+
+class AgentRunActivationState(str, Enum):
+    """Selected activation state projected onto the AgentRun mainline."""
+
+    QUEUED = "queued"
+    DISPATCHED = "dispatched"
+    RUNNING = "running"
+    WAITING_SERVER = "waiting_server"
+    WAITING_USER = "waiting_user"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -1893,6 +1920,66 @@ def _optional_enum(enum_type: type[Enum], value: Any) -> Enum | None:
     return enum_type(_enum_value(value))
 
 
+def agent_run_activation_state_for_status(
+    status: AgentRunStatus | str | None,
+    waiting_reason: AgentRunWaitingReason | str | None = None,
+) -> AgentRunActivationState:
+    status_value = _enum_value(status) or AgentRunStatus.QUEUED.value
+    waiting_reason_value = _enum_value(waiting_reason) or ""
+    if status_value == AgentRunStatus.QUEUED.value:
+        return AgentRunActivationState.QUEUED
+    if status_value == AgentRunStatus.DISPATCHED.value:
+        return AgentRunActivationState.DISPATCHED
+    if status_value == AgentRunStatus.RUNNING.value:
+        return AgentRunActivationState.RUNNING
+    if status_value == AgentRunStatus.WAITING.value:
+        if waiting_reason_value in {
+            AgentRunWaitingReason.USER_APPROVAL.value,
+            AgentRunWaitingReason.USER_INPUT.value,
+        }:
+            return AgentRunActivationState.WAITING_USER
+        return AgentRunActivationState.WAITING_SERVER
+    if status_value == AgentRunStatus.COMPLETED.value:
+        return AgentRunActivationState.COMPLETED
+    if status_value == AgentRunStatus.FAILED.value:
+        return AgentRunActivationState.FAILED
+    if status_value == AgentRunStatus.CANCELLED.value:
+        return AgentRunActivationState.CANCELLED
+    if status_value == AgentRunStatus.BLOCKED.value:
+        return AgentRunActivationState.BLOCKED
+    return AgentRunActivationState.QUEUED
+
+
+def agent_run_mainline_state_for_status(
+    status: AgentRunStatus | str | None,
+    waiting_reason: AgentRunWaitingReason | str | None = None,
+) -> AgentRunMainlineState:
+    status_value = _enum_value(status) or AgentRunStatus.QUEUED.value
+    waiting_reason_value = _enum_value(waiting_reason) or ""
+    if status_value in {
+        AgentRunStatus.QUEUED.value,
+        AgentRunStatus.DISPATCHED.value,
+        AgentRunStatus.RUNNING.value,
+    }:
+        return AgentRunMainlineState.EXECUTING
+    if status_value == AgentRunStatus.WAITING.value:
+        if waiting_reason_value in {
+            AgentRunWaitingReason.USER_APPROVAL.value,
+            AgentRunWaitingReason.USER_INPUT.value,
+        }:
+            return AgentRunMainlineState.WAITING_FEEDBACK
+        return AgentRunMainlineState.EXECUTING
+    if status_value == AgentRunStatus.COMPLETED.value:
+        return AgentRunMainlineState.CONTINUABLE
+    if status_value == AgentRunStatus.FAILED.value:
+        return AgentRunMainlineState.FAILED
+    if status_value == AgentRunStatus.CANCELLED.value:
+        return AgentRunMainlineState.CANCELLED
+    if status_value == AgentRunStatus.BLOCKED.value:
+        return AgentRunMainlineState.BLOCKED
+    return AgentRunMainlineState.EXECUTING
+
+
 @dataclass
 class AgentRun:
     """Long-lived Agent mainline; not a worker claim or single model call."""
@@ -1904,6 +1991,8 @@ class AgentRun:
     source: AgentRunSource = AgentRunSource.MANUAL
     trigger_mode: TriggerMode = TriggerMode.ISSUE_TASK
     status: AgentRunStatus = AgentRunStatus.QUEUED
+    mainline_state: AgentRunMainlineState | str | None = None
+    activation_state: AgentRunActivationState | str | None = None
     waiting_reason: AgentRunWaitingReason | None = None
     resume_policy: AgentRunResumePolicy | None = None
     runtime_profile_id: str | None = None
@@ -1929,6 +2018,20 @@ class AgentRun:
         self.trigger_mode = TriggerMode(_enum_value(self.trigger_mode))
         self.status = AgentRunStatus(_enum_value(self.status) or AgentRunStatus.QUEUED)
         self.waiting_reason = _optional_enum(AgentRunWaitingReason, self.waiting_reason)
+        self.mainline_state = AgentRunMainlineState(
+            _enum_value(self.mainline_state)
+            or agent_run_mainline_state_for_status(
+                self.status,
+                self.waiting_reason,
+            ).value
+        )
+        self.activation_state = AgentRunActivationState(
+            _enum_value(self.activation_state)
+            or agent_run_activation_state_for_status(
+                self.status,
+                self.waiting_reason,
+            ).value
+        )
         self.resume_policy = _optional_enum(AgentRunResumePolicy, self.resume_policy)
         if self.executor is not None:
             self.executor = ExecutorType(_enum_value(self.executor))

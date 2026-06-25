@@ -16,6 +16,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     ActivationSteerStatus,
     AgentRunActivation,
     AgentRunActivationInputKind,
+    AgentRunActivationState,
     AgentRunActivationStatus,
     AgentRunFeedback,
     AgentRunFeedbackKind,
@@ -25,6 +26,7 @@ from reuleauxcoder.domain.agent_runtime.models import (
     AgentRunRelationType,
     AgentRunResumePolicy,
     AgentRunSource,
+    AgentRunMainlineState,
     AgentThreadBinding,
     AgentThreadBindingLifetime,
     AgentThreadBindingStatus,
@@ -45,6 +47,8 @@ from reuleauxcoder.domain.agent_runtime.models import (
     TriggerMode,
     WorkerKind,
     WorktreeRole,
+    agent_run_activation_state_for_status,
+    agent_run_mainline_state_for_status,
 )
 from labrastro_server.services.agent_runtime.executor_backend import (
     ExecutorEvent,
@@ -581,6 +585,7 @@ def _relation_from_submit_request(
 
 
 _TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "cancelled", "blocked"}
+_SESSION_RUN_BINDING_CLOSED_AGENT_RUN_STATUSES = {"failed", "cancelled"}
 _CANCEL_REQUEST_AGENT_RUN_STATUSES = {"dispatched", "running", "waiting"}
 _ACTIVE_STEER_AGENT_RUN_STATUSES = {"running"}
 _ACTIVE_AGENT_RUN_STATUSES = {"queued", "dispatched", "running", "waiting"}
@@ -615,6 +620,8 @@ def _agent_run_to_dict(task: AgentRun) -> dict[str, Any]:
         "source": task.source.value,
         "trigger_mode": task.trigger_mode.value,
         "status": task.status.value,
+        "mainline_state": task.mainline_state.value,
+        "activation_state": task.activation_state.value,
         "waiting_reason": task.waiting_reason.value if task.waiting_reason else None,
         "resume_policy": task.resume_policy.value if task.resume_policy else None,
         "runtime_profile_id": task.runtime_profile_id,
@@ -657,6 +664,8 @@ def _agent_run_storage_values(task: AgentRun) -> dict[str, Any]:
         "source": task.source.value,
         "trigger_mode": task.trigger_mode.value,
         "status": task.status.value,
+        "mainline_state": task.mainline_state.value,
+        "activation_state": task.activation_state.value,
         "waiting_reason": task.waiting_reason.value if task.waiting_reason else None,
         "resume_policy": task.resume_policy.value if task.resume_policy else None,
         "runtime_profile_id": task.runtime_profile_id,
@@ -679,6 +688,22 @@ def _agent_run_storage_values(task: AgentRun) -> dict[str, Any]:
         "cancel_reason": task.cancel_reason,
         "budget": _dict_from(task.metadata.get("budget")),
         "metadata": dict(task.metadata),
+    }
+
+
+def _semantic_state_values(
+    status: AgentRunStatus | str,
+    waiting_reason: AgentRunWaitingReason | str | None = None,
+) -> dict[str, str]:
+    return {
+        "mainline_state": agent_run_mainline_state_for_status(
+            status,
+            waiting_reason,
+        ).value,
+        "activation_state": agent_run_activation_state_for_status(
+            status,
+            waiting_reason,
+        ).value,
     }
 
 
@@ -1247,29 +1272,34 @@ class PostgresAgentRunStore:
         selected_only: bool = True,
         include_inactive: bool = False,
     ) -> SessionRunBinding | None:
-        clauses = ["session_run_id=:session_run_id"]
+        clauses = ["b.session_run_id=:session_run_id"]
         params: dict[str, Any] = {
             "session_run_id": str(session_run_id or "").strip(),
         }
         branch_id = str(branch_binding_id or "").strip()
         if branch_id:
-            clauses.append("(branch_binding_id=:branch_binding_id OR id=:branch_binding_id)")
+            clauses.append("(b.branch_binding_id=:branch_binding_id OR b.id=:branch_binding_id)")
             params["branch_binding_id"] = branch_id
         elif selected_only:
-            clauses.append("selected=true")
+            clauses.append("b.selected=true")
         if not include_inactive:
-            clauses.append("status='active'")
+            clauses.append("b.status='active'")
+            clauses.append(
+                "r.id IS NOT NULL AND r.status NOT IN "
+                "('failed', 'cancelled')"
+            )
         with self.engine.begin() as conn:
             row = conn.execute(
                 text(
                     f"""
-                    SELECT id, session_run_id, session_id, peer_id, branch_binding_id,
-                           agent_run_id, selected, parent_branch_binding_id,
-                           base_session_item_id, source_agent_run_id,
-                           target_agent_run_id, status, metadata, created_at, updated_at
-                    FROM labrastro_session_run_bindings
+                    SELECT b.id, b.session_run_id, b.session_id, b.peer_id, b.branch_binding_id,
+                           b.agent_run_id, b.selected, b.parent_branch_binding_id,
+                           b.base_session_item_id, b.source_agent_run_id,
+                           b.target_agent_run_id, b.status, b.metadata, b.created_at, b.updated_at
+                    FROM labrastro_session_run_bindings b
+                    LEFT JOIN labrastro_agent_runs r ON r.id = b.agent_run_id
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY updated_at DESC, id ASC
+                    ORDER BY b.updated_at DESC, b.id ASC
                     LIMIT 1
                     """
                 ),
@@ -1278,38 +1308,189 @@ class PostgresAgentRunStore:
         return _session_run_binding_from_row(row) if row is not None else None
 
     def list_session_run_bindings(self, **filters: Any) -> list[SessionRunBinding]:
+        include_terminal = bool(filters.pop("include_terminal", False))
         clauses: list[str] = ["1=1"]
         params: dict[str, Any] = {}
+        status_filter_value = ""
         for key in (
             "session_run_id",
             "session_id",
             "peer_id",
             "branch_binding_id",
             "agent_run_id",
+            "target_agent_run_id",
             "selected",
             "status",
         ):
             value = filters.get(key)
             if value is None:
                 continue
-            clauses.append(f"{key}=:{key}")
+            clauses.append(f"b.{key}=:{key}")
             params[key] = bool(value) if key == "selected" else str(getattr(value, "value", value))
+            if key == "status":
+                status_filter_value = params[key]
+        if (
+            not include_terminal
+            and status_filter_value == SessionRunBindingStatus.ACTIVE.value
+        ):
+            clauses.append(
+                "r.id IS NOT NULL AND r.status NOT IN "
+                "('failed', 'cancelled')"
+            )
         with self.engine.begin() as conn:
             rows = conn.execute(
                 text(
                     f"""
-                    SELECT id, session_run_id, session_id, peer_id, branch_binding_id,
-                           agent_run_id, selected, parent_branch_binding_id,
-                           base_session_item_id, source_agent_run_id,
-                           target_agent_run_id, status, metadata, created_at, updated_at
-                    FROM labrastro_session_run_bindings
+                    SELECT b.id, b.session_run_id, b.session_id, b.peer_id, b.branch_binding_id,
+                           b.agent_run_id, b.selected, b.parent_branch_binding_id,
+                           b.base_session_item_id, b.source_agent_run_id,
+                           b.target_agent_run_id, b.status, b.metadata, b.created_at, b.updated_at
+                    FROM labrastro_session_run_bindings b
+                    LEFT JOIN labrastro_agent_runs r ON r.id = b.agent_run_id
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY updated_at DESC, id ASC
+                    ORDER BY b.updated_at DESC, b.id ASC
                     """
                 ),
                 params,
             ).mappings()
             return [_session_run_binding_from_row(row) for row in rows]
+
+    def set_session_run_binding_status(
+        self,
+        binding_id: str,
+        *,
+        status: SessionRunBindingStatus | str,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRunBinding | None:
+        binding_status = SessionRunBindingStatus(str(getattr(status, "value", status)))
+        normalized_id = str(binding_id or "").strip()
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT id, session_run_id, session_id, peer_id, branch_binding_id,
+                           agent_run_id, selected, parent_branch_binding_id,
+                           base_session_item_id, source_agent_run_id,
+                           target_agent_run_id, status, metadata, created_at, updated_at
+                    FROM labrastro_session_run_bindings
+                    WHERE id=:binding_id
+                    """
+                ),
+                {"binding_id": normalized_id},
+            ).mappings().first()
+            if row is None:
+                return None
+            row_metadata = _dict_from(row["metadata"])
+            row_metadata.update(dict(metadata or {}))
+            if reason:
+                row_metadata["status_reason"] = str(reason)
+            conn.execute(
+                text(
+                    """
+                    UPDATE labrastro_session_run_bindings
+                    SET status=:status,
+                        metadata=CAST(:metadata AS JSONB),
+                        updated_at=now()
+                    WHERE id=:binding_id
+                    """
+                ),
+                {
+                    "binding_id": normalized_id,
+                    "status": binding_status.value,
+                    "metadata": _json(row_metadata),
+                },
+            )
+            binding = _session_run_binding_from_row(row)
+            binding.status = binding_status
+            binding.metadata = row_metadata
+            event_type = (
+                "session_run_binding_deleted"
+                if binding_status == SessionRunBindingStatus.DELETED
+                else "session_run_binding_closed"
+                if binding_status == SessionRunBindingStatus.CLOSED
+                else "session_run_binding_upserted"
+            )
+            self._append_event(
+                conn,
+                binding.agent_run_id,
+                event_type,
+                {
+                    "binding_id": binding.id,
+                    "reason": str(reason or ""),
+                    "binding": _session_run_binding_to_dict(binding),
+                },
+            )
+        return self.find_session_run_binding(
+            session_run_id=binding.session_run_id,
+            branch_binding_id=binding.id,
+            selected_only=False,
+            include_inactive=True,
+        )
+
+    def _reactivate_session_run_binding_for_continue(
+        self,
+        conn: Any,
+        *,
+        task_id: str,
+        activation_payload: dict[str, Any],
+    ) -> None:
+        source = str(activation_payload.get("source") or "")
+        if source not in {"session_run_continue", "session_run_recover"}:
+            return
+        session_run_id = str(activation_payload.get("session_run_id") or "").strip()
+        branch_binding_id = str(activation_payload.get("branch_binding_id") or "").strip()
+        if not session_run_id or not branch_binding_id:
+            return
+        row = conn.execute(
+            text(
+                """
+                SELECT id, session_run_id, session_id, peer_id, branch_binding_id,
+                       agent_run_id, selected, parent_branch_binding_id,
+                       base_session_item_id, source_agent_run_id,
+                       target_agent_run_id, status, metadata, created_at, updated_at
+                FROM labrastro_session_run_bindings
+                WHERE session_run_id=:session_run_id
+                  AND agent_run_id=:task_id
+                  AND (branch_binding_id=:branch_binding_id OR id=:branch_binding_id)
+                ORDER BY updated_at DESC, id ASC
+                LIMIT 1
+                """
+            ),
+            {
+                "session_run_id": session_run_id,
+                "task_id": str(task_id or "").strip(),
+                "branch_binding_id": branch_binding_id,
+            },
+        ).mappings().first()
+        if row is None:
+            return
+        row_metadata = _dict_from(row["metadata"])
+        row_metadata["status_reason"] = source
+        conn.execute(
+            text(
+                """
+                UPDATE labrastro_session_run_bindings
+                SET status='active',
+                    metadata=CAST(:metadata AS JSONB),
+                    updated_at=now()
+                WHERE id=:binding_id
+                """
+            ),
+            {
+                "binding_id": str(row["id"]),
+                "metadata": _json(row_metadata),
+            },
+        )
+        binding = _session_run_binding_from_row(row)
+        binding.status = SessionRunBindingStatus.ACTIVE
+        binding.metadata = row_metadata
+        self._append_event(
+            conn,
+            binding.agent_run_id,
+            "session_run_binding_upserted",
+            {"binding": _session_run_binding_to_dict(binding)},
+        )
 
     def mark_agent_call_waiting(
         self,
@@ -1331,6 +1512,8 @@ class PostgresAgentRunStore:
                     """
                     UPDATE labrastro_agent_runs
                     SET status='waiting',
+                        mainline_state='executing',
+                        activation_state='waiting_server',
                         waiting_reason='agent_call',
                         resume_policy='external_event',
                         terminal_result='{}'::jsonb,
@@ -1525,7 +1708,8 @@ class PostgresAgentRunStore:
                     """
                     INSERT INTO labrastro_agent_runs (
                         id, agent_id, kind, owner_session_run_id, source,
-                        trigger_mode, status, waiting_reason, resume_policy,
+                        trigger_mode, status, mainline_state, activation_state,
+                        waiting_reason, resume_policy,
                         runtime_profile_id, executor, execution_location,
                         worktree_role, publish_policy, executor_session_id,
                         current_activation_id, workdir, sandbox_id,
@@ -1533,7 +1717,8 @@ class PostgresAgentRunStore:
                         cleanup_policy, metadata, runtime_snapshot
                     ) VALUES (
                         :id, :agent_id, :kind, :owner_session_run_id, :source,
-                        :trigger_mode, :status, :waiting_reason, :resume_policy,
+                        :trigger_mode, :status, :mainline_state, :activation_state,
+                        :waiting_reason, :resume_policy,
                         :runtime_profile_id, :executor, :execution_location,
                         :worktree_role, :publish_policy, :executor_session_id,
                         :current_activation_id, :workdir, :sandbox_id,
@@ -1682,6 +1867,8 @@ class PostgresAgentRunStore:
                         """
                         UPDATE labrastro_agent_runs
                         SET status='dispatched',
+                            mainline_state='executing',
+                            activation_state='dispatched',
                             current_activation_id=:activation_id,
                             dispatched_at=COALESCE(dispatched_at, now()),
                             updated_at=now()
@@ -1691,6 +1878,8 @@ class PostgresAgentRunStore:
                     {"task_id": task.id, "activation_id": activation.id},
                 )
                 task.status = AgentRunStatus.DISPATCHED
+                task.mainline_state = AgentRunMainlineState.EXECUTING
+                task.activation_state = AgentRunActivationState.DISPATCHED
                 metadata.setdefault("activation_id", activation.id)
                 metadata.setdefault("agent_run_id", task.id)
                 self._upsert_activation_with_conn(conn, activation)
@@ -1839,6 +2028,8 @@ class PostgresAgentRunStore:
                         """
                         UPDATE labrastro_agent_runs
                         SET status='running',
+                            mainline_state='executing',
+                            activation_state='running',
                             started_at=COALESCE(started_at, now()),
                             updated_at=now()
                         WHERE id=:task_id
@@ -1847,6 +2038,8 @@ class PostgresAgentRunStore:
                     {"task_id": task_id},
                 )
                 task.status = AgentRunStatus.RUNNING
+                task.mainline_state = AgentRunMainlineState.EXECUTING
+                task.activation_state = AgentRunActivationState.RUNNING
                 self._append_event(conn, task_id, "status", {"status": "running"})
             cancel_reason = self._cancel_reason(conn, task_id)
             from labrastro_server.services.agent_runtime.control_plane import (
@@ -2009,7 +2202,10 @@ class PostgresAgentRunStore:
                     text(
                         """
                         UPDATE labrastro_agent_runs
-                        SET status='failed', failure_reason='host_restarted',
+                        SET status='failed',
+                            mainline_state='failed',
+                            activation_state='failed',
+                            failure_reason='host_restarted',
                             terminal_result=jsonb_build_object(
                                 'output',
                                 'host restarted while task was in flight'
@@ -2171,7 +2367,10 @@ class PostgresAgentRunStore:
                     text(
                         """
                         UPDATE labrastro_agent_runs
-                        SET status='blocked', failure_reason=:failure_reason,
+                        SET status='blocked',
+                            mainline_state='blocked',
+                            activation_state='blocked',
+                            failure_reason=:failure_reason,
                             cancel_reason=NULL, metadata=CAST(:metadata AS JSONB),
                             updated_at=now()
                         WHERE id=:task_id
@@ -2202,7 +2401,10 @@ class PostgresAgentRunStore:
                         text(
                             """
                             UPDATE labrastro_agent_runs
-                            SET status='blocked', waiting_reason=NULL,
+                            SET status='blocked',
+                                mainline_state='blocked',
+                                activation_state='blocked',
+                                waiting_reason=NULL,
                                 resume_policy=NULL, failure_reason=:failure_reason,
                                 cancel_reason=NULL, updated_at=now()
                             WHERE id=:task_id
@@ -2238,6 +2440,8 @@ class PostgresAgentRunStore:
                             """
                             UPDATE labrastro_agent_runs
                             SET status=:status,
+                                mainline_state=:mainline_state,
+                                activation_state=:activation_state,
                                 waiting_reason=:waiting_reason,
                                 resume_policy=:resume_policy,
                                 failure_reason=CASE
@@ -2255,6 +2459,10 @@ class PostgresAgentRunStore:
                         {
                             "task_id": task_id,
                             "status": mapped,
+                            **_semantic_state_values(
+                                mapped,
+                                "user_approval" if mapped == "waiting" else None,
+                            ),
                             "waiting_reason": (
                                 "user_approval" if mapped == "waiting" else None
                             ),
@@ -2452,6 +2660,8 @@ class PostgresAgentRunStore:
                 """
                 UPDATE labrastro_agent_runs
                 SET status=:status,
+                    mainline_state=:mainline_state,
+                    activation_state=:activation_state,
                     terminal_result=CAST(:terminal_result AS JSONB),
                     waiting_reason=:waiting_reason,
                     resume_policy=:resume_policy,
@@ -2471,6 +2681,7 @@ class PostgresAgentRunStore:
             {
                 "task_id": task_id,
                 "status": status,
+                **_semantic_state_values(status, waiting_reason),
                 "terminal_result": _json({"output": output or ""}),
                 "waiting_reason": (
                     waiting_reason.value if waiting_reason is not None else None
@@ -2575,6 +2786,7 @@ class PostgresAgentRunStore:
             input_kind=AgentRunActivationInputKind.ADMIN_RESUME,
             input_payload={"resume_session": bool(resume_session)},
             resume_session=resume_session,
+            allow_closed_for_admin_retry=True,
         )
 
     def append_agent_run_feedback(
@@ -2765,6 +2977,7 @@ class PostgresAgentRunStore:
         resume_session: bool = False,
         feedback_id: str | None = None,
         prompt: str | None = None,
+        allow_closed_for_admin_retry: bool = False,
     ) -> AgentRun:
         from labrastro_server.services.agent_runtime.control_plane import (
             _activation_id_for_task,
@@ -2777,8 +2990,19 @@ class PostgresAgentRunStore:
         )
         with self.engine.begin() as conn:
             task = self._task_from_row(self._task_row(conn, task_id))
-            if not task.is_terminal and task.status != AgentRunStatus.WAITING:
-                raise ValueError("only terminal or waiting AgentRuns can be continued")
+            continuable_statuses = {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.WAITING,
+                AgentRunStatus.BLOCKED,
+            }
+            if allow_closed_for_admin_retry:
+                continuable_statuses = {
+                    *continuable_statuses,
+                    AgentRunStatus.FAILED,
+                    AgentRunStatus.CANCELLED,
+                }
+            if task.status not in continuable_statuses:
+                raise ValueError("AgentRun is not continuable")
             previous_activation = self._load_current_activation_with_conn(conn, task)
             previous_seq = (
                 previous_activation.seq
@@ -2821,6 +3045,8 @@ class PostgresAgentRunStore:
                     """
                     UPDATE labrastro_agent_runs
                     SET status='queued',
+                        mainline_state='executing',
+                        activation_state='queued',
                         waiting_reason=NULL,
                         resume_policy=NULL,
                         terminal_result='{}'::jsonb,
@@ -2842,6 +3068,11 @@ class PostgresAgentRunStore:
                 },
             )
             task = self._task_from_row(self._task_row(conn, task_id))
+            self._reactivate_session_run_binding_for_continue(
+                conn,
+                task_id=task.id,
+                activation_payload=activation_payload,
+            )
             self._upsert_activation_with_conn(conn, activation)
             if feedback_id:
                 conn.execute(
@@ -2887,6 +3118,8 @@ class PostgresAgentRunStore:
                     """
                     UPDATE labrastro_agent_runs
                     SET status='failed',
+                        mainline_state='failed',
+                        activation_state='failed',
                         terminal_result=CAST(:terminal_result AS JSONB),
                         failure_reason=:error, cancel_reason=NULL,
                         completed_at=now(), updated_at=now()
@@ -2917,6 +3150,8 @@ class PostgresAgentRunStore:
                         """
                         UPDATE labrastro_agent_runs
                         SET status='cancelled',
+                            mainline_state='cancelled',
+                            activation_state='cancelled',
                             terminal_result=CAST(:terminal_result AS JSONB),
                             failure_reason='cancelled', cancel_reason=:reason,
                             completed_at=now(), updated_at=now()
@@ -2980,6 +3215,8 @@ class PostgresAgentRunStore:
                     """
                     UPDATE labrastro_agent_runs
                     SET status='cancelled',
+                        mainline_state='cancelled',
+                        activation_state='cancelled',
                         terminal_result=CAST(:terminal_result AS JSONB),
                         failure_reason='cancelled', cancel_reason=:reason,
                         completed_at=now(), updated_at=now()
@@ -2997,6 +3234,141 @@ class PostgresAgentRunStore:
             self._append_parent_terminal_event(conn, task)
             self._release_claims(conn, task_id, status="cancelled")
             self._cancel_child_agent_runs(conn, task_id, reason=reason)
+            return True
+
+    def stop_agent_run_activation(self, task_id: str, *, reason: str = "user_stop") -> bool:
+        from labrastro_server.services.agent_runtime.control_plane import (
+            _activation_from_task,
+            _activation_to_dict,
+            _activation_with_runtime_state,
+            _agent_run_to_dict,
+        )
+
+        with self.engine.begin() as conn:
+            task = self._task_from_row(self._task_row(conn, task_id))
+            if task.status in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED,
+                AgentRunStatus.BLOCKED,
+            }:
+                return False
+            activation_id = str(task.current_activation_id or "").strip()
+            if not activation_id:
+                return False
+            if task.status in {
+                AgentRunStatus.DISPATCHED,
+                AgentRunStatus.RUNNING,
+                AgentRunStatus.WAITING,
+            }:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO labrastro_agent_run_cancel_requests(task_id, reason)
+                        VALUES (:task_id, :reason)
+                        ON CONFLICT (task_id) DO UPDATE
+                        SET reason=EXCLUDED.reason, requested_at=now(), resolved_at=NULL
+                        """
+                    ),
+                    {"task_id": task_id, "reason": reason},
+                )
+                claim_row_for_event = conn.execute(
+                    text(
+                        """
+                        SELECT activation_id, worker_id FROM labrastro_agent_run_activation_claims
+                        WHERE task_id=:task_id AND status='active'
+                        ORDER BY claimed_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"task_id": task_id},
+                ).mappings().first()
+                self._append_event(
+                    conn,
+                    task_id,
+                    "cancel_requested",
+                    {
+                        "reason": reason,
+                        "activation_id": str(claim_row_for_event["activation_id"]) if claim_row_for_event else activation_id,
+                        "worker_id": str(claim_row_for_event["worker_id"]) if claim_row_for_event else "",
+                    },
+                )
+            conn.execute(
+                text(
+                    """
+                    UPDATE labrastro_agent_runs
+                    SET status='completed',
+                        mainline_state='continuable',
+                        activation_state='cancelled',
+                        terminal_result=CAST(:terminal_result AS JSONB),
+                        waiting_reason=NULL,
+                        resume_policy=NULL,
+                        failure_reason=NULL,
+                        cancel_reason=:reason,
+                        completed_at=now(),
+                        updated_at=now()
+                    WHERE id=:task_id
+                    """
+                ),
+                {
+                    "task_id": task_id,
+                    "reason": reason,
+                    "terminal_result": _json({"output": reason}),
+                },
+            )
+            task = self._task_from_row(self._task_row(conn, task_id))
+            claim_row = conn.execute(
+                text(
+                    """
+                    SELECT * FROM labrastro_agent_run_activation_claims
+                    WHERE task_id=:task_id AND status='active'
+                    ORDER BY claimed_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"task_id": task_id},
+            ).mappings().first()
+            activation = self._load_current_activation_with_conn(conn, task) or _activation_from_task(
+                task,
+                activation_id=activation_id,
+                status=AgentRunActivationStatus.CANCELLED,
+            )
+            stopped_activation = _activation_with_runtime_state(
+                activation,
+                status=AgentRunActivationStatus.CANCELLED,
+                request_id=str(claim_row["request_id"]) if claim_row is not None else None,
+                worker_id=str(claim_row["worker_id"]) if claim_row is not None else None,
+                output=reason,
+                result_payload={
+                    "status": "cancelled",
+                    "output": reason,
+                    "reason": reason,
+                },
+            )
+            stopped_activation.ended_at = datetime.now(timezone.utc).isoformat()
+            self._upsert_activation_with_conn(conn, stopped_activation)
+            self._append_event(
+                conn,
+                task_id,
+                "activation_completed",
+                {
+                    "activation_id": stopped_activation.id,
+                    "activation": _activation_to_dict(stopped_activation),
+                    "result": stopped_activation.result_payload,
+                },
+            )
+            self._append_event(
+                conn,
+                task_id,
+                "activation_stopped",
+                {
+                    "reason": reason,
+                    "activation_id": stopped_activation.id,
+                    "agent_run": _agent_run_to_dict(task),
+                },
+            )
+            self._release_claims(conn, task_id, status="cancelled")
+            self._resolve_cancel(conn, task_id)
             return True
 
     def _cancel_child_agent_runs(
@@ -3043,6 +3415,8 @@ class PostgresAgentRunStore:
                         """
                         UPDATE labrastro_agent_runs
                         SET status='cancelled',
+                            mainline_state='cancelled',
+                            activation_state='cancelled',
                             terminal_result=CAST(:terminal_result AS JSONB),
                             failure_reason='cancelled', cancel_reason=:reason,
                             completed_at=now(), updated_at=now()
@@ -3092,13 +3466,19 @@ class PostgresAgentRunStore:
                         """
                         UPDATE labrastro_agent_runs
                         SET status='cancelled',
+                            mainline_state='cancelled',
+                            activation_state='cancelled',
                             terminal_result=CAST(:terminal_result AS JSONB),
                             failure_reason='cancelled', cancel_reason=:reason,
                             completed_at=now(), updated_at=now()
                         WHERE id=:task_id
                         """
                     ),
-                    {"task_id": child_id, "reason": child_reason},
+                    {
+                        "task_id": child_id,
+                        "reason": child_reason,
+                        "terminal_result": _json({"output": child_reason}),
+                    },
                 )
                 self._release_claims(conn, child_id, status="cancelled")
                 self._resolve_cancel(conn, child_id)
@@ -3681,6 +4061,8 @@ class PostgresAgentRunStore:
                 """
                 UPDATE labrastro_agent_runs
                 SET status='queued',
+                    mainline_state='executing',
+                    activation_state='queued',
                     waiting_reason=NULL,
                     resume_policy=NULL,
                     terminal_result='{}'::jsonb,
@@ -3860,6 +4242,22 @@ class PostgresAgentRunStore:
             ),
             trigger_mode=TriggerMode(str(row["trigger_mode"])),
             status=AgentRunStatus(str(row["status"])),
+            mainline_state=(
+                AgentRunMainlineState(str(row["mainline_state"]))
+                if "mainline_state" in row_mapping and row["mainline_state"] is not None
+                else agent_run_mainline_state_for_status(
+                    str(row["status"]),
+                    row["waiting_reason"] if "waiting_reason" in row_mapping else None,
+                )
+            ),
+            activation_state=(
+                AgentRunActivationState(str(row["activation_state"]))
+                if "activation_state" in row_mapping and row["activation_state"] is not None
+                else agent_run_activation_state_for_status(
+                    str(row["status"]),
+                    row["waiting_reason"] if "waiting_reason" in row_mapping else None,
+                )
+            ),
             waiting_reason=(
                 row["waiting_reason"]
                 if "waiting_reason" in row_mapping
@@ -4137,7 +4535,10 @@ class PostgresAgentRunStore:
                     text(
                         """
                         UPDATE labrastro_agent_runs
-                        SET status='queued', updated_at=now()
+                        SET status='queued',
+                            mainline_state='executing',
+                            activation_state='queued',
+                            updated_at=now()
                         WHERE id=:task_id
                         """
                     ),
@@ -4145,6 +4546,8 @@ class PostgresAgentRunStore:
                 )
                 recovered.append(task_id)
                 task.status = AgentRunStatus.QUEUED
+                task.mainline_state = AgentRunMainlineState.EXECUTING
+                task.activation_state = AgentRunActivationState.QUEUED
                 from labrastro_server.services.agent_runtime.control_plane import (
                     _activation_from_task,
                     _activation_with_runtime_state,
@@ -4215,6 +4618,14 @@ class PostgresAgentRunStore:
                 """
                 UPDATE labrastro_agent_runs
                 SET status=CASE WHEN status='dispatched' THEN 'running' ELSE status END,
+                    mainline_state=CASE
+                        WHEN status='dispatched' THEN 'executing'
+                        ELSE mainline_state
+                    END,
+                    activation_state=CASE
+                        WHEN status='dispatched' THEN 'running'
+                        ELSE activation_state
+                    END,
                     executor_session_id=COALESCE(:executor_session_id, executor_session_id),
                     workdir=COALESCE(:workdir, workdir),
                     started_at=COALESCE(started_at, now()),

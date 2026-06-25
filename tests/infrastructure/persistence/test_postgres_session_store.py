@@ -13,6 +13,7 @@ from labrastro_server.infrastructure.persistence.migration import run_migrations
 from labrastro_server.infrastructure.persistence.postgres_session_store import (
     PostgresSessionStore,
 )
+from reuleauxcoder.domain.session.models import SessionRuntimeState
 
 
 pytestmark = pytest.mark.skipif(
@@ -115,6 +116,90 @@ def test_postgres_session_store_writes_single_session_record() -> None:
             ).scalar_one()
         assert int(document_count or 0) == 0
         assert int(event_count or 0) == 0
+    finally:
+        store.delete(session_id)
+
+
+def test_postgres_session_store_trace_only_session_marks_history_content() -> None:
+    engine = _engine()
+    store = PostgresSessionStore(engine)
+    session_id = "pg-trace-only-session"
+
+    try:
+        store.append_trace_event(
+            session_id,
+            "session_run_start",
+            {"prompt": "trace-only"},
+            session_run_id="run-trace-only",
+            session_run_seq=1,
+        )
+
+        record = store.load_record(session_id)
+        assert record is not None
+        assert record["history"]["messages"] == []
+        assert record["transcript"]["turns"][0]["userMessage"]["text"] == "trace-only"
+        listed = store.list(limit=10, fingerprint=None)
+        assert any(item.id == session_id for item in listed)
+
+        with engine.begin() as conn:
+            has_history = conn.execute(
+                text(
+                    """
+                    SELECT has_history_content
+                    FROM labrastro_sessions
+                    WHERE id=:session_id
+                    """
+                ),
+                {"session_id": session_id},
+            ).scalar_one()
+        assert has_history is True
+
+        store.save_runtime_state(
+            session_id,
+            "m1",
+            SessionRuntimeState(model="m1"),
+            messages=[],
+        )
+        with engine.begin() as conn:
+            has_history_after_runtime = conn.execute(
+                text(
+                    """
+                    SELECT has_history_content
+                    FROM labrastro_sessions
+                    WHERE id=:session_id
+                    """
+                ),
+                {"session_id": session_id},
+            ).scalar_one()
+        assert has_history_after_runtime is True
+    finally:
+        store.delete(session_id)
+
+
+def test_postgres_session_store_trace_only_session_uses_event_fingerprint() -> None:
+    engine = _engine()
+    store = PostgresSessionStore(engine)
+    session_id = "pg-trace-fingerprint-session"
+    fingerprint = "remote:test-peer:/tmp/workspace"
+
+    try:
+        store.append_trace_event(
+            session_id,
+            "session_run_start",
+            {"prompt": "trace-fingerprint"},
+            session_run_id="run-trace-fingerprint",
+            session_run_seq=1,
+            fingerprint=fingerprint,
+        )
+
+        listed_for_owner = store.list(limit=10, fingerprint=fingerprint)
+        listed_for_default = store.list(limit=10, fingerprint="local")
+        assert any(item.id == session_id for item in listed_for_owner)
+        assert all(item.id != session_id for item in listed_for_default)
+
+        loaded = store.load(session_id)
+        assert loaded is not None
+        assert loaded.fingerprint == fingerprint
     finally:
         store.delete(session_id)
 
