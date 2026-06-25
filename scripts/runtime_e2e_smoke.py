@@ -32,12 +32,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import textwrap
 import time
 from typing import Any
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 
 SOURCE_EXCLUDES = [
@@ -126,6 +127,10 @@ def env_file_value(value: str) -> str:
     return text
 
 
+def postgres_database_url(*, user: str, password: str, host: str, database: str) -> str:
+    return f"postgresql://{user}:{quote(password, safe='')}@{host}:5432/{database}"
+
+
 @dataclass
 class Masker:
     values: list[str] = field(default_factory=list)
@@ -212,6 +217,19 @@ def load_secret_from_env(env_name: str, label: str) -> str:
     return value
 
 
+def split_ssh_host(value: str) -> tuple[str, int]:
+    host = value.strip()
+    if host.startswith("[") and "]:" in host:
+        name, port = host[1:].rsplit("]:", 1)
+        if port.isdigit():
+            return name, int(port)
+    if host.count(":") == 1:
+        name, port = host.rsplit(":", 1)
+        if name and port.isdigit():
+            return name, int(port)
+    return host, 22
+
+
 class LocalSSH:
     def __init__(self, host: str, user: str, password: str, masker: Masker):
         try:
@@ -225,8 +243,10 @@ class LocalSSH:
         self.masker = masker
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_host, ssh_port = split_ssh_host(host)
         self.client.connect(
-            hostname=host,
+            hostname=ssh_host,
+            port=ssh_port,
             username=user,
             password=password,
             look_for_keys=False,
@@ -621,6 +641,8 @@ class ServerRunner:
 
     def preflight(self) -> None:
         self.log("preflight")
+        if not self.auth_password:
+            raise RuntimeError("LABRASTRO_SUPERADMIN_PASSWORD is required before deployment")
         self.bash("command -v docker >/dev/null")
         self.run_cmd(["docker", "inspect", self.host_container], timeout=30)
         self.run_cmd(["docker", "inspect", self.pg_container], timeout=30)
@@ -737,7 +759,12 @@ class ServerRunner:
             database="postgres",
         )
         self.psql(f"CREATE DATABASE {self.db_name}", database="postgres")
-        dsn = f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_container}:5432/{self.db_name}"
+        dsn = postgres_database_url(
+            user=self.pg_user,
+            password=self.pg_password,
+            host=self.pg_container,
+            database=self.db_name,
+        )
         self.masker.add(dsn)
         self.database_url = dsn
         self.record_step("create_database", database=self.db_name)
@@ -1235,6 +1262,8 @@ class ServerRunner:
                 "--claim-interval",
                 "200ms",
                 "--agent-run-worker",
+                "--agent-run-worker-kind",
+                "server_worker",
                 "--worker-session-id",
                 worker_id,
             ],
@@ -1382,24 +1411,45 @@ class ServerRunner:
             time.sleep(1)
         raise RuntimeError(f"task {task_id} did not finish, last detail={detail}")
 
+    @staticmethod
+    def agent_run_id_from_task_run(task_run: dict[str, Any]) -> str:
+        metadata = task_run.get("metadata") if isinstance(task_run, dict) else {}
+        if not isinstance(metadata, dict):
+            return ""
+        ref = metadata.get("agent_run_ref")
+        if not isinstance(ref, dict):
+            return ""
+        return str(ref.get("id") or "")
+
     def find_agent_run_id_for_task_run(
         self,
         task_run_id: str,
         *,
+        peer_token: str,
+        taskflow_id: str,
         timeout_sec: int = 30,
     ) -> str:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            body = self.admin_json(
-                "/remote/admin/agent-runs/list",
-                {"limit": 200},
+            runtime = self.peer_get(
+                f"/remote/taskflow/taskflows/{taskflow_id}/runtime",
+                peer_token,
+                {"event_limit": 20},
             )
-            for row in body.get("agent_runs") or []:
-                metadata = row.get("metadata") if isinstance(row, dict) else {}
-                if isinstance(metadata, dict) and metadata.get("task_run_id") == task_run_id:
-                    return str(row.get("id") or "")
+            for item in runtime.get("task_runs") or []:
+                if not isinstance(item, dict):
+                    continue
+                task_run = item.get("task_run")
+                if not isinstance(task_run, dict) or str(task_run.get("id") or "") != task_run_id:
+                    continue
+                agent_run = item.get("agent_run")
+                if isinstance(agent_run, dict) and agent_run.get("id"):
+                    return str(agent_run["id"])
+                agent_run_id = self.agent_run_id_from_task_run(task_run)
+                if agent_run_id:
+                    return agent_run_id
             time.sleep(1)
-        raise RuntimeError(f"AgentRun not found for TaskRun {task_run_id}")
+        raise RuntimeError(f"AgentRun not found for TaskRun {task_run_id} in {taskflow_id}")
 
     def claim_task_until(
         self,
@@ -1481,10 +1531,11 @@ class ServerRunner:
             self.assert_task_labels(
                 happy_id,
                 happy,
-                {"queued", "claimed", "worktree_ready", "text", "branch_pushed"},
+                {"queued", "claimed", "worktree_ready", "text", "completed"},
             )
             artifacts = {item.get("type"): item for item in happy.get("artifacts") or []}
-            if "branch" not in artifacts:
+            publish_policy = str(happy["agent_run"].get("publish_policy") or "")
+            if publish_policy != "never" and "branch" not in artifacts:
                 raise RuntimeError(f"happy task missing artifacts: {artifacts}")
             workdir = Path((happy.get("session") or {}).get("workdir") or "")
             if not (workdir / "agent-output-happy.txt").exists():
@@ -1492,24 +1543,66 @@ class ServerRunner:
             self.report["tasks"]["happy"] = self.summarize_task(happy)
 
             cancel_id = f"task-cancel-{self.timestamp.lower()}"
-            self.submit_task(
-                cancel_id,
-                agent_id,
-                fixture,
-                suffix="cancel",
-                extra_metadata={"fake_sleep_sec": 5},
+            submit_error: dict[str, BaseException] = {}
+
+            def submit_cancel_task() -> None:
+                try:
+                    self.submit_task(
+                        cancel_id,
+                        agent_id,
+                        fixture,
+                        suffix="cancel",
+                        extra_metadata={"fake_sleep_sec": 30},
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    submit_error["error"] = exc
+
+            cancel_submit = threading.Thread(
+                target=submit_cancel_task,
+                name=f"submit-{cancel_id}",
+                daemon=True,
             )
-            self.wait_for_label(cancel_id, "running", timeout_sec=90)
-            cancel_body = self.admin_json(
-                "/remote/admin/agent-runs/cancel",
-                {"agent_run_id": cancel_id, "reason": "agent_run_smoke_cancel"},
-            )
+            cancel_submit.start()
+            time.sleep(2)
+            cancel_body: dict[str, Any] = {}
+            cancel_error = ""
+            cancel_deadline = time.time() + 10
+            while time.time() < cancel_deadline:
+                try:
+                    cancel_body = self.admin_json(
+                        "/remote/admin/agent-runs/cancel",
+                        {"agent_run_id": cancel_id, "reason": "agent_run_smoke_cancel"},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    cancel_error = str(exc)
+                    time.sleep(0.5)
+                    continue
+                if cancel_body.get("ok") is True:
+                    break
+                try:
+                    current = self.load_task(cancel_id)
+                    current_status = str((current.get("agent_run") or {}).get("status") or "")
+                    if current_status in TERMINAL_STATUSES:
+                        raise RuntimeError(
+                            f"cancel AgentRun reached {current_status} before cancel accepted: {cancel_body}"
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    cancel_error = str(exc)
+                time.sleep(0.5)
             if cancel_body.get("ok") is not True:
-                raise RuntimeError(f"cancel failed: {cancel_body}")
+                suffix = f"; last_error={cancel_error}" if cancel_error else ""
+                raise RuntimeError(f"cancel failed: {cancel_body}{suffix}")
             cancel_detail = self.poll_task(cancel_id, timeout_sec=90)
             status = str(cancel_detail["agent_run"]["status"])
             if status not in {"cancelled", "canceled"}:
                 raise RuntimeError(f"cancel AgentRun status mismatch: {cancel_detail['agent_run']}")
+            cancel_submit.join(timeout=10)
+            if cancel_submit.is_alive():
+                raise RuntimeError("cancel submit did not return after cancellation")
+            if submit_error:
+                raise RuntimeError(f"cancel submit failed: {submit_error['error']}")
             self.report["tasks"]["cancel"] = self.summarize_task(cancel_detail)
             self.stop_worker()
             self.start_worker(
@@ -1643,15 +1736,24 @@ class ServerRunner:
         )["task_run"]
         if dispatch.get("status") != "dispatched":
             raise RuntimeError(f"taskflow dispatch did not dispatch TaskRun: {dispatch}")
-        agent_run_id = self.find_agent_run_id_for_task_run(str(dispatch["id"]))
+        agent_run_id = self.agent_run_id_from_task_run(dispatch) or self.find_agent_run_id_for_task_run(
+            str(dispatch["id"]),
+            peer_token=peer_token,
+            taskflow_id=taskflow_id,
+        )
         detail = self.poll_task(agent_run_id, timeout_sec=120)
         if detail["agent_run"]["status"] != "completed":
             raise RuntimeError(f"taskflow AgentRun did not complete: {detail['agent_run']}")
+        if detail["agent_run"].get("source") != "taskflow":
+            raise RuntimeError(f"taskflow AgentRun source mismatch: {detail['agent_run']}")
         agent_run_metadata = detail["agent_run"].get("metadata") or {}
         if agent_run_metadata.get("dispatch_source") != "taskflow":
             raise RuntimeError(f"taskflow AgentRun metadata missing source: {agent_run_metadata}")
-        if agent_run_metadata.get("taskflow_id") != taskflow_id:
-            raise RuntimeError(f"taskflow AgentRun metadata missing taskflow id: {agent_run_metadata}")
+        for forbidden in ("task_run_id", "taskflow_id", "work_item_id", "goal_id"):
+            if forbidden in agent_run_metadata:
+                raise RuntimeError(
+                    f"taskflow AgentRun leaked Taskflow metadata {forbidden}: {agent_run_metadata}"
+                )
         agent_run_events = self.peer_get(
             f"/remote/agent-runs/{agent_run_id}/events",
             peer_token,
@@ -1821,19 +1923,25 @@ class ServerRunner:
         assignment_task_run_id = dispatch.get("task_run_id")
         if dispatch.get("status") != "dispatched" or not assignment_task_run_id:
             raise RuntimeError(f"assignment dispatch failed: {dispatch}")
+        assignment_issue_detail = self.peer_get(f"/remote/issues/{issue_id}", peer_token)
+        assignment_taskflow_id = str(
+            (assignment_issue_detail.get("issue") or {}).get("taskflow_id") or ""
+        )
+        if not assignment_taskflow_id:
+            raise RuntimeError(f"assignment issue missing taskflow id: {assignment_issue_detail}")
         assignment_agent_run_id = self.find_agent_run_id_for_task_run(
-            str(assignment_task_run_id)
+            str(assignment_task_run_id),
+            peer_token=peer_token,
+            taskflow_id=assignment_taskflow_id,
         )
         assignment_detail = self.poll_task(str(assignment_agent_run_id), timeout_sec=120)
         assignment_metadata = assignment_detail["agent_run"].get("metadata") or {}
-        for key, expected in {
-            "dispatch_source": "assignment",
-            "issue_id": issue_id,
-            "assignment_id": assignment_id,
-        }.items():
-            if assignment_metadata.get(key) != expected:
+        if assignment_metadata.get("dispatch_source") != "assignment":
+            raise RuntimeError(f"assignment AgentRun metadata mismatch: {assignment_metadata}")
+        for forbidden in ("issue_id", "assignment_id", "mention_id", "task_run_id", "taskflow_id"):
+            if forbidden in assignment_metadata:
                 raise RuntimeError(
-                    f"assignment AgentRun metadata mismatch for {key}: {assignment_metadata}"
+                    f"assignment AgentRun leaked business metadata {forbidden}: {assignment_metadata}"
                 )
 
         parse = self.peer_post(
@@ -1880,20 +1988,25 @@ class ServerRunner:
         mention_task_run_id = mention_dispatch.get("task_run_id")
         if mention_dispatch.get("status") != "dispatched" or not mention_task_run_id:
             raise RuntimeError(f"mention assignment dispatch failed: {mention_dispatch}")
+        mention_issue_detail = self.peer_get(f"/remote/issues/{issue_id}", peer_token)
+        mention_taskflow_id = str(
+            (mention_issue_detail.get("issue") or {}).get("taskflow_id") or ""
+        )
+        if not mention_taskflow_id:
+            raise RuntimeError(f"mention issue missing taskflow id: {mention_issue_detail}")
         mention_agent_run_id = self.find_agent_run_id_for_task_run(
-            str(mention_task_run_id)
+            str(mention_task_run_id),
+            peer_token=peer_token,
+            taskflow_id=mention_taskflow_id,
         )
         mention_detail = self.poll_task(str(mention_agent_run_id), timeout_sec=120)
         mention_metadata = mention_detail["agent_run"].get("metadata") or {}
-        for key, expected in {
-            "dispatch_source": "mention",
-            "issue_id": issue_id,
-            "assignment_id": mention_assignment_id,
-            "mention_id": mention["id"],
-        }.items():
-            if mention_metadata.get(key) != expected:
+        if mention_metadata.get("dispatch_source") != "mention":
+            raise RuntimeError(f"mention AgentRun metadata mismatch: {mention_metadata}")
+        for forbidden in ("issue_id", "assignment_id", "mention_id", "task_run_id", "taskflow_id"):
+            if forbidden in mention_metadata:
                 raise RuntimeError(
-                    f"mention AgentRun metadata mismatch for {key}: {mention_metadata}"
+                    f"mention AgentRun leaked business metadata {forbidden}: {mention_metadata}"
                 )
 
         issue_detail = self.peer_get(f"/remote/issues/{issue_id}", peer_token)
@@ -1932,7 +2045,17 @@ class ServerRunner:
         blocked_task_run_id = blocked_dispatch.get("task_run_id")
         if blocked_dispatch.get("status") != "dispatched" or not blocked_task_run_id:
             raise RuntimeError(f"default assignment dispatch failed: {blocked_dispatch}")
-        blocked_agent_run_id = self.find_agent_run_id_for_task_run(str(blocked_task_run_id))
+        blocked_issue_detail = self.peer_get(f"/remote/issues/{blocked_issue_id}", peer_token)
+        blocked_taskflow_id = str(
+            (blocked_issue_detail.get("issue") or {}).get("taskflow_id") or ""
+        )
+        if not blocked_taskflow_id:
+            raise RuntimeError(f"default assignment issue missing taskflow id: {blocked_issue_detail}")
+        blocked_agent_run_id = self.find_agent_run_id_for_task_run(
+            str(blocked_task_run_id),
+            peer_token=peer_token,
+            taskflow_id=blocked_taskflow_id,
+        )
         blocked_detail = self.poll_task(str(blocked_agent_run_id), timeout_sec=120)
         if blocked_detail["agent_run"]["status"] != "completed":
             raise RuntimeError(
@@ -1981,13 +2104,41 @@ class ServerRunner:
         detail: dict[str, Any] = {}
         while time.time() < deadline:
             detail = self.load_task(task_id)
-            if label in self.event_labels(detail):
-                return detail
             status = str((detail.get("agent_run") or {}).get("status") or "")
             if status in TERMINAL_STATUSES:
                 raise RuntimeError(f"AgentRun {task_id} reached {status} before label {label}")
+            if label in self.event_labels(detail):
+                return detail
             time.sleep(1)
         raise RuntimeError(f"AgentRun {task_id} did not reach label {label}; last={detail}")
+
+    def wait_for_nonterminal_label(
+        self,
+        task_id: str,
+        label: str,
+        *,
+        timeout_sec: int,
+    ) -> dict[str, Any]:
+        deadline = time.time() + timeout_sec
+        detail: dict[str, Any] = {}
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                detail = self.load_task(task_id)
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                time.sleep(0.5)
+                continue
+            status = str((detail.get("agent_run") or {}).get("status") or "")
+            if status in TERMINAL_STATUSES:
+                raise RuntimeError(f"AgentRun {task_id} reached {status} before label {label}")
+            if label in self.event_labels(detail):
+                return detail
+            time.sleep(0.5)
+        suffix = f"; last_error={last_error}" if last_error else ""
+        raise RuntimeError(
+            f"AgentRun {task_id} did not reach nonterminal label {label}; last={detail}{suffix}"
+        )
 
     def summarize_task(self, detail: dict[str, Any]) -> dict[str, Any]:
         task = detail.get("agent_run") or {}
@@ -2044,13 +2195,16 @@ class ServerRunner:
             timeout_sec=75,
         )
         request_id = claim["request_id"]
+        activation_id = str(claim.get("activation_id") or "")
         self.masker.add(request_id)
+        self.masker.add(activation_id)
         hb = self.http_json(
             "POST",
-            "/remote/agent-runs/heartbeat",
+            "/remote/agent-run-activations/heartbeat",
             {
                 "peer_token": peer_token,
                 "request_id": request_id,
+                "activation_id": activation_id,
                 "agent_run_id": task_id,
                 "worker_id": "manual-recovery-worker",
                 "lease_sec": 30,
@@ -2126,18 +2280,25 @@ class ServerRunner:
             "SELECT count(*) FROM labrastro_sessions WHERE fingerprint='agent-run-smoke:" + self.timestamp + "'",
             database=self.db_name,
         ).stdout.strip()
-        document_count = self.psql(
+        transcript_count = self.psql(
+            "SELECT count(*) FROM labrastro_sessions "
+            "WHERE id='" + data["session_id"] + "' "
+            "AND jsonb_array_length(COALESCE(record->'transcript'->'turns', '[]'::jsonb)) > 0",
+            database=self.db_name,
+        ).stdout.strip()
+        legacy_document_count = self.psql(
             "SELECT count(*) FROM labrastro_session_documents WHERE session_id='" + data["session_id"] + "'",
             database=self.db_name,
         ).stdout.strip()
-        if session_count == "0" or document_count == "0":
+        if session_count == "0" or transcript_count == "0":
             raise RuntimeError(
-                f"session/document rows missing: sessions={session_count} documents={document_count}"
+                f"session transcript missing: sessions={session_count} transcripts={transcript_count}"
             )
         self.report["checks"]["session_persistence"] = {
             "session_id": data["session_id"],
             "sessions": session_count,
-            "documents": document_count,
+            "transcripts": transcript_count,
+            "legacy_documents": legacy_document_count,
         }
         self.record_step("session_persistence", session_id=data["session_id"])
 
